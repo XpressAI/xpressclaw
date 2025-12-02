@@ -3,7 +3,7 @@
 from pathlib import Path
 import click
 
-from xpressai.tasks.sop import SOP, SOPManager
+from xpressai.tasks.sop import SOP, SOPInput, SOPOutput, SOPStep, SOPManager
 
 
 def list_sops(sops_dir: Path | None = None) -> None:
@@ -82,19 +82,41 @@ def create_sop(name: str, sops_dir: Path | None = None) -> None:
         click.echo(click.style(f"SOP already exists: {name}", fg="red"))
         return
 
-    # Create template SOP
+    # Create a full example SOP
     sop = SOP(
         name=name,
-        summary="Describe what this SOP does",
-        tools=["tool_name"],
-        inputs=[],
-        outputs=[],
-        steps=[],
+        summary="Gets the current time and writes it to hello.txt",
+        tools=["get_current_time", "write_file"],
+        inputs=[
+            SOPInput(
+                name="output_path",
+                context="The file path where the message will be written.",
+                default="hello.txt",
+            ),
+        ],
+        outputs=[
+            SOPOutput(
+                name="status",
+                context="SUCCESS if the file was written, FAIL otherwise.",
+            ),
+        ],
+        steps=[
+            SOPStep(
+                prompt="Get the current time.",
+                tools=["get_current_time"],
+                inputs=[],
+            ),
+            SOPStep(
+                prompt='Write a file with the message "The current time is: {current_time}"',
+                tools=["write_file"],
+                inputs=["output_path"],
+            ),
+        ],
     )
 
     path = manager.create(sop)
     click.echo(click.style(f"Created SOP: {path}", fg="green"))
-    click.echo("Edit the file to define your workflow.")
+    click.echo("Edit the file to customize your workflow.")
 
 
 def delete_sop(name: str, sops_dir: Path | None = None) -> None:
