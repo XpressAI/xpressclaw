@@ -34,7 +34,8 @@ dependencies = [
     "aiosqlite>=0.19",
     "sqlite-vec>=0.1.0",
     
-    # Agent SDK (optional - use anthropic directly for now)
+    # Agent SDK - Claude Agent SDK with Anthropic API fallback
+    "claude-agent-sdk>=0.0.15",
     "anthropic>=0.18",
     
     # Docker

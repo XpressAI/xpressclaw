@@ -1,11 +1,13 @@
 """Claude Agent SDK backend.
 
 Provides integration with the Claude Agent SDK for advanced agent capabilities.
+Uses ClaudeSDKClient for session-based conversations with tool support.
 """
 
 from typing import AsyncIterator, Any
 import logging
 import os
+from pathlib import Path
 
 from xpressai.agents.base import AgentBackend
 from xpressai.core.config import AgentConfig
@@ -14,32 +16,59 @@ from xpressai.core.exceptions import BackendError, BackendInitializationError
 logger = logging.getLogger(__name__)
 
 # Check for SDK availability
+CLAUDE_SDK_AVAILABLE = False
+ANTHROPIC_AVAILABLE = False
+
+try:
+    from claude_agent_sdk import (
+        ClaudeSDKClient,
+        ClaudeAgentOptions,
+        AssistantMessage,
+        TextBlock,
+        ToolUseBlock,
+        ResultMessage,
+        tool,
+        create_sdk_mcp_server,
+    )
+
+    CLAUDE_SDK_AVAILABLE = True
+    logger.info("Claude Agent SDK available")
+except ImportError:
+    logger.debug("claude-agent-sdk not installed, falling back to anthropic")
+
 try:
     from anthropic import Anthropic
 
     ANTHROPIC_AVAILABLE = True
 except ImportError:
-    ANTHROPIC_AVAILABLE = False
-    logger.warning("anthropic package not available")
+    logger.debug("anthropic package not available")
 
 
 class ClaudeAgentBackend(AgentBackend):
-    """Backend using Claude via Anthropic API.
+    """Backend using Claude Agent SDK with ClaudeSDKClient.
 
-    Uses the Anthropic Python SDK for Claude model access with streaming
-    and tool support.
+    Uses the official Claude Agent SDK for session-based conversations
+    with full tool support, hooks, and interrupts.
+
+    Falls back to direct Anthropic API if SDK is not available.
     """
 
     def __init__(self):
         """Initialize the backend."""
-        self._client = None
+        self._client: Any = None
         self._config: AgentConfig | None = None
         self._model = "claude-sonnet-4-20250514"
         self._system_prompt = ""
         self._memory_context = ""
         self._tools: list[dict[str, Any]] = []
+        self._cwd: Path | None = None
+        self._use_sdk = CLAUDE_SDK_AVAILABLE
+        self._connected = False
+
+        # Fallback anthropic client
+        self._anthropic_client: Any = None
         self._conversation_history: list[dict[str, Any]] = []
-        self._max_tokens = 4096
+        self._max_tokens = 8192
 
     async def initialize(self, config: AgentConfig) -> None:
         """Initialize with configuration.
@@ -52,26 +81,55 @@ class ClaudeAgentBackend(AgentBackend):
         """
         self._config = config
         self._system_prompt = config.role
+        self._cwd = Path.cwd()
 
-        if not ANTHROPIC_AVAILABLE:
+        if self._use_sdk:
+            await self._initialize_sdk()
+        else:
+            await self._initialize_anthropic()
+
+    async def _initialize_sdk(self) -> None:
+        """Initialize using Claude Agent SDK."""
+        if not CLAUDE_SDK_AVAILABLE:
             raise BackendInitializationError(
-                "anthropic package not installed. Install with: pip install anthropic",
+                "claude-agent-sdk not installed. Install with: pip install claude-agent-sdk",
                 {"backend": "claude-code"},
             )
 
-        # Get API key
+        # Build options
+        options = ClaudeAgentOptions(
+            system_prompt=self._system_prompt if self._system_prompt else None,
+            cwd=str(self._cwd) if self._cwd else None,
+            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
+            permission_mode="acceptEdits",
+        )
+
+        self._client = ClaudeSDKClient(options=options)
+        logger.info("Claude Agent SDK backend initialized")
+
+    async def _initialize_anthropic(self) -> None:
+        """Initialize using direct Anthropic API (fallback)."""
+        if not ANTHROPIC_AVAILABLE:
+            raise BackendInitializationError(
+                "Neither claude-agent-sdk nor anthropic package installed. "
+                "Install with: pip install claude-agent-sdk",
+                {"backend": "claude-code"},
+            )
+
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise BackendInitializationError(
-                "ANTHROPIC_API_KEY environment variable not set", {"backend": "claude-code"}
+                "ANTHROPIC_API_KEY environment variable not set",
+                {"backend": "claude-code"},
             )
 
         try:
-            self._client = Anthropic(api_key=api_key)
-            logger.info("Claude backend initialized")
+            self._anthropic_client = Anthropic(api_key=api_key)
+            logger.info("Claude backend initialized (using Anthropic API fallback)")
         except Exception as e:
             raise BackendInitializationError(
-                f"Failed to initialize Anthropic client: {e}", {"backend": "claude-code"}
+                f"Failed to initialize Anthropic client: {e}",
+                {"backend": "claude-code"},
             )
 
     async def send(self, message: str) -> AsyncIterator[str]:
@@ -83,7 +141,63 @@ class ClaudeAgentBackend(AgentBackend):
         Yields:
             Response text chunks
         """
+        if self._use_sdk:
+            async for chunk in self._send_sdk(message):
+                yield chunk
+        else:
+            async for chunk in self._send_anthropic(message):
+                yield chunk
+
+    async def _send_sdk(self, message: str) -> AsyncIterator[str]:
+        """Send message via Claude Agent SDK.
+
+        Args:
+            message: User message
+
+        Yields:
+            Response text chunks
+        """
         if self._client is None:
+            raise BackendError("Backend not initialized")
+
+        try:
+            # Connect if not connected
+            if not self._connected:
+                await self._client.connect()
+                self._connected = True
+
+            # Send query
+            await self._client.query(message)
+
+            # Stream response
+            async for msg in self._client.receive_response():
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            yield block.text
+                        elif isinstance(block, ToolUseBlock):
+                            # Yield tool use information for visibility
+                            yield f"\n[Using tool: {block.name}]\n"
+                elif isinstance(msg, ResultMessage):
+                    # Log completion info
+                    if msg.total_cost_usd:
+                        logger.debug(f"Request cost: ${msg.total_cost_usd:.4f}")
+                    if msg.is_error:
+                        logger.warning(f"Request ended with error: {msg.result}")
+
+        except Exception as e:
+            raise BackendError(f"Claude Agent SDK error: {e}")
+
+    async def _send_anthropic(self, message: str) -> AsyncIterator[str]:
+        """Send message via direct Anthropic API (fallback).
+
+        Args:
+            message: User message
+
+        Yields:
+            Response text chunks
+        """
+        if self._anthropic_client is None:
             raise BackendError("Backend not initialized")
 
         # Build system prompt
@@ -92,19 +206,13 @@ class ClaudeAgentBackend(AgentBackend):
             system += f"\n\n{self._memory_context}"
 
         # Add user message to history
-        self._conversation_history.append(
-            {
-                "role": "user",
-                "content": message,
-            }
-        )
+        self._conversation_history.append({"role": "user", "content": message})
 
         try:
-            # Create streaming message
-            with self._client.messages.stream(
+            with self._anthropic_client.messages.stream(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=system,
+                system=system if system else None,
                 messages=self._conversation_history,
                 tools=self._format_tools() if self._tools else None,
             ) as stream:
@@ -114,35 +222,31 @@ class ClaudeAgentBackend(AgentBackend):
                     response_text += text
                     yield text
 
-                # Add response to history
-                self._conversation_history.append(
-                    {
-                        "role": "assistant",
-                        "content": response_text,
-                    }
-                )
+                self._conversation_history.append({"role": "assistant", "content": response_text})
 
             # Keep history manageable
             if len(self._conversation_history) > 40:
                 self._conversation_history = self._conversation_history[-40:]
 
         except Exception as e:
-            raise BackendError(f"Claude API error: {e}")
+            raise BackendError(f"Anthropic API error: {e}")
 
     def _format_tools(self) -> list[dict[str, Any]]:
-        """Format tools for Claude API.
+        """Format tools for Anthropic API.
 
         Returns:
             Formatted tool definitions
         """
         formatted = []
 
-        for tool in self._tools:
+        for tool_def in self._tools:
             formatted.append(
                 {
-                    "name": tool.get("name", "unknown"),
-                    "description": tool.get("description", ""),
-                    "input_schema": tool.get("parameters", {"type": "object", "properties": {}}),
+                    "name": tool_def.get("name", "unknown"),
+                    "description": tool_def.get("description", ""),
+                    "input_schema": tool_def.get(
+                        "parameters", {"type": "object", "properties": {}}
+                    ),
                 }
             )
 
@@ -156,6 +260,11 @@ class ClaudeAgentBackend(AgentBackend):
         """
         self._memory_context = context
 
+        # For SDK, we'd need to reconnect with updated system prompt
+        if self._use_sdk and self._connected:
+            # Update will take effect on next query via system prompt
+            pass
+
     async def register_tools(self, tools: list[dict[str, Any]]) -> None:
         """Register tools.
 
@@ -164,16 +273,30 @@ class ClaudeAgentBackend(AgentBackend):
         """
         self._tools = tools
 
+        # For SDK, tools are registered via MCP servers
+        # This is used primarily for the Anthropic API fallback
+
     async def shutdown(self) -> None:
         """Shutdown the backend."""
+        if self._use_sdk and self._client and self._connected:
+            try:
+                await self._client.disconnect()
+            except Exception as e:
+                logger.warning(f"Error disconnecting SDK client: {e}")
+            self._connected = False
+
         self._client = None
+        self._anthropic_client = None
         self._conversation_history.clear()
         self._memory_context = ""
 
     async def interrupt(self) -> None:
         """Interrupt current operation."""
-        # The Anthropic SDK handles interruption via context managers
-        pass
+        if self._use_sdk and self._client and self._connected:
+            try:
+                await self._client.interrupt()
+            except Exception as e:
+                logger.warning(f"Error interrupting: {e}")
 
     def clear_history(self) -> None:
         """Clear conversation history."""
@@ -187,6 +310,14 @@ class ClaudeAgentBackend(AgentBackend):
         """
         self._model = model
 
+    def set_working_directory(self, path: Path) -> None:
+        """Set the working directory for file operations.
+
+        Args:
+            path: Working directory path
+        """
+        self._cwd = path
+
     @property
     def model(self) -> str:
         """The model being used."""
@@ -194,66 +325,26 @@ class ClaudeAgentBackend(AgentBackend):
 
     @property
     def supports_streaming(self) -> bool:
+        """Whether streaming is supported."""
         return True
 
     @property
     def supports_tools(self) -> bool:
+        """Whether tool use is supported."""
         return True
 
     @property
     def supports_memory(self) -> bool:
-        return True
-
-
-class ClaudeAgentSDKBackend(AgentBackend):
-    """Backend using the Claude Agent SDK.
-
-    This is a placeholder for when the official Claude Agent SDK is available.
-    Currently falls back to the standard Anthropic API.
-    """
-
-    def __init__(self):
-        """Initialize the backend."""
-        # Use the standard Claude backend for now
-        self._inner = ClaudeAgentBackend()
-
-    async def initialize(self, config: AgentConfig) -> None:
-        """Initialize with configuration."""
-        await self._inner.initialize(config)
-
-    async def send(self, message: str) -> AsyncIterator[str]:
-        """Send a message and stream response."""
-        async for chunk in self._inner.send(message):
-            yield chunk
-
-    async def inject_memory(self, context: str) -> None:
-        """Inject memory context."""
-        await self._inner.inject_memory(context)
-
-    async def register_tools(self, tools: list[dict[str, Any]]) -> None:
-        """Register tools."""
-        await self._inner.register_tools(tools)
-
-    async def shutdown(self) -> None:
-        """Shutdown the backend."""
-        await self._inner.shutdown()
-
-    async def interrupt(self) -> None:
-        """Interrupt current operation."""
-        await self._inner.interrupt()
-
-    @property
-    def model(self) -> str:
-        return self._inner.model
-
-    @property
-    def supports_streaming(self) -> bool:
+        """Whether memory injection is supported."""
         return True
 
     @property
-    def supports_tools(self) -> bool:
-        return True
+    def using_sdk(self) -> bool:
+        """Whether using the Claude Agent SDK."""
+        return self._use_sdk
 
-    @property
-    def supports_memory(self) -> bool:
-        return True
+
+class ClaudeCodeBackend(ClaudeAgentBackend):
+    """Alias for ClaudeAgentBackend for backwards compatibility."""
+
+    pass

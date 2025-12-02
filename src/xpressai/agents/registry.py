@@ -34,6 +34,7 @@ class BackendRegistry:
 
         self._backends["local"] = LocalModelBackend
         self._backends["claude-code"] = ClaudeAgentBackend
+        self._backends["claude"] = ClaudeAgentBackend  # Alias
 
     def register(self, name: str, backend_class: type[AgentBackend]) -> None:
         """Register a new backend type.
