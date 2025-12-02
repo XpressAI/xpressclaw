@@ -56,6 +56,21 @@ class ToolConfig:
 
 
 @dataclass
+class McpServerConfig:
+    """MCP server configuration.
+
+    Supports stdio, SSE, and HTTP server types.
+    """
+
+    type: str = "stdio"  # stdio | sse | http
+    command: str | None = None  # For stdio: command to run
+    args: list[str] = field(default_factory=list)  # For stdio: command arguments
+    env: dict[str, str] = field(default_factory=dict)  # Environment variables
+    url: str | None = None  # For sse/http: server URL
+    headers: dict[str, str] = field(default_factory=dict)  # For sse/http: headers
+
+
+@dataclass
 class WakeOnConfig:
     """Wake-on trigger configuration."""
 
@@ -141,6 +156,7 @@ class Config:
     system: SystemConfig = field(default_factory=SystemConfig)
     agents: list[AgentConfig] = field(default_factory=list)
     tools: dict[str, ToolConfig] = field(default_factory=dict)
+    mcp_servers: dict[str, McpServerConfig] = field(default_factory=dict)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     local_model: LocalModelConfig = field(default_factory=LocalModelConfig)
 
@@ -218,6 +234,20 @@ class Config:
                 # Path shorthand
                 tools[name] = ToolConfig(enabled=True, paths=[tool_data])
 
+        # Parse MCP servers
+        mcp_servers = {}
+        mcp_data = data.get("mcp_servers", {})
+        for name, server_data in mcp_data.items():
+            if isinstance(server_data, dict):
+                mcp_servers[name] = McpServerConfig(
+                    type=server_data.get("type", "stdio"),
+                    command=server_data.get("command"),
+                    args=server_data.get("args", []),
+                    env=server_data.get("env", {}),
+                    url=server_data.get("url"),
+                    headers=server_data.get("headers", {}),
+                )
+
         # Parse memory
         memory_data = data.get("memory", {})
         memory = MemoryConfig(
@@ -243,6 +273,7 @@ class Config:
             system=system,
             agents=agents,
             tools=tools,
+            mcp_servers=mcp_servers,
             memory=memory,
             local_model=local_model,
         )
@@ -391,6 +422,28 @@ tools:
 memory:
   near_term_slots: 8
   eviction: least-recently-relevant
+
+# MCP (Model Context Protocol) servers
+# These provide additional tools to your agents
+# mcp_servers:
+#   github:
+#     type: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env:
+#       GITHUB_PERSONAL_ACCESS_TOKEN: ${{GITHUB_TOKEN}}
+#   
+#   filesystem:
+#     type: stdio
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"]
+#   
+#   # SSE server example
+#   custom_api:
+#     type: sse
+#     url: http://localhost:3000/mcp
+#     headers:
+#       Authorization: Bearer ${{API_TOKEN}}
 
 # Local model settings (when using backend: local)
 # Start vLLM with: vllm serve Qwen/Qwen3-8B

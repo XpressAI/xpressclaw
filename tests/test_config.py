@@ -10,6 +10,7 @@ from xpressai.core.config import (
     BudgetConfig,
     AgentConfig,
     MemoryConfig,
+    McpServerConfig,
     load_config,
 )
 
@@ -138,3 +139,63 @@ class TestMemoryConfig:
             MemoryConfig(near_term_slots=0)
         with pytest.raises(ConfigValidationError):
             MemoryConfig(near_term_slots=20)
+
+
+class TestMcpServerConfig:
+    """Tests for McpServerConfig."""
+
+    def test_default_type(self):
+        """Test default type is stdio."""
+        config = McpServerConfig()
+        assert config.type == "stdio"
+
+    def test_stdio_server(self):
+        """Test stdio server configuration."""
+        config = McpServerConfig(
+            type="stdio",
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-github"],
+            env={"GITHUB_TOKEN": "test"},
+        )
+        assert config.type == "stdio"
+        assert config.command == "npx"
+        assert len(config.args) == 2
+        assert config.env["GITHUB_TOKEN"] == "test"
+
+    def test_sse_server(self):
+        """Test SSE server configuration."""
+        config = McpServerConfig(
+            type="sse",
+            url="http://localhost:3000/mcp",
+            headers={"Authorization": "Bearer token"},
+        )
+        assert config.type == "sse"
+        assert config.url == "http://localhost:3000/mcp"
+        assert "Authorization" in config.headers
+
+    def test_mcp_servers_in_config(self):
+        """Test parsing mcp_servers from config dict."""
+        data = {
+            "system": {"isolation": "none"},
+            "agents": [],
+            "mcp_servers": {
+                "github": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": {"GITHUB_TOKEN": "test"},
+                },
+                "custom_api": {
+                    "type": "sse",
+                    "url": "http://localhost:3000/mcp",
+                },
+            },
+        }
+        config = Config.from_dict(data)
+
+        assert len(config.mcp_servers) == 2
+        assert "github" in config.mcp_servers
+        assert "custom_api" in config.mcp_servers
+        assert config.mcp_servers["github"].type == "stdio"
+        assert config.mcp_servers["github"].command == "npx"
+        assert config.mcp_servers["custom_api"].type == "sse"

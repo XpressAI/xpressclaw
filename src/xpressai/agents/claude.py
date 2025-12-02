@@ -65,6 +65,9 @@ class ClaudeAgentBackend(AgentBackend):
         self._use_sdk = CLAUDE_SDK_AVAILABLE
         self._connected = False
 
+        # MCP server configurations
+        self._mcp_server_configs: dict[str, dict[str, Any]] = {}
+
         # Fallback anthropic client
         self._anthropic_client: Any = None
         self._conversation_history: list[dict[str, Any]] = []
@@ -96,16 +99,58 @@ class ClaudeAgentBackend(AgentBackend):
                 {"backend": "claude-code"},
             )
 
+        # Build MCP server configs from stored config
+        mcp_servers = self._build_mcp_servers()
+
+        # Build allowed tools list
+        allowed_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"]
+
+        # Add MCP tool permissions
+        for server_name in mcp_servers.keys():
+            # Allow all tools from each MCP server
+            allowed_tools.append(f"mcp__{server_name}__*")
+
         # Build options
         options = ClaudeAgentOptions(
             system_prompt=self._system_prompt if self._system_prompt else None,
             cwd=str(self._cwd) if self._cwd else None,
-            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"],
+            allowed_tools=allowed_tools,
             permission_mode="acceptEdits",
+            mcp_servers=mcp_servers if mcp_servers else None,
         )
 
         self._client = ClaudeSDKClient(options=options)
-        logger.info("Claude Agent SDK backend initialized")
+        logger.info(f"Claude Agent SDK backend initialized with {len(mcp_servers)} MCP servers")
+
+    def _build_mcp_servers(self) -> dict[str, Any]:
+        """Build MCP server configurations for the SDK.
+
+        Returns:
+            Dict of MCP server configs compatible with ClaudeAgentOptions
+        """
+        mcp_servers: dict[str, Any] = {}
+
+        for name, config in self._mcp_server_configs.items():
+            if config.get("type") == "stdio":
+                mcp_servers[name] = {
+                    "command": config.get("command"),
+                    "args": config.get("args", []),
+                    "env": config.get("env", {}),
+                }
+            elif config.get("type") == "sse":
+                mcp_servers[name] = {
+                    "type": "sse",
+                    "url": config.get("url"),
+                    "headers": config.get("headers", {}),
+                }
+            elif config.get("type") == "http":
+                mcp_servers[name] = {
+                    "type": "http",
+                    "url": config.get("url"),
+                    "headers": config.get("headers", {}),
+                }
+
+        return mcp_servers
 
     async def _initialize_anthropic(self) -> None:
         """Initialize using direct Anthropic API (fallback)."""
@@ -317,6 +362,41 @@ class ClaudeAgentBackend(AgentBackend):
             path: Working directory path
         """
         self._cwd = path
+
+    def configure_mcp_servers(self, mcp_servers: dict[str, Any]) -> None:
+        """Configure MCP servers for the backend.
+
+        Must be called before initialize() to take effect.
+
+        Args:
+            mcp_servers: Dict mapping server names to their configurations.
+                Each config should have:
+                - type: "stdio" | "sse" | "http"
+                - command: Command to run (for stdio)
+                - args: Command arguments (for stdio)
+                - env: Environment variables
+                - url: Server URL (for sse/http)
+                - headers: Request headers (for sse/http)
+        """
+        self._mcp_server_configs = {}
+
+        for name, config in mcp_servers.items():
+            # Handle both McpServerConfig objects and dicts
+            if hasattr(config, "__dict__"):
+                # It's a dataclass, convert to dict
+                self._mcp_server_configs[name] = {
+                    "type": getattr(config, "type", "stdio"),
+                    "command": getattr(config, "command", None),
+                    "args": getattr(config, "args", []),
+                    "env": getattr(config, "env", {}),
+                    "url": getattr(config, "url", None),
+                    "headers": getattr(config, "headers", {}),
+                }
+            else:
+                # It's already a dict
+                self._mcp_server_configs[name] = config
+
+        logger.debug(f"Configured {len(self._mcp_server_configs)} MCP servers")
 
     @property
     def model(self) -> str:

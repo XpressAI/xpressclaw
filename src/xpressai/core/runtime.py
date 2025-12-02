@@ -223,7 +223,12 @@ class Runtime:
 
             agent_config = self._get_agent_config(agent_id)
             if agent_config:
-                backend = await get_backend(agent.backend, agent_id, agent_config)
+                backend = await get_backend(
+                    agent.backend,
+                    agent_id,
+                    agent_config,
+                    mcp_servers=self.config.mcp_servers,
+                )
 
             agent.status = "running"
             agent.started_at = datetime.now()
@@ -332,7 +337,12 @@ class Runtime:
         from xpressai.agents.registry import get_backend
 
         agent_config = self._get_agent_config(agent_id)
-        backend = await get_backend(agent.backend, agent_id, agent_config)
+        backend = await get_backend(
+            agent.backend,
+            agent_id,
+            agent_config,
+            mcp_servers=self.config.mcp_servers,
+        )
 
         # Inject memory context
         if self._memory:

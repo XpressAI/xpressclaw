@@ -7,7 +7,7 @@ from typing import Any
 import logging
 
 from xpressai.agents.base import AgentBackend, AgentStatus
-from xpressai.core.config import AgentConfig
+from xpressai.core.config import AgentConfig, McpServerConfig
 from xpressai.core.exceptions import BackendNotFoundError, BackendInitializationError
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class BackendRegistry:
         backend_type: str,
         agent_id: str,
         config: AgentConfig | None = None,
+        mcp_servers: dict[str, McpServerConfig] | None = None,
     ) -> AgentBackend:
         """Get or create a backend instance for an agent.
 
@@ -66,6 +67,7 @@ class BackendRegistry:
             backend_type: Type of backend
             agent_id: ID of the agent
             config: Optional agent configuration
+            mcp_servers: Optional MCP server configurations
 
         Returns:
             Backend instance
@@ -87,6 +89,10 @@ class BackendRegistry:
 
         try:
             backend = self._backends[backend_type]()
+
+            # Configure MCP servers before initialization (for Claude backend)
+            if mcp_servers and hasattr(backend, "configure_mcp_servers"):
+                backend.configure_mcp_servers(mcp_servers)
 
             if config:
                 await backend.initialize(config)
@@ -155,6 +161,7 @@ async def get_backend(
     backend_type: str,
     agent_id: str,
     config: AgentConfig | None = None,
+    mcp_servers: dict[str, McpServerConfig] | None = None,
 ) -> AgentBackend:
     """Get or create a backend instance.
 
@@ -162,11 +169,12 @@ async def get_backend(
         backend_type: Type of backend
         agent_id: ID of the agent
         config: Optional agent configuration
+        mcp_servers: Optional MCP server configurations
 
     Returns:
         Backend instance
     """
-    return await get_registry().get(backend_type, agent_id, config)
+    return await get_registry().get(backend_type, agent_id, config, mcp_servers)
 
 
 def available_backends() -> list[str]:
