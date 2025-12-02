@@ -88,6 +88,7 @@ def _run_detached(config) -> None:
     """Run runtime as a background daemon."""
     import os
     import sys
+    import logging
 
     # Fork to background
     pid = os.fork()
@@ -104,14 +105,25 @@ def _run_detached(config) -> None:
     # Close standard file descriptors
     sys.stdin.close()
 
-    # Redirect to log file
+    # Setup log file
     log_path = Path.home() / ".xpressai" / "runtime.log"
     log_path.parent.mkdir(exist_ok=True)
 
-    # Open log file
+    # Open log file for stdout/stderr
     log_file = open(log_path, "a")
     os.dup2(log_file.fileno(), sys.stdout.fileno())
     os.dup2(log_file.fileno(), sys.stderr.fileno())
+
+    # Configure Python logging to write to the same file
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_path),
+        ],
+        force=True,  # Override any existing config
+    )
 
     # Write PID file
     pid_path = Path.home() / ".xpressai" / "runtime.pid"
@@ -122,10 +134,26 @@ def _run_detached(config) -> None:
 
 
 async def _run_background(config) -> None:
-    """Background runtime loop."""
+    """Background runtime loop with API server."""
+    import threading
+
     runtime = Runtime(config)
     await runtime.initialize()
     await runtime.start()
+
+    # Start API server in a thread for status queries
+    def run_api():
+        try:
+            from xpressai.web.app import create_app
+            import uvicorn
+
+            app = create_app(runtime)
+            uvicorn.run(app, host="127.0.0.1", port=8935, log_level="warning")
+        except Exception as e:
+            print(f"API server error: {e}")
+
+    api_thread = threading.Thread(target=run_api, daemon=True)
+    api_thread.start()
 
     # Keep running until killed
     while True:

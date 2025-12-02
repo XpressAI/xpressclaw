@@ -89,6 +89,11 @@ class Runtime:
         self._task_board = None
         self._budget_manager = None
         self._docker = None
+        self._sop_manager = None
+
+        # Agent runners and backends
+        self._runners: dict[str, Any] = {}  # AgentRunner instances
+        self._backends: dict[str, Any] = {}  # AgentBackend instances
 
     @property
     def is_running(self) -> bool:
@@ -109,6 +114,7 @@ class Runtime:
         from xpressai.memory.manager import MemoryManager
         from xpressai.tasks.board import TaskBoard
         from xpressai.budget.manager import BudgetManager
+        from xpressai.tasks.sop import SOPManager
 
         # Initialize database
         db_path = self.config.system.data_dir / "xpressai.db"
@@ -118,6 +124,7 @@ class Runtime:
         self._memory = MemoryManager(self._db, self.config.memory)
         self._task_board = TaskBoard(self._db)
         self._budget_manager = BudgetManager(self._db, self.config.system.budget)
+        self._sop_manager = SOPManager(self.workspace / ".xpressai" / "sops")
 
         # Register agents from config
         for agent_config in self.config.agents:
@@ -220,6 +227,7 @@ class Runtime:
 
             # Initialize backend
             from xpressai.agents.registry import get_backend
+            from xpressai.agents.runner import AgentRunner
 
             agent_config = self._get_agent_config(agent_id)
             if agent_config:
@@ -230,13 +238,26 @@ class Runtime:
                     mcp_servers=self.config.mcp_servers,
                 )
 
+                # Store backend for later use
+                self._backends[agent_id] = backend
+
+                # Create and start the runner
+                runner = AgentRunner(
+                    agent_id=agent_id,
+                    backend=backend,
+                    task_board=self._task_board,
+                    sop_manager=self._sop_manager,
+                )
+                await runner.start()
+                self._runners[agent_id] = runner
+
             agent.status = "running"
             agent.started_at = datetime.now()
             agent.error_message = None
 
             await self._emit_event(RuntimeEvent(type="agent.started", agent_id=agent_id))
 
-            logger.info(f"Agent {agent_id} started")
+            logger.info(f"Agent {agent_id} started (runner active)")
 
         except Exception as e:
             agent.status = "error"
@@ -271,12 +292,21 @@ class Runtime:
         await self._emit_event(RuntimeEvent(type="agent.stopping", agent_id=agent_id))
 
         try:
+            # Stop runner if running
+            if agent_id in self._runners:
+                await self._runners[agent_id].stop()
+                del self._runners[agent_id]
+
+            # Clean up backend reference
+            if agent_id in self._backends:
+                del self._backends[agent_id]
+
             # Stop container if running
             if agent.container_id and self._docker:
                 await self._docker.stop_agent(agent_id, timeout=timeout)
                 agent.container_id = None
 
-            # Shutdown backend
+            # Shutdown backend via registry
             from xpressai.agents.registry import get_registry
 
             await get_registry().shutdown(agent_id)
@@ -409,12 +439,20 @@ _runtime: Runtime | None = None
 def get_runtime() -> Runtime:
     """Get or create the global runtime instance.
 
+    Loads config from xpressai.yaml in current directory if available.
+
     Returns:
         Global Runtime instance
     """
     global _runtime
     if _runtime is None:
-        _runtime = Runtime()
+        # Try to load config from current directory
+        config_path = Path.cwd() / "xpressai.yaml"
+        if config_path.exists():
+            config = load_config(config_path)
+            _runtime = Runtime(config)
+        else:
+            _runtime = Runtime()
     return _runtime
 
 

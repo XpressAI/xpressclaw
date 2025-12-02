@@ -7,12 +7,12 @@ from xpressai.core.runtime import get_runtime
 from xpressai.tasks.board import TaskStatus
 
 
-def list_tasks(agent: str, status: str | None = None) -> None:
+def list_tasks(agent: str, status: str | None = None, show_all: bool = False) -> None:
     """List tasks for an agent."""
-    asyncio.run(_list_tasks_async(agent, status))
+    asyncio.run(_list_tasks_async(agent, status, show_all))
 
 
-async def _list_tasks_async(agent: str, status: str | None) -> None:
+async def _list_tasks_async(agent: str, status: str | None, show_all: bool = False) -> None:
     """List tasks asynchronously."""
     runtime = get_runtime()
     await runtime.initialize()
@@ -67,51 +67,6 @@ async def _list_tasks_async(agent: str, status: str | None) -> None:
             if task.sop_id:
                 click.echo(f"           SOP: {task.sop_id}")
         click.echo()
-
-    # Group by status
-    by_status: dict[str, list] = {
-        "pending": [],
-        "in_progress": [],
-        "completed": [],
-        "blocked": [],
-        "cancelled": [],
-    }
-
-    for task in tasks:
-        by_status[task.status.value].append(task)
-
-    # Show columns
-    columns = [
-        ("Pending", "pending", "yellow"),
-        ("In Progress", "in_progress", "blue"),
-        ("Completed", "completed", "green"),
-    ]
-
-    if show_all:
-        columns.extend(
-            [
-                ("Blocked", "blocked", "red"),
-                ("Cancelled", "cancelled", "white"),
-            ]
-        )
-
-    for name, key, color in columns:
-        if status is None or status == key:
-            task_list = by_status[key]
-            click.echo(click.style(f"{name} ({len(task_list)})", fg=color, bold=True))
-            for task in task_list:
-                agent = (
-                    click.style(f"@{task.agent_id}", fg="cyan")
-                    if task.agent_id
-                    else click.style("unassigned", fg="red")
-                )
-                task_id = click.style(task.id[:8], dim=True)
-                click.echo(f"  {task_id} {agent} {task.title}")
-                if task.sop_id:
-                    click.echo(f"           SOP: {task.sop_id}")
-                if task.description:
-                    click.echo(f"           {task.description[:50]}...")
-            click.echo()
 
 
 def add_task(
