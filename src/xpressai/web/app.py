@@ -52,9 +52,10 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         version="0.1.0",
     )
 
-    # Templates directory
+    # Templates directory - only use if index.html exists
     template_dir = Path(__file__).parent / "templates"
-    if template_dir.exists():
+    index_template = template_dir / "index.html"
+    if index_template.exists():
         templates = Jinja2Templates(directory=str(template_dir))
     else:
         templates = None
@@ -67,7 +68,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 "index.html", {"request": request, "title": "XpressAI Dashboard"}
             )
 
-        # Inline template when templates directory doesn't exist
+        # Inline template when index.html doesn't exist
         return HTMLResponse(content=_get_inline_index())
 
     @app.get("/api/status")
