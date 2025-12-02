@@ -92,9 +92,15 @@ def dashboard(port: int, host: str) -> None:
 
 
 @cli.group()
-def tasks() -> None:
-    """Manage the task board."""
-    pass
+@click.argument("agent")
+@click.pass_context
+def tasks(ctx: click.Context, agent: str) -> None:
+    """Manage tasks for an agent.
+
+    Example: xpressai tasks atlas list
+    """
+    ctx.ensure_object(dict)
+    ctx.obj["agent"] = agent
 
 
 @tasks.command("list")
@@ -103,37 +109,33 @@ def tasks() -> None:
     "-s",
     type=click.Choice(["pending", "in_progress", "completed", "blocked", "cancelled"]),
 )
-@click.option(
-    "--all", "-a", "show_all", is_flag=True, help="Show all statuses including blocked/cancelled"
-)
-def tasks_list(status: str | None, show_all: bool) -> None:
-    """List tasks on the board."""
+@click.pass_context
+def tasks_list(ctx: click.Context, status: str | None) -> None:
+    """List tasks for this agent."""
     from xpressai.cli.tasks_cmd import list_tasks
 
-    list_tasks(status=status, show_all=show_all)
+    list_tasks(agent=ctx.obj["agent"], status=status)
 
 
 @tasks.command("add")
 @click.argument("title")
-@click.argument("agent")
-@click.option("--description", "-d", help="Task description")
 @click.option("--sop", "-s", help="SOP to follow for this task")
 @click.option("--priority", "-p", default=0, help="Priority (higher = more important)")
-def tasks_add(
-    title: str, agent: str, description: str | None, sop: str | None, priority: int
-) -> None:
-    """Add a new task for an agent.
+@click.pass_context
+def tasks_add(ctx: click.Context, title: str, sop: str | None, priority: int) -> None:
+    """Add a new task.
 
-    Example: xpressai tasks add "Deploy to production" atlas --sop deployment
+    Example: xpressai tasks atlas add "Deploy to production" --sop deployment
     """
     from xpressai.cli.tasks_cmd import add_task
 
-    add_task(title=title, agent=agent, description=description, sop=sop, priority=priority)
+    add_task(title=title, agent=ctx.obj["agent"], sop=sop, priority=priority)
 
 
 @tasks.command("complete")
 @click.argument("task_id")
-def tasks_complete(task_id: str) -> None:
+@click.pass_context
+def tasks_complete(ctx: click.Context, task_id: str) -> None:
     """Mark a task as completed."""
     from xpressai.cli.tasks_cmd import complete_task
 
@@ -142,12 +144,12 @@ def tasks_complete(task_id: str) -> None:
 
 @tasks.command("start")
 @click.argument("task_id")
-@click.option("--agent", "-a", help="Agent working on task")
-def tasks_start(task_id: str, agent: str | None) -> None:
-    """Mark a task as in progress."""
+@click.pass_context
+def tasks_start(ctx: click.Context, task_id: str) -> None:
+    """Start working on a task."""
     from xpressai.cli.tasks_cmd import start_task
 
-    start_task(task_id, agent)
+    start_task(task_id, ctx.obj["agent"])
 
 
 @tasks.command("block")

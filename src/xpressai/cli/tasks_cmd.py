@@ -7,12 +7,12 @@ from xpressai.core.runtime import get_runtime
 from xpressai.tasks.board import TaskStatus
 
 
-def list_tasks(status: str | None = None, show_all: bool = False) -> None:
-    """List tasks on the board."""
-    asyncio.run(_list_tasks_async(status, show_all))
+def list_tasks(agent: str, status: str | None = None) -> None:
+    """List tasks for an agent."""
+    asyncio.run(_list_tasks_async(agent, status))
 
 
-async def _list_tasks_async(status: str | None, show_all: bool) -> None:
+async def _list_tasks_async(agent: str, status: str | None) -> None:
     """List tasks asynchronously."""
     runtime = get_runtime()
     await runtime.initialize()
@@ -21,17 +21,52 @@ async def _list_tasks_async(status: str | None, show_all: bool) -> None:
         click.echo("Task board not initialized.")
         return
 
-    # Get tasks
+    # Get tasks for this agent
     status_filter = TaskStatus(status) if status else None
-    tasks = await runtime._task_board.get_tasks(status=status_filter)
+    tasks = await runtime._task_board.get_tasks(status=status_filter, agent_id=agent)
+
+    click.echo(click.style(f"Tasks for @{agent}", fg="cyan", bold=True))
+    click.echo()
 
     if not tasks:
-        click.echo("No tasks found.")
-        click.echo('Create a task with: xpressai tasks add "Task title"')
+        click.echo("No tasks.")
+        click.echo(f'Add a task: xpressai tasks {agent} add "Task title"')
         return
 
-    click.echo(click.style("Task Board", fg="cyan", bold=True))
-    click.echo()
+    # Group by status
+    by_status: dict[str, list] = {
+        "pending": [],
+        "in_progress": [],
+        "completed": [],
+        "blocked": [],
+        "cancelled": [],
+    }
+
+    for task in tasks:
+        by_status[task.status.value].append(task)
+
+    # Show columns (only non-empty)
+    columns = [
+        ("Pending", "pending", "yellow"),
+        ("In Progress", "in_progress", "blue"),
+        ("Blocked", "blocked", "red"),
+        ("Completed", "completed", "green"),
+    ]
+
+    for name, key, color in columns:
+        task_list = by_status[key]
+        if not task_list:
+            continue
+        if status is not None and status != key:
+            continue
+
+        click.echo(click.style(f"{name} ({len(task_list)})", fg=color, bold=True))
+        for task in task_list:
+            task_id = click.style(task.id[:8], dim=True)
+            click.echo(f"  {task_id} {task.title}")
+            if task.sop_id:
+                click.echo(f"           SOP: {task.sop_id}")
+        click.echo()
 
     # Group by status
     by_status: dict[str, list] = {
@@ -82,18 +117,16 @@ async def _list_tasks_async(status: str | None, show_all: bool) -> None:
 def add_task(
     title: str,
     agent: str,
-    description: str | None = None,
     sop: str | None = None,
     priority: int = 0,
 ) -> None:
     """Add a new task for an agent."""
-    asyncio.run(_add_task_async(title, agent, description, sop, priority))
+    asyncio.run(_add_task_async(title, agent, sop, priority))
 
 
 async def _add_task_async(
     title: str,
     agent: str,
-    description: str | None,
     sop: str | None,
     priority: int,
 ) -> None:
@@ -117,16 +150,15 @@ async def _add_task_async(
 
     task = await runtime._task_board.create_task(
         title=title,
-        description=description,
         agent_id=agent,
         sop_id=sop,
         priority=priority,
     )
 
-    click.echo(click.style(f"Created task for {agent}: {task.title}", fg="green"))
+    click.echo(click.style(f"Created task: {task.title}", fg="green"))
     if sop:
         click.echo(f"  SOP: {sop}")
-    click.echo(f"  ID: {task.id[:8]}...")
+    click.echo(f"  ID: {task.id[:8]}")
 
 
 def complete_task(task_id: str) -> None:
