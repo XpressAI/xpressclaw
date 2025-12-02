@@ -115,14 +115,20 @@ def tasks_list(status: str | None, show_all: bool) -> None:
 
 @tasks.command("add")
 @click.argument("title")
+@click.argument("agent")
 @click.option("--description", "-d", help="Task description")
-@click.option("--agent", "-a", help="Assign to agent")
+@click.option("--sop", "-s", help="SOP to follow for this task")
 @click.option("--priority", "-p", default=0, help="Priority (higher = more important)")
-def tasks_add(title: str, description: str | None, agent: str | None, priority: int) -> None:
-    """Add a new task."""
+def tasks_add(
+    title: str, agent: str, description: str | None, sop: str | None, priority: int
+) -> None:
+    """Add a new task for an agent.
+
+    Example: xpressai tasks add "Deploy to production" atlas --sop deployment
+    """
     from xpressai.cli.tasks_cmd import add_task
 
-    add_task(title=title, description=description, agent=agent, priority=priority)
+    add_task(title=title, agent=agent, description=description, sop=sop, priority=priority)
 
 
 @tasks.command("complete")
