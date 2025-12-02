@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from xpressai.core.runtime import XpressAIRuntime
+    from xpressai.core.runtime import Runtime
 
 try:
     from fastapi import FastAPI, Request, HTTPException
@@ -25,10 +25,10 @@ except ImportError:
 
 
 # Global runtime reference (set when app is created)
-_runtime: XpressAIRuntime | None = None
+_runtime: Runtime | None = None
 
 
-def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
+def create_app(runtime: Runtime | None = None) -> FastAPI:
     """Create the FastAPI application.
 
     Args:
@@ -74,16 +74,14 @@ def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
     async def get_status():
         """Get current system status."""
         if not _runtime:
-            return {"status": "no_runtime", "agents": {}, "budget": {}}
+            return {"status": "no_runtime", "agents": [], "budget": {}}
 
-        agents = await _runtime.get_agent_status()
-        budget = {}
-        if _runtime.budget_manager:
-            budget = await _runtime.budget_manager.get_status()
+        agents = await _runtime.list_agents()
+        budget = await _runtime.get_budget_summary()
 
         return {
-            "status": "running" if _runtime._running else "stopped",
-            "agents": agents,
+            "status": "running" if _runtime.is_running else "stopped",
+            "agents": [{"name": a.name, "status": a.status, "backend": a.backend} for a in agents],
             "budget": budget,
         }
 
@@ -93,8 +91,10 @@ def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
         if not _runtime:
             return {"agents": []}
 
-        agents = await _runtime.get_agent_status()
-        return {"agents": list(agents.values())}
+        agents = await _runtime.list_agents()
+        return {
+            "agents": [{"name": a.name, "status": a.status, "backend": a.backend} for a in agents]
+        }
 
     @app.get("/api/agents/{agent_name}")
     async def get_agent(agent_name: str):
@@ -102,28 +102,28 @@ def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
         if not _runtime:
             raise HTTPException(status_code=503, detail="Runtime not available")
 
-        agents = await _runtime.get_agent_status()
-        if agent_name not in agents:
+        agent = await _runtime.get_agent(agent_name)
+        if not agent:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
 
-        return agents[agent_name]
+        return {"name": agent.name, "status": agent.status, "backend": agent.backend}
 
     @app.get("/api/budget")
     async def get_budget():
         """Get budget status."""
-        if not _runtime or not _runtime.budget_manager:
-            return {"error": "Budget manager not available"}
+        if not _runtime:
+            return {"error": "Runtime not available"}
 
-        return await _runtime.budget_manager.get_status()
+        return await _runtime.get_budget_summary()
 
     @app.get("/api/tasks")
     async def list_tasks():
         """List all tasks."""
-        if not _runtime or not _runtime.task_board:
+        if not _runtime:
             return {"tasks": []}
 
-        tasks = await _runtime.task_board.list_tasks()
-        return {"tasks": [t.__dict__ for t in tasks]}
+        counts = await _runtime.get_task_counts()
+        return {"counts": counts}
 
     # HTMX partials
     @app.get("/partials/agents", response_class=HTMLResponse)
@@ -132,21 +132,20 @@ def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
         if not _runtime:
             return HTMLResponse("<p>No runtime available</p>")
 
-        agents = await _runtime.get_agent_status()
+        agents = await _runtime.list_agents()
 
         html_parts = ["<div class='agent-list'>"]
-        for name, info in agents.items():
-            status = info.get("status", "unknown")
+        for agent in agents:
             status_class = {
                 "running": "status-running",
                 "stopped": "status-stopped",
                 "error": "status-error",
-            }.get(status, "status-unknown")
+            }.get(agent.status, "status-unknown")
 
             html_parts.append(f"""
                 <div class="agent-card">
-                    <span class="agent-status {status_class}">{status}</span>
-                    <span class="agent-name">{name}</span>
+                    <span class="agent-status {status_class}">{agent.status}</span>
+                    <span class="agent-name">{agent.name}</span>
                 </div>
             """)
 
@@ -156,22 +155,30 @@ def create_app(runtime: XpressAIRuntime | None = None) -> FastAPI:
     @app.get("/partials/budget", response_class=HTMLResponse)
     async def budget_partial(request: Request):
         """HTMX partial for budget display."""
-        if not _runtime or not _runtime.budget_manager:
+        if not _runtime:
             return HTMLResponse("<p>Budget tracking not available</p>")
 
-        status = await _runtime.budget_manager.get_status()
-        daily_used = status.get("daily_used", 0)
-        daily_limit = status.get("daily_limit", 20.0)
-        pct = (daily_used / daily_limit * 100) if daily_limit > 0 else 0
+        summary = await _runtime.get_budget_summary()
+        total_spent = float(summary.get("total_spent", 0))
+        limit = summary.get("limit")
 
-        return HTMLResponse(f"""
-            <div class="budget-display">
-                <div class="budget-bar" style="--progress: {pct}%">
-                    <div class="budget-fill"></div>
+        if limit:
+            limit = float(limit)
+            pct = (total_spent / limit * 100) if limit > 0 else 0
+            return HTMLResponse(f"""
+                <div class="budget-display">
+                    <div class="budget-bar" style="--progress: {pct}%">
+                        <div class="budget-fill"></div>
+                    </div>
+                    <p>${total_spent:.2f} / ${limit:.2f} ({pct:.1f}%)</p>
                 </div>
-                <p>${daily_used:.2f} / ${daily_limit:.2f} ({pct:.1f}%)</p>
-            </div>
-        """)
+            """)
+        else:
+            return HTMLResponse(f"""
+                <div class="budget-display">
+                    <p>Spent: ${total_spent:.2f} (no limit set)</p>
+                </div>
+            """)
 
     return app
 
@@ -255,9 +262,7 @@ def _get_inline_index() -> str:
 """
 
 
-def run_web(
-    runtime: XpressAIRuntime | None = None, host: str = "127.0.0.1", port: int = 8080
-) -> None:
+def run_web(runtime: Runtime | None = None, host: str = "127.0.0.1", port: int = 8080) -> None:
     """Run the web dashboard.
 
     Args:
