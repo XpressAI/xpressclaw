@@ -179,6 +179,43 @@ def tasks_delete(task_id: str) -> None:
     delete_task(task_id)
 
 
+@tasks.command("schedule")
+@click.argument("title")
+@click.option(
+    "--cron", "-c", required=True, help="Cron expression (e.g., '0 9 * * *' for 9am daily)"
+)
+@click.option("--name", "-n", help="Name for this schedule")
+@click.pass_context
+def tasks_schedule(ctx: click.Context, title: str, cron: str, name: str | None) -> None:
+    """Schedule a recurring task.
+
+    Examples:
+        xpressai tasks atlas schedule "Summarize HN" --cron "0 9 * * *"
+        xpressai tasks atlas schedule "Weekly report" --cron "0 17 * * 5" --name weekly-report
+    """
+    from xpressai.cli.tasks_cmd import schedule_task
+
+    schedule_task(title=title, agent=ctx.obj["agent"], cron=cron, name=name)
+
+
+@tasks.command("schedules")
+@click.pass_context
+def tasks_schedules(ctx: click.Context) -> None:
+    """List scheduled tasks for this agent."""
+    from xpressai.cli.tasks_cmd import list_schedules
+
+    list_schedules(agent=ctx.obj["agent"])
+
+
+@tasks.command("unschedule")
+@click.argument("schedule_id")
+def tasks_unschedule(schedule_id: str) -> None:
+    """Remove a scheduled task."""
+    from xpressai.cli.tasks_cmd import remove_schedule
+
+    remove_schedule(schedule_id)
+
+
 @cli.group()
 def sop() -> None:
     """Manage Standard Operating Procedures."""

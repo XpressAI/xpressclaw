@@ -213,3 +213,153 @@ async def _delete_task_async(task_id: str) -> None:
     await runtime._task_board.delete_task(task.id)
 
     click.echo(click.style(f"Deleted task: {task.title}", fg="green"))
+
+
+def schedule_task(
+    title: str,
+    agent: str,
+    cron: str,
+    name: str | None = None,
+) -> None:
+    """Schedule a recurring task."""
+    asyncio.run(_schedule_task_async(title, agent, cron, name))
+
+
+async def _schedule_task_async(
+    title: str,
+    agent: str,
+    cron: str,
+    name: str | None,
+) -> None:
+    """Schedule task asynchronously."""
+    import uuid
+
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._scheduler is None:
+        click.echo(click.style("Scheduler not initialized.", fg="red"))
+        return
+
+    # Verify agent exists
+    agent_state = await runtime.get_agent(agent)
+    if not agent_state:
+        available = await runtime.list_agents()
+        agent_names = [a.name for a in available]
+        click.echo(click.style(f"Unknown agent: {agent}", fg="red"))
+        if agent_names:
+            click.echo(f"Available agents: {', '.join(agent_names)}")
+        return
+
+    # Generate schedule ID and name
+    schedule_id = str(uuid.uuid4())[:8]
+    schedule_name = name or f"schedule-{schedule_id}"
+
+    try:
+        schedule = await runtime._scheduler.add_schedule(
+            schedule_id=schedule_id,
+            name=schedule_name,
+            cron=cron,
+            agent_id=agent,
+            title=title,
+        )
+
+        next_run = runtime._scheduler.get_next_run(schedule_id)
+        next_run_str = next_run.strftime("%Y-%m-%d %H:%M") if next_run else "unknown"
+
+        click.echo(click.style(f"Scheduled: {schedule_name}", fg="green"))
+        click.echo(f"  ID: {schedule_id}")
+        click.echo(f"  Cron: {cron}")
+        click.echo(f"  Agent: @{agent}")
+        click.echo(f"  Task: {title}")
+        click.echo(f"  Next run: {next_run_str}")
+
+    except Exception as e:
+        click.echo(click.style(f"Failed to create schedule: {e}", fg="red"))
+
+
+def list_schedules(agent: str) -> None:
+    """List scheduled tasks for an agent."""
+    asyncio.run(_list_schedules_async(agent))
+
+
+async def _list_schedules_async(agent: str) -> None:
+    """List schedules asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._scheduler is None:
+        click.echo(click.style("Scheduler not initialized.", fg="red"))
+        return
+
+    # Start scheduler to load schedules from DB
+    runtime._scheduler.start()
+
+    schedules = runtime._scheduler.list_schedules()
+
+    # Filter by agent
+    agent_schedules = [s for s in schedules if s.agent_id == agent]
+
+    click.echo(click.style(f"Scheduled tasks for @{agent}", fg="cyan", bold=True))
+    click.echo()
+
+    if not agent_schedules:
+        click.echo("No scheduled tasks.")
+        click.echo(f'Add one: xpressai tasks {agent} schedule "Task title" --cron "0 9 * * *"')
+        return
+
+    for schedule in agent_schedules:
+        next_run = runtime._scheduler.get_next_run(schedule.id)
+        next_run_str = next_run.strftime("%Y-%m-%d %H:%M") if next_run else "unknown"
+        status = (
+            click.style("[enabled]", fg="green")
+            if schedule.enabled
+            else click.style("[disabled]", fg="red")
+        )
+
+        click.echo(f"{status} {schedule.name}")
+        click.echo(f"    ID: {schedule.id}")
+        click.echo(f"    Cron: {schedule.cron}")
+        click.echo(f"    Task: {schedule.title}")
+        click.echo(f"    Next run: {next_run_str}")
+        click.echo(f"    Run count: {schedule.run_count}")
+        click.echo()
+
+
+def remove_schedule(schedule_id: str) -> None:
+    """Remove a scheduled task."""
+    asyncio.run(_remove_schedule_async(schedule_id))
+
+
+async def _remove_schedule_async(schedule_id: str) -> None:
+    """Remove schedule asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._scheduler is None:
+        click.echo(click.style("Scheduler not initialized.", fg="red"))
+        return
+
+    # Start scheduler to load schedules from DB
+    runtime._scheduler.start()
+
+    # Find schedule by ID prefix
+    schedules = runtime._scheduler.list_schedules()
+    matching = [s for s in schedules if s.id.startswith(schedule_id)]
+
+    if not matching:
+        click.echo(click.style(f"Schedule not found: {schedule_id}", fg="red"))
+        return
+
+    if len(matching) > 1:
+        click.echo(
+            click.style(f"Multiple schedules match '{schedule_id}'. Be more specific.", fg="red")
+        )
+        for s in matching:
+            click.echo(f"  {s.id} - {s.name}")
+        return
+
+    schedule = matching[0]
+    await runtime._scheduler.remove_schedule(schedule.id)
+
+    click.echo(click.style(f"Removed schedule: {schedule.name}", fg="green"))

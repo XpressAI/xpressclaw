@@ -90,6 +90,7 @@ class Runtime:
         self._budget_manager = None
         self._docker = None
         self._sop_manager = None
+        self._scheduler = None
 
         # Agent runners and backends
         self._runners: dict[str, Any] = {}  # AgentRunner instances
@@ -115,6 +116,7 @@ class Runtime:
         from xpressai.tasks.board import TaskBoard
         from xpressai.budget.manager import BudgetManager
         from xpressai.tasks.sop import SOPManager
+        from xpressai.tasks.scheduler import TaskScheduler
 
         # Initialize database
         db_path = self.config.system.data_dir / "xpressai.db"
@@ -125,6 +127,7 @@ class Runtime:
         self._task_board = TaskBoard(self._db)
         self._budget_manager = BudgetManager(self._db, self.config.system.budget)
         self._sop_manager = SOPManager(self.workspace / ".xpressai" / "sops")
+        self._scheduler = TaskScheduler(self._task_board, self._db)
 
         # Register agents from config
         for agent_config in self.config.agents:
@@ -149,6 +152,10 @@ class Runtime:
         self._running = True
         await self._emit_event(RuntimeEvent(type="runtime.starting"))
 
+        # Start scheduler
+        if self._scheduler:
+            self._scheduler.start()
+
         # Start agents
         for agent_id in self._agents:
             try:
@@ -169,6 +176,10 @@ class Runtime:
             return
 
         await self._emit_event(RuntimeEvent(type="runtime.stopping"))
+
+        # Stop scheduler
+        if self._scheduler:
+            self._scheduler.stop()
 
         # Stop all agents
         for agent_id in list(self._agents.keys()):

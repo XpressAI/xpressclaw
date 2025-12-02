@@ -110,6 +110,7 @@ class Database:
         migrations = [
             (1, self._migrate_v1),
             (2, self._migrate_v2),
+            (3, self._migrate_v3),
         ]
 
         for target_version, migrate_func in migrations:
@@ -321,6 +322,27 @@ class Database:
             
             CREATE INDEX IF NOT EXISTS idx_tool_agent ON tool_logs(agent_id);
             CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_logs(tool_name);
+        """)
+
+    def _migrate_v3(self, conn: sqlite3.Connection) -> None:
+        """Version 3 schema: Scheduled tasks."""
+        conn.executescript("""
+            -- Scheduled tasks
+            CREATE TABLE IF NOT EXISTS schedules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                cron TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                enabled INTEGER DEFAULT 1,
+                last_run TIMESTAMP,
+                run_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_schedules_agent ON schedules(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
         """)
 
     def backup(self, backup_path: Path | None = None) -> Path:
