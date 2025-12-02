@@ -1,6 +1,6 @@
 # XpressAI - Agent Runtime System
 
-XpressAI is a "Phusion Passenger for AI agents" - a simple, opinionated runtime that makes it easy to run, manage, and observe AI agents. Think of it as an agent operating system that handles isolation, memory, tools, budgets, and observability so you can focus on what your agents do, not how they run.
+XpressAI is an "Operating System for AI agents" - a simple, opinionated runtime that makes it easy to run, manage, and observe AI agents. Think of it as an agent operating system that handles isolation, memory, tools, budgets, and observability so you can focus on what your agents do, not how they run.
 
 ## Project Vision
 
@@ -53,7 +53,7 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 ## Project Structure
 
 ```
-xpressai/
+xpressai-cli/                # Current project directory
 ├── src/xpressai/
 │   ├── __init__.py
 │   ├── cli/                 # CLI commands (click or typer)
@@ -118,6 +118,9 @@ xpressai/
 
 ## Development Guidelines
 
+### Git Version Control
+- Read ADR-000 and follow the instructions. We use git not just for source code versioning but also to store important notes about changes for later.
+
 ### Code Style
 - Use type hints everywhere
 - Prefer composition over inheritance
@@ -144,11 +147,13 @@ xpressai/
 ## Key Design Principles
 
 1. **Zero Config Start** - `xpressai init && xpressai up` should just work
-2. **Local First** - Default to Qwen3-8B, upgrade to cloud when needed
+2. **Cloud Optional** - We default to the Claude Agent SDK but also allow local models (like Qwen3-8B by default) when needed for privacy/security.
 3. **Safety by Default** - Containers, budgets, tool permissions
 4. **Observable** - Always know what agents are doing
 5. **Framework Agnostic** - Run any agent backend through a common interface
 6. **MCP Native** - Tools speak MCP, period
+7. **Reliable** - SOPs ensure Agents perform consistently and can learn to avoid mistakes over time.
+8. **Agents Remember and Learn** - The plain-text zettelcasten memory system with SQLite-vec powered enable agents that can learn.
 
 ## Current Focus
 
