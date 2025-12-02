@@ -98,12 +98,77 @@ def tasks() -> None:
 
 
 @tasks.command("list")
-@click.option("--status", type=click.Choice(["pending", "in_progress", "completed"]))
-def tasks_list(status: str | None) -> None:
+@click.option(
+    "--status",
+    "-s",
+    type=click.Choice(["pending", "in_progress", "completed", "blocked", "cancelled"]),
+)
+@click.option(
+    "--all", "-a", "show_all", is_flag=True, help="Show all statuses including blocked/cancelled"
+)
+def tasks_list(status: str | None, show_all: bool) -> None:
     """List tasks on the board."""
     from xpressai.cli.tasks_cmd import list_tasks
 
-    list_tasks(status=status)
+    list_tasks(status=status, show_all=show_all)
+
+
+@tasks.command("add")
+@click.argument("title")
+@click.option("--description", "-d", help="Task description")
+@click.option("--agent", "-a", help="Assign to agent")
+@click.option("--priority", "-p", default=0, help="Priority (higher = more important)")
+def tasks_add(title: str, description: str | None, agent: str | None, priority: int) -> None:
+    """Add a new task."""
+    from xpressai.cli.tasks_cmd import add_task
+
+    add_task(title=title, description=description, agent=agent, priority=priority)
+
+
+@tasks.command("complete")
+@click.argument("task_id")
+def tasks_complete(task_id: str) -> None:
+    """Mark a task as completed."""
+    from xpressai.cli.tasks_cmd import complete_task
+
+    complete_task(task_id)
+
+
+@tasks.command("start")
+@click.argument("task_id")
+@click.option("--agent", "-a", help="Agent working on task")
+def tasks_start(task_id: str, agent: str | None) -> None:
+    """Mark a task as in progress."""
+    from xpressai.cli.tasks_cmd import start_task
+
+    start_task(task_id, agent)
+
+
+@tasks.command("block")
+@click.argument("task_id")
+def tasks_block(task_id: str) -> None:
+    """Mark a task as blocked."""
+    from xpressai.cli.tasks_cmd import block_task
+
+    block_task(task_id)
+
+
+@tasks.command("cancel")
+@click.argument("task_id")
+def tasks_cancel(task_id: str) -> None:
+    """Cancel a task."""
+    from xpressai.cli.tasks_cmd import cancel_task
+
+    cancel_task(task_id)
+
+
+@tasks.command("delete")
+@click.argument("task_id")
+def tasks_delete(task_id: str) -> None:
+    """Delete a task."""
+    from xpressai.cli.tasks_cmd import delete_task
+
+    delete_task(task_id)
 
 
 @cli.group()
