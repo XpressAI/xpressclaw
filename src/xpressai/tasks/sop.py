@@ -1,20 +1,46 @@
 """Standard Operating Procedures (SOPs) for XpressAI.
 
-SOPs are reusable workflows that agents can follow for consistent behavior.
+SOPs are YAML files that guide agents through workflows using prompts and tools.
+They live in the .xpressai/sops/ directory.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from pathlib import Path
 from typing import Any
-import uuid
-import json
 import yaml
 import logging
 
-from xpressai.memory.database import Database
 from xpressai.core.exceptions import SOPError
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SOPInput:
+    """An input parameter for an SOP.
+
+    Attributes:
+        name: Input parameter name
+        context: Description of what this input is for
+        default: Optional default value
+    """
+
+    name: str
+    context: str
+    default: str | None = None
+
+
+@dataclass
+class SOPOutput:
+    """An output from an SOP.
+
+    Attributes:
+        name: Output name
+        context: Description of what this output represents
+    """
+
+    name: str
+    context: str
 
 
 @dataclass
@@ -22,47 +48,37 @@ class SOPStep:
     """A single step in an SOP.
 
     Attributes:
-        description: What this step does
-        action: The action to perform
-        expected_outcome: What should happen
-        on_failure: What to do if step fails (retry | skip | abort)
-        timeout_seconds: Max time for this step
+        prompt: The prompt/instruction for the agent
+        tools: List of tools the agent can use for this step
+        inputs: List of input names this step uses
     """
 
-    description: str
-    action: str
-    expected_outcome: str | None = None
-    on_failure: str = "abort"  # retry | skip | abort
-    timeout_seconds: int | None = None
+    prompt: str
+    tools: list[str] = field(default_factory=list)
+    inputs: list[str] = field(default_factory=list)
 
 
 @dataclass
 class SOP:
     """A Standard Operating Procedure.
 
+    SOPs are simple YAML files that define a workflow for an agent.
+
     Attributes:
-        id: Unique SOP ID
         name: SOP name
-        description: What this SOP does
-        steps: List of steps to execute
-        triggers: List of triggers
-        timeout_seconds: Total timeout
-        confirmation_required: Whether to ask user before running
-        created_at: Creation timestamp
-        created_by: Who created this SOP
-        version: SOP version number
+        summary: Brief description of what this SOP does
+        tools: List of all tools this SOP may use
+        inputs: Input parameters
+        outputs: Expected outputs
+        steps: Ordered list of steps to execute
     """
 
-    id: str
     name: str
-    description: str | None = None
+    summary: str
+    tools: list[str] = field(default_factory=list)
+    inputs: list[SOPInput] = field(default_factory=list)
+    outputs: list[SOPOutput] = field(default_factory=list)
     steps: list[SOPStep] = field(default_factory=list)
-    triggers: list[dict[str, Any]] = field(default_factory=list)
-    timeout_seconds: int | None = None
-    confirmation_required: bool = False
-    created_at: datetime = field(default_factory=datetime.now)
-    created_by: str | None = None
-    version: int = 1
 
     @classmethod
     def from_yaml(cls, yaml_content: str) -> "SOP":
@@ -76,28 +92,67 @@ class SOP:
         """
         data = yaml.safe_load(yaml_content)
 
+        # Parse inputs
+        inputs = []
+        for inp in data.get("inputs", []):
+            inputs.append(
+                SOPInput(
+                    name=inp.get("name", ""),
+                    context=inp.get("context", ""),
+                    default=inp.get("default"),
+                )
+            )
+
+        # Parse outputs
+        outputs = []
+        for out in data.get("outputs", []):
+            outputs.append(
+                SOPOutput(
+                    name=out.get("name", ""),
+                    context=out.get("context", ""),
+                )
+            )
+
+        # Parse steps
         steps = []
-        for step_data in data.get("steps", []):
+        for step in data.get("steps", []):
             steps.append(
                 SOPStep(
-                    description=step_data.get("description", ""),
-                    action=step_data.get("action", ""),
-                    expected_outcome=step_data.get("expected_outcome"),
-                    on_failure=step_data.get("on_failure", "abort"),
-                    timeout_seconds=step_data.get("timeout_seconds"),
+                    prompt=step.get("prompt", ""),
+                    tools=step.get("tools", []),
+                    inputs=step.get("inputs", []),
                 )
             )
 
         return cls(
-            id=data.get("id", str(uuid.uuid4())),
             name=data.get("name", "Unnamed SOP"),
-            description=data.get("description"),
+            summary=data.get("summary", ""),
+            tools=data.get("tools", []),
+            inputs=inputs,
+            outputs=outputs,
             steps=steps,
-            triggers=data.get("triggers", []),
-            timeout_seconds=data.get("timeout_seconds"),
-            confirmation_required=data.get("confirmation_required", False),
-            created_by=data.get("created_by"),
         )
+
+    @classmethod
+    def from_file(cls, path: Path) -> "SOP":
+        """Load an SOP from a YAML file.
+
+        Args:
+            path: Path to YAML file
+
+        Returns:
+            SOP instance
+
+        Raises:
+            SOPError: If file cannot be read or parsed
+        """
+        try:
+            content = path.read_text()
+            return cls.from_yaml(content)
+        except FileNotFoundError:
+            raise SOPError(f"SOP file not found: {path}", {"path": str(path)})
+        except yaml.YAMLError as e:
+            raise SOPError(f"Invalid YAML in SOP file: {e}", {"path": str(path)})
 
     def to_yaml(self) -> str:
         """Convert SOP to YAML string.
@@ -105,199 +160,137 @@ class SOP:
         Returns:
             YAML string
         """
-        data = {
-            "id": self.id,
+        data: dict[str, Any] = {
             "name": self.name,
-            "description": self.description,
-            "steps": [
-                {
-                    "description": step.description,
-                    "action": step.action,
-                    "expected_outcome": step.expected_outcome,
-                    "on_failure": step.on_failure,
-                    "timeout_seconds": step.timeout_seconds,
-                }
-                for step in self.steps
-            ],
-            "triggers": self.triggers,
-            "timeout_seconds": self.timeout_seconds,
-            "confirmation_required": self.confirmation_required,
+            "summary": self.summary,
         }
 
-        return yaml.dump(data, default_flow_style=False)
+        if self.tools:
+            data["tools"] = self.tools
+
+        if self.inputs:
+            data["inputs"] = [
+                {"name": inp.name, "context": inp.context}
+                | ({"default": inp.default} if inp.default else {})
+                for inp in self.inputs
+            ]
+
+        if self.outputs:
+            data["outputs"] = [{"name": out.name, "context": out.context} for out in self.outputs]
+
+        if self.steps:
+            data["steps"] = []
+            for step in self.steps:
+                step_data: dict[str, Any] = {"prompt": step.prompt}
+                if step.tools:
+                    step_data["tools"] = step.tools
+                if step.inputs:
+                    step_data["inputs"] = step.inputs
+                data["steps"].append(step_data)
+
+        return yaml.dump(data, default_flow_style=False, sort_keys=False)
+
+    def to_file(self, path: Path) -> None:
+        """Save SOP to a YAML file.
+
+        Args:
+            path: Path to save to
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_yaml())
+        logger.info(f"Saved SOP to {path}")
 
 
 class SOPManager:
-    """Manages SOPs storage and execution."""
+    """Manages SOPs stored as YAML files."""
 
-    def __init__(self, db: Database):
+    def __init__(self, sops_dir: Path | None = None):
         """Initialize SOP manager.
 
         Args:
-            db: Database instance
+            sops_dir: Directory containing SOP files. Defaults to .xpressai/sops/
         """
-        self.db = db
+        self.sops_dir = sops_dir or Path.cwd() / ".xpressai" / "sops"
 
-    async def create(self, sop: SOP) -> SOP:
-        """Create a new SOP.
-
-        Args:
-            sop: SOP to create
-
-        Returns:
-            Created SOP
-        """
-        with self.db.connect() as conn:
-            content = sop.to_yaml()
-            triggers = json.dumps(sop.triggers) if sop.triggers else None
-
-            conn.execute(
-                """
-                INSERT INTO sops (id, name, description, content, triggers, created_by, version)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    sop.id,
-                    sop.name,
-                    sop.description,
-                    content,
-                    triggers,
-                    sop.created_by,
-                    sop.version,
-                ),
-            )
-
-        return sop
-
-    async def get(self, sop_id: str) -> SOP:
-        """Get an SOP by ID.
-
-        Args:
-            sop_id: SOP ID
-
-        Returns:
-            SOP instance
-
-        Raises:
-            SOPError: If SOP not found
-        """
-        with self.db.connect() as conn:
-            row = conn.execute("SELECT * FROM sops WHERE id = ?", (sop_id,)).fetchone()
-
-            if row is None:
-                raise SOPError(f"SOP not found: {sop_id}", {"sop_id": sop_id})
-
-            return self._row_to_sop(row)
-
-    async def get_by_name(self, name: str) -> SOP | None:
-        """Get an SOP by name.
-
-        Args:
-            name: SOP name
-
-        Returns:
-            SOP instance or None
-        """
-        with self.db.connect() as conn:
-            row = conn.execute("SELECT * FROM sops WHERE name = ?", (name,)).fetchone()
-
-            if row is None:
-                return None
-
-            return self._row_to_sop(row)
-
-    async def list_sops(self) -> list[SOP]:
+    def list_sops(self) -> list[SOP]:
         """List all SOPs.
 
         Returns:
             List of SOPs
         """
-        with self.db.connect() as conn:
-            rows = conn.execute("SELECT * FROM sops ORDER BY name").fetchall()
+        sops = []
 
-            return [self._row_to_sop(row) for row in rows]
+        if not self.sops_dir.exists():
+            return sops
 
-    async def update(self, sop: SOP) -> SOP:
-        """Update an existing SOP.
-
-        Args:
-            sop: SOP with updates
-
-        Returns:
-            Updated SOP
-        """
-        sop.version += 1
-
-        with self.db.connect() as conn:
-            content = sop.to_yaml()
-            triggers = json.dumps(sop.triggers) if sop.triggers else None
-
-            conn.execute(
-                """
-                UPDATE sops
-                SET name = ?, description = ?, content = ?, triggers = ?, 
-                    version = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """,
-                (
-                    sop.name,
-                    sop.description,
-                    content,
-                    triggers,
-                    sop.version,
-                    sop.id,
-                ),
-            )
-
-        return sop
-
-    async def delete(self, sop_id: str) -> None:
-        """Delete an SOP.
-
-        Args:
-            sop_id: SOP ID
-        """
-        with self.db.connect() as conn:
-            conn.execute("DELETE FROM sops WHERE id = ?", (sop_id,))
-
-    async def find_by_trigger(self, trigger_type: str, trigger_value: str) -> list[SOP]:
-        """Find SOPs that match a trigger.
-
-        Args:
-            trigger_type: Type of trigger (schedule, event, etc.)
-            trigger_value: Trigger value to match
-
-        Returns:
-            List of matching SOPs
-        """
-        sops = await self.list_sops()
-        matching = []
-
-        for sop in sops:
-            for trigger in sop.triggers:
-                if trigger.get(trigger_type) == trigger_value:
-                    matching.append(sop)
-                    break
-
-        return matching
-
-    def _row_to_sop(self, row) -> SOP:
-        """Convert database row to SOP."""
-        sop = SOP.from_yaml(row["content"])
-        sop.id = row["id"]
-        sop.name = row["name"]
-        sop.description = row["description"]
-        sop.version = row["version"]
-
-        if row["triggers"]:
+        for path in self.sops_dir.glob("*.yaml"):
             try:
-                sop.triggers = json.loads(row["triggers"])
-            except json.JSONDecodeError:
-                pass
+                sops.append(SOP.from_file(path))
+            except SOPError as e:
+                logger.warning(f"Failed to load SOP {path}: {e}")
 
-        if row["created_at"]:
-            sop.created_at = datetime.fromisoformat(row["created_at"])
+        for path in self.sops_dir.glob("*.yml"):
+            try:
+                sops.append(SOP.from_file(path))
+            except SOPError as e:
+                logger.warning(f"Failed to load SOP {path}: {e}")
 
-        sop.created_by = row["created_by"]
+        return sops
 
-        return sop
+    def get(self, name: str) -> SOP | None:
+        """Get an SOP by name.
+
+        Args:
+            name: SOP name (without .yaml extension)
+
+        Returns:
+            SOP instance or None
+        """
+        # Try exact filename match first
+        for ext in [".yaml", ".yml"]:
+            path = self.sops_dir / f"{name}{ext}"
+            if path.exists():
+                return SOP.from_file(path)
+
+        # Search by SOP name field
+        for sop in self.list_sops():
+            if sop.name == name:
+                return sop
+
+        return None
+
+    def create(self, sop: SOP, filename: str | None = None) -> Path:
+        """Create a new SOP file.
+
+        Args:
+            sop: SOP to save
+            filename: Optional filename (without extension)
+
+        Returns:
+            Path to created file
+        """
+        if filename is None:
+            # Convert name to filename-friendly format
+            filename = sop.name.lower().replace(" ", "-")
+
+        path = self.sops_dir / f"{filename}.yaml"
+        sop.to_file(path)
+        return path
+
+    def delete(self, name: str) -> bool:
+        """Delete an SOP file.
+
+        Args:
+            name: SOP name or filename (without extension)
+
+        Returns:
+            True if deleted, False if not found
+        """
+        for ext in [".yaml", ".yml"]:
+            path = self.sops_dir / f"{name}{ext}"
+            if path.exists():
+                path.unlink()
+                logger.info(f"Deleted SOP: {path}")
+                return True
+
+        return False

@@ -93,7 +93,7 @@ def dashboard(port: int, host: str) -> None:
 
 @cli.group()
 def tasks() -> None:
-    """Manage tasks and SOPs."""
+    """Manage the task board."""
     pass
 
 
@@ -104,6 +104,47 @@ def tasks_list(status: str | None) -> None:
     from xpressai.cli.tasks_cmd import list_tasks
 
     list_tasks(status=status)
+
+
+@cli.group()
+def sop() -> None:
+    """Manage Standard Operating Procedures."""
+    pass
+
+
+@sop.command("list")
+def sop_list() -> None:
+    """List all SOPs."""
+    from xpressai.cli.sop_cmd import list_sops
+
+    list_sops()
+
+
+@sop.command("show")
+@click.argument("name")
+def sop_show(name: str) -> None:
+    """Show details of an SOP."""
+    from xpressai.cli.sop_cmd import show_sop
+
+    show_sop(name)
+
+
+@sop.command("create")
+@click.argument("name")
+def sop_create(name: str) -> None:
+    """Create a new SOP from a template."""
+    from xpressai.cli.sop_cmd import create_sop
+
+    create_sop(name)
+
+
+@sop.command("delete")
+@click.argument("name")
+def sop_delete(name: str) -> None:
+    """Delete an SOP."""
+    from xpressai.cli.sop_cmd import delete_sop
+
+    delete_sop(name)
 
 
 @cli.group()

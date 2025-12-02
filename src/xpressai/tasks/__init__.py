@@ -1,7 +1,7 @@
 """Task and SOP system for XpressAI."""
 
 from xpressai.tasks.board import Task, TaskStatus, TaskBoard
-from xpressai.tasks.sop import SOP, SOPStep, SOPManager
+from xpressai.tasks.sop import SOP, SOPStep, SOPInput, SOPOutput, SOPManager
 
 __all__ = [
     "Task",
@@ -9,5 +9,7 @@ __all__ = [
     "TaskBoard",
     "SOP",
     "SOPStep",
+    "SOPInput",
+    "SOPOutput",
     "SOPManager",
 ]

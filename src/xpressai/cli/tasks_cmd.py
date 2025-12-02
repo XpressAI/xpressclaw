@@ -1,4 +1,4 @@
-"""XpressAI tasks commands - Manage tasks and SOPs."""
+"""XpressAI tasks commands - Manage the task board."""
 
 import asyncio
 import click
