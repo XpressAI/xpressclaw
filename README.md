@@ -1,6 +1,38 @@
-# XpressAI CLI
+<p align="center">
+  <img src="https://raw.githubusercontent.com/XpressAI/xpressai-cli/main/docs/assets/xpressai-banner.png" alt="XpressAI CLI" width="600">
+</p>
 
-**XpressAI on your machine.** Build continuous AI agents that work autonomously, remember what they've learned, and stay on budget while you sleep.
+<p align="center">
+<b>XpressAI on your machine.</b> Build continuous AI agents that work autonomously, remember what they've learned, and stay on budget while you sleep.
+</p>
+
+<p align="center">
+<a href="https://docs.xpress.ai/cli">Docs</a> •
+<a href="https://docs.xpress.ai/cli/getting-started">Install</a> •
+<a href="https://docs.xpress.ai/cli/tutorials">Tutorials</a> •
+<a href="https://github.com/XpressAI/xpressai-cli/blob/main/CONTRIBUTING.md">Contribute</a> •
+<a href="https://discord.com/invite/vgEg2ZtxCw">Discord</a>
+</p>
+
+<p align="center">
+<a href="https://github.com/XpressAI/xpressai-cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/XpressAI/xpressai-cli?color=brightgreen" alt="License"></a>
+<a href="https://github.com/XpressAI/xpressai-cli/releases"><img src="https://img.shields.io/github/v/release/XpressAI/xpressai-cli?color=yellow" alt="Release"></a>
+<img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python">
+</p>
+
+---
+
+XpressAI CLI is a local runtime for autonomous AI agents. Define agents in YAML, give them tasks, and let them work through queues while you sleep. Built-in scheduling, memory, budget controls, and observability.
+
+## Features
+
+- **Autonomous Agents** - Agents pick up tasks from a queue and work through them
+- **Scheduled Tasks** - Cron-style scheduling for recurring work
+- **Memory** - Agents remember context across sessions using zettelkasten-style notes
+- **Budget Controls** - Set daily spending limits so agents don't run up your API bill
+- **Multiple Backends** - Claude, OpenAI, local models (Qwen3-8B), and more
+- **Container Isolation** - Run agents in Docker containers for safety
+- **Observability** - Logs, status, and dashboards to see what agents are doing
 
 ## Quick Start
 
@@ -32,16 +64,6 @@ xpressai up -d  # Run in background
 xpressai logs atlas
 xpressai status
 ```
-
-## Features
-
-- **Autonomous Agents** - Agents pick up tasks from a queue and work through them
-- **Scheduled Tasks** - Cron-style scheduling for recurring work
-- **Memory** - Agents remember context across sessions using a zettelkasten-style note system
-- **Budget Controls** - Set daily spending limits so agents don't run up your API bill
-- **Multiple Backends** - Claude, OpenAI, local models (Qwen3-8B), and more
-- **Container Isolation** - Run agents in Docker containers for safety
-- **Observability** - Logs, status, and dashboards to see what agents are doing
 
 ## Installation
 
@@ -113,12 +135,12 @@ memory:
   eviction: least-recently-relevant
 ```
 
-See [docs/configuration.md](docs/configuration.md) for the full reference.
+See [Configuration](docs/configuration.md) for the full reference.
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) - First steps with XpressAI
-- [Configuration](docs/configuration.md) - Full configuration reference
+- [Getting Started](docs/getting-started.md) - First steps with XpressAI CLI
+- [Configuration](docs/configuration.md) - Full configuration reference  
 - [Commands](docs/commands.md) - CLI command reference
 - [Scheduling](docs/scheduling.md) - Set up recurring tasks
 
@@ -130,6 +152,18 @@ See [docs/configuration.md](docs/configuration.md) for the full reference.
 4. **Agents execute tasks** using their configured tools and memory
 5. **Everything is logged** so you can review what happened
 
+## Community
+
+Have questions? Want to share what you're building? Join us!
+
+- [Discord](https://discord.com/invite/vgEg2ZtxCw) - Chat with the community and devs
+- [GitHub Issues](https://github.com/XpressAI/xpressai-cli/issues) - Report bugs or request features
+- [GitHub Discussions](https://github.com/XpressAI/xpressai-cli/discussions) - Ask questions and share ideas
+
+## Enterprise
+
+For organizations looking to scale their agent deployments or requiring additional features and support, [XpressAI Platform](https://xpress.ai/) offers enhanced capabilities and dedicated support.
+
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)
