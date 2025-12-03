@@ -6,21 +6,24 @@ Provides embedding-based similarity search for memories.
 from dataclasses import dataclass
 from typing import Any
 import logging
-import numpy as np
 
 from xpressai.memory.database import Database, SQLITE_VEC_AVAILABLE
 from xpressai.core.exceptions import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
-# Try to load sentence-transformers for embeddings
+# Try to load sentence-transformers and numpy for embeddings
+# These are optional dependencies (install with: pip install xpressai[local])
 try:
+    import numpy as np
     from sentence_transformers import SentenceTransformer
 
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
+    np = None  # type: ignore
     EMBEDDINGS_AVAILABLE = False
-    logger.warning("sentence-transformers not available, embedding search disabled")
+    logger.info("sentence-transformers not available, embedding search disabled. "
+                "Install with: pip install xpressai[local]")
 
 
 @dataclass
@@ -54,7 +57,7 @@ class EmbeddingModel:
             if not EMBEDDINGS_AVAILABLE:
                 raise EmbeddingError(
                     "sentence-transformers not installed. "
-                    "Install with: pip install sentence-transformers"
+                    "Install with: pip install xpressai[local]"
                 )
             self._model = SentenceTransformer(self.model_name)
             self.dim = self._model.get_sentence_embedding_dimension()

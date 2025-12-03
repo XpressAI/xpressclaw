@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -2956,12 +2956,10 @@ dependencies = [
     { name = "click" },
     { name = "docker" },
     { name = "fastapi" },
-    { name = "huggingface-hub" },
     { name = "jinja2" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "rich" },
-    { name = "sentence-transformers" },
     { name = "sqlite-vec" },
     { name = "sse-starlette" },
     { name = "textual" },
@@ -2980,6 +2978,17 @@ dev = [
 llama = [
     { name = "llama-cpp-python" },
 ]
+local = [
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "sentence-transformers" },
+]
+local-all = [
+    { name = "huggingface-hub" },
+    { name = "llama-cpp-python" },
+    { name = "numpy" },
+    { name = "sentence-transformers" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2991,10 +3000,11 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "docker", specifier = ">=7.0" },
     { name = "fastapi", specifier = ">=0.109" },
-    { name = "huggingface-hub", specifier = ">=0.20" },
+    { name = "huggingface-hub", marker = "extra == 'local'", specifier = ">=0.20" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "llama-cpp-python", marker = "extra == 'llama'", specifier = ">=0.2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
+    { name = "numpy", marker = "extra == 'local'", specifier = ">=1.24" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
@@ -3003,13 +3013,15 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.2" },
-    { name = "sentence-transformers", specifier = ">=2.5" },
+    { name = "sentence-transformers", marker = "extra == 'local'", specifier = ">=2.5" },
     { name = "sqlite-vec", specifier = ">=0.1.0" },
     { name = "sse-starlette", specifier = ">=2.0" },
     { name = "textual", specifier = ">=0.50" },
     { name = "uvicorn", specifier = ">=0.27" },
+    { name = "xpressai", extras = ["llama"], marker = "extra == 'local-all'" },
+    { name = "xpressai", extras = ["local"], marker = "extra == 'local-all'" },
 ]
-provides-extras = ["dev", "llama"]
+provides-extras = ["dev", "local", "llama", "local-all"]
 
 [[package]]
 name = "yarl"

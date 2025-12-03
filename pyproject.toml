@@ -53,12 +53,6 @@ dependencies = [
     
     # Scheduling
     "apscheduler>=3.10",
-    
-    # Embeddings (local)
-    "sentence-transformers>=2.5",
-    
-    # Local inference (optional, but useful)
-    "huggingface-hub>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -71,8 +65,21 @@ dev = [
     "pre-commit>=3.6",
 ]
 
+# Local model support (requires PyTorch - may not work on all platforms)
+local = [
+    "sentence-transformers>=2.5",
+    "huggingface-hub>=0.20",
+    "numpy>=1.24",
+]
+
 llama = [
     "llama-cpp-python>=0.2",
+]
+
+# All local model features
+local-all = [
+    "xpressai[local]",
+    "xpressai[llama]",
 ]
 
 

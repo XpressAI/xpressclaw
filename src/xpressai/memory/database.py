@@ -13,6 +13,32 @@ from xpressai.core.exceptions import DatabaseError, MigrationError
 
 logger = logging.getLogger(__name__)
 
+# Check if SQLite extension loading is supported
+# macOS system Python and some distributions disable this for security
+_EXTENSIONS_SUPPORTED: bool | None = None
+
+
+def _check_extension_support() -> bool:
+    """Check if SQLite extension loading is supported."""
+    global _EXTENSIONS_SUPPORTED
+    if _EXTENSIONS_SUPPORTED is not None:
+        return _EXTENSIONS_SUPPORTED
+    
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.enable_load_extension(True)
+        conn.close()
+        _EXTENSIONS_SUPPORTED = True
+    except AttributeError:
+        _EXTENSIONS_SUPPORTED = False
+        logger.warning(
+            "SQLite extension loading not supported by this Python build. "
+            "Vector search will be disabled. To enable, use a Python build "
+            "compiled with --enable-loadable-sqlite-extensions (e.g., pyenv or python.org installer)."
+        )
+    return _EXTENSIONS_SUPPORTED
+
+
 # Try to import sqlite-vec
 try:
     import sqlite_vec
@@ -20,7 +46,7 @@ try:
     SQLITE_VEC_AVAILABLE = True
 except ImportError:
     SQLITE_VEC_AVAILABLE = False
-    logger.warning("sqlite-vec not available, vector search will be disabled")
+    logger.info("sqlite-vec not installed, vector search will be disabled")
 
 
 class Database:
@@ -68,14 +94,17 @@ class Database:
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
 
-        # Load sqlite-vec extension if available
-        if SQLITE_VEC_AVAILABLE:
+        # Load sqlite-vec extension if available and supported
+        if SQLITE_VEC_AVAILABLE and _check_extension_support():
             try:
                 conn.enable_load_extension(True)
                 sqlite_vec.load(conn)
                 conn.enable_load_extension(False)
             except Exception as e:
-                logger.warning(f"Failed to load sqlite-vec: {e}")
+                # Only log once per session
+                if not getattr(self, '_vec_load_warned', False):
+                    logger.warning(f"Failed to load sqlite-vec: {e}")
+                    self._vec_load_warned = True
 
         try:
             yield conn
@@ -276,8 +305,8 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_sessions_agent ON agent_sessions(agent_id);
         """)
 
-        # Create vector table if sqlite-vec is available
-        if SQLITE_VEC_AVAILABLE:
+        # Create vector table if sqlite-vec is available and extensions are supported
+        if SQLITE_VEC_AVAILABLE and _check_extension_support():
             try:
                 # Check if vec0 is available
                 conn.execute("SELECT vec_version()")
@@ -288,7 +317,7 @@ class Database:
                     )
                 """)
             except sqlite3.OperationalError as e:
-                logger.warning(f"Could not create vector table: {e}")
+                logger.debug(f"Could not create vector table: {e}")
 
     def _migrate_v2(self, conn: sqlite3.Connection) -> None:
         """Version 2 schema: Activity logs and events."""
