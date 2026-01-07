@@ -319,6 +319,9 @@ class MemoryManager:
     ) -> int:
         """Load a memory into an agent's slot.
 
+        When slots are full, the evicted memory is linked to related
+        memories in the Zettelkasten before being removed from active slots.
+
         Args:
             agent_id: ID of the agent
             memory: Memory to load
@@ -328,7 +331,45 @@ class MemoryManager:
             Slot index where memory was loaded
         """
         slot_manager = self.get_slot_manager(agent_id)
+        slots = await slot_manager.get_slots()
+
+        # Check if we need to evict
+        empty_slot = next((s for s in slots if s.is_empty), None)
+        if empty_slot is None:
+            # Find slot to evict
+            evict_index = await slot_manager._select_for_eviction(slots, relevance_score)
+            evicted_memory = slots[evict_index].memory
+
+            if evicted_memory:
+                # Link evicted memory to related memories in Zettelkasten
+                await self._link_to_related(evicted_memory)
+                logger.info(f"Evicted memory {evicted_memory.id} from slot, linked to related memories")
+
         return await slot_manager.load(memory, relevance_score)
+
+    async def _link_to_related(self, memory: Memory, limit: int = 3) -> None:
+        """Link a memory to its most related memories in Zettelkasten.
+
+        Args:
+            memory: Memory to link
+            limit: Maximum number of links to create
+        """
+        try:
+            # Find similar memories via vector search
+            similar = await self.vector_store.find_similar(memory.id, limit=limit + 1)
+
+            for result in similar:
+                if result.memory_id != memory.id and result.score > 0.5:
+                    # Create bidirectional link
+                    await self.zettelkasten.link(
+                        memory.id, result.memory_id,
+                        link_type="related",
+                        bidirectional=True
+                    )
+                    logger.debug(f"Linked memory {memory.id} to {result.memory_id} (score={result.score:.2f})")
+
+        except Exception as e:
+            logger.warning(f"Failed to link memory to related: {e}")
 
     async def get_slots(self, agent_id: str) -> list[MemorySlot]:
         """Get all slots for an agent.

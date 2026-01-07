@@ -140,6 +140,9 @@ class Database:
             (1, self._migrate_v1),
             (2, self._migrate_v2),
             (3, self._migrate_v3),
+            (4, self._migrate_v4),
+            (5, self._migrate_v5),
+            (6, self._migrate_v6),
         ]
 
         for target_version, migrate_func in migrations:
@@ -369,10 +372,60 @@ class Database:
                 run_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-            
+
             CREATE INDEX IF NOT EXISTS idx_schedules_agent ON schedules(agent_id);
             CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
         """)
+
+    def _migrate_v4(self, conn: sqlite3.Connection) -> None:
+        """Version 4 schema: Task messages for conversations."""
+        conn.executescript("""
+            -- Task messages for conversation threads
+            CREATE TABLE IF NOT EXISTS task_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id);
+            CREATE INDEX IF NOT EXISTS idx_task_messages_timestamp ON task_messages(timestamp);
+        """)
+
+    def _migrate_v5(self, conn: sqlite3.Connection) -> None:
+        """Version 5 schema: Agent chat messages for direct conversations."""
+        conn.executescript("""
+            -- Agent chat messages for direct conversations (not task-based)
+            CREATE TABLE IF NOT EXISTS agent_chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_chat_agent ON agent_chat_messages(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_agent_chat_timestamp ON agent_chat_messages(timestamp);
+        """)
+
+    def _migrate_v6(self, conn: sqlite3.Connection) -> None:
+        """Version 6 schema: Add cache token columns to usage_logs."""
+        # Add cache token columns to usage_logs
+        try:
+            conn.execute(
+                "ALTER TABLE usage_logs ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute(
+                "ALTER TABLE usage_logs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     def backup(self, backup_path: Path | None = None) -> Path:
         """Create a backup of the database.

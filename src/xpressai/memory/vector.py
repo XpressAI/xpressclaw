@@ -3,27 +3,75 @@
 Provides embedding-based similarity search for memories.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 import logging
+import os
 
 from xpressai.memory.database import Database, SQLITE_VEC_AVAILABLE
 from xpressai.core.exceptions import EmbeddingError
 
 logger = logging.getLogger(__name__)
 
-# Try to load sentence-transformers and numpy for embeddings
-# These are optional dependencies (install with: pip install xpressai[local])
-try:
-    import numpy as np
-    from sentence_transformers import SentenceTransformer
+# Shared thread pool for CPU-bound embedding operations
+_embedding_executor: ThreadPoolExecutor | None = None
 
-    EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    np = None  # type: ignore
-    EMBEDDINGS_AVAILABLE = False
-    logger.info("sentence-transformers not available, embedding search disabled. "
-                "Install with: pip install xpressai[local]")
+def _get_executor() -> ThreadPoolExecutor:
+    """Get or create the shared thread pool executor."""
+    global _embedding_executor
+    if _embedding_executor is None:
+        _embedding_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedding")
+    return _embedding_executor
+
+# Check if embedding dependencies are available (lazy import to avoid loading PyTorch at startup)
+def _check_embeddings_available() -> bool:
+    """Check if sentence-transformers is importable without actually importing it."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("sentence_transformers") is not None
+    except Exception:
+        return False
+
+EMBEDDINGS_AVAILABLE = _check_embeddings_available()
+
+# These will be imported lazily when first needed
+np = None
+SentenceTransformer = None
+_embeddings_imported = False
+
+def _lazy_import_embeddings():
+    """Lazily import heavy embedding dependencies."""
+    global np, SentenceTransformer, _embeddings_imported, EMBEDDINGS_AVAILABLE
+
+    if _embeddings_imported:
+        return EMBEDDINGS_AVAILABLE
+
+    _embeddings_imported = True
+
+    if not EMBEDDINGS_AVAILABLE:
+        logger.info("sentence-transformers not available, embedding search disabled. "
+                    "Install with: pip install xpressai[local]")
+        return False
+
+    try:
+        # Disable tokenizers parallelism before importing
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+        import numpy as _np
+        from sentence_transformers import SentenceTransformer as _ST
+
+        # Set globals
+        globals()['np'] = _np
+        globals()['SentenceTransformer'] = _ST
+
+        logger.info("Loaded sentence-transformers for embedding search")
+        return True
+    except ImportError as e:
+        logger.warning(f"Failed to import sentence-transformers: {e}")
+        EMBEDDINGS_AVAILABLE = False
+        return False
 
 
 @dataclass
@@ -54,7 +102,8 @@ class EmbeddingModel:
     def _get_model(self):
         """Lazy load the model."""
         if self._model is None:
-            if not EMBEDDINGS_AVAILABLE:
+            # Trigger lazy import of heavy dependencies
+            if not _lazy_import_embeddings():
                 raise EmbeddingError(
                     "sentence-transformers not installed. "
                     "Install with: pip install xpressai[local]"
@@ -64,7 +113,7 @@ class EmbeddingModel:
         return self._model
 
     def embed(self, text: str) -> list[float]:
-        """Generate embedding for text.
+        """Generate embedding for text (synchronous).
 
         Args:
             text: Text to embed
@@ -77,7 +126,7 @@ class EmbeddingModel:
         return embedding.tolist()
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for multiple texts.
+        """Generate embeddings for multiple texts (synchronous).
 
         Args:
             texts: List of texts to embed
@@ -88,6 +137,33 @@ class EmbeddingModel:
         model = self._get_model()
         embeddings = model.encode(texts, convert_to_numpy=True)
         return [e.tolist() for e in embeddings]
+
+    async def embed_async(self, text: str) -> list[float]:
+        """Generate embedding for text (non-blocking).
+
+        Runs the CPU-bound encoding in a thread pool to avoid blocking
+        the async event loop.
+
+        Args:
+            text: Text to embed
+
+        Returns:
+            Embedding vector as list of floats
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_get_executor(), self.embed, text)
+
+    async def embed_batch_async(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings for multiple texts (non-blocking).
+
+        Args:
+            texts: List of texts to embed
+
+        Returns:
+            List of embedding vectors
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_get_executor(), self.embed_batch, texts)
 
 
 class VectorStore:
@@ -119,6 +195,41 @@ class VectorStore:
         """Check if vector operations are available."""
         return SQLITE_VEC_AVAILABLE and EMBEDDINGS_AVAILABLE
 
+    def _ensure_table_exists(self, conn) -> bool:
+        """Ensure the memory_embeddings table exists.
+
+        Args:
+            conn: Database connection
+
+        Returns:
+            True if table exists or was created, False otherwise
+        """
+        # Check if table already exists
+        table_exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_embeddings'"
+        ).fetchone()
+
+        if table_exists:
+            return True
+
+        # Try to create it if sqlite-vec is available
+        if not SQLITE_VEC_AVAILABLE:
+            return False
+
+        try:
+            conn.execute("SELECT vec_version()")
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_embeddings USING vec0(
+                    memory_id TEXT PRIMARY KEY,
+                    embedding FLOAT[{self.embedding_dim}]
+                )
+            """)
+            logger.info("Created memory_embeddings table")
+            return True
+        except Exception as e:
+            logger.debug(f"Could not create vector table: {e}")
+            return False
+
     async def add(self, memory_id: str, text: str) -> None:
         """Add embedding for a memory.
 
@@ -131,15 +242,27 @@ class VectorStore:
             return
 
         try:
-            embedding = self.embedding_model.embed(text)
+            # Use async embed to avoid blocking the event loop
+            embedding = await self.embedding_model.embed_async(text)
 
             with self.db.connect() as conn:
+                # Ensure table exists (creates if sqlite-vec is available)
+                if not self._ensure_table_exists(conn):
+                    logger.debug("Vector table not available, skipping embedding")
+                    return
+
                 # Convert to bytes for sqlite-vec
                 embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
 
+                # sqlite-vec virtual tables don't support INSERT OR REPLACE
+                # Delete existing first, then insert
+                conn.execute(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ?",
+                    (memory_id,),
+                )
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding)
+                    INSERT INTO memory_embeddings (memory_id, embedding)
                     VALUES (?, ?)
                 """,
                     (memory_id, embedding_bytes),
@@ -159,14 +282,20 @@ class VectorStore:
 
         try:
             texts = [text for _, text in items]
-            embeddings = self.embedding_model.embed_batch(texts)
+            # Use async embed to avoid blocking the event loop
+            embeddings = await self.embedding_model.embed_batch_async(texts)
 
             with self.db.connect() as conn:
                 for (memory_id, _), embedding in zip(items, embeddings):
                     embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
+                    # sqlite-vec virtual tables don't support INSERT OR REPLACE
+                    conn.execute(
+                        "DELETE FROM memory_embeddings WHERE memory_id = ?",
+                        (memory_id,),
+                    )
                     conn.execute(
                         """
-                        INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding)
+                        INSERT INTO memory_embeddings (memory_id, embedding)
                         VALUES (?, ?)
                     """,
                         (memory_id, embedding_bytes),
@@ -205,7 +334,8 @@ class VectorStore:
             return []
 
         try:
-            query_embedding = self.embedding_model.embed(query)
+            # Use async embed to avoid blocking the event loop
+            query_embedding = await self.embedding_model.embed_async(query)
             query_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
 
             with self.db.connect() as conn:
@@ -302,14 +432,32 @@ class VectorStore:
             Dictionary with stats
         """
         if not self.available:
-            return {"available": False}
+            return {"available": False, "total_embeddings": 0}
 
-        with self.db.connect() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+        try:
+            with self.db.connect() as conn:
+                # Check if table exists first
+                table_exists = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_embeddings'"
+                ).fetchone()
 
-            return {
-                "available": True,
-                "total_embeddings": count,
-                "embedding_dim": self.embedding_dim,
-                "model": self.embedding_model.model_name if self._embedding_model else "not loaded",
-            }
+                if not table_exists:
+                    return {
+                        "available": True,
+                        "total_embeddings": 0,
+                        "embedding_dim": self.embedding_dim,
+                        "model": self.embedding_model.model_name if self._embedding_model else "not loaded",
+                        "note": "table not yet created",
+                    }
+
+                count = conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0]
+
+                return {
+                    "available": True,
+                    "total_embeddings": count,
+                    "embedding_dim": self.embedding_dim,
+                    "model": self.embedding_model.model_name if self._embedding_model else "not loaded",
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get vector stats: {e}")
+            return {"available": False, "total_embeddings": 0, "error": str(e)}
