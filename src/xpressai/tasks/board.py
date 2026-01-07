@@ -19,6 +19,7 @@ class TaskStatus(str, Enum):
 
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
+    WAITING_FOR_INPUT = "waiting_for_input"
     BLOCKED = "blocked"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
@@ -197,6 +198,50 @@ class TaskBoard:
             # Return updated task
             return await self.get_task(task_id)
 
+    async def update_task(
+        self,
+        task_id: str,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> Task:
+        """Update a task's title and/or description.
+
+        Args:
+            task_id: Task ID
+            title: New title (optional)
+            description: New description (optional)
+
+        Returns:
+            Updated task
+        """
+        with self.db.connect() as conn:
+            now = datetime.now()
+
+            # Get current task
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+
+            if row is None:
+                raise TaskNotFoundError(f"Task not found: {task_id}", {"task_id": task_id})
+
+            # Build update
+            updates = ["updated_at = ?"]
+            params: list[Any] = [now.isoformat()]
+
+            if title is not None:
+                updates.append("title = ?")
+                params.append(title)
+
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+
+            params.append(task_id)
+
+            conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", params)
+
+            # Return updated task
+            return await self.get_task(task_id)
+
     async def delete_task(self, task_id: str) -> None:
         """Delete a task.
 
@@ -205,6 +250,22 @@ class TaskBoard:
         """
         with self.db.connect() as conn:
             conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+
+    async def delete_tasks_by_status(self, status: TaskStatus) -> int:
+        """Delete all tasks with a given status.
+
+        Args:
+            status: Status of tasks to delete
+
+        Returns:
+            Number of tasks deleted
+        """
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM tasks WHERE status = ?",
+                (status.value,)
+            )
+            return cursor.rowcount
 
     async def get_tasks(
         self,
@@ -263,6 +324,7 @@ class TaskBoard:
             counts = {
                 "pending": 0,
                 "in_progress": 0,
+                "waiting_for_input": 0,
                 "completed": 0,
                 "blocked": 0,
                 "cancelled": 0,
