@@ -60,12 +60,55 @@ class BudgetManager:
         self.config = config
         self.cost_calculator = CostCalculator()
 
+    def register_model_pricing(self, model: str, price_input: float, price_output: float) -> None:
+        """Register custom pricing for a model.
+
+        Args:
+            model: Model identifier
+            price_input: Price per 1M input tokens
+            price_output: Price per 1M output tokens
+        """
+        self.cost_calculator.register_pricing(model, price_input, price_output)
+
+    async def get_top_spenders(self, limit: int = 3) -> list[dict[str, Any]]:
+        """Get top spending agents.
+
+        Args:
+            limit: Maximum number of agents to return
+
+        Returns:
+            List of agent spending summaries, sorted by total spent descending
+        """
+        with self.db.connect() as conn:
+            rows = conn.execute("""
+                SELECT
+                    agent_id,
+                    daily_spent,
+                    monthly_spent,
+                    total_spent
+                FROM budget_state
+                ORDER BY total_spent DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+
+            return [
+                {
+                    "agent_id": row["agent_id"],
+                    "daily_spent": float(row["daily_spent"] or 0),
+                    "monthly_spent": float(row["monthly_spent"] or 0),
+                    "total_spent": float(row["total_spent"] or 0),
+                }
+                for row in rows
+            ]
+
     async def record_usage(
         self,
         agent_id: str,
         model: str,
         input_tokens: int,
         output_tokens: int,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
         operation: str = "query",
         session_id: str | None = None,
     ) -> UsageRecord:
@@ -76,6 +119,8 @@ class BudgetManager:
             model: Model used
             input_tokens: Number of input tokens
             output_tokens: Number of output tokens
+            cache_creation_tokens: Tokens written to cache
+            cache_read_tokens: Tokens read from cache (cache hits)
             operation: Type of operation
             session_id: Optional session ID
 
@@ -85,23 +130,33 @@ class BudgetManager:
         Raises:
             BudgetExceededError: If budget is exceeded after recording
         """
-        cost = self.cost_calculator.calculate(model, input_tokens, output_tokens)
+        cost = self.cost_calculator.calculate(
+            model, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+        )
 
         with self.db.connect() as conn:
             # Insert usage record
             conn.execute(
                 """
-                INSERT INTO usage_logs 
-                (agent_id, model, input_tokens, output_tokens, cost_usd, operation, session_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO usage_logs
+                (agent_id, model, input_tokens, output_tokens, cache_creation_tokens,
+                 cache_read_tokens, cost_usd, operation, session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (agent_id, model, input_tokens, output_tokens, float(cost), operation, session_id),
+                (agent_id, model, input_tokens, output_tokens, cache_creation_tokens,
+                 cache_read_tokens, float(cost), operation, session_id),
             )
 
             record_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         # Update budget state
         await self._update_state(agent_id, cost)
+
+        logger.debug(
+            f"Recorded usage for {agent_id}: {model} - "
+            f"in={input_tokens}, out={output_tokens}, cache_write={cache_creation_tokens}, "
+            f"cache_read={cache_read_tokens}, cost=${cost:.6f}"
+        )
 
         return UsageRecord(
             id=record_id,
@@ -110,6 +165,8 @@ class BudgetManager:
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
             cost_usd=cost,
             operation=operation,
             session_id=session_id,
@@ -394,6 +451,18 @@ class BudgetManager:
             if agent_id:
                 state = await self._get_state(agent_id)
 
+                # Get token totals for this agent
+                token_row = conn.execute("""
+                    SELECT
+                        SUM(input_tokens) as input_tokens,
+                        SUM(output_tokens) as output_tokens,
+                        SUM(COALESCE(cache_creation_tokens, 0)) as cache_creation_tokens,
+                        SUM(COALESCE(cache_read_tokens, 0)) as cache_read_tokens,
+                        COUNT(*) as request_count
+                    FROM usage_logs
+                    WHERE agent_id = ?
+                """, (agent_id,)).fetchone()
+
                 return {
                     "agent_id": agent_id,
                     "daily_spent": float(state.daily_spent),
@@ -403,15 +472,31 @@ class BudgetManager:
                     "total_spent": float(state.total_spent),
                     "is_paused": state.is_paused,
                     "pause_reason": state.pause_reason,
+                    "input_tokens": token_row["input_tokens"] or 0,
+                    "output_tokens": token_row["output_tokens"] or 0,
+                    "cache_creation_tokens": token_row["cache_creation_tokens"] or 0,
+                    "cache_read_tokens": token_row["cache_read_tokens"] or 0,
+                    "request_count": token_row["request_count"] or 0,
                 }
 
             # Aggregate all agents
             row = conn.execute("""
-                SELECT 
+                SELECT
                     SUM(daily_spent) as daily,
                     SUM(monthly_spent) as monthly,
                     SUM(total_spent) as total
                 FROM budget_state
+            """).fetchone()
+
+            # Get total token usage
+            token_row = conn.execute("""
+                SELECT
+                    SUM(input_tokens) as input_tokens,
+                    SUM(output_tokens) as output_tokens,
+                    SUM(COALESCE(cache_creation_tokens, 0)) as cache_creation_tokens,
+                    SUM(COALESCE(cache_read_tokens, 0)) as cache_read_tokens,
+                    COUNT(*) as request_count
+                FROM usage_logs
             """).fetchone()
 
             return {
@@ -420,6 +505,11 @@ class BudgetManager:
                 "monthly_spent": row["monthly"] or 0,
                 "monthly_limit": float(self.config.monthly) if self.config.monthly else None,
                 "total_spent": row["total"] or 0,
+                "input_tokens": token_row["input_tokens"] or 0,
+                "output_tokens": token_row["output_tokens"] or 0,
+                "cache_creation_tokens": token_row["cache_creation_tokens"] or 0,
+                "cache_read_tokens": token_row["cache_read_tokens"] or 0,
+                "request_count": token_row["request_count"] or 0,
             }
 
     async def get_usage_history(

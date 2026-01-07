@@ -80,25 +80,28 @@ class WakeOnConfig:
 
 
 @dataclass
+class HooksConfig:
+    """Agent hooks configuration for memory and other sub-agents."""
+
+    before_message: list[str] = field(default_factory=list)
+    after_message: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentConfig:
     """Configuration for a single agent."""
 
     name: str
     backend: str = "local"
+    model: str | None = None  # Model name for Claude/OpenAI backends
     role: str = ""
-    autonomy: str = "medium"  # low | medium | high
     tools: list[str] = field(default_factory=list)
     budget: BudgetConfig | None = None
     rate_limit: RateLimitConfig | None = None
     wake_on: list[WakeOnConfig] = field(default_factory=list)
     container: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        valid_autonomy = {"low", "medium", "high"}
-        if self.autonomy not in valid_autonomy:
-            raise ConfigValidationError(
-                f"Invalid autonomy level: {self.autonomy}", {"valid_levels": list(valid_autonomy)}
-            )
+    local_model: "LocalModelConfig | None" = None  # Per-agent local model override
+    hooks: HooksConfig = field(default_factory=HooksConfig)  # Memory and other hooks
 
 
 @dataclass
@@ -109,7 +112,7 @@ class SystemConfig:
     budget: BudgetConfig = field(default_factory=BudgetConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     data_dir: Path = field(default_factory=lambda: Path.home() / ".xpressai")
-    workspace_dir: Path = field(default_factory=lambda: Path.home() / "agent-workspace")
+    workspace_dir: Path = field(default_factory=Path.cwd)  # Current directory where xpressai is run
 
     def __post_init__(self) -> None:
         valid_isolation = {"docker", "none"}
@@ -129,6 +132,33 @@ class MemoryConfig:
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dim: int = 384
 
+    # Optional: separate LLM config for memory sub-agent
+    # If not set, uses the same config as the main agent
+    memory_agent: "LocalModelConfig | None" = None
+
+    # Customizable prompts for memory hooks
+    recall_prompt: str = """Based on the following user message, identify what memories might be relevant.
+Return a search query that will help find useful context.
+
+User message: {message}
+
+Return only the search query, no other text."""
+
+    remember_prompt: str = """Review the following conversation and decide if anything should be remembered for future reference.
+
+Conversation:
+{conversation}
+
+If there's something worth remembering (facts, preferences, decisions, learnings), respond with:
+REMEMBER: <one sentence summary>
+CONTENT: <detailed content to store>
+TAGS: <comma-separated tags>
+
+If nothing needs to be remembered, respond with:
+NOTHING
+
+Respond with only one of the above formats, no other text."""
+
     def __post_init__(self) -> None:
         if self.near_term_slots < 1 or self.near_term_slots > 16:
             raise ConfigValidationError(
@@ -147,6 +177,11 @@ class LocalModelConfig:
     thinking_mode: str = "auto"  # auto | always | never
     base_url: str = "http://localhost:8000"  # vLLM default port
     api_key: str = "EMPTY"  # vLLM doesn't require auth by default
+    tool_format: str = "xml"  # xml | json - format for tool calls
+    max_tool_calls: int = 20  # Maximum tool call iterations per task
+    # Optional pricing per 1M tokens (for budget tracking with paid API endpoints)
+    price_input: float | None = None  # Price per 1M input tokens
+    price_output: float | None = None  # Price per 1M output tokens
 
 
 @dataclass
@@ -202,16 +237,43 @@ class Config:
                     )
                 )
 
+            # Parse per-agent local model config
+            agent_local_model = None
+            if "local_model" in agent_data:
+                lm = agent_data["local_model"]
+                agent_local_model = LocalModelConfig(
+                    model=lm.get("model", "Qwen/Qwen3-8B"),
+                    inference_backend=lm.get("inference_backend", "vllm"),
+                    quantization=lm.get("quantization", "q4_k_m"),
+                    context_length=lm.get("context_length", 32768),
+                    thinking_mode=lm.get("thinking_mode", "auto"),
+                    base_url=lm.get("base_url", "http://localhost:8000"),
+                    api_key=lm.get("api_key", "EMPTY"),
+                    tool_format=lm.get("tool_format", "xml"),
+                    max_tool_calls=lm.get("max_tool_calls", 20),
+                    price_input=lm.get("price_input"),
+                    price_output=lm.get("price_output"),
+                )
+
+            # Parse hooks config
+            hooks_data = agent_data.get("hooks", {})
+            agent_hooks = HooksConfig(
+                before_message=hooks_data.get("before_message", []),
+                after_message=hooks_data.get("after_message", []),
+            )
+
             agents.append(
                 AgentConfig(
                     name=agent_data.get("name", "default"),
                     backend=agent_data.get("backend", "local"),
+                    model=agent_data.get("model"),
                     role=agent_data.get("role", ""),
-                    autonomy=agent_data.get("autonomy", "medium"),
                     tools=agent_data.get("tools", []),
                     budget=agent_budget,
                     wake_on=wake_on,
                     container=agent_data.get("container", {}),
+                    local_model=agent_local_model,
+                    hooks=agent_hooks,
                 )
             )
 
@@ -250,12 +312,34 @@ class Config:
 
         # Parse memory
         memory_data = data.get("memory", {})
-        memory = MemoryConfig(
-            near_term_slots=memory_data.get("near_term_slots", 8),
-            eviction=memory_data.get("eviction", "least-recently-relevant"),
-            retention=memory_data.get("retention", "none"),
-            embedding_model=memory_data.get("embedding_model", "all-MiniLM-L6-v2"),
-        )
+        memory_kwargs = {
+            "near_term_slots": memory_data.get("near_term_slots", 8),
+            "eviction": memory_data.get("eviction", "least-recently-relevant"),
+            "retention": memory_data.get("retention", "none"),
+            "embedding_model": memory_data.get("embedding_model", "all-MiniLM-L6-v2"),
+        }
+        # Include custom prompts if specified
+        if "recall_prompt" in memory_data:
+            memory_kwargs["recall_prompt"] = memory_data["recall_prompt"]
+        if "remember_prompt" in memory_data:
+            memory_kwargs["remember_prompt"] = memory_data["remember_prompt"]
+        # Parse optional memory_agent LLM config
+        if "memory_agent" in memory_data:
+            ma = memory_data["memory_agent"]
+            memory_kwargs["memory_agent"] = LocalModelConfig(
+                model=ma.get("model", "Qwen/Qwen3-8B"),
+                inference_backend=ma.get("inference_backend", "vllm"),
+                quantization=ma.get("quantization", "q4_k_m"),
+                context_length=ma.get("context_length", 32768),
+                thinking_mode=ma.get("thinking_mode", "auto"),
+                base_url=ma.get("base_url", "http://localhost:8000"),
+                api_key=ma.get("api_key", "EMPTY"),
+                tool_format=ma.get("tool_format", "xml"),
+                max_tool_calls=ma.get("max_tool_calls", 20),
+                price_input=ma.get("price_input"),
+                price_output=ma.get("price_output"),
+            )
+        memory = MemoryConfig(**memory_kwargs)
 
         # Parse local model config
         local_data = data.get("local_model", {})
@@ -267,6 +351,10 @@ class Config:
             thinking_mode=local_data.get("thinking_mode", "auto"),
             base_url=local_data.get("base_url", "http://localhost:8000"),
             api_key=local_data.get("api_key", "EMPTY"),
+            tool_format=local_data.get("tool_format", "xml"),
+            max_tool_calls=local_data.get("max_tool_calls", 20),
+            price_input=local_data.get("price_input"),
+            price_output=local_data.get("price_output"),
         )
 
         return cls(
@@ -295,8 +383,8 @@ class Config:
                 {
                     "name": agent.name,
                     "backend": agent.backend,
+                    **({"model": agent.model} if agent.model else {}),
                     "role": agent.role,
-                    "autonomy": agent.autonomy,
                     "tools": agent.tools,
                 }
                 for agent in self.agents
@@ -401,7 +489,21 @@ agents:
     backend: {backend}
     role: |
       You are a helpful AI assistant.
-    # autonomy: medium  # low | medium | high
+
+      ## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
+      You cannot form new long-term memories naturally. After each conversation ends, you will forget everything unless you explicitly save it.
+
+      - **Before starting work:** Use `search_memory` to recall what you know about the user, their projects, and relevant context
+      - **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts (company info, preferences, decisions, contacts, technical details, URLs)
+      - **Be proactive:** If someone tells you about themselves or their work, SAVE IT
+      - Your memory is your zettelkasten - treat it as essential to your function
+
+    # Memory hooks - inject memories before processing and store after
+    hooks:
+      before_message:
+        - memory_recall  # Recalls relevant memories into prompt
+      after_message:
+        - memory_remember  # Stores important info from conversation
 
 # Tool configuration
 tools:

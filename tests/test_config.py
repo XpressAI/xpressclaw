@@ -53,11 +53,6 @@ class TestAgentConfig:
         with pytest.raises(TypeError):
             AgentConfig()  # Missing name
 
-    def test_default_autonomy(self):
-        """Test default autonomy level."""
-        config = AgentConfig(name="test")
-        assert config.autonomy == "medium"
-
     def test_default_backend(self):
         """Test default backend."""
         config = AgentConfig(name="test")
