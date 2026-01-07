@@ -15,8 +15,22 @@ if TYPE_CHECKING:
     from xpressai.tools.registry import ToolRegistry, ToolCategory, ToolDefinition
 
 
-# Default workspace (can be configured)
-DEFAULT_WORKSPACE = Path.home() / "agent-workspace"
+# Workspace directory (configurable via set_workspace)
+_workspace: Path | None = None
+
+
+def set_workspace(path: Path) -> None:
+    """Set the workspace directory for file operations."""
+    global _workspace
+    _workspace = path
+
+
+def get_workspace() -> Path:
+    """Get the current workspace directory."""
+    if _workspace is not None:
+        return _workspace
+    # Default to current directory
+    return Path.cwd()
 
 
 async def read_file(path: str, encoding: str = "utf-8") -> str:
@@ -57,10 +71,10 @@ async def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     await asyncio.to_thread(file_path.write_text, content, encoding=encoding)
-    return f"Successfully wrote {len(content)} bytes to {path}"
+    return f"Successfully wrote {len(content)} bytes to {file_path}"
 
 
-async def list_directory(path: str = ".", recursive: bool = False) -> List[Dict[str, Any]]:
+async def list_directory(path: str = ".", recursive: bool = False) -> Dict[str, Any]:
     """List contents of a directory.
 
     Args:
@@ -68,7 +82,7 @@ async def list_directory(path: str = ".", recursive: bool = False) -> List[Dict[
         recursive: Whether to list recursively
 
     Returns:
-        List of file/directory entries
+        Dict with directory path and list of file/directory entries
     """
     dir_path = _resolve_path(path)
 
@@ -82,10 +96,9 @@ async def list_directory(path: str = ".", recursive: bool = False) -> List[Dict[
 
     def collect_entries(base: Path, relative_to: Path):
         for item in base.iterdir():
-            rel_path = item.relative_to(relative_to)
             entry = {
                 "name": item.name,
-                "path": str(rel_path),
+                "path": str(item),  # Absolute path
                 "type": "directory" if item.is_dir() else "file",
             }
             if item.is_file():
@@ -96,10 +109,13 @@ async def list_directory(path: str = ".", recursive: bool = False) -> List[Dict[
                 collect_entries(item, relative_to)
 
     await asyncio.to_thread(collect_entries, dir_path, dir_path)
-    return entries
+    return {
+        "directory": str(dir_path),
+        "entries": entries,
+    }
 
 
-async def search_files(pattern: str, path: str = ".", max_results: int = 100) -> List[str]:
+async def search_files(pattern: str, path: str = ".", max_results: int = 100) -> Dict[str, Any]:
     """Search for files matching a pattern.
 
     Args:
@@ -108,7 +124,7 @@ async def search_files(pattern: str, path: str = ".", max_results: int = 100) ->
         max_results: Maximum number of results
 
     Returns:
-        List of matching file paths
+        Dict with search directory and list of matching absolute paths
     """
     dir_path = _resolve_path(path)
 
@@ -120,10 +136,15 @@ async def search_files(pattern: str, path: str = ".", max_results: int = 100) ->
         for match in dir_path.glob(pattern):
             if len(results) >= max_results:
                 break
-            results.append(str(match.relative_to(dir_path)))
+            results.append(str(match))  # Absolute path
         return results
 
-    return await asyncio.to_thread(do_search)
+    matches = await asyncio.to_thread(do_search)
+    return {
+        "search_directory": str(dir_path),
+        "pattern": pattern,
+        "matches": matches,
+    }
 
 
 async def delete_file(path: str) -> str:
@@ -138,13 +159,13 @@ async def delete_file(path: str) -> str:
     file_path = _resolve_path(path)
 
     if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
     if file_path.is_dir():
-        raise ValueError(f"Cannot delete directory with this tool: {path}")
+        raise ValueError(f"Cannot delete directory with this tool: {file_path}")
 
     await asyncio.to_thread(file_path.unlink)
-    return f"Successfully deleted {path}"
+    return f"Successfully deleted {file_path}"
 
 
 async def create_directory(path: str) -> str:
@@ -159,10 +180,10 @@ async def create_directory(path: str) -> str:
     dir_path = _resolve_path(path)
 
     if dir_path.exists():
-        raise ValueError(f"Path already exists: {path}")
+        raise ValueError(f"Path already exists: {dir_path}")
 
     await asyncio.to_thread(dir_path.mkdir, parents=True, exist_ok=True)
-    return f"Successfully created directory {path}"
+    return f"Successfully created directory {dir_path}"
 
 
 def _resolve_path(path: str) -> Path:
@@ -177,15 +198,18 @@ def _resolve_path(path: str) -> Path:
     Raises:
         ValueError: If path escapes the workspace
     """
-    # For now, use a simple workspace
-    workspace = DEFAULT_WORKSPACE
+    # Use configured workspace
+    workspace = get_workspace()
     workspace.mkdir(parents=True, exist_ok=True)
 
+    # Expand ~ to home directory first
+    expanded_path = os.path.expanduser(path)
+
     # Resolve the path
-    if Path(path).is_absolute():
-        resolved = Path(path).resolve()
+    if Path(expanded_path).is_absolute():
+        resolved = Path(expanded_path).resolve()
     else:
-        resolved = (workspace / path).resolve()
+        resolved = (workspace / expanded_path).resolve()
 
     # Check that it's within workspace
     try:
@@ -207,12 +231,12 @@ async def register_filesystem_tools(registry: ToolRegistry) -> None:
     registry.register_tool(
         ToolDefinition(
             name="read_file",
-            description="Read the contents of a file",
+            description="Read the contents of a file. Call this tool directly - do not use execute_command for file operations.",
             category=ToolCategory.FILESYSTEM,
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path to the file to read"},
+                    "path": {"type": "string", "description": "Path to the file (use simple names like 'file.txt', not full paths)"},
                     "encoding": {
                         "type": "string",
                         "description": "File encoding (default: utf-8)",
@@ -228,12 +252,12 @@ async def register_filesystem_tools(registry: ToolRegistry) -> None:
     registry.register_tool(
         ToolDefinition(
             name="write_file",
-            description="Write content to a file",
+            description="Write/create a file with the specified content. Call this tool directly - do not use execute_command for file operations.",
             category=ToolCategory.FILESYSTEM,
             input_schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path to the file to write"},
+                    "path": {"type": "string", "description": "Path to the file (use simple names like 'file.txt', not full paths)"},
                     "content": {"type": "string", "description": "Content to write to the file"},
                     "encoding": {
                         "type": "string",
@@ -251,7 +275,7 @@ async def register_filesystem_tools(registry: ToolRegistry) -> None:
     registry.register_tool(
         ToolDefinition(
             name="list_directory",
-            description="List contents of a directory",
+            description="List contents of a directory. Call this tool directly - do not use execute_command.",
             category=ToolCategory.FILESYSTEM,
             input_schema={
                 "type": "object",

@@ -84,10 +84,14 @@ class ToolRegistry:
         from xpressai.tools.builtin.filesystem import register_filesystem_tools
         from xpressai.tools.builtin.shell import register_shell_tools
         from xpressai.tools.builtin.web import register_web_tools
+        from xpressai.tools.builtin.ask_user import register_ask_user_tool
+        from xpressai.tools.builtin.task_control import register_task_control_tools
 
         await register_filesystem_tools(self)
         await register_shell_tools(self)
         await register_web_tools(self)
+        await register_ask_user_tool(self)
+        await register_task_control_tools(self)
 
     def register_tool(self, tool: ToolDefinition) -> None:
         """Register a tool in the registry.

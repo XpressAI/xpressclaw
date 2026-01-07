@@ -2,12 +2,20 @@
 
 import pytest
 from pathlib import Path
+from unittest.mock import MagicMock, AsyncMock
 
 from xpressai.tools.registry import (
     ToolRegistry,
     ToolDefinition,
     ToolCategory,
     ToolPermission,
+)
+from xpressai.tools.builtin.meta import (
+    set_managers,
+    create_task,
+    create_memory,
+    search_memory,
+    META_TOOLS,
 )
 
 
@@ -225,3 +233,124 @@ class TestToolRegistry:
         assert len(schemas) == 1
         assert schemas[0]["name"] == "test_tool"
         assert schemas[0]["inputSchema"]["type"] == "object"
+
+
+class TestMetaTools:
+    """Tests for meta tools (task creation, memory, etc.)."""
+
+    @pytest.fixture(autouse=True)
+    def reset_managers(self):
+        """Reset managers before and after each test."""
+        set_managers(None, None, None, agent_id=None, in_task_context=False, task_id=None)
+        yield
+        set_managers(None, None, None, agent_id=None, in_task_context=False, task_id=None)
+
+    @pytest.mark.asyncio
+    async def test_create_task_blocked_in_task_context(self):
+        """Test that create_task is blocked when agent is executing a task."""
+        mock_board = MagicMock()
+        mock_memory = MagicMock()
+        mock_sop = MagicMock()
+
+        # Set context as if we're inside a task execution
+        set_managers(
+            mock_board,
+            mock_memory,
+            mock_sop,
+            agent_id="test-agent",
+            in_task_context=True,
+            task_id="task-123",
+        )
+
+        # Try to create a task - should be blocked
+        result = await create_task("New Task", "Description")
+
+        assert "error" in result
+        assert "Cannot create new tasks while executing a task" in result["error"]
+        assert "hint" in result
+
+    @pytest.mark.asyncio
+    async def test_create_task_allowed_in_chat_context(self):
+        """Test that create_task works in chat context (not in task)."""
+        mock_board = MagicMock()
+        mock_task = MagicMock()
+        mock_task.id = "task-456"
+        mock_task.title = "New Task"
+        mock_task.status.value = "pending"
+        mock_task.agent_id = "test-agent"
+        mock_board.create_task = AsyncMock(return_value=mock_task)
+
+        set_managers(
+            mock_board,
+            MagicMock(),
+            MagicMock(),
+            agent_id="test-agent",
+            in_task_context=False,  # Chat context, not task
+            task_id=None,
+        )
+
+        result = await create_task("New Task", "Description")
+
+        assert result["success"] is True
+        assert result["task_id"] == "task-456"
+        mock_board.create_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_task_without_board_returns_error(self):
+        """Test create_task returns error if task board not available."""
+        set_managers(None, None, None, agent_id=None, in_task_context=False)
+
+        result = await create_task("Test Task")
+
+        assert "error" in result
+        assert "Task board not available" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_memory_works(self):
+        """Test create_memory creates memories."""
+        mock_memory = MagicMock()
+        mock_result = MagicMock()
+        mock_result.id = "mem-123"
+        mock_result.summary = "Test summary"
+        mock_result.tags = ["tag1", "tag2"]
+        mock_memory.add = AsyncMock(return_value=mock_result)
+
+        set_managers(MagicMock(), mock_memory, MagicMock(), agent_id="test-agent")
+
+        result = await create_memory(
+            content="Full content here",
+            summary="Test summary",
+            tags=["tag1", "tag2"],
+        )
+
+        assert result["success"] is True
+        assert result["memory_id"] == "mem-123"
+        mock_memory.add.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_search_memory_works(self):
+        """Test search_memory returns results."""
+        mock_memory = MagicMock()
+        mock_result = MagicMock()
+        mock_result.memory.id = "mem-123"
+        mock_result.memory.summary = "Found memory"
+        mock_result.memory.content = "Memory content"
+        mock_result.memory.tags = ["tag1"]
+        mock_result.relevance_score = 0.95
+        mock_memory.search = AsyncMock(return_value=[mock_result])
+
+        set_managers(MagicMock(), mock_memory, MagicMock(), agent_id="test-agent")
+
+        result = await search_memory("test query", limit=5)
+
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert len(result["memories"]) == 1
+        assert result["memories"][0]["id"] == "mem-123"
+
+    def test_meta_tools_dict_contains_expected_tools(self):
+        """Test META_TOOLS dict has the expected tools."""
+        assert "create_task" in META_TOOLS
+        assert "create_memory" in META_TOOLS
+        assert "search_memory" in META_TOOLS
+        assert "create_procedure" in META_TOOLS

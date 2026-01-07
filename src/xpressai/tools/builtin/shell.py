@@ -12,12 +12,16 @@ import asyncio
 import shlex
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from xpressai.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Import workspace from filesystem tools for consistency
+from xpressai.tools.builtin.filesystem import get_workspace
 
 
 # Default allowed commands (safe subset)
@@ -102,7 +106,7 @@ async def execute_command(
     Args:
         command: The command to execute
         timeout: Timeout in seconds (default 60)
-        working_directory: Directory to run command in
+        working_directory: Directory to run command in (default: current directory)
         allowed_commands: List of allowed command prefixes
 
     Returns:
@@ -130,7 +134,13 @@ async def execute_command(
             f"Allowed commands: {', '.join(sorted(allowed)[:10])}..."
         )
 
-    logger.info(f"Executing command: {command}")
+    # Use agent workspace as default working directory
+    if working_directory is None:
+        workspace = get_workspace()
+        workspace.mkdir(parents=True, exist_ok=True)
+        working_directory = str(workspace)
+
+    logger.info(f"Executing command: {command} (in {working_directory})")
 
     # Execute the command
     try:
@@ -208,13 +218,21 @@ async def register_shell_tools(registry: ToolRegistry) -> None:
         working_directory: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Wrapper that returns dict for MCP."""
+        # Resolve default working directory
+        actual_working_dir = working_directory
+        if actual_working_dir is None:
+            workspace = get_workspace()
+            workspace.mkdir(parents=True, exist_ok=True)
+            actual_working_dir = str(workspace)
+
         result = await execute_command(
             command=command,
             timeout=timeout,
-            working_directory=working_directory,
+            working_directory=actual_working_dir,
         )
         return {
             "command": result.command,
+            "working_directory": actual_working_dir,
             "exit_code": result.exit_code,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -225,8 +243,9 @@ async def register_shell_tools(registry: ToolRegistry) -> None:
         ToolDefinition(
             name="execute_command",
             description=(
-                "Execute a shell command. Only certain commands are allowed for safety. "
-                "Allowed commands include: git, npm, pip, python, make, ls, cat, grep, etc."
+                "Execute a shell command (like ls, cat, git, python, etc.) in the agent workspace. "
+                "Default working directory is the current directory."
+                "NOTE: This is for shell commands only. To read/write files, use the read_file and write_file tools instead."
             ),
             category=ToolCategory.SHELL,
             input_schema={
