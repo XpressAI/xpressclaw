@@ -15,6 +15,19 @@ from xpressai.core.exceptions import BackendError, BackendInitializationError
 
 logger = logging.getLogger(__name__)
 
+# Memory system instructions - prepended to all agents
+MEMORY_SYSTEM_INSTRUCTIONS = """
+## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
+
+You cannot form new long-term memories naturally. After each conversation ends, you will forget everything unless you explicitly save it using your memory tools.
+
+**Before starting work:** Use `search_memory` to recall what you know about the user, their projects, and relevant context.
+
+**During conversations:** When you learn important information (user details, company info, project decisions, preferences, technical details, contacts, URLs), use `create_memory` IMMEDIATELY. If you don't save it, you won't remember it next time.
+
+**Be proactive:** If someone tells you about themselves or their work, SAVE IT. Your memory is your zettelkasten - treat it as essential to your function.
+""".strip()
+
 # Check for SDK availability
 CLAUDE_SDK_AVAILABLE = False
 ANTHROPIC_AVAILABLE = False
@@ -33,6 +46,51 @@ try:
 
     CLAUDE_SDK_AVAILABLE = True
     logger.info("Claude Agent SDK available")
+
+    # Define task control tools for the SDK
+    # Note: SDK tools receive arguments as a dict and return MCP-style content
+    @tool(
+        name="complete_task",
+        description="Mark the current task as COMPLETED. You MUST call this tool when you have finished the task. Do not just respond with text - call this tool to signal completion.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A brief summary of what was accomplished",
+                },
+            },
+            "required": ["summary"],
+        },
+    )
+    async def complete_task(args: dict) -> dict:
+        from xpressai.tools.builtin.task_control import _mark_task_done
+        summary = args.get("summary", "")
+        _mark_task_done(summary)
+        logger.info(f"Task marked as completed via SDK: {summary[:100]}...")
+        return {"content": [{"type": "text", "text": f"Task completed: {summary}"}]}
+
+    @tool(
+        name="fail_task",
+        description="Mark the current task as FAILED. Call this if you cannot complete the task for any reason (missing permissions, missing information, errors, etc.).",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Explanation of why the task cannot be completed",
+                },
+            },
+            "required": ["reason"],
+        },
+    )
+    async def fail_task(args: dict) -> dict:
+        from xpressai.tools.builtin.task_control import _mark_task_done
+        reason = args.get("reason", "")
+        _mark_task_done(f"FAILED: {reason}")
+        logger.info(f"Task marked as failed via SDK: {reason[:100]}...")
+        return {"content": [{"type": "text", "text": f"Task failed: {reason}"}]}
+
 except ImportError:
     logger.debug("claude-agent-sdk not installed, falling back to anthropic")
 
@@ -102,21 +160,38 @@ class ClaudeAgentBackend(AgentBackend):
         # Build MCP server configs from stored config
         mcp_servers = self._build_mcp_servers()
 
-        # Build allowed tools list
-        allowed_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task"]
+        # Build allowed tools list - include our custom task control tools
+        allowed_tools = [
+            "Read", "Write", "Edit", "Bash", "Glob", "Grep", "Task",
+            "WebFetch", "WebSearch",  # Web tools
+            "complete_task", "fail_task",  # Task control tools
+        ]
 
         # Add MCP tool permissions
         for server_name in mcp_servers.keys():
             # Allow all tools from each MCP server
             allowed_tools.append(f"mcp__{server_name}__*")
 
-        # Build options
+        # Create in-process MCP server for task control tools
+        task_control_server = create_sdk_mcp_server(
+            name="xpressai_task_control",
+            version="1.0.0",
+            tools=[complete_task, fail_task],
+        )
+        mcp_servers["xpressai_task_control"] = task_control_server
+
+        # Build full system prompt with memory instructions
+        # Memory tools are always available in chat mode via meta tools
+        full_system_prompt = f"{MEMORY_SYSTEM_INSTRUCTIONS}\n\n{self._system_prompt}" if self._system_prompt else MEMORY_SYSTEM_INSTRUCTIONS
+
+        # Use bypassPermissions for autonomous agent operation
+        # Valid modes: acceptEdits, bypassPermissions, default, dontAsk, plan
         options = ClaudeAgentOptions(
-            system_prompt=self._system_prompt if self._system_prompt else None,
+            system_prompt=full_system_prompt if full_system_prompt else None,
             cwd=str(self._cwd) if self._cwd else None,
             allowed_tools=allowed_tools,
-            permission_mode="acceptEdits",
-            mcp_servers=mcp_servers if mcp_servers else None,
+            permission_mode="bypassPermissions",
+            mcp_servers=mcp_servers,
         )
 
         self._client = ClaudeSDKClient(options=options)
@@ -245,8 +320,8 @@ class ClaudeAgentBackend(AgentBackend):
         if self._anthropic_client is None:
             raise BackendError("Backend not initialized")
 
-        # Build system prompt
-        system = self._system_prompt
+        # Build system prompt with memory instructions
+        system = f"{MEMORY_SYSTEM_INSTRUCTIONS}\n\n{self._system_prompt}" if self._system_prompt else MEMORY_SYSTEM_INSTRUCTIONS
         if self._memory_context:
             system += f"\n\n{self._memory_context}"
 

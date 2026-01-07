@@ -87,14 +87,20 @@ class Runtime:
         self._db = None
         self._memory = None
         self._task_board = None
+        self._conversation_manager = None
         self._budget_manager = None
         self._docker = None
         self._sop_manager = None
         self._scheduler = None
+        self._tool_registry = None
+        self._activity = None
 
         # Agent runners and backends
         self._runners: dict[str, Any] = {}  # AgentRunner instances
         self._backends: dict[str, Any] = {}  # AgentBackend instances
+
+        # Memory sub-agent backends (per-agent, separate context to avoid conversation pollution)
+        self._memory_backends: dict[str, Any] = {}  # cache_key -> backend instance
 
     @property
     def is_running(self) -> bool:
@@ -106,6 +112,149 @@ class Runtime:
         """Check if runtime is initialized."""
         return self._initialized
 
+    @property
+    def memory_manager(self):
+        """Get the memory manager instance."""
+        return self._memory
+
+    @property
+    def task_board(self):
+        """Get the task board instance."""
+        return self._task_board
+
+    @property
+    def sop_manager(self):
+        """Get the SOP manager instance."""
+        return self._sop_manager
+
+    @property
+    def conversation_manager(self):
+        """Get the conversation manager instance."""
+        return self._conversation_manager
+
+    @property
+    def activity_manager(self):
+        """Get the activity manager instance."""
+        return self._activity
+
+    @property
+    def memory_backends(self):
+        """Get the memory sub-agent backends dict.
+
+        Each agent gets its own memory backend (same type as main backend)
+        with a separate conversation history to avoid polluting the main
+        agent conversations.
+        """
+        return self._memory_backends
+
+    async def get_memory_backend(self, agent_config: AgentConfig | None = None):
+        """Get or create the memory sub-agent backend.
+
+        Creates a backend of the same type as the agent, with a separate
+        conversation context for memory operations.
+
+        Priority for configuration:
+        1. memory.memory_agent if explicitly configured (user override with local model)
+        2. Same backend type as the agent (default - uses agent's model with separate context)
+
+        Args:
+            agent_config: The agent config to derive backend type and settings from
+
+        Returns:
+            Backend instance for memory operations, or None if unavailable
+        """
+        from xpressai.agents.registry import get_registry
+
+        # 1. Check for explicit memory_agent override (always uses local model)
+        if self.config.memory and self.config.memory.memory_agent:
+            model_config = self.config.memory.memory_agent
+            logger.debug("Using explicit memory_agent config (local model)")
+
+            # Cache key for explicit memory agent
+            cache_key = f"memory:{model_config.base_url}:{model_config.model}"
+            if cache_key in self._memory_backends:
+                return self._memory_backends[cache_key]
+
+            try:
+                from xpressai.agents.local import LocalModelBackend
+
+                backend = LocalModelBackend()
+                backend.configure_model(model_config)
+                backend._system_prompt = self._get_memory_system_prompt()
+                await backend._check_server()
+
+                self._memory_backends[cache_key] = backend
+                logger.info(f"Memory sub-agent initialized with explicit config: {model_config.model}")
+                return backend
+
+            except Exception as e:
+                logger.warning(f"Failed to initialize explicit memory backend: {e}")
+                return None
+
+        # 2. Use same backend type as the agent (default)
+        if not agent_config:
+            logger.debug("No agent config provided for memory backend")
+            return None
+
+        backend_type = agent_config.backend
+        cache_key = f"memory:{agent_config.name}:{backend_type}"
+
+        if cache_key in self._memory_backends:
+            # Clear history on reuse to ensure fresh context
+            backend = self._memory_backends[cache_key]
+            if hasattr(backend, 'clear_history'):
+                backend.clear_history()
+            return backend
+
+        try:
+            registry = get_registry()
+
+            # Create a new backend of the same type
+            backend_class = registry._backends.get(backend_type)
+            if not backend_class:
+                logger.warning(f"Unknown backend type for memory: {backend_type}")
+                return None
+
+            backend = backend_class()
+
+            # Configure based on backend type
+            if backend_type == "local":
+                # Local model - use agent's local_model config or global
+                model_config = agent_config.local_model or self.config.local_model
+                if model_config and hasattr(backend, "configure_model"):
+                    backend.configure_model(model_config)
+
+            # Create a memory-focused config for initialization
+            # Memory backends don't need MCP servers or tools - they're just for text analysis
+            memory_agent_config = AgentConfig(
+                name=f"{agent_config.name}_memory",
+                backend=backend_type,
+                role=self._get_memory_system_prompt(),
+            )
+
+            # Do NOT configure MCP servers for memory backends - they don't need tools
+            # and spawning extra subprocesses wastes resources
+
+            await backend.initialize(memory_agent_config)
+
+            self._memory_backends[cache_key] = backend
+            logger.info(f"Memory sub-agent initialized with {backend_type} backend for {agent_config.name}")
+            return backend
+
+        except Exception as e:
+            logger.warning(f"Failed to initialize memory backend ({backend_type}): {e}")
+            return None
+
+    def _get_memory_system_prompt(self) -> str:
+        """Get the system prompt for memory analysis."""
+        return (
+            "You are a memory analysis assistant. Your role is to:\n"
+            "1. Evaluate if memories are relevant to the current context\n"
+            "2. Analyze conversations to extract important information to remember\n"
+            "3. Rewrite memories to be more useful based on how they were used\n"
+            "Be concise and focused. Reply with just the requested format."
+        )
+
     async def initialize(self) -> None:
         """Initialize the runtime and all subsystems."""
         if self._initialized:
@@ -114,20 +263,39 @@ class Runtime:
         from xpressai.memory.database import Database
         from xpressai.memory.manager import MemoryManager
         from xpressai.tasks.board import TaskBoard
+        from xpressai.tasks.conversation import ConversationManager
         from xpressai.budget.manager import BudgetManager
         from xpressai.tasks.sop import SOPManager
         from xpressai.tasks.scheduler import TaskScheduler
+        from xpressai.tools.registry import ToolRegistry
+        from xpressai.core.activity import ActivityManager
 
         # Initialize database
         db_path = self.config.system.data_dir / "xpressai.db"
         self._db = Database(db_path)
 
         # Initialize subsystems
+        self._activity = ActivityManager(self._db)
         self._memory = MemoryManager(self._db, self.config.memory)
         self._task_board = TaskBoard(self._db)
+        self._conversation_manager = ConversationManager(self._db, self._task_board)
         self._budget_manager = BudgetManager(self._db, self.config.system.budget)
         self._sop_manager = SOPManager(self.workspace / ".xpressai" / "sops")
         self._scheduler = TaskScheduler(self._task_board, self._db)
+
+        # Set workspace for builtin tools (file operations, shell commands)
+        from xpressai.tools.builtin.filesystem import set_workspace
+        set_workspace(self.config.system.workspace_dir)
+        logger.info(f"Workspace set to: {self.config.system.workspace_dir}")
+
+        # Initialize tool registry with builtin tools
+        self._tool_registry = ToolRegistry()
+        await self._tool_registry.initialize()
+        logger.info(f"Tool registry initialized with {len(self._tool_registry.list_tools())} tools")
+
+        # Set up ask_user tool with conversation manager
+        from xpressai.tools.builtin.ask_user import set_conversation_manager
+        set_conversation_manager(self._conversation_manager)
 
         # Register agents from config
         for agent_config in self.config.agents:
@@ -137,8 +305,16 @@ class Runtime:
                 backend=agent_config.backend,
             )
 
+        # Memory sub-agent is initialized lazily via get_memory_backend()
+        # to use the same LLM config as the agent being chatted with
+
         self._initialized = True
         await self._emit_event(RuntimeEvent(type="runtime.initialized"))
+
+        # Log startup
+        from xpressai.core.activity import EventType
+        await self._activity.log(EventType.SYSTEM_STARTUP, data={"agents": list(self._agents.keys())})
+
         logger.info("Runtime initialized")
 
     async def start(self) -> None:
@@ -194,6 +370,12 @@ class Runtime:
 
         self._running = False
         await self._emit_event(RuntimeEvent(type="runtime.stopped"))
+
+        # Log shutdown
+        if self._activity:
+            from xpressai.core.activity import EventType
+            await self._activity.log(EventType.SYSTEM_SHUTDOWN)
+
         logger.info("Runtime stopped")
 
     async def start_agent(self, agent_id: str) -> AgentState:
@@ -252,13 +434,58 @@ class Runtime:
                 # Store backend for later use
                 self._backends[agent_id] = backend
 
+                # Configure tools for local backends
+                if agent.backend == "local" and self._tool_registry:
+                    # Get tool schemas for the backend
+                    tool_schemas = self._tool_registry.get_tool_schemas()
+                    if hasattr(backend, 'register_tools'):
+                        await backend.register_tools(tool_schemas)
+                        logger.info(f"Registered {len(tool_schemas)} tools for {agent_id}")
+
+                    # Set tool format from config
+                    local_model_config = agent_config.local_model or self.config.local_model
+                    if local_model_config and hasattr(backend, 'set_tool_format'):
+                        backend.set_tool_format(local_model_config.tool_format)
+
+                # Get max_tool_calls from config and register pricing
+                max_tool_calls = 20  # default
+                local_model_config = agent_config.local_model or self.config.local_model
+                if local_model_config:
+                    max_tool_calls = local_model_config.max_tool_calls
+
+                    # Register custom pricing for local model if set
+                    if (local_model_config.price_input is not None and
+                        local_model_config.price_output is not None and
+                        self._budget_manager):
+                        self._budget_manager.register_model_pricing(
+                            local_model_config.model,
+                            local_model_config.price_input,
+                            local_model_config.price_output
+                        )
+                        logger.info(f"Registered pricing for {local_model_config.model}: "
+                                    f"${local_model_config.price_input}/M input, "
+                                    f"${local_model_config.price_output}/M output")
+
+                # Create memory backend factory for this agent
+                async def memory_backend_factory(ac=agent_config):
+                    return await self.get_memory_backend(ac)
+
                 # Create and start the runner
                 runner = AgentRunner(
                     agent_id=agent_id,
                     backend=backend,
                     task_board=self._task_board,
                     sop_manager=self._sop_manager,
+                    conversation_manager=self._conversation_manager,
+                    tool_registry=self._tool_registry if agent.backend == "local" else None,
+                    activity_manager=self._activity,
+                    memory_manager=self._memory,
+                    memory_config=self.config.memory,
+                    agent_config=agent_config,
+                    memory_backend_factory=memory_backend_factory,
+                    budget_manager=self._budget_manager,
                 )
+                runner.max_tool_calls = max_tool_calls
                 await runner.start()
                 self._runners[agent_id] = runner
 
@@ -267,6 +494,15 @@ class Runtime:
             agent.error_message = None
 
             await self._emit_event(RuntimeEvent(type="agent.started", agent_id=agent_id))
+
+            # Log agent started
+            if self._activity:
+                from xpressai.core.activity import EventType
+                await self._activity.log(
+                    EventType.AGENT_STARTED,
+                    agent_id=agent_id,
+                    data={"backend": agent.backend}
+                )
 
             logger.info(f"Agent {agent_id} started (runner active)")
 
@@ -327,6 +563,11 @@ class Runtime:
 
             await self._emit_event(RuntimeEvent(type="agent.stopped", agent_id=agent_id))
 
+            # Log agent stopped
+            if self._activity:
+                from xpressai.core.activity import EventType
+                await self._activity.log(EventType.AGENT_STOPPED, agent_id=agent_id)
+
             logger.info(f"Agent {agent_id} stopped")
 
         except Exception as e:
@@ -343,6 +584,57 @@ class Runtime:
             List of agent states
         """
         return list(self._agents.values())
+
+    def register_agent(self, agent_config: "AgentConfig") -> AgentState:
+        """Register a new agent dynamically.
+
+        Args:
+            agent_config: Configuration for the new agent
+
+        Returns:
+            The new agent state
+
+        Raises:
+            ValueError: If agent already exists
+        """
+        if agent_config.name in self._agents:
+            raise ValueError(f"Agent '{agent_config.name}' already exists")
+
+        # Add to config's agent list
+        self.config.agents.append(agent_config)
+
+        # Create agent state
+        agent = AgentState(
+            id=agent_config.name,
+            name=agent_config.name,
+            backend=agent_config.backend,
+        )
+        self._agents[agent_config.name] = agent
+
+        logger.info(f"Registered new agent: {agent_config.name}")
+        return agent
+
+    def reload_config(self) -> None:
+        """Reload configuration from xpressai.yaml and register any new agents."""
+        from pathlib import Path
+        from xpressai.core.config import load_config
+
+        config_path = Path.cwd() / "xpressai.yaml"
+        if not config_path.exists():
+            logger.warning("No xpressai.yaml found for reload")
+            return
+
+        new_config = load_config(config_path)
+
+        # Find new agents that aren't already registered
+        existing_names = set(self._agents.keys())
+        for agent_config in new_config.agents:
+            if agent_config.name not in existing_names:
+                self.register_agent(agent_config)
+
+        # Update the config reference for any new settings
+        self.config = new_config
+        logger.info("Configuration reloaded")
 
     async def get_agent(self, agent_id: str) -> AgentState | None:
         """Get a specific agent's state.
@@ -416,7 +708,7 @@ class Runtime:
         """
         if self._task_board:
             return await self._task_board.get_counts()
-        return {"pending": 0, "in_progress": 0, "completed": 0}
+        return {"pending": 0, "in_progress": 0, "waiting_for_input": 0, "completed": 0}
 
     async def get_budget_summary(self, agent_id: str | None = None) -> dict[str, Any]:
         """Get budget summary.
@@ -430,6 +722,19 @@ class Runtime:
         if self._budget_manager:
             return await self._budget_manager.get_summary(agent_id)
         return {"total_spent": 0, "limit": None}
+
+    async def get_top_spenders(self, limit: int = 3) -> list[dict[str, Any]]:
+        """Get top spending agents.
+
+        Args:
+            limit: Number of top spenders to return
+
+        Returns:
+            List of agent spending summaries
+        """
+        if self._budget_manager:
+            return await self._budget_manager.get_top_spenders(limit)
+        return []
 
     def _get_agent_config(self, agent_id: str) -> AgentConfig | None:
         """Get config for an agent."""

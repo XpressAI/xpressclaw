@@ -94,6 +94,10 @@ class BackendRegistry:
             if mcp_servers and hasattr(backend, "configure_mcp_servers"):
                 backend.configure_mcp_servers(mcp_servers)
 
+            # Configure local model settings if available (for local backends)
+            if config and config.local_model and hasattr(backend, "configure_model"):
+                backend.configure_model(config.local_model)
+
             if config:
                 await backend.initialize(config)
 
