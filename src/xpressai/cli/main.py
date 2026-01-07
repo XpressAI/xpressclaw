@@ -82,13 +82,71 @@ def tui() -> None:
 
 
 @cli.command()
-@click.option("--port", "-p", default=8935, help="Port to run on")
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-def dashboard(port: int, host: str) -> None:
-    """Open the web dashboard."""
-    from xpressai.web.app import run_web
+@click.argument("agent")
+def chat(agent: str) -> None:
+    """Start an interactive chat session with an agent.
 
-    run_web(host=host, port=port)
+    Example: xpressai chat atlas
+    """
+    from xpressai.cli.chat_cmd import run_chat
+
+    run_chat(agent)
+
+
+@cli.command()
+@click.option("--agent", "-a", help="Filter by agent")
+@click.option("--limit", "-n", default=50, help="Number of events to show")
+@click.option("--follow", "-f", is_flag=True, help="Follow activity in real-time")
+def activity(agent: str | None, limit: int, follow: bool) -> None:
+    """View activity logs.
+
+    Shows system events like task completions, agent errors, etc.
+    """
+    from xpressai.cli.activity_cmd import run_activity
+
+    run_activity(agent=agent, limit=limit, follow=follow)
+
+
+@cli.command()
+@click.option("--port", "-p", default=8935, help="Port to check")
+@click.option("--host", default="127.0.0.1", help="Host to check")
+@click.option("--open", "-o", "open_browser", is_flag=True, help="Open in browser")
+def dashboard(port: int, host: str, open_browser: bool) -> None:
+    """Open the web dashboard.
+
+    The dashboard is served by 'xpressai up'. This command checks if it's
+    running and shows the URL.
+    """
+    import urllib.request
+
+    url = f"http://{host}:{port}"
+
+    # Check if runtime is serving the dashboard
+    try:
+        health_url = f"{url}/api/health"
+        with urllib.request.urlopen(health_url, timeout=2) as response:
+            # Runtime is running with dashboard
+            click.echo(click.style("Dashboard available at:", fg="green"))
+            click.echo(f"  {url}")
+            click.echo()
+
+            if open_browser:
+                import webbrowser
+                webbrowser.open(url)
+                click.echo("Opened in browser.")
+            else:
+                click.echo("Run with --open to open in browser.")
+            return
+    except Exception:
+        pass
+
+    # No runtime running
+    click.echo(click.style("Dashboard not available.", fg="yellow"))
+    click.echo()
+    click.echo("The dashboard is served by the runtime. Start it with:")
+    click.echo(click.style("  xpressai up", fg="cyan"))
+    click.echo()
+    click.echo(f"Then open: {url}")
 
 
 @cli.group()
@@ -177,6 +235,60 @@ def tasks_delete(task_id: str) -> None:
     from xpressai.cli.tasks_cmd import delete_task
 
     delete_task(task_id)
+
+
+@tasks.command("assign")
+@click.argument("task_id")
+@click.argument("agent_id", required=False)
+@click.pass_context
+def tasks_assign(ctx: click.Context, task_id: str, agent_id: str | None) -> None:
+    """Assign a task to an agent (or unassign if no agent given).
+
+    Example: xpressai tasks atlas assign abc123 bob
+    """
+    from xpressai.cli.tasks_cmd import assign_task
+
+    assign_task(task_id, agent_id)
+
+
+@tasks.command("messages")
+@click.argument("task_id")
+@click.pass_context
+def tasks_messages(ctx: click.Context, task_id: str) -> None:
+    """Show conversation messages for a task.
+
+    Example: xpressai tasks atlas messages abc123
+    """
+    from xpressai.cli.tasks_cmd import show_messages
+
+    show_messages(task_id)
+
+
+@tasks.command("message")
+@click.argument("task_id")
+@click.argument("content")
+@click.pass_context
+def tasks_message(ctx: click.Context, task_id: str, content: str) -> None:
+    """Add a message to a task conversation.
+
+    Example: xpressai tasks atlas message abc123 "Please also add tests"
+    """
+    from xpressai.cli.tasks_cmd import add_message
+
+    add_message(task_id, content)
+
+
+@tasks.command("retry")
+@click.argument("task_id")
+@click.pass_context
+def tasks_retry(ctx: click.Context, task_id: str) -> None:
+    """Retry a failed task from scratch.
+
+    Clears conversation history and resets to pending.
+    """
+    from xpressai.cli.tasks_cmd import retry_task
+
+    retry_task(task_id)
 
 
 @tasks.command("schedule")
@@ -270,6 +382,77 @@ def budget_show(agent: str | None) -> None:
     from xpressai.cli.budget_cmd import show_budget
 
     show_budget(agent=agent)
+
+
+@cli.group()
+def memory() -> None:
+    """Inspect agent memory state."""
+    pass
+
+
+@memory.command("list")
+@click.option("--agent", "-a", help="Filter by agent")
+@click.option("--limit", "-n", default=10, help="Number of memories to show")
+def memory_list(agent: str | None, limit: int) -> None:
+    """List recent memories."""
+    from xpressai.cli.memory_cmd import run_memory_list
+
+    run_memory_list(agent=agent, limit=limit)
+
+
+@memory.command("search")
+@click.argument("query")
+@click.option("--agent", "-a", help="Filter by agent")
+@click.option("--limit", "-n", default=10, help="Maximum results")
+def memory_search(query: str, agent: str | None, limit: int) -> None:
+    """Search memories by semantic similarity.
+
+    Example: xpressai memory search "deployment process"
+    """
+    from xpressai.cli.memory_cmd import run_memory_search
+
+    run_memory_search(query=query, agent=agent, limit=limit)
+
+
+@memory.command("show")
+@click.argument("memory_id")
+def memory_show(memory_id: str) -> None:
+    """Show details of a specific memory."""
+    from xpressai.cli.memory_cmd import run_memory_show
+
+    run_memory_show(memory_id=memory_id)
+
+
+@memory.command("stats")
+def memory_stats() -> None:
+    """Show memory system statistics."""
+    from xpressai.cli.memory_cmd import run_memory_stats
+
+    run_memory_stats()
+
+
+@memory.command("slots")
+@click.argument("agent")
+def memory_slots(agent: str) -> None:
+    """Show near-term memory slots for an agent.
+
+    Example: xpressai memory slots atlas
+    """
+    from xpressai.cli.memory_cmd import run_memory_slots
+
+    run_memory_slots(agent=agent)
+
+
+@memory.command("delete")
+@click.argument("memory_id")
+def memory_delete(memory_id: str) -> None:
+    """Delete a memory by ID.
+
+    Example: xpressai memory delete abc123
+    """
+    from xpressai.cli.memory_cmd import run_memory_delete
+
+    run_memory_delete(memory_id=memory_id)
 
 
 if __name__ == "__main__":

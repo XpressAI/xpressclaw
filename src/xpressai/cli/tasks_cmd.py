@@ -363,3 +363,204 @@ async def _remove_schedule_async(schedule_id: str) -> None:
     await runtime._scheduler.remove_schedule(schedule.id)
 
     click.echo(click.style(f"Removed schedule: {schedule.name}", fg="green"))
+
+
+def assign_task(task_id: str, agent_id: str | None) -> None:
+    """Assign a task to an agent."""
+    asyncio.run(_assign_task_async(task_id, agent_id))
+
+
+async def _assign_task_async(task_id: str, agent_id: str | None) -> None:
+    """Assign task asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._task_board is None:
+        click.echo("Task board not initialized.")
+        return
+
+    # Find task by ID prefix
+    tasks = await runtime._task_board.get_tasks()
+    matching = [t for t in tasks if t.id.startswith(task_id)]
+
+    if not matching:
+        click.echo(click.style(f"Task not found: {task_id}", fg="red"))
+        return
+
+    if len(matching) > 1:
+        click.echo(click.style(f"Multiple tasks match '{task_id}'. Be more specific.", fg="red"))
+        for t in matching:
+            click.echo(f"  {t.id[:8]}... - {t.title}")
+        return
+
+    task = matching[0]
+
+    # Verify agent exists if assigning
+    if agent_id:
+        agent_state = await runtime.get_agent(agent_id)
+        if not agent_state:
+            available = await runtime.list_agents()
+            agent_names = [a.name for a in available]
+            click.echo(click.style(f"Unknown agent: {agent_id}", fg="red"))
+            if agent_names:
+                click.echo(f"Available agents: {', '.join(agent_names)}")
+            return
+
+    await runtime._task_board.assign_task(task.id, agent_id)
+
+    if agent_id:
+        click.echo(click.style(f"Task '{task.title}' assigned to @{agent_id}", fg="green"))
+    else:
+        click.echo(click.style(f"Task '{task.title}' unassigned", fg="yellow"))
+
+
+def show_messages(task_id: str) -> None:
+    """Show conversation messages for a task."""
+    asyncio.run(_show_messages_async(task_id))
+
+
+async def _show_messages_async(task_id: str) -> None:
+    """Show task messages asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._task_board is None:
+        click.echo("Task board not initialized.")
+        return
+
+    # Find task by ID prefix
+    tasks = await runtime._task_board.get_tasks()
+    matching = [t for t in tasks if t.id.startswith(task_id)]
+
+    if not matching:
+        click.echo(click.style(f"Task not found: {task_id}", fg="red"))
+        return
+
+    if len(matching) > 1:
+        click.echo(click.style(f"Multiple tasks match '{task_id}'. Be more specific.", fg="red"))
+        for t in matching:
+            click.echo(f"  {t.id[:8]}... - {t.title}")
+        return
+
+    task = matching[0]
+
+    # Get messages
+    if not hasattr(runtime, 'conversation_manager') or not runtime.conversation_manager:
+        click.echo(click.style("Conversation manager not available.", fg="yellow"))
+        return
+
+    messages = await runtime.conversation_manager.get_messages(task.id)
+
+    click.echo(click.style(f"Conversation for: {task.title}", fg="cyan", bold=True))
+    click.echo(click.style(f"Status: {task.status.value}", fg="white"))
+    click.echo()
+
+    if not messages:
+        click.echo(click.style("No messages yet.", fg="yellow"))
+        return
+
+    role_colors = {
+        "user": "green",
+        "agent": "blue",
+        "system": "white",
+        "tool": "yellow",
+        "hook": "cyan",
+    }
+
+    for msg in messages:
+        color = role_colors.get(msg.role, "white")
+        timestamp = msg.timestamp.strftime("%H:%M:%S")
+
+        # Format header
+        role_display = msg.role.upper()
+        click.echo(click.style(f"[{timestamp}] {role_display}", fg=color, bold=True))
+
+        # Format content (indent each line)
+        for line in msg.content.split("\n"):
+            click.echo(f"  {line}")
+        click.echo()
+
+
+def add_message(task_id: str, content: str) -> None:
+    """Add a message to a task conversation."""
+    asyncio.run(_add_message_async(task_id, content))
+
+
+async def _add_message_async(task_id: str, content: str) -> None:
+    """Add message asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._task_board is None:
+        click.echo("Task board not initialized.")
+        return
+
+    # Find task by ID prefix
+    tasks = await runtime._task_board.get_tasks()
+    matching = [t for t in tasks if t.id.startswith(task_id)]
+
+    if not matching:
+        click.echo(click.style(f"Task not found: {task_id}", fg="red"))
+        return
+
+    if len(matching) > 1:
+        click.echo(click.style(f"Multiple tasks match '{task_id}'. Be more specific.", fg="red"))
+        for t in matching:
+            click.echo(f"  {t.id[:8]}... - {t.title}")
+        return
+
+    task = matching[0]
+
+    # Add message
+    if not hasattr(runtime, 'conversation_manager') or not runtime.conversation_manager:
+        click.echo(click.style("Conversation manager not available.", fg="yellow"))
+        return
+
+    await runtime.conversation_manager.add_message(task.id, "user", content)
+
+    # Resume task if waiting
+    if task.status == TaskStatus.WAITING_FOR_INPUT:
+        await runtime._task_board.update_status(task.id, TaskStatus.PENDING)
+        click.echo(click.style(f"Message added and task resumed.", fg="green"))
+    else:
+        click.echo(click.style(f"Message added to task.", fg="green"))
+
+
+def retry_task(task_id: str) -> None:
+    """Retry a failed task from scratch."""
+    asyncio.run(_retry_task_async(task_id))
+
+
+async def _retry_task_async(task_id: str) -> None:
+    """Retry task asynchronously."""
+    runtime = get_runtime()
+    await runtime.initialize()
+
+    if runtime._task_board is None:
+        click.echo("Task board not initialized.")
+        return
+
+    # Find task by ID prefix
+    tasks = await runtime._task_board.get_tasks()
+    matching = [t for t in tasks if t.id.startswith(task_id)]
+
+    if not matching:
+        click.echo(click.style(f"Task not found: {task_id}", fg="red"))
+        return
+
+    if len(matching) > 1:
+        click.echo(click.style(f"Multiple tasks match '{task_id}'. Be more specific.", fg="red"))
+        for t in matching:
+            click.echo(f"  {t.id[:8]}... - {t.title}")
+        return
+
+    task = matching[0]
+
+    # Clear conversation history
+    if hasattr(runtime, 'conversation_manager') and runtime.conversation_manager:
+        await runtime.conversation_manager.clear_messages(task.id)
+
+    # Reset task to pending
+    await runtime._task_board.update_status(task.id, TaskStatus.PENDING)
+
+    click.echo(click.style(f"Task '{task.title}' reset for retry.", fg="green"))
