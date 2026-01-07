@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="grid">
+    <div class="card">
+        <h2>Agents</h2>
+        <div id="agents-list"
+             hx-get="/partials/agents"
+             hx-trigger="load, every 5s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Budget</h2>
+        <div id="budget-display"
+             hx-get="/partials/budget"
+             hx-trigger="load, every 10s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Tasks</h2>
+        <div id="tasks-summary"
+             hx-get="/partials/tasks"
+             hx-trigger="load, every 5s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Memory</h2>
+        <div id="memory-stats"
+             hx-get="/partials/memory"
+             hx-trigger="load, every 30s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+</div>
+
+<div class="card full-width">
+    <h2>Recent Activity</h2>
+    <div id="activity-log"
+         hx-get="/partials/activity"
+         hx-trigger="load, every 3s"
+         hx-swap="innerHTML">
+        Loading...
+    </div>
+</div>
+{% endblock %}

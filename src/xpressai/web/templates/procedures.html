@@ -1,0 +1,721 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Procedures</h2>
+    <button class="btn-primary" onclick="showCreateForm()">+ New Procedure</button>
+</div>
+
+<div id="create-form-container"></div>
+
+<div class="procedures-container">
+    <div class="procedures-list" id="procedures-list"
+         hx-get="/partials/procedures/list"
+         hx-trigger="load"
+         hx-swap="innerHTML">
+        Loading procedures...
+    </div>
+    <div class="procedure-detail" id="procedure-detail">
+        <div class="empty-state">Select a procedure to view details</div>
+    </div>
+</div>
+
+<script>
+function selectProcedure(element) {
+    // Highlight selected
+    document.querySelectorAll('.procedure-item').forEach(el => el.classList.remove('selected'));
+    element.classList.add('selected');
+}
+
+function closeRunForm() {
+    document.getElementById('run-form-container').innerHTML = '';
+}
+
+function showCreateForm() {
+    fetch('/partials/procedures/create-form')
+        .then(response => response.text())
+        .then(html => {
+            document.getElementById('create-form-container').innerHTML = html;
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Failed to load create form');
+        });
+}
+
+function closeCreateForm() {
+    document.getElementById('create-form-container').innerHTML = '';
+}
+
+function handleProcedureRun(event) {
+    event.preventDefault();
+    const form = event.target;
+    const formData = new FormData(form);
+    
+    // Extract procedure name from form action
+    const actionUrl = form.getAttribute('hx-post');
+    
+    fetch(actionUrl, {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'ok' && data.task_id) {
+            // Redirect to the task detail page
+            window.location.href = '/task/' + data.task_id;
+        } else {
+            alert('Error creating task: ' + (data.error || 'Unknown error'));
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('Failed to create task');
+    });
+}
+
+function handleCreateProcedure(event) {
+    event.preventDefault();
+    const form = event.target;
+    const formData = new FormData();
+    
+    // Basic fields
+    formData.append('name', form.querySelector('[name="name"]').value);
+    formData.append('summary', form.querySelector('[name="summary"]').value);
+    formData.append('tools', form.querySelector('[name="tools"]').value);
+    
+    // Collect inputs
+    const inputs = [];
+    document.querySelectorAll('#inputs-container .input-entry').forEach(entry => {
+        const name = entry.querySelector('.input-name').value.trim();
+        if (name) {
+            inputs.push({
+                name: name,
+                context: entry.querySelector('.input-context').value.trim(),
+                default: entry.querySelector('.input-default').value.trim() || null
+            });
+        }
+    });
+    formData.append('inputs', JSON.stringify(inputs));
+    
+    // Collect steps
+    const steps = [];
+    document.querySelectorAll('#steps-container .step-entry').forEach(entry => {
+        const prompt = entry.querySelector('.step-prompt').value.trim();
+        if (prompt) {
+            const toolsStr = entry.querySelector('.step-tools').value.trim();
+            const inputsStr = entry.querySelector('.step-inputs').value.trim();
+            steps.push({
+                prompt: prompt,
+                tools: toolsStr ? toolsStr.split(',').map(t => t.trim()) : [],
+                inputs: inputsStr ? inputsStr.split(',').map(i => i.trim()) : []
+            });
+        }
+    });
+    formData.append('steps', JSON.stringify(steps));
+    
+    // Collect outputs
+    const outputs = [];
+    document.querySelectorAll('#outputs-container .output-entry').forEach(entry => {
+        const name = entry.querySelector('.output-name').value.trim();
+        if (name) {
+            outputs.push({
+                name: name,
+                context: entry.querySelector('.output-context').value.trim()
+            });
+        }
+    });
+    formData.append('outputs', JSON.stringify(outputs));
+    
+    fetch('/api/procedures', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            closeCreateForm();
+            // Refresh the procedures list
+            htmx.trigger('#procedures-list', 'load');
+            alert('Procedure created successfully!');
+        } else {
+            alert('Error creating procedure: ' + (data.detail || 'Unknown error'));
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('Failed to create procedure');
+    });
+}
+
+function handleEditProcedure(event, originalName) {
+    event.preventDefault();
+    const form = event.target;
+    const formData = new FormData();
+    
+    // Basic fields
+    formData.append('name', form.querySelector('[name="name"]').value);
+    formData.append('summary', form.querySelector('[name="summary"]').value);
+    formData.append('tools', form.querySelector('[name="tools"]').value);
+    
+    // Collect inputs
+    const inputs = [];
+    document.querySelectorAll('#inputs-container .input-entry').forEach(entry => {
+        const name = entry.querySelector('.input-name').value.trim();
+        if (name) {
+            inputs.push({
+                name: name,
+                context: entry.querySelector('.input-context').value.trim(),
+                default: entry.querySelector('.input-default').value.trim() || null
+            });
+        }
+    });
+    formData.append('inputs', JSON.stringify(inputs));
+    
+    // Collect steps
+    const steps = [];
+    document.querySelectorAll('#steps-container .step-entry').forEach(entry => {
+        const prompt = entry.querySelector('.step-prompt').value.trim();
+        if (prompt) {
+            const toolsStr = entry.querySelector('.step-tools').value.trim();
+            const inputsStr = entry.querySelector('.step-inputs').value.trim();
+            steps.push({
+                prompt: prompt,
+                tools: toolsStr ? toolsStr.split(',').map(t => t.trim()) : [],
+                inputs: inputsStr ? inputsStr.split(',').map(i => i.trim()) : []
+            });
+        }
+    });
+    formData.append('steps', JSON.stringify(steps));
+    
+    // Collect outputs
+    const outputs = [];
+    document.querySelectorAll('#outputs-container .output-entry').forEach(entry => {
+        const name = entry.querySelector('.output-name').value.trim();
+        if (name) {
+            outputs.push({
+                name: name,
+                context: entry.querySelector('.output-context').value.trim()
+            });
+        }
+    });
+    formData.append('outputs', JSON.stringify(outputs));
+    
+    fetch('/api/procedures/' + encodeURIComponent(originalName), {
+        method: 'PUT',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            closeRunForm();
+            // Refresh the procedures list
+            htmx.trigger('#procedures-list', 'load');
+            // Reload the detail view with new name
+            htmx.ajax('GET', '/partials/procedures/' + encodeURIComponent(data.name), '#procedure-detail');
+            alert('Procedure updated successfully!');
+        } else {
+            alert('Error updating procedure: ' + (data.detail || 'Unknown error'));
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('Failed to update procedure');
+    });
+}
+
+function deleteProcedure(name) {
+    if (!confirm('Are you sure you want to delete "' + name + '"? This action cannot be undone.')) {
+        return;
+    }
+    
+    fetch('/api/procedures/' + encodeURIComponent(name), {
+        method: 'DELETE'
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            // Clear detail view
+            document.getElementById('procedure-detail').innerHTML = '<div class="empty-state">Select a procedure to view details</div>';
+            // Refresh the procedures list
+            htmx.trigger('#procedures-list', 'load');
+            alert('Procedure deleted successfully!');
+        } else {
+            alert('Error deleting procedure: ' + (data.detail || 'Unknown error'));
+        }
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        alert('Failed to delete procedure');
+    });
+}
+
+// Dynamic form helpers
+function addInput() {
+    const container = document.getElementById('inputs-container');
+    const index = container.children.length;
+    const html = `
+        <div class="input-entry" data-index="${index}">
+            <input type="text" placeholder="Name" class="input-name">
+            <input type="text" placeholder="Description" class="input-context">
+            <input type="text" placeholder="Default value" class="input-default">
+            <button type="button" class="btn-remove" onclick="removeEntry(this)">×</button>
+        </div>
+    `;
+    container.insertAdjacentHTML('beforeend', html);
+}
+
+function addStep() {
+    const container = document.getElementById('steps-container');
+    const index = container.children.length;
+    const html = `
+        <div class="step-entry" data-index="${index}">
+            <textarea placeholder="Step prompt - what should the agent do?" class="step-prompt" rows="2"></textarea>
+            <input type="text" placeholder="Tools (comma-separated)" class="step-tools">
+            <input type="text" placeholder="Inputs used (comma-separated)" class="step-inputs">
+            <button type="button" class="btn-remove" onclick="removeEntry(this)">×</button>
+        </div>
+    `;
+    container.insertAdjacentHTML('beforeend', html);
+}
+
+function addOutput() {
+    const container = document.getElementById('outputs-container');
+    const index = container.children.length;
+    const html = `
+        <div class="output-entry" data-index="${index}">
+            <input type="text" placeholder="Output name" class="output-name">
+            <input type="text" placeholder="Description" class="output-context">
+            <button type="button" class="btn-remove" onclick="removeEntry(this)">×</button>
+        </div>
+    `;
+    container.insertAdjacentHTML('beforeend', html);
+}
+
+function removeEntry(button) {
+    button.parentElement.remove();
+}
+</script>
+
+<style>
+.procedures-container {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 1rem;
+    height: calc(100vh - 200px);
+}
+
+.procedures-list {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    overflow-y: auto;
+    padding: 0.5rem;
+}
+
+.procedure-detail {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    overflow-y: auto;
+    padding: 1rem;
+}
+
+.procedure-item {
+    padding: 0.75rem;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.procedure-item:hover {
+    background: rgba(255,255,255,0.03);
+}
+
+.procedure-item.selected {
+    background: rgba(88, 166, 255, 0.1);
+    border-left: 3px solid var(--accent);
+}
+
+.procedure-item-name {
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+}
+
+.procedure-item-summary {
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+    margin-bottom: 0.25rem;
+}
+
+.procedure-item-meta {
+    font-size: 0.75rem;
+    color: var(--fg-muted);
+    display: flex;
+    gap: 0.75rem;
+}
+
+/* Detail view styles */
+.procedure-detail-header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.procedure-detail-header h3 {
+    margin: 0 0 0.5rem 0;
+    color: var(--accent);
+}
+
+.procedure-summary {
+    color: var(--fg-muted);
+    margin: 0;
+}
+
+.detail-section {
+    margin-bottom: 1.5rem;
+}
+
+.detail-section h4 {
+    font-size: 0.9rem;
+    color: var(--fg-muted);
+    margin: 0 0 0.5rem 0;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.tools-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.tool-tag {
+    background: var(--bg);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+}
+
+.inputs-list,
+.outputs-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.input-item,
+.output-item {
+    background: var(--bg);
+    padding: 0.75rem;
+    border-radius: 6px;
+    margin-bottom: 0.5rem;
+}
+
+.input-name,
+.output-name {
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+}
+
+.input-context,
+.output-context {
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+}
+
+.input-default {
+    font-size: 0.8rem;
+    color: var(--accent);
+    margin-top: 0.25rem;
+}
+
+.steps-list {
+    padding-left: 1.25rem;
+    margin: 0;
+}
+
+.step-item {
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.step-item:last-child {
+    border-bottom: none;
+}
+
+.step-prompt {
+    margin-bottom: 0.25rem;
+}
+
+.step-tools,
+.step-inputs {
+    font-size: 0.8rem;
+    color: var(--fg-muted);
+}
+
+.procedure-actions {
+    margin-top: 1.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+}
+
+/* Run form modal */
+.run-form-modal {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-top: 1rem;
+}
+
+.run-form-modal h4 {
+    margin: 0 0 1rem 0;
+    color: var(--accent);
+}
+
+.form-field {
+    margin-bottom: 1rem;
+}
+
+.form-field label {
+    display: block;
+    font-weight: 500;
+    margin-bottom: 0.25rem;
+}
+
+.form-field .help-text {
+    font-size: 0.85rem;
+    color: var(--fg-muted);
+    margin: 0.25rem 0 0.5rem 0;
+}
+
+.form-field input[type="text"],
+.form-field select {
+    width: 100%;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg);
+    font-size: 0.9rem;
+}
+
+.form-field input[type="text"]:focus,
+.form-field select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.form-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 1rem;
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+}
+
+.btn-primary:hover {
+    background: #4a9af8;
+}
+
+.btn-secondary {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.btn-secondary:hover {
+    background: rgba(255,255,255,0.05);
+}
+
+.btn-danger {
+    background: var(--error, #f85149);
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+}
+
+.btn-danger:hover {
+    background: #da3633;
+}
+
+.btn-small {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+
+.btn-small:hover {
+    background: rgba(88, 166, 255, 0.1);
+}
+
+.btn-remove {
+    background: transparent;
+    color: var(--error, #f85149);
+    border: none;
+    padding: 0.25rem 0.5rem;
+    cursor: pointer;
+    font-size: 1.2rem;
+    line-height: 1;
+}
+
+.btn-remove:hover {
+    color: #da3633;
+}
+
+/* Page header with button */
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.page-header h2 {
+    margin: 0;
+}
+
+/* Create form container */
+#create-form-container {
+    margin-bottom: 1rem;
+}
+
+.procedure-form-container {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+}
+
+.procedure-form-container h3 {
+    margin: 0 0 1rem 0;
+    color: var(--accent);
+}
+
+.form-section {
+    margin: 1.5rem 0;
+    padding: 1rem;
+    background: var(--bg);
+    border-radius: 6px;
+}
+
+.form-section h4 {
+    margin: 0 0 0.75rem 0;
+    font-size: 0.9rem;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Dynamic form entries */
+.input-entry,
+.step-entry,
+.output-entry {
+    display: grid;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding: 0.75rem;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    align-items: start;
+}
+
+.input-entry {
+    grid-template-columns: 1fr 2fr 1fr auto;
+}
+
+.step-entry {
+    grid-template-columns: 1fr;
+}
+
+.step-entry textarea {
+    width: 100%;
+}
+
+.step-entry input {
+    margin-top: 0.5rem;
+}
+
+.output-entry {
+    grid-template-columns: 1fr 2fr auto;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .input-entry,
+    .output-entry {
+        grid-template-columns: 1fr;
+    }
+    
+    .procedures-container {
+        grid-template-columns: 1fr;
+        height: auto;
+    }
+    
+    .procedures-list,
+    .procedure-detail {
+        max-height: 50vh;
+    }
+}
+
+/* Form field styles for edit/create forms */
+.procedure-form-container .form-field input[type="text"],
+.procedure-form-container .form-field textarea,
+.procedure-form-container .form-field select,
+.input-entry input,
+.step-entry input,
+.step-entry textarea,
+.output-entry input {
+    width: 100%;
+    padding: 0.5rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.procedure-form-container .form-field textarea {
+    resize: vertical;
+    min-height: 60px;
+}
+
+.procedure-form-container .form-field input:focus,
+.procedure-form-container .form-field textarea:focus,
+.input-entry input:focus,
+.step-entry input:focus,
+.step-entry textarea:focus,
+.output-entry input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* Procedure actions in detail view */
+.procedure-actions {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+</style>
+{% endblock %}

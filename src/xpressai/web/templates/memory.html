@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Memory System</h2>
+    <div class="header-controls">
+        <select id="agent-filter" class="agent-select" onchange="filterByAgent(this.value)">
+            {% for agent in agents %}
+            <option value="{{ agent.name }}">{{ agent.name }}</option>
+            {% endfor %}
+        </select>
+        <form class="search-form" id="search-form" hx-get="/partials/memory/search" hx-target="#memory-results" hx-swap="innerHTML">
+            <input type="hidden" name="agent" id="search-agent">
+            <input type="text" name="q" placeholder="Search memories..." class="search-input">
+            <button type="submit" class="btn">Search</button>
+        </form>
+    </div>
+</div>
+
+<div class="stats-row" id="stats-container">
+    Loading stats...
+</div>
+
+<div class="card">
+    <h3>Recent Memories</h3>
+    <div id="memory-results">
+        Loading...
+    </div>
+</div>
+
+<script>
+let currentAgent = '{{ agents[0].name if agents else "" }}';
+
+function filterByAgent(agentId) {
+    currentAgent = agentId;
+    document.getElementById('search-agent').value = agentId;
+    loadMemories();
+    loadStats();
+}
+
+function loadMemories() {
+    htmx.ajax('GET', `/partials/memory/recent?agent=${encodeURIComponent(currentAgent)}`, {
+        target: '#memory-results',
+        swap: 'innerHTML'
+    });
+}
+
+function loadStats() {
+    htmx.ajax('GET', `/partials/memory/stats?agent=${encodeURIComponent(currentAgent)}`, {
+        target: '#stats-container',
+        swap: 'innerHTML'
+    });
+}
+
+function toggleMemory(header) {
+    const item = header.closest('.memory-item');
+    const details = item.querySelector('.memory-details');
+
+    if (details.style.display === 'none') {
+        details.style.display = 'block';
+        item.classList.add('expanded');
+    } else {
+        details.style.display = 'none';
+        item.classList.remove('expanded');
+    }
+}
+
+async function deleteMemory(memoryId) {
+    if (!confirm('Are you sure you want to delete this memory?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/memory/${memoryId}`, {
+            method: 'DELETE'
+        });
+
+        const result = await response.json();
+
+        if (result.status === 'ok') {
+            const item = document.querySelector(`[data-memory-id="${memoryId}"]`);
+            if (item) {
+                item.remove();
+            }
+            loadStats();
+        } else {
+            alert('Failed to delete memory: ' + (result.error || 'Unknown error'));
+        }
+    } catch (error) {
+        alert('Failed to delete memory: ' + error.message);
+    }
+}
+
+// Initial load
+document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('search-agent').value = currentAgent;
+    loadMemories();
+    loadStats();
+});
+</script>
+{% endblock %}

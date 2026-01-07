@@ -1,0 +1,693 @@
+{% extends "base.html" %}
+
+{% block title %}New Agent - XpressAI{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <a href="/agents" class="back-link">&larr; Back to Agents</a>
+    <h2>Create New Agent</h2>
+</div>
+
+<form id="agent-form" class="agent-form">
+    <div class="form-section">
+        <h3>Basic Information</h3>
+
+        <div class="form-group">
+            <label for="name">Agent Name <span class="required">*</span></label>
+            <input type="text" id="name" name="name" required
+                   pattern="[a-z][a-z0-9_-]*"
+                   placeholder="e.g., atlas, coder, researcher"
+                   title="Lowercase letters, numbers, hyphens, underscores. Must start with a letter.">
+            <p class="hint">A unique identifier for this agent (lowercase, no spaces)</p>
+        </div>
+
+        <div class="form-group">
+            <label for="backend">Backend <span class="required">*</span></label>
+            <select id="backend" name="backend" required>
+                <option value="claude">Claude (Anthropic API)</option>
+                <option value="local">Local Model (vLLM/Ollama)</option>
+                <option value="openai">OpenAI</option>
+            </select>
+            <p class="hint">Which LLM provider to use for this agent</p>
+        </div>
+
+    </div>
+
+    <div class="form-section" id="claude-section" style="display: none;">
+        <h3>Claude Configuration</h3>
+
+        <div class="form-group">
+            <label for="claude_model">Model</label>
+            <select id="claude_model" name="claude_model">
+                <option value="claude-sonnet-4-5-20251022" selected>Claude Sonnet 4.5 (Recommended)</option>
+                <option value="claude-opus-4-5-20251101">Claude Opus 4.5 (Most capable)</option>
+                <option value="claude-opus-4-20250514">Claude Opus 4</option>
+                <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
+                <option value="claude-haiku-4-5-20251022">Claude Haiku 4.5 (Fastest)</option>
+            </select>
+            <p class="hint">Which Claude model to use for this agent</p>
+        </div>
+    </div>
+
+    <div class="form-section" id="openai-section" style="display: none;">
+        <h3>OpenAI Configuration</h3>
+
+        <div class="form-group">
+            <label for="openai_model">Model</label>
+            <select id="openai_model" name="openai_model">
+                <option value="gpt-5.2" selected>GPT-5.2 (Recommended)</option>
+                <option value="gpt-5.2-pro">GPT-5.2 Pro (Harder thinking)</option>
+                <option value="gpt-5.1-codex-max">GPT-5.1 Codex Max (Coding)</option>
+                <option value="gpt-5-mini">GPT-5 Mini (Balanced)</option>
+                <option value="gpt-5-nano">GPT-5 Nano (Fastest)</option>
+            </select>
+            <p class="hint">Which OpenAI model to use for this agent</p>
+        </div>
+    </div>
+
+    <div class="form-section" id="local-model-section" style="display: none;">
+        <h3>Local Model Configuration</h3>
+        <p class="section-hint">Configure the local model backend for this agent</p>
+
+        <div class="form-group">
+            <label for="local_inference_backend">Inference Backend</label>
+            <select id="local_inference_backend" name="local_inference_backend">
+                <option value="ollama" selected>Ollama (Simple setup)</option>
+                <option value="vllm">vLLM (Large models on multiple GPUs)</option>
+                <option value="llama.cpp">llama.cpp (Custom models, router, LoRA adapters)</option>
+            </select>
+            <p class="hint">Which local inference server to use</p>
+        </div>
+
+        <div id="ollama-warning" class="backend-warning" style="display: none;">
+            <strong>Ollama Setup Required</strong>
+            <p>Make sure Ollama is running and the model is pulled:</p>
+            <code id="ollama-pull-cmd">ollama pull qwen3:8b</code>
+            <p class="hint">Then start the server with: <code>ollama serve</code></p>
+        </div>
+
+        <div class="form-group">
+            <label for="local_model">Model</label>
+            <input type="text" id="local_model" name="local_model"
+                   value="qwen3:8b"
+                   placeholder="e.g., qwen3:8b, llama3:8b, codellama:7b">
+            <p class="hint" id="model-hint">Model tag (run "ollama list" to see available models)</p>
+        </div>
+
+        <div class="form-group">
+            <label for="local_base_url">Base URL</label>
+            <input type="text" id="local_base_url" name="local_base_url"
+                   value="http://localhost:11434"
+                   placeholder="http://localhost:11434">
+            <p class="hint">API endpoint URL (Ollama: 11434, vLLM: 8000, llama.cpp: 8080)</p>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="local_context_length">Context Length</label>
+                <input type="number" id="local_context_length" name="local_context_length"
+                       value="32768" min="1024" max="131072">
+                <p class="hint">Maximum context window size</p>
+            </div>
+
+            <div class="form-group">
+                <label for="local_tool_format">Tool Format</label>
+                <select id="local_tool_format" name="local_tool_format">
+                    <option value="native" selected>Native (Model's built-in format)</option>
+                    <option value="xml">XML (Better for most models)</option>
+                    <option value="json">JSON</option>
+                </select>
+                <p class="hint">How tools are formatted for the model</p>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="local_thinking_mode">Thinking Mode</label>
+                <select id="local_thinking_mode" name="local_thinking_mode">
+                    <option value="auto" selected>Auto</option>
+                    <option value="always">Always</option>
+                    <option value="never">Never</option>
+                </select>
+                <p class="hint">When to use extended thinking</p>
+            </div>
+
+            <div class="form-group">
+                <label for="local_max_tool_calls">Max Tool Calls</label>
+                <input type="number" id="local_max_tool_calls" name="local_max_tool_calls"
+                       value="20" min="1" max="100">
+                <p class="hint">Maximum tool iterations per task</p>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="local_api_key">API Key (Optional)</label>
+            <input type="text" id="local_api_key" name="local_api_key"
+                   value=""
+                   placeholder="Leave empty if not required">
+            <p class="hint">API key if your local server requires authentication</p>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="local_price_input">Input Price ($/1M tokens)</label>
+                <input type="number" id="local_price_input" name="local_price_input"
+                       step="0.01" min="0" placeholder="0.00">
+                <p class="hint">Leave empty if free/self-hosted</p>
+            </div>
+
+            <div class="form-group">
+                <label for="local_price_output">Output Price ($/1M tokens)</label>
+                <input type="number" id="local_price_output" name="local_price_output"
+                       step="0.01" min="0" placeholder="0.00">
+                <p class="hint">Leave empty if free/self-hosted</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>System Prompt (Role)</h3>
+
+        <div class="form-group">
+            <label for="role">Instructions for the Agent</label>
+            <textarea id="role" name="role" rows="14"
+                      placeholder="You are a helpful AI assistant...">You are a helpful AI assistant.
+
+## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
+You cannot form new long-term memories naturally. After each conversation ends, you will forget everything unless you explicitly save it.
+
+- **Before starting work:** Use `search_memory` to recall what you know about the user, their projects, and relevant context
+- **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts (company info, preferences, decisions, contacts, technical details, URLs)
+- **Be proactive:** If someone tells you about themselves or their work, SAVE IT
+- Your memory is your zettelkasten - treat it as essential to your function</textarea>
+            <p class="hint">Define the agent's personality, capabilities, and behavior guidelines</p>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>Memory & Hooks</h3>
+
+        <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="hook_memory_recall" name="hooks[]" value="memory_recall" checked>
+                Memory Recall
+            </label>
+            <p class="hint">Automatically recall relevant memories before processing messages</p>
+        </div>
+
+        <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" id="hook_memory_remember" name="hooks[]" value="memory_remember" checked>
+                Memory Remember
+            </label>
+            <p class="hint">Automatically store important information after conversations</p>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>Tools</h3>
+        <p class="section-hint">Select which tools this agent can use</p>
+
+        <div class="tools-grid">
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="tools[]" value="filesystem" checked>
+                    Filesystem
+                </label>
+                <p class="hint">Read/write files</p>
+            </div>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="tools[]" value="shell" checked>
+                    Shell
+                </label>
+                <p class="hint">Execute commands</p>
+            </div>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="tools[]" value="web">
+                    Web Browser
+                </label>
+                <p class="hint">Fetch web pages</p>
+            </div>
+
+            <div class="form-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="tools[]" value="memory" checked>
+                    Memory Tools
+                </label>
+                <p class="hint">Create/search memories</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <h3>Budget</h3>
+        <p class="section-hint">Set spending limits for this agent (leave empty for no limit)</p>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="budget_daily">Daily Limit ($)</label>
+                <input type="number" id="budget_daily" name="budget_daily"
+                       step="0.01" min="0" placeholder="No limit">
+                <p class="hint">Maximum daily spending</p>
+            </div>
+
+            <div class="form-group">
+                <label for="budget_monthly">Monthly Limit ($)</label>
+                <input type="number" id="budget_monthly" name="budget_monthly"
+                       step="0.01" min="0" placeholder="No limit">
+                <p class="hint">Maximum monthly spending</p>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="budget_on_exceeded">When Budget Exceeded</label>
+            <select id="budget_on_exceeded" name="budget_on_exceeded">
+                <option value="pause" selected>Pause agent</option>
+                <option value="alert">Alert only (continue running)</option>
+                <option value="stop">Stop agent completely</option>
+            </select>
+            <p class="hint">Action to take when budget limit is reached</p>
+        </div>
+    </div>
+
+    <div class="form-actions">
+        <a href="/agents" class="btn btn-secondary">Cancel</a>
+        <button type="submit" class="btn btn-primary">Create Agent</button>
+    </div>
+</form>
+
+<div id="form-message" class="form-message" style="display: none;"></div>
+
+<style>
+.agent-form {
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+.form-section {
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+.form-section h3 {
+    margin: 0 0 1rem 0;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border, #30363d);
+    font-size: 1.1rem;
+    color: var(--fg, #c9d1d9);
+}
+
+.section-hint {
+    color: var(--fg-muted, #8b949e);
+    font-size: 0.875rem;
+    margin-bottom: 1rem;
+}
+
+.form-group {
+    margin-bottom: 1.25rem;
+}
+
+.form-group:last-child {
+    margin-bottom: 0;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 500;
+    color: var(--fg, #c9d1d9);
+}
+
+.required {
+    color: var(--danger, #f85149);
+}
+
+.form-group input[type="text"],
+.form-group select,
+.form-group textarea {
+    width: 100%;
+    padding: 0.75rem;
+    background: var(--bg, #0d1117);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    color: var(--fg, #c9d1d9);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.form-group textarea {
+    font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+    resize: vertical;
+    min-height: 200px;
+}
+
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: var(--accent, #58a6ff);
+    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+}
+
+.form-group .hint {
+    margin: 0.5rem 0 0 0;
+    font-size: 0.8rem;
+    color: var(--fg-muted, #8b949e);
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    font-weight: normal !important;
+}
+
+.checkbox-label input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+}
+
+.tools-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 1rem;
+}
+
+.form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+}
+
+.form-group input[type="number"] {
+    width: 100%;
+    padding: 0.75rem;
+    background: var(--bg, #0d1117);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    color: var(--fg, #c9d1d9);
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+
+.form-group input[type="number"]:focus {
+    outline: none;
+    border-color: var(--accent, #58a6ff);
+    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+}
+
+.backend-warning {
+    background: rgba(210, 153, 34, 0.15);
+    border: 1px solid var(--warning, #d29922);
+    border-radius: 6px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+
+.backend-warning strong {
+    color: var(--warning, #d29922);
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
+.backend-warning p {
+    margin: 0.5rem 0;
+    color: var(--fg, #c9d1d9);
+    font-size: 0.9rem;
+}
+
+.backend-warning code {
+    background: var(--bg, #0d1117);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+    font-size: 0.85rem;
+    color: var(--accent, #58a6ff);
+}
+
+.form-actions {
+    display: flex;
+    gap: 1rem;
+    justify-content: flex-end;
+    margin-top: 1.5rem;
+}
+
+.btn {
+    padding: 0.75rem 1.5rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-decoration: none;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: var(--accent, #58a6ff);
+    color: #fff;
+}
+
+.btn-primary:hover {
+    background: #79b8ff;
+}
+
+.btn-secondary {
+    background: var(--card-bg, #21262d);
+    color: var(--fg, #c9d1d9);
+    border: 1px solid var(--border, #30363d);
+}
+
+.btn-secondary:hover {
+    background: var(--border, #30363d);
+}
+
+.back-link {
+    display: inline-block;
+    margin-bottom: 1rem;
+    color: var(--fg-muted, #8b949e);
+    text-decoration: none;
+    font-size: 0.9rem;
+}
+
+.back-link:hover {
+    color: var(--accent, #58a6ff);
+}
+
+.form-message {
+    padding: 1rem;
+    border-radius: 6px;
+    margin-top: 1rem;
+    max-width: 800px;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.form-message.success {
+    background: rgba(46, 160, 67, 0.15);
+    border: 1px solid var(--success, #2ea043);
+    color: var(--success, #2ea043);
+}
+
+.form-message.error {
+    background: rgba(248, 81, 73, 0.15);
+    border: 1px solid var(--danger, #f85149);
+    color: var(--danger, #f85149);
+}
+
+.page-header {
+    margin-bottom: 1.5rem;
+}
+
+.page-header h2 {
+    margin: 0;
+}
+</style>
+
+<script>
+// Show/hide backend config sections based on selection
+const backendSelect = document.getElementById('backend');
+const claudeSection = document.getElementById('claude-section');
+const openaiSection = document.getElementById('openai-section');
+const localModelSection = document.getElementById('local-model-section');
+const inferenceBackendSelect = document.getElementById('local_inference_backend');
+const baseUrlInput = document.getElementById('local_base_url');
+const localModelInput = document.getElementById('local_model');
+const ollamaWarning = document.getElementById('ollama-warning');
+const ollamaPullCmd = document.getElementById('ollama-pull-cmd');
+const modelHint = document.getElementById('model-hint');
+
+function updateBackendSections() {
+    const backend = backendSelect.value;
+    claudeSection.style.display = backend === 'claude' ? 'block' : 'none';
+    openaiSection.style.display = backend === 'openai' ? 'block' : 'none';
+    localModelSection.style.display = backend === 'local' ? 'block' : 'none';
+}
+
+function updateInferenceBackend() {
+    const backend = inferenceBackendSelect.value;
+    const isOllama = backend === 'ollama';
+
+    // Update base URL
+    if (isOllama) {
+        baseUrlInput.value = 'http://localhost:11434';
+        localModelInput.value = 'qwen3:8b';
+        localModelInput.placeholder = 'e.g., qwen3:8b, llama3:8b, codellama:7b';
+        modelHint.textContent = 'Model tag (run "ollama list" to see available models)';
+    } else if (backend === 'llama.cpp') {
+        baseUrlInput.value = 'http://localhost:8080';
+        localModelInput.value = 'Qwen/Qwen3-8B';
+        localModelInput.placeholder = 'e.g., Qwen/Qwen3-8B';
+        modelHint.textContent = 'Model name or path to GGUF file';
+    } else {
+        baseUrlInput.value = 'http://localhost:8000';
+        localModelInput.value = 'Qwen/Qwen3-8B';
+        localModelInput.placeholder = 'e.g., Qwen/Qwen3-8B';
+        modelHint.textContent = 'HuggingFace model ID';
+    }
+
+    // Show/hide Ollama warning
+    ollamaWarning.style.display = isOllama ? 'block' : 'none';
+    updateOllamaPullCommand();
+}
+
+function updateOllamaPullCommand() {
+    const model = localModelInput.value.trim();
+    ollamaPullCmd.textContent = 'ollama pull ' + (model || 'qwen3:8b');
+}
+
+backendSelect.addEventListener('change', updateBackendSections);
+inferenceBackendSelect.addEventListener('change', updateInferenceBackend);
+localModelInput.addEventListener('input', updateOllamaPullCommand);
+
+// Initialize on page load
+updateBackendSections();
+updateInferenceBackend();
+
+document.getElementById('agent-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+
+    const form = e.target;
+    const messageDiv = document.getElementById('form-message');
+    const submitBtn = form.querySelector('button[type="submit"]');
+
+    // Gather form data
+    const data = {
+        name: form.name.value.trim().toLowerCase(),
+        backend: form.backend.value,
+        role: form.role.value,
+        hooks: {
+            before_message: [],
+            after_message: []
+        },
+        tools: []
+    };
+
+    // Add model based on backend
+    if (data.backend === 'claude') {
+        data.model = document.getElementById('claude_model').value;
+    } else if (data.backend === 'openai') {
+        data.model = document.getElementById('openai_model').value;
+    } else if (data.backend === 'local') {
+        data.local_model = {
+            model: document.getElementById('local_model').value,
+            inference_backend: document.getElementById('local_inference_backend').value,
+            base_url: document.getElementById('local_base_url').value,
+            context_length: parseInt(document.getElementById('local_context_length').value),
+            tool_format: document.getElementById('local_tool_format').value,
+            thinking_mode: document.getElementById('local_thinking_mode').value,
+            max_tool_calls: parseInt(document.getElementById('local_max_tool_calls').value),
+            api_key: document.getElementById('local_api_key').value || 'EMPTY'
+        };
+        // Add pricing if specified
+        const priceInput = document.getElementById('local_price_input').value;
+        const priceOutput = document.getElementById('local_price_output').value;
+        if (priceInput) data.local_model.price_input = parseFloat(priceInput);
+        if (priceOutput) data.local_model.price_output = parseFloat(priceOutput);
+    }
+
+    // Gather hooks
+    if (document.getElementById('hook_memory_recall').checked) {
+        data.hooks.before_message.push('memory_recall');
+    }
+    if (document.getElementById('hook_memory_remember').checked) {
+        data.hooks.after_message.push('memory_remember');
+    }
+
+    // Gather tools
+    document.querySelectorAll('input[name="tools[]"]:checked').forEach(function(cb) {
+        data.tools.push(cb.value);
+    });
+
+    // Gather budget config
+    const budgetDaily = document.getElementById('budget_daily').value;
+    const budgetMonthly = document.getElementById('budget_monthly').value;
+    const budgetOnExceeded = document.getElementById('budget_on_exceeded').value;
+    if (budgetDaily || budgetMonthly) {
+        data.budget = {
+            on_exceeded: budgetOnExceeded
+        };
+        if (budgetDaily) data.budget.daily = parseFloat(budgetDaily);
+        if (budgetMonthly) data.budget.monthly = parseFloat(budgetMonthly);
+    }
+
+    // Validate
+    if (!data.name) {
+        showMessage('Agent name is required', 'error');
+        return;
+    }
+
+    if (!/^[a-z][a-z0-9_-]*$/.test(data.name)) {
+        showMessage('Agent name must start with a letter and contain only lowercase letters, numbers, hyphens, and underscores', 'error');
+        return;
+    }
+
+    // Submit
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Creating...';
+
+    try {
+        const response = await fetch('/api/agents', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+            showMessage('Agent created successfully! Redirecting...', 'success');
+            setTimeout(function() {
+                window.location.href = '/agents';
+            }, 1500);
+        } else {
+            showMessage(result.detail || 'Failed to create agent', 'error');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Create Agent';
+        }
+    } catch (err) {
+        showMessage('Error: ' + err.message, 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Create Agent';
+    }
+});
+
+function showMessage(text, type) {
+    const messageDiv = document.getElementById('form-message');
+    messageDiv.textContent = text;
+    messageDiv.className = 'form-message ' + type;
+    messageDiv.style.display = 'block';
+    messageDiv.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+</script>
+{% endblock %}

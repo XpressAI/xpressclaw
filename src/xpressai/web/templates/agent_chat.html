@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+
+{% block title %}Chat with {{ agent.name }} - XpressAI{% endblock %}
+
+{% block content %}
+<div class="chat-container">
+    <div class="chat-header">
+        <div class="chat-header-left">
+            <a href="/agents" class="back-link">&larr; Back to Agents</a>
+            <div class="chat-agent-info">
+                <span class="agent-status-indicator status-{{ agent.status }}"></span>
+                <h2>{{ agent.name }}</h2>
+                <span class="agent-backend-badge">{{ agent.backend }}</span>
+            </div>
+        </div>
+        <div class="chat-header-right">
+            <button class="btn btn-sm btn-outline-muted"
+                    hx-post="/api/agent/{{ agent.name }}/chat/clear"
+                    hx-swap="none"
+                    hx-confirm="Clear chat history?"
+                    hx-on::after-request="htmx.trigger('#chat-messages', 'load')">
+                Clear Chat
+            </button>
+        </div>
+    </div>
+
+    <div class="chat-body">
+        <div id="chat-messages"
+             hx-get="/partials/agent/{{ agent.name }}/messages"
+             hx-trigger="load, refresh"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="chat-footer">
+        <form class="chat-form"
+              hx-post="/api/agent/{{ agent.name }}/chat"
+              hx-swap="none"
+              hx-on::after-request="this.reset(); htmx.trigger('#chat-messages', 'refresh')">
+            <input type="text"
+                   name="message"
+                   placeholder="Type your message..."
+                   required
+                   autocomplete="off"
+                   {% if agent.status != 'running' %}disabled{% endif %}>
+            <button type="submit" {% if agent.status != 'running' %}disabled{% endif %}>
+                Send
+            </button>
+        </form>
+        {% if agent.status != 'running' %}
+        <p class="chat-status-warning">Agent is not running. Start the agent to chat.</p>
+        {% endif %}
+        <p class="chat-hint">
+            This agent can create tasks, save memories, and create procedures.
+        </p>
+    </div>
+</div>
+
+<script>
+(function() {
+    var chatMessages = document.getElementById('chat-messages');
+    var expandedHooks = new Set();
+    var lastMessageCount = 0;
+    var pollInterval = null;
+
+    // Save which hooks are expanded
+    function saveExpandedState() {
+        expandedHooks.clear();
+        chatMessages.querySelectorAll('details.hook[open]').forEach(function(el) {
+            var ts = el.getAttribute('data-timestamp');
+            if (ts) expandedHooks.add(ts);
+        });
+    }
+
+    // Restore expanded state after refresh
+    function restoreExpandedState() {
+        expandedHooks.forEach(function(ts) {
+            var el = chatMessages.querySelector('details.hook[data-timestamp="' + ts + '"]');
+            if (el) el.setAttribute('open', '');
+        });
+    }
+
+    // Get current scroll state
+    function isNearBottom() {
+        return (chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight) < 100;
+    }
+
+    // Before swap - save state
+    document.body.addEventListener('htmx:beforeSwap', function(evt) {
+        if (evt.detail.target.id === 'chat-messages') {
+            saveExpandedState();
+        }
+    });
+
+    // After swap - restore state and scroll
+    document.body.addEventListener('htmx:afterSwap', function(evt) {
+        if (evt.detail.target.id === 'chat-messages') {
+            restoreExpandedState();
+
+            // Count messages to detect new ones
+            var newCount = chatMessages.querySelectorAll('.chat-message').length;
+            var hasNewMessages = newCount > lastMessageCount;
+            lastMessageCount = newCount;
+
+            // Scroll to bottom on initial load or if was near bottom
+            if (hasNewMessages || newCount === 0) {
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+        }
+    });
+
+    // Start polling after initial load
+    document.body.addEventListener('htmx:afterSettle', function(evt) {
+        if (evt.detail.target.id === 'chat-messages' && !pollInterval) {
+            pollInterval = setInterval(function() {
+                // Only poll if not already loading
+                if (!chatMessages.classList.contains('htmx-request')) {
+                    htmx.trigger(chatMessages, 'refresh');
+                }
+            }, 3000);
+        }
+    });
+})();
+</script>
+{% endblock %}

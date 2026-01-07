@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+
+{% block title %}Task: {{ task.title }} - XpressAI{% endblock %}
+
+{% block content %}
+<div class="task-detail">
+    <div class="task-header">
+        <div class="task-header-top">
+            <a href="/tasks" class="back-link">&larr; Back to Tasks</a>
+            <div class="task-actions">
+                {% if task.status.value in ['blocked', 'completed'] %}
+                <button class="btn btn-sm btn-retry"
+                        hx-post="/api/tasks/{{ task.id }}/retry"
+                        hx-swap="none"
+                        hx-confirm="Retry this task? This will clear the conversation and start fresh."
+                        hx-on::after-request="location.reload()">
+                    Retry
+                </button>
+                {% endif %}
+                {% if task.status.value not in ['completed'] %}
+                <button class="btn btn-sm btn-success"
+                        hx-post="/api/tasks/{{ task.id }}/complete"
+                        hx-swap="none"
+                        hx-confirm="Mark this task as completed?"
+                        hx-on::after-request="location.reload()">
+                    Complete
+                </button>
+                {% endif %}
+                {% if task.status.value not in ['completed', 'blocked'] %}
+                <button class="btn btn-sm btn-outline-danger"
+                        hx-post="/api/tasks/{{ task.id }}/fail"
+                        hx-swap="none"
+                        hx-confirm="Cancel/fail this task?"
+                        hx-on::after-request="location.reload()">
+                    Cancel
+                </button>
+                {% endif %}
+                <button class="btn btn-sm btn-outline-muted"
+                        hx-delete="/api/tasks/{{ task.id }}"
+                        hx-swap="none"
+                        hx-confirm="Delete this task permanently?"
+                        hx-on::after-request="window.location.href='/tasks'">
+                    Delete
+                </button>
+            </div>
+        </div>
+        <div class="task-title-wrapper">
+            <h2 id="title-display" class="editable-title" title="Click to edit">{{ task.title }}</h2>
+            <form id="title-form" class="title-edit-form" style="display: none;"
+                  hx-patch="/api/tasks/{{ task.id }}"
+                  hx-swap="none">
+                <input type="text" name="title" value="{{ task.title }}" required>
+                <button type="submit" class="btn btn-sm">Save</button>
+                <button type="button" class="btn btn-sm btn-outline-muted" onclick="cancelTitleEdit()">Cancel</button>
+            </form>
+        </div>
+        <div class="task-meta">
+            <span class="status status-{{ task.status.value }}">{{ task.status.value | replace('_', ' ') }}</span>
+            <select class="agent-select"
+                    hx-post="/api/tasks/{{ task.id }}/assign"
+                    hx-trigger="change"
+                    hx-swap="none"
+                    name="agent_id">
+                <option value="" {% if not task.agent_id %}selected{% endif %}>Unassigned</option>
+                {% for agent in agents %}
+                <option value="{{ agent.id }}" {% if task.agent_id == agent.id %}selected{% endif %}>{{ agent.name }}</option>
+                {% endfor %}
+            </select>
+            <span class="created">{{ task.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+        </div>
+    </div>
+
+    <div class="task-description card">
+        <h3>Description <span class="edit-hint">(click to edit)</span></h3>
+        <div id="desc-display" class="editable-description" title="Click to edit">{{ task.description or 'No description. Click to add one.' }}</div>
+        <form id="desc-form" class="description-edit-form" style="display: none;"
+              hx-patch="/api/tasks/{{ task.id }}"
+              hx-swap="none">
+            <textarea name="description" rows="4" placeholder="Enter task description...">{{ task.description or '' }}</textarea>
+            <div class="edit-actions">
+                <button type="submit" class="btn btn-sm">Save</button>
+                <button type="button" class="btn btn-sm btn-outline-muted" onclick="cancelDescEdit()">Cancel</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="task-conversation">
+        <h3>Conversation</h3>
+        <div id="messages"
+             hx-get="/partials/task/{{ task.id }}/messages"
+             hx-trigger="load, every 3s"
+             hx-swap="innerHTML">
+            Loading messages...
+        </div>
+
+        <form class="message-form"
+              hx-post="/api/tasks/{{ task.id }}/messages"
+              hx-swap="none"
+              hx-on::after-request="this.reset(); htmx.trigger('#messages', 'load')">
+            <div class="form-row">
+                <input type="text"
+                       name="content"
+                       placeholder="Type your message..."
+                       required
+                       autocomplete="off">
+                <button type="submit">Send</button>
+            </div>
+            {% if task.status.value == 'waiting_for_input' %}
+            <p class="hint">This task is waiting for your input. Send a message to continue.</p>
+            {% endif %}
+        </form>
+    </div>
+</div>
+
+<script>
+(function() {
+    var messagesEl = document.getElementById('messages');
+    var wasAtBottom = true;
+
+    // Check if scrolled near bottom
+    function isNearBottom() {
+        if (!messagesEl) return true;
+        return (messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight) < 50;
+    }
+
+    // Track scroll position before refresh
+    document.body.addEventListener('htmx:beforeRequest', function(evt) {
+        if (evt.detail.target && evt.detail.target.id === 'messages') {
+            wasAtBottom = isNearBottom();
+        }
+    });
+
+    // Only auto-scroll if was at bottom before refresh
+    document.body.addEventListener('htmx:afterSwap', function(evt) {
+        if (evt.detail.target && evt.detail.target.id === 'messages') {
+            if (wasAtBottom) {
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+            }
+        }
+    });
+
+    // Title editing
+    var titleDisplay = document.getElementById('title-display');
+    var titleForm = document.getElementById('title-form');
+
+    if (titleDisplay) {
+        titleDisplay.addEventListener('click', function() {
+            titleDisplay.style.display = 'none';
+            titleForm.style.display = 'flex';
+            titleForm.querySelector('input').focus();
+            titleForm.querySelector('input').select();
+        });
+    }
+
+    if (titleForm) {
+        titleForm.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.successful) {
+                var newTitle = titleForm.querySelector('input').value;
+                titleDisplay.textContent = newTitle;
+                document.title = 'Task: ' + newTitle + ' - XpressAI';
+                titleForm.style.display = 'none';
+                titleDisplay.style.display = '';
+            }
+        });
+    }
+
+    window.cancelTitleEdit = function() {
+        titleForm.style.display = 'none';
+        titleDisplay.style.display = '';
+    };
+
+    // Description editing
+    var descDisplay = document.getElementById('desc-display');
+    var descForm = document.getElementById('desc-form');
+
+    if (descDisplay) {
+        descDisplay.addEventListener('click', function() {
+            descDisplay.style.display = 'none';
+            descForm.style.display = 'block';
+            descForm.querySelector('textarea').focus();
+        });
+    }
+
+    if (descForm) {
+        descForm.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.successful) {
+                var newDesc = descForm.querySelector('textarea').value;
+                descDisplay.textContent = newDesc || 'No description. Click to add one.';
+                descForm.style.display = 'none';
+                descDisplay.style.display = '';
+            }
+        });
+    }
+
+    window.cancelDescEdit = function() {
+        descForm.style.display = 'none';
+        descDisplay.style.display = '';
+    };
+})();
+</script>
+{% endblock %}

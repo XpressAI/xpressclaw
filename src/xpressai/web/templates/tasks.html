@@ -1,0 +1,614 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Task Board</h2>
+</div>
+
+<!-- Schedules Section -->
+<div class="schedules-section">
+    <div class="schedules-header" onclick="toggleSchedulesSection()">
+        <div class="schedules-title">
+            <span class="chevron collapsed" id="schedules-chevron">▶</span>
+            <span class="calendar-icon">📅</span>
+            <span class="title-text">Schedules</span>
+            <span class="active-count" id="schedules-active-count"
+                  hx-get="/partials/schedules/count"
+                  hx-trigger="load, scheduleUpdate from:body"
+                  hx-swap="innerHTML"></span>
+        </div>
+        <button class="new-schedule-btn" onclick="event.stopPropagation(); toggleScheduleForm()">
+            + New Schedule
+        </button>
+    </div>
+
+    <div id="schedules-content" class="schedules-content collapsed">
+        <div id="schedule-form" class="schedule-form" style="display: none;">
+            <form hx-post="/api/schedules"
+                  hx-swap="none"
+                  hx-on::after-request="this.reset(); htmx.trigger(document.body, 'scheduleUpdate'); document.getElementById('schedule-form').style.display='none';">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="schedule-name">Name</label>
+                        <input type="text" id="schedule-name" name="name" placeholder="daily-standup" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="schedule-cron">Cron Expression</label>
+                        <input type="text" id="schedule-cron" name="cron" placeholder="0 9 * * *" required>
+                        <span class="hint">e.g., "0 9 * * *" = 9am daily, "0 */4 * * *" = every 4 hours</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="schedule-agent">Agent</label>
+                        <select id="schedule-agent" name="agent_id" required>
+                            {% for agent in agents %}
+                            <option value="{{ agent.id }}">{{ agent.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="schedule-title">Task Title</label>
+                        <input type="text" id="schedule-title" name="title" placeholder="Daily standup for {date}" required>
+                        <span class="hint">Use {date}, {time}, {datetime} placeholders</span>
+                    </div>
+                    <div class="form-group full-width">
+                        <label for="schedule-description">Description (optional)</label>
+                        <input type="text" id="schedule-description" name="description" placeholder="Run daily standup routine">
+                    </div>
+                </div>
+                <div class="form-actions-inline">
+                    <button type="button" class="btn btn-secondary" onclick="toggleScheduleForm()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create Schedule</button>
+                </div>
+            </form>
+        </div>
+
+        <div id="schedules-list"
+             hx-get="/partials/schedules"
+             hx-trigger="load, scheduleUpdate from:body"
+             hx-swap="innerHTML">
+            Loading schedules...
+        </div>
+    </div>
+</div>
+
+<!-- Quick Task Creation -->
+<div class="quick-task-form">
+    <form hx-post="/api/tasks"
+          hx-swap="none"
+          hx-on::after-request="this.reset(); htmx.trigger('#pending-tasks', 'load')">
+        <div class="form-row">
+            <input type="text"
+                   name="title"
+                   placeholder="+ Add task..."
+                   required>
+            <select name="agent_id">
+                <option value="">Unassigned</option>
+                {% for agent in agents %}
+                <option value="{{ agent.id }}">{{ agent.name }}</option>
+                {% endfor %}
+            </select>
+            <button type="submit">Add</button>
+        </div>
+    </form>
+</div>
+
+<!-- Kanban Board -->
+<div class="kanban-board">
+    <div class="kanban-column">
+        <div class="column-header">
+            <span class="status-dot pending"></span>
+            <span class="column-title">PENDING</span>
+            <span class="task-count" id="pending-count"></span>
+        </div>
+        <div class="task-list" id="pending-tasks"
+             hx-get="/partials/tasks/pending"
+             hx-trigger="load, every 5s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="kanban-column">
+        <div class="column-header">
+            <span class="status-dot in-progress"></span>
+            <span class="column-title">IN PROGRESS</span>
+            <span class="task-count" id="in-progress-count"></span>
+        </div>
+        <div class="task-list" id="in-progress-tasks"
+             hx-get="/partials/tasks/in_progress"
+             hx-trigger="load, every 5s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="kanban-column">
+        <div class="column-header">
+            <span class="status-dot waiting"></span>
+            <span class="column-title">WAITING FOR INPUT</span>
+            <span class="task-count" id="waiting-count"></span>
+        </div>
+        <div class="task-list" id="waiting-tasks"
+             hx-get="/partials/tasks/waiting_for_input"
+             hx-trigger="load, every 3s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+    </div>
+
+    <div class="kanban-column">
+        <div class="column-header">
+            <span class="status-dot done"></span>
+            <span class="column-title">DONE</span>
+            <span class="task-count" id="done-count"></span>
+        </div>
+        <div class="task-list" id="done-tasks"
+             hx-get="/partials/tasks/done"
+             hx-trigger="load, every 5s"
+             hx-swap="innerHTML">
+            Loading...
+        </div>
+        <div class="clear-actions">
+            <button class="clear-btn"
+                    hx-delete="/api/tasks/completed/clear"
+                    hx-swap="none"
+                    hx-confirm="Clear all completed tasks?"
+                    hx-on::after-request="htmx.trigger('#done-tasks', 'load')">
+                Clear Done
+            </button>
+            <button class="clear-btn clear-btn-danger"
+                    hx-delete="/api/tasks/blocked/clear"
+                    hx-swap="none"
+                    hx-confirm="Clear all failed tasks?"
+                    hx-on::after-request="htmx.trigger('#done-tasks', 'load')">
+                Clear Failed
+            </button>
+        </div>
+    </div>
+</div>
+
+<style>
+/* Schedules Section */
+.schedules-section {
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 8px;
+    margin-bottom: 1.5rem;
+    overflow: hidden;
+}
+
+.schedules-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    cursor: pointer;
+    user-select: none;
+}
+
+.schedules-header:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.schedules-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.chevron {
+    font-size: 0.7rem;
+    color: var(--fg-muted, #8b949e);
+    display: inline-block;
+    width: 1em;
+}
+
+.calendar-icon {
+    font-size: 1rem;
+}
+
+.title-text {
+    font-weight: 600;
+    color: var(--fg, #c9d1d9);
+}
+
+.active-count {
+    font-size: 0.85rem;
+    color: var(--fg-muted, #8b949e);
+}
+
+.new-schedule-btn {
+    background: transparent;
+    border: none;
+    color: var(--accent, #58a6ff);
+    font-size: 0.9rem;
+    cursor: pointer;
+    padding: 0.4rem 0.8rem;
+    border-radius: 4px;
+}
+
+.new-schedule-btn:hover {
+    background: rgba(88, 166, 255, 0.1);
+}
+
+.schedules-content {
+    border-top: 1px solid var(--border, #30363d);
+    padding: 0.5rem;
+}
+
+.schedules-content.collapsed {
+    display: none;
+    border-top: none;
+}
+
+/* Schedule Cards */
+.schedule-card {
+    display: flex;
+    align-items: flex-start;
+    padding: 0.75rem 1rem;
+    background: var(--bg, #0d1117);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    margin-bottom: 0.5rem;
+}
+
+.schedule-card.paused {
+    opacity: 0.5;
+}
+
+.schedule-icon {
+    color: var(--accent, #58a6ff);
+    margin-right: 0.75rem;
+    font-size: 1rem;
+    margin-top: 0.1rem;
+}
+
+.schedule-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.schedule-name {
+    font-weight: 600;
+    color: var(--fg, #c9d1d9);
+    font-size: 0.95rem;
+}
+
+.schedule-timing {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--fg-muted, #8b949e);
+    font-size: 0.85rem;
+    margin-top: 0.25rem;
+}
+
+.schedule-timing .clock-icon {
+    font-size: 0.8rem;
+}
+
+.schedule-agent {
+    display: inline-block;
+    background: var(--card-bg, #161b22);
+    color: var(--fg-muted, #8b949e);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    margin-top: 0.4rem;
+}
+
+.schedule-actions-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.5rem;
+    margin-left: 1rem;
+}
+
+.schedule-buttons {
+    display: flex;
+    gap: 0.25rem;
+}
+
+.schedule-btn {
+    background: transparent;
+    border: none;
+    color: var(--fg-muted, #8b949e);
+    cursor: pointer;
+    padding: 0.35rem;
+    border-radius: 4px;
+    font-size: 0.9rem;
+    line-height: 1;
+}
+
+.schedule-btn:hover {
+    background: var(--border, #30363d);
+    color: var(--fg, #c9d1d9);
+}
+
+.schedule-btn.play:hover {
+    color: var(--success, #2ea043);
+}
+
+.schedule-next {
+    font-size: 0.75rem;
+    color: var(--fg-muted, #8b949e);
+    white-space: nowrap;
+}
+
+.no-schedules {
+    color: var(--fg-muted, #8b949e);
+    text-align: center;
+    padding: 1.5rem;
+    font-size: 0.9rem;
+}
+
+/* Schedule Form */
+.schedule-form {
+    background: var(--bg, #0d1117);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    padding: 1rem;
+    margin-bottom: 0.5rem;
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1rem;
+}
+
+.form-grid .full-width {
+    grid-column: span 2;
+}
+
+.form-grid .form-group {
+    margin-bottom: 0;
+}
+
+.form-grid label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: 0.85rem;
+    color: var(--fg-muted, #8b949e);
+}
+
+.form-grid input,
+.form-grid select {
+    width: 100%;
+    padding: 0.5rem;
+    border: 1px solid var(--border, #30363d);
+    border-radius: 4px;
+    background: var(--bg-secondary, #161b22);
+    color: var(--fg, #c9d1d9);
+}
+
+.form-grid .hint {
+    display: block;
+    font-size: 0.75rem;
+    color: var(--fg-muted, #8b949e);
+    margin-top: 0.25rem;
+}
+
+.form-actions-inline {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 1rem;
+}
+
+/* Quick Task Form */
+.quick-task-form {
+    margin-bottom: 1rem;
+}
+
+.quick-task-form .form-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.quick-task-form input[type="text"] {
+    flex: 1;
+    padding: 0.6rem 0.8rem;
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    color: var(--fg, #c9d1d9);
+}
+
+.quick-task-form select {
+    padding: 0.6rem 0.8rem;
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    color: var(--fg, #c9d1d9);
+    min-width: 120px;
+}
+
+.quick-task-form button {
+    padding: 0.6rem 1rem;
+    background: var(--accent, #58a6ff);
+    border: none;
+    border-radius: 6px;
+    color: white;
+    font-weight: 500;
+    cursor: pointer;
+}
+
+.quick-task-form button:hover {
+    background: var(--accent-hover, #79b8ff);
+}
+
+/* Kanban Board */
+.kanban-board {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+}
+
+.kanban-column {
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    min-height: 300px;
+}
+
+.column-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border, #30363d);
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.status-dot.pending { background: var(--fg-muted, #8b949e); }
+.status-dot.in-progress { background: var(--accent, #58a6ff); }
+.status-dot.waiting { background: var(--warning, #d29922); }
+.status-dot.done { background: var(--success, #2ea043); }
+
+.column-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--fg-muted, #8b949e);
+    letter-spacing: 0.05em;
+}
+
+.task-count {
+    font-size: 0.7rem;
+    color: var(--fg-muted, #6e7681);
+    margin-left: auto;
+    opacity: 0.7;
+}
+
+.task-list {
+    flex: 1;
+    padding: 0.5rem;
+    overflow-y: auto;
+}
+
+.clear-actions {
+    padding: 0.5rem;
+    border-top: 1px solid var(--border, #30363d);
+    display: flex;
+    gap: 0.5rem;
+}
+
+.clear-btn {
+    flex: 1;
+    padding: 0.4rem;
+    font-size: 0.75rem;
+    background: transparent;
+    border: 1px solid var(--border, #30363d);
+    border-radius: 4px;
+    color: var(--fg-muted, #8b949e);
+    cursor: pointer;
+}
+
+.clear-btn:hover {
+    background: var(--border, #30363d);
+}
+
+.clear-btn-danger:hover {
+    background: var(--danger, #f85149);
+    border-color: var(--danger, #f85149);
+    color: white;
+}
+
+/* Dropdown Menu */
+.dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.dropdown-content {
+    display: none;
+    position: absolute;
+    right: 0;
+    top: 100%;
+    background: var(--card-bg, #161b22);
+    border: 1px solid var(--border, #30363d);
+    border-radius: 6px;
+    min-width: 120px;
+    z-index: 100;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.dropdown:hover .dropdown-content,
+.dropdown.active .dropdown-content {
+    display: block;
+}
+
+.dropdown-item {
+    display: block;
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    background: transparent;
+    border: none;
+    color: var(--fg, #c9d1d9);
+    text-align: left;
+    cursor: pointer;
+    font-size: 0.85rem;
+}
+
+.dropdown-item:hover {
+    background: var(--border, #30363d);
+}
+
+.dropdown-item.danger {
+    color: var(--danger, #f85149);
+}
+
+.dropdown-item.danger:hover {
+    background: rgba(248, 81, 73, 0.15);
+}
+
+@media (max-width: 1200px) {
+    .kanban-board {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 768px) {
+    .kanban-board {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+
+<script>
+function toggleSchedulesSection() {
+    const content = document.getElementById('schedules-content');
+    const chevron = document.getElementById('schedules-chevron');
+    const isCollapsed = content.classList.toggle('collapsed');
+    chevron.textContent = isCollapsed ? '▶' : '▼';
+}
+
+function toggleScheduleForm() {
+    const form = document.getElementById('schedule-form');
+    form.style.display = form.style.display === 'none' ? 'block' : 'none';
+}
+
+function toggleDropdown(event, id) {
+    event.stopPropagation();
+    const dropdown = document.getElementById(id);
+    dropdown.classList.toggle('active');
+
+    // Close on outside click
+    const closeHandler = (e) => {
+        if (!dropdown.contains(e.target)) {
+            dropdown.classList.remove('active');
+            document.removeEventListener('click', closeHandler);
+        }
+    };
+    setTimeout(() => document.addEventListener('click', closeHandler), 0);
+}
+</script>
+{% endblock %}
