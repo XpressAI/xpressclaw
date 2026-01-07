@@ -100,9 +100,9 @@
             <span class="column-title">PENDING</span>
             <span class="task-count" id="pending-count"></span>
         </div>
-        <div class="task-list" id="pending-tasks"
+        <div class="task-list drop-zone" id="pending-tasks" data-status="pending"
              hx-get="/partials/tasks/pending"
-             hx-trigger="load, every 5s"
+             hx-trigger="load, every 5s, taskMoved from:body"
              hx-swap="innerHTML">
             Loading...
         </div>
@@ -114,9 +114,9 @@
             <span class="column-title">IN PROGRESS</span>
             <span class="task-count" id="in-progress-count"></span>
         </div>
-        <div class="task-list" id="in-progress-tasks"
+        <div class="task-list drop-zone" id="in-progress-tasks" data-status="in_progress"
              hx-get="/partials/tasks/in_progress"
-             hx-trigger="load, every 5s"
+             hx-trigger="load, every 5s, taskMoved from:body"
              hx-swap="innerHTML">
             Loading...
         </div>
@@ -128,9 +128,9 @@
             <span class="column-title">WAITING FOR INPUT</span>
             <span class="task-count" id="waiting-count"></span>
         </div>
-        <div class="task-list" id="waiting-tasks"
+        <div class="task-list drop-zone" id="waiting-tasks" data-status="waiting_for_input"
              hx-get="/partials/tasks/waiting_for_input"
-             hx-trigger="load, every 3s"
+             hx-trigger="load, every 3s, taskMoved from:body"
              hx-swap="innerHTML">
             Loading...
         </div>
@@ -142,9 +142,9 @@
             <span class="column-title">DONE</span>
             <span class="task-count" id="done-count"></span>
         </div>
-        <div class="task-list" id="done-tasks"
+        <div class="task-list drop-zone" id="done-tasks" data-status="completed"
              hx-get="/partials/tasks/done"
-             hx-trigger="load, every 5s"
+             hx-trigger="load, every 5s, taskMoved from:body"
              hx-swap="innerHTML">
             Loading...
         </div>
@@ -492,6 +492,32 @@
     flex: 1;
     padding: 0.5rem;
     overflow-y: auto;
+    min-height: 100px;
+}
+
+/* Drag and Drop Styles */
+.task-card {
+    cursor: grab;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+}
+
+.task-card:active {
+    cursor: grabbing;
+}
+
+.task-card.dragging {
+    opacity: 0.5;
+    transform: scale(0.98);
+}
+
+.drop-zone.drag-over {
+    background: rgba(88, 166, 255, 0.1);
+    border: 2px dashed var(--accent, #58a6ff);
+    border-radius: 6px;
+}
+
+.drop-zone.drag-over .empty-state {
+    color: var(--accent, #58a6ff);
 }
 
 .clear-actions {
@@ -610,5 +636,98 @@ function toggleDropdown(event, id) {
     };
     setTimeout(() => document.addEventListener('click', closeHandler), 0);
 }
+
+// Drag and Drop functionality
+let draggedTask = null;
+
+function initDragAndDrop() {
+    // Use event delegation on the kanban board
+    const board = document.querySelector('.kanban-board');
+    if (!board) return;
+
+    // Drag start
+    board.addEventListener('dragstart', (e) => {
+        const taskCard = e.target.closest('.task-card');
+        if (!taskCard) return;
+
+        draggedTask = taskCard;
+        taskCard.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', taskCard.dataset.taskId);
+    });
+
+    // Drag end
+    board.addEventListener('dragend', (e) => {
+        const taskCard = e.target.closest('.task-card');
+        if (taskCard) {
+            taskCard.classList.remove('dragging');
+        }
+        draggedTask = null;
+
+        // Remove drag-over from all zones
+        document.querySelectorAll('.drop-zone').forEach(zone => {
+            zone.classList.remove('drag-over');
+        });
+    });
+
+    // Drag over drop zones
+    document.querySelectorAll('.drop-zone').forEach(zone => {
+        zone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            zone.classList.add('drag-over');
+        });
+
+        zone.addEventListener('dragleave', (e) => {
+            // Only remove if we're leaving the zone entirely
+            if (!zone.contains(e.relatedTarget)) {
+                zone.classList.remove('drag-over');
+            }
+        });
+
+        zone.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            zone.classList.remove('drag-over');
+
+            const taskId = e.dataTransfer.getData('text/plain');
+            const newStatus = zone.dataset.status;
+
+            if (!taskId || !newStatus) return;
+
+            // Prevent dropping on same column
+            if (draggedTask && draggedTask.closest('.drop-zone') === zone) {
+                return;
+            }
+
+            // Update task status via API
+            try {
+                const formData = new FormData();
+                formData.append('status', newStatus);
+
+                const response = await fetch(`/api/tasks/${taskId}/status`, {
+                    method: 'PATCH',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    // Trigger HTMX to refresh all columns
+                    htmx.trigger(document.body, 'taskMoved');
+                } else {
+                    console.error('Failed to update task status');
+                }
+            } catch (error) {
+                console.error('Error updating task:', error);
+            }
+        });
+    });
+}
+
+// Initialize on page load
+document.addEventListener('DOMContentLoaded', initDragAndDrop);
+
+// Re-initialize after HTMX swaps (for dynamically loaded task cards)
+document.body.addEventListener('htmx:afterSwap', (e) => {
+    // No need to re-init since we use event delegation
+});
 </script>
 {% endblock %}

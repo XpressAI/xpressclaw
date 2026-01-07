@@ -854,6 +854,32 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"Task not found or error: {e}")
 
+    @app.patch("/api/tasks/{task_id}/status")
+    async def update_task_status(task_id: str, status: str = Form(...)):
+        """Update a task's status (for drag and drop)."""
+        if not _runtime or not _runtime.task_board:
+            raise HTTPException(status_code=503, detail="Runtime not available")
+
+        from xpressai.tasks.board import TaskStatus
+
+        # Map status strings to TaskStatus enum
+        status_map = {
+            "pending": TaskStatus.PENDING,
+            "in_progress": TaskStatus.IN_PROGRESS,
+            "waiting_for_input": TaskStatus.WAITING_FOR_INPUT,
+            "completed": TaskStatus.COMPLETED,
+            "blocked": TaskStatus.BLOCKED,
+        }
+
+        if status not in status_map:
+            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
+
+        try:
+            task = await _runtime.task_board.update_status(task_id, status_map[status])
+            return {"status": "ok", "task_id": task.id, "new_status": task.status.value}
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Task not found or error: {e}")
+
     @app.delete("/api/tasks/completed/clear")
     async def clear_completed_tasks():
         """Delete all completed tasks."""
@@ -1327,7 +1353,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # Add failed class for blocked tasks to get red tint
             failed_class = "task-failed" if task.status == TaskStatus.BLOCKED else ""
             html_parts.append(f"""
-                <a href="/task/{task.id}" class="task-card {status_class} {failed_class}">
+                <a href="/task/{task.id}" class="task-card {status_class} {failed_class}"
+                   draggable="true" data-task-id="{task.id}">
                     <div class="title">{task.title}</div>
                     <div class="meta">{task.agent_id or 'unassigned'}</div>
                 </a>
@@ -1368,7 +1395,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         for task in tasks:
             status_class = f"status-{task.status.value}"
             html_parts.append(f"""
-                <a href="/task/{task.id}" class="task-card {status_class}">
+                <a href="/task/{task.id}" class="task-card {status_class}"
+                   draggable="true" data-task-id="{task.id}">
                     <div class="title">{task.title}</div>
                     <div class="meta">{task.agent_id or 'unassigned'}</div>
                 </a>
