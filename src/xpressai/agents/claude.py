@@ -422,6 +422,19 @@ class ClaudeAgentBackend(AgentBackend):
         """Clear conversation history."""
         self._conversation_history.clear()
 
+    def set_history(self, history: list[dict[str, str]]) -> None:
+        """Set conversation history from external source.
+
+        Args:
+            history: List of message dicts with 'role' and 'content' keys.
+                     Role should be 'user' or 'assistant'.
+        """
+        self._conversation_history = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in history
+            if msg.get("role") in ("user", "assistant") and msg.get("content")
+        ]
+
     def set_model(self, model: str) -> None:
         """Set the model to use.
 

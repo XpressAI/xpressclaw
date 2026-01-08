@@ -2,67 +2,265 @@
 
 {% block title %}Chat with {{ agent.name }} - XpressAI{% endblock %}
 
+{% block body_class %}chat-page{% endblock %}
+
 {% block content %}
-<div class="chat-container">
-    <div class="chat-header">
-        <div class="chat-header-left">
-            <a href="/agents" class="back-link">&larr; Back to Agents</a>
-            <div class="chat-agent-info">
+<div class="chat-layout">
+    <!-- Left Sidebar: Conversations -->
+    <div class="chat-sidebar left-sidebar" id="conversations-sidebar">
+        <div class="sidebar-header">
+            <span class="sidebar-title">Chats</span>
+        </div>
+        <div class="sidebar-content">
+            <button class="btn btn-primary btn-sm new-conv-btn" onclick="createNewConversation()">
+                + New chat
+            </button>
+            <div id="conversations-list"
+                 hx-get="/partials/agent/{{ agent.name }}/conversations"
+                 hx-trigger="load, conversationsUpdated from:body"
+                 hx-swap="innerHTML">
+            </div>
+        </div>
+    </div>
+
+    <!-- Center: Chat Area -->
+    <div class="chat-main">
+        <div class="chat-header">
+            <div class="chat-header-left">
                 <span class="agent-status-indicator status-{{ agent.status }}"></span>
                 <h2>{{ agent.name }}</h2>
                 <span class="agent-backend-badge">{{ agent.backend }}</span>
             </div>
         </div>
-        <div class="chat-header-right">
-            <button class="btn btn-sm btn-outline-muted"
-                    hx-post="/api/agent/{{ agent.name }}/chat/clear"
-                    hx-swap="none"
-                    hx-confirm="Clear chat history?"
-                    hx-on::after-request="htmx.trigger('#chat-messages', 'load')">
-                Clear Chat
-            </button>
+
+        <div class="chat-body">
+            <div id="chat-messages">
+                <div class="empty-state">Select or create a conversation to start chatting.</div>
+            </div>
+        </div>
+
+        <div class="chat-footer">
+            <form class="chat-form" id="chat-form" onsubmit="sendMessage(event)">
+                <div class="chat-input-row">
+                    <button type="button" class="attach-btn" onclick="document.getElementById('image-input').click()" title="Attach images">+</button>
+                    <input type="file" id="image-input" accept="image/*" multiple style="display:none" onchange="handleImageSelect(event)">
+                    <input type="text"
+                           id="message-input"
+                           name="message"
+                           placeholder="Type your message..."
+                           autocomplete="off"
+                           {% if agent.status != 'running' %}disabled{% endif %}>
+                    <button type="submit" {% if agent.status != 'running' %}disabled{% endif %}>Send</button>
+                </div>
+                <div id="image-preview" class="image-preview-row"></div>
+            </form>
+            {% if agent.status != 'running' %}
+            <p class="chat-status-warning">Agent is not running. Start the agent to chat.</p>
+            {% endif %}
         </div>
     </div>
 
-    <div class="chat-body">
-        <div id="chat-messages"
-             hx-get="/partials/agent/{{ agent.name }}/messages"
-             hx-trigger="load, refresh"
-             hx-swap="innerHTML">
-            Loading...
+    <!-- Right Sidebar: Agent Info -->
+    <div class="chat-sidebar right-sidebar" id="info-sidebar">
+        <div class="sidebar-header">
+            <span class="sidebar-title">Agent Info</span>
+        </div>
+        <div class="sidebar-content">
+            <div id="agent-info-panel"
+                 hx-get="/partials/agent/{{ agent.name }}/info-panel"
+                 hx-trigger="load, every 10s"
+                 hx-swap="innerHTML">
+            </div>
         </div>
     </div>
+</div>
 
-    <div class="chat-footer">
-        <form class="chat-form"
-              hx-post="/api/agent/{{ agent.name }}/chat"
-              hx-swap="none"
-              hx-on::after-request="this.reset(); htmx.trigger('#chat-messages', 'refresh')">
-            <input type="text"
-                   name="message"
-                   placeholder="Type your message..."
-                   required
-                   autocomplete="off"
-                   {% if agent.status != 'running' %}disabled{% endif %}>
-            <button type="submit" {% if agent.status != 'running' %}disabled{% endif %}>
-                Send
-            </button>
-        </form>
-        {% if agent.status != 'running' %}
-        <p class="chat-status-warning">Agent is not running. Start the agent to chat.</p>
-        {% endif %}
-        <p class="chat-hint">
-            This agent can create tasks, save memories, and create procedures.
-        </p>
-    </div>
+<!-- Image Preview Modal -->
+<div id="image-modal" class="image-modal" onclick="closeImageModal()">
+    <img id="modal-image" src="" alt="Preview">
 </div>
 
 <script>
 (function() {
+    var agentId = "{{ agent.name }}";
+    var currentConversationId = null;
+    var attachedImages = [];
     var chatMessages = document.getElementById('chat-messages');
     var expandedHooks = new Set();
     var lastMessageCount = 0;
     var pollInterval = null;
+
+    // Create new conversation
+    window.createNewConversation = async function() {
+        try {
+            var response = await fetch('/api/agent/' + agentId + '/conversations', {
+                method: 'POST'
+            });
+            var data = await response.json();
+            if (data.conversation_id) {
+                currentConversationId = data.conversation_id;
+                loadMessages();
+                htmx.trigger(document.body, 'conversationsUpdated');
+                updateActiveConversation();
+            }
+        } catch (e) {
+            console.error('Error creating conversation:', e);
+        }
+    };
+
+    // Select existing conversation
+    window.selectConversation = function(convId) {
+        currentConversationId = convId;
+        loadMessages();
+        updateActiveConversation();
+    };
+
+    // Update active state in conversation list
+    function updateActiveConversation() {
+        document.querySelectorAll('.conversation-item').forEach(function(el) {
+            el.classList.toggle('active', el.dataset.convId === currentConversationId);
+        });
+    }
+
+    // Load messages for current conversation
+    window.loadMessages = function() {
+        if (!currentConversationId) {
+            chatMessages.innerHTML = '<div class="empty-state">Select or create a conversation to start chatting.</div>';
+            return;
+        }
+        var url = '/partials/agent/' + agentId + '/messages?conversation_id=' + currentConversationId;
+        htmx.ajax('GET', url, {target: '#chat-messages', swap: 'innerHTML'});
+    };
+
+    // Send message
+    window.sendMessage = async function(event) {
+        event.preventDefault();
+        if (!currentConversationId) {
+            // Auto-create conversation if none selected
+            await createNewConversation();
+        }
+
+        var input = document.getElementById('message-input');
+        var message = input.value.trim();
+        if (!message && attachedImages.length === 0) return;
+
+        var formData = new FormData();
+        formData.append('message', message);
+        formData.append('conversation_id', currentConversationId);
+        if (attachedImages.length > 0) {
+            formData.append('images', JSON.stringify(attachedImages));
+        }
+
+        try {
+            var response = await fetch('/api/agent/' + agentId + '/chat', {
+                method: 'POST',
+                body: formData
+            });
+            if (response.ok) {
+                input.value = '';
+                clearAttachedImages();
+                loadMessages();
+                htmx.trigger(document.body, 'conversationsUpdated');
+            }
+        } catch (e) {
+            console.error('Error sending message:', e);
+        }
+    };
+
+    // Image handling
+    window.handleImageSelect = function(event) {
+        var files = event.target.files;
+        for (var i = 0; i < files.length && attachedImages.length < 5; i++) {
+            var file = files[i];
+            var reader = new FileReader();
+            reader.onload = function(e) {
+                attachedImages.push(e.target.result);
+                updateImagePreview();
+            };
+            reader.readAsDataURL(file);
+        }
+        event.target.value = '';
+    };
+
+    // Handle paste
+    document.getElementById('message-input').addEventListener('paste', function(e) {
+        var items = e.clipboardData.items;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].type.indexOf('image') !== -1) {
+                var file = items[i].getAsFile();
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    if (attachedImages.length < 5) {
+                        attachedImages.push(ev.target.result);
+                        updateImagePreview();
+                    }
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+    });
+
+    // Handle drag and drop
+    var chatBody = document.querySelector('.chat-body');
+    chatBody.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        chatBody.classList.add('drag-over');
+    });
+    chatBody.addEventListener('dragleave', function() {
+        chatBody.classList.remove('drag-over');
+    });
+    chatBody.addEventListener('drop', function(e) {
+        e.preventDefault();
+        chatBody.classList.remove('drag-over');
+        var files = e.dataTransfer.files;
+        for (var i = 0; i < files.length && attachedImages.length < 5; i++) {
+            if (files[i].type.indexOf('image') !== -1) {
+                var reader = new FileReader();
+                reader.onload = function(ev) {
+                    attachedImages.push(ev.target.result);
+                    updateImagePreview();
+                };
+                reader.readAsDataURL(files[i]);
+            }
+        }
+    });
+
+    function updateImagePreview() {
+        var preview = document.getElementById('image-preview');
+        preview.innerHTML = attachedImages.map(function(img, i) {
+            return '<div class="preview-thumb" onclick="removeAttachedImage(' + i + ')">' +
+                   '<img src="' + img + '" alt="Preview">' +
+                   '<span class="remove-btn">&times;</span></div>';
+        }).join('');
+    }
+
+    window.removeAttachedImage = function(index) {
+        attachedImages.splice(index, 1);
+        updateImagePreview();
+    };
+
+    function clearAttachedImages() {
+        attachedImages = [];
+        updateImagePreview();
+    }
+
+    // Image preview in messages
+    window.toggleImagePreview = function(el) {
+        var img = el.dataset.image;
+        if (img) {
+            document.getElementById('modal-image').src = img;
+            document.getElementById('image-modal').classList.add('show');
+        }
+    };
+
+    window.closeImageModal = function() {
+        document.getElementById('image-modal').classList.remove('show');
+    };
+
+    // Close modal on escape
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeImageModal();
+    });
 
     // Save which hooks are expanded
     function saveExpandedState() {
@@ -81,11 +279,6 @@
         });
     }
 
-    // Get current scroll state
-    function isNearBottom() {
-        return (chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight) < 100;
-    }
-
     // Before swap - save state
     document.body.addEventListener('htmx:beforeSwap', function(evt) {
         if (evt.detail.target.id === 'chat-messages') {
@@ -97,26 +290,24 @@
     document.body.addEventListener('htmx:afterSwap', function(evt) {
         if (evt.detail.target.id === 'chat-messages') {
             restoreExpandedState();
-
-            // Count messages to detect new ones
             var newCount = chatMessages.querySelectorAll('.chat-message').length;
             var hasNewMessages = newCount > lastMessageCount;
             lastMessageCount = newCount;
-
-            // Scroll to bottom on initial load or if was near bottom
             if (hasNewMessages || newCount === 0) {
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             }
         }
+        if (evt.detail.target.id === 'conversations-list') {
+            updateActiveConversation();
+        }
     });
 
-    // Start polling after initial load
+    // Polling for new messages
     document.body.addEventListener('htmx:afterSettle', function(evt) {
         if (evt.detail.target.id === 'chat-messages' && !pollInterval) {
             pollInterval = setInterval(function() {
-                // Only poll if not already loading
-                if (!chatMessages.classList.contains('htmx-request')) {
-                    htmx.trigger(chatMessages, 'refresh');
+                if (currentConversationId && !chatMessages.classList.contains('htmx-request')) {
+                    loadMessages();
                 }
             }, 3000);
         }

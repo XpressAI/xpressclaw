@@ -873,6 +873,18 @@ class LocalModelBackend(AgentBackend):
         """Clear conversation history."""
         self._conversation_history.clear()
 
+    def set_history(self, history: list[dict[str, str]]) -> None:
+        """Set conversation history from external source.
+
+        Args:
+            history: List of message dicts with 'role' and 'content' keys.
+        """
+        self._conversation_history = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in history
+            if msg.get("role") in ("user", "assistant") and msg.get("content")
+        ]
+
     @property
     def model(self) -> str:
         """The model being used."""

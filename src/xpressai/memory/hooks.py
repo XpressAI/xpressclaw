@@ -98,7 +98,7 @@ async def memory_recall(
         # 3. Evaluate usefulness and build context
         useful_memories = []
 
-        # Evaluate short-term memories
+        # Evaluate short-term memories (keep them in slots - LRU cache style)
         for item in short_term_memories:
             memory = item["memory"]
             is_useful = True  # Short-term memories are assumed useful by default
@@ -118,12 +118,11 @@ Reply with just "useful" or "useless"."""
             if is_useful:
                 useful_memories.append({"memory": memory, "score": 1.0, "source": "short_term"})
                 track_used_memory(agent_id, memory, 1.0)
+                # Update relevance score to keep it in slots longer
+                await slot_manager.update_relevance(item["slot_index"], 1.0)
+                logger.debug(f"Memory in slot {item['slot_index']} used (kept in slot)")
 
-                # UNLOAD from slot - it's now "in use"
-                await slot_manager.unload(item["slot_index"])
-                logger.debug(f"Unloaded memory from slot {item['slot_index']} (in use)")
-
-        # Add mid-term results (already filtered by relevance)
+        # Add mid-term results and load them into slots (LRU cache behavior)
         for search_result in mid_term_results:
             # Don't duplicate if already in short-term
             if not any(m["memory"].id == search_result.memory.id for m in useful_memories):
@@ -133,6 +132,10 @@ Reply with just "useful" or "useless"."""
                     "source": "mid_term"
                 })
                 track_used_memory(agent_id, search_result.memory, search_result.relevance_score)
+
+                # Load mid-term memory into slot (evicts least relevant if full)
+                await slot_manager.load(search_result.memory, search_result.relevance_score)
+                logger.debug(f"Loaded mid-term memory {search_result.memory.id} into slot")
 
         debug_info["useful_count"] = len(useful_memories)
 
