@@ -27,7 +27,7 @@ from xpressai.memory.context import (
 )
 
 # Import shared dependencies
-from xpressai.web.deps import (
+from xpressai.web.common import (
     get_runtime,
     set_runtime,
     get_templates,

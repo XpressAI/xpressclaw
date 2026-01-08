@@ -13,7 +13,7 @@ from typing import Optional
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse
 
-from xpressai.web.deps import get_runtime, get_templates
+from xpressai.web.common import get_runtime, get_templates
 
 logger = logging.getLogger(__name__)
 
