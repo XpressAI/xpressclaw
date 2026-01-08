@@ -26,6 +26,19 @@ from xpressai.memory.context import (
     set_message_embedder,
 )
 
+# Import shared dependencies
+from xpressai.web.deps import (
+    get_runtime,
+    set_runtime,
+    get_templates,
+    set_templates,
+    render_markdown,
+    FASTAPI_AVAILABLE,
+)
+
+# Import route modules
+from xpressai.web.routes.tasks import router as tasks_router
+
 try:
     from fastapi import FastAPI, Request, HTTPException, Form
     from fastapi.responses import HTMLResponse, RedirectResponse
@@ -33,26 +46,12 @@ try:
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 
-    FASTAPI_AVAILABLE = True
 except ImportError:
-    FASTAPI_AVAILABLE = False
     FastAPI = None  # type: ignore
     BaseModel = object  # type: ignore
 
 
-class CreateTaskRequest(BaseModel):
-    """Request body for creating a task."""
-    title: str
-    description: Optional[str] = None
-    agent_id: Optional[str] = None
-
-
-class AddMessageRequest(BaseModel):
-    """Request body for adding a message to a task."""
-    content: str
-
-
-# Global runtime reference (set when app is created)
+# Keep local reference for backwards compatibility within this file
 _runtime: Runtime | None = None
 
 
@@ -170,6 +169,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     if template_dir.exists() and (template_dir / "index.html").exists():
         templates = Jinja2Templates(directory=str(template_dir))
 
+    # Set shared dependencies for route modules
+    set_runtime(runtime)
+    if templates:
+        set_templates(templates)
+
+    # Include route modules
+    app.include_router(tasks_router)
+
     # -------------------------
     # Page Routes
     # -------------------------
@@ -278,20 +285,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             )
         return HTMLResponse("<h1>Agent Chat - Templates not installed</h1>")
 
-    @app.get("/tasks", response_class=HTMLResponse)
-    async def tasks_page(request: Request):
-        """Tasks page."""
-        agents = []
-        if _runtime:
-            agents = await _runtime.list_agents()
-            print(f"[DEBUG] Tasks page: found {len(agents)} agents: {[a.name for a in agents]}")
-        else:
-            print("[DEBUG] Tasks page: _runtime is None")
-        if templates:
-            return templates.TemplateResponse(
-                "tasks.html", {"request": request, "active": "tasks", "agents": agents}
-            )
-        return HTMLResponse("<h1>Tasks - Templates not installed</h1>")
+    # Note: /tasks route is now in routes/tasks.py
 
     @app.get("/memory", response_class=HTMLResponse)
     async def memory_page(request: Request):
@@ -341,37 +335,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             )
         return HTMLResponse("<h1>Procedures - Templates not installed</h1>")
 
-    @app.get("/task/{task_id}", response_class=HTMLResponse)
-    async def task_detail_page(request: Request, task_id: str):
-        """Task detail page with conversation thread."""
-        if not _runtime or not _runtime.task_board:
-            return HTMLResponse("<h1>Runtime not available</h1>")
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        # Get conversation messages
-        messages = []
-        if hasattr(_runtime, 'conversation_manager') and _runtime.conversation_manager:
-            messages = await _runtime.conversation_manager.get_messages(task_id)
-
-        # Get agents for assignment dropdown
-        agents = await _runtime.list_agents()
-
-        if templates:
-            return templates.TemplateResponse(
-                "task_detail.html",
-                {
-                    "request": request,
-                    "active": "tasks",
-                    "task": task,
-                    "messages": messages,
-                    "agents": agents,
-                }
-            )
-        return HTMLResponse(f"<h1>Task: {task.title}</h1><p>{task.description}</p>")
+    # Note: /task/{task_id} route is now in routes/tasks.py
 
     # -------------------------
     # API Routes
@@ -717,278 +681,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
         return await _runtime.get_budget_summary()
 
-    @app.get("/api/tasks")
-    async def list_tasks():
-        """List all tasks."""
-        if not _runtime:
-            return {"tasks": []}
-
-        counts = await _runtime.get_task_counts()
-        return {"counts": counts}
-
-    @app.post("/api/tasks")
-    async def create_task(
-        title: str = Form(...),
-        description: Optional[str] = Form(None),
-        agent_id: Optional[str] = Form(None),
-    ):
-        """Create a new task from form data."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        # Convert empty string to None for agent_id
-        if agent_id == "":
-            agent_id = None
-
-        task = await _runtime.task_board.create_task(
-            title=title,
-            description=description if description else None,
-            agent_id=agent_id,
-        )
-
-        return {
-            "id": task.id,
-            "title": task.title,
-            "status": task.status.value,
-        }
-
-    @app.get("/api/tasks/{task_id}")
-    async def get_task(task_id: str):
-        """Get a specific task."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        return {
-            "id": task.id,
-            "title": task.title,
-            "description": task.description,
-            "status": task.status.value,
-            "agent_id": task.agent_id,
-            "created_at": task.created_at.isoformat(),
-        }
-
-    @app.get("/api/tasks/{task_id}/messages")
-    async def get_task_messages(task_id: str):
-        """Get messages for a task."""
-        if not _runtime:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        if not hasattr(_runtime, 'conversation_manager') or not _runtime.conversation_manager:
-            return {"messages": []}
-
-        messages = await _runtime.conversation_manager.get_messages(task_id)
-        return {
-            "messages": [
-                {
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "timestamp": m.timestamp.isoformat(),
-                }
-                for m in messages
-            ]
-        }
-
-    @app.post("/api/tasks/{task_id}/messages")
-    async def add_task_message(task_id: str, content: str = Form(...)):
-        """Add a user message to a task.
-
-        If the task is waiting, completed, or blocked, this will resume it.
-        """
-        if not _runtime:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        if not hasattr(_runtime, 'conversation_manager') or not _runtime.conversation_manager:
-            raise HTTPException(status_code=503, detail="Conversation manager not available")
-
-        # Get current task status
-        task = await _runtime.task_board.get_task(task_id)
-
-        from xpressai.tasks.board import TaskStatus
-
-        # Add the user message
-        await _runtime.conversation_manager.add_message(task_id, "user", content)
-
-        # Resume task if it's in a terminal or waiting state
-        if task.status in (TaskStatus.WAITING_FOR_INPUT, TaskStatus.COMPLETED, TaskStatus.BLOCKED):
-            await _runtime.task_board.update_status(task_id, TaskStatus.PENDING)
-
-        return {"status": "ok"}
-
-    @app.post("/api/tasks/{task_id}/complete")
-    async def complete_task_manual(task_id: str):
-        """Manually mark a task as completed."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        # Add a message noting manual completion
-        if hasattr(_runtime, 'conversation_manager') and _runtime.conversation_manager:
-            await _runtime.conversation_manager.add_message(
-                task_id, "system", "Task manually marked as completed by user"
-            )
-
-        await _runtime.task_board.update_status(task_id, TaskStatus.COMPLETED)
-        return {"status": "ok", "task_id": task_id}
-
-    @app.post("/api/tasks/{task_id}/fail")
-    async def fail_task_manual(task_id: str):
-        """Manually mark a task as failed/blocked."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        # Add a message noting manual cancellation
-        if hasattr(_runtime, 'conversation_manager') and _runtime.conversation_manager:
-            await _runtime.conversation_manager.add_message(
-                task_id, "system", "Task manually cancelled/failed by user"
-            )
-
-        await _runtime.task_board.update_status(task_id, TaskStatus.BLOCKED)
-        return {"status": "ok", "task_id": task_id}
-
-    @app.post("/api/tasks/{task_id}/retry")
-    async def retry_task(task_id: str):
-        """Retry a failed task from scratch.
-
-        Clears the conversation history and resets the task to pending.
-        """
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        # Clear conversation history
-        if hasattr(_runtime, 'conversation_manager') and _runtime.conversation_manager:
-            await _runtime.conversation_manager.clear_messages(task_id)
-
-        # Reset task to pending
-        await _runtime.task_board.update_status(task_id, TaskStatus.PENDING)
-        return {"status": "ok", "task_id": task_id}
-
-    @app.post("/api/tasks/{task_id}/assign")
-    async def assign_task(task_id: str, agent_id: str = Form("")):
-        """Assign a task to an agent."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        try:
-            task = await _runtime.task_board.get_task(task_id)
-        except Exception:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-        # Empty string means unassigned
-        assigned_agent = agent_id if agent_id else None
-
-        await _runtime.task_board.assign_task(task_id, assigned_agent)
-        return {"status": "ok", "task_id": task_id, "agent_id": assigned_agent}
-
-    @app.delete("/api/tasks/{task_id}")
-    async def delete_task(task_id: str):
-        """Delete a specific task."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        try:
-            await _runtime.task_board.delete_task(task_id)
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Task not found or error: {e}")
-
-        return {"status": "ok", "task_id": task_id}
-
-    @app.patch("/api/tasks/{task_id}")
-    async def update_task(task_id: str, request: Request):
-        """Update a task's title and/or description."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        try:
-            form = await request.form()
-            title = form.get("title")
-            description = form.get("description")
-
-            # Convert empty strings to None for description (to allow clearing)
-            if description == "":
-                description = None
-
-            task = await _runtime.task_board.update_task(
-                task_id,
-                title=title if title else None,
-                description=description,
-            )
-            return {"status": "ok", "task_id": task.id, "title": task.title}
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Task not found or error: {e}")
-
-    @app.patch("/api/tasks/{task_id}/status")
-    async def update_task_status(task_id: str, status: str = Form(...)):
-        """Update a task's status (for drag and drop)."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        # Map status strings to TaskStatus enum
-        status_map = {
-            "pending": TaskStatus.PENDING,
-            "in_progress": TaskStatus.IN_PROGRESS,
-            "waiting_for_input": TaskStatus.WAITING_FOR_INPUT,
-            "completed": TaskStatus.COMPLETED,
-            "blocked": TaskStatus.BLOCKED,
-        }
-
-        if status not in status_map:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-
-        try:
-            task = await _runtime.task_board.update_status(task_id, status_map[status])
-            return {"status": "ok", "task_id": task.id, "new_status": task.status.value}
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Task not found or error: {e}")
-
-    @app.delete("/api/tasks/completed/clear")
-    async def clear_completed_tasks():
-        """Delete all completed tasks."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        count = await _runtime.task_board.delete_tasks_by_status(TaskStatus.COMPLETED)
-        return {"status": "ok", "deleted_count": count}
-
-    @app.delete("/api/tasks/blocked/clear")
-    async def clear_blocked_tasks():
-        """Delete all blocked/failed tasks."""
-        if not _runtime or not _runtime.task_board:
-            raise HTTPException(status_code=503, detail="Runtime not available")
-
-        from xpressai.tasks.board import TaskStatus
-
-        count = await _runtime.task_board.delete_tasks_by_status(TaskStatus.BLOCKED)
-        return {"status": "ok", "deleted_count": count}
+    # Note: Task API routes (/api/tasks/*) are now in routes/tasks.py
 
     # Scheduled Tasks API
     @app.get("/api/schedules")
@@ -1375,229 +1068,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 </div>
             """)
 
-    @app.get("/partials/tasks", response_class=HTMLResponse)
-    async def tasks_partial(request: Request):
-        """HTMX partial for tasks summary."""
-        if not _runtime:
-            return HTMLResponse('<div class="empty-state">Tasks not available</div>')
-
-        counts = await _runtime.get_task_counts()
-        pending = counts.get("pending", 0)
-        in_progress = counts.get("in_progress", 0)
-        waiting = counts.get("waiting_for_input", 0)
-        completed = counts.get("completed", 0)
-
-        waiting_html = ""
-        if waiting > 0:
-            waiting_html = f"""
-                <div class="task-count waiting">
-                    <span class="number">{waiting}</span>
-                    <span class="label">Waiting</span>
-                </div>
-            """
-
-        return HTMLResponse(f"""
-            <div class="task-counts">
-                <div class="task-count pending">
-                    <span class="number">{pending}</span>
-                    <span class="label">Pending</span>
-                </div>
-                <div class="task-count in-progress">
-                    <span class="number">{in_progress}</span>
-                    <span class="label">In Progress</span>
-                </div>
-                {waiting_html}
-                <div class="task-count completed">
-                    <span class="number">{completed}</span>
-                    <span class="label">Completed</span>
-                </div>
-            </div>
-        """)
-
-    @app.get("/partials/tasks/done", response_class=HTMLResponse)
-    async def tasks_done_partial(request: Request):
-        """HTMX partial for done tasks (completed + blocked/failed)."""
-        if not _runtime or not _runtime.task_board:
-            return HTMLResponse('<div class="empty-state">No tasks</div><span id="done-count" class="task-count" hx-swap-oob="true">0</span>')
-
-        from xpressai.tasks.board import TaskStatus
-
-        # Get both completed and blocked tasks
-        completed_tasks = await _runtime.task_board.get_tasks(status=TaskStatus.COMPLETED, limit=20)
-        blocked_tasks = await _runtime.task_board.get_tasks(status=TaskStatus.BLOCKED, limit=20)
-
-        all_tasks = completed_tasks + blocked_tasks
-        count = len(all_tasks)
-
-        if not all_tasks:
-            return HTMLResponse(f'<div class="empty-state">No tasks</div><span id="done-count" class="task-count" hx-swap-oob="true">{count}</span>')
-
-        # Sort by updated_at descending (most recent first)
-        all_tasks.sort(key=lambda t: t.updated_at, reverse=True)
-
-        html_parts = []
-        for task in all_tasks[:20]:  # Limit to 20 total
-            status_class = f"status-{task.status.value}"
-            # Add failed class for blocked tasks to get red tint
-            failed_class = "task-failed" if task.status == TaskStatus.BLOCKED else ""
-            html_parts.append(f"""
-                <a href="/task/{task.id}" class="task-card {status_class} {failed_class}"
-                   draggable="true" data-task-id="{task.id}">
-                    <div class="title">{task.title}</div>
-                    <div class="meta">{task.agent_id or 'unassigned'}</div>
-                </a>
-            """)
-
-        # Add out-of-band swap for the count
-        html_parts.append(f'<span id="done-count" class="task-count" hx-swap-oob="true">{count}</span>')
-
-        return HTMLResponse("".join(html_parts))
-
-    @app.get("/partials/tasks/{status}", response_class=HTMLResponse)
-    async def tasks_by_status_partial(request: Request, status: str):
-        """HTMX partial for tasks by status (for kanban board)."""
-        # Map status to count element ID
-        count_id_map = {
-            "pending": "pending-count",
-            "in_progress": "in-progress-count",
-            "waiting_for_input": "waiting-count",
-        }
-        count_id = count_id_map.get(status, f"{status}-count")
-
-        if not _runtime or not _runtime.task_board:
-            return HTMLResponse(f'<div class="empty-state">No tasks</div><span id="{count_id}" class="task-count" hx-swap-oob="true">0</span>')
-
-        from xpressai.tasks.board import TaskStatus
-        try:
-            status_enum = TaskStatus(status)
-        except ValueError:
-            return HTMLResponse(f'<div class="empty-state">Invalid status: {status}</div>')
-
-        tasks = await _runtime.task_board.get_tasks(status=status_enum, limit=20)
-        count = len(tasks)
-
-        if not tasks:
-            return HTMLResponse(f'<div class="empty-state">No tasks</div><span id="{count_id}" class="task-count" hx-swap-oob="true">{count}</span>')
-
-        html_parts = []
-        for task in tasks:
-            status_class = f"status-{task.status.value}"
-            html_parts.append(f"""
-                <a href="/task/{task.id}" class="task-card {status_class}"
-                   draggable="true" data-task-id="{task.id}">
-                    <div class="title">{task.title}</div>
-                    <div class="meta">{task.agent_id or 'unassigned'}</div>
-                </a>
-            """)
-
-        # Add out-of-band swap for the count
-        html_parts.append(f'<span id="{count_id}" class="task-count" hx-swap-oob="true">{count}</span>')
-
-        return HTMLResponse("".join(html_parts))
-
-    @app.get("/partials/task/{task_id}/messages", response_class=HTMLResponse)
-    async def task_messages_partial(request: Request, task_id: str):
-        """HTMX partial for task conversation messages."""
-        import html as html_module
-
-        if not _runtime:
-            return HTMLResponse('<div class="empty-state">Runtime not available</div>')
-
-        try:
-            messages = []
-            if hasattr(_runtime, 'conversation_manager') and _runtime.conversation_manager:
-                messages = await _runtime.conversation_manager.get_messages(task_id)
-
-            if not messages:
-                return HTMLResponse('<div class="empty-state">No messages yet</div>')
-
-            html_parts = ['<div class="conversation">']
-            for msg in messages:
-                timestamp = msg.timestamp.strftime("%H:%M")
-                content = msg.content
-                rendered_content = _render_markdown(content)
-
-                # Determine display type based on content patterns
-                is_hook = msg.role == "hook"
-                is_tool_call = (
-                    content.startswith("Calling tool:") or
-                    content.startswith("[Tool Call]:") or
-                    content.startswith("Tool call:")
-                )
-                is_tool_result = (
-                    msg.role == "tool" or
-                    content.startswith("[Tool Result") or
-                    (": " in content and not is_tool_call and msg.role == "agent" and
-                     any(content.startswith(t) for t in ["read_file:", "write_file:", "list_directory:",
-                         "execute_command:", "fetch_url:", "complete_task:", "fail_task:"]))
-                )
-                is_system = msg.role == "system" or content.startswith("Task prompt") or content.startswith("Task failed") or content.startswith("Task did not")
-
-                if is_hook:
-                    hook_name = content.split(":")[0] if ":" in content else "hook"
-                    hook_detail = content[len(hook_name)+1:].strip() if ":" in content else content
-                    rendered_detail = _render_markdown(hook_detail)
-                    html_parts.append(f"""
-                        <details class="chat-message hook" data-timestamp="{msg.timestamp.isoformat()}">
-                            <summary class="hook-summary">
-                                <span class="hook-icon">&#9881;</span>
-                                <span class="hook-name">{html_module.escape(hook_name)}</span>
-                                <span class="meta">{timestamp}</span>
-                            </summary>
-                            <div class="hook-content">{rendered_detail}</div>
-                        </details>
-                    """)
-                elif is_system or is_tool_result:
-                    if is_system:
-                        first_line = content.split('\n')[0][:60]
-                        summary = f"System: {html_module.escape(first_line)}..."
-                    else:
-                        if content.startswith("[Tool Result"):
-                            match = content.split(']:')[0] if ']:' in content else content[:40]
-                            summary = html_module.escape(match.replace('[', '').replace(']', ''))
-                        elif ':' in content:
-                            tool_name = content.split(':')[0]
-                            summary = f"Tool Result: {html_module.escape(tool_name)}"
-                        else:
-                            summary = "Tool Result"
-                    html_parts.append(f"""
-                        <details class="message message-tool" data-timestamp="{msg.timestamp.isoformat()}">
-                            <summary>
-                                <span class="message-summary">{summary}</span>
-                                <span class="message-time">{timestamp}</span>
-                            </summary>
-                            <div class="message-content markdown-content">{rendered_content}</div>
-                        </details>
-                    """)
-                elif is_tool_call:
-                    html_parts.append(f"""
-                        <div class="message message-agent">
-                            <div class="message-header">
-                                <span class="message-role">AGENT</span>
-                                <span class="message-time">{timestamp}</span>
-                            </div>
-                            <div class="message-content markdown-content">{rendered_content}</div>
-                        </div>
-                    """)
-                else:
-                    role_display = msg.role.upper()
-                    role_class = f"message-{msg.role}"
-                    html_parts.append(f"""
-                        <div class="message {role_class}">
-                            <div class="message-header">
-                                <span class="message-role">{role_display}</span>
-                                <span class="message-time">{timestamp}</span>
-                            </div>
-                            <div class="message-content markdown-content">{rendered_content}</div>
-                        </div>
-                    """)
-
-            html_parts.append("</div>")
-            return HTMLResponse("".join(html_parts))
-
-        except Exception as e:
-            logger.error(f"Error loading task messages: {e}")
-            return HTMLResponse(f'<div class="empty-state error">Error loading messages: {html_module.escape(str(e))}</div>')
+    # Note: Task partials (/partials/tasks/*, /partials/task/*) are now in routes/tasks.py
 
     @app.get("/partials/memory", response_class=HTMLResponse)
     async def memory_partial(request: Request):
