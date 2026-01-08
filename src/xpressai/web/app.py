@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from xpressai.core.runtime import Runtime
 
+# Import context management for dynamic history
+from xpressai.memory.context import (
+    count_tokens,
+    ContextManager,
+    Message,
+    MessageEmbedder,
+    get_message_embedder,
+    set_message_embedder,
+)
+
 try:
     from fastapi import FastAPI, Request, HTTPException, Form
     from fastapi.responses import HTMLResponse, RedirectResponse
@@ -46,6 +56,77 @@ class AddMessageRequest(BaseModel):
 _runtime: Runtime | None = None
 
 
+def _render_markdown(text: str) -> str:
+    """Simple markdown rendering without external dependencies."""
+    import html as html_module
+    import re
+
+    # Escape HTML first for security
+    text = html_module.escape(text)
+
+    # Code blocks (``` ... ```)
+    text = re.sub(
+        r'```(\w*)\n(.*?)```',
+        lambda m: f'<pre><code class="language-{m.group(1)}">{m.group(2)}</code></pre>',
+        text,
+        flags=re.DOTALL
+    )
+
+    # Inline code
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
+
+    # Headers
+    text = re.sub(r'^### (.+)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
+    text = re.sub(r'^## (.+)$', r'<h2>\1</h2>', text, flags=re.MULTILINE)
+    text = re.sub(r'^# (.+)$', r'<h1>\1</h1>', text, flags=re.MULTILINE)
+
+    # Bold and italic
+    text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<strong><em>\1</em></strong>', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
+
+    # Links
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank">\1</a>', text)
+
+    # Horizontal rules
+    text = re.sub(r'^---+$', r'<hr>', text, flags=re.MULTILINE)
+
+    # Lists (simple)
+    text = re.sub(r'^(\d+)\. (.+)$', r'<li>\2</li>', text, flags=re.MULTILINE)
+    text = re.sub(r'^- (.+)$', r'<li>\1</li>', text, flags=re.MULTILINE)
+
+    # Tables (basic support)
+    lines = text.split('\n')
+    in_table = False
+    result_lines = []
+    for line in lines:
+        if '|' in line and not line.strip().startswith('<'):
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            if cells:
+                if all(c.replace('-', '') == '' for c in cells):
+                    continue  # Skip separator row
+                if not in_table:
+                    result_lines.append('<table>')
+                    in_table = True
+                result_lines.append('<tr>' + ''.join(f'<td>{c}</td>' for c in cells) + '</tr>')
+            else:
+                result_lines.append(line)
+        else:
+            if in_table:
+                result_lines.append('</table>')
+                in_table = False
+            result_lines.append(line)
+    if in_table:
+        result_lines.append('</table>')
+    text = '\n'.join(result_lines)
+
+    # Paragraphs - convert remaining newlines
+    text = re.sub(r'\n\n+', '</p><p>', text)
+    text = text.replace('\n', '<br>')
+
+    return text
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     """Create the FastAPI application.
 
@@ -57,6 +138,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     """
     global _runtime
     _runtime = runtime
+
+    # Initialize message embedder for async embedding computation
+    if runtime and hasattr(runtime, '_db') and hasattr(runtime, 'vector_store'):
+        if runtime._db and runtime.vector_store:
+            embedder = MessageEmbedder(runtime._db, runtime.vector_store)
+            set_message_embedder(embedder)
+            logger.info("Message embedder initialized for async embedding computation")
 
     if not FASTAPI_AVAILABLE:
         raise ImportError(
@@ -1427,8 +1515,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             for msg in messages:
                 timestamp = msg.timestamp.strftime("%H:%M")
                 content = msg.content
-                escaped_content = html_module.escape(content)
-                escaped_content = escaped_content.replace('\n', '<br>')
+                rendered_content = _render_markdown(content)
 
                 # Determine display type based on content patterns
                 is_hook = msg.role == "hook"
@@ -1449,7 +1536,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 if is_hook:
                     hook_name = content.split(":")[0] if ":" in content else "hook"
                     hook_detail = content[len(hook_name)+1:].strip() if ":" in content else content
-                    escaped_detail = html_module.escape(hook_detail).replace('\n', '<br>')
+                    rendered_detail = _render_markdown(hook_detail)
                     html_parts.append(f"""
                         <details class="chat-message hook" data-timestamp="{msg.timestamp.isoformat()}">
                             <summary class="hook-summary">
@@ -1457,7 +1544,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                                 <span class="hook-name">{html_module.escape(hook_name)}</span>
                                 <span class="meta">{timestamp}</span>
                             </summary>
-                            <div class="hook-content">{escaped_detail}</div>
+                            <div class="hook-content">{rendered_detail}</div>
                         </details>
                     """)
                 elif is_system or is_tool_result:
@@ -1479,7 +1566,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                                 <span class="message-summary">{summary}</span>
                                 <span class="message-time">{timestamp}</span>
                             </summary>
-                            <div class="message-content">{escaped_content}</div>
+                            <div class="message-content markdown-content">{rendered_content}</div>
                         </details>
                     """)
                 elif is_tool_call:
@@ -1489,7 +1576,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                                 <span class="message-role">AGENT</span>
                                 <span class="message-time">{timestamp}</span>
                             </div>
-                            <div class="message-content">{escaped_content}</div>
+                            <div class="message-content markdown-content">{rendered_content}</div>
                         </div>
                     """)
                 else:
@@ -1501,7 +1588,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                                 <span class="message-role">{role_display}</span>
                                 <span class="message-time">{timestamp}</span>
                             </div>
-                            <div class="message-content">{escaped_content}</div>
+                            <div class="message-content markdown-content">{rendered_content}</div>
                         </div>
                     """)
 
@@ -1819,13 +1906,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     def _render_chat_message(row) -> str:
         """Render a single chat message to HTML."""
         import html as html_module
+        import json as json_module
 
         role = row["role"]
         content = row["content"]
         timestamp = row["timestamp"] or ""
-
-        # Escape HTML in content but preserve newlines
-        escaped_content = html_module.escape(content).replace("\n", "<br>")
 
         time_str = ""
         if timestamp:
@@ -1835,12 +1920,36 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             except:
                 pass
 
+        # Check if content is multipart (JSON with images)
+        text_content = content
+        image_indicators = ""
+        try:
+            parsed = json_module.loads(content)
+            if isinstance(parsed, dict) and parsed.get("type") == "multipart":
+                text_content = parsed.get("text", "")
+                images = parsed.get("images", [])
+                if images:
+                    # Show collapsed image indicators
+                    img_html = []
+                    for i, img in enumerate(images[:5]):
+                        img_html.append(f'''
+                            <span class="image-indicator" onclick="toggleImagePreview(this)" data-image="{img}">
+                                <span class="image-icon">&#128247;</span> Image {i+1}
+                            </span>
+                        ''')
+                    image_indicators = '<div class="image-indicators">' + ''.join(img_html) + '</div>'
+        except (json_module.JSONDecodeError, TypeError):
+            pass  # Not JSON, use as plain text
+
+        # Render markdown
+        rendered_content = _render_markdown(text_content)
+
         # Hook messages are collapsible
         if role == "hook":
             # Extract hook name from content (e.g., "memory_recall: ...")
-            hook_name = content.split(":")[0] if ":" in content else "hook"
-            hook_detail = content[len(hook_name)+1:].strip() if ":" in content else content
-            escaped_detail = html_module.escape(hook_detail).replace("\n", "<br>")
+            hook_name = text_content.split(":")[0] if ":" in text_content else "hook"
+            hook_detail = text_content[len(hook_name)+1:].strip() if ":" in text_content else text_content
+            rendered_detail = _render_markdown(hook_detail)
 
             return f"""
                 <details class="chat-message hook" data-timestamp="{timestamp}">
@@ -1849,34 +1958,47 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                         <span class="hook-name">{html_module.escape(hook_name)}</span>
                         <span class="meta">{time_str}</span>
                     </summary>
-                    <div class="hook-content">{escaped_detail}</div>
+                    <div class="hook-content">{rendered_detail}</div>
                 </details>
             """
         else:
             return f"""
                 <div class="chat-message {role}" data-timestamp="{timestamp}">
-                    <div class="content">{escaped_content}</div>
+                    {image_indicators}
+                    <div class="content markdown-content">{rendered_content}</div>
                     <div class="meta">{time_str}</div>
                 </div>
             """
 
     @app.get("/partials/agent/{agent_id}/messages", response_class=HTMLResponse)
-    async def agent_chat_messages_partial(agent_id: str):
+    async def agent_chat_messages_partial(agent_id: str, conversation_id: str = ""):
         """HTMX partial for agent chat messages."""
         if not _runtime or not _runtime._db:
             return HTMLResponse('<div class="empty-state">Chat not available</div>')
 
         # Get chat messages from database
         with _runtime._db.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT role, content, timestamp FROM agent_chat_messages
-                WHERE agent_id = ?
-                ORDER BY timestamp ASC
-                LIMIT 100
-                """,
-                (agent_id,),
-            ).fetchall()
+            if conversation_id:
+                rows = conn.execute(
+                    """
+                    SELECT role, content, timestamp FROM agent_chat_messages
+                    WHERE agent_id = ? AND conversation_id = ?
+                    ORDER BY timestamp ASC
+                    LIMIT 100
+                    """,
+                    (agent_id, conversation_id),
+                ).fetchall()
+            else:
+                # Legacy: get messages without conversation_id
+                rows = conn.execute(
+                    """
+                    SELECT role, content, timestamp FROM agent_chat_messages
+                    WHERE agent_id = ? AND conversation_id IS NULL
+                    ORDER BY timestamp ASC
+                    LIMIT 100
+                    """,
+                    (agent_id,),
+                ).fetchall()
 
         if not rows:
             return HTMLResponse(
@@ -1891,7 +2013,7 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return HTMLResponse("".join(html_parts))
 
     @app.get("/partials/agent/{agent_id}/messages/new", response_class=HTMLResponse)
-    async def agent_chat_messages_new_partial(agent_id: str, after: str = ""):
+    async def agent_chat_messages_new_partial(agent_id: str, after: str = "", conversation_id: str = ""):
         """HTMX partial for new agent chat messages (only messages after timestamp)."""
         if not _runtime or not _runtime._db:
             return HTMLResponse("")
@@ -1899,26 +2021,48 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         with _runtime._db.connect() as conn:
             if after:
                 # Get only new messages after the timestamp
-                rows = conn.execute(
-                    """
-                    SELECT role, content, timestamp FROM agent_chat_messages
-                    WHERE agent_id = ? AND timestamp > ?
-                    ORDER BY timestamp ASC
-                    LIMIT 50
-                    """,
-                    (agent_id, after),
-                ).fetchall()
+                if conversation_id:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, timestamp FROM agent_chat_messages
+                        WHERE agent_id = ? AND conversation_id = ? AND timestamp > ?
+                        ORDER BY timestamp ASC
+                        LIMIT 50
+                        """,
+                        (agent_id, conversation_id, after),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, timestamp FROM agent_chat_messages
+                        WHERE agent_id = ? AND conversation_id IS NULL AND timestamp > ?
+                        ORDER BY timestamp ASC
+                        LIMIT 50
+                        """,
+                        (agent_id, after),
+                    ).fetchall()
             else:
                 # No timestamp - get recent messages (fallback for first poll)
-                rows = conn.execute(
-                    """
-                    SELECT role, content, timestamp FROM agent_chat_messages
-                    WHERE agent_id = ?
-                    ORDER BY timestamp DESC
-                    LIMIT 20
-                    """,
-                    (agent_id,),
-                ).fetchall()
+                if conversation_id:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, timestamp FROM agent_chat_messages
+                        WHERE agent_id = ? AND conversation_id = ?
+                        ORDER BY timestamp DESC
+                        LIMIT 20
+                        """,
+                        (agent_id, conversation_id),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, timestamp FROM agent_chat_messages
+                        WHERE agent_id = ? AND conversation_id IS NULL
+                        ORDER BY timestamp DESC
+                        LIMIT 20
+                        """,
+                        (agent_id,),
+                    ).fetchall()
                 # Reverse to get chronological order
                 rows = list(reversed(rows))
 
@@ -1932,8 +2076,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return HTMLResponse("".join(html_parts))
 
     @app.post("/api/agent/{agent_id}/chat")
-    async def agent_chat_send(agent_id: str, message: str = Form(...)):
+    async def agent_chat_send(
+        agent_id: str,
+        message: str = Form(...),
+        conversation_id: str = Form(None),
+        images: str = Form(None),  # JSON array of base64 data URLs
+    ):
         """Send a message to an agent and get a response."""
+        import json as json_module
+
         if not _runtime:
             raise HTTPException(status_code=503, detail="Runtime not available")
 
@@ -1944,17 +2095,127 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if agent.status != "running":
             raise HTTPException(status_code=400, detail="Agent is not running")
 
-        # Store user message
+        # Parse images if provided
+        image_list = []
+        if images:
+            try:
+                image_list = json_module.loads(images)
+                if not isinstance(image_list, list):
+                    image_list = []
+            except:
+                image_list = []
+
+        # Build content - either plain text or multipart JSON
+        if image_list:
+            content = json_module.dumps({
+                "type": "multipart",
+                "text": message,
+                "images": image_list[:5],  # Max 5 images
+            })
+        else:
+            content = message
+
+        # Store user message with token count for context management
+        user_token_count = count_tokens(content)
+        user_message_id = None
         with _runtime._db.connect() as conn:
-            conn.execute(
-                "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                (agent_id, "user", message),
+            cursor = conn.execute(
+                """INSERT INTO agent_chat_messages
+                   (agent_id, role, content, conversation_id, token_count)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (agent_id, "user", content, conversation_id, user_token_count),
             )
+            user_message_id = cursor.lastrowid
+
+            # Update conversation title if this is the first message
+            if conversation_id:
+                # Check if conversation has a title
+                row = conn.execute(
+                    "SELECT title FROM conversations WHERE id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if row and not row["title"]:
+                    # Set title from first user message (truncate to 40 chars)
+                    title = message[:40] if len(message) <= 40 else message[:37] + "..."
+                    conn.execute(
+                        """UPDATE conversations
+                           SET title = ?, updated_at = CURRENT_TIMESTAMP
+                           WHERE id = ?""",
+                        (title, conversation_id),
+                    )
+                else:
+                    # Update conversation timestamp
+                    conn.execute(
+                        "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (conversation_id,),
+                    )
+
+        # Schedule async embedding computation for user message (non-blocking)
+        embedder = get_message_embedder()
+        if embedder and user_message_id:
+            embedder.schedule_embedding(user_message_id, content)
 
         # Get the backend for this agent
         backend = _runtime._backends.get(agent_id)
         if not backend:
             raise HTTPException(status_code=500, detail="Agent backend not available")
+
+        # Load conversation history using dynamic context management
+        # This maximizes context utilization while staying within token limits
+        # See ADR-014 for the algorithm details
+        if conversation_id and hasattr(backend, "set_history"):
+            with _runtime._db.connect() as conn:
+                # Get all messages with token counts
+                # Note: agent responses are stored as 'agent' role, not 'assistant'
+                history_rows = conn.execute(
+                    """SELECT id, role, content, token_count, embedding, timestamp
+                       FROM agent_chat_messages
+                       WHERE agent_id = ? AND conversation_id = ?
+                       AND role IN ('user', 'agent')
+                       ORDER BY timestamp""",
+                    (agent_id, conversation_id),
+                ).fetchall()
+
+                if history_rows:
+                    # Convert to Message objects for context management
+                    messages = []
+                    for row in history_rows:
+                        token_count = row["token_count"] or count_tokens(row["content"])
+                        messages.append(Message(
+                            id=row["id"],
+                            role="assistant" if row["role"] == "agent" else row["role"],
+                            content=row["content"],
+                            token_count=token_count,
+                            embedding=row["embedding"],
+                            timestamp=row["timestamp"],
+                        ))
+
+                    # Get model from backend for context limits
+                    model = getattr(backend, "model", "claude-sonnet-4-20250514")
+
+                    # Create context manager for this model
+                    context_mgr = ContextManager.for_model(
+                        model=model,
+                        target_utilization=0.90,
+                        recent_window_ratio=0.50,
+                        min_threshold=0.3,
+                    )
+
+                    # Assemble context with relevance-based selection
+                    assembled_history, total_tokens = context_mgr.assemble_context(messages)
+
+                    # Filter out elision markers for backends that don't understand them
+                    history = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in assembled_history
+                        if m["content"] != "[...]"
+                    ]
+
+                    backend.set_history(history)
+                    logger.debug(
+                        f"Context management: {len(messages)} messages -> {len(history)} selected, "
+                        f"{total_tokens} tokens (model: {model})"
+                    )
 
         # Get agent config for hooks
         agent_config = None
@@ -2018,15 +2279,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
                 with _runtime._db.connect() as conn:
                     conn.execute(
-                        "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                        (agent_id, "hook", "memory_recall:\n" + "\n".join(log_parts)),
+                        "INSERT INTO agent_chat_messages (agent_id, role, content, conversation_id) VALUES (?, ?, ?, ?)",
+                        (agent_id, "hook", "memory_recall:\n" + "\n".join(log_parts), conversation_id),
                     )
             except Exception as e:
                 logger.error(f"Memory recall hook error: {e}")
                 with _runtime._db.connect() as conn:
                     conn.execute(
-                        "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                        (agent_id, "hook", f"memory_recall error: {e}"),
+                        "INSERT INTO agent_chat_messages (agent_id, role, content, conversation_id) VALUES (?, ?, ?, ?)",
+                        (agent_id, "hook", f"memory_recall error: {e}", conversation_id),
                     )
 
         # Set up meta tools for this chat
@@ -2078,12 +2339,21 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                     response_parts.append(chunk)
                 response_text = "".join(response_parts)
 
-            # Store agent response
+            # Store agent response with token count for context management
+            agent_token_count = count_tokens(response_text)
+            agent_message_id = None
             with _runtime._db.connect() as conn:
-                conn.execute(
-                    "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                    (agent_id, "agent", response_text),
+                cursor = conn.execute(
+                    """INSERT INTO agent_chat_messages
+                       (agent_id, role, content, conversation_id, token_count)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (agent_id, "agent", response_text, conversation_id, agent_token_count),
                 )
+                agent_message_id = cursor.lastrowid
+
+            # Schedule async embedding computation for agent response (non-blocking)
+            if embedder and agent_message_id:
+                embedder.schedule_embedding(agent_message_id, response_text)
 
             # Clear injected memory context after response (reset to original system message)
             if memory_context and hasattr(backend, "clear_injected_memory"):
@@ -2152,15 +2422,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                                 hook_msg += f"\nError: {debug['error']}"
                         with _runtime._db.connect() as conn:
                             conn.execute(
-                                "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                                (agent_id, "hook", hook_msg),
+                                "INSERT INTO agent_chat_messages (agent_id, role, content, conversation_id) VALUES (?, ?, ?, ?)",
+                                (agent_id, "hook", hook_msg, conversation_id),
                             )
                     except Exception as e:
                         logger.error(f"Memory remember hook error: {e}")
                         with _runtime._db.connect() as conn:
                             conn.execute(
-                                "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                                (agent_id, "hook", f"memory_remember error: {e}"),
+                                "INSERT INTO agent_chat_messages (agent_id, role, content, conversation_id) VALUES (?, ?, ?, ?)",
+                                (agent_id, "hook", f"memory_remember error: {e}", conversation_id),
                             )
 
             return {"status": "ok", "response": response_text}
@@ -2170,8 +2440,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             # Store error as system message
             with _runtime._db.connect() as conn:
                 conn.execute(
-                    "INSERT INTO agent_chat_messages (agent_id, role, content) VALUES (?, ?, ?)",
-                    (agent_id, "system", f"Error: {str(e)}"),
+                    "INSERT INTO agent_chat_messages (agent_id, role, content, conversation_id) VALUES (?, ?, ?, ?)",
+                    (agent_id, "system", f"Error: {str(e)}", conversation_id),
                 )
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -2193,6 +2463,238 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             backend.clear_history()
 
         return {"status": "ok", "message": "Chat history cleared"}
+
+    # -------------------------
+    # Conversation Management
+    # -------------------------
+
+    @app.get("/api/agent/{agent_id}/conversations")
+    async def list_conversations(agent_id: str):
+        """List all conversations for an agent."""
+        if not _runtime or not _runtime._db:
+            return []
+
+        with _runtime._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, created_at, updated_at
+                FROM conversations
+                WHERE agent_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (agent_id,),
+            ).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    @app.post("/api/agent/{agent_id}/conversations")
+    async def create_conversation(agent_id: str):
+        """Create a new conversation for an agent."""
+        import uuid
+
+        if not _runtime or not _runtime._db:
+            raise HTTPException(status_code=503, detail="Runtime not available")
+
+        conv_id = str(uuid.uuid4())
+
+        with _runtime._db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations (id, agent_id, title)
+                VALUES (?, ?, ?)
+                """,
+                (conv_id, agent_id, None),
+            )
+
+        return {"status": "ok", "conversation_id": conv_id}
+
+    @app.delete("/api/agent/{agent_id}/conversations/{conv_id}")
+    async def delete_conversation(agent_id: str, conv_id: str):
+        """Delete a conversation and its messages."""
+        if not _runtime or not _runtime._db:
+            raise HTTPException(status_code=503, detail="Runtime not available")
+
+        with _runtime._db.connect() as conn:
+            # Delete messages first
+            conn.execute(
+                "DELETE FROM agent_chat_messages WHERE conversation_id = ?",
+                (conv_id,),
+            )
+            # Delete conversation
+            conn.execute(
+                "DELETE FROM conversations WHERE id = ? AND agent_id = ?",
+                (conv_id, agent_id),
+            )
+
+        return {"status": "ok"}
+
+    @app.get("/partials/agent/{agent_id}/conversations", response_class=HTMLResponse)
+    async def conversations_sidebar_partial(agent_id: str, current: str = ""):
+        """HTMX partial for conversation sidebar list."""
+        if not _runtime or not _runtime._db:
+            return HTMLResponse('<div class="empty-state">Not available</div>')
+
+        with _runtime._db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, title, updated_at
+                FROM conversations
+                WHERE agent_id = ?
+                ORDER BY updated_at DESC
+                LIMIT 50
+                """,
+                (agent_id,),
+            ).fetchall()
+
+        if not rows:
+            return HTMLResponse('<div class="empty-state">No conversations yet</div>')
+
+        html_parts = []
+        for row in rows:
+            conv_id = row["id"]
+            title = row["title"] or "New conversation"
+            # Truncate long titles
+            if len(title) > 35:
+                title = title[:32] + "..."
+
+            active_class = "active" if conv_id == current else ""
+            updated = row["updated_at"] or ""
+            time_str = ""
+            if updated:
+                try:
+                    dt = datetime.fromisoformat(updated)
+                    time_str = dt.strftime("%b %d")
+                except:
+                    pass
+
+            html_parts.append(f"""
+                <div class="conversation-item {active_class}"
+                     data-conv-id="{conv_id}"
+                     onclick="selectConversation('{conv_id}')">
+                    <div class="conv-title">{title}</div>
+                    <div class="conv-meta">{time_str}</div>
+                </div>
+            """)
+
+        return HTMLResponse("".join(html_parts))
+
+    # -------------------------
+    # Agent Info Panel
+    # -------------------------
+
+    @app.get("/partials/agent/{agent_id}/info-panel", response_class=HTMLResponse)
+    async def agent_info_panel_partial(agent_id: str):
+        """HTMX partial for agent info panel (budget, memory slots, tasks)."""
+        if not _runtime:
+            return HTMLResponse('<div class="empty-state">Not available</div>')
+
+        html_parts = []
+
+        # Budget section
+        try:
+            budget = await _runtime.get_budget_summary(agent_id)
+            daily_spent = budget.get("daily_spent", 0)
+            daily_limit = budget.get("daily_limit", 0)
+            total_spent = budget.get("total_spent", 0)
+            is_paused = budget.get("is_paused", False)
+
+            pct = (daily_spent / daily_limit * 100) if daily_limit > 0 else 0
+            pct = min(pct, 100)
+
+            paused_html = '<span class="badge paused">PAUSED</span>' if is_paused else ""
+
+            html_parts.append(f"""
+                <div class="info-section">
+                    <div class="info-header">Budget {paused_html}</div>
+                    <div class="budget-bar">
+                        <div class="budget-fill" style="width: {pct:.0f}%"></div>
+                    </div>
+                    <div class="budget-text">${daily_spent:.2f} / ${daily_limit:.2f} daily</div>
+                    <div class="budget-total">Total: ${total_spent:.2f}</div>
+                </div>
+            """)
+        except Exception as e:
+            html_parts.append(f'<div class="info-section error">Budget: {e}</div>')
+
+        # Memory slots section
+        try:
+            if _runtime.memory_manager:
+                slot_manager = _runtime.memory_manager.get_slot_manager(agent_id)
+                slots = await slot_manager.get_slots()
+                stats = await slot_manager.get_stats()
+
+                slot_html = '<div class="memory-slots-grid">'
+                for slot in slots:
+                    if not slot.is_empty:
+                        relevance = slot.relevance_score
+                        summary = slot.memory.summary[:50] if slot.memory and slot.memory.summary else ""
+                        slot_html += f"""
+                            <div class="memory-slot occupied" title="{summary}">
+                                <span class="slot-num">{slot.index + 1}</span>
+                                <span class="slot-score">{relevance:.1f}</span>
+                            </div>
+                        """
+                    else:
+                        slot_html += f'<div class="memory-slot empty"><span class="slot-num">{slot.index + 1}</span></div>'
+                slot_html += '</div>'
+
+                occupied = stats.get("active_slots", 0)
+                total = stats.get("total_slots", 8)
+                html_parts.append(f"""
+                    <div class="info-section">
+                        <div class="info-header">Memory Slots ({occupied}/{total})</div>
+                        {slot_html}
+                    </div>
+                """)
+            else:
+                html_parts.append("""
+                    <div class="info-section">
+                        <div class="info-header">Memory Slots</div>
+                        <div class="empty-state">Not configured</div>
+                    </div>
+                """)
+        except Exception as e:
+            html_parts.append(f'<div class="info-section error">Memory: {e}</div>')
+
+        # Tasks section
+        try:
+            if _runtime.task_board:
+                tasks = await _runtime.task_board.get_tasks(agent_id=agent_id, limit=5)
+                if tasks:
+                    task_html = ""
+                    for task in tasks:
+                        status_class = task.status.value.replace("_", "-")
+                        task_html += f"""
+                            <a href="/tasks?task={task.id}" class="task-item status-{status_class}">
+                                <span class="task-status-dot"></span>
+                                <span class="task-title">{task.title[:40]}</span>
+                            </a>
+                        """
+                    html_parts.append(f"""
+                        <div class="info-section">
+                            <div class="info-header">Recent Tasks</div>
+                            <div class="task-list-mini">{task_html}</div>
+                        </div>
+                    """)
+                else:
+                    html_parts.append("""
+                        <div class="info-section">
+                            <div class="info-header">Recent Tasks</div>
+                            <div class="empty-state">No tasks</div>
+                        </div>
+                    """)
+        except Exception as e:
+            html_parts.append(f'<div class="info-section error">Tasks: {e}</div>')
+
+        return HTMLResponse("".join(html_parts))
 
     # Zettelkasten browser routes
     @app.get("/api/zettelkasten/tags")

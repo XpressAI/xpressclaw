@@ -143,6 +143,8 @@ class Database:
             (4, self._migrate_v4),
             (5, self._migrate_v5),
             (6, self._migrate_v6),
+            (7, self._migrate_v7),
+            (8, self._migrate_v8),
         ]
 
         for target_version, migrate_func in migrations:
@@ -426,6 +428,77 @@ class Database:
             )
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+    def _migrate_v7(self, conn: sqlite3.Connection) -> None:
+        """Version 7 schema: Conversations for agent chat."""
+        conn.executescript("""
+            -- Conversations table for agent chat
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                title TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_conversations_agent ON conversations(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
+        """)
+
+        # Add conversation_id column to agent_chat_messages
+        try:
+            conn.execute(
+                "ALTER TABLE agent_chat_messages ADD COLUMN conversation_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Create index for conversation_id
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_chat_conversation ON agent_chat_messages(conversation_id)"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+    def _migrate_v8(self, conn: sqlite3.Connection) -> None:
+        """Version 8 schema: Add token_count and embedding for dynamic context management."""
+        # Add token_count column to agent_chat_messages
+        try:
+            conn.execute(
+                "ALTER TABLE agent_chat_messages ADD COLUMN token_count INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add embedding column to agent_chat_messages (stored as BLOB for sqlite-vec)
+        try:
+            conn.execute(
+                "ALTER TABLE agent_chat_messages ADD COLUMN embedding BLOB"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Create index on token_count for efficient aggregation
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_chat_tokens ON agent_chat_messages(token_count)"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+        # Create virtual table for message embeddings if sqlite-vec is available
+        if SQLITE_VEC_AVAILABLE and _check_extension_support():
+            try:
+                conn.execute("SELECT vec_version()")
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS message_embeddings USING vec0(
+                        message_id INTEGER PRIMARY KEY,
+                        embedding FLOAT[384]
+                    )
+                """)
+            except sqlite3.OperationalError as e:
+                logger.debug(f"Could not create message vector table: {e}")
 
     def backup(self, backup_path: Path | None = None) -> Path:
         """Create a backup of the database.
