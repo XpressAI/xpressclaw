@@ -283,7 +283,7 @@ async def schedules_partial(request: Request):
                         <div class="dropdown" id="dropdown-{s.id}">
                             <button class="schedule-btn" onclick="toggleDropdown(event, 'dropdown-{s.id}')" title="More options">⋯</button>
                             <div class="dropdown-content">
-                                {'<button class="dropdown-item" hx-post="/api/schedules/' + s.id + '/disable" hx-swap="none" hx-on::after-request="htmx.trigger(document.body, \'scheduleUpdate\')">Pause</button>' if s.enabled else '<button class="dropdown-item" hx-post="/api/schedules/' + s.id + '/enable" hx-swap="none" hx-on::after-request="htmx.trigger(document.body, \'scheduleUpdate\')">Resume</button>'}
+                                {'<button class="dropdown-item" hx-post="/api/schedules/' + s.id + '/disable" hx-swap="none" hx-on::after-request="htmx.trigger(document.body, ' + "'" + 'scheduleUpdate' + "'" + ')">Pause</button>' if s.enabled else '<button class="dropdown-item" hx-post="/api/schedules/' + s.id + '/enable" hx-swap="none" hx-on::after-request="htmx.trigger(document.body, ' + "'" + 'scheduleUpdate' + "'" + ')">Resume</button>'}
                                 <button class="dropdown-item danger"
                                         hx-delete="/api/schedules/{s.id}"
                                         hx-swap="none"
