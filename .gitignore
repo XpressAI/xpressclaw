@@ -1,6 +1,36 @@
-__pycache__
-*.pyc
+# Rust
+/target/
+**/*.rs.bk
 
+# Python (kept for reference on this branch)
+__pycache__/
+*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Node (frontend)
+node_modules/
+frontend/build/
+frontend/.svelte-kit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / temp
 .coverage
 temp/
-.idea/
+
+# xpressclaw runtime
+.xpressclaw/
+
+# Models (too large for git)
+models/*.onnx
+models/*.gguf

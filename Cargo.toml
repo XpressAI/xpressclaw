@@ -1,0 +1,76 @@
+[workspace]
+members = [
+    "crates/xpressclaw-core",
+    "crates/xpressclaw-server",
+    "crates/xpressclaw-cli",
+    "crates/xpressclaw-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Xpress AI <hello@xpress.ai>"]
+repository = "https://github.com/XpressAI/xpressclaw"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", features = ["ws", "multipart"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Docker
+bollard = "0.18"
+
+# Scheduling
+tokio-cron-scheduler = "0.13"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Streaming
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Static assets
+rust-embed = "8"
+
+# Markdown
+pulldown-cmark = "0.12"
+
+# Async traits
+async-trait = "0.1"
+
+# Futures utilities
+futures-util = "0.3"

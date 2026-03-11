@@ -1,0 +1,31 @@
+[package]
+name = "xpressclaw-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core runtime library for xpressclaw — the AI agent OS"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+zerocopy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+bollard = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio-stream = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
