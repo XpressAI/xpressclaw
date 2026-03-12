@@ -2,123 +2,121 @@
   <img src="https://raw.githubusercontent.com/XpressAI/xpressclaw/main/docs/assets/xpressclaw-banner.png" alt="xpressclaw" width="600">
 </p>
 
-<h3 align="center">Your AI agents. Running while you sleep.</h3>
+<h3 align="center">Collaborative Local Agent Workspace</h3>
 
 <p align="center">
-xpressclaw is an open-source AI agent runtime. Define agents in YAML, give them tasks, and let them work autonomously — with built-in memory, budget controls, scheduling, and observability.
+A single binary that gives you a complete AI agent runtime — chat with your agents, give them tasks, and let them work autonomously. Built-in memory, budget controls, scheduling, and a polished web UI.
 </p>
 
 <p align="center">
-<a href="https://xpressclaw.ai">Website</a> •
-<a href="https://hub.xpressclaw.ai">Hub</a> •
-<a href="https://github.com/XpressAI/xpressclaw/blob/main/CONTRIBUTING.md">Contribute</a> •
+<a href="https://xpressclaw.ai">Website</a> &bull;
+<a href="https://hub.xpressclaw.ai">Hub</a> &bull;
+<a href="https://github.com/XpressAI/xpressclaw/blob/main/CONTRIBUTING.md">Contribute</a> &bull;
 <a href="https://discord.com/invite/vgEg2ZtxCw">Discord</a>
 </p>
 
 <p align="center">
 <a href="https://github.com/XpressAI/xpressclaw/blob/main/LICENSE"><img src="https://img.shields.io/github/license/XpressAI/xpressclaw?color=brightgreen" alt="License"></a>
 <a href="https://github.com/XpressAI/xpressclaw/releases"><img src="https://img.shields.io/github/v/release/XpressAI/xpressclaw?color=yellow" alt="Release"></a>
-<img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python">
+<img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
 </p>
 
 ---
 
 ```bash
-pip install xpressai
-xpressai init
-xpressai up
+xpressclaw init
+xpressclaw up
 ```
 
-That's it. Your first agent is running.
+That's it. Open `http://localhost:8935` and start chatting with your agents.
 
-> **Built before the hype.** The agent orchestration technology behind xpressclaw has been running in production at regulated financial institutions since 2024 — before "AI agents" became a buzzword. We open-sourced the core so everyone can benefit.
+## Why xpressclaw?
+
+Most agent frameworks give you a library. xpressclaw gives you a **running system** — a ~12MB binary with everything included: server, web UI, LLM router, and agent management. No Python environment to configure, no Docker Compose sprawl, no YAML templating engines.
+
+- **Chat-first interface** — Talk to your agents in a messaging UI, not a terminal. `@mention` agents in conversations, just like Slack.
+- **Single binary, zero dependencies** — Download one file, run it. The server, API, and web frontend are all embedded.
+- **Native desktop app** — Tauri-based `.app` / `.dmg` with system tray. Runs in the background, always available.
+- **Production-tested architecture** — Built on the same agent orchestration patterns that power Xpress AI's enterprise platform, deployed at regulated financial institutions.
+- **Local-first, cloud-optional** — Works with Ollama out of the box. Add OpenAI or Anthropic keys when you need them.
+- **Secure by default** — Agents run in Docker containers. Budget controls prevent runaway costs. No exceptions.
 
 ## Features
 
-### Autonomous Agents
+### Chat with Your Agents
 
-Agents run continuously, picking up tasks from a queue and working through them. Assign work and come back to results — no babysitting required.
+The primary interface is a **messaging UI**. Create conversations, add agents, and talk to them — individually or in groups. Agents respond via the configured LLM (local or cloud).
 
-### SOPs (Standard Operating Procedures)
+### Autonomous Task Execution
 
-Define step-by-step procedures your agents follow. Agents perform consistently, learn from mistakes, and improve over time. Predictable, auditable, reliable.
+Agents pick up tasks from a queue and work through them. Schedule recurring work with cron expressions. Define SOPs (Standard Operating Procedures) so agents perform consistently.
 
 ### Persistent Memory
 
-Zettelkasten-style memory with vector search. Agents remember context across sessions, build knowledge over time, and retrieve relevant information automatically.
+Zettelkasten-style knowledge base with vector search (sqlite-vec). Agents remember context across sessions and retrieve relevant information automatically.
 
-### Privacy & Safety by Default
+### Multiple LLM Backends
+
+- **Local:** Qwen 3.5, Llama 3, Mistral, and more via Ollama
+- **Cloud:** Claude (Anthropic), GPT-4o (OpenAI), and 100+ models via OpenRouter
+- **Framework agnostic:** Agent harnesses for Claude SDK, LangChain, Xaibo, and generic
+
+### Privacy & Safety
 
 - **Container isolation** — each agent runs in its own Docker container
-- **Budget controls** — set daily spending limits so agents don't run up your API bill
-- **Tool permissions** — explicit allow-list per agent; agents only get what they need
-- **Local model support** — run Qwen3-8B, Llama 3, Mistral, and more via Ollama or llama.cpp
-
-### Multiple Backends
-
-- **Local:** Qwen3-8B (default, zero-config), any GGUF model via llama.cpp or Ollama
-- **Cloud:** Claude, OpenAI, Gemini, and 100+ models via OpenRouter (bring your own key)
-- **Framework agnostic:** Run agents built with Claude SDK, LangChain, CrewAI, Xaibo, and more
+- **Budget controls** — daily/monthly spending limits per agent and globally
+- **Tool permissions** — explicit allow-list; agents only access what you grant
+- **Everything local** — your data never leaves your machine unless you choose a cloud LLM
 
 ### Full Observability
 
-Always know what your agents are doing. Logs, status dashboards, budget tracking, and a terminal UI for real-time monitoring.
-
-### Community Hub
-
-Discover and share agent configurations, SOPs, and skill packs at [hub.xpressclaw.ai](https://hub.xpressclaw.ai). Install community-built agents with one command.
+Activity logs, budget dashboards, agent status monitoring. Know what your agents did at 3am.
 
 ## Quick Start
 
-### Option 1: pip install
+### Option 1: Download Binary
+
+Grab the latest release from [GitHub Releases](https://github.com/XpressAI/xpressclaw/releases).
 
 ```bash
-pip install xpressai
-xpressai init
-xpressai up
+xpressclaw init
+xpressclaw up
+# Open http://localhost:8935
 ```
 
-### Option 2: From Source
+### Option 2: Native App (macOS)
 
-```bash
-git clone https://github.com/XpressAI/xpressclaw.git
-cd xpressclaw
-pip install -e .
-xpressai init
-xpressai up
-```
+Download `xpressclaw.dmg` from [Releases](https://github.com/XpressAI/xpressclaw/releases) — double-click to install. The app runs in the system tray.
 
-### Option 3: Native App (macOS / Windows)
+### Option 3: Build from Source
 
-Download from [xpressclaw.ai](https://xpressclaw.ai) — no terminal needed.
+See [Building](#building) below.
 
 ### Requirements
 
-- Python 3.11+
-- Docker (optional, for container isolation)
-- An API key for your chosen backend (Claude, OpenAI, etc.) or a local model
+- Docker or Podman (required for agent container isolation)
+- Ollama (optional, for local LLM — `ollama pull qwen3.5:latest`)
+- Or an API key for Claude / OpenAI / OpenRouter
 
 ## What Can It Do?
 
+**Chat with agents from the web UI:**
+
+Create a conversation, add an agent, and start talking. Use `@atlas` to mention a specific agent in a multi-agent conversation.
+
 **Schedule recurring tasks:**
 ```bash
-xpressai tasks atlas schedule "Summarize top 10 HN stories" --cron "0 9 * * *"
-```
-
-**Assign work and let agents handle it:**
-```bash
-xpressai tasks atlas add "Refactor the auth module to use JWT"
-xpressai up -d
+xpressclaw tasks create "Summarize top 10 HN stories" --agent atlas
 ```
 
 **Review what happened while you were away:**
 ```bash
-xpressai logs atlas
-xpressai status
-xpressai budget
+xpressclaw logs
+xpressclaw status
+xpressclaw budget
 ```
 
-**Define an SOP for consistent behavior:**
+**Define SOPs for consistent behavior:**
 ```yaml
 name: weekly-report
 steps:
@@ -128,89 +126,176 @@ steps:
   - Draft report and send to team channel
 ```
 
+**Interactive CLI chat:**
+```bash
+xpressclaw chat atlas
+```
+
 ## Configuration
 
-`xpressai init` creates an `xpressai.yaml` in your project:
+`xpressclaw init` creates a `xpressclaw.yaml` in your project:
 
 ```yaml
 system:
   budget:
     daily: $20.00
     on_exceeded: pause
-
   isolation: docker
 
 agents:
   - name: atlas
-    backend: claude-code
+    backend: generic
     role: |
       You are a helpful assistant.
-
-tools:
-  builtin:
-    filesystem: ~/agent-workspace
-    shell:
-      enabled: true
-      allowed_commands: [git, npm, python]
 
 memory:
   near_term_slots: 8
   eviction: least-recently-relevant
+
+llm:
+  default_provider: local
+  # local_model: qwen3.5:latest
+  # Set OPENAI_API_KEY or ANTHROPIC_API_KEY env vars for cloud providers
+```
+
+## Building
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (stable toolchain)
+- [Node.js](https://nodejs.org/) 18+ (for the frontend)
+- Docker (for running agents)
+
+### Build the CLI
+
+```bash
+git clone https://github.com/XpressAI/xpressclaw.git
+cd xpressclaw
+
+# Build the frontend first
+cd frontend && npm ci && npm run build && cd ..
+
+# Build the Rust binary
+cargo build --release
+
+# The binary is at target/release/xpressclaw
+./target/release/xpressclaw --help
+```
+
+### Build the Desktop App (Tauri)
+
+```bash
+# Install Tauri CLI
+cargo install tauri-cli
+
+# Build (this also builds the frontend)
+cargo tauri build
+
+# Output: target/release/bundle/macos/xpressclaw.app
+#         target/release/bundle/dmg/xpressclaw_0.1.0_x64.dmg
+```
+
+### Build Agent Harness Images
+
+Agent harnesses are Docker images that run your agents in isolation:
+
+```bash
+cd harnesses
+
+# Build all harness images
+docker buildx bake
+
+# Or build individually
+docker build -t xpressclaw-harness-base ./base
+docker build -t xpressclaw-harness-generic ./generic
+docker build -t xpressclaw-harness-claude-sdk ./claude-sdk
+```
+
+### Run Tests
+
+```bash
+# All Rust tests (184 tests)
+cargo test --workspace
+
+# Frontend type check
+cd frontend && npm run check
+```
+
+### Development Mode
+
+```bash
+# Terminal 1: Run the Rust server with auto-reload
+cargo run -- up
+
+# Terminal 2: Run the frontend dev server with hot reload
+cd frontend && npm run dev
+
+# The frontend dev server proxies API calls to localhost:8935
 ```
 
 ## Architecture
 
-**Tech Stack:**
+xpressclaw is a Cargo workspace with four crates:
 
-| Component | Technology |
-|-----------|-----------|
-| Agent Runtime | Python 3.11+ |
-| Web UI | FastAPI + HTMX (server-rendered dashboard) |
-| Terminal UI | Textual (real-time monitoring) |
-| Storage | SQLite + sqlite-vec (state, memory, embeddings) |
-| Isolation | Docker (agent sandboxing) |
-| Local LLM | llama.cpp / Ollama (privacy-first inference) |
+| Crate | Purpose |
+|-------|---------|
+| `xpressclaw-core` | Business logic: config, SQLite + sqlite-vec, agents, memory, tasks, budget, LLM router, Docker management, MCP tools |
+| `xpressclaw-server` | Axum REST API, SSE streaming, embedded SvelteKit frontend (rust-embed) |
+| `xpressclaw-cli` | 10 CLI commands via clap: init, up, down, status, chat, tasks, memory, budget, sop, logs |
+| `xpressclaw-tauri` | Native desktop app with system tray (Tauri v2) |
 
-**Key Subsystems:**
+```
+xpressclaw (single ~12MB binary)
++-- Axum server (REST API + embedded SvelteKit frontend)
++-- LLM Router (Ollama / OpenAI / Anthropic)
++-- SQLite + sqlite-vec (tasks, memory, conversations, budget)
++-- Docker Manager (agent container lifecycle)
++-- Agent Harnesses (isolated Python containers per backend)
+```
 
-- **Agent Manager** — orchestrates agent lifecycles, handles restarts, manages temporary specialist agents
-- **Memory System** — zettelkasten notes with vector search, 8-slot near-term memory with eviction
-- **Tool System** — MCP (Model Context Protocol) as universal standard for all tools
-- **Budget System** — per-agent and global spending limits with configurable actions
-- **Isolation System** — Docker containers for each agent, filesystem and network sandboxing
+**Key design decisions:**
+- **Single binary** — server, API, frontend, and CLI in one executable
+- **Docker required** — agent isolation is not optional
+- **SQLite for everything** — tasks, memory, embeddings, conversations, budget
+- **OpenAI-compatible protocol** — harnesses expose `/v1/chat/completions`
+
+## CLI Reference
+
+```
+xpressclaw init              Initialize workspace with config + data dir
+xpressclaw up [--detach]     Start the server and agents
+xpressclaw down              Stop all running agents
+xpressclaw status            Show agent status and budget summary
+xpressclaw chat <agent>      Interactive chat in the terminal
+xpressclaw tasks             Task management (list, create, update, delete)
+xpressclaw memory            Memory inspection (list, search, add)
+xpressclaw budget            Budget report and usage history
+xpressclaw sop               SOP management (list, create, run)
+xpressclaw logs              Activity log viewer
+```
+
+Default port: `8935` (override with `--port`).
 
 ## From Open Source to Enterprise
 
-xpressclaw is the open-source foundation. When your organization needs team collaboration, visual workflows, compliance certifications, and enterprise support — Xpress AI has you covered.
+xpressclaw is the open-source foundation. When your team needs collaboration, visual workflows, compliance, and enterprise support — [Xpress AI](https://xpress.ai) has you covered.
 
 | | xpressclaw (Free) | Xpress AI (Enterprise) |
 |---|---|---|
 | Autonomous AI agents | :white_check_mark: | :white_check_mark: |
+| Chat-first web UI | :white_check_mark: | :white_check_mark: |
 | SOPs & scheduling | :white_check_mark: | :white_check_mark: |
 | Local model support | :white_check_mark: | :white_check_mark: |
 | Budget controls | :white_check_mark: | :white_check_mark: |
 | Team collaboration | | :white_check_mark: |
 | Visual workflow builder (Xircuits) | | :white_check_mark: |
+| iOS & Android apps | | :white_check_mark: |
 | On-premise deployment | | :white_check_mark: |
-| SOC 2 Type I (in progress) | | :white_check_mark: |
 | Role-based access control | | :white_check_mark: |
 | Audit logging & compliance | | :white_check_mark: |
 | Dedicated support & SLA | | :white_check_mark: |
 
 [Request an Enterprise Demo](https://xpress.ai)
-
-## The Story Behind xpressclaw
-
-We didn't start building AI agents because it was trendy. We started because our enterprise customers — regulated financial institutions in Japan — needed AI that could actually be deployed.
-
-That meant:
-- **On-premise** (no data leaving the building)
-- **Auditable** (every agent action logged)
-- **Reliable** (SOPs, not prompt-and-pray)
-
-We built this technology as Xpress AI — and it's been running in production at companies like Moneytree (a MUFG subsidiary) since before "AI agents" became a buzzword.
-
-Now we're open-sourcing the core as xpressclaw because we believe everyone deserves AI agents that actually work.
 
 ## Contributing
 
@@ -219,9 +304,8 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ```bash
 git clone https://github.com/XpressAI/xpressclaw.git
 cd xpressclaw
-pip install -e ".[dev]"
-pre-commit install
-pytest
+cd frontend && npm ci && npm run build && cd ..
+cargo test --workspace
 ```
 
 ## Community
@@ -230,7 +314,7 @@ pytest
 - **Hub:** [hub.xpressclaw.ai](https://hub.xpressclaw.ai)
 - **Discord:** [discord.com/invite/vgEg2ZtxCw](https://discord.com/invite/vgEg2ZtxCw)
 - **Twitter/X:** [@xpressclaw](https://twitter.com/xpressclaw)
-- **Enterprise inquiries:** [enterprise@xpress.ai](mailto:enterprise@xpress.ai)
+- **Enterprise:** [xpress.ai](https://xpress.ai)
 
 ## License
 
@@ -239,6 +323,5 @@ pytest
 ---
 
 <p align="center">
-Built with love by the <a href="https://xpress.ai">Xpress AI</a> team.<br>
-<i>The AI workforce your compliance team will actually approve.</i>
+Built by <a href="https://xpress.ai">Xpress AI</a> — the team behind enterprise agent platforms for regulated industries.
 </p>
