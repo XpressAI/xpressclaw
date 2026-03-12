@@ -24,7 +24,9 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_procedures).post(create_procedure))
         .route(
             "/{name}",
-            get(get_procedure).put(update_procedure).delete(delete_procedure),
+            get(get_procedure)
+                .put(update_procedure)
+                .delete(delete_procedure),
         )
         .route("/{name}/run", axum::routing::post(run_procedure))
 }

@@ -2,11 +2,9 @@
 /target/
 **/*.rs.bk
 
-# Python (kept for reference on this branch)
+# Python (harness containers)
 __pycache__/
 *.pyc
-*.py[cod]
-*.egg-info/
 .venv/
 
 # Node (frontend)

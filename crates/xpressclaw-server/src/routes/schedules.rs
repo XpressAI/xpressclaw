@@ -19,10 +19,7 @@ pub struct ListParams {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_schedules).post(create_schedule))
-        .route(
-            "/{id}",
-            get(get_schedule).delete(delete_schedule),
-        )
+        .route("/{id}", get(get_schedule).delete(delete_schedule))
         .route("/{id}/enable", post(enable_schedule))
         .route("/{id}/disable", post(disable_schedule))
         .route("/{id}/trigger", post(trigger_schedule))
@@ -147,9 +144,7 @@ mod tests {
             llm_router: None,
         };
 
-        Router::new()
-            .nest("/schedules", routes())
-            .with_state(state)
+        Router::new().nest("/schedules", routes()).with_state(state)
     }
 
     async fn body_json(body: Body) -> Value {

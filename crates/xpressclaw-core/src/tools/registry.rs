@@ -241,6 +241,7 @@ impl ToolRegistry {
     }
 
     /// Log a tool invocation to the database.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_invocation(
         &self,
         agent_id: &str,
@@ -372,15 +373,10 @@ mod tests {
         assert_eq!(registry.tool_count(), 3);
         assert_eq!(registry.list_tools(None).len(), 3);
         assert_eq!(
-            registry
-                .list_tools(Some(&ToolCategory::Filesystem))
-                .len(),
+            registry.list_tools(Some(&ToolCategory::Filesystem)).len(),
             2
         );
-        assert_eq!(
-            registry.list_tools(Some(&ToolCategory::Shell)).len(),
-            1
-        );
+        assert_eq!(registry.list_tools(Some(&ToolCategory::Shell)).len(), 1);
     }
 
     #[test]

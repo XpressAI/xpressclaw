@@ -71,7 +71,11 @@ impl VectorStore {
             .map_err(|e| Error::Database(e.to_string()))
         })?;
 
-        debug!(memory_id, dim = embedding.len(), "stored embedding (sqlite-vec)");
+        debug!(
+            memory_id,
+            dim = embedding.len(),
+            "stored embedding (sqlite-vec)"
+        );
         Ok(())
     }
 
@@ -175,11 +179,9 @@ impl VectorStore {
     pub fn get_stats(&self) -> Result<VectorStats> {
         self.db.with_conn(|conn| {
             let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM memory_embeddings",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM memory_embeddings", [], |row| {
+                    row.get(0)
+                })
                 .unwrap_or(0);
 
             Ok(VectorStats {
@@ -222,9 +224,9 @@ pub fn simple_embedding(text: &str) -> Vec<f32> {
 
     // Hash character trigrams into buckets
     for window in chars.windows(3) {
-        let hash = window.iter().fold(0u64, |acc, c| {
-            acc.wrapping_mul(31).wrapping_add(*c as u64)
-        });
+        let hash = window
+            .iter()
+            .fold(0u64, |acc, c| acc.wrapping_mul(31).wrapping_add(*c as u64));
         let idx = (hash % EMBEDDING_DIM as u64) as usize;
         vec[idx] += 1.0;
     }
@@ -315,13 +317,22 @@ mod tests {
         insert_memory(&db, "mem-cooking");
 
         store
-            .add("mem-rust", &simple_embedding("Rust programming language systems"))
+            .add(
+                "mem-rust",
+                &simple_embedding("Rust programming language systems"),
+            )
             .unwrap();
         store
-            .add("mem-python", &simple_embedding("Python programming language scripting"))
+            .add(
+                "mem-python",
+                &simple_embedding("Python programming language scripting"),
+            )
             .unwrap();
         store
-            .add("mem-cooking", &simple_embedding("Italian cooking pasta recipe"))
+            .add(
+                "mem-cooking",
+                &simple_embedding("Italian cooking pasta recipe"),
+            )
             .unwrap();
 
         let query = simple_embedding("programming language");
@@ -340,9 +351,15 @@ mod tests {
         insert_memory(&db, "mem-b");
         insert_memory(&db, "mem-c");
 
-        store.add("mem-a", &simple_embedding("cats and dogs")).unwrap();
-        store.add("mem-b", &simple_embedding("cats and kittens")).unwrap();
-        store.add("mem-c", &simple_embedding("quantum physics")).unwrap();
+        store
+            .add("mem-a", &simple_embedding("cats and dogs"))
+            .unwrap();
+        store
+            .add("mem-b", &simple_embedding("cats and kittens"))
+            .unwrap();
+        store
+            .add("mem-c", &simple_embedding("quantum physics"))
+            .unwrap();
 
         let similar = store.find_similar("mem-a", 2).unwrap();
         assert_eq!(similar.len(), 2);

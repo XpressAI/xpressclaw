@@ -50,7 +50,10 @@ impl ScheduleManager {
     /// Create a new schedule.
     pub fn create(&self, req: &CreateSchedule) -> Result<Schedule> {
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         self.db.with_conn(|conn| {
             conn.execute(
@@ -77,11 +80,7 @@ impl ScheduleManager {
     }
 
     /// List all schedules, optionally filtered by agent_id or enabled status.
-    pub fn list(
-        &self,
-        agent_id: Option<&str>,
-        enabled_only: bool,
-    ) -> Result<Vec<Schedule>> {
+    pub fn list(&self, agent_id: Option<&str>, enabled_only: bool) -> Result<Vec<Schedule>> {
         self.db.with_conn(|conn| {
             let mut sql = "SELECT * FROM schedules WHERE 1=1".to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -99,7 +98,9 @@ impl ScheduleManager {
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 params.iter().map(|p| p.as_ref()).collect();
 
-            let mut stmt = conn.prepare(&sql).map_err(|e| Error::Database(e.to_string()))?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| Error::Database(e.to_string()))?;
             let schedules = stmt
                 .query_map(param_refs.as_slice(), |row| Ok(row_to_schedule(row)))
                 .map_err(|e| Error::Database(e.to_string()))?

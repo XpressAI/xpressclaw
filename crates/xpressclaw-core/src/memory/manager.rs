@@ -55,7 +55,11 @@ impl MemoryManager {
             tracing::warn!(id = memory.id, error = %e, "failed to store embedding");
         }
 
-        debug!(id = memory.id, summary = memory.summary, "memory added with embedding");
+        debug!(
+            id = memory.id,
+            summary = memory.summary,
+            "memory added with embedding"
+        );
         Ok(memory)
     }
 
@@ -65,12 +69,7 @@ impl MemoryManager {
     }
 
     /// Update a memory's content and/or summary, re-computing embedding.
-    pub fn update(
-        &self,
-        id: &str,
-        content: Option<&str>,
-        summary: Option<&str>,
-    ) -> Result<Memory> {
+    pub fn update(&self, id: &str, content: Option<&str>, summary: Option<&str>) -> Result<Memory> {
         let memory = self.zk.update(id, content, summary)?;
 
         // Re-compute embedding
@@ -202,12 +201,7 @@ impl MemoryManager {
     ///
     /// If eviction occurs, the evicted memory is linked to related memories
     /// before removal from slots.
-    pub fn load_to_slot(
-        &self,
-        agent_id: &str,
-        memory_id: &str,
-        relevance: f64,
-    ) -> Result<()> {
+    pub fn load_to_slot(&self, agent_id: &str, memory_id: &str, relevance: f64) -> Result<()> {
         let evicted = self.slots.load(agent_id, memory_id, relevance)?;
 
         // If a memory was evicted, try to link it to related memories
@@ -215,7 +209,9 @@ impl MemoryManager {
             if let Ok(similar) = self.vector.find_similar(&evicted_id, 3) {
                 for vr in similar {
                     if vr.similarity > 0.5 {
-                        let _ = self.zk.link(&evicted_id, &vr.memory_id, "similar", vr.similarity);
+                        let _ = self
+                            .zk
+                            .link(&evicted_id, &vr.memory_id, "similar", vr.similarity);
                     }
                 }
             }
@@ -225,10 +221,7 @@ impl MemoryManager {
     }
 
     /// Get the memory slots for an agent.
-    pub fn get_slots(
-        &self,
-        agent_id: &str,
-    ) -> Result<Vec<crate::memory::slots::MemorySlot>> {
+    pub fn get_slots(&self, agent_id: &str) -> Result<Vec<crate::memory::slots::MemorySlot>> {
         self.slots.get_slots(agent_id)
     }
 
@@ -237,10 +230,7 @@ impl MemoryManager {
     /// Returns the full memory content (not just IDs) formatted for the agent.
     pub fn get_context_for_agent(&self, agent_id: &str) -> Result<String> {
         let slots = self.slots.get_slots(agent_id)?;
-        let occupied: Vec<_> = slots
-            .iter()
-            .filter(|s| s.memory_id.is_some())
-            .collect();
+        let occupied: Vec<_> = slots.iter().filter(|s| s.memory_id.is_some()).collect();
 
         if occupied.is_empty() {
             return Ok(String::new());
@@ -374,9 +364,21 @@ mod tests {
     fn test_semantic_search() {
         let (_, mgr) = setup();
 
-        add_memory(&mgr, "Rust language", "Rust is a systems programming language focused on safety");
-        add_memory(&mgr, "Python language", "Python is a high-level scripting language");
-        add_memory(&mgr, "Italian cooking", "How to make pasta carbonara with eggs and cheese");
+        add_memory(
+            &mgr,
+            "Rust language",
+            "Rust is a systems programming language focused on safety",
+        );
+        add_memory(
+            &mgr,
+            "Python language",
+            "Python is a high-level scripting language",
+        );
+        add_memory(
+            &mgr,
+            "Italian cooking",
+            "How to make pasta carbonara with eggs and cheese",
+        );
 
         let results = mgr.search("programming language", 3).unwrap();
         assert_eq!(results.len(), 3);
@@ -414,7 +416,9 @@ mod tests {
         let _m3 = add_memory(&mgr, "Physics", "Quantum entanglement is fascinating");
 
         // Link m1 and m2
-        mgr.zettelkasten().link(&m1.id, &m2.id, "related", 1.0).unwrap();
+        mgr.zettelkasten()
+            .link(&m1.id, &m2.id, "related", 1.0)
+            .unwrap();
 
         let related = mgr.find_related(&m1.id, 5).unwrap();
         assert!(!related.is_empty());
@@ -441,7 +445,11 @@ mod tests {
     fn test_context_for_agent() {
         let (_, mgr) = setup();
 
-        let mem = add_memory(&mgr, "Context test", "This is important context for the agent");
+        let mem = add_memory(
+            &mgr,
+            "Context test",
+            "This is important context for the agent",
+        );
         mgr.load_to_slot("atlas", &mem.id, 0.85).unwrap();
 
         let context = mgr.get_context_for_agent("atlas").unwrap();
@@ -455,14 +463,23 @@ mod tests {
     fn test_refresh_slots() {
         let (_, mgr) = setup();
 
-        add_memory(&mgr, "Rust systems", "Rust systems programming memory safety");
-        add_memory(&mgr, "Python scripting", "Python high level scripting language");
+        add_memory(
+            &mgr,
+            "Rust systems",
+            "Rust systems programming memory safety",
+        );
+        add_memory(
+            &mgr,
+            "Python scripting",
+            "Python high level scripting language",
+        );
 
-        mgr.refresh_slots("atlas", "programming language", 2).unwrap();
+        mgr.refresh_slots("atlas", "programming language", 2)
+            .unwrap();
 
         let slots = mgr.get_slots("atlas").unwrap();
         let occupied: Vec<_> = slots.iter().filter(|s| s.memory_id.is_some()).collect();
-        assert!(occupied.len() >= 1); // at least one relevant memory loaded
+        assert!(!occupied.is_empty()); // at least one relevant memory loaded
     }
 
     #[test]

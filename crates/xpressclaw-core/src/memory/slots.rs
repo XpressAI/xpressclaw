@@ -72,12 +72,7 @@ impl MemorySlotManager {
     /// Load a memory into a slot. If all slots are full, evicts one first.
     ///
     /// Returns the evicted memory ID if one was evicted.
-    pub fn load(
-        &self,
-        agent_id: &str,
-        memory_id: &str,
-        relevance: f64,
-    ) -> Result<Option<String>> {
+    pub fn load(&self, agent_id: &str, memory_id: &str, relevance: f64) -> Result<Option<String>> {
         self.init_slots(agent_id)?;
 
         // Check if this memory is already loaded
@@ -115,9 +110,7 @@ impl MemorySlotManager {
                      ORDER BY slot_index ASC LIMIT 1",
                 )
                 .map_err(|e| Error::Database(e.to_string()))?;
-            let idx: Option<i32> = stmt
-                .query_row([agent_id], |row| row.get(0))
-                .ok();
+            let idx: Option<i32> = stmt.query_row([agent_id], |row| row.get(0)).ok();
             Ok::<_, Error>(idx)
         })?;
 
@@ -130,7 +123,12 @@ impl MemorySlotManager {
                     rusqlite::params![memory_id, relevance, agent_id, slot_idx],
                 )
             })?;
-            debug!(agent_id, memory_id, slot = slot_idx, "loaded memory into slot");
+            debug!(
+                agent_id,
+                memory_id,
+                slot = slot_idx,
+                "loaded memory into slot"
+            );
             return Ok(None);
         }
 
@@ -183,12 +181,7 @@ impl MemorySlotManager {
     }
 
     /// Update the relevance score of a loaded memory.
-    pub fn update_relevance(
-        &self,
-        agent_id: &str,
-        memory_id: &str,
-        relevance: f64,
-    ) -> Result<()> {
+    pub fn update_relevance(&self, agent_id: &str, memory_id: &str, relevance: f64) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE memory_slots SET relevance_score = ?1 \
@@ -256,10 +249,7 @@ impl MemorySlotManager {
     /// Build a context string from loaded memories for prompt injection.
     pub fn get_context_string(&self, agent_id: &str) -> Result<String> {
         let slots = self.get_slots(agent_id)?;
-        let occupied: Vec<&MemorySlot> = slots
-            .iter()
-            .filter(|s| s.memory_id.is_some())
-            .collect();
+        let occupied: Vec<&MemorySlot> = slots.iter().filter(|s| s.memory_id.is_some()).collect();
 
         if occupied.is_empty() {
             return Ok(String::new());
@@ -374,7 +364,10 @@ mod tests {
         assert_eq!(count, 1);
 
         let slots = mgr.get_slots("atlas").unwrap();
-        let loaded = slots.iter().find(|s| s.memory_id.as_deref() == Some("mem-1")).unwrap();
+        let loaded = slots
+            .iter()
+            .find(|s| s.memory_id.as_deref() == Some("mem-1"))
+            .unwrap();
         assert!((loaded.relevance_score.unwrap() - 0.9).abs() < 0.01);
     }
 
@@ -402,7 +395,9 @@ mod tests {
 
         // The new one should be in there
         let slots = mgr.get_slots("atlas").unwrap();
-        assert!(slots.iter().any(|s| s.memory_id.as_deref() == Some("mem-new")));
+        assert!(slots
+            .iter()
+            .any(|s| s.memory_id.as_deref() == Some("mem-new")));
     }
 
     #[test]
@@ -428,7 +423,10 @@ mod tests {
         mgr.update_relevance("atlas", "mem-1", 0.99).unwrap();
 
         let slots = mgr.get_slots("atlas").unwrap();
-        let slot = slots.iter().find(|s| s.memory_id.as_deref() == Some("mem-1")).unwrap();
+        let slot = slots
+            .iter()
+            .find(|s| s.memory_id.as_deref() == Some("mem-1"))
+            .unwrap();
         assert!((slot.relevance_score.unwrap() - 0.99).abs() < 0.01);
     }
 

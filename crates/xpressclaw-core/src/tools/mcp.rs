@@ -238,9 +238,9 @@ impl McpClient {
         }
 
         let result: InitializeResult = serde_json::from_value(
-            response.result.ok_or_else(|| {
-                Error::Tool("MCP initialize returned no result".into())
-            })?,
+            response
+                .result
+                .ok_or_else(|| Error::Tool("MCP initialize returned no result".into()))?,
         )
         .map_err(|e| Error::Tool(format!("invalid initialize result: {e}")))?;
 
@@ -256,12 +256,7 @@ impl McpClient {
         // Send initialized notification
         let notif = JsonRpcRequest::notification("notifications/initialized", None);
         // Fire and forget — notifications don't expect a response
-        let _ = self
-            .client
-            .post(&self.base_url)
-            .json(&notif)
-            .send()
-            .await;
+        let _ = self.client.post(&self.base_url).json(&notif).send().await;
 
         Ok(self.server_info.as_ref().unwrap())
     }
@@ -433,12 +428,9 @@ impl McpServer {
             "tools/list" => McpRequestResult::Response(self.handle_list_tools(request)),
             "tools/call" => self.handle_call_tool(request),
             // Notifications — no response needed
-            "notifications/initialized" | "notifications/cancelled" => {
-                McpRequestResult::Response(JsonRpcResponse::success(
-                    request.id.clone(),
-                    serde_json::json!({}),
-                ))
-            }
+            "notifications/initialized" | "notifications/cancelled" => McpRequestResult::Response(
+                JsonRpcResponse::success(request.id.clone(), serde_json::json!({})),
+            ),
             _ => McpRequestResult::Response(JsonRpcResponse::error(
                 request.id.clone(),
                 -32601,
@@ -465,10 +457,7 @@ impl McpServer {
 
     fn handle_list_tools(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let tools: Vec<&McpToolDef> = self.tools.values().collect();
-        JsonRpcResponse::success(
-            request.id.clone(),
-            serde_json::json!({ "tools": tools }),
-        )
+        JsonRpcResponse::success(request.id.clone(), serde_json::json!({ "tools": tools }))
     }
 
     fn handle_call_tool(&self, request: &JsonRpcRequest) -> McpRequestResult {
@@ -650,11 +639,7 @@ mod tests {
         };
 
         assert!(resp.is_error());
-        assert!(resp
-            .error
-            .unwrap()
-            .message
-            .contains("tool not found"));
+        assert!(resp.error.unwrap().message.contains("tool not found"));
     }
 
     #[test]

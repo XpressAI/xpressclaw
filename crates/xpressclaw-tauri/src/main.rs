@@ -33,8 +33,7 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let mut builder = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init());
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
 
     // Prevent multiple instances on desktop
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -131,7 +130,11 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
             config: serde_json::Value::Object(agent_json),
         }) {
             Ok(record) => {
-                info!(name = record.name, backend = record.backend, "registered agent")
+                info!(
+                    name = record.name,
+                    backend = record.backend,
+                    "registered agent"
+                )
             }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
         }
@@ -143,7 +146,8 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         let mut router = LlmRouter::new(&config.llm);
 
         if let Some(ref key) = config.llm.openai_api_key {
-            let provider = OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
+            let provider =
+                OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
             router.register_provider("openai", Arc::new(provider));
         }
 

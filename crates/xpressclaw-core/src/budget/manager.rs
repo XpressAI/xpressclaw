@@ -89,7 +89,12 @@ impl BudgetManager {
         self.save_state(&state)?;
         self.check_limits(agent_id, &state)?;
 
-        debug!(agent_id, cost, total = state.total_spent, "updated spending");
+        debug!(
+            agent_id,
+            cost,
+            total = state.total_spent,
+            "updated spending"
+        );
         Ok(state)
     }
 
@@ -242,9 +247,8 @@ impl BudgetManager {
 
     pub fn get_top_spenders(&self, limit: i64) -> Result<Vec<BudgetState>> {
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT * FROM budget_state ORDER BY total_spent DESC LIMIT ?1",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT * FROM budget_state ORDER BY total_spent DESC LIMIT ?1")?;
             let states = stmt
                 .query_map([limit], |row| {
                     Ok(BudgetState {

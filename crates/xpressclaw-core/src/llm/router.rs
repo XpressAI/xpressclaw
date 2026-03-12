@@ -152,9 +152,11 @@ impl LlmRouter {
             &self.default_provider
         };
 
-        self.providers
-            .get(provider_name)
-            .ok_or_else(|| Error::Llm(format!("no provider registered for model '{model}' (tried '{provider_name}')")))
+        self.providers.get(provider_name).ok_or_else(|| {
+            Error::Llm(format!(
+                "no provider registered for model '{model}' (tried '{provider_name}')"
+            ))
+        })
     }
 
     pub async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
@@ -163,10 +165,7 @@ impl LlmRouter {
     }
 
     pub fn models(&self) -> Vec<ModelInfo> {
-        self.providers
-            .values()
-            .flat_map(|p| p.models())
-            .collect()
+        self.providers.values().flat_map(|p| p.models()).collect()
     }
 }
 
@@ -279,14 +278,8 @@ mod tests {
     fn test_router_models_aggregates() {
         let config = LlmConfig::default();
         let mut router = LlmRouter::new(&config);
-        router.register_provider(
-            "a",
-            Arc::new(MockProvider { name: "a".into() }),
-        );
-        router.register_provider(
-            "b",
-            Arc::new(MockProvider { name: "b".into() }),
-        );
+        router.register_provider("a", Arc::new(MockProvider { name: "a".into() }));
+        router.register_provider("b", Arc::new(MockProvider { name: "b".into() }));
 
         let models = router.models();
         assert_eq!(models.len(), 2);

@@ -26,14 +26,11 @@ pub fn routes() -> Router<AppState> {
 async fn budget_summary(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(
-        state.db.clone(),
-        state.config.system.budget.clone(),
-    );
-    let summary = mgr.get_summary(None).map_err(|e| internal_error(e))?;
+    let mgr = BudgetManager::new(state.db.clone(), state.config.system.budget.clone());
+    let summary = mgr.get_summary(None).map_err(internal_error)?;
 
     // Per-agent breakdown
-    let agents = mgr.get_top_spenders(100).map_err(|e| internal_error(e))?;
+    let agents = mgr.get_top_spenders(100).map_err(internal_error)?;
     let agent_list: Vec<Value> = agents
         .iter()
         .map(|a| {
@@ -63,13 +60,8 @@ async fn agent_budget(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(
-        state.db.clone(),
-        state.config.system.budget.clone(),
-    );
-    let summary = mgr
-        .get_summary(Some(&agent_id))
-        .map_err(|e| internal_error(e))?;
+    let mgr = BudgetManager::new(state.db.clone(), state.config.system.budget.clone());
+    let summary = mgr.get_summary(Some(&agent_id)).map_err(internal_error)?;
     Ok(Json(json!(summary)))
 }
 
@@ -81,7 +73,7 @@ async fn usage_history(
     let limit = params.limit.unwrap_or(100);
     let records = tracker
         .get_usage(params.agent_id.as_deref(), limit)
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
     Ok(Json(json!(records)))
 }
 
@@ -116,9 +108,7 @@ mod tests {
             db: db.clone(),
             llm_router: None,
         };
-        let router = Router::new()
-            .nest("/budget", routes())
-            .with_state(state);
+        let router = Router::new().nest("/budget", routes()).with_state(state);
         (db, router)
     }
 

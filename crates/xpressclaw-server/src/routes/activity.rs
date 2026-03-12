@@ -123,9 +123,7 @@ mod tests {
             db: db.clone(),
             llm_router: None,
         };
-        let router = Router::new()
-            .nest("/activity", routes())
-            .with_state(state);
+        let router = Router::new().nest("/activity", routes()).with_state(state);
         (db, router)
     }
 
@@ -164,8 +162,7 @@ mod tests {
             .unwrap();
         mgr.log("task.completed", Some("atlas"), None, None)
             .unwrap();
-        mgr.log("task.created", Some("hermes"), None, None)
-            .unwrap();
+        mgr.log("task.created", Some("hermes"), None, None).unwrap();
 
         // List all
         let resp = app

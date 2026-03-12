@@ -87,8 +87,9 @@ pub async fn run(cmd: MemoryCommand, port: u16) -> anyhow::Result<()> {
 
         MemoryCommand::Search { query, limit } => {
             let encoded = urlencoding::encode(&query);
-            let results: Vec<serde_json::Value> =
-                api.get(&format!("/memory/search?q={encoded}&limit={limit}")).await?;
+            let results: Vec<serde_json::Value> = api
+                .get(&format!("/memory/search?q={encoded}&limit={limit}"))
+                .await?;
 
             println!("{} results for \"{query}\":", results.len());
             println!();

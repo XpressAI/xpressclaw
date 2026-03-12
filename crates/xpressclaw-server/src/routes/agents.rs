@@ -227,9 +227,7 @@ mod tests {
             llm_router: None,
         };
 
-        Router::new()
-            .nest("/agents", routes())
-            .with_state(state)
+        Router::new().nest("/agents", routes()).with_state(state)
     }
 
     async fn body_json(body: Body) -> Value {

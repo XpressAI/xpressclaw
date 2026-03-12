@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions,
-    LogsOptions, RemoveContainerOptions, StopContainerOptions,
+    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
+    RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
@@ -82,11 +82,7 @@ impl DockerManager {
     }
 
     /// Launch an agent container.
-    pub async fn launch(
-        &self,
-        agent_id: &str,
-        spec: &ContainerSpec,
-    ) -> Result<ContainerInfo> {
+    pub async fn launch(&self, agent_id: &str, spec: &ContainerSpec) -> Result<ContainerInfo> {
         let container_name = format!("xpressclaw-{agent_id}");
 
         // Remove existing container if present
@@ -282,10 +278,7 @@ impl DockerManager {
     pub async fn is_running(&self, agent_id: &str) -> bool {
         let container_name = format!("xpressclaw-{agent_id}");
         match self.docker.inspect_container(&container_name, None).await {
-            Ok(info) => info
-                .state
-                .and_then(|s| s.running)
-                .unwrap_or(false),
+            Ok(info) => info.state.and_then(|s| s.running).unwrap_or(false),
             Err(_) => false,
         }
     }
@@ -320,7 +313,11 @@ impl DockerManager {
 
     async fn get_host_port(&self, container_id: &str, expose_port: Option<u16>) -> Option<u16> {
         let port = expose_port?;
-        let info = self.docker.inspect_container(container_id, None).await.ok()?;
+        let info = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .ok()?;
         let network = info.network_settings?;
         let ports = network.ports?;
         let bindings = ports.get(&format!("{port}/tcp"))?.as_ref()?;

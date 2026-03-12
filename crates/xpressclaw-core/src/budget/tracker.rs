@@ -43,7 +43,9 @@ impl CostTracker {
         operation: &str,
         session_id: Option<&str>,
     ) -> Result<UsageRecord> {
-        let cost = self.pricing.calculate(model, input_tokens, output_tokens, 0, 0);
+        let cost = self
+            .pricing
+            .calculate(model, input_tokens, output_tokens, 0, 0);
 
         let id = {
             let conn = self.db.conn();
@@ -55,7 +57,10 @@ impl CostTracker {
             conn.last_insert_rowid()
         };
 
-        debug!(agent_id, model, input_tokens, output_tokens, cost, "recorded usage");
+        debug!(
+            agent_id,
+            model, input_tokens, output_tokens, cost, "recorded usage"
+        );
 
         let conn = self.db.conn();
         let mut stmt = conn.prepare("SELECT * FROM usage_logs WHERE id = ?1")?;
@@ -78,26 +83,25 @@ impl CostTracker {
         Ok(record)
     }
 
-    pub fn get_usage(
-        &self,
-        agent_id: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<UsageRecord>> {
+    pub fn get_usage(&self, agent_id: Option<&str>, limit: i64) -> Result<Vec<UsageRecord>> {
         let conn = self.db.conn();
 
-        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(aid) = agent_id {
-            (
-                "SELECT * FROM usage_logs WHERE agent_id = ?1 ORDER BY timestamp DESC LIMIT ?2".into(),
-                vec![Box::new(aid.to_string()), Box::new(limit)],
-            )
-        } else {
-            (
-                "SELECT * FROM usage_logs ORDER BY timestamp DESC LIMIT ?1".into(),
-                vec![Box::new(limit)],
-            )
-        };
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if let Some(aid) = agent_id {
+                (
+                    "SELECT * FROM usage_logs WHERE agent_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+                        .into(),
+                    vec![Box::new(aid.to_string()), Box::new(limit)],
+                )
+            } else {
+                (
+                    "SELECT * FROM usage_logs ORDER BY timestamp DESC LIMIT ?1".into(),
+                    vec![Box::new(limit)],
+                )
+            };
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let records = stmt
             .query_map(param_refs.as_slice(), |row| {

@@ -127,10 +127,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Memory { command, port } => memory::run(command, port).await,
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
-        Command::Logs {
-            agent,
-            limit,
-            port,
-        } => logs::run(agent, limit, port).await,
+        Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
     }
 }

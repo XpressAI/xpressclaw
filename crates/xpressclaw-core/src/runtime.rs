@@ -83,11 +83,7 @@ impl Runtime {
         registry.update_status(agent_id, &AgentStatus::Starting, None)?;
 
         // Build container spec from agent config
-        let agent_config = self
-            .config
-            .agents
-            .iter()
-            .find(|a| a.name == agent_id);
+        let agent_config = self.config.agents.iter().find(|a| a.name == agent_id);
 
         let mut spec = if let Some(ac) = agent_config {
             build_container_spec(
@@ -105,7 +101,8 @@ impl Runtime {
             };
             spec.environment.push(format!("AGENT_ID={agent_id}"));
             spec.environment.push(format!("AGENT_NAME={}", record.name));
-            spec.environment.push(format!("AGENT_BACKEND={}", record.backend));
+            spec.environment
+                .push(format!("AGENT_BACKEND={}", record.backend));
             spec
         };
 
@@ -129,11 +126,7 @@ impl Runtime {
             }
             Err(e) => {
                 error!(agent_id, error = %e, "failed to start agent container");
-                registry.update_status(
-                    agent_id,
-                    &AgentStatus::Error(e.to_string()),
-                    None,
-                )?;
+                registry.update_status(agent_id, &AgentStatus::Error(e.to_string()), None)?;
                 Err(e)
             }
         }
@@ -224,7 +217,12 @@ impl Runtime {
 
         // Enqueue
         let queue_item = queue.enqueue(task_id, agent_id)?;
-        debug!(task_id, agent_id, queue_id = queue_item.id, "task dispatched to queue");
+        debug!(
+            task_id,
+            agent_id,
+            queue_id = queue_item.id,
+            "task dispatched to queue"
+        );
 
         // Update task status to in_progress
         board.update_status(task_id, "in_progress", Some(agent_id))?;

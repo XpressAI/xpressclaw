@@ -6,9 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
-use xpressclaw_core::conversations::{
-    ConversationManager, CreateConversation, SendMessage,
-};
+use xpressclaw_core::conversations::{ConversationManager, CreateConversation, SendMessage};
 use xpressclaw_core::llm::router::{ChatCompletionRequest, ChatMessage};
 
 use crate::state::AppState;
@@ -88,9 +86,10 @@ async fn get_conversation(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
     let conv = mgr.get(&id).map_err(|e| match &e {
-        xpressclaw_core::error::Error::ConversationNotFound { .. } => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-        }
+        xpressclaw_core::error::Error::ConversationNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
     Ok(Json(json!(conv)))
@@ -105,9 +104,10 @@ async fn update_conversation(
     let conv = mgr
         .update(&id, req.title.as_deref(), req.icon.as_deref())
         .map_err(|e| match &e {
-            xpressclaw_core::error::Error::ConversationNotFound { .. } => {
-                (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-            }
+            xpressclaw_core::error::Error::ConversationNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
             _ => internal_error(e),
         })?;
     Ok(Json(json!(conv)))
@@ -119,9 +119,10 @@ async fn delete_conversation(
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
     mgr.delete(&id).map_err(|e| match &e {
-        xpressclaw_core::error::Error::ConversationNotFound { .. } => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-        }
+        xpressclaw_core::error::Error::ConversationNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
     Ok(StatusCode::NO_CONTENT)
@@ -189,12 +190,12 @@ async fn send_message(
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            let role = agent.config["role"].as_str().unwrap_or("You are a helpful AI assistant.");
+            let role = agent.config["role"]
+                .as_str()
+                .unwrap_or("You are a helpful AI assistant.");
 
             // Build context from recent conversation history
-            let history = mgr
-                .get_messages(&conv_id, 20, None)
-                .unwrap_or_default();
+            let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
             let mut llm_messages = vec![ChatMessage {
                 role: "system".into(),
@@ -270,9 +271,10 @@ async fn get_participants(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
     let conv = mgr.get(&id).map_err(|e| match &e {
-        xpressclaw_core::error::Error::ConversationNotFound { .. } => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-        }
+        xpressclaw_core::error::Error::ConversationNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
     Ok(Json(json!(conv.participants)))
@@ -286,9 +288,10 @@ async fn add_participant(
     let mgr = ConversationManager::new(state.db.clone());
     mgr.add_participant(&id, &req.participant_type, &req.participant_id)
         .map_err(|e| match &e {
-            xpressclaw_core::error::Error::ConversationNotFound { .. } => {
-                (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-            }
+            xpressclaw_core::error::Error::ConversationNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
             _ => internal_error(e),
         })?;
     Ok(StatusCode::NO_CONTENT)

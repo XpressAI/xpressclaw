@@ -76,13 +76,16 @@ impl McpProxy {
         let mut client = McpClient::new(url);
 
         // Initialize
-        client.initialize().await.map_err(|e| {
-            Error::Tool(format!("failed to initialize MCP server '{name}': {e}"))
-        })?;
+        client
+            .initialize()
+            .await
+            .map_err(|e| Error::Tool(format!("failed to initialize MCP server '{name}': {e}")))?;
 
         // Discover tools
         let tools = client.list_tools().await.map_err(|e| {
-            Error::Tool(format!("failed to list tools from MCP server '{name}': {e}"))
+            Error::Tool(format!(
+                "failed to list tools from MCP server '{name}': {e}"
+            ))
         })?;
 
         let discovered: Vec<McpToolDef> = tools.to_vec();
@@ -162,7 +165,10 @@ impl McpProxy {
                 )?;
                 return Err(Error::ToolPermission(reason));
             }
-            PolicyDecision::NeedsApproval { mode, matched_pattern } => {
+            PolicyDecision::NeedsApproval {
+                mode,
+                matched_pattern,
+            } => {
                 match mode {
                     ApprovalMode::Script { ref command } => {
                         // Run the approval script — it gets only metadata, not arguments
@@ -219,7 +225,9 @@ impl McpProxy {
                         )?;
                         return Err(Error::ToolPermission(reason));
                     }
-                    ApprovalMode::Agent { agent_id: ref approver_id } => {
+                    ApprovalMode::Agent {
+                        agent_id: ref approver_id,
+                    } => {
                         let reason = format!(
                             "tool '{tool_name}' requires approval from agent '{approver_id}' (not yet implemented)"
                         );
@@ -259,17 +267,17 @@ impl McpProxy {
         }
 
         // Find which server handles this tool
-        let server_name = self.tool_routing.get(tool_name).ok_or_else(|| {
-            Error::ToolNotFound {
+        let server_name = self
+            .tool_routing
+            .get(tool_name)
+            .ok_or_else(|| Error::ToolNotFound {
                 name: tool_name.to_string(),
-            }
-        })?;
+            })?;
 
-        let client = self.clients.get(server_name).ok_or_else(|| {
-            Error::Tool(format!(
-                "MCP server '{server_name}' is not connected"
-            ))
-        })?;
+        let client = self
+            .clients
+            .get(server_name)
+            .ok_or_else(|| Error::Tool(format!("MCP server '{server_name}' is not connected")))?;
 
         // Extract the actual tool name (strip the server prefix)
         let actual_tool_name = tool_name
@@ -531,13 +539,11 @@ mod tests {
     async fn test_policy_deny_blocks_tool_call() {
         let db = Arc::new(Database::open_memory().unwrap());
         let mut registry = ToolRegistry::new(db.clone());
-        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
-            ToolPolicyRule {
-                pattern: "dangerous_*".into(),
-                action: PolicyAction::Deny,
-                approval: None,
-            },
-        ]));
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
+            pattern: "dangerous_*".into(),
+            action: PolicyAction::Deny,
+            approval: None,
+        }]));
 
         // Register and route the tool
         registry.register_tool(ToolDefinition {
@@ -631,13 +637,11 @@ mod tests {
     async fn test_policy_manual_approval_required() {
         let db = Arc::new(Database::open_memory().unwrap());
         let registry = ToolRegistry::new(db.clone());
-        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
-            ToolPolicyRule {
-                pattern: "*".into(),
-                action: PolicyAction::RequireApproval,
-                approval: None, // defaults to Manual
-            },
-        ]));
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
+            pattern: "*".into(),
+            action: PolicyAction::RequireApproval,
+            approval: None, // defaults to Manual
+        }]));
 
         proxy.tool_routing.insert("tool".into(), "server".into());
 
@@ -659,15 +663,13 @@ mod tests {
         let mut registry = ToolRegistry::new(db.clone());
 
         // Policy that approves via "true" (always approves)
-        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
-            ToolPolicyRule {
-                pattern: "*".into(),
-                action: PolicyAction::RequireApproval,
-                approval: Some(crate::tools::policy::ApprovalMode::Script {
-                    command: "true".into(),
-                }),
-            },
-        ]));
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
+            pattern: "*".into(),
+            action: PolicyAction::RequireApproval,
+            approval: Some(crate::tools::policy::ApprovalMode::Script {
+                command: "true".into(),
+            }),
+        }]));
 
         registry.register_tool(ToolDefinition {
             name: "some_tool".into(),
@@ -697,15 +699,13 @@ mod tests {
         let registry = ToolRegistry::new(db.clone());
 
         // Policy that denies via "false" (always denies)
-        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
-            ToolPolicyRule {
-                pattern: "*".into(),
-                action: PolicyAction::RequireApproval,
-                approval: Some(crate::tools::policy::ApprovalMode::Script {
-                    command: "false".into(),
-                }),
-            },
-        ]));
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
+            pattern: "*".into(),
+            action: PolicyAction::RequireApproval,
+            approval: Some(crate::tools::policy::ApprovalMode::Script {
+                command: "false".into(),
+            }),
+        }]));
 
         proxy.tool_routing.insert("tool".into(), "server".into());
 

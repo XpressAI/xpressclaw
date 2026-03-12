@@ -50,9 +50,8 @@ impl TaskConversation {
 
     pub fn get_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM task_messages WHERE task_id = ?1 ORDER BY timestamp ASC",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM task_messages WHERE task_id = ?1 ORDER BY timestamp ASC")?;
 
         let messages = stmt
             .query_map([task_id], |row| {

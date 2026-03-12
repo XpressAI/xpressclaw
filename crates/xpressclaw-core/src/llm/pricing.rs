@@ -100,7 +100,10 @@ impl PricingTable {
             "claude-haiku-4.5".into(),
             "claude-haiku-4-5-20251022".into(),
         );
-        aliases.insert("claude-haiku-3.5".into(), "claude-3-5-haiku-20241022".into());
+        aliases.insert(
+            "claude-haiku-3.5".into(),
+            "claude-3-5-haiku-20241022".into(),
+        );
 
         Self { pricing, aliases }
     }

@@ -36,7 +36,11 @@ impl ApiClient {
         resp.json().await.context("failed to parse API response")
     }
 
-    pub async fn post<T: DeserializeOwned>(&self, path: &str, body: &serde_json::Value) -> Result<T> {
+    pub async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
         let url = format!("{}{path}", self.base_url);
         let resp = self
             .client
@@ -73,7 +77,11 @@ impl ApiClient {
         resp.json().await.context("failed to parse API response")
     }
 
-    pub async fn patch<T: DeserializeOwned>(&self, path: &str, body: &serde_json::Value) -> Result<T> {
+    pub async fn patch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
         let url = format!("{}{path}", self.base_url);
         let resp = self
             .client

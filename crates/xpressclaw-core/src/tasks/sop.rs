@@ -106,7 +106,10 @@ impl SopManager {
             .map_err(|e| Error::Sop(format!("invalid SOP content YAML: {e}")))?;
 
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         self.db.with_conn(|conn| {
             conn.execute(
@@ -188,7 +191,10 @@ impl SopManager {
                 .map_err(|e| Error::Sop(format!("invalid SOP content YAML: {e}")))?;
         }
 
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         // Verify it exists
         let existing = self.get_by_name(name)?;
@@ -405,7 +411,9 @@ steps:
         mgr.create(&CreateSop {
             name: "code-review".to_string(),
             description: Some("Review a PR".to_string()),
-            content: "summary: Review code\nsteps:\n  - name: Review\n    description: Check the code\n".to_string(),
+            content:
+                "summary: Review code\nsteps:\n  - name: Review\n    description: Check the code\n"
+                    .to_string(),
             triggers: None,
             created_by: None,
         })

@@ -10,12 +10,15 @@ use crate::error::{Error, Result};
 static INIT_SQLITE_VEC: Once = Once::new();
 
 fn ensure_sqlite_vec() {
-    INIT_SQLITE_VEC.call_once(|| {
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+    INIT_SQLITE_VEC.call_once(|| unsafe {
+        type ExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtFn>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
     });
 }
 

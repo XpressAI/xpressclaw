@@ -142,9 +142,8 @@ impl AgentRegistry {
     }
 
     pub fn delete(&self, agent_id: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
-            conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id])
-        })?;
+        self.db
+            .with_conn(|conn| conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]))?;
         Ok(())
     }
 }

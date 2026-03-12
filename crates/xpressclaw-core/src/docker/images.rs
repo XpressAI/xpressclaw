@@ -106,14 +106,8 @@ pub fn build_container_spec(
         .collect();
 
     // Memory/CPU limits from agent container config
-    let memory_limit = agent
-        .container
-        .get("memory_limit")
-        .and_then(|v| v.as_i64());
-    let cpu_limit = agent
-        .container
-        .get("cpu_limit")
-        .and_then(|v| v.as_i64());
+    let memory_limit = agent.container.get("memory_limit").and_then(|v| v.as_i64());
+    let cpu_limit = agent.container.get("cpu_limit").and_then(|v| v.as_i64());
 
     ContainerSpec {
         image: image.to_string(),
@@ -197,7 +191,10 @@ mod tests {
 
         assert_eq!(spec.image, HARNESS_GENERIC);
         assert_eq!(spec.expose_port, Some(8080));
-        assert!(spec.environment.iter().any(|e| e == "AGENT_NAME=test-agent"));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "AGENT_NAME=test-agent"));
         assert!(spec.environment.iter().any(|e| e == "LLM_MODEL=gpt-4o"));
         assert!(spec
             .environment
@@ -255,8 +252,14 @@ mod tests {
             Some("https://api.openai.com/v1"),
         );
 
-        assert!(spec.environment.iter().any(|e| e == "ANTHROPIC_API_KEY=ant-key"));
-        assert!(spec.environment.iter().any(|e| e == "OPENAI_API_KEY=oai-key"));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "ANTHROPIC_API_KEY=ant-key"));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "OPENAI_API_KEY=oai-key"));
         assert!(spec.environment.iter().any(|e| e == "LLM_API_KEY=oai-key"));
         assert!(spec
             .environment

@@ -119,10 +119,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
     let mut config = Config::load_default()?;
     config::env_overrides(&mut config);
 
-    info!(
-        agents = config.agents.len(),
-        "loaded configuration"
-    );
+    info!(agents = config.agents.len(), "loaded configuration");
 
     // Validate Docker/Podman is available
     match DockerManager::connect().await {
@@ -161,7 +158,11 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
             backend: agent_config.backend.clone(),
             config: serde_json::Value::Object(agent_json),
         }) {
-            Ok(record) => info!(name = record.name, backend = record.backend, "registered agent"),
+            Ok(record) => info!(
+                name = record.name,
+                backend = record.backend,
+                "registered agent"
+            ),
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
         }
     }
@@ -177,10 +178,8 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         let mut router = LlmRouter::new(&config.llm);
 
         if let Some(ref key) = config.llm.openai_api_key {
-            let provider = OpenAiProvider::new(
-                Some(key.clone()),
-                config.llm.openai_base_url.clone(),
-            );
+            let provider =
+                OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
             router.register_provider("openai", Arc::new(provider));
         }
 

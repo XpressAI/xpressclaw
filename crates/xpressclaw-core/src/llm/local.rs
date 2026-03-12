@@ -1,4 +1,4 @@
-use super::router::{LlmProvider, ModelInfo, ChatCompletionRequest, ChatCompletionResponse};
+use super::router::{ChatCompletionRequest, ChatCompletionResponse, LlmProvider, ModelInfo};
 use crate::error::{Error, Result};
 
 /// Local LLM provider that proxies to an OpenAI-compatible server.
@@ -47,9 +47,7 @@ impl LlmProvider for LocalProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Llm(format!(
-                "Local LLM error {status}: {body}"
-            )));
+            return Err(Error::Llm(format!("Local LLM error {status}: {body}")));
         }
 
         resp.json()

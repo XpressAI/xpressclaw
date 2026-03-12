@@ -3,9 +3,7 @@ use tracing::debug;
 
 use crate::error::{Error, Result};
 
-use super::router::{
-    ChatCompletionRequest, ChatCompletionResponse, LlmProvider, ModelInfo,
-};
+use super::router::{ChatCompletionRequest, ChatCompletionResponse, LlmProvider, ModelInfo};
 
 /// OpenAI-compatible provider.
 ///
@@ -50,23 +48,26 @@ impl LlmProvider for OpenAiProvider {
             req = req.bearer_auth(key);
         }
 
-        debug!(model = request.model, "sending request to OpenAI-compatible API");
+        debug!(
+            model = request.model,
+            "sending request to OpenAI-compatible API"
+        );
 
-        let resp = req.send().await.map_err(|e| {
-            Error::Llm(format!("OpenAI request failed: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| Error::Llm(format!("OpenAI request failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Llm(format!(
-                "OpenAI API error {status}: {body}"
-            )));
+            return Err(Error::Llm(format!("OpenAI API error {status}: {body}")));
         }
 
-        let completion: ChatCompletionResponse = resp.json().await.map_err(|e| {
-            Error::Llm(format!("Failed to parse OpenAI response: {e}"))
-        })?;
+        let completion: ChatCompletionResponse = resp
+            .json()
+            .await
+            .map_err(|e| Error::Llm(format!("Failed to parse OpenAI response: {e}")))?;
 
         Ok(completion)
     }

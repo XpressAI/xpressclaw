@@ -76,9 +76,7 @@ impl HarnessClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Agent(format!(
-                "harness error {status}: {body}"
-            )));
+            return Err(Error::Agent(format!("harness error {status}: {body}")));
         }
 
         resp.json()
@@ -89,7 +87,13 @@ impl HarnessClient {
     /// Check if the harness is healthy.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);
-        match self.client.get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+        match self
+            .client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }

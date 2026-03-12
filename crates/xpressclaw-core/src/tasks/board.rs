@@ -30,7 +30,7 @@ impl TaskStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
             "pending" => Ok(Self::Pending),
             "in_progress" => Ok(Self::InProgress),
@@ -98,7 +98,10 @@ impl TaskBoard {
 
     pub fn create(&self, req: &CreateTask) -> Result<Task> {
         let id = Uuid::new_v4().to_string();
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         let priority = req.priority.unwrap_or(0);
         let context_json = req.context.as_ref().map(|c| c.to_string());
 
@@ -159,7 +162,8 @@ impl TaskBoard {
         sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT ?");
         params.push(Box::new(limit));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let tasks = stmt
             .query_map(param_refs.as_slice(), |row| Ok(row_to_task(row)))
@@ -171,18 +175,27 @@ impl TaskBoard {
         Ok(tasks)
     }
 
-    pub fn update_status(&self, task_id: &str, status: &str, agent_id: Option<&str>) -> Result<Task> {
-        let parsed = TaskStatus::from_str(status)?;
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+    pub fn update_status(
+        &self,
+        task_id: &str,
+        status: &str,
+        agent_id: Option<&str>,
+    ) -> Result<Task> {
+        let parsed = TaskStatus::parse(status)?;
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         {
             let conn = self.db.conn();
 
             // Verify task exists
-            let exists: bool = conn
-                .query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", [task_id], |row| {
-                    row.get::<_, i64>(0).map(|c| c > 0)
-                })?;
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get::<_, i64>(0).map(|c| c > 0),
+            )?;
 
             if !exists {
                 return Err(Error::TaskNotFound {
@@ -219,16 +232,20 @@ impl TaskBoard {
     }
 
     pub fn update(&self, task_id: &str, req: &UpdateTask) -> Result<Task> {
-        let now = Utc::now().naive_utc().format("%Y-%m-%d %H:%M:%S").to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         {
             let conn = self.db.conn();
 
             // Verify task exists
-            let exists: bool = conn
-                .query_row("SELECT COUNT(*) FROM tasks WHERE id = ?1", [task_id], |row| {
-                    row.get::<_, i64>(0).map(|c| c > 0)
-                })?;
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get::<_, i64>(0).map(|c| c > 0),
+            )?;
 
             if !exists {
                 return Err(Error::TaskNotFound {
@@ -268,13 +285,11 @@ impl TaskBoard {
 
     pub fn counts(&self) -> Result<TaskCounts> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")?;
+        let mut stmt =
+            conn.prepare("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                ))
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();
@@ -316,7 +331,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         id: row.get("id")?,
         title: row.get("title")?,
         description: row.get("description")?,
-        status: TaskStatus::from_str(&status_str)?,
+        status: TaskStatus::parse(&status_str)?,
         priority: row.get("priority")?,
         agent_id: row.get("agent_id")?,
         parent_task_id: row.get("parent_task_id")?,

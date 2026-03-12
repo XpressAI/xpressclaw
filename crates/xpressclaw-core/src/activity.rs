@@ -55,9 +55,8 @@ impl ActivityManager {
 
     pub fn get_recent(&self, limit: i64) -> Result<Vec<ActivityEvent>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT * FROM activity_logs ORDER BY timestamp DESC LIMIT ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT * FROM activity_logs ORDER BY timestamp DESC LIMIT ?1")?;
 
         let events = stmt
             .query_map([limit], |row| Ok(row_to_event(row)))

@@ -160,9 +160,7 @@ impl ConversationManager {
                         participants: vec![],
                     })
                 })
-                .map_err(|_| Error::ConversationNotFound {
-                    id: id.to_string(),
-                })?;
+                .map_err(|_| Error::ConversationNotFound { id: id.to_string() })?;
 
             conv.participants = self.load_participants(conn, id)?;
             Ok(conv)
@@ -170,19 +168,22 @@ impl ConversationManager {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        let deleted = self.db.with_conn(|conn| {
-            conn.execute("DELETE FROM conversations WHERE id = ?1", [id])
-        })?;
+        let deleted = self
+            .db
+            .with_conn(|conn| conn.execute("DELETE FROM conversations WHERE id = ?1", [id]))?;
 
         if deleted == 0 {
-            return Err(Error::ConversationNotFound {
-                id: id.to_string(),
-            });
+            return Err(Error::ConversationNotFound { id: id.to_string() });
         }
         Ok(())
     }
 
-    pub fn update(&self, id: &str, title: Option<&str>, icon: Option<&str>) -> Result<Conversation> {
+    pub fn update(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<Conversation> {
         self.db.with_conn(|conn| {
             if let Some(t) = title {
                 conn.execute(
@@ -234,11 +235,7 @@ impl ConversationManager {
         })
     }
 
-    pub fn send_message(
-        &self,
-        conv_id: &str,
-        msg: &SendMessage,
-    ) -> Result<ConversationMessage> {
+    pub fn send_message(&self, conv_id: &str, msg: &SendMessage) -> Result<ConversationMessage> {
         self.db.with_conn(|conn| {
             let message_type = msg.message_type.as_deref().unwrap_or("message");
 
@@ -322,11 +319,7 @@ impl ConversationManager {
     }
 
     /// Get agent IDs mentioned in content, or all agent participants if none explicitly mentioned.
-    pub fn resolve_target_agents(
-        &self,
-        conv_id: &str,
-        content: &str,
-    ) -> Result<Vec<String>> {
+    pub fn resolve_target_agents(&self, conv_id: &str, content: &str) -> Result<Vec<String>> {
         let mentions = Self::parse_mentions(content);
         let mentioned_agents: Vec<String> = mentions
             .iter()
@@ -339,7 +332,9 @@ impl ConversationManager {
         }
 
         // No explicit mention — auto-route to all agent participants
-        let participants = self.db.with_conn(|conn| self.load_participants(conn, conv_id))?;
+        let participants = self
+            .db
+            .with_conn(|conn| self.load_participants(conn, conv_id))?;
         Ok(participants
             .iter()
             .filter(|p| p.participant_type == "agent")
@@ -549,8 +544,14 @@ mod tests {
             "Hey @[AGENT:atlas:atlas] and @[AGENT:flynn:flynn], how are you?",
         );
         assert_eq!(mentions.len(), 2);
-        assert_eq!(mentions[0], ("AGENT".into(), "atlas".into(), "atlas".into()));
-        assert_eq!(mentions[1], ("AGENT".into(), "flynn".into(), "flynn".into()));
+        assert_eq!(
+            mentions[0],
+            ("AGENT".into(), "atlas".into(), "atlas".into())
+        );
+        assert_eq!(
+            mentions[1],
+            ("AGENT".into(), "flynn".into(), "flynn".into())
+        );
 
         // No mentions
         assert!(ConversationManager::parse_mentions("no mentions here").is_empty());
@@ -585,9 +586,7 @@ mod tests {
             .unwrap();
 
         // No mention — should auto-route to atlas (the only agent participant)
-        let targets = mgr
-            .resolve_target_agents(&conv.id, "hello there")
-            .unwrap();
+        let targets = mgr.resolve_target_agents(&conv.id, "hello there").unwrap();
         assert_eq!(targets, vec!["atlas"]);
     }
 

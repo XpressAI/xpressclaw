@@ -10,7 +10,7 @@
 
 	onMount(async () => {
 		try {
-			agent = await agents.get($page.params.id);
+			agent = await agents.get($page.params.id!);
 		} catch (e) {
 			error = String(e);
 		}

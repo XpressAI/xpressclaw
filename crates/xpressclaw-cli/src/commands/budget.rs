@@ -44,7 +44,10 @@ pub async fn run(agent: Option<String>, port: u16) -> anyhow::Result<()> {
         println!("No usage recorded.");
     } else {
         println!("Recent usage:");
-        println!("  {:<10} {:<18} {:>8} {:>8} {:>10}", "Agent", "Model", "In", "Out", "Cost");
+        println!(
+            "  {:<10} {:<18} {:>8} {:>8} {:>10}",
+            "Agent", "Model", "In", "Out", "Cost"
+        );
         for u in &usage {
             let agent_id = u["agent_id"].as_str().unwrap_or("-");
             let model = u["model"].as_str().unwrap_or("?");

@@ -152,7 +152,10 @@ pub async fn run(cmd: SopCommand, port: u16) -> anyhow::Result<()> {
             let task: serde_json::Value =
                 api.post(&format!("/procedures/{name}/run"), &body).await?;
             let task_id = task["id"].as_str().unwrap_or("?");
-            println!("Running procedure {name} → task {}", &task_id[..8.min(task_id.len())]);
+            println!(
+                "Running procedure {name} → task {}",
+                &task_id[..8.min(task_id.len())]
+            );
         }
     }
 

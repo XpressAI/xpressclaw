@@ -187,12 +187,7 @@ impl Zettelkasten {
     }
 
     /// Update a memory's content and/or summary.
-    pub fn update(
-        &self,
-        id: &str,
-        content: Option<&str>,
-        summary: Option<&str>,
-    ) -> Result<Memory> {
+    pub fn update(&self, id: &str, content: Option<&str>, summary: Option<&str>) -> Result<Memory> {
         // Verify it exists
         self.get_without_access(id)?;
 
@@ -217,20 +212,13 @@ impl Zettelkasten {
 
     /// Delete a memory (cascading deletes handle links and tags).
     pub fn delete(&self, id: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
-            conn.execute("DELETE FROM memories WHERE id = ?1", [id])
-        })?;
+        self.db
+            .with_conn(|conn| conn.execute("DELETE FROM memories WHERE id = ?1", [id]))?;
         Ok(())
     }
 
     /// Create a bidirectional link between two memories.
-    pub fn link(
-        &self,
-        from_id: &str,
-        to_id: &str,
-        link_type: &str,
-        strength: f64,
-    ) -> Result<()> {
+    pub fn link(&self, from_id: &str, to_id: &str, link_type: &str, strength: f64) -> Result<()> {
         self.db.with_conn(|conn| {
             // Forward link
             conn.execute(
@@ -296,9 +284,7 @@ impl Zettelkasten {
             Ok::<_, Error>(ids)
         })?;
 
-        ids.iter()
-            .map(|id| self.get_without_access(id))
-            .collect()
+        ids.iter().map(|id| self.get_without_access(id)).collect()
     }
 
     /// Find recently accessed memories.
@@ -309,8 +295,7 @@ impl Zettelkasten {
         limit: i64,
     ) -> Result<Vec<Memory>> {
         let ids: Vec<String> = self.db.with_conn(|conn| {
-            let mut sql =
-                "SELECT id FROM memories WHERE 1=1".to_string();
+            let mut sql = "SELECT id FROM memories WHERE 1=1".to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
             if let Some(l) = layer {
@@ -337,9 +322,7 @@ impl Zettelkasten {
             Ok::<_, Error>(ids)
         })?;
 
-        ids.iter()
-            .map(|id| self.get_without_access(id))
-            .collect()
+        ids.iter().map(|id| self.get_without_access(id)).collect()
     }
 
     /// Traverse the knowledge graph from a starting memory.
@@ -398,9 +381,7 @@ impl Zettelkasten {
             Ok::<_, Error>(ids)
         })?;
 
-        ids.iter()
-            .map(|id| self.get_without_access(id))
-            .collect()
+        ids.iter().map(|id| self.get_without_access(id)).collect()
     }
 
     /// Get statistics about the memory store.
@@ -415,11 +396,9 @@ impl Zettelkasten {
                 .map_err(|e| Error::Database(e.to_string()))?;
 
             let tags: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT tag) FROM memory_tags",
-                    [],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT COUNT(DISTINCT tag) FROM memory_tags", [], |row| {
+                    row.get(0)
+                })
                 .map_err(|e| Error::Database(e.to_string()))?;
 
             Ok(MemoryStats {

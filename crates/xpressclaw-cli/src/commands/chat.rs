@@ -12,13 +12,7 @@ pub async fn run(agent: &str, port: u16) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("agent '{agent}' not found"))?;
 
     // Determine which model to use: check agent config, then /v1/models for default
-    let model = agent_info["config"]["model"]
-        .as_str()
-        .map(String::from)
-        .or_else(|| {
-            // No model in agent config — pick the first available model
-            None
-        });
+    let model = agent_info["config"]["model"].as_str().map(String::from);
 
     let model = match model {
         Some(m) => m,
@@ -73,11 +67,7 @@ pub async fn run(agent: &str, port: u16) -> anyhow::Result<()> {
         // Use /v1/chat/completions endpoint
         let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
         let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await?;
+        let resp = client.post(&url).json(&body).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use xpressclaw_core::config::DEFAULT_CONFIG_TEMPLATE;
-use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::docker::images;
+use xpressclaw_core::docker::manager::DockerManager;
 
 pub async fn run(path: &str) -> anyhow::Result<()> {
     let dir = Path::new(path);

@@ -33,12 +33,12 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
         .route("/counts", get(task_counts))
-        .route("/{id}", get(get_task).patch(update_task).delete(delete_task))
-        .route("/{id}/status", patch(update_task_status))
         .route(
-            "/{id}/messages",
-            get(get_messages).post(add_message),
+            "/{id}",
+            get(get_task).patch(update_task).delete(delete_task),
         )
+        .route("/{id}/status", patch(update_task_status))
+        .route("/{id}/messages", get(get_messages).post(add_message))
 }
 
 async fn list_tasks(
@@ -50,9 +50,9 @@ async fn list_tasks(
 
     let tasks = board
         .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
-    let counts = board.counts().map_err(|e| internal_error(e))?;
+    let counts = board.counts().map_err(internal_error)?;
 
     Ok(Json(json!({ "tasks": tasks, "counts": counts })))
 }
@@ -62,7 +62,7 @@ async fn create_task(
     Json(req): Json<CreateTask>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    let task = board.create(&req).map_err(|e| internal_error(e))?;
+    let task = board.create(&req).map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(task))))
 }
 
@@ -72,9 +72,10 @@ async fn get_task(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
     let task = board.get(&id).map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-        }
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
     Ok(Json(json!(task)))
@@ -87,9 +88,10 @@ async fn update_task(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
     let task = board.update(&id, &req).map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-        }
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
     Ok(Json(json!(task)))
@@ -100,7 +102,7 @@ async fn delete_task(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    board.delete(&id).map_err(|e| internal_error(e))?;
+    board.delete(&id).map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -113,12 +115,14 @@ async fn update_task_status(
     let task = board
         .update_status(&id, &req.status, req.agent_id.as_deref())
         .map_err(|e| match &e {
-            xpressclaw_core::error::Error::TaskNotFound { .. } => {
-                (StatusCode::NOT_FOUND, Json(json!({ "error": e.to_string() })))
-            }
-            xpressclaw_core::error::Error::Task(_) => {
-                (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() })))
-            }
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            xpressclaw_core::error::Error::Task(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
             _ => internal_error(e),
         })?;
     Ok(Json(json!(task)))
@@ -128,7 +132,7 @@ async fn task_counts(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    let counts = board.counts().map_err(|e| internal_error(e))?;
+    let counts = board.counts().map_err(internal_error)?;
     Ok(Json(json!(counts)))
 }
 
@@ -137,7 +141,7 @@ async fn get_messages(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let conv = TaskConversation::new(state.db.clone());
-    let messages = conv.get_messages(&id).map_err(|e| internal_error(e))?;
+    let messages = conv.get_messages(&id).map_err(internal_error)?;
     Ok(Json(json!(messages)))
 }
 
@@ -149,7 +153,7 @@ async fn add_message(
     let conv = TaskConversation::new(state.db.clone());
     let msg = conv
         .add_message(&id, &req.role, &req.content)
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(msg))))
 }
 
@@ -177,11 +181,13 @@ mod tests {
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState { config, db, llm_router: None };
+        let state = AppState {
+            config,
+            db,
+            llm_router: None,
+        };
 
-        Router::new()
-            .nest("/tasks", routes())
-            .with_state(state)
+        Router::new().nest("/tasks", routes()).with_state(state)
     }
 
     async fn body_json(body: Body) -> Value {
@@ -266,9 +272,7 @@ mod tests {
                     .method("POST")
                     .uri("/tasks")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"title": "Status test"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"title": "Status test"}).to_string()))
                     .unwrap(),
             )
             .await
@@ -310,9 +314,7 @@ mod tests {
                     .method("POST")
                     .uri("/tasks")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"title": "Bad status"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"title": "Bad status"}).to_string()))
                     .unwrap(),
             )
             .await
@@ -328,9 +330,7 @@ mod tests {
                     .method("PATCH")
                     .uri(format!("/tasks/{task_id}/status"))
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"status": "invalid_status"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"status": "invalid_status"}).to_string()))
                     .unwrap(),
             )
             .await
@@ -368,9 +368,7 @@ mod tests {
                     .method("POST")
                     .uri("/tasks")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"title": "To delete"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"title": "To delete"}).to_string()))
                     .unwrap(),
             )
             .await
@@ -420,9 +418,7 @@ mod tests {
                     .method("POST")
                     .uri("/tasks")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"title": "Message test"}).to_string(),
-                    ))
+                    .body(Body::from(json!({"title": "Message test"}).to_string()))
                     .unwrap(),
             )
             .await

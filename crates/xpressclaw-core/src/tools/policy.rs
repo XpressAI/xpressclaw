@@ -434,14 +434,14 @@ mod tests {
     async fn test_approval_script_approve() {
         // "true" exits 0 = approved
         let result = ToolPolicyEngine::run_approval_script("true", "test_tool", "atlas").await;
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[tokio::test]
     async fn test_approval_script_deny() {
         // "false" exits 1 = denied
         let result = ToolPolicyEngine::run_approval_script("false", "test_tool", "atlas").await;
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[tokio::test]
@@ -449,11 +449,10 @@ mod tests {
         // Script that checks env vars are set
         let script = r#"test "$TOOL_NAME" = "my_tool" && test "$AGENT_ID" = "atlas""#;
         let result = ToolPolicyEngine::run_approval_script(script, "my_tool", "atlas").await;
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         // Wrong values should fail
-        let result =
-            ToolPolicyEngine::run_approval_script(script, "wrong_tool", "atlas").await;
-        assert_eq!(result.unwrap(), false);
+        let result = ToolPolicyEngine::run_approval_script(script, "wrong_tool", "atlas").await;
+        assert!(!result.unwrap());
     }
 }
