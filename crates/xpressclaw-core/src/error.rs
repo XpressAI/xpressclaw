@@ -99,6 +99,13 @@ pub enum Error {
     #[error("tool execution failed: {0}")]
     ToolExecution(String),
 
+    // Conversations
+    #[error("conversation not found: {id}")]
+    ConversationNotFound { id: String },
+
+    #[error("conversation error: {0}")]
+    Conversation(String),
+
     // Database
     #[error("database error: {0}")]
     Database(String),

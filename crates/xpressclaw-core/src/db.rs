@@ -127,6 +127,7 @@ impl Database {
             (7, MIGRATION_V7),
             (8, MIGRATION_V8),
             (9, MIGRATION_V9),
+            (10, MIGRATION_V10),
         ];
 
         for &(target, sql) in migrations {
@@ -420,6 +421,48 @@ CREATE VIRTUAL TABLE memory_embeddings USING vec0(
 );
 ";
 
+const MIGRATION_V10: &str = "
+-- Rebuild conversations with multi-participant support
+DROP TABLE IF EXISTS conversations;
+
+CREATE TABLE conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    icon TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_message_at TIMESTAMP
+);
+CREATE INDEX idx_conv_updated ON conversations(updated_at);
+CREATE INDEX idx_conv_last_msg ON conversations(last_message_at);
+
+-- Participants (user or agent) in a conversation
+CREATE TABLE conversation_participants (
+    conversation_id TEXT NOT NULL,
+    participant_type TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, participant_type, participant_id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_conv_part_conv ON conversation_participants(conversation_id);
+
+-- Messages in a conversation
+CREATE TABLE conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    sender_type TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    sender_name TEXT,
+    content TEXT NOT NULL,
+    message_type TEXT NOT NULL DEFAULT 'message',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_conv_msg_conv ON conversation_messages(conversation_id);
+CREATE INDEX idx_conv_msg_created ON conversation_messages(created_at);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +480,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "9");
+        assert_eq!(version, "10");
     }
 
     #[test]
@@ -460,5 +503,7 @@ mod tests {
         assert!(tables.contains(&"activity_logs".to_string()));
         assert!(tables.contains(&"task_queue".to_string()));
         assert!(tables.contains(&"conversations".to_string()));
+        assert!(tables.contains(&"conversation_participants".to_string()));
+        assert!(tables.contains(&"conversation_messages".to_string()));
     }
 }

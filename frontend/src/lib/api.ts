@@ -13,6 +13,62 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return res.json();
 }
 
+// -- Conversations --
+
+export interface Conversation {
+	id: string;
+	title: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	last_message_at: string | null;
+	participants: ConversationParticipant[];
+}
+
+export interface ConversationParticipant {
+	participant_type: string;
+	participant_id: string;
+	joined_at: string;
+}
+
+export interface ConversationMessage {
+	id: number;
+	conversation_id: string;
+	sender_type: string;
+	sender_id: string;
+	sender_name: string | null;
+	content: string;
+	message_type: string;
+	created_at: string;
+}
+
+export const conversations = {
+	list: (limit = 50) => request<Conversation[]>(`/api/conversations?limit=${limit}`),
+	get: (id: string) => request<Conversation>(`/api/conversations/${id}`),
+	create: (data: { title?: string; icon?: string; participant_ids?: string[] }) =>
+		request<Conversation>('/api/conversations', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { title?: string; icon?: string }) =>
+		request<Conversation>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	delete: (id: string) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
+	messages: (id: string, limit = 50, beforeId?: number) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (beforeId) params.set('before_id', String(beforeId));
+		return request<ConversationMessage[]>(`/api/conversations/${id}/messages?${params}`);
+	},
+	sendMessage: (id: string, content: string, senderName?: string) =>
+		request<ConversationMessage[]>(`/api/conversations/${id}/messages`, {
+			method: 'POST',
+			body: JSON.stringify({ content, sender_name: senderName })
+		}),
+	addParticipant: (id: string, participantType: string, participantId: string) =>
+		request<void>(`/api/conversations/${id}/participants`, {
+			method: 'POST',
+			body: JSON.stringify({ participant_type: participantType, participant_id: participantId })
+		}),
+	removeParticipant: (id: string, participantId: string) =>
+		request<void>(`/api/conversations/${id}/participants/${participantId}`, { method: 'DELETE' })
+};
+
 // -- Agents --
 
 export interface Agent {

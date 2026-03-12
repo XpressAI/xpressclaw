@@ -5,6 +5,7 @@ pub mod runtime;
 
 pub mod activity;
 pub mod agents;
+pub mod conversations;
 pub mod budget;
 pub mod docker;
 pub mod llm;
