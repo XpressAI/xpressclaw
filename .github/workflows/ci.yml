@@ -44,6 +44,28 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Integration tests that require API keys run in a protected environment.
+  # For PRs from forks, a maintainer must approve the workflow run before
+  # secrets are exposed. Configure the "integration" environment in
+  # Settings > Environments with required reviewers.
+  integration:
+    name: Integration Tests
+    needs: rust
+    runs-on: ubuntu-latest
+    environment: integration
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run integration tests
+        env:
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: cargo test --workspace -- --ignored
+
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
