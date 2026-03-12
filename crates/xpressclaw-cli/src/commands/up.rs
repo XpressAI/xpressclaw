@@ -170,7 +170,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
     let config = Arc::new(config);
     let llm_router = {
         use xpressclaw_core::llm::anthropic::AnthropicProvider;
-        use xpressclaw_core::llm::llamacpp::LlamaCppProvider;
+        use xpressclaw_core::llm::local::LocalProvider;
         use xpressclaw_core::llm::openai::OpenAiProvider;
         use xpressclaw_core::llm::router::LlmRouter;
 
@@ -190,7 +190,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         }
 
         if let Some(ref model) = config.llm.local_model {
-            let provider = LlamaCppProvider::ollama(model.clone());
+            let provider = LocalProvider::ollama(model.clone());
             router.register_provider("local", Arc::new(provider));
         }
 

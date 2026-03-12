@@ -5,6 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 use crate::tools::mcp::{McpClient, McpContent, McpToolDef, McpToolResult};
+use crate::tools::policy::{ApprovalMode, PolicyDecision, ToolPolicyEngine};
 use crate::tools::registry::{ToolCategory, ToolDefinition, ToolRegistry};
 
 /// Maps MCP server names to their connection info.
@@ -19,20 +20,23 @@ pub struct McpServerEntry {
 /// The proxy:
 /// 1. Connects to MCP server containers and discovers their tools
 /// 2. Registers discovered tools in the ToolRegistry
-/// 3. Enforces per-agent permissions before forwarding tool calls
-/// 4. Logs all tool invocations for auditing
+/// 3. Evaluates tool policy rules (glob-pattern allow/deny/approval)
+/// 4. Enforces per-agent permissions before forwarding tool calls
+/// 5. Logs all tool invocations for auditing
 ///
 /// ```text
 /// Agent Container ──► McpProxy ──► MCP Server Container
 ///                       │
-///                  ToolRegistry
-///                  (permissions)
+///                  ToolPolicyEngine    (pattern-based rules)
+///                  ToolRegistry        (per-agent permissions)
 /// ```
 pub struct McpProxy {
     /// Active MCP server connections: server_name → client
     clients: HashMap<String, McpClient>,
     /// Which server provides which tool: tool_name → server_name
     tool_routing: HashMap<String, String>,
+    /// Policy engine for pattern-based tool rules.
+    policy: ToolPolicyEngine,
 }
 
 impl McpProxy {
@@ -40,7 +44,22 @@ impl McpProxy {
         Self {
             clients: HashMap::new(),
             tool_routing: HashMap::new(),
+            policy: ToolPolicyEngine::default(),
         }
+    }
+
+    /// Create a proxy with policy rules.
+    pub fn with_policy(policy: ToolPolicyEngine) -> Self {
+        Self {
+            clients: HashMap::new(),
+            tool_routing: HashMap::new(),
+            policy,
+        }
+    }
+
+    /// Get a reference to the policy engine.
+    pub fn policy(&self) -> &ToolPolicyEngine {
+        &self.policy
     }
 
     /// Connect to an MCP server and discover its tools.
@@ -112,7 +131,12 @@ impl McpProxy {
         info!(server = name, "disconnected from MCP server");
     }
 
-    /// Call a tool through the proxy, enforcing permissions.
+    /// Call a tool through the proxy, enforcing policies and permissions.
+    ///
+    /// Enforcement order:
+    /// 1. **Policy rules** — glob-pattern allow/deny/approval (coarse-grained)
+    /// 2. **Registry permissions** — per-agent allow/deny (fine-grained)
+    /// 3. **Execution** — forward to MCP server, log result
     ///
     /// The tool_name should be in the format "server__tool" as registered.
     pub async fn call_tool(
@@ -122,7 +146,99 @@ impl McpProxy {
         arguments: serde_json::Value,
         registry: &ToolRegistry,
     ) -> Result<McpToolResult> {
-        // Check permission
+        // 1. Check policy rules (pattern-based, coarse-grained)
+        match self.policy.evaluate(tool_name, agent_id) {
+            PolicyDecision::Allow => { /* proceed to permission check */ }
+            PolicyDecision::Deny { reason } => {
+                warn!(agent_id, tool_name, %reason, "tool call denied by policy");
+                registry.log_invocation(
+                    agent_id,
+                    tool_name,
+                    Some(&arguments.to_string()),
+                    None,
+                    None,
+                    false,
+                    Some(&reason),
+                )?;
+                return Err(Error::ToolPermission(reason));
+            }
+            PolicyDecision::NeedsApproval { mode, matched_pattern } => {
+                match mode {
+                    ApprovalMode::Script { ref command } => {
+                        // Run the approval script — it gets only metadata, not arguments
+                        match ToolPolicyEngine::run_approval_script(command, tool_name, agent_id)
+                            .await
+                        {
+                            Ok(true) => {
+                                debug!(tool_name, agent_id, "approval script approved tool call");
+                            }
+                            Ok(false) => {
+                                let reason = format!(
+                                    "denied by approval script for pattern '{matched_pattern}'"
+                                );
+                                warn!(agent_id, tool_name, %reason, "tool call denied by approval script");
+                                registry.log_invocation(
+                                    agent_id,
+                                    tool_name,
+                                    Some(&arguments.to_string()),
+                                    None,
+                                    None,
+                                    false,
+                                    Some(&reason),
+                                )?;
+                                return Err(Error::ToolPermission(reason));
+                            }
+                            Err(e) => {
+                                let reason = format!("approval script failed: {e}");
+                                warn!(agent_id, tool_name, %reason, "approval script error");
+                                registry.log_invocation(
+                                    agent_id,
+                                    tool_name,
+                                    Some(&arguments.to_string()),
+                                    None,
+                                    None,
+                                    false,
+                                    Some(&reason),
+                                )?;
+                                return Err(Error::ToolExecution(reason));
+                            }
+                        }
+                    }
+                    ApprovalMode::Manual => {
+                        let reason = format!(
+                            "tool '{tool_name}' requires manual approval (matched pattern '{matched_pattern}')"
+                        );
+                        registry.log_invocation(
+                            agent_id,
+                            tool_name,
+                            Some(&arguments.to_string()),
+                            None,
+                            None,
+                            false,
+                            Some(&reason),
+                        )?;
+                        return Err(Error::ToolPermission(reason));
+                    }
+                    ApprovalMode::Agent { agent_id: ref approver_id } => {
+                        let reason = format!(
+                            "tool '{tool_name}' requires approval from agent '{approver_id}' (not yet implemented)"
+                        );
+                        registry.log_invocation(
+                            agent_id,
+                            tool_name,
+                            Some(&arguments.to_string()),
+                            None,
+                            None,
+                            false,
+                            Some(&reason),
+                        )?;
+                        return Err(Error::ToolPermission(reason));
+                    }
+                }
+            }
+        }
+
+        // 2. Check per-agent registry permissions (fine-grained)
         if !registry.is_tool_allowed(agent_id, tool_name) {
             warn!(
                 agent_id,
@@ -251,6 +367,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::db::Database;
+    use crate::tools::policy::{PolicyAction, ToolPolicyRule};
     use crate::tools::registry::ToolPermission;
 
     fn setup() -> (Arc<Database>, ToolRegistry, McpProxy) {
@@ -265,6 +382,7 @@ mod tests {
         let (_, _, proxy) = setup();
         assert_eq!(proxy.connected_servers().len(), 0);
         assert_eq!(proxy.routed_tool_count(), 0);
+        assert!(proxy.policy().is_empty());
     }
 
     #[test]
@@ -405,5 +523,200 @@ mod tests {
         // Hermes gets both
         let tools = proxy.available_tools("hermes", &registry);
         assert_eq!(tools.len(), 2);
+    }
+
+    // ── Policy integration tests ──
+
+    #[tokio::test]
+    async fn test_policy_deny_blocks_tool_call() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut registry = ToolRegistry::new(db.clone());
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
+            ToolPolicyRule {
+                pattern: "dangerous_*".into(),
+                action: PolicyAction::Deny,
+                approval: None,
+            },
+        ]));
+
+        // Register and route the tool
+        registry.register_tool(ToolDefinition {
+            name: "dangerous_delete".into(),
+            description: "Delete things".into(),
+            category: ToolCategory::Mcp,
+            input_schema: serde_json::json!({}),
+            mcp_server: Some("server".into()),
+            enabled: true,
+        });
+        proxy
+            .tool_routing
+            .insert("dangerous_delete".into(), "server".into());
+
+        let result = proxy
+            .call_tool(
+                "atlas",
+                "dangerous_delete",
+                serde_json::json!({}),
+                &registry,
+            )
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ToolPermission(msg) => {
+                assert!(msg.contains("denied by policy"));
+                assert!(msg.contains("dangerous_*"));
+            }
+            e => panic!("expected ToolPermission, got: {e}"),
+        }
+
+        // Verify logged
+        let logs = registry.get_logs(Some("atlas"), None, 10).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(!logs[0].success);
+    }
+
+    #[tokio::test]
+    async fn test_policy_allow_with_denied_catch_all() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut registry = ToolRegistry::new(db.clone());
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
+            ToolPolicyRule {
+                pattern: "safe_*".into(),
+                action: PolicyAction::Allow,
+                approval: None,
+            },
+            ToolPolicyRule {
+                pattern: "*".into(),
+                action: PolicyAction::Deny,
+                approval: None,
+            },
+        ]));
+
+        // Register tools
+        for name in ["safe_read", "unsafe_write"] {
+            registry.register_tool(ToolDefinition {
+                name: name.into(),
+                description: name.into(),
+                category: ToolCategory::Mcp,
+                input_schema: serde_json::json!({}),
+                mcp_server: Some("server".into()),
+                enabled: true,
+            });
+            proxy.tool_routing.insert(name.into(), "server".into());
+        }
+
+        // safe_read: policy allows, but will fail at routing (no real server)
+        // — that's fine, the point is it passes the policy check
+        let result = proxy
+            .call_tool("atlas", "safe_read", serde_json::json!({}), &registry)
+            .await;
+        // Should fail with "server not connected", not "policy denied"
+        match result.unwrap_err() {
+            Error::Tool(msg) => assert!(msg.contains("not connected")),
+            e => panic!("expected Tool(not connected), got: {e}"),
+        }
+
+        // unsafe_write: policy denies
+        let result = proxy
+            .call_tool("atlas", "unsafe_write", serde_json::json!({}), &registry)
+            .await;
+        match result.unwrap_err() {
+            Error::ToolPermission(msg) => assert!(msg.contains("denied by policy")),
+            e => panic!("expected ToolPermission, got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_policy_manual_approval_required() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let registry = ToolRegistry::new(db.clone());
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
+            ToolPolicyRule {
+                pattern: "*".into(),
+                action: PolicyAction::RequireApproval,
+                approval: None, // defaults to Manual
+            },
+        ]));
+
+        proxy.tool_routing.insert("tool".into(), "server".into());
+
+        let result = proxy
+            .call_tool("atlas", "tool", serde_json::json!({}), &registry)
+            .await;
+
+        match result.unwrap_err() {
+            Error::ToolPermission(msg) => {
+                assert!(msg.contains("requires manual approval"));
+            }
+            e => panic!("expected ToolPermission(manual approval), got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_policy_script_approval() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut registry = ToolRegistry::new(db.clone());
+
+        // Policy that approves via "true" (always approves)
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
+            ToolPolicyRule {
+                pattern: "*".into(),
+                action: PolicyAction::RequireApproval,
+                approval: Some(crate::tools::policy::ApprovalMode::Script {
+                    command: "true".into(),
+                }),
+            },
+        ]));
+
+        registry.register_tool(ToolDefinition {
+            name: "some_tool".into(),
+            description: "Test".into(),
+            category: ToolCategory::Mcp,
+            input_schema: serde_json::json!({}),
+            mcp_server: Some("server".into()),
+            enabled: true,
+        });
+        proxy
+            .tool_routing
+            .insert("some_tool".into(), "server".into());
+
+        // Should pass policy (script approves) but fail at routing (no real server)
+        let result = proxy
+            .call_tool("atlas", "some_tool", serde_json::json!({}), &registry)
+            .await;
+        match result.unwrap_err() {
+            Error::Tool(msg) => assert!(msg.contains("not connected")),
+            e => panic!("expected Tool(not connected) after script approval, got: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_policy_script_denial() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let registry = ToolRegistry::new(db.clone());
+
+        // Policy that denies via "false" (always denies)
+        let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![
+            ToolPolicyRule {
+                pattern: "*".into(),
+                action: PolicyAction::RequireApproval,
+                approval: Some(crate::tools::policy::ApprovalMode::Script {
+                    command: "false".into(),
+                }),
+            },
+        ]));
+
+        proxy.tool_routing.insert("tool".into(), "server".into());
+
+        let result = proxy
+            .call_tool("atlas", "tool", serde_json::json!({}), &registry)
+            .await;
+        match result.unwrap_err() {
+            Error::ToolPermission(msg) => {
+                assert!(msg.contains("denied by approval script"));
+            }
+            e => panic!("expected ToolPermission(approval denied), got: {e}"),
+        }
     }
 }

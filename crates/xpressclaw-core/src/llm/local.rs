@@ -1,18 +1,21 @@
 use super::router::{LlmProvider, ModelInfo, ChatCompletionRequest, ChatCompletionResponse};
 use crate::error::{Error, Result};
 
-/// Embedded llama.cpp provider via llama-cpp-rs.
+/// Local LLM provider that proxies to an OpenAI-compatible server.
 ///
-/// This will use llama-cpp-rs with Metal (macOS) and CUDA (Linux/Windows) backends.
-/// For now, this delegates to an OpenAI-compatible local server endpoint,
-/// which supports vLLM, Ollama, or llama.cpp server mode.
-pub struct LlamaCppProvider {
+/// Works with Ollama, vLLM, llama.cpp server, or any other local server
+/// that exposes an OpenAI-compatible `/v1/chat/completions` endpoint.
+///
+/// The xpressclaw server exposes its own `/v1/chat/completions` endpoint
+/// and passes `OPENAI_BASE_URL` into agent containers so they can call
+/// back to it. This provider handles routing to the local LLM backend.
+pub struct LocalProvider {
     base_url: String,
     model_name: String,
     client: reqwest::Client,
 }
 
-impl LlamaCppProvider {
+impl LocalProvider {
     /// Create a provider that connects to a local OpenAI-compatible server.
     pub fn new(base_url: String, model_name: String) -> Self {
         Self {
@@ -22,14 +25,14 @@ impl LlamaCppProvider {
         }
     }
 
-    /// Default: connect to Ollama's OpenAI-compatible endpoint.
+    /// Connect to Ollama's OpenAI-compatible endpoint.
     pub fn ollama(model_name: String) -> Self {
         Self::new("http://localhost:11434".to_string(), model_name)
     }
 }
 
 #[async_trait::async_trait]
-impl LlmProvider for LlamaCppProvider {
+impl LlmProvider for LocalProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 

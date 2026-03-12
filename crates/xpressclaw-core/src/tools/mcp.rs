@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::error::{Error, Result};
 
@@ -339,10 +339,71 @@ impl McpClient {
 
 // ── MCP Server (handles incoming requests from harness containers) ──
 
+/// A validated tool call request extracted from JSON-RPC.
+///
+/// When `McpServer::handle_request()` returns `McpRequestResult::ToolCall`,
+/// the caller should execute this through the `McpProxy` (which enforces
+/// policies and permissions) and then wrap the result in a `JsonRpcResponse`.
+#[derive(Debug, Clone)]
+pub struct ToolCallRequest {
+    /// The JSON-RPC request ID (needed to construct the response).
+    pub request_id: Option<serde_json::Value>,
+    /// The tool name to execute.
+    pub tool_name: String,
+    /// The tool arguments (JSON object).
+    pub arguments: serde_json::Value,
+}
+
+impl ToolCallRequest {
+    /// Wrap a successful tool result in a JSON-RPC response.
+    pub fn success_response(&self, result: &McpToolResult) -> JsonRpcResponse {
+        JsonRpcResponse::success(
+            self.request_id.clone(),
+            serde_json::to_value(result).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "content": [{"type": "text", "text": "failed to serialize result"}],
+                    "isError": true
+                })
+            }),
+        )
+    }
+
+    /// Wrap an error in a JSON-RPC response.
+    pub fn error_response(&self, message: &str) -> JsonRpcResponse {
+        JsonRpcResponse::success(
+            self.request_id.clone(),
+            serde_json::json!({
+                "content": [{"type": "text", "text": message}],
+                "isError": true
+            }),
+        )
+    }
+}
+
+/// Result of handling an incoming JSON-RPC request.
+pub enum McpRequestResult {
+    /// Request was handled synchronously (initialize, tools/list, errors).
+    Response(JsonRpcResponse),
+    /// A tool call that needs async execution through the proxy/policy engine.
+    /// The caller should:
+    /// 1. Execute via `McpProxy::call_tool()`
+    /// 2. Convert the result with `ToolCallRequest::success_response()` or `error_response()`
+    ToolCall(ToolCallRequest),
+}
+
 /// Handles MCP protocol requests from agent harness containers.
 ///
-/// This acts as the server side — agents in containers call tools through us,
-/// and we route them to the actual MCP server containers or built-in tools.
+/// This acts as the server side — agents in containers call tools through us.
+/// For `tools/call`, the server validates the request and returns a
+/// `ToolCallRequest` for the caller to execute asynchronously through the
+/// proxy (which enforces policies and permissions).
+///
+/// ```text
+/// Agent ──JSON-RPC──► McpServer ──ToolCallRequest──► McpProxy ──► MCP Server
+///                                                       │
+///                                                  ToolPolicyEngine
+///                                                  ToolRegistry
+/// ```
 pub struct McpServer {
     /// Tools that this server exposes to harness containers.
     tools: HashMap<String, McpToolDef>,
@@ -360,17 +421,29 @@ impl McpServer {
         self.tools.insert(tool.name.clone(), tool);
     }
 
-    /// Handle an incoming JSON-RPC request and produce a response.
-    pub fn handle_request(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    /// Handle an incoming JSON-RPC request.
+    ///
+    /// Returns `McpRequestResult::Response` for requests handled synchronously
+    /// (initialize, tools/list, validation errors).
+    /// Returns `McpRequestResult::ToolCall` for tool calls that need async
+    /// execution through the proxy.
+    pub fn handle_request(&self, request: &JsonRpcRequest) -> McpRequestResult {
         match request.method.as_str() {
-            "initialize" => self.handle_initialize(request),
-            "tools/list" => self.handle_list_tools(request),
+            "initialize" => McpRequestResult::Response(self.handle_initialize(request)),
+            "tools/list" => McpRequestResult::Response(self.handle_list_tools(request)),
             "tools/call" => self.handle_call_tool(request),
-            _ => JsonRpcResponse::error(
+            // Notifications — no response needed
+            "notifications/initialized" | "notifications/cancelled" => {
+                McpRequestResult::Response(JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::json!({}),
+                ))
+            }
+            _ => McpRequestResult::Response(JsonRpcResponse::error(
                 request.id.clone(),
                 -32601,
                 &format!("method not found: {}", request.method),
-            ),
+            )),
         }
     }
 
@@ -398,54 +471,49 @@ impl McpServer {
         )
     }
 
-    fn handle_call_tool(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_call_tool(&self, request: &JsonRpcRequest) -> McpRequestResult {
         let params = match &request.params {
             Some(p) => p,
             None => {
-                return JsonRpcResponse::error(
+                return McpRequestResult::Response(JsonRpcResponse::error(
                     request.id.clone(),
                     -32602,
                     "missing params for tools/call",
-                );
+                ));
             }
         };
 
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) => n,
             None => {
-                return JsonRpcResponse::error(
+                return McpRequestResult::Response(JsonRpcResponse::error(
                     request.id.clone(),
                     -32602,
                     "missing 'name' in tools/call params",
-                );
+                ));
             }
         };
 
         if !self.tools.contains_key(name) {
-            return JsonRpcResponse::error(
+            return McpRequestResult::Response(JsonRpcResponse::error(
                 request.id.clone(),
                 -32602,
                 &format!("tool not found: {name}"),
-            );
+            ));
         }
 
-        // For now, tool execution happens through the proxy layer.
-        // This server just validates the request structure.
-        warn!(
-            tool = name,
-            "tool call received but execution is handled by proxy"
-        );
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
 
-        JsonRpcResponse::success(
-            request.id.clone(),
-            serde_json::json!({
-                "content": [{
-                    "type": "text",
-                    "text": "Tool execution is handled by the proxy layer"
-                }],
-                "isError": false
-            }),
-        )
+        debug!(tool = name, "validated tool call, delegating to proxy");
+
+        McpRequestResult::ToolCall(ToolCallRequest {
+            request_id: request.id.clone(),
+            tool_name: name.to_string(),
+            arguments,
+        })
     }
 
     /// Get the number of registered tools.
@@ -506,7 +574,10 @@ mod tests {
     fn test_mcp_server_initialize() {
         let server = McpServer::new();
         let req = JsonRpcRequest::new(1, "initialize", None);
-        let resp = server.handle_request(&req);
+        let resp = match server.handle_request(&req) {
+            McpRequestResult::Response(r) => r,
+            McpRequestResult::ToolCall(_) => panic!("expected response"),
+        };
 
         assert!(!resp.is_error());
         let result = resp.result.unwrap();
@@ -530,13 +601,39 @@ mod tests {
         });
 
         let req = JsonRpcRequest::new(2, "tools/list", None);
-        let resp = server.handle_request(&req);
+        let resp = match server.handle_request(&req) {
+            McpRequestResult::Response(r) => r,
+            McpRequestResult::ToolCall(_) => panic!("expected response"),
+        };
 
         assert!(!resp.is_error());
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "search");
+    }
+
+    #[test]
+    fn test_mcp_server_call_tool_returns_tool_call() {
+        let mut server = McpServer::new();
+        server.register_tool(McpToolDef {
+            name: "search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+        });
+
+        let req = JsonRpcRequest::new(
+            3,
+            "tools/call",
+            Some(serde_json::json!({"name": "search", "arguments": {"query": "test"}})),
+        );
+        match server.handle_request(&req) {
+            McpRequestResult::ToolCall(call) => {
+                assert_eq!(call.tool_name, "search");
+                assert_eq!(call.arguments["query"], "test");
+            }
+            McpRequestResult::Response(_) => panic!("expected ToolCall"),
+        }
     }
 
     #[test]
@@ -547,7 +644,10 @@ mod tests {
             "tools/call",
             Some(serde_json::json!({"name": "nonexistent", "arguments": {}})),
         );
-        let resp = server.handle_request(&req);
+        let resp = match server.handle_request(&req) {
+            McpRequestResult::Response(r) => r,
+            McpRequestResult::ToolCall(_) => panic!("expected error response"),
+        };
 
         assert!(resp.is_error());
         assert!(resp
@@ -561,10 +661,38 @@ mod tests {
     fn test_mcp_server_unknown_method() {
         let server = McpServer::new();
         let req = JsonRpcRequest::new(4, "unknown/method", None);
-        let resp = server.handle_request(&req);
+        let resp = match server.handle_request(&req) {
+            McpRequestResult::Response(r) => r,
+            McpRequestResult::ToolCall(_) => panic!("expected error response"),
+        };
 
         assert!(resp.is_error());
         assert_eq!(resp.error.unwrap().code, -32601);
+    }
+
+    #[test]
+    fn test_tool_call_request_response_helpers() {
+        let call = ToolCallRequest {
+            request_id: Some(serde_json::Value::Number(1.into())),
+            tool_name: "test".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = McpToolResult {
+            content: vec![McpContent::Text {
+                text: "hello".into(),
+            }],
+            is_error: false,
+        };
+
+        let resp = call.success_response(&result);
+        assert!(!resp.is_error());
+
+        let resp = call.error_response("something went wrong");
+        // error_response wraps as tool result with isError: true, not JSON-RPC error
+        assert!(!resp.is_error()); // not a JSON-RPC error
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
     }
 
     #[test]

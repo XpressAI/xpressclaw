@@ -48,23 +48,32 @@ pub fn build_container_spec(
         format!("AGENT_BACKEND={}", agent.backend),
     ];
 
-    // LLM routing — harnesses call back to the server's built-in /v1/ router by default
+    // LLM routing — harnesses call back to the server's built-in /v1/ router by default.
+    // We set both the custom LLM_BASE_URL and the standard OPENAI_BASE_URL so that
+    // any OpenAI-compatible SDK inside the container works out of the box.
     let llm_base_url = openai_base_url
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("http://host.docker.internal:{server_port}/v1"));
     env.push(format!("LLM_BASE_URL={llm_base_url}"));
+    env.push(format!("OPENAI_BASE_URL={llm_base_url}"));
 
     if let Some(model) = &agent.model {
         env.push(format!("LLM_MODEL={model}"));
     }
 
-    // API keys for harnesses that call cloud APIs directly
+    // API keys for harnesses that call cloud APIs directly.
+    // Also set OPENAI_API_KEY (even as a placeholder) so OpenAI SDKs don't error.
     if let Some(key) = anthropic_api_key {
         env.push(format!("ANTHROPIC_API_KEY={key}"));
     }
     if let Some(key) = openai_api_key {
         env.push(format!("OPENAI_API_KEY={key}"));
         env.push(format!("LLM_API_KEY={key}"));
+    } else {
+        // Placeholder key — the server's /v1 endpoint doesn't require auth,
+        // but OpenAI SDKs refuse to start without an API key set.
+        env.push("OPENAI_API_KEY=sk-xpressclaw".to_string());
+        env.push("LLM_API_KEY=sk-xpressclaw".to_string());
     }
 
     // Agent role as JSON config
@@ -194,6 +203,16 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "LLM_BASE_URL=http://host.docker.internal:6969/v1"));
+        // OPENAI_BASE_URL mirrors LLM_BASE_URL for SDK compatibility
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "OPENAI_BASE_URL=http://host.docker.internal:6969/v1"));
+        // Placeholder API key when no real key is provided
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "OPENAI_API_KEY=sk-xpressclaw"));
     }
 
     #[test]
@@ -243,5 +262,9 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "LLM_BASE_URL=https://api.openai.com/v1"));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "OPENAI_BASE_URL=https://api.openai.com/v1"));
     }
 }

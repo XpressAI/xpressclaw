@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::tools::policy::ToolPolicyRule;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -265,6 +266,10 @@ pub struct Config {
     pub tools: HashMap<String, ToolConfig>,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// Pattern-based tool policy rules. Evaluated in order — first match wins.
+    /// If no rule matches, the tool call is allowed by default.
+    #[serde(default)]
+    pub tool_policies: Vec<ToolPolicyRule>,
     pub memory: MemoryConfig,
     pub llm: LlmConfig,
 }
@@ -281,6 +286,7 @@ impl Default for Config {
             }],
             tools: HashMap::new(),
             mcp_servers: HashMap::new(),
+            tool_policies: Vec::new(),
             memory: MemoryConfig::default(),
             llm: LlmConfig::default(),
         }
@@ -416,6 +422,18 @@ llm:
   # local_model: qwen3.5:latest
   # openai_api_key: (set OPENAI_API_KEY env var)
   # anthropic_api_key: (set ANTHROPIC_API_KEY env var)
+
+# Tool policy rules (evaluated in order, first match wins)
+# tool_policies:
+#   - pattern: "dangerous_*"
+#     action: deny
+#   - pattern: "github__*"
+#     action: allow
+#   - pattern: "*"
+#     action: require_approval
+#     approval:
+#       type: script
+#       command: /usr/local/bin/approve-tool
 
 # MCP (Model Context Protocol) servers
 # mcp_servers:
