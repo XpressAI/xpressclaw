@@ -382,7 +382,7 @@
 								{#each ollamaInfo.models as m}
 									<option value={m.name}>{m.name}</option>
 								{/each}
-								{#if modelRec && !ollamaInfo.models.find(m => m.name === modelRec.model)}
+								{#if modelRec && !ollamaInfo.models.find(m => m.name === modelRec?.model)}
 									<option value={modelRec.model}>{modelRec.model} (will download)</option>
 								{/if}
 							</select>
