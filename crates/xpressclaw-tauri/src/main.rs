@@ -89,6 +89,27 @@ async fn start_server(port: u16) -> anyhow::Result<()> {
 }
 
 async fn build_state(port: u16) -> anyhow::Result<AppState> {
+    let config_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("xpressclaw.yaml");
+
+    // Check if config exists — if not, start in setup mode
+    if !config_path.exists() {
+        info!("no config file found — starting in setup mode");
+        let config = Config::default();
+        let db_path = config.system.data_dir.join("xpressclaw.db");
+        std::fs::create_dir_all(&config.system.data_dir).ok();
+        let db = Arc::new(Database::open(&db_path)?);
+
+        return Ok(AppState {
+            config: Arc::new(config),
+            db,
+            llm_router: None,
+            config_path,
+            setup_complete: false,
+        });
+    }
+
     let mut config = Config::load_default()?;
     config::env_overrides(&mut config);
 
@@ -107,6 +128,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
 
     // Open database
     let db_path = config.system.data_dir.join("xpressclaw.db");
+    std::fs::create_dir_all(&config.system.data_dir).ok();
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
@@ -170,5 +192,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         config,
         db,
         llm_router: Some(Arc::new(llm_router)),
+        config_path,
+        setup_complete: true,
     })
 }

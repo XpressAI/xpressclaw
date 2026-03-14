@@ -16,6 +16,9 @@
 	let mentionQuery = $state('');
 	let editingTitle = $state(false);
 	let titleInput = $state('');
+	let thinkingAgent = $state<string | null>(null);
+	let streamingContent = $state('');
+	let cancelStream = $state<(() => void) | null>(null);
 
 	// Participant agent names for @mention
 	let participantAgents = $derived(
@@ -60,17 +63,45 @@
 		input = '';
 		sending = true;
 		error = null;
+		thinkingAgent = null;
+		streamingContent = '';
 
-		try {
-			const newMsgs = await conversations.sendMessage(conv.id, content, 'You');
-			messages = [...messages, ...newMsgs];
-			await tick();
-			scrollToBottom();
-		} catch (e) {
-			error = String(e);
-		} finally {
-			sending = false;
-		}
+		const abort = conversations.streamMessage(conv.id, content, 'You', {
+			onUserMessage: async (msg) => {
+				messages = [...messages, msg];
+				await tick();
+				scrollToBottom();
+			},
+			onThinking: async (agentId) => {
+				thinkingAgent = agentId;
+				streamingContent = '';
+				await tick();
+				scrollToBottom();
+			},
+			onChunk: async (_agentId, chunk) => {
+				streamingContent += chunk;
+				await tick();
+				scrollToBottom();
+			},
+			onAgentMessage: async (msg) => {
+				thinkingAgent = null;
+				streamingContent = '';
+				messages = [...messages, msg];
+				await tick();
+				scrollToBottom();
+			},
+			onError: (_agentId, err) => {
+				error = err;
+			},
+			onDone: () => {
+				sending = false;
+				thinkingAgent = null;
+				streamingContent = '';
+				cancelStream = null;
+			}
+		});
+
+		cancelStream = abort;
 	}
 
 	function scrollToBottom() {
@@ -254,19 +285,21 @@
 				</div>
 			{/each}
 
-			{#if sending}
+			{#if thinkingAgent}
 				<div class="flex gap-3">
 					<div class="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center text-xs font-bold bg-accent text-accent-foreground">
-						{participantAgents.length > 0 ? participantAgents[0][0].toUpperCase() : '?'}
+						{thinkingAgent[0].toUpperCase()}
 					</div>
-					<div class="space-y-1">
-						<span class="text-xs font-medium">{participantAgents[0] ?? 'Agent'}</span>
+					<div class="max-w-[70%] space-y-1">
+						<div class="flex items-center gap-2">
+							<span class="text-xs font-medium">{thinkingAgent}</span>
+						</div>
 						<div class="rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground">
-							<span class="inline-flex gap-1">
-								<span class="animate-bounce" style="animation-delay: 0ms">.</span>
-								<span class="animate-bounce" style="animation-delay: 150ms">.</span>
-								<span class="animate-bounce" style="animation-delay: 300ms">.</span>
-							</span>
+							{#if streamingContent}
+								{@html renderContent(streamingContent)}<span class="inline-block w-1.5 h-4 bg-foreground/60 animate-pulse ml-0.5 align-text-bottom"></span>
+							{:else}
+								<span class="text-muted-foreground">{thinkingAgent} is thinking<span class="inline-flex gap-0.5 ml-1"><span class="animate-bounce" style="animation-delay: 0ms">.</span><span class="animate-bounce" style="animation-delay: 150ms">.</span><span class="animate-bounce" style="animation-delay: 300ms">.</span></span></span>
+							{/if}
 						</div>
 					</div>
 				</div>

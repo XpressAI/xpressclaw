@@ -12,6 +12,7 @@ pub mod llm;
 mod memory;
 mod procedures;
 mod schedules;
+mod setup;
 mod tasks;
 
 pub fn api_routes() -> Router<AppState> {
@@ -25,4 +26,5 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/memory", memory::routes())
         .nest("/schedules", schedules::routes())
         .nest("/procedures", procedures::routes())
+        .nest("/setup", setup::routes())
 }

@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::config::LlmConfig;
 use crate::error::{Error, Result};
+
+/// A boxed stream of chat completion chunks.
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
 /// A chat message in OpenAI format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +101,33 @@ pub trait LlmProvider: Send + Sync {
     /// Complete a chat request (non-streaming).
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse>;
 
+    /// Stream a chat completion as a series of chunks.
+    /// Default implementation wraps `chat()` into a single-chunk stream.
+    async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
+        let resp = self.chat(request).await?;
+        let chunk = ChatCompletionChunk {
+            id: resp.id,
+            object: "chat.completion.chunk".into(),
+            created: resp.created,
+            model: resp.model,
+            choices: resp
+                .choices
+                .into_iter()
+                .map(|c| ChunkChoice {
+                    index: c.index,
+                    delta: ChunkDelta {
+                        role: Some(c.message.role),
+                        content: Some(c.message.content),
+                    },
+                    finish_reason: c.finish_reason,
+                })
+                .collect(),
+        };
+        Ok(Box::pin(futures_util::stream::once(async move {
+            Ok(chunk)
+        })))
+    }
+
     /// List available models.
     fn models(&self) -> Vec<ModelInfo>;
 
@@ -162,6 +194,11 @@ impl LlmRouter {
     pub async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let provider = self.resolve_provider(&request.model)?;
         provider.chat(request).await
+    }
+
+    pub async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
+        let provider = self.resolve_provider(&request.model)?;
+        provider.chat_stream(request).await
     }
 
     pub fn models(&self) -> Vec<ModelInfo> {

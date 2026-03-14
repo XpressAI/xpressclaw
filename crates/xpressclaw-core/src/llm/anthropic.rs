@@ -24,6 +24,27 @@ impl AnthropicProvider {
             api_key,
         }
     }
+
+    /// Validate an Anthropic API key by sending a minimal request.
+    pub async fn validate_key(api_key: &str) -> std::result::Result<bool, String> {
+        let client = Client::new();
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": "claude-haiku-4-5-20251022",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Request failed: {e}"))?;
+
+        // 200 = valid key, 401 = invalid, other = valid key but some other issue
+        Ok(resp.status() != reqwest::StatusCode::UNAUTHORIZED)
+    }
 }
 
 // -- Anthropic API types --

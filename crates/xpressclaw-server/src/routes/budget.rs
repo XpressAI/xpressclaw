@@ -107,6 +107,8 @@ mod tests {
             config,
             db: db.clone(),
             llm_router: None,
+            config_path: std::path::PathBuf::from("test.yaml"),
+            setup_complete: true,
         };
         let router = Router::new().nest("/budget", routes()).with_state(state);
         (db, router)

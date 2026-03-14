@@ -185,6 +185,8 @@ mod tests {
             config,
             db,
             llm_router: None,
+            config_path: std::path::PathBuf::from("test.yaml"),
+            setup_complete: true,
         };
 
         Router::new().nest("/tasks", routes()).with_state(state)

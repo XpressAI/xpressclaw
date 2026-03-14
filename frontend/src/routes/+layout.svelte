@@ -26,6 +26,8 @@
 		return pathname === `/conversations/${id}`;
 	}
 
+	let isSetupRoute = $derived($page.url.pathname.startsWith('/setup'));
+
 	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let showNewChat = $state(false);
@@ -44,6 +46,9 @@
 	}
 
 	onMount(() => {
+		// Skip sidebar loading during setup
+		if (isSetupRoute) return;
+
 		loadSidebar();
 		// Refresh sidebar periodically
 		const interval = setInterval(loadSidebar, 10000);
@@ -85,125 +90,130 @@
 	}
 </script>
 
-<div class="flex h-screen">
-	<!-- Sidebar -->
-	<aside class="flex w-60 flex-col border-r border-border bg-card">
-		<!-- Header -->
-		<div class="flex h-14 items-center gap-2 border-b border-border px-4">
-			<div class="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground text-sm font-bold">
-				x
-			</div>
-			<span class="text-sm font-semibold">xpressclaw</span>
-		</div>
-
-		<!-- Conversations Section -->
-		<div class="flex items-center justify-between px-3 pt-3 pb-1">
-			<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Conversations</span>
-			<button
-				onclick={() => (showNewChat = !showNewChat)}
-				class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground text-sm"
-				title="New conversation"
-			>+</button>
-		</div>
-
-		{#if showNewChat}
-			<div class="mx-2 mb-2 rounded-lg border border-border bg-background p-2 space-y-2">
-				<input
-					type="text"
-					bind:value={newChatTitle}
-					placeholder="Conversation name..."
-					class="w-full rounded-md border border-border bg-card px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-				/>
-				<div class="text-xs text-muted-foreground">Add agents:</div>
-				<div class="space-y-1 max-h-28 overflow-y-auto">
-					{#each agentList as agent}
-						<label class="flex items-center gap-2 text-xs cursor-pointer hover:bg-accent/50 rounded px-1 py-0.5">
-							<input
-								type="checkbox"
-								checked={selectedAgents.has(agent.id)}
-								onchange={() => toggleAgent(agent.id)}
-								class="rounded border-border"
-							/>
-							<span class="truncate">{agent.name}</span>
-						</label>
-					{/each}
+{#if isSetupRoute}
+	<!-- Setup wizard: full-screen, no sidebar -->
+	{@render children()}
+{:else}
+	<div class="flex h-screen">
+		<!-- Sidebar -->
+		<aside class="flex w-60 flex-col border-r border-border bg-card">
+			<!-- Header -->
+			<div class="flex h-14 items-center gap-2 border-b border-border px-4">
+				<div class="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground text-sm font-bold">
+					x
 				</div>
-				<div class="flex gap-1">
-					<button
-						onclick={createConversation}
-						class="flex-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
-					>Create</button>
-					<button
-						onclick={() => (showNewChat = false)}
-						class="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
-					>Cancel</button>
-				</div>
+				<span class="text-sm font-semibold">xpressclaw</span>
 			</div>
-		{/if}
 
-		<!-- Conversation list -->
-		<div class="flex-1 overflow-y-auto px-2 space-y-0.5">
-			{#each convList as conv}
-				{@const active = isConvActive(conv.id, $page.url.pathname)}
-				<a
-					href="/conversations/{conv.id}"
-					class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors {active
-						? 'bg-accent text-accent-foreground font-medium'
-						: 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'}"
-				>
-					<span class="text-xs flex-shrink-0">{convIcon(conv)}</span>
-					<span class="truncate">{convLabel(conv)}</span>
-				</a>
-			{:else}
-				<div class="px-2 py-4 text-center text-xs text-muted-foreground">
-					No conversations yet
-				</div>
-			{/each}
-		</div>
-
-		<!-- Agents Section -->
-		<div class="border-t border-border">
-			<div class="px-3 pt-2 pb-1">
-				<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Agents</span>
+			<!-- Conversations Section -->
+			<div class="flex items-center justify-between px-3 pt-3 pb-1">
+				<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Conversations</span>
+				<button
+					onclick={() => (showNewChat = !showNewChat)}
+					class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground text-sm"
+					title="New conversation"
+				>+</button>
 			</div>
-			<div class="px-2 pb-1 space-y-0.5 max-h-28 overflow-y-auto">
-				{#each agentList as agent}
+
+			{#if showNewChat}
+				<div class="mx-2 mb-2 rounded-lg border border-border bg-background p-2 space-y-2">
+					<input
+						type="text"
+						bind:value={newChatTitle}
+						placeholder="Conversation name..."
+						class="w-full rounded-md border border-border bg-card px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+					/>
+					<div class="text-xs text-muted-foreground">Add agents:</div>
+					<div class="space-y-1 max-h-28 overflow-y-auto">
+						{#each agentList as agent}
+							<label class="flex items-center gap-2 text-xs cursor-pointer hover:bg-accent/50 rounded px-1 py-0.5">
+								<input
+									type="checkbox"
+									checked={selectedAgents.has(agent.id)}
+									onchange={() => toggleAgent(agent.id)}
+									class="rounded border-border"
+								/>
+								<span class="truncate">{agent.name}</span>
+							</label>
+						{/each}
+					</div>
+					<div class="flex gap-1">
+						<button
+							onclick={createConversation}
+							class="flex-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+						>Create</button>
+						<button
+							onclick={() => (showNewChat = false)}
+							class="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
+						>Cancel</button>
+					</div>
+				</div>
+			{/if}
+
+			<!-- Conversation list -->
+			<div class="flex-1 overflow-y-auto px-2 space-y-0.5">
+				{#each convList as conv}
+					{@const active = isConvActive(conv.id, $page.url.pathname)}
 					<a
-						href="/agents/{agent.id}"
-						class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
-					>
-						<span class="h-1.5 w-1.5 rounded-full flex-shrink-0 {agent.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
-						<span class="truncate">{agent.name}</span>
-					</a>
-				{/each}
-			</div>
-		</div>
-
-		<!-- Navigation Section -->
-		<div class="border-t border-border">
-			<nav class="p-1.5 space-y-0.5">
-				{#each nav as item}
-					{@const active = isActive(item.href, $page.url.pathname)}
-					<a
-						href={item.href}
-						class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors {active
+						href="/conversations/{conv.id}"
+						class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors {active
 							? 'bg-accent text-accent-foreground font-medium'
 							: 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'}"
 					>
-						<span class="w-3 text-center opacity-60">{item.icon}</span>
-						{item.label}
+						<span class="text-xs flex-shrink-0">{convIcon(conv)}</span>
+						<span class="truncate">{convLabel(conv)}</span>
 					</a>
+				{:else}
+					<div class="px-2 py-4 text-center text-xs text-muted-foreground">
+						No conversations yet
+					</div>
 				{/each}
-			</nav>
-		</div>
+			</div>
 
-		<div class="border-t border-border p-2 text-xs text-muted-foreground text-center">
-			v0.1.0
-		</div>
-	</aside>
+			<!-- Agents Section -->
+			<div class="border-t border-border">
+				<div class="px-3 pt-2 pb-1">
+					<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Agents</span>
+				</div>
+				<div class="px-2 pb-1 space-y-0.5 max-h-28 overflow-y-auto">
+					{#each agentList as agent}
+						<a
+							href="/agents/{agent.id}"
+							class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+						>
+							<span class="h-1.5 w-1.5 rounded-full flex-shrink-0 {agent.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
+							<span class="truncate">{agent.name}</span>
+						</a>
+					{/each}
+				</div>
+			</div>
 
-	<!-- Main content -->
-	<main class="flex-1 overflow-auto">
-		{@render children()}
-	</main>
-</div>
+			<!-- Navigation Section -->
+			<div class="border-t border-border">
+				<nav class="p-1.5 space-y-0.5">
+					{#each nav as item}
+						{@const active = isActive(item.href, $page.url.pathname)}
+						<a
+							href={item.href}
+							class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors {active
+								? 'bg-accent text-accent-foreground font-medium'
+								: 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'}"
+						>
+							<span class="w-3 text-center opacity-60">{item.icon}</span>
+							{item.label}
+						</a>
+					{/each}
+				</nav>
+			</div>
+
+			<div class="border-t border-border p-2 text-xs text-muted-foreground text-center">
+				v0.1.0
+			</div>
+		</aside>
+
+		<!-- Main content -->
+		<main class="flex-1 overflow-auto">
+			{@render children()}
+		</main>
+	</div>
+{/if}

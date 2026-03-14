@@ -25,6 +25,7 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
+sysinfo = "0.34"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

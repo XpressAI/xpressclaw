@@ -20,36 +20,46 @@ pub async fn run(detach: bool, port: u16) -> anyhow::Result<()> {
 async fn run_foreground(port: u16) -> anyhow::Result<()> {
     let state = build_state(port).await?;
 
-    println!("xpressclaw is starting...");
-    println!("  Web UI: http://localhost:{port}");
-    println!("  API:    http://localhost:{port}/api");
-    println!("  LLM:    http://localhost:{port}/v1");
-
-    // Check LLM availability
-    if state.config.llm.openai_api_key.is_some() || state.config.llm.anthropic_api_key.is_some() {
-        println!("  LLM:    cloud provider configured");
-    } else if state.config.llm.local_model.is_some() {
-        let model = state.config.llm.local_model.as_deref().unwrap_or("unknown");
-        match reqwest::get("http://localhost:11434/api/tags").await {
-            Ok(resp) if resp.status().is_success() => {
-                println!("  LLM:    Ollama ({model})");
-            }
-            _ => {
-                println!();
-                println!("  Warning: Ollama is not running.");
-                println!("  Chat and agent tasks need a local LLM.");
-                println!("  Start Ollama: `ollama serve`");
-                println!("  Pull model:   `ollama pull {model}`");
-            }
-        }
-    } else {
+    if !state.setup_complete {
+        println!("xpressclaw is starting in setup mode...");
         println!();
-        println!("  Warning: No LLM provider configured.");
-        println!("  Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or install Ollama.");
-    }
+        println!("  Open http://localhost:{port} to complete setup.");
+        println!();
+        println!("Press Ctrl+C to stop.");
+    } else {
+        println!("xpressclaw is starting...");
+        println!("  Web UI: http://localhost:{port}");
+        println!("  API:    http://localhost:{port}/api");
+        println!("  LLM:    http://localhost:{port}/v1");
 
-    println!();
-    println!("Press Ctrl+C to stop.");
+        // Check LLM availability
+        if state.config.llm.openai_api_key.is_some()
+            || state.config.llm.anthropic_api_key.is_some()
+        {
+            println!("  LLM:    cloud provider configured");
+        } else if state.config.llm.local_model.is_some() {
+            let model = state.config.llm.local_model.as_deref().unwrap_or("unknown");
+            match reqwest::get("http://localhost:11434/api/tags").await {
+                Ok(resp) if resp.status().is_success() => {
+                    println!("  LLM:    Ollama ({model})");
+                }
+                _ => {
+                    println!();
+                    println!("  Warning: Ollama is not running.");
+                    println!("  Chat and agent tasks need a local LLM.");
+                    println!("  Start Ollama: `ollama serve`");
+                    println!("  Pull model:   `ollama pull {model}`");
+                }
+            }
+        } else {
+            println!();
+            println!("  Warning: No LLM provider configured.");
+            println!("  Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or install Ollama.");
+        }
+
+        println!();
+        println!("Press Ctrl+C to stop.");
+    }
 
     server::serve(state, port).await?;
 
@@ -115,6 +125,27 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
 
 /// Build the AppState (shared between foreground and detached modes).
 async fn build_state(port: u16) -> anyhow::Result<AppState> {
+    let config_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("xpressclaw.yaml");
+
+    // Check if config exists — if not, start in setup mode
+    if !config_path.exists() {
+        info!("no config file found — starting in setup mode");
+        let config = Config::default();
+        let db_path = config.system.data_dir.join("xpressclaw.db");
+        std::fs::create_dir_all(&config.system.data_dir).ok();
+        let db = Arc::new(Database::open(&db_path)?);
+
+        return Ok(AppState {
+            config: Arc::new(config),
+            db,
+            llm_router: None,
+            config_path,
+            setup_complete: false,
+        });
+    }
+
     // Load config
     let mut config = Config::load_default()?;
     config::env_overrides(&mut config);
@@ -125,17 +156,13 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
     match DockerManager::connect().await {
         Ok(_) => info!("container runtime available"),
         Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Docker/Podman is not running: {e}\n\
-                 xpressclaw requires a container runtime for agent isolation.\n\
-                 Install Docker: https://docs.docker.com/get-docker/\n\
-                 Or Podman: https://podman.io/getting-started/installation"
-            ));
+            warn!(error = %e, "Docker/Podman not available — some features will be limited");
         }
     }
 
     // Open database
     let db_path = config.system.data_dir.join("xpressclaw.db");
+    std::fs::create_dir_all(&config.system.data_dir).ok();
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
@@ -202,5 +229,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         config,
         db,
         llm_router: Some(Arc::new(llm_router)),
+        config_path,
+        setup_complete: true,
     })
 }

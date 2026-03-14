@@ -42,6 +42,15 @@ export interface ConversationMessage {
 	created_at: string;
 }
 
+export interface StreamCallbacks {
+	onUserMessage?: (msg: ConversationMessage) => void;
+	onThinking?: (agentId: string) => void;
+	onChunk?: (agentId: string, content: string) => void;
+	onAgentMessage?: (msg: ConversationMessage) => void;
+	onError?: (agentId: string | null, error: string) => void;
+	onDone?: () => void;
+}
+
 export const conversations = {
 	list: (limit = 50) => request<Conversation[]>(`/api/conversations?limit=${limit}`),
 	get: (id: string) => request<Conversation>(`/api/conversations/${id}`),
@@ -60,6 +69,87 @@ export const conversations = {
 			method: 'POST',
 			body: JSON.stringify({ content, sender_name: senderName })
 		}),
+	streamMessage: (id: string, content: string, senderName: string | undefined, callbacks: StreamCallbacks): (() => void) => {
+		const controller = new AbortController();
+
+		(async () => {
+			try {
+				const res = await fetch(`${BASE}/api/conversations/${id}/messages/stream`, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ content, sender_name: senderName }),
+					signal: controller.signal
+				});
+				if (!res.ok) {
+					const body = await res.json().catch(() => ({ error: res.statusText }));
+					callbacks.onError?.(null, body.error || res.statusText);
+					return;
+				}
+
+				const reader = res.body?.getReader();
+				if (!reader) return;
+
+				const decoder = new TextDecoder();
+				let buffer = '';
+				let currentEvent = '';
+
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+
+					buffer += decoder.decode(value, { stream: true });
+
+					// Process complete SSE messages (separated by \n\n)
+					while (buffer.includes('\n\n')) {
+						const idx = buffer.indexOf('\n\n');
+						const block = buffer.slice(0, idx);
+						buffer = buffer.slice(idx + 2);
+
+						let eventType = '';
+						let data = '';
+						for (const line of block.split('\n')) {
+							if (line.startsWith('event:')) eventType = line.slice(6).trim();
+							else if (line.startsWith('data:')) data = line.slice(5).trim();
+						}
+
+						if (!data || data === 'ping') continue;
+
+						try {
+							const parsed = JSON.parse(data);
+							switch (eventType) {
+								case 'user_message':
+									callbacks.onUserMessage?.(parsed);
+									break;
+								case 'thinking':
+									callbacks.onThinking?.(parsed.agent_id);
+									break;
+								case 'chunk':
+									callbacks.onChunk?.(parsed.agent_id, parsed.content);
+									break;
+								case 'agent_message':
+									callbacks.onAgentMessage?.(parsed);
+									break;
+								case 'error':
+									callbacks.onError?.(parsed.agent_id ?? null, parsed.error);
+									break;
+								case 'done':
+									callbacks.onDone?.();
+									break;
+							}
+						} catch { /* skip unparseable */ }
+					}
+				}
+
+				callbacks.onDone?.();
+			} catch (e) {
+				if (!controller.signal.aborted) {
+					callbacks.onError?.(null, e instanceof Error ? e.message : String(e));
+				}
+			}
+		})();
+
+		return () => controller.abort();
+	},
 	addParticipant: (id: string, participantType: string, participantId: string) =>
 		request<void>(`/api/conversations/${id}/participants`, {
 			method: 'POST',
@@ -298,4 +388,81 @@ export const activity = {
 
 export const health = {
 	check: () => request<{ status: string; version: string }>('/api/health')
+};
+
+// -- Setup --
+
+export interface SetupStatus {
+	setup_complete: boolean;
+}
+
+export interface DockerStatus {
+	available: boolean;
+	error: string | null;
+}
+
+export interface SystemInfo {
+	total_memory_gb: number;
+	available_memory_gb: number;
+	cpu_count: number;
+	gpu: {
+		available: boolean;
+		name: string | null;
+		vram_gb: number | null;
+	};
+	os: string;
+	arch: string;
+}
+
+export interface OllamaInfo {
+	available: boolean;
+	models: { name: string; size: number | null }[];
+	error: string | null;
+}
+
+export interface ModelOption {
+	model: string;
+	display_name: string;
+	ram_required_gb: number;
+	suitable: boolean;
+}
+
+export interface ModelRecommendation {
+	model: string;
+	embedding_model: string;
+	reason: string;
+	all_options: ModelOption[];
+}
+
+export interface AgentPreset {
+	id: string;
+	name: string;
+	description: string;
+	icon: string;
+	role: string;
+	backend: string;
+	default_tools: string[];
+}
+
+export const setup = {
+	status: () => request<SetupStatus>('/api/setup/status'),
+	checkDocker: () => request<DockerStatus>('/api/setup/check-docker'),
+	systemInfo: () => request<SystemInfo>('/api/setup/system-info'),
+	checkOllama: () => request<OllamaInfo>('/api/setup/check-ollama'),
+	recommendModel: () => request<ModelRecommendation>('/api/setup/recommend-model'),
+	validateKey: (provider: string, apiKey: string, baseUrl?: string) =>
+		request<{ valid: boolean; error?: string }>('/api/setup/validate-key', {
+			method: 'POST',
+			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
+		}),
+	presets: () => request<AgentPreset[]>('/api/setup/presets'),
+	complete: (data: {
+		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string };
+		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
+		mcp_servers?: Record<string, unknown>;
+	}) =>
+		request<{ success: boolean; config_path: string }>('/api/setup/complete', {
+			method: 'POST',
+			body: JSON.stringify(data)
+		})
 };

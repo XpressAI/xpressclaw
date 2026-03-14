@@ -1,7 +1,11 @@
+use std::convert::Infallible;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -50,6 +54,7 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_conversation),
         )
         .route("/{id}/messages", get(get_messages).post(send_message))
+        .route("/{id}/messages/stream", axum::routing::post(stream_message))
         .route(
             "/{id}/participants",
             get(get_participants).post(add_participant),
@@ -265,6 +270,204 @@ async fn send_message(
     Ok((StatusCode::CREATED, Json(json!(messages))))
 }
 
+/// Streaming version of send_message. Returns SSE events:
+/// - `user_message`: the stored user message
+/// - `thinking`: agent is about to generate a response
+/// - `chunk`: a token chunk from the agent
+/// - `agent_message`: the final stored agent message
+/// - `done`: all agents have responded
+/// - `error`: an error occurred
+async fn stream_message(
+    State(state): State<AppState>,
+    Path(conv_id): Path<String>,
+    Json(req): Json<SendMessageInput>,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<Value>),
+> {
+    let mgr = ConversationManager::new(state.db.clone());
+
+    // Store user message
+    let user_msg = mgr
+        .send_message(
+            &conv_id,
+            &SendMessage {
+                sender_type: "user".into(),
+                sender_id: "local".into(),
+                sender_name: req.sender_name.clone(),
+                content: req.content.clone(),
+                message_type: None,
+            },
+        )
+        .map_err(internal_error)?;
+
+    // Resolve which agents should respond
+    let target_agents = mgr
+        .resolve_target_agents(&conv_id, &req.content)
+        .map_err(internal_error)?;
+
+    let llm_router = state.llm_router.clone();
+    let db = state.db.clone();
+
+    let stream = async_stream::stream! {
+        // Send user message event
+        if let Ok(evt) = Event::default().event("user_message").json_data(&json!(user_msg)) {
+            yield Ok(evt);
+        }
+
+        let Some(llm_router) = llm_router else {
+            if let Ok(evt) = Event::default().event("error").json_data(&json!({"error": "LLM router not configured"})) {
+                yield Ok(evt);
+            }
+            if let Ok(evt) = Event::default().event("done").json_data(&json!({})) {
+                yield Ok(evt);
+            }
+            return;
+        };
+
+        let registry = AgentRegistry::new(db.clone());
+        let mgr = ConversationManager::new(db.clone());
+
+        for agent_id in &target_agents {
+            let agent = match registry.get(agent_id) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            let model = agent.config["model"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    llm_router
+                        .models()
+                        .first()
+                        .map(|m| m.id.clone())
+                        .unwrap_or_else(|| "local".to_string())
+                });
+
+            let role = agent.config["role"]
+                .as_str()
+                .unwrap_or("You are a helpful AI assistant.");
+
+            let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
+
+            let mut llm_messages = vec![ChatMessage {
+                role: "system".into(),
+                content: role.to_string(),
+            }];
+
+            for m in &history {
+                let r = match m.sender_type.as_str() {
+                    "agent" => "assistant",
+                    _ => "user",
+                };
+                llm_messages.push(ChatMessage {
+                    role: r.to_string(),
+                    content: m.content.clone(),
+                });
+            }
+
+            let llm_req = ChatCompletionRequest {
+                model,
+                messages: llm_messages,
+                temperature: Some(0.7),
+                max_tokens: Some(4096),
+                stream: Some(true),
+                top_p: None,
+                stop: None,
+            };
+
+            // Send "thinking" event
+            if let Ok(evt) = Event::default().event("thinking").json_data(&json!({
+                "agent_id": agent_id
+            })) {
+                yield Ok(evt);
+            }
+
+            match llm_router.chat_stream(&llm_req).await {
+                Ok(mut chunk_stream) => {
+                    let mut full_content = String::new();
+
+                    while let Some(result) = chunk_stream.next().await {
+                        match result {
+                            Ok(chunk) => {
+                                if let Some(choice) = chunk.choices.first() {
+                                    if let Some(ref text) = choice.delta.content {
+                                        full_content.push_str(text);
+                                        if let Ok(evt) = Event::default().event("chunk").json_data(&json!({
+                                            "agent_id": agent_id,
+                                            "content": text
+                                        })) {
+                                            yield Ok(evt);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Ok(evt) = Event::default().event("error").json_data(&json!({
+                                    "agent_id": agent_id,
+                                    "error": e.to_string()
+                                })) {
+                                    yield Ok(evt);
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    // Store the completed message
+                    if !full_content.is_empty() {
+                        if let Ok(agent_msg) = mgr.send_message(
+                            &conv_id,
+                            &SendMessage {
+                                sender_type: "agent".into(),
+                                sender_id: agent_id.clone(),
+                                sender_name: Some(agent_id.clone()),
+                                content: full_content,
+                                message_type: None,
+                            },
+                        ) {
+                            if let Ok(evt) = Event::default().event("agent_message").json_data(&json!(agent_msg)) {
+                                yield Ok(evt);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Store error and send event
+                    let _ = mgr.send_message(
+                        &conv_id,
+                        &SendMessage {
+                            sender_type: "agent".into(),
+                            sender_id: agent_id.clone(),
+                            sender_name: Some(agent_id.clone()),
+                            content: format!("*Error: {e}*"),
+                            message_type: Some("system".into()),
+                        },
+                    );
+                    if let Ok(evt) = Event::default().event("error").json_data(&json!({
+                        "agent_id": agent_id,
+                        "error": e.to_string()
+                    })) {
+                        yield Ok(evt);
+                    }
+                }
+            }
+        }
+
+        // Done
+        if let Ok(evt) = Event::default().event("done").json_data(&json!({})) {
+            yield Ok(evt);
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
+}
+
 async fn get_participants(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -343,6 +546,8 @@ mod tests {
             config,
             db,
             llm_router: None,
+            config_path: std::path::PathBuf::from("test.yaml"),
+            setup_complete: true,
         };
 
         Router::new()
