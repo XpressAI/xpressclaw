@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { setup } from '$lib/api';
+	import { setup, agents as agentsApi } from '$lib/api';
 	import type {
 		DockerStatus,
 		SystemInfo,
@@ -61,6 +61,20 @@
 	let downloading = $state(false);
 	let downloadProgress = $state<DownloadStatus | null>(null);
 	let downloadPollTimer: ReturnType<typeof setInterval> | null = null;
+	let startingAgents = $state(false);
+
+	async function autoStartAgents() {
+		try {
+			startingAgents = true;
+			const allAgents = await agentsApi.list();
+			for (const agent of allAgents) {
+				if (agent.status !== 'running') {
+					await agentsApi.start(agent.id).catch(() => {});
+				}
+			}
+		} catch { /* ignore */ }
+		startingAgents = false;
+	}
 
 	const presetIcons: Record<string, string> = {
 		brain: '&#x1f9e0;',
@@ -197,6 +211,7 @@
 				if (downloadProgress.status === 'Complete') {
 					stopDownloadPolling();
 					downloading = false;
+					autoStartAgents();
 				} else if (downloadProgress.status === 'Error') {
 					stopDownloadPolling();
 					downloading = false;
@@ -246,6 +261,7 @@
 				startDownloadPolling();
 			} else {
 				step = 4;
+				autoStartAgents();
 			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
@@ -773,7 +789,11 @@
 				</div>
 				<h2 class="text-lg font-semibold text-foreground mb-2">Setup Complete!</h2>
 				<p class="text-sm text-muted-foreground mb-6">
-					Your configuration has been saved and applied. You're ready to go!
+					{#if startingAgents}
+						Starting agents...
+					{:else}
+						Your configuration has been saved and agents are running. You're ready to go!
+					{/if}
 				</p>
 
 				<button
