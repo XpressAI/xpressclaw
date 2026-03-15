@@ -66,18 +66,13 @@ fn main() {
                 .path()
                 .resource_dir()
                 .ok()
-                .map(|d| d.join("binaries").join("xpressclaw"))
+                .map(|d| d.join("binaries").join(sidecar_binary_name()))
                 .filter(|p| p.exists())
                 .or_else(|| {
                     // Dev mode: look in the binaries/ directory next to the Tauri manifest
-                    let target_triple = if cfg!(target_arch = "x86_64") {
-                        "x86_64-apple-darwin"
-                    } else {
-                        "aarch64-apple-darwin"
-                    };
                     let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("binaries")
-                        .join(format!("xpressclaw-{target_triple}"));
+                        .join(sidecar_binary_name());
                     if dev_path.exists() {
                         Some(dev_path)
                     } else {
@@ -88,22 +83,36 @@ fn main() {
 
             info!(path = %sidecar_path.display(), "launching sidecar");
 
-            // Spawn with a clean environment to avoid inheriting Metal/GPU state
-            // from the Tauri process that can cause segfaults in the child.
-            let child = std::process::Command::new(&sidecar_path)
-                .args(["up", "--port", &port.to_string(), "--workdir", &workdir])
-                .env_clear()
-                .env("HOME", std::env::var("HOME").unwrap_or_default())
-                .env("PATH", std::env::var("PATH").unwrap_or_default())
-                .env("USER", std::env::var("USER").unwrap_or_default())
-                .env(
+            // Spawn the sidecar process
+            let mut cmd = std::process::Command::new(&sidecar_path);
+            cmd.args(["up", "--port", &port.to_string(), "--workdir", &workdir])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            // On macOS, clear environment to avoid inheriting state that can
+            // cause issues in the child process, then re-add essentials.
+            #[cfg(target_os = "macos")]
+            {
+                cmd.env_clear()
+                    .env("HOME", std::env::var("HOME").unwrap_or_default())
+                    .env("PATH", std::env::var("PATH").unwrap_or_default())
+                    .env("USER", std::env::var("USER").unwrap_or_default())
+                    .env(
+                        "RUST_LOG",
+                        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                    );
+            }
+
+            // On Windows/Linux, inherit environment normally
+            #[cfg(not(target_os = "macos"))]
+            {
+                cmd.env(
                     "RUST_LOG",
                     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-                )
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("failed to spawn sidecar");
+                );
+            }
+
+            let child = cmd.spawn().expect("failed to spawn sidecar");
 
             info!(pid = child.id(), "sidecar spawned");
 
@@ -146,6 +155,16 @@ fn main() {
                 }
             }
         });
+}
+
+/// Return the platform-specific sidecar binary name.
+fn sidecar_binary_name() -> String {
+    let triple = env!("TAURI_ENV_TARGET_TRIPLE");
+    if cfg!(target_os = "windows") {
+        format!("xpressclaw-{triple}.exe")
+    } else {
+        format!("xpressclaw-{triple}")
+    }
 }
 
 /// Poll the health endpoint until the server is ready.

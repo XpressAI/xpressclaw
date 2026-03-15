@@ -20,12 +20,18 @@ fn main() {
         .parent()
         .unwrap();
 
-    let dest = binaries_dir.join(format!("xpressclaw-{target_triple}"));
+    // Windows binaries have .exe extension
+    let exe_suffix = if target_triple.contains("windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let dest = binaries_dir.join(format!("xpressclaw-{target_triple}{exe_suffix}"));
 
     let src = workspace_root
         .join("target")
         .join(&profile)
-        .join("xpressclaw");
+        .join(format!("xpressclaw{exe_suffix}"));
 
     if src.exists() {
         std::fs::copy(&src, &dest).ok();
