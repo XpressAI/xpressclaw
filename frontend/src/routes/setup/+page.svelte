@@ -547,7 +547,7 @@
 							? 'border-primary bg-primary/10 text-primary'
 							: 'border-border hover:border-primary/40'}"
 					>
-						{preset.name} {added ? '&#10003;' : '+'}
+						{preset.name} {added ? '✓' : '+'}
 					</button>
 				{/each}
 			</div>
