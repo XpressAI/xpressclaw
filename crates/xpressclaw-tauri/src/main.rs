@@ -86,6 +86,20 @@ fn main() {
 
 async fn start_server(port: u16) -> anyhow::Result<()> {
     let state = build_state(port).await?;
+
+    // If setup is complete, load the LLM router in the background so the
+    // server starts immediately (model loading can take 20-30s for large models).
+    if state.is_setup_complete() && state.llm_router().is_none() {
+        let state_clone = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = state_clone.config();
+            info!("loading LLM router in background...");
+            let router = LlmRouter::build_from_config(&config.llm);
+            state_clone.apply_config(config, Some(Arc::new(router)));
+            info!("LLM router ready");
+        });
+    }
+
     info!(port, "starting embedded server");
     server::serve(state, port).await
 }
@@ -167,17 +181,10 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         }
     }
 
-    // Build LLM router
+    // LLM router is loaded in the background after server starts
+    // to avoid blocking the UI for 20-30s during model loading.
     let config = Arc::new(config);
-    let llm_router = LlmRouter::build_from_config(&config.llm);
-
     let _ = port;
 
-    Ok(AppState::new(
-        config,
-        db,
-        Some(Arc::new(llm_router)),
-        config_path,
-        true,
-    ))
+    Ok(AppState::new(config, db, None, config_path, true))
 }

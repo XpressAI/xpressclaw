@@ -376,18 +376,13 @@
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F4BB;</div>
 					<div class="flex-1">
-						<div class="text-sm font-medium text-foreground">Local Model</div>
+						<div class="text-sm font-medium text-foreground">Local</div>
 						<div class="text-xs text-muted-foreground">
-							Run models locally. Free and private.
+							Runs a model directly inside xpressclaw. Free and private.
 							{#if modelRec}
 								Recommended: {modelRec.model}
 							{/if}
 						</div>
-						{#if ollamaInfo?.available && ollamaInfo.models.length > 0}
-							<div class="mt-1 text-xs text-emerald-500">
-								Ollama detected &mdash; {ollamaInfo.models.length} model{ollamaInfo.models.length === 1 ? '' : 's'} installed
-							</div>
-						{/if}
 					</div>
 				</button>
 
@@ -419,28 +414,13 @@
 				<div class="space-y-3 rounded-lg border border-border p-4">
 					<div>
 						<label for="local-model" class="block text-xs font-medium text-foreground mb-1">Model</label>
-						{#if ollamaInfo?.available && ollamaInfo.models.length > 0}
-							<select
-								id="local-model"
-								bind:value={llmLocalModel}
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-							>
-								{#each ollamaInfo.models as m}
-									<option value={m.name}>{m.name}</option>
-								{/each}
-								{#if modelRec && !ollamaInfo.models.find(m => m.name === modelRec?.model)}
-									<option value={modelRec.model}>{modelRec.model} (will download)</option>
-								{/if}
-							</select>
-						{:else}
-							<input
-								id="local-model"
-								type="text"
-								bind:value={llmLocalModel}
-								placeholder="qwen3.5:8b"
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-							/>
-						{/if}
+						<input
+							id="local-model"
+							type="text"
+							bind:value={llmLocalModel}
+							placeholder="qwen3.5:9b"
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+						/>
 					</div>
 					{#if modelRec}
 						<p class="text-xs text-muted-foreground">{modelRec.reason}</p>
@@ -468,7 +448,7 @@
 					{/if}
 					<div>
 						<label for="local-url" class="block text-xs font-medium text-foreground mb-1">
-							Server URL <span class="text-muted-foreground font-normal">(optional)</span>
+							Remote server <span class="text-muted-foreground font-normal">(optional)</span>
 						</label>
 						<input
 							id="local-url"
@@ -478,7 +458,7 @@
 							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 						/>
 						<p class="mt-1 text-xs text-muted-foreground">
-							Ollama, llama.cpp, vLLM, or any OpenAI-compatible server. Defaults to Ollama.
+							Leave empty to run the model inside xpressclaw. Set a URL to use an external server (Ollama, vLLM, or any OpenAI-compatible endpoint).
 						</p>
 					</div>
 				</div>
