@@ -43,13 +43,37 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
             "has_anthropic_key": config.llm.anthropic_api_key.is_some(),
             "local_model": config.llm.local_model,
         },
-        "agents": config.agents.iter().map(|a| json!({
-            "name": a.name,
-            "backend": a.backend,
-            "role": a.role,
-            "model": a.model,
-            "tools": a.tools,
-        })).collect::<Vec<_>>(),
+        "agents": config.agents.iter().map(|a| {
+            let mut agent = json!({
+                "name": a.name,
+                "backend": a.backend,
+                "role": a.role,
+                "model": a.model,
+                "tools": a.tools,
+                "volumes": a.volumes,
+            });
+            if let Some(ref budget) = a.budget {
+                agent["budget"] = json!({
+                    "daily": budget.daily,
+                    "monthly": budget.monthly,
+                    "on_exceeded": budget.on_exceeded,
+                });
+            }
+            if let Some(ref rl) = a.rate_limit {
+                agent["rate_limit"] = json!({
+                    "requests_per_minute": rl.requests_per_minute,
+                    "tokens_per_minute": rl.tokens_per_minute,
+                    "concurrent_requests": rl.concurrent_requests,
+                });
+            }
+            if !a.wake_on.is_empty() {
+                agent["wake_on"] = json!(a.wake_on.iter().map(|w| json!({
+                    "schedule": w.schedule,
+                    "event": w.event,
+                })).collect::<Vec<_>>());
+            }
+            agent
+        }).collect::<Vec<_>>(),
         "system": {
             "budget": {
                 "daily": config.system.budget.daily,

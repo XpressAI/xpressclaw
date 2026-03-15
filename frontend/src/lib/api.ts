@@ -452,7 +452,17 @@ export interface LiveConfig {
 		has_anthropic_key: boolean;
 		local_model: string | null;
 	};
-	agents: { name: string; backend: string; role: string; model: string | null; tools: string[] }[];
+	agents: {
+		name: string;
+		backend: string;
+		role: string;
+		model: string | null;
+		tools: string[];
+		volumes: string[];
+		budget?: { daily: string | null; monthly: string | null; on_exceeded: string };
+		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };
+		wake_on?: { schedule: string | null; event: string | null }[];
+	}[];
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
 	mcp_servers: string[];
 }
