@@ -2,7 +2,11 @@ name: Build & Push Harness Images
 
 on:
   push:
-    branches: [rust-rewrite, main]
+    branches: [main]
+    paths:
+      - 'harnesses/**'
+  pull_request:
+    branches: [main]
     paths:
       - 'harnesses/**'
   workflow_dispatch:
@@ -22,6 +26,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
+        if: github.event_name == 'push'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -30,7 +35,8 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/base
-          push: true
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -50,15 +56,24 @@ jobs:
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
+        if: github.event_name == 'push'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build the base image locally so child images can resolve FROM
+      - uses: docker/build-push-action@v6
+        with:
+          context: harnesses/base
+          load: true
+          tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
+          cache-from: type=gha
+
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/${{ matrix.harness }}
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-${{ matrix.harness }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
