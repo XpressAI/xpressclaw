@@ -40,10 +40,13 @@
 	let newMcpArgs = $state('');
 
 	const mcpPresets = [
-		{ name: 'GitHub', id: 'github', command: 'npx', args: '-y @modelcontextprotocol/server-github', envKey: 'GITHUB_PERSONAL_ACCESS_TOKEN' },
+		{ name: 'Shell', id: 'shell', command: 'npx', args: '-y @mako10k/mcp-shell-server', envKey: '' },
 		{ name: 'Filesystem', id: 'filesystem', command: 'npx', args: '-y @modelcontextprotocol/server-filesystem /workspace', envKey: '' },
+		{ name: 'Git', id: 'git', command: 'npx', args: '-y @modelcontextprotocol/server-git', envKey: '' },
+		{ name: 'GitHub', id: 'github', command: 'npx', args: '-y @modelcontextprotocol/server-github', envKey: 'GITHUB_PERSONAL_ACCESS_TOKEN' },
 		{ name: 'Brave Search', id: 'brave-search', command: 'npx', args: '-y @modelcontextprotocol/server-brave-search', envKey: 'BRAVE_API_KEY' },
 		{ name: 'Slack', id: 'slack', command: 'npx', args: '-y @modelcontextprotocol/server-slack', envKey: 'SLACK_BOT_TOKEN' },
+		{ name: 'Fetch', id: 'fetch', command: 'npx', args: '-y @modelcontextprotocol/server-fetch', envKey: '' },
 	];
 
 	// -- Step 3: Agents --

@@ -33,7 +33,12 @@ fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let mut builder = tauri::Builder::default().plugin(tauri_plugin_shell::init());
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init());
 
     // Prevent multiple instances on desktop
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -89,9 +94,12 @@ async fn start_server(port: u16) -> anyhow::Result<()> {
 }
 
 async fn build_state(port: u16) -> anyhow::Result<AppState> {
-    let config_path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("xpressclaw.yaml");
+    // Use ~/.xpressclaw/xpressclaw.yaml — current_dir() is read-only in macOS .app bundles
+    let data_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .join(".xpressclaw");
+    std::fs::create_dir_all(&data_dir).ok();
+    let config_path = data_dir.join("xpressclaw.yaml");
 
     // Check if config exists — if not, start in setup mode
     if !config_path.exists() {
