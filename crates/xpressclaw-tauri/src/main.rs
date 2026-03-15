@@ -7,7 +7,7 @@ mod tray;
 use std::sync::Mutex;
 
 use tauri::Manager;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8935;

@@ -20,14 +20,19 @@ fn main() {
         .parent()
         .unwrap();
 
+    let dest = binaries_dir.join(format!("xpressclaw-{target_triple}"));
+
     let src = workspace_root
         .join("target")
         .join(&profile)
         .join("xpressclaw");
-    let dest = binaries_dir.join(format!("xpressclaw-{target_triple}"));
 
     if src.exists() {
         std::fs::copy(&src, &dest).ok();
+    } else if !dest.exists() {
+        // Create a placeholder so tauri_build doesn't fail during CI/clippy.
+        // The real binary must be built before running the app.
+        std::fs::write(&dest, "placeholder").ok();
     }
 
     tauri_build::build()
