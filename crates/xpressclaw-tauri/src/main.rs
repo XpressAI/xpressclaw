@@ -110,6 +110,9 @@ fn main() {
                 wait_for_server(port).await;
                 info!("server is ready");
                 if let Some(window) = handle.get_webview_window("main") {
+                    // Reload — the webview tried loading before the server was ready
+                    let url = format!("http://localhost:{port}");
+                    let _ = window.navigate(url.parse().unwrap());
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
