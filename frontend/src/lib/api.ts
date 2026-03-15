@@ -481,7 +481,7 @@ export const setup = {
 		}),
 	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
-		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string };
+		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
 		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 	}) =>

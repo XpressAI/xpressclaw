@@ -12,7 +12,7 @@ use xpressclaw_core::agents::presets::PRESETS;
 use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::config::{AgentConfig, Config, LlmConfig, McpServerConfig};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
-use xpressclaw_core::llm::local::{detect_ollama, LocalProvider};
+use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::system;
@@ -42,6 +42,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
             "openai_base_url": config.llm.openai_base_url,
             "has_anthropic_key": config.llm.anthropic_api_key.is_some(),
             "local_model": config.llm.local_model,
+            "local_base_url": config.llm.local_base_url,
         },
         "agents": config.agents.iter().map(|a| {
             let mut agent = json!({
@@ -171,6 +172,11 @@ struct LlmSetup {
     api_key: Option<String>,
     base_url: Option<String>,
     local_model: Option<String>,
+    local_base_url: Option<String>,
+    /// If true, download the GGUF model and use embedded llama.cpp.
+    /// Set when Ollama is not available.
+    #[serde(default)]
+    use_embedded: bool,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +193,40 @@ async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
+
+    // If using embedded llama.cpp (no Ollama), download the GGUF model
+    let local_model_path = if is_local && req.llm.use_embedded {
+        #[cfg(feature = "local-llm")]
+        {
+            let model_name = req
+                .llm
+                .local_model
+                .as_deref()
+                .unwrap_or(xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_FILE);
+
+            // Map model display names to HuggingFace repo/file
+            let (repo, filename) = resolve_gguf_source(model_name);
+            info!(
+                repo = repo,
+                file = filename,
+                "downloading GGUF model for embedded llama.cpp"
+            );
+
+            let path = xpressclaw_core::llm::llamacpp::download_gguf(repo, filename)
+                .map_err(internal_error)?;
+
+            Some(path.to_string_lossy().to_string())
+        }
+        #[cfg(not(feature = "local-llm"))]
+        {
+            warn!("local-llm feature not enabled, skipping GGUF download");
+            None
+        }
+    } else {
+        None
+    };
+
     let llm = LlmConfig {
         default_provider: req.llm.provider.clone(),
         openai_api_key: if req.llm.provider == "openai" {
@@ -204,11 +244,17 @@ async fn complete_setup(
         } else {
             None
         },
-        local_model: if req.llm.provider == "local" || req.llm.provider == "ollama" {
+        local_model: if is_local {
             req.llm
                 .local_model
                 .clone()
                 .or(Some("qwen3.5:latest".into()))
+        } else {
+            None
+        },
+        local_model_path: local_model_path,
+        local_base_url: if is_local {
+            req.llm.local_base_url.clone()
         } else {
             None
         },
@@ -299,27 +345,7 @@ async fn complete_setup(
     }
 
     // Build LLM router from the new config
-    let llm_router = {
-        let mut router = LlmRouter::new(&config.llm);
-
-        if let Some(ref key) = config.llm.openai_api_key {
-            let provider =
-                OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
-            router.register_provider("openai", Arc::new(provider));
-        }
-
-        if let Some(ref key) = config.llm.anthropic_api_key {
-            let provider = AnthropicProvider::new(key.clone());
-            router.register_provider("anthropic", Arc::new(provider));
-        }
-
-        if let Some(ref model) = config.llm.local_model {
-            let provider = LocalProvider::ollama(model.clone());
-            router.register_provider("local", Arc::new(provider));
-        }
-
-        router
-    };
+    let llm_router = LlmRouter::build_from_config(&config.llm);
 
     // Swap the live state so all handlers see the new config
     state.apply_config(config, Some(Arc::new(llm_router)));
@@ -329,6 +355,44 @@ async fn complete_setup(
         "success": true,
         "config_path": state.config_path.display().to_string()
     })))
+}
+
+/// Map a model name from the setup UI to a HuggingFace GGUF repo and filename.
+///
+/// The setup wizard shows model names like "qwen3.5:4b" (Ollama-style).
+/// This maps them to the corresponding HuggingFace GGUF repo/file.
+///
+/// Available Qwen3.5 models:
+/// - Dense: 0.8B, 4B, 9B, 27B
+/// - MoE: 35B-A3B, 122B-A10B, 397B-A17B
+#[cfg(feature = "local-llm")]
+fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
+    match model_name {
+        // Dense models
+        s if s.contains("0.8") => {
+            ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
+        }
+        s if s.contains("4b") => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+        s if s.contains("9b") => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-UD-Q4_K_XL.gguf"),
+        s if s.contains("27b") => ("unsloth/Qwen3.5-27B-GGUF", "Qwen3.5-27B-UD-Q4_K_XL.gguf"),
+        // MoE models (user must explicitly select)
+        s if s.contains("35b") || s.contains("a3b") => {
+            ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf")
+        }
+        s if s.contains("122b") || s.contains("a10b") => {
+            ("unsloth/Qwen3.5-122B-A10B-GGUF", "Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf")
+        }
+        s if s.contains("397b") || s.contains("a17b") => {
+            ("unsloth/Qwen3.5-397B-A17B-GGUF", "Qwen3.5-397B-A17B-UD-Q4_K_XL.gguf")
+        }
+        // If it's already a .gguf filename, use the default repo
+        s if s.ends_with(".gguf") => (
+            xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_REPO,
+            model_name,
+        ),
+        // Default: 4B is the safe default for most systems
+        _ => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+    }
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

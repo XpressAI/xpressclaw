@@ -26,7 +26,7 @@ pub fn routes() -> Router<AppState> {
 async fn budget_summary(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(state.db.clone(), state.config().system.budget.clone());
+    let mgr = BudgetManager::new(state.db.clone(), state.config());
     let summary = mgr.get_summary(None).map_err(internal_error)?;
 
     // Per-agent breakdown
@@ -60,7 +60,7 @@ async fn agent_budget(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(state.db.clone(), state.config().system.budget.clone());
+    let mgr = BudgetManager::new(state.db.clone(), state.config());
     let summary = mgr.get_summary(Some(&agent_id)).map_err(internal_error)?;
     Ok(Json(json!(summary)))
 }
@@ -150,7 +150,7 @@ mod tests {
             .record("atlas", "claude-sonnet-4.5", 1000, 500, "chat", None)
             .unwrap();
 
-        let mgr = BudgetManager::new(db, Default::default());
+        let mgr = BudgetManager::new(db, Arc::new(Config::load_default().unwrap()));
         mgr.update_spending("atlas", 0.01).unwrap();
 
         let resp = app

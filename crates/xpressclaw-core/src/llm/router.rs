@@ -151,6 +151,76 @@ impl LlmRouter {
         }
     }
 
+    /// Build a fully configured LLM router from config.
+    ///
+    /// Registers all providers based on config:
+    /// - OpenAI if API key is set
+    /// - Anthropic if API key is set
+    /// - Local model: uses embedded llama.cpp (LlamaCppProvider) if `local_model_path`
+    ///   is set, otherwise falls back to HTTP proxy (LocalProvider for Ollama/vLLM/etc.)
+    pub fn build_from_config(config: &LlmConfig) -> Self {
+        let mut router = Self::new(config);
+
+        if let Some(ref key) = config.openai_api_key {
+            let provider = super::openai::OpenAiProvider::new(
+                Some(key.clone()),
+                config.openai_base_url.clone(),
+            );
+            router.register_provider("openai", Arc::new(provider));
+        }
+
+        if let Some(ref key) = config.anthropic_api_key {
+            let provider = super::anthropic::AnthropicProvider::new(key.clone());
+            router.register_provider("anthropic", Arc::new(provider));
+        }
+
+        // Local model: prefer embedded llama.cpp, fall back to HTTP proxy
+        if let Some(ref path) = config.local_model_path {
+            #[cfg(feature = "local-llm")]
+            {
+                let model_name = config
+                    .local_model
+                    .clone()
+                    .unwrap_or_else(|| "local".to_string());
+                match super::llamacpp::LlamaCppProvider::from_path(path, model_name) {
+                    Ok(provider) => {
+                        tracing::info!(path = %path, "using embedded llama.cpp provider");
+                        router.register_provider("local", Arc::new(provider));
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to load GGUF model, falling back to HTTP proxy");
+                        if let Some(ref model) = config.local_model {
+                            let provider = super::local::LocalProvider::from_config(
+                                model.clone(),
+                                config.local_base_url.clone(),
+                            );
+                            router.register_provider("local", Arc::new(provider));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(feature = "local-llm"))]
+            {
+                tracing::warn!("local-llm feature not enabled, using HTTP proxy for local model");
+                if let Some(ref model) = config.local_model {
+                    let provider = super::local::LocalProvider::from_config(
+                        model.clone(),
+                        config.local_base_url.clone(),
+                    );
+                    router.register_provider("local", Arc::new(provider));
+                }
+            }
+        } else if let Some(ref model) = config.local_model {
+            let provider = super::local::LocalProvider::from_config(
+                model.clone(),
+                config.local_base_url.clone(),
+            );
+            router.register_provider("local", Arc::new(provider));
+        }
+
+        router
+    }
+
     pub fn register_provider(&mut self, name: &str, provider: Arc<dyn LlmProvider>) {
         self.providers.insert(name.to_string(), provider);
     }

@@ -26,6 +26,7 @@
 	let llmApiKey = $state('');
 	let llmBaseUrl = $state('');
 	let llmLocalModel = $state('');
+	let llmLocalBaseUrl = $state('');
 	let keyValidating = $state(false);
 	let keyValid = $state<boolean | null>(null);
 	let keyError = $state('');
@@ -187,12 +188,17 @@
 				tools: undefined
 			}));
 
+			const isLocal = llmProvider === 'local' || llmProvider === 'ollama';
+			const useEmbedded = isLocal && (!ollamaInfo?.available || !llmLocalBaseUrl);
+
 			await setup.complete({
 				llm: {
 					provider: llmProvider,
 					api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
 					base_url: llmProvider === 'openai' && llmBaseUrl ? llmBaseUrl : undefined,
-					local_model: (llmProvider === 'local' || llmProvider === 'ollama') ? llmLocalModel : undefined
+					local_model: isLocal ? llmLocalModel : undefined,
+					local_base_url: isLocal && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
+					use_embedded: useEmbedded
 				},
 				agents: agentList,
 				mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined
@@ -328,21 +334,16 @@
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F4BB;</div>
 					<div class="flex-1">
-						<div class="text-sm font-medium text-foreground">Local Model (Ollama)</div>
+						<div class="text-sm font-medium text-foreground">Local Model</div>
 						<div class="text-xs text-muted-foreground">
 							Run models locally. Free and private.
 							{#if modelRec}
 								Recommended: {modelRec.model}
 							{/if}
 						</div>
-						{#if ollamaInfo && !ollamaInfo.available}
-							<div class="mt-1 text-xs text-amber-500">
-								Ollama is not running.
-								<a href="https://ollama.ai" target="_blank" rel="noopener noreferrer" class="underline">Install Ollama</a>
-							</div>
-						{:else if ollamaInfo && ollamaInfo.models.length > 0}
+						{#if ollamaInfo?.available && ollamaInfo.models.length > 0}
 							<div class="mt-1 text-xs text-emerald-500">
-								{ollamaInfo.models.length} model{ollamaInfo.models.length === 1 ? '' : 's'} installed
+								Ollama detected &mdash; {ollamaInfo.models.length} model{ollamaInfo.models.length === 1 ? '' : 's'} installed
 							</div>
 						{/if}
 					</div>
@@ -423,6 +424,21 @@
 							</div>
 						</div>
 					{/if}
+					<div>
+						<label for="local-url" class="block text-xs font-medium text-foreground mb-1">
+							Server URL <span class="text-muted-foreground font-normal">(optional)</span>
+						</label>
+						<input
+							id="local-url"
+							type="text"
+							bind:value={llmLocalBaseUrl}
+							placeholder="http://localhost:11434"
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+						/>
+						<p class="mt-1 text-xs text-muted-foreground">
+							Ollama, llama.cpp, vLLM, or any OpenAI-compatible server. Defaults to Ollama.
+						</p>
+					</div>
 				</div>
 			{:else if llmProvider === 'openai'}
 				<div class="space-y-3 rounded-lg border border-border p-4">

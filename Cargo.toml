@@ -74,3 +74,8 @@ async-trait = "0.1"
 
 # Futures utilities
 futures-util = "0.3"
+
+# Local LLM (llama.cpp)
+llama-cpp-2 = { version = "0.1", default-features = false }
+hf-hub = "0.5"
+encoding_rs = "0.8"

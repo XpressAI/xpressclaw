@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::config::{BudgetConfig, OnExceeded};
+use crate::config::{BudgetConfig, Config, OnExceeded};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
@@ -31,15 +31,35 @@ pub struct BudgetSummary {
     pub request_count: i64,
 }
 
-/// Budget enforcement and policies.
+/// Budget enforcement with per-agent inheritance from system defaults.
+///
+/// Each agent can have its own budget config. If not set, the system-wide
+/// budget config is used as the default. This means you only need to
+/// configure budgets on agents that differ from the system default.
 pub struct BudgetManager {
     db: Arc<Database>,
-    config: BudgetConfig,
+    config: Arc<Config>,
 }
 
 impl BudgetManager {
-    pub fn new(db: Arc<Database>, config: BudgetConfig) -> Self {
+    pub fn new(db: Arc<Database>, config: Arc<Config>) -> Self {
         Self { db, config }
+    }
+
+    /// Resolve the effective budget config for an agent.
+    /// Agent-specific budget overrides system defaults.
+    pub fn effective_budget(&self, agent_id: &str) -> &BudgetConfig {
+        self.config
+            .agents
+            .iter()
+            .find(|a| a.name == agent_id)
+            .and_then(|a| a.budget.as_ref())
+            .unwrap_or(&self.config.system.budget)
+    }
+
+    /// Get the system-wide budget config (used for global summaries).
+    pub fn system_budget(&self) -> &BudgetConfig {
+        &self.config.system.budget
     }
 
     pub fn get_state(&self, agent_id: &str) -> Result<BudgetState> {
@@ -98,8 +118,11 @@ impl BudgetManager {
         Ok(state)
     }
 
+    /// Check if an agent is within budget. Uses the agent's effective budget
+    /// (per-agent override or system default).
     pub fn check_budget(&self, agent_id: &str) -> Result<bool> {
         let state = self.get_state(agent_id)?;
+        let budget = self.effective_budget(agent_id);
 
         if state.is_paused {
             return Err(Error::Budget(format!(
@@ -109,9 +132,9 @@ impl BudgetManager {
             )));
         }
 
-        if let Some(daily_limit) = self.config.daily_amount() {
+        if let Some(daily_limit) = budget.daily_amount() {
             if state.daily_spent >= daily_limit {
-                if self.config.on_exceeded == OnExceeded::Stop {
+                if budget.on_exceeded == OnExceeded::Stop {
                     return Err(Error::Budget(format!(
                         "Daily budget exceeded: ${:.2} >= ${:.2}",
                         state.daily_spent, daily_limit
@@ -121,9 +144,9 @@ impl BudgetManager {
             }
         }
 
-        if let Some(monthly_limit) = self.config.monthly_amount() {
+        if let Some(monthly_limit) = budget.monthly_amount() {
             if state.monthly_spent >= monthly_limit {
-                if self.config.on_exceeded == OnExceeded::Stop {
+                if budget.on_exceeded == OnExceeded::Stop {
                     return Err(Error::Budget(format!(
                         "Monthly budget exceeded: ${:.2} >= ${:.2}",
                         state.monthly_spent, monthly_limit
@@ -137,17 +160,18 @@ impl BudgetManager {
     }
 
     fn check_limits(&self, agent_id: &str, state: &BudgetState) -> Result<()> {
+        let budget = self.effective_budget(agent_id);
         let mut exceeded = false;
         let mut reason = None;
 
-        if let Some(daily_limit) = self.config.daily_amount() {
+        if let Some(daily_limit) = budget.daily_amount() {
             if state.daily_spent >= daily_limit {
                 exceeded = true;
                 reason = Some(format!("Daily limit ${:.2} exceeded", daily_limit));
             }
         }
 
-        if let Some(monthly_limit) = self.config.monthly_amount() {
+        if let Some(monthly_limit) = budget.monthly_amount() {
             if state.monthly_spent >= monthly_limit {
                 exceeded = true;
                 reason = Some(format!("Monthly limit ${:.2} exceeded", monthly_limit));
@@ -155,14 +179,19 @@ impl BudgetManager {
         }
 
         if exceeded {
-            self.handle_exceeded(agent_id, reason.as_deref())?;
+            self.handle_exceeded(agent_id, budget, reason.as_deref())?;
         }
 
         Ok(())
     }
 
-    fn handle_exceeded(&self, agent_id: &str, reason: Option<&str>) -> Result<()> {
-        match self.config.on_exceeded {
+    fn handle_exceeded(
+        &self,
+        agent_id: &str,
+        budget: &BudgetConfig,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        match budget.on_exceeded {
             OnExceeded::Pause => {
                 self.db.with_conn(|conn| {
                     conn.execute(
@@ -198,7 +227,14 @@ impl BudgetManager {
         Ok(())
     }
 
+    /// Get budget summary for an agent (or global if agent_id is None).
+    /// Limits are resolved from the agent's effective budget config.
     pub fn get_summary(&self, agent_id: Option<&str>) -> Result<BudgetSummary> {
+        let budget = match agent_id {
+            Some(aid) => self.effective_budget(aid),
+            None => self.system_budget(),
+        };
+
         let (spent_daily, spent_monthly, spent_total) = if let Some(aid) = agent_id {
             let state = self.get_state(aid)?;
             (state.daily_spent, state.monthly_spent, state.total_spent)
@@ -235,9 +271,9 @@ impl BudgetManager {
 
         Ok(BudgetSummary {
             daily_spent: spent_daily,
-            daily_limit: self.config.daily_amount(),
+            daily_limit: budget.daily_amount(),
             monthly_spent: spent_monthly,
-            monthly_limit: self.config.monthly_amount(),
+            monthly_limit: budget.monthly_amount(),
             total_spent: spent_total,
             input_tokens,
             output_tokens,
@@ -297,12 +333,10 @@ mod tests {
 
     fn setup() -> (Arc<Database>, BudgetManager) {
         let db = Arc::new(Database::open_memory().unwrap());
-        let config = BudgetConfig {
-            daily: Some("$10.00".to_string()),
-            monthly: Some("$100.00".to_string()),
-            ..Default::default()
-        };
-        let mgr = BudgetManager::new(db.clone(), config);
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$10.00".to_string());
+        config.system.budget.monthly = Some("$100.00".to_string());
+        let mgr = BudgetManager::new(db.clone(), Arc::new(config));
         (db, mgr)
     }
 
@@ -383,14 +417,74 @@ mod tests {
     #[test]
     fn test_stop_policy() {
         let db = Arc::new(Database::open_memory().unwrap());
-        let config = BudgetConfig {
-            daily: Some("$10.00".to_string()),
-            on_exceeded: OnExceeded::Stop,
-            ..Default::default()
-        };
-        let mgr = BudgetManager::new(db, config);
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$10.00".to_string());
+        config.system.budget.on_exceeded = OnExceeded::Stop;
+        let mgr = BudgetManager::new(db, Arc::new(config));
 
         let result = mgr.update_spending("atlas", 11.0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_per_agent_budget_override() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        // System default: $10/day
+        config.system.budget.daily = Some("$10.00".to_string());
+        // Agent "atlas" override: $5/day
+        config.agents = vec![crate::config::AgentConfig {
+            name: "atlas".to_string(),
+            budget: Some(BudgetConfig {
+                daily: Some("$5.00".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mgr = BudgetManager::new(db, Arc::new(config));
+
+        // atlas has $5 limit
+        let budget = mgr.effective_budget("atlas");
+        assert!((budget.daily_amount().unwrap() - 5.0).abs() < 1e-10);
+
+        // unknown agent falls back to system $10
+        let budget = mgr.effective_budget("hermes");
+        assert!((budget.daily_amount().unwrap() - 10.0).abs() < 1e-10);
+
+        // atlas gets paused at $6 (over $5 limit)
+        mgr.update_spending("atlas", 6.0).unwrap();
+        let state = mgr.get_state("atlas").unwrap();
+        assert!(state.is_paused);
+
+        // hermes is fine at $6 (under $10 limit)
+        mgr.update_spending("hermes", 6.0).unwrap();
+        let state = mgr.get_state("hermes").unwrap();
+        assert!(!state.is_paused);
+    }
+
+    #[test]
+    fn test_per_agent_summary_shows_effective_limits() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$10.00".to_string());
+        config.agents = vec![crate::config::AgentConfig {
+            name: "atlas".to_string(),
+            budget: Some(BudgetConfig {
+                daily: Some("$5.00".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let mgr = BudgetManager::new(db, Arc::new(config));
+
+        mgr.update_spending("atlas", 2.0).unwrap();
+
+        // Agent summary shows agent's own limit
+        let summary = mgr.get_summary(Some("atlas")).unwrap();
+        assert!((summary.daily_limit.unwrap() - 5.0).abs() < 1e-10);
+
+        // Global summary shows system limit
+        let summary = mgr.get_summary(None).unwrap();
+        assert!((summary.daily_limit.unwrap() - 10.0).abs() < 1e-10);
     }
 }

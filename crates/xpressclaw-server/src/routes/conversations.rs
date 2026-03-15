@@ -10,6 +10,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
+use xpressclaw_core::budget::manager::BudgetManager;
+use xpressclaw_core::budget::rate_limiter::RateLimitResult;
+use xpressclaw_core::budget::tracker::CostTracker;
 use xpressclaw_core::conversations::{ConversationManager, CreateConversation, SendMessage};
 use xpressclaw_core::llm::router::{ChatCompletionRequest, ChatMessage};
 
@@ -175,8 +178,74 @@ async fn send_message(
 
     if let Some(llm_router) = state.llm_router() {
         let registry = AgentRegistry::new(state.db.clone());
+        let budget_mgr = BudgetManager::new(state.db.clone(), state.config());
+        let cost_tracker = CostTracker::new(state.db.clone());
+        let rate_limiter = state.rate_limiter();
 
         for agent_id in &target_agents {
+            // Check budget before calling LLM
+            match budget_mgr.check_budget(agent_id) {
+                Ok(false) => {
+                    let err_msg = mgr
+                        .send_message(
+                            &conv_id,
+                            &SendMessage {
+                                sender_type: "agent".into(),
+                                sender_id: agent_id.clone(),
+                                sender_name: Some(agent_id.clone()),
+                                content: format!(
+                                    "*Budget exceeded for agent {}. Message not sent.*",
+                                    agent_id
+                                ),
+                                message_type: Some("system".into()),
+                            },
+                        )
+                        .map_err(internal_error)?;
+                    messages.push(json!(err_msg));
+                    continue;
+                }
+                Err(e) => {
+                    let err_msg = mgr
+                        .send_message(
+                            &conv_id,
+                            &SendMessage {
+                                sender_type: "agent".into(),
+                                sender_id: agent_id.clone(),
+                                sender_name: Some(agent_id.clone()),
+                                content: format!("*{}*", e),
+                                message_type: Some("system".into()),
+                            },
+                        )
+                        .map_err(internal_error)?;
+                    messages.push(json!(err_msg));
+                    continue;
+                }
+                Ok(true) => {} // within budget
+            }
+
+            // Check rate limits
+            if let RateLimitResult::RequestsExceeded { limit, .. }
+            | RateLimitResult::TokensExceeded { limit, .. } = rate_limiter.check(agent_id)
+            {
+                let err_msg = mgr
+                    .send_message(
+                        &conv_id,
+                        &SendMessage {
+                            sender_type: "agent".into(),
+                            sender_id: agent_id.clone(),
+                            sender_name: Some(agent_id.clone()),
+                            content: format!(
+                                "*Rate limit reached for agent {} ({}/min). Please wait.*",
+                                agent_id, limit
+                            ),
+                            message_type: Some("system".into()),
+                        },
+                    )
+                    .map_err(internal_error)?;
+                messages.push(json!(err_msg));
+                continue;
+            }
+
             // Look up agent to get model config
             let agent = match registry.get(agent_id) {
                 Ok(a) => a,
@@ -187,7 +256,6 @@ async fn send_message(
                 .as_str()
                 .map(String::from)
                 .unwrap_or_else(|| {
-                    // Use first available model from router
                     llm_router
                         .models()
                         .first()
@@ -199,7 +267,6 @@ async fn send_message(
                 .as_str()
                 .unwrap_or("You are a helpful AI assistant.");
 
-            // Build context from recent conversation history
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
             let mut llm_messages = vec![ChatMessage {
@@ -212,7 +279,6 @@ async fn send_message(
                     "agent" => "assistant",
                     _ => "user",
                 };
-                // Skip the user message we just stored (it's already the last)
                 llm_messages.push(ChatMessage {
                     role: r.to_string(),
                     content: m.content.clone(),
@@ -220,7 +286,7 @@ async fn send_message(
             }
 
             let llm_req = ChatCompletionRequest {
-                model,
+                model: model.clone(),
                 messages: llm_messages,
                 temperature: Some(0.7),
                 max_tokens: Some(4096),
@@ -231,6 +297,27 @@ async fn send_message(
 
             match llm_router.chat(&llm_req).await {
                 Ok(resp) => {
+                    // Record usage and update budget
+                    if let Some(ref usage) = resp.usage {
+                        let _ = cost_tracker.record(
+                            agent_id,
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            "chat",
+                            Some(&conv_id),
+                        );
+                        let cost = cost_tracker.pricing().calculate(
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            0,
+                            0,
+                        );
+                        let _ = budget_mgr.update_spending(agent_id, cost);
+                        rate_limiter.record_request(agent_id, usage.total_tokens as u32);
+                    }
+
                     if let Some(choice) = resp.choices.first() {
                         let agent_msg = mgr
                             .send_message(
@@ -248,7 +335,6 @@ async fn send_message(
                     }
                 }
                 Err(e) => {
-                    // Store error as system message so user sees it
                     let err_msg = mgr
                         .send_message(
                             &conv_id,
@@ -305,6 +391,8 @@ async fn stream_message(
 
     let llm_router = state.llm_router();
     let db = state.db.clone();
+    let config = state.config();
+    let rate_limiter = state.rate_limiter();
 
     let stream = async_stream::stream! {
         // Send user message event
@@ -324,8 +412,56 @@ async fn stream_message(
 
         let registry = AgentRegistry::new(db.clone());
         let mgr = ConversationManager::new(db.clone());
+        let budget_mgr = BudgetManager::new(db.clone(), config);
+        let cost_tracker = CostTracker::new(db.clone());
 
         for agent_id in &target_agents {
+            // Check budget
+            match budget_mgr.check_budget(agent_id) {
+                Ok(false) => {
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
+                        "agent_id": agent_id,
+                        "error": format!("Budget exceeded for agent {}", agent_id)
+                    })) {
+                        yield Ok(evt);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
+                        "agent_id": agent_id,
+                        "error": e.to_string()
+                    })) {
+                        yield Ok(evt);
+                    }
+                    continue;
+                }
+                Ok(true) => {}
+            }
+
+            // Check rate limits
+            match rate_limiter.check(agent_id) {
+                RateLimitResult::RequestsExceeded { limit, .. } => {
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
+                        "agent_id": agent_id,
+                        "error": format!("Rate limit reached ({} requests/min)", limit)
+                    })) {
+                        yield Ok(evt);
+                    }
+                    continue;
+                }
+                RateLimitResult::TokensExceeded { limit, .. } => {
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
+                        "agent_id": agent_id,
+                        "error": format!("Token rate limit reached ({} tokens/min)", limit)
+                    })) {
+                        yield Ok(evt);
+                    }
+                    continue;
+                }
+                RateLimitResult::Allowed => {}
+            }
+
             let agent = match registry.get(agent_id) {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -365,7 +501,7 @@ async fn stream_message(
             }
 
             let llm_req = ChatCompletionRequest {
-                model,
+                model: model.clone(),
                 messages: llm_messages,
                 temperature: Some(0.7),
                 max_tokens: Some(4096),
@@ -384,6 +520,7 @@ async fn stream_message(
             match llm_router.chat_stream(&llm_req).await {
                 Ok(mut chunk_stream) => {
                     let mut full_content = String::new();
+                    let mut total_tokens: i64 = 0;
 
                     while let Some(result) = chunk_stream.next().await {
                         match result {
@@ -391,6 +528,7 @@ async fn stream_message(
                                 if let Some(choice) = chunk.choices.first() {
                                     if let Some(ref text) = choice.delta.content {
                                         full_content.push_str(text);
+                                        total_tokens += 1; // approximate: 1 chunk ≈ 1 token
                                         if let Ok(evt) = Event::default().event("chunk").json_data(json!({
                                             "agent_id": agent_id,
                                             "content": text
@@ -412,8 +550,18 @@ async fn stream_message(
                         }
                     }
 
-                    // Store the completed message
+                    // Record usage
                     if !full_content.is_empty() {
+                        // Estimate input tokens from message count (rough approximation)
+                        let input_tokens = (llm_req.messages.iter().map(|m| m.content.len()).sum::<usize>() / 4) as i64;
+                        let output_tokens = total_tokens;
+                        let _ = cost_tracker.record(
+                            agent_id, &model, input_tokens, output_tokens, "chat", Some(&conv_id),
+                        );
+                        let cost = cost_tracker.pricing().calculate(&model, input_tokens, output_tokens, 0, 0);
+                        let _ = budget_mgr.update_spending(agent_id, cost);
+                        rate_limiter.record_request(agent_id, (input_tokens + output_tokens) as u32);
+
                         if let Ok(agent_msg) = mgr.send_message(
                             &conv_id,
                             &SendMessage {
@@ -431,7 +579,6 @@ async fn stream_message(
                     }
                 }
                 Err(e) => {
-                    // Store error and send event
                     let _ = mgr.send_message(
                         &conv_id,
                         &SendMessage {

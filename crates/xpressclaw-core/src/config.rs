@@ -238,6 +238,9 @@ pub struct LlmConfig {
     pub anthropic_api_key: Option<String>,
     pub local_model: Option<String>,
     pub local_model_path: Option<String>,
+    /// Base URL for the local LLM server (Ollama, llama.cpp, vLLM, etc.).
+    /// Defaults to Ollama's address (http://localhost:11434) if not set.
+    pub local_base_url: Option<String>,
     pub context_length: u32,
 }
 
@@ -250,6 +253,7 @@ impl Default for LlmConfig {
             anthropic_api_key: None,
             local_model: Some("qwen3.5:latest".to_string()),
             local_model_path: None,
+            local_base_url: None,
             context_length: 32768,
         }
     }

@@ -6,6 +6,12 @@ license.workspace = true
 authors.workspace = true
 description = "Core runtime library for xpressclaw — the AI agent OS"
 
+[features]
+default = ["local-llm"]
+local-llm = ["dep:llama-cpp-2", "dep:hf-hub", "dep:encoding_rs"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+
 [dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -26,6 +32,11 @@ tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 sysinfo = "0.34"
+
+# Local LLM (optional, enabled by default via "local-llm" feature)
+llama-cpp-2 = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+encoding_rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

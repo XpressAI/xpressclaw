@@ -12,9 +12,6 @@ use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
-use xpressclaw_core::llm::anthropic::AnthropicProvider;
-use xpressclaw_core::llm::local::LocalProvider;
-use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
@@ -172,27 +169,7 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
 
     // Build LLM router
     let config = Arc::new(config);
-    let llm_router = {
-        let mut router = LlmRouter::new(&config.llm);
-
-        if let Some(ref key) = config.llm.openai_api_key {
-            let provider =
-                OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
-            router.register_provider("openai", Arc::new(provider));
-        }
-
-        if let Some(ref key) = config.llm.anthropic_api_key {
-            let provider = AnthropicProvider::new(key.clone());
-            router.register_provider("anthropic", Arc::new(provider));
-        }
-
-        if let Some(ref model) = config.llm.local_model {
-            let provider = LocalProvider::ollama(model.clone());
-            router.register_provider("local", Arc::new(provider));
-        }
-
-        router
-    };
+    let llm_router = LlmRouter::build_from_config(&config.llm);
 
     let _ = port;
 
