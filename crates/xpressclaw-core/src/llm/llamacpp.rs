@@ -12,9 +12,10 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -135,23 +136,29 @@ pub fn download_gguf_with_progress(
     Ok(path)
 }
 
+/// Default context length for inference.
+const DEFAULT_CONTEXT_LENGTH: u32 = 32_768;
+
 /// Embedded llama.cpp LLM provider.
 ///
 /// Loads a GGUF model in-process and runs inference directly using the llama.cpp
 /// C library (via safe Rust bindings). No external server required.
 ///
-/// The model is loaded once and shared across requests. A new `LlamaContext` is
-/// created per inference call to allow concurrent requests without locking.
+/// The model and context are created on the same thread during initialization
+/// to avoid Metal/GPU threading issues. The context is reused across requests
+/// behind a Mutex (one inference at a time).
 pub struct LlamaCppProvider {
+    #[allow(dead_code)]
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
+    ctx: Mutex<LlamaContext<'static>>,
     model_name: String,
     context_length: u32,
 }
 
-// SAFETY: LlamaBackend and LlamaModel hold raw pointers to thread-safe C structs.
-// The llama.cpp library supports concurrent reads on the model from multiple threads.
-// Each inference call creates its own LlamaContext (no shared mutable state).
+// SAFETY: LlamaBackend, LlamaModel, and LlamaContext hold raw pointers to C structs.
+// The context is protected by a Mutex ensuring single-threaded access.
+// The model is read-only after loading and safe to share.
 unsafe impl Send for LlamaCppProvider {}
 unsafe impl Sync for LlamaCppProvider {}
 
@@ -173,9 +180,6 @@ impl LlamaCppProvider {
 
         let params = {
             let p = LlamaModelParams::default();
-            // Metal on Intel Macs (x86_64) produces incorrect results with modern
-            // quantization formats. Force CPU-only on those machines.
-            // Apple Silicon and CUDA GPUs work correctly.
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             let p = p.with_n_gpu_layers(0);
             p
@@ -183,13 +187,27 @@ impl LlamaCppProvider {
         let model = LlamaModel::load_from_file(&backend, path, &params)
             .map_err(|e| Error::Llm(format!("failed to load model: {e}")))?;
 
-        tracing::info!(model = model_name, "GGUF model loaded");
+        let context_length = DEFAULT_CONTEXT_LENGTH;
+
+        // Create context on the SAME thread as the model to avoid Metal threading issues.
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(context_length));
+        let ctx = model
+            .new_context(&backend, ctx_params)
+            .map_err(|e| Error::Llm(format!("context creation failed: {e}")))?;
+
+        // SAFETY: We hold the backend and model in Arcs that outlive the context.
+        // The Mutex ensures the context is only accessed by one thread at a time.
+        let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
+
+        tracing::info!(model = model_name, n_ctx = context_length, "GGUF model loaded");
 
         Ok(Self {
             backend: Arc::new(backend),
             model: Arc::new(model),
+            ctx: Mutex::new(ctx),
             model_name,
-            context_length: 262_144,
+            context_length,
         })
     }
 
@@ -246,13 +264,13 @@ impl LlamaCppProvider {
 
     /// Run synchronous inference on the model.
     fn generate(&self, prompt: &str, max_tokens: i32, temperature: f32) -> Result<(String, Usage)> {
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.context_length));
-
         let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .map_err(|e| Error::Llm(format!("context creation failed: {e}")))?;
+            .ctx
+            .lock()
+            .map_err(|e| Error::Llm(format!("context lock failed: {e}")))?;
+
+        // Clear KV cache for fresh inference
+        ctx.clear_kv_cache();
 
         // Tokenize the prompt (no BOS — Qwen models don't use a BOS token)
         let tokens_list = self
