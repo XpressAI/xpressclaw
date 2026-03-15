@@ -575,4 +575,5 @@ mod tests {
 
         eprintln!("Response: {:?}", response.choices[0].message.content);
     }
+
 }

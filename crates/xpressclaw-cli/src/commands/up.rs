@@ -8,17 +8,17 @@ use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
-pub async fn run(detach: bool, port: u16) -> anyhow::Result<()> {
+pub async fn run(detach: bool, port: u16, workdir: Option<String>) -> anyhow::Result<()> {
     if detach {
         return run_detached(port);
     }
 
-    run_foreground(port).await
+    run_foreground(port, workdir).await
 }
 
 /// Run the server in the foreground (default).
-async fn run_foreground(port: u16) -> anyhow::Result<()> {
-    let state = build_state(port).await?;
+async fn run_foreground(port: u16, workdir: Option<String>) -> anyhow::Result<()> {
+    let state = build_state(port, workdir).await?;
 
     if !state.is_setup_complete() {
         println!("xpressclaw is starting in setup mode...");
@@ -123,10 +123,12 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
 }
 
 /// Build the AppState (shared between foreground and detached modes).
-async fn build_state(port: u16) -> anyhow::Result<AppState> {
-    let config_path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("xpressclaw.yaml");
+async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppState> {
+    let work_dir = match workdir {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    let config_path = work_dir.join("xpressclaw.yaml");
 
     // Check if config exists — if not, start in setup mode
     if !config_path.exists() {
