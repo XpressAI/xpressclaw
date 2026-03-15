@@ -347,16 +347,47 @@ async fn complete_setup(
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
 
-    // Spawn background download if needed
+    // Handle embedded model download if needed
     #[cfg(feature = "local-llm")]
     if needs_download {
-        use xpressclaw_core::llm::llamacpp::{download_gguf_with_progress, DownloadStatus};
+        use xpressclaw_core::llm::llamacpp::{
+            download_gguf_with_progress, is_gguf_cached, DownloadStatus,
+        };
 
+        // Check cache first — skip download entirely if model is already cached
+        if let Some(cached_path) = is_gguf_cached(&gguf_repo, &gguf_file) {
+            info!(path = %cached_path.display(), "GGUF model already cached");
+
+            // Update config with cached model path and rebuild router
+            let old_config = state.config();
+            let mut new_llm = old_config.llm.clone();
+            new_llm.local_model_path = Some(cached_path.to_string_lossy().to_string());
+
+            let new_config = Config {
+                llm: new_llm,
+                agents: old_config.agents.clone(),
+                mcp_servers: old_config.mcp_servers.clone(),
+                system: old_config.system.clone(),
+                ..Default::default()
+            };
+            let _ = new_config.save(&state.config_path);
+
+            let new_config = Arc::new(new_config);
+            let router = LlmRouter::build_from_config(&new_config.llm);
+            state.apply_config(new_config, Some(Arc::new(router)));
+
+            return Ok(Json(json!({
+                "success": true,
+                "downloading": false,
+                "config_path": state.config_path.display().to_string()
+            })));
+        }
+
+        // Not cached — spawn background download with progress tracking
         let progress = state.download_progress.clone();
         let state_clone = state.clone();
         let config_path = state.config_path.clone();
 
-        // Mark as downloading
         {
             let mut dp = progress.write().unwrap();
             dp.status = DownloadStatus::Downloading;
@@ -368,7 +399,6 @@ async fn complete_setup(
                 Ok(path) => {
                     info!(path = %path.display(), "GGUF download complete");
 
-                    // Update config with model path and rebuild LLM router
                     let old_config = state_clone.config();
                     let mut new_llm = old_config.llm.clone();
                     new_llm.local_model_path = Some(path.to_string_lossy().to_string());

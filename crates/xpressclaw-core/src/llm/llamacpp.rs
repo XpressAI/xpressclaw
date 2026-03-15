@@ -101,6 +101,12 @@ pub fn download_gguf(repo_id: &str, filename: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Check if a GGUF model is already cached locally.
+pub fn is_gguf_cached(repo_id: &str, filename: &str) -> Option<PathBuf> {
+    let cache = hf_hub::Cache::from_env();
+    cache.model(repo_id.to_string()).get(filename)
+}
+
 /// Download a GGUF model with progress tracking for the frontend.
 pub fn download_gguf_with_progress(
     repo_id: &str,
