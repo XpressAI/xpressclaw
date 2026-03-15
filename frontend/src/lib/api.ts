@@ -467,6 +467,14 @@ export interface LiveConfig {
 	mcp_servers: string[];
 }
 
+export interface DownloadStatus {
+	status: 'Idle' | 'Downloading' | 'Complete' | 'Error';
+	filename: string;
+	downloaded_bytes: number;
+	total_bytes: number;
+	error: string | null;
+}
+
 export const setup = {
 	status: () => request<SetupStatus>('/api/setup/status'),
 	getConfig: () => request<LiveConfig>('/api/setup/config'),
@@ -485,8 +493,9 @@ export const setup = {
 		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 	}) =>
-		request<{ success: boolean; config_path: string }>('/api/setup/complete', {
+		request<{ success: boolean; downloading: boolean; config_path: string }>('/api/setup/complete', {
 			method: 'POST',
 			body: JSON.stringify(data)
-		})
+		}),
+	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status')
 };

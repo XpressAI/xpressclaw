@@ -25,7 +25,7 @@
     ],
     "trayIcon": {
       "id": "main-tray",
-      "iconPath": "icons/icon.png",
+      "iconPath": "icons/tray-icon.png",
       "iconAsTemplate": true,
       "tooltip": "xpressclaw"
     },

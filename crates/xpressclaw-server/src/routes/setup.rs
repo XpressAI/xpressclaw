@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
+        .route("/download-status", get(download_status))
         .route("/config", get(get_config))
 }
 
@@ -188,43 +189,40 @@ struct AgentSetup {
     tools: Option<Vec<String>>,
 }
 
+/// Return current GGUF download progress.
+async fn download_status(State(state): State<AppState>) -> Json<Value> {
+    #[cfg(feature = "local-llm")]
+    {
+        let dp = state.download_progress.read().unwrap().clone();
+        Json(json!(dp))
+    }
+    #[cfg(not(feature = "local-llm"))]
+    {
+        let _ = state;
+        Json(json!({ "status": "Idle" }))
+    }
+}
+
 /// Save the setup configuration and mark setup as complete.
 async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
+    let needs_download = is_local && req.llm.use_embedded;
 
-    // If using embedded llama.cpp (no Ollama), download the GGUF model
-    let local_model_path = if is_local && req.llm.use_embedded {
-        #[cfg(feature = "local-llm")]
-        {
-            let model_name = req
-                .llm
-                .local_model
-                .as_deref()
-                .unwrap_or(xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_FILE);
-
-            // Map model display names to HuggingFace repo/file
-            let (repo, filename) = resolve_gguf_source(model_name);
-            info!(
-                repo = repo,
-                file = filename,
-                "downloading GGUF model for embedded llama.cpp"
-            );
-
-            let path = xpressclaw_core::llm::llamacpp::download_gguf(repo, filename)
-                .map_err(internal_error)?;
-
-            Some(path.to_string_lossy().to_string())
-        }
-        #[cfg(not(feature = "local-llm"))]
-        {
-            warn!("local-llm feature not enabled, skipping GGUF download");
-            None
-        }
+    // Resolve GGUF source if needed (for config, even before download completes)
+    #[cfg(feature = "local-llm")]
+    let (gguf_repo, gguf_file) = if needs_download {
+        let model_name = req
+            .llm
+            .local_model
+            .as_deref()
+            .unwrap_or(xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_FILE);
+        let (r, f) = resolve_gguf_source(model_name);
+        (r.to_string(), f.to_string())
     } else {
-        None
+        (String::new(), String::new())
     };
 
     let llm = LlmConfig {
@@ -252,7 +250,8 @@ async fn complete_setup(
         } else {
             None
         },
-        local_model_path: local_model_path,
+        // Model path will be set after download completes
+        local_model_path: None,
         local_base_url: if is_local {
             req.llm.local_base_url.clone()
         } else {
@@ -263,7 +262,6 @@ async fn complete_setup(
 
     // Agents
     let agents = if req.agents.is_empty() {
-        // Default agent if none specified
         vec![AgentConfig {
             name: "atlas".to_string(),
             backend: "generic".to_string(),
@@ -346,13 +344,67 @@ async fn complete_setup(
 
     // Build LLM router from the new config
     let llm_router = LlmRouter::build_from_config(&config.llm);
-
-    // Swap the live state so all handlers see the new config
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
 
+    // Spawn background download if needed
+    #[cfg(feature = "local-llm")]
+    if needs_download {
+        use xpressclaw_core::llm::llamacpp::{download_gguf_with_progress, DownloadStatus};
+
+        let progress = state.download_progress.clone();
+        let state_clone = state.clone();
+        let config_path = state.config_path.clone();
+
+        // Mark as downloading
+        {
+            let mut dp = progress.write().unwrap();
+            dp.status = DownloadStatus::Downloading;
+            dp.filename = gguf_file.clone();
+        }
+
+        tokio::task::spawn_blocking(move || {
+            match download_gguf_with_progress(&gguf_repo, &gguf_file, progress.clone()) {
+                Ok(path) => {
+                    info!(path = %path.display(), "GGUF download complete");
+
+                    // Update config with model path and rebuild LLM router
+                    let old_config = state_clone.config();
+                    let mut new_llm = old_config.llm.clone();
+                    new_llm.local_model_path = Some(path.to_string_lossy().to_string());
+
+                    let new_config = Config {
+                        llm: new_llm,
+                        agents: old_config.agents.clone(),
+                        mcp_servers: old_config.mcp_servers.clone(),
+                        system: old_config.system.clone(),
+                        ..Default::default()
+                    };
+                    let _ = new_config.save(&config_path);
+
+                    let new_config = Arc::new(new_config);
+                    let router = LlmRouter::build_from_config(&new_config.llm);
+                    state_clone.apply_config(new_config, Some(Arc::new(router)));
+                }
+                Err(e) => {
+                    warn!(error = %e, "GGUF download failed");
+                    let mut dp = progress.write().unwrap();
+                    dp.status = DownloadStatus::Error;
+                    dp.error = Some(e.to_string());
+                }
+            }
+        });
+
+        return Ok(Json(json!({
+            "success": true,
+            "downloading": true,
+            "config_path": state.config_path.display().to_string()
+        })));
+    }
+
     Ok(Json(json!({
         "success": true,
+        "downloading": false,
         "config_path": state.config_path.display().to_string()
     })))
 }

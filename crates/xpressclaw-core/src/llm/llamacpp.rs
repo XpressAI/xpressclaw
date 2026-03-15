@@ -33,6 +33,51 @@ pub const DEFAULT_GGUF_REPO: &str = "unsloth/Qwen3.5-0.8B-GGUF";
 /// Default GGUF filename (smallest viable model).
 pub const DEFAULT_GGUF_FILE: &str = "Qwen3.5-0.8B-UD-Q4_K_XL.gguf";
 
+/// Download progress tracking for the frontend.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct DownloadProgress {
+    pub status: DownloadStatus,
+    pub filename: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub enum DownloadStatus {
+    #[default]
+    Idle,
+    Downloading,
+    Complete,
+    Error,
+}
+
+/// Progress reporter that writes into shared state for the frontend to poll.
+struct SharedProgress {
+    state: Arc<std::sync::RwLock<DownloadProgress>>,
+}
+
+impl hf_hub::api::Progress for SharedProgress {
+    fn init(&mut self, size: usize, filename: &str) {
+        if let Ok(mut s) = self.state.write() {
+            s.total_bytes = size as u64;
+            s.filename = filename.to_string();
+            s.status = DownloadStatus::Downloading;
+            s.downloaded_bytes = 0;
+        }
+    }
+    fn update(&mut self, size: usize) {
+        if let Ok(mut s) = self.state.write() {
+            s.downloaded_bytes += size as u64;
+        }
+    }
+    fn finish(&mut self) {
+        if let Ok(mut s) = self.state.write() {
+            s.status = DownloadStatus::Complete;
+        }
+    }
+}
+
 /// Download a GGUF model from HuggingFace.
 ///
 /// Uses the `hf-hub` crate which caches downloads in `~/.cache/huggingface/hub/`.
@@ -50,6 +95,34 @@ pub fn download_gguf(repo_id: &str, filename: &str) -> Result<PathBuf> {
     let path = api
         .model(repo_id.to_string())
         .get(filename)
+        .map_err(|e| Error::Llm(format!("failed to download {repo_id}/{filename}: {e}")))?;
+
+    tracing::info!(path = %path.display(), "GGUF model ready");
+    Ok(path)
+}
+
+/// Download a GGUF model with progress tracking for the frontend.
+pub fn download_gguf_with_progress(
+    repo_id: &str,
+    filename: &str,
+    progress_state: Arc<std::sync::RwLock<DownloadProgress>>,
+) -> Result<PathBuf> {
+    use hf_hub::api::sync::ApiBuilder;
+
+    tracing::info!(repo = repo_id, file = filename, "downloading GGUF model");
+
+    let api = ApiBuilder::new()
+        .with_progress(false)
+        .build()
+        .map_err(|e| Error::Llm(format!("HuggingFace API init failed: {e}")))?;
+
+    let progress = SharedProgress {
+        state: progress_state,
+    };
+
+    let path = api
+        .model(repo_id.to_string())
+        .download_with_progress(filename, progress)
         .map_err(|e| Error::Llm(format!("failed to download {repo_id}/{filename}: {e}")))?;
 
     tracing::info!(path = %path.display(), "GGUF model ready");
@@ -110,7 +183,7 @@ impl LlamaCppProvider {
             backend: Arc::new(backend),
             model: Arc::new(model),
             model_name,
-            context_length: 4096,
+            context_length: 262144,
         })
     }
 
@@ -182,15 +255,16 @@ impl LlamaCppProvider {
             .map_err(|e| Error::Llm(format!("tokenization failed: {e}")))?;
 
         let prompt_tokens = tokens_list.len() as i64;
-        let n_len = tokens_list.len() as i32 + max_tokens;
-
-        // Ensure context is large enough
         let n_ctx = ctx.n_ctx() as i32;
-        if n_len > n_ctx {
+
+        // Cap max_tokens to fit within the context window
+        let max_tokens = max_tokens.min(n_ctx - tokens_list.len() as i32);
+        if max_tokens <= 0 {
             return Err(Error::Llm(format!(
-                "prompt ({prompt_tokens} tokens) + max_tokens ({max_tokens}) = {n_len} exceeds context ({n_ctx})"
+                "prompt ({prompt_tokens} tokens) fills the entire context ({n_ctx})"
             )));
         }
+        let n_len = tokens_list.len() as i32 + max_tokens;
 
         // Feed prompt tokens into a batch
         let mut batch = LlamaBatch::new(512, 1);

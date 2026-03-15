@@ -7,7 +7,8 @@
 		SystemInfo,
 		OllamaInfo,
 		ModelRecommendation,
-		AgentPreset
+		AgentPreset,
+		DownloadStatus
 	} from '$lib/api';
 
 	// Steps: 0=docker, 1=llm, 2=connectors, 3=agents, 4=complete
@@ -57,6 +58,9 @@
 	// -- Step 4: Complete --
 	let saving = $state(false);
 	let saveError = $state('');
+	let downloading = $state(false);
+	let downloadProgress = $state<DownloadStatus | null>(null);
+	let downloadPollTimer: ReturnType<typeof setInterval> | null = null;
 
 	const presetIcons: Record<string, string> = {
 		brain: '&#x1f9e0;',
@@ -177,6 +181,40 @@
 		step = target;
 	}
 
+	function formatBytes(bytes: number): string {
+		if (bytes === 0) return '0 B';
+		const units = ['B', 'KB', 'MB', 'GB'];
+		const i = Math.floor(Math.log(bytes) / Math.log(1024));
+		return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
+	}
+
+	function startDownloadPolling() {
+		downloading = true;
+		step = 4;
+		downloadPollTimer = setInterval(async () => {
+			try {
+				downloadProgress = await setup.downloadStatus();
+				if (downloadProgress.status === 'Complete') {
+					stopDownloadPolling();
+					downloading = false;
+				} else if (downloadProgress.status === 'Error') {
+					stopDownloadPolling();
+					downloading = false;
+					saveError = downloadProgress.error || 'Download failed';
+				}
+			} catch {
+				// ignore transient fetch errors during polling
+			}
+		}, 500);
+	}
+
+	function stopDownloadPolling() {
+		if (downloadPollTimer) {
+			clearInterval(downloadPollTimer);
+			downloadPollTimer = null;
+		}
+	}
+
 	async function completeSetup() {
 		saving = true;
 		saveError = '';
@@ -191,7 +229,7 @@
 			const isLocal = llmProvider === 'local' || llmProvider === 'ollama';
 			const useEmbedded = isLocal && (!ollamaInfo?.available || !llmLocalBaseUrl);
 
-			await setup.complete({
+			const result = await setup.complete({
 				llm: {
 					provider: llmProvider,
 					api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
@@ -204,7 +242,11 @@
 				mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined
 			});
 
-			step = 4;
+			if (result.downloading) {
+				startDownloadPolling();
+			} else {
+				step = 4;
+			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
 		}
@@ -718,21 +760,47 @@
 			<p class="mt-2 text-xs text-red-500">{saveError}</p>
 		{/if}
 
-	<!-- Step 4: Complete -->
+	<!-- Step 4: Complete (or downloading) -->
 	{:else if step === 4}
-		<div class="text-center py-8">
-			<div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500 text-3xl">
-				&#10003;
-			</div>
-			<h2 class="text-lg font-semibold text-foreground mb-2">Setup Complete!</h2>
-			<p class="text-sm text-muted-foreground mb-6">
-				Your configuration has been saved and applied. You're ready to go!
-			</p>
+		{#if downloading}
+			<div class="text-center py-8">
+				<h2 class="text-lg font-semibold text-foreground mb-2">Downloading Model</h2>
+				<p class="text-sm text-muted-foreground mb-4">
+					{downloadProgress?.filename || 'Preparing download...'}
+				</p>
 
-			<button
-				onclick={() => goto('/dashboard')}
-				class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90"
-			>Go to Dashboard</button>
-		</div>
+				<div class="w-full max-w-md mx-auto bg-muted rounded-full h-3 mb-2">
+					<div
+						class="bg-primary h-3 rounded-full transition-all duration-300"
+						style="width: {downloadProgress && downloadProgress.total_bytes > 0
+							? Math.min(100, downloadProgress.downloaded_bytes / downloadProgress.total_bytes * 100)
+							: 0}%"
+					></div>
+				</div>
+
+				<p class="text-xs text-muted-foreground">
+					{formatBytes(downloadProgress?.downloaded_bytes ?? 0)} / {formatBytes(downloadProgress?.total_bytes ?? 0)}
+				</p>
+
+				{#if saveError}
+					<p class="mt-4 text-xs text-red-500">{saveError}</p>
+				{/if}
+			</div>
+		{:else}
+			<div class="text-center py-8">
+				<div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500 text-3xl">
+					&#10003;
+				</div>
+				<h2 class="text-lg font-semibold text-foreground mb-2">Setup Complete!</h2>
+				<p class="text-sm text-muted-foreground mb-6">
+					Your configuration has been saved and applied. You're ready to go!
+				</p>
+
+				<button
+					onclick={() => goto('/dashboard')}
+					class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90"
+				>Go to Dashboard</button>
+			</div>
+		{/if}
 	{/if}
 </div>
