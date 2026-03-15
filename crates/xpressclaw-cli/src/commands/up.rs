@@ -147,8 +147,8 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
         ));
     }
 
-    // Load config
-    let mut config = Config::load_default()?;
+    // Load config from the resolved path
+    let mut config = Config::load(&config_path)?;
     config::env_overrides(&mut config);
 
     info!(agents = config.agents.len(), "loaded configuration");
