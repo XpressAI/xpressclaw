@@ -177,8 +177,8 @@ export interface Agent {
 export const agents = {
 	list: () => request<Agent[]>('/api/agents'),
 	get: (id: string) => request<Agent>(`/api/agents/${id}`),
-	start: (id: string) => request<Agent>(`/api/agents/${id}/start`, { method: 'POST' }),
-	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST' }),
+	start: (id: string) => request<Agent>(`/api/agents/${id}/start`, { method: 'POST', body: '{}' }),
+	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST', body: '{}' }),
 	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' })
 };
 
