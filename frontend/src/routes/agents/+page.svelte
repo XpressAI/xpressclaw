@@ -44,7 +44,7 @@
 	{:else if agentList.length === 0}
 		<div class="rounded-lg border border-border bg-card p-8 text-center">
 			<p class="text-muted-foreground">No agents configured.</p>
-			<p class="text-sm text-muted-foreground mt-2">Add agents to your <code class="text-xs bg-muted px-1 py-0.5 rounded">xpressclaw.yaml</code> and run <code class="text-xs bg-muted px-1 py-0.5 rounded">xpressclaw up</code></p>
+			<p class="text-sm text-muted-foreground mt-2">Complete the <a href="/setup" class="text-primary hover:underline">setup wizard</a> to add agents.</p>
 		</div>
 	{:else}
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
