@@ -189,7 +189,11 @@ impl LlamaCppProvider {
         );
 
         let context_length = DEFAULT_CONTEXT_LENGTH;
-        tracing::info!(model = model_name, n_ctx = context_length, "GGUF model loaded");
+        tracing::info!(
+            model = model_name,
+            n_ctx = context_length,
+            "GGUF model loaded"
+        );
 
         Ok(Self {
             backend,
@@ -412,7 +416,11 @@ impl LlmProvider for LlamaCppProvider {
                         index: 0,
                         delta: super::router::ChunkDelta {
                             role: None,
-                            content: if content.is_empty() { None } else { Some(content) },
+                            content: if content.is_empty() {
+                                None
+                            } else {
+                                Some(content)
+                            },
                         },
                         finish_reason: finish,
                     }],
@@ -544,30 +552,34 @@ mod tests {
     fn test_llamacpp_minimal() {
         use std::io::Write;
 
-        let path = download_gguf(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE)
-            .expect("download failed");
+        let path = download_gguf(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE).expect("download failed");
 
         let backend = LlamaBackend::init().unwrap();
         // Force CPU-only (ngl=0) — Metal on x86_64 Mac produces incorrect results
         // with some quantization formats.
         let params = LlamaModelParams::default().with_n_gpu_layers(0);
-        let model = LlamaModel::load_from_file(&backend, path, &params)
-            .expect("unable to load model");
+        let model =
+            LlamaModel::load_from_file(&backend, path, &params).expect("unable to load model");
 
         // Use model's chat template
         let tmpl = model.chat_template(None).expect("no chat template");
-        let msgs = vec![
-            LlamaChatMessage::new("user".into(), "What is 2+2? Answer briefly.".into()).unwrap(),
-        ];
-        let prompt = model.apply_chat_template(&tmpl, &msgs, true)
+        let msgs =
+            vec![
+                LlamaChatMessage::new("user".into(), "What is 2+2? Answer briefly.".into())
+                    .unwrap(),
+            ];
+        let prompt = model
+            .apply_chat_template(&tmpl, &msgs, true)
             .expect("template failed");
         eprintln!("Prompt: {prompt:?}");
 
         let ctx_params = LlamaContextParams::default();
-        let mut ctx = model.new_context(&backend, ctx_params)
+        let mut ctx = model
+            .new_context(&backend, ctx_params)
             .expect("unable to create context");
 
-        let tokens_list = model.str_to_token(&prompt, AddBos::Always)
+        let tokens_list = model
+            .str_to_token(&prompt, AddBos::Always)
             .expect("tokenization failed");
         eprintln!("Token count: {}", tokens_list.len());
 
@@ -593,7 +605,9 @@ mod tests {
                 break;
             }
 
-            let piece = model.token_to_piece(token, &mut decoder, true, None).unwrap();
+            let piece = model
+                .token_to_piece(token, &mut decoder, true, None)
+                .unwrap();
             eprint!("{piece}");
             std::io::stderr().flush().ok();
             output.push_str(&piece);
@@ -677,5 +691,4 @@ mod tests {
 
         eprintln!("Response: {:?}", response.choices[0].message.content);
     }
-
 }

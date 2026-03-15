@@ -78,7 +78,11 @@ fn main() {
                     let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("binaries")
                         .join(format!("xpressclaw-{target_triple}"));
-                    if dev_path.exists() { Some(dev_path) } else { None }
+                    if dev_path.exists() {
+                        Some(dev_path)
+                    } else {
+                        None
+                    }
                 })
                 .expect("sidecar binary not found");
 
@@ -92,7 +96,10 @@ fn main() {
                 .env("HOME", std::env::var("HOME").unwrap_or_default())
                 .env("PATH", std::env::var("PATH").unwrap_or_default())
                 .env("USER", std::env::var("USER").unwrap_or_default())
-                .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+                .env(
+                    "RUST_LOG",
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+                )
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -132,9 +139,7 @@ fn main() {
         .expect("error building xpressclaw desktop app")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                let mut child = {
-                    app.state::<SidecarState>().0.lock().unwrap().take()
-                };
+                let mut child = { app.state::<SidecarState>().0.lock().unwrap().take() };
                 if let Some(ref mut child) = child {
                     info!("killing sidecar");
                     let _ = child.kill();

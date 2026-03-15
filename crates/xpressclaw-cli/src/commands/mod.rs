@@ -123,7 +123,11 @@ pub enum Command {
 pub async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Init { path } => init::run(&path).await,
-        Command::Up { detach, port, workdir } => up::run(detach, port, workdir).await,
+        Command::Up {
+            detach,
+            port,
+            workdir,
+        } => up::run(detach, port, workdir).await,
         Command::Down { port } => down::run(port).await,
         Command::Status { port } => status::run(port).await,
         Command::Chat { agent, port } => chat::run(&agent, port).await,

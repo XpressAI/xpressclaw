@@ -6,10 +6,7 @@ fn main() {
             .args(["--print", "host-tuple"])
             .output()
             .expect("failed to run rustc");
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .trim()
-            .to_string()
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     });
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();

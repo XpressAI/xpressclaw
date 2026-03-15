@@ -451,22 +451,23 @@ async fn complete_setup(
 fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
     match model_name {
         // Dense models
-        s if s.contains("0.8") => {
-            ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf")
-        }
+        s if s.contains("0.8") => ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"),
         s if s.contains("4b") => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
         s if s.contains("9b") => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-UD-Q4_K_XL.gguf"),
         s if s.contains("27b") => ("unsloth/Qwen3.5-27B-GGUF", "Qwen3.5-27B-UD-Q4_K_XL.gguf"),
         // MoE models (user must explicitly select)
-        s if s.contains("35b") || s.contains("a3b") => {
-            ("unsloth/Qwen3.5-35B-A3B-GGUF", "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf")
-        }
-        s if s.contains("122b") || s.contains("a10b") => {
-            ("unsloth/Qwen3.5-122B-A10B-GGUF", "Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf")
-        }
-        s if s.contains("397b") || s.contains("a17b") => {
-            ("unsloth/Qwen3.5-397B-A17B-GGUF", "Qwen3.5-397B-A17B-UD-Q4_K_XL.gguf")
-        }
+        s if s.contains("35b") || s.contains("a3b") => (
+            "unsloth/Qwen3.5-35B-A3B-GGUF",
+            "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+        ),
+        s if s.contains("122b") || s.contains("a10b") => (
+            "unsloth/Qwen3.5-122B-A10B-GGUF",
+            "Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf",
+        ),
+        s if s.contains("397b") || s.contains("a17b") => (
+            "unsloth/Qwen3.5-397B-A17B-GGUF",
+            "Qwen3.5-397B-A17B-UD-Q4_K_XL.gguf",
+        ),
         // If it's already a .gguf filename, use the default repo
         s if s.ends_with(".gguf") => (
             xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_REPO,
