@@ -308,15 +308,15 @@ async fn stream_message(
 
     let stream = async_stream::stream! {
         // Send user message event
-        if let Ok(evt) = Event::default().event("user_message").json_data(&json!(user_msg)) {
+        if let Ok(evt) = Event::default().event("user_message").json_data(json!(user_msg)) {
             yield Ok(evt);
         }
 
         let Some(llm_router) = llm_router else {
-            if let Ok(evt) = Event::default().event("error").json_data(&json!({"error": "LLM router not configured"})) {
+            if let Ok(evt) = Event::default().event("error").json_data(json!({"error": "LLM router not configured"})) {
                 yield Ok(evt);
             }
-            if let Ok(evt) = Event::default().event("done").json_data(&json!({})) {
+            if let Ok(evt) = Event::default().event("done").json_data(json!({})) {
                 yield Ok(evt);
             }
             return;
@@ -375,7 +375,7 @@ async fn stream_message(
             };
 
             // Send "thinking" event
-            if let Ok(evt) = Event::default().event("thinking").json_data(&json!({
+            if let Ok(evt) = Event::default().event("thinking").json_data(json!({
                 "agent_id": agent_id
             })) {
                 yield Ok(evt);
@@ -391,7 +391,7 @@ async fn stream_message(
                                 if let Some(choice) = chunk.choices.first() {
                                     if let Some(ref text) = choice.delta.content {
                                         full_content.push_str(text);
-                                        if let Ok(evt) = Event::default().event("chunk").json_data(&json!({
+                                        if let Ok(evt) = Event::default().event("chunk").json_data(json!({
                                             "agent_id": agent_id,
                                             "content": text
                                         })) {
@@ -401,7 +401,7 @@ async fn stream_message(
                                 }
                             }
                             Err(e) => {
-                                if let Ok(evt) = Event::default().event("error").json_data(&json!({
+                                if let Ok(evt) = Event::default().event("error").json_data(json!({
                                     "agent_id": agent_id,
                                     "error": e.to_string()
                                 })) {
@@ -424,7 +424,7 @@ async fn stream_message(
                                 message_type: None,
                             },
                         ) {
-                            if let Ok(evt) = Event::default().event("agent_message").json_data(&json!(agent_msg)) {
+                            if let Ok(evt) = Event::default().event("agent_message").json_data(json!(agent_msg)) {
                                 yield Ok(evt);
                             }
                         }
@@ -442,7 +442,7 @@ async fn stream_message(
                             message_type: Some("system".into()),
                         },
                     );
-                    if let Ok(evt) = Event::default().event("error").json_data(&json!({
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
                         "agent_id": agent_id,
                         "error": e.to_string()
                     })) {
@@ -453,7 +453,7 @@ async fn stream_message(
         }
 
         // Done
-        if let Ok(evt) = Event::default().event("done").json_data(&json!({})) {
+        if let Ok(evt) = Event::default().event("done").json_data(json!({})) {
             yield Ok(evt);
         }
     };

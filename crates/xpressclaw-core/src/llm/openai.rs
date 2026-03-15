@@ -170,9 +170,8 @@ pub fn parse_sse_stream(
                         continue;
                     }
 
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => chunks.push(Ok(chunk)),
-                        Err(_) => {} // skip unparseable lines
+                    if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
+                        chunks.push(Ok(chunk));
                     }
                 }
                 futures_util::stream::iter(chunks)

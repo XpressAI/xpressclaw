@@ -128,10 +128,7 @@ async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut config = Config::default();
-
-    // LLM config
-    config.llm = LlmConfig {
+    let llm = LlmConfig {
         default_provider: req.llm.provider.clone(),
         openai_api_key: if req.llm.provider == "openai" {
             req.llm.api_key.clone()
@@ -160,7 +157,7 @@ async fn complete_setup(
     };
 
     // Agents
-    config.agents = if req.agents.is_empty() {
+    let agents = if req.agents.is_empty() {
         // Default agent if none specified
         vec![AgentConfig {
             name: "atlas".to_string(),
@@ -200,13 +197,15 @@ async fn complete_setup(
             .collect()
     };
 
-    // MCP servers
-    config.mcp_servers = req.mcp_servers;
+    let config = Config {
+        llm,
+        agents,
+        mcp_servers: req.mcp_servers,
+        ..Default::default()
+    };
 
     // Save config
-    config
-        .save(&state.config_path)
-        .map_err(|e| internal_error(e))?;
+    config.save(&state.config_path).map_err(internal_error)?;
 
     Ok(Json(json!({
         "success": true,
