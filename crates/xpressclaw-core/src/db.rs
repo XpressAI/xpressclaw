@@ -1,0 +1,512 @@
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Once};
+
+use rusqlite::Connection;
+use tracing::info;
+
+use crate::error::{Error, Result};
+
+/// Register sqlite-vec as an auto-extension. Must be called before opening connections.
+static INIT_SQLITE_VEC: Once = Once::new();
+
+fn ensure_sqlite_vec() {
+    INIT_SQLITE_VEC.call_once(|| unsafe {
+        type ExtFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), ExtFn>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
+/// Database manager for xpressclaw.
+///
+/// Uses SQLite with WAL mode for concurrent reads.
+/// sqlite-vec is loaded as an extension when available.
+pub struct Database {
+    path: PathBuf,
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl Database {
+    /// Open (or create) the database at the given path.
+    pub fn open(path: &Path) -> Result<Self> {
+        ensure_sqlite_vec();
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Database(format!("failed to create data dir: {e}")))?;
+        }
+
+        let conn = Connection::open(path)?;
+
+        // Performance pragmas
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -64000;
+             PRAGMA temp_store = MEMORY;",
+        )?;
+
+        let db = Self {
+            path: path.to_path_buf(),
+            conn: Arc::new(Mutex::new(conn)),
+        };
+
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Open an in-memory database (for testing).
+    pub fn open_memory() -> Result<Self> {
+        ensure_sqlite_vec();
+
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        let db = Self {
+            path: PathBuf::from(":memory:"),
+            conn: Arc::new(Mutex::new(conn)),
+        };
+
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Get a reference to the connection (locked).
+    ///
+    /// **Warning:** The returned `MutexGuard` holds the lock for its entire lifetime.
+    /// Prefer [`with_conn`] to avoid accidental deadlocks when calling other methods
+    /// that also need the connection.
+    pub fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("database mutex poisoned")
+    }
+
+    /// Execute a closure with the connection, ensuring the lock is released afterward.
+    ///
+    /// This prevents the common deadlock pattern where a method holds `conn()` and
+    /// then calls another method that also calls `conn()`.
+    pub fn with_conn<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Connection) -> T,
+    {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        f(&conn)
+    }
+
+    /// Run all pending migrations.
+    fn migrate(&self) -> Result<()> {
+        let conn = self.conn();
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )?;
+
+        let version: u32 = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let migrations: &[(u32, &str)] = &[
+            (1, MIGRATION_V1),
+            (2, MIGRATION_V2),
+            (3, MIGRATION_V3),
+            (4, MIGRATION_V4),
+            (5, MIGRATION_V5),
+            (6, MIGRATION_V6),
+            (7, MIGRATION_V7),
+            (8, MIGRATION_V8),
+            (9, MIGRATION_V9),
+            (10, MIGRATION_V10),
+        ];
+
+        for &(target, sql) in migrations {
+            if version < target {
+                conn.execute_batch(sql).map_err(|e| Error::Migration {
+                    version: target,
+                    message: e.to_string(),
+                })?;
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', ?1)",
+                    [target.to_string()],
+                )?;
+
+                info!("applied migration v{target}");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Path to the database file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+// -- Migrations --
+
+const MIGRATION_V1: &str = "
+-- Memories (Zettelkasten notes)
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    access_count INTEGER DEFAULT 0,
+    source TEXT NOT NULL,
+    layer TEXT NOT NULL DEFAULT 'shared',
+    agent_id TEXT,
+    user_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memories_layer ON memories(layer);
+CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(accessed_at);
+CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id);
+
+-- Memory links (Zettelkasten bidirectional links)
+CREATE TABLE IF NOT EXISTS memory_links (
+    from_id TEXT NOT NULL,
+    to_id TEXT NOT NULL,
+    link_type TEXT DEFAULT 'related',
+    strength REAL DEFAULT 1.0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (from_id, to_id),
+    FOREIGN KEY (from_id) REFERENCES memories(id) ON DELETE CASCADE,
+    FOREIGN KEY (to_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+
+-- Memory tags
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (memory_id, tag),
+    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+
+-- Memory slots (near-term memory)
+CREATE TABLE IF NOT EXISTS memory_slots (
+    agent_id TEXT NOT NULL,
+    slot_index INTEGER NOT NULL,
+    memory_id TEXT,
+    relevance_score REAL,
+    loaded_at TIMESTAMP,
+    PRIMARY KEY (agent_id, slot_index),
+    FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE SET NULL
+);
+
+-- Tasks
+CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    agent_id TEXT,
+    parent_task_id TEXT,
+    sop_id TEXT,
+    context TEXT,
+    FOREIGN KEY (parent_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+
+-- SOPs (Standard Operating Procedures)
+CREATE TABLE IF NOT EXISTS sops (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    content TEXT NOT NULL,
+    triggers TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_by TEXT,
+    version INTEGER DEFAULT 1
+);
+
+-- Agents
+CREATE TABLE IF NOT EXISTS agents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    config TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'stopped',
+    container_id TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    stopped_at TIMESTAMP,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+
+-- Usage logs
+CREATE TABLE IF NOT EXISTS usage_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL NOT NULL,
+    operation TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_agent ON usage_logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_logs(session_id);
+
+-- Budget state
+CREATE TABLE IF NOT EXISTS budget_state (
+    agent_id TEXT PRIMARY KEY,
+    daily_spent REAL DEFAULT 0.0,
+    daily_reset_at TIMESTAMP,
+    monthly_spent REAL DEFAULT 0.0,
+    monthly_reset_at TIMESTAMP,
+    total_spent REAL DEFAULT 0.0,
+    is_paused INTEGER DEFAULT 0,
+    pause_reason TEXT
+);
+
+-- Agent sessions
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP,
+    messages TEXT,
+    total_tokens INTEGER DEFAULT 0,
+    total_cost REAL DEFAULT 0.0,
+    FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_agent ON agent_sessions(agent_id);
+";
+
+const MIGRATION_V2: &str = "
+-- Activity logs for observability
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    agent_id TEXT,
+    event_type TEXT NOT NULL,
+    event_data TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_activity_agent ON activity_logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_activity_type ON activity_logs(event_type);
+
+-- Tool execution logs
+CREATE TABLE IF NOT EXISTS tool_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    agent_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    input_data TEXT,
+    output_data TEXT,
+    duration_ms INTEGER,
+    success INTEGER DEFAULT 1,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tool_agent ON tool_logs(agent_id);
+CREATE INDEX IF NOT EXISTS idx_tool_name ON tool_logs(tool_name);
+";
+
+const MIGRATION_V3: &str = "
+-- Scheduled tasks
+CREATE TABLE IF NOT EXISTS schedules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    cron TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    enabled INTEGER DEFAULT 1,
+    last_run TIMESTAMP,
+    run_count INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_agent ON schedules(agent_id);
+CREATE INDEX IF NOT EXISTS idx_schedules_enabled ON schedules(enabled);
+";
+
+const MIGRATION_V4: &str = "
+-- Task messages for conversation threads
+CREATE TABLE IF NOT EXISTS task_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_messages_task ON task_messages(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_messages_timestamp ON task_messages(timestamp);
+";
+
+const MIGRATION_V5: &str = "
+-- Agent chat messages for direct conversations
+CREATE TABLE IF NOT EXISTS agent_chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_agent_chat_agent ON agent_chat_messages(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_chat_timestamp ON agent_chat_messages(timestamp);
+";
+
+const MIGRATION_V6: &str = "
+-- Add cache token columns (SQLite ALTER TABLE is limited, use try-add pattern via separate statements)
+";
+
+// Note: v6 adds columns via ALTER TABLE. In Rust we handle this differently
+// since we can't do try/except like Python. We check if columns exist first.
+
+const MIGRATION_V7: &str = "
+-- Conversations table for agent chat
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    title TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_agent ON conversations(agent_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
+";
+
+const MIGRATION_V8: &str = "
+-- Task queue for harness dispatch
+CREATE TABLE IF NOT EXISTS task_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    harness_response TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status);
+CREATE INDEX IF NOT EXISTS idx_task_queue_agent ON task_queue(agent_id);
+";
+
+const MIGRATION_V9: &str = "
+-- Drop legacy brute-force JSON embeddings table
+DROP TABLE IF EXISTS memory_embeddings_json;
+
+-- Vector embeddings via sqlite-vec (vec0 virtual table)
+-- Uses cosine distance for similarity search
+CREATE VIRTUAL TABLE memory_embeddings USING vec0(
+    memory_id text primary key,
+    embedding float[384] distance_metric=cosine
+);
+";
+
+const MIGRATION_V10: &str = "
+-- Rebuild conversations with multi-participant support
+DROP TABLE IF EXISTS conversations;
+
+CREATE TABLE conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    icon TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_message_at TIMESTAMP
+);
+CREATE INDEX idx_conv_updated ON conversations(updated_at);
+CREATE INDEX idx_conv_last_msg ON conversations(last_message_at);
+
+-- Participants (user or agent) in a conversation
+CREATE TABLE conversation_participants (
+    conversation_id TEXT NOT NULL,
+    participant_type TEXT NOT NULL,
+    participant_id TEXT NOT NULL,
+    joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, participant_type, participant_id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_conv_part_conv ON conversation_participants(conversation_id);
+
+-- Messages in a conversation
+CREATE TABLE conversation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    sender_type TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    sender_name TEXT,
+    content TEXT NOT NULL,
+    message_type TEXT NOT NULL DEFAULT 'message',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_conv_msg_conv ON conversation_messages(conversation_id);
+CREATE INDEX idx_conv_msg_created ON conversation_messages(created_at);
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_memory_db() {
+        let db = Database::open_memory().unwrap();
+        let conn = db.conn();
+
+        // Verify schema version
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "10");
+    }
+
+    #[test]
+    fn test_tables_exist() {
+        let db = Database::open_memory().unwrap();
+        let conn = db.conn();
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(tables.contains(&"memories".to_string()));
+        assert!(tables.contains(&"tasks".to_string()));
+        assert!(tables.contains(&"agents".to_string()));
+        assert!(tables.contains(&"schedules".to_string()));
+        assert!(tables.contains(&"activity_logs".to_string()));
+        assert!(tables.contains(&"task_queue".to_string()));
+        assert!(tables.contains(&"conversations".to_string()));
+        assert!(tables.contains(&"conversation_participants".to_string()));
+        assert!(tables.contains(&"conversation_messages".to_string()));
+    }
+}

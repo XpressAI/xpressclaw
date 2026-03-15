@@ -1,0 +1,28 @@
+[package]
+name = "xpressclaw-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Axum REST API server for xpressclaw"
+
+[dependencies]
+xpressclaw-core = { path = "../xpressclaw-core" }
+tokio = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+async-stream = "0.3"
+rust-embed = { workspace = true }
+
+[dev-dependencies]
+http-body-util = "0.1"

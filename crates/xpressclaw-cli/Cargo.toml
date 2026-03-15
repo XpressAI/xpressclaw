@@ -1,0 +1,25 @@
+[package]
+name = "xpressclaw-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for xpressclaw — the AI agent OS"
+
+[[bin]]
+name = "xpressclaw"
+path = "src/main.rs"
+
+[dependencies]
+xpressclaw-core = { path = "../xpressclaw-core" }
+xpressclaw-server = { path = "../xpressclaw-server" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+urlencoding = "2"

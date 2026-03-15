@@ -1,6 +1,34 @@
-__pycache__
-*.pyc
+# Rust
+/target/
+**/*.rs.bk
 
+# Python (harness containers)
+__pycache__/
+*.pyc
+.venv/
+
+# Node (frontend)
+node_modules/
+frontend/build/
+frontend/.svelte-kit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / temp
 .coverage
 temp/
-.idea/
+
+# xpressclaw runtime
+.xpressclaw/
+
+# Models (too large for git)
+models/*.onnx
+models/*.gguf
