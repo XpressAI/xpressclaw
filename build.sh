@@ -32,11 +32,11 @@ if command -v docker &>/dev/null; then
     if command -v docker-buildx &>/dev/null || docker buildx version &>/dev/null 2>&1; then
         docker buildx bake
     else
-        docker build -t xpressclaw-harness-base ./base
-        docker build -t xpressclaw-harness-generic ./generic
-        docker build -t xpressclaw-harness-claude-sdk ./claude-sdk
-        docker build -t xpressclaw-harness-langchain ./langchain
-        docker build -t xpressclaw-harness-xaibo ./xaibo
+        docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest ./base
+        docker build -t ghcr.io/xpressai/xpressclaw-harness-generic:latest ./generic
+        docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest ./claude-sdk
+        docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest ./langchain
+        docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest ./xaibo
     fi
     cd ..
 else
