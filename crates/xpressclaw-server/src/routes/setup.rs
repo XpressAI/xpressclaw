@@ -234,6 +234,10 @@ mod tests {
 
     use super::*;
 
+    fn test_config_path() -> std::path::PathBuf {
+        std::env::temp_dir().join("test-xpressclaw-setup.yaml")
+    }
+
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
@@ -241,7 +245,7 @@ mod tests {
             config,
             db,
             llm_router: None,
-            config_path: std::path::PathBuf::from("/tmp/test-xpressclaw-setup.yaml"),
+            config_path: test_config_path(),
             setup_complete: false,
         };
 
@@ -367,9 +371,9 @@ mod tests {
         assert_eq!(body["success"], true);
 
         // Verify config was written
-        let config_path = std::path::Path::new("/tmp/test-xpressclaw-setup.yaml");
+        let config_path = test_config_path();
         assert!(config_path.exists());
-        let config = Config::load(config_path).unwrap();
+        let config = Config::load(&config_path).unwrap();
         assert_eq!(config.llm.default_provider, "local");
         assert_eq!(config.agents[0].name, "atlas");
 
