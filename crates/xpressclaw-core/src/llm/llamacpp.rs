@@ -386,30 +386,132 @@ impl LlmProvider for LlamaCppProvider {
     }
 
     async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
-        // For now, wrap the non-streaming response as a single chunk.
-        // True token-by-token streaming can be added later.
-        let resp = self.chat(request).await?;
-        let chunk = super::router::ChatCompletionChunk {
-            id: resp.id,
-            object: "chat.completion.chunk".into(),
-            created: resp.created,
-            model: resp.model,
-            choices: resp
-                .choices
-                .into_iter()
-                .map(|c| super::router::ChunkChoice {
-                    index: c.index,
-                    delta: super::router::ChunkDelta {
-                        role: Some(c.message.role),
-                        content: Some(c.message.content),
-                    },
-                    finish_reason: c.finish_reason,
-                })
-                .collect(),
-        };
-        Ok(Box::pin(futures_util::stream::once(
-            async move { Ok(chunk) },
-        )))
+        let prompt = self.format_prompt(&request.messages)?;
+        let max_tokens = request.max_tokens.unwrap_or(256) as i32;
+        let temperature = request.temperature.unwrap_or(0.8) as f32;
+
+        let model = self.model.clone();
+        let backend = self.backend.clone();
+        let model_name = self.model_name.clone();
+        let context_length = self.context_length;
+        let id = format!("llamacpp-{}", uuid::Uuid::new_v4());
+        let created = chrono::Utc::now().timestamp();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<super::router::ChatCompletionChunk>>(32);
+
+        let id_clone = id.clone();
+        let model_name_clone = model_name.clone();
+        tokio::task::spawn_blocking(move || {
+            let send_chunk = |content: String, finish: Option<String>| {
+                let chunk = super::router::ChatCompletionChunk {
+                    id: id_clone.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model_name_clone.clone(),
+                    choices: vec![super::router::ChunkChoice {
+                        index: 0,
+                        delta: super::router::ChunkDelta {
+                            role: None,
+                            content: if content.is_empty() { None } else { Some(content) },
+                        },
+                        finish_reason: finish,
+                    }],
+                };
+                let _ = tx.blocking_send(Ok(chunk));
+            };
+
+            // Create context
+            let ctx_params =
+                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(context_length));
+            let mut ctx = match model.new_context(&backend, ctx_params) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Error::Llm(format!("context failed: {e}"))));
+                    return;
+                }
+            };
+
+            let tokens_list = match model.str_to_token(&prompt, AddBos::Never) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(Error::Llm(format!("tokenize failed: {e}"))));
+                    return;
+                }
+            };
+
+            let n_ctx = ctx.n_ctx() as i32;
+            let max_tokens = max_tokens.min(n_ctx - tokens_list.len() as i32);
+            if max_tokens <= 0 {
+                let _ = tx.blocking_send(Err(Error::Llm("prompt fills entire context".into())));
+                return;
+            }
+            let n_len = tokens_list.len() as i32 + max_tokens;
+
+            let batch_size = tokens_list.len().max(512);
+            let mut batch = LlamaBatch::new(batch_size, 1);
+            let last_index = (tokens_list.len() - 1) as i32;
+            for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
+                let _ = batch.add(token, i, &[0], i == last_index);
+            }
+            if ctx.decode(&mut batch).is_err() {
+                let _ = tx.blocking_send(Err(Error::Llm("prompt decode failed".into())));
+                return;
+            }
+
+            let mut sampler = if temperature > 0.0 {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
+                    LlamaSampler::top_k(40),
+                    LlamaSampler::min_p(0.05, 1),
+                    LlamaSampler::temp(temperature),
+                    LlamaSampler::dist(1234),
+                ])
+            } else {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
+                    LlamaSampler::greedy(),
+                ])
+            };
+
+            let mut n_cur = batch.n_tokens();
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            let mut full_output = String::new();
+
+            while n_cur <= n_len {
+                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+
+                if model.is_eog_token(token) {
+                    break;
+                }
+
+                let piece = match model.token_to_piece(token, &mut decoder, true, None) {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                full_output.push_str(&piece);
+
+                // Send token immediately
+                send_chunk(piece, None);
+
+                if full_output.ends_with("<|im_end|>") {
+                    break;
+                }
+
+                batch.clear();
+                let _ = batch.add(token, n_cur, &[0], true);
+                n_cur += 1;
+                if ctx.decode(&mut batch).is_err() {
+                    break;
+                }
+            }
+
+            // Send final chunk with finish_reason
+            send_chunk(String::new(), Some("stop".into()));
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Box::pin(stream))
     }
 
     fn models(&self) -> Vec<ModelInfo> {

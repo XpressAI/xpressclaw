@@ -175,8 +175,28 @@
 	}
 
 	function renderContent(content: string): string {
+		let result = content;
+
+		// Complete thinking block: <think>...</think> → collapsible
+		result = result.replace(/<think>([\s\S]*?)<\/think>/g, (_match: string, thinking: string) => {
+			const trimmed = thinking.trim();
+			if (!trimmed) return '';
+			const escaped = trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+			return `<details class="mb-2 rounded border border-border/50 bg-muted/30 text-xs"><summary class="cursor-pointer px-2 py-1 text-muted-foreground select-none">Thinking...</summary><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`;
+		});
+
+		// Incomplete thinking block while streaming: <think>... (no closing tag)
+		result = result.replace(/<think>([\s\S]*)$/g, (_match: string, thinking: string) => {
+			const trimmed = thinking.trim();
+			if (!trimmed) return '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
+			const escaped = trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+			return `<div class="mb-2 rounded border border-border/50 bg-muted/30 text-xs"><div class="px-2 py-1 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`;
+		});
+
 		// Replace @[AGENT:id:name] with styled badges
-		return content.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '<span class="inline-block rounded bg-blue-500/20 text-blue-400 px-1 text-xs font-medium">@$2</span>');
+		result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '<span class="inline-block rounded bg-blue-500/20 text-blue-400 px-1 text-xs font-medium">@$2</span>');
+
+		return result;
 	}
 
 	function isThinking(agentId: string): boolean {
