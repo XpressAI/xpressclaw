@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/XpressAI/xpressclaw/main/docs/assets/xpressclaw-banner.png" alt="xpressclaw" width="600">
+  <img src="https://raw.githubusercontent.com/XpressAI/xpressclaw/main/docs/assets/xpressclaw-banner.jpeg" alt="xpressclaw" width="600">
 </p>
 
 <h3 align="center">Collaborative Local Agent Workspace</h3>
