@@ -26,7 +26,7 @@ pub fn routes() -> Router<AppState> {
 async fn budget_summary(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(state.db.clone(), state.config.system.budget.clone());
+    let mgr = BudgetManager::new(state.db.clone(), state.config().system.budget.clone());
     let summary = mgr.get_summary(None).map_err(internal_error)?;
 
     // Per-agent breakdown
@@ -60,7 +60,7 @@ async fn agent_budget(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mgr = BudgetManager::new(state.db.clone(), state.config.system.budget.clone());
+    let mgr = BudgetManager::new(state.db.clone(), state.config().system.budget.clone());
     let summary = mgr.get_summary(Some(&agent_id)).map_err(internal_error)?;
     Ok(Json(json!(summary)))
 }
@@ -103,13 +103,13 @@ mod tests {
     fn test_app() -> (Arc<Database>, Router) {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
+        let state = AppState::new(
             config,
-            db: db.clone(),
-            llm_router: None,
-            config_path: std::path::PathBuf::from("test.yaml"),
-            setup_complete: true,
-        };
+            db.clone(),
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
         let router = Router::new().nest("/budget", routes()).with_state(state);
         (db, router)
     }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -5,11 +7,14 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use tracing::{info, warn};
 use xpressclaw_core::agents::presets::PRESETS;
+use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::config::{AgentConfig, Config, LlmConfig, McpServerConfig};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
-use xpressclaw_core::llm::local::detect_ollama;
+use xpressclaw_core::llm::local::{detect_ollama, LocalProvider};
 use xpressclaw_core::llm::openai::OpenAiProvider;
+use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::system;
 
 use crate::state::AppState;
@@ -24,11 +29,41 @@ pub fn routes() -> Router<AppState> {
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
+        .route("/config", get(get_config))
+}
+
+/// Return the current live configuration (sanitized — no API keys).
+async fn get_config(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config();
+    Json(json!({
+        "llm": {
+            "default_provider": config.llm.default_provider,
+            "has_openai_key": config.llm.openai_api_key.is_some(),
+            "openai_base_url": config.llm.openai_base_url,
+            "has_anthropic_key": config.llm.anthropic_api_key.is_some(),
+            "local_model": config.llm.local_model,
+        },
+        "agents": config.agents.iter().map(|a| json!({
+            "name": a.name,
+            "backend": a.backend,
+            "role": a.role,
+            "model": a.model,
+            "tools": a.tools,
+        })).collect::<Vec<_>>(),
+        "system": {
+            "budget": {
+                "daily": config.system.budget.daily,
+                "monthly": config.system.budget.monthly,
+                "on_exceeded": config.system.budget.on_exceeded,
+            },
+        },
+        "mcp_servers": config.mcp_servers.keys().collect::<Vec<_>>(),
+    }))
 }
 
 /// Check whether setup has been completed.
 async fn setup_status(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "setup_complete": state.setup_complete }))
+    Json(json!({ "setup_complete": state.is_setup_complete() }))
 }
 
 /// Check if Docker/Podman is available.
@@ -204,8 +239,67 @@ async fn complete_setup(
         ..Default::default()
     };
 
-    // Save config
+    // Save config to disk
     config.save(&state.config_path).map_err(internal_error)?;
+    info!(path = %state.config_path.display(), "saved configuration");
+
+    // Apply config immediately — register agents and build LLM router
+    let config = Arc::new(config);
+
+    // Register agents in the database
+    let registry = AgentRegistry::new(state.db.clone());
+    for agent_config in &config.agents {
+        let mut agent_json = serde_json::Map::new();
+        if !agent_config.role.is_empty() {
+            agent_json.insert(
+                "role".into(),
+                serde_json::Value::String(agent_config.role.clone()),
+            );
+        }
+        if let Some(ref model) = agent_config.model {
+            agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+
+        match registry.register(&RegisterAgent {
+            name: agent_config.name.clone(),
+            backend: agent_config.backend.clone(),
+            config: serde_json::Value::Object(agent_json),
+        }) {
+            Ok(record) => info!(
+                name = record.name,
+                backend = record.backend,
+                "registered agent"
+            ),
+            Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
+        }
+    }
+
+    // Build LLM router from the new config
+    let llm_router = {
+        let mut router = LlmRouter::new(&config.llm);
+
+        if let Some(ref key) = config.llm.openai_api_key {
+            let provider =
+                OpenAiProvider::new(Some(key.clone()), config.llm.openai_base_url.clone());
+            router.register_provider("openai", Arc::new(provider));
+        }
+
+        if let Some(ref key) = config.llm.anthropic_api_key {
+            let provider = AnthropicProvider::new(key.clone());
+            router.register_provider("anthropic", Arc::new(provider));
+        }
+
+        if let Some(ref model) = config.llm.local_model {
+            let provider = LocalProvider::ollama(model.clone());
+            router.register_provider("local", Arc::new(provider));
+        }
+
+        router
+    };
+
+    // Swap the live state so all handlers see the new config
+    state.apply_config(config, Some(Arc::new(llm_router)));
+    info!("configuration applied — setup complete");
 
     Ok(Json(json!({
         "success": true,
@@ -241,13 +335,7 @@ mod tests {
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
-            config,
-            db,
-            llm_router: None,
-            config_path: test_config_path(),
-            setup_complete: false,
-        };
+        let state = AppState::new(config, db, None, test_config_path(), false);
 
         Router::new().nest("/setup", routes()).with_state(state)
     }

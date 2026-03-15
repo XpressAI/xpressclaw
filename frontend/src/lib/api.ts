@@ -444,8 +444,22 @@ export interface AgentPreset {
 	default_tools: string[];
 }
 
+export interface LiveConfig {
+	llm: {
+		default_provider: string;
+		has_openai_key: boolean;
+		openai_base_url: string | null;
+		has_anthropic_key: boolean;
+		local_model: string | null;
+	};
+	agents: { name: string; backend: string; role: string; model: string | null; tools: string[] }[];
+	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
+	mcp_servers: string[];
+}
+
 export const setup = {
 	status: () => request<SetupStatus>('/api/setup/status'),
+	getConfig: () => request<LiveConfig>('/api/setup/config'),
 	checkDocker: () => request<DockerStatus>('/api/setup/check-docker'),
 	systemInfo: () => request<SystemInfo>('/api/setup/system-info'),
 	checkOllama: () => request<OllamaInfo>('/api/setup/check-ollama'),

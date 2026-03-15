@@ -173,7 +173,7 @@ async fn send_message(
         .resolve_target_agents(&conv_id, &req.content)
         .map_err(internal_error)?;
 
-    if let Some(llm_router) = &state.llm_router {
+    if let Some(llm_router) = state.llm_router() {
         let registry = AgentRegistry::new(state.db.clone());
 
         for agent_id in &target_agents {
@@ -303,7 +303,7 @@ async fn stream_message(
         .resolve_target_agents(&conv_id, &req.content)
         .map_err(internal_error)?;
 
-    let llm_router = state.llm_router.clone();
+    let llm_router = state.llm_router();
     let db = state.db.clone();
 
     let stream = async_stream::stream! {
@@ -539,13 +539,13 @@ mod tests {
             .unwrap();
         });
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
+        let state = AppState::new(
             config,
             db,
-            llm_router: None,
-            config_path: std::path::PathBuf::from("test.yaml"),
-            setup_complete: true,
-        };
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
 
         Router::new()
             .nest("/conversations", routes())

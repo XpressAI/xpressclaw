@@ -20,7 +20,7 @@ pub async fn run(detach: bool, port: u16) -> anyhow::Result<()> {
 async fn run_foreground(port: u16) -> anyhow::Result<()> {
     let state = build_state(port).await?;
 
-    if !state.setup_complete {
+    if !state.is_setup_complete() {
         println!("xpressclaw is starting in setup mode...");
         println!();
         println!("  Open http://localhost:{port} to complete setup.");
@@ -33,11 +33,11 @@ async fn run_foreground(port: u16) -> anyhow::Result<()> {
         println!("  LLM:    http://localhost:{port}/v1");
 
         // Check LLM availability
-        if state.config.llm.openai_api_key.is_some() || state.config.llm.anthropic_api_key.is_some()
-        {
+        let config = state.config();
+        if config.llm.openai_api_key.is_some() || config.llm.anthropic_api_key.is_some() {
             println!("  LLM:    cloud provider configured");
-        } else if state.config.llm.local_model.is_some() {
-            let model = state.config.llm.local_model.as_deref().unwrap_or("unknown");
+        } else if config.llm.local_model.is_some() {
+            let model = config.llm.local_model.as_deref().unwrap_or("unknown");
             match reqwest::get("http://localhost:11434/api/tags").await {
                 Ok(resp) if resp.status().is_success() => {
                     println!("  LLM:    Ollama ({model})");
@@ -136,13 +136,13 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         std::fs::create_dir_all(&config.system.data_dir).ok();
         let db = Arc::new(Database::open(&db_path)?);
 
-        return Ok(AppState {
-            config: Arc::new(config),
+        return Ok(AppState::new(
+            Arc::new(config),
             db,
-            llm_router: None,
+            None,
             config_path,
-            setup_complete: false,
-        });
+            false,
+        ));
     }
 
     // Load config
@@ -224,11 +224,11 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
 
     let _ = port; // available for future use (e.g., logging)
 
-    Ok(AppState {
+    Ok(AppState::new(
         config,
         db,
-        llm_router: Some(Arc::new(llm_router)),
+        Some(Arc::new(llm_router)),
         config_path,
-        setup_complete: true,
-    })
+        true,
+    ))
 }

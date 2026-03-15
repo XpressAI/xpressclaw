@@ -710,12 +710,8 @@
 			</div>
 			<h2 class="text-lg font-semibold text-foreground mb-2">Setup Complete!</h2>
 			<p class="text-sm text-muted-foreground mb-6">
-				Your xpressclaw configuration has been saved. Restart the server to load the new configuration.
+				Your configuration has been saved and applied. You're ready to go!
 			</p>
-
-			<div class="rounded-lg border border-border bg-background p-4 text-left text-sm font-mono text-muted-foreground mb-6">
-				<div class="text-foreground">$ xpressclaw down && xpressclaw up</div>
-			</div>
 
 			<button
 				onclick={() => goto('/dashboard')}
