@@ -109,13 +109,13 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
         std::fs::create_dir_all(&config.system.data_dir).ok();
         let db = Arc::new(Database::open(&db_path)?);
 
-        return Ok(AppState {
-            config: Arc::new(config),
+        return Ok(AppState::new(
+            Arc::new(config),
             db,
-            llm_router: None,
+            None,
             config_path,
-            setup_complete: false,
-        });
+            false,
+        ));
     }
 
     let mut config = Config::load_default()?;
@@ -196,11 +196,11 @@ async fn build_state(port: u16) -> anyhow::Result<AppState> {
 
     let _ = port;
 
-    Ok(AppState {
+    Ok(AppState::new(
         config,
         db,
-        llm_router: Some(Arc::new(llm_router)),
+        Some(Arc::new(llm_router)),
         config_path,
-        setup_complete: true,
-    })
+        true,
+    ))
 }

@@ -20,7 +20,7 @@ async fn chat_completions(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let router = state.llm_router.as_ref().ok_or_else(|| {
+    let router = state.llm_router().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "LLM router not configured" })),
@@ -40,7 +40,7 @@ async fn chat_completions(
 async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let router = state.llm_router.as_ref().ok_or_else(|| {
+    let router = state.llm_router().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "LLM router not configured" })),

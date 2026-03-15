@@ -221,13 +221,13 @@ mod tests {
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
+        let state = AppState::new(
             config,
             db,
-            llm_router: None,
-            config_path: std::path::PathBuf::from("test.yaml"),
-            setup_complete: true,
-        };
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
 
         Router::new().nest("/agents", routes()).with_state(state)
     }

@@ -118,13 +118,13 @@ mod tests {
     fn test_app() -> (Arc<Database>, Router) {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
+        let state = AppState::new(
             config,
-            db: db.clone(),
-            llm_router: None,
-            config_path: std::path::PathBuf::from("test.yaml"),
-            setup_complete: true,
-        };
+            db.clone(),
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
         let router = Router::new().nest("/activity", routes()).with_state(state);
         (db, router)
     }

@@ -145,7 +145,7 @@ async fn memory_stats(
 }
 
 fn memory_manager(state: &AppState) -> MemoryManager {
-    MemoryManager::new(state.db.clone(), &state.config.memory.eviction)
+    MemoryManager::new(state.db.clone(), &state.config().memory.eviction)
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -179,13 +179,13 @@ mod tests {
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState {
+        let state = AppState::new(
             config,
             db,
-            llm_router: None,
-            config_path: std::path::PathBuf::from("test.yaml"),
-            setup_complete: true,
-        };
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
 
         Router::new().nest("/memory", routes()).with_state(state)
     }

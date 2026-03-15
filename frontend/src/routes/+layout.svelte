@@ -99,9 +99,7 @@
 		<aside class="flex w-60 flex-col border-r border-border bg-card">
 			<!-- Header -->
 			<div class="flex h-14 items-center gap-2 border-b border-border px-4">
-				<div class="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground text-sm font-bold">
-					x
-				</div>
+				<img src="/icon-32.png" alt="xpressclaw" class="h-7 w-7 rounded-md" />
 				<span class="text-sm font-semibold">xpressclaw</span>
 			</div>
 
