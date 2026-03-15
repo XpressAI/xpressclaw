@@ -189,7 +189,7 @@ impl LlamaCppProvider {
             backend: Arc::new(backend),
             model: Arc::new(model),
             model_name,
-            context_length: 262144,
+            context_length: 262_144,
         })
     }
 
@@ -272,8 +272,9 @@ impl LlamaCppProvider {
         }
         let n_len = tokens_list.len() as i32 + max_tokens;
 
-        // Feed prompt tokens into a batch
-        let mut batch = LlamaBatch::new(512, 1);
+        // Feed prompt tokens into a batch (size must fit the prompt)
+        let batch_size = tokens_list.len().max(512);
+        let mut batch = LlamaBatch::new(batch_size, 1);
         let last_index = (tokens_list.len() - 1) as i32;
         for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
             batch

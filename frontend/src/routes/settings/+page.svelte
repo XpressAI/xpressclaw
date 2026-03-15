@@ -44,8 +44,15 @@
 	{#if config}
 		<!-- LLM Providers -->
 		<div class="rounded-lg border border-border bg-card p-4 space-y-3">
-			<h2 class="text-sm font-semibold">LLM Providers</h2>
-			<p class="text-xs text-muted-foreground">Available providers. Each agent selects its own model.</p>
+			<div class="flex justify-between items-center">
+				<div>
+					<h2 class="text-sm font-semibold">LLM Providers</h2>
+					<p class="text-xs text-muted-foreground">Available providers. Each agent selects its own model.</p>
+				</div>
+				<a href="/setup" class="text-xs text-primary hover:text-primary/80 border border-border rounded-md px-3 py-1.5 hover:bg-accent transition-colors">
+					Change
+				</a>
+			</div>
 			<dl class="space-y-2 text-sm">
 				<div class="flex justify-between">
 					<dt class="text-muted-foreground">Default provider</dt>
