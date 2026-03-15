@@ -68,6 +68,9 @@ jobs:
       - name: Install tauri-cli
         run: cargo install tauri-cli --version "^2"
 
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
       - name: Build Tauri app
         run: cargo tauri build --target ${{ matrix.target }}
 
