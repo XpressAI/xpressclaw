@@ -7,15 +7,13 @@ mod tray;
 use std::sync::Mutex;
 
 use tauri::Manager;
-use tauri_plugin_shell::process::{CommandChild, CommandEvent};
-use tauri_plugin_shell::ShellExt;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8935;
 
 /// Holds the sidecar child process for cleanup on exit.
-struct SidecarState(Mutex<Option<CommandChild>>);
+struct SidecarState(Mutex<Option<std::process::Child>>);
 
 fn main() {
     tracing_subscriber::fmt()
@@ -63,51 +61,48 @@ fn main() {
             std::fs::create_dir_all(&data_dir).ok();
             let workdir = data_dir.to_string_lossy().to_string();
 
-            // Spawn the CLI binary as a sidecar
-            let sidecar = app
-                .shell()
-                .sidecar("xpressclaw")
-                .expect("failed to create sidecar command")
-                .args(["up", "--port", &port.to_string(), "--workdir", &workdir]);
+            // Resolve the sidecar binary path
+            let sidecar_path = app
+                .path()
+                .resource_dir()
+                .ok()
+                .map(|d| d.join("binaries").join("xpressclaw"))
+                .filter(|p| p.exists())
+                .or_else(|| {
+                    // Dev mode: look in the binaries/ directory next to the Tauri manifest
+                    let target_triple = if cfg!(target_arch = "x86_64") {
+                        "x86_64-apple-darwin"
+                    } else {
+                        "aarch64-apple-darwin"
+                    };
+                    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("binaries")
+                        .join(format!("xpressclaw-{target_triple}"));
+                    if dev_path.exists() { Some(dev_path) } else { None }
+                })
+                .expect("sidecar binary not found");
 
-            let (mut rx, child) = sidecar.spawn().expect("failed to spawn sidecar");
+            info!(path = %sidecar_path.display(), "launching sidecar");
 
-            info!(pid = child.pid(), "sidecar spawned");
+            // Spawn with a clean environment to avoid inheriting Metal/GPU state
+            // from the Tauri process that can cause segfaults in the child.
+            let child = std::process::Command::new(&sidecar_path)
+                .args(["up", "--port", &port.to_string(), "--workdir", &workdir])
+                .env_clear()
+                .env("HOME", std::env::var("HOME").unwrap_or_default())
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("USER", std::env::var("USER").unwrap_or_default())
+                .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("failed to spawn sidecar");
+
+            info!(pid = child.id(), "sidecar spawned");
 
             // Store child handle for cleanup on exit
             let state = app.state::<SidecarState>();
             *state.0.lock().unwrap() = Some(child);
-
-            // Forward sidecar stdout/stderr to our logs
-            let handle_for_logs = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        CommandEvent::Stdout(line) => {
-                            let msg = String::from_utf8_lossy(&line);
-                            info!(target: "sidecar", "{}", msg.trim());
-                        }
-                        CommandEvent::Stderr(line) => {
-                            let msg = String::from_utf8_lossy(&line);
-                            info!(target: "sidecar", "{}", msg.trim());
-                        }
-                        CommandEvent::Terminated(payload) => {
-                            error!(
-                                code = ?payload.code,
-                                signal = ?payload.signal,
-                                "sidecar terminated"
-                            );
-                            if let Some(tray) = handle_for_logs.tray_by_id("main-tray") {
-                                let _ = tray.set_tooltip(Some("xpressclaw - Server stopped"));
-                            }
-                        }
-                        CommandEvent::Error(e) => {
-                            error!(target: "sidecar", "error: {e}");
-                        }
-                        _ => {}
-                    }
-                }
-            });
 
             // Wait for server to be ready, then show the window
             let handle = app.handle().clone();
@@ -132,9 +127,15 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("error building xpressclaw desktop app")
-        .run(move |_app, event| {
+        .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                info!("app exiting, sidecar will be cleaned up by OS");
+                let mut child = {
+                    app.state::<SidecarState>().0.lock().unwrap().take()
+                };
+                if let Some(ref mut child) = child {
+                    info!("killing sidecar");
+                    let _ = child.kill();
+                }
             }
         });
 }

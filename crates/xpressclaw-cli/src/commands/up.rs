@@ -124,6 +124,21 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
 
 /// Build the AppState (shared between foreground and detached modes).
 async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppState> {
+    // Dump environment for debugging sidecar issues
+    for (key, value) in std::env::vars() {
+        if key.starts_with("MTL")
+            || key.starts_with("METAL")
+            || key.starts_with("__")
+            || key.starts_with("DYLD")
+            || key.starts_with("GGML")
+            || key.starts_with("LLAMA")
+            || key.contains("GPU")
+            || key.contains("TAURI")
+        {
+            info!(key = key, value = value, "env");
+        }
+    }
+
     let work_dir = match workdir {
         Some(dir) => std::path::PathBuf::from(dir),
         None => std::env::current_dir().unwrap_or_default(),
