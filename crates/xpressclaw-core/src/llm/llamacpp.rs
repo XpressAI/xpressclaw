@@ -175,8 +175,10 @@ impl LlamaCppProvider {
 
         tracing::info!(path = %path.display(), "loading GGUF model");
 
-        let backend = LlamaBackend::init()
-            .map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?;
+        let backend = Arc::new(
+            LlamaBackend::init()
+                .map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?,
+        );
 
         let params = {
             let p = LlamaModelParams::default();
@@ -184,27 +186,30 @@ impl LlamaCppProvider {
             let p = p.with_n_gpu_layers(0);
             p
         };
-        let model = LlamaModel::load_from_file(&backend, path, &params)
-            .map_err(|e| Error::Llm(format!("failed to load model: {e}")))?;
+        let model = Arc::new(
+            LlamaModel::load_from_file(&backend, path, &params)
+                .map_err(|e| Error::Llm(format!("failed to load model: {e}")))?,
+        );
 
         let context_length = DEFAULT_CONTEXT_LENGTH;
 
-        // Create context on the SAME thread as the model to avoid Metal threading issues.
+        // Create context from the Arc'd model/backend so the internal pointers
+        // remain valid when the struct is moved or accessed from other threads.
         let ctx_params =
             LlamaContextParams::default().with_n_ctx(NonZeroU32::new(context_length));
         let ctx = model
             .new_context(&backend, ctx_params)
             .map_err(|e| Error::Llm(format!("context creation failed: {e}")))?;
 
-        // SAFETY: We hold the backend and model in Arcs that outlive the context.
-        // The Mutex ensures the context is only accessed by one thread at a time.
+        // SAFETY: The context borrows from model and backend which live in Arcs
+        // stored in the same struct — they won't move or be dropped before the context.
         let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
 
         tracing::info!(model = model_name, n_ctx = context_length, "GGUF model loaded");
 
         Ok(Self {
-            backend: Arc::new(backend),
-            model: Arc::new(model),
+            backend,
+            model,
             ctx: Mutex::new(ctx),
             model_name,
             context_length,
