@@ -107,7 +107,11 @@ mod tests {
     #[test]
     fn test_preset_has_role() {
         for preset in PRESETS {
-            assert!(!preset.role.is_empty(), "preset {} has empty role", preset.id);
+            assert!(
+                !preset.role.is_empty(),
+                "preset {} has empty role",
+                preset.id
+            );
         }
     }
 }

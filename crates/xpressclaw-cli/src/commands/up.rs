@@ -33,8 +33,7 @@ async fn run_foreground(port: u16) -> anyhow::Result<()> {
         println!("  LLM:    http://localhost:{port}/v1");
 
         // Check LLM availability
-        if state.config.llm.openai_api_key.is_some()
-            || state.config.llm.anthropic_api_key.is_some()
+        if state.config.llm.openai_api_key.is_some() || state.config.llm.anthropic_api_key.is_some()
         {
             println!("  LLM:    cloud provider configured");
         } else if state.config.llm.local_model.is_some() {

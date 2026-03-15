@@ -281,10 +281,7 @@ async fn stream_message(
     State(state): State<AppState>,
     Path(conv_id): Path<String>,
     Json(req): Json<SendMessageInput>,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, Infallible>>>,
-    (StatusCode, Json<Value>),
-> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
 
     // Store user message

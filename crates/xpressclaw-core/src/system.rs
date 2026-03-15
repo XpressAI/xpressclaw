@@ -165,7 +165,10 @@ fn detect_gpu_macos() -> GpuInfo {
 fn detect_gpu_linux() -> GpuInfo {
     // Check for NVIDIA
     if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
     {
         if output.status.success() {

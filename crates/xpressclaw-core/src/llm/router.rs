@@ -123,9 +123,9 @@ pub trait LlmProvider: Send + Sync {
                 })
                 .collect(),
         };
-        Ok(Box::pin(futures_util::stream::once(async move {
-            Ok(chunk)
-        })))
+        Ok(Box::pin(futures_util::stream::once(
+            async move { Ok(chunk) },
+        )))
     }
 
     /// List available models.

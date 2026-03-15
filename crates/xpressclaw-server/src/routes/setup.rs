@@ -149,7 +149,10 @@ async fn complete_setup(
             None
         },
         local_model: if req.llm.provider == "local" || req.llm.provider == "ollama" {
-            req.llm.local_model.clone().or(Some("qwen3.5:latest".into()))
+            req.llm
+                .local_model
+                .clone()
+                .or(Some("qwen3.5:latest".into()))
         } else {
             None
         },
