@@ -12,10 +12,9 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -144,21 +143,19 @@ const DEFAULT_CONTEXT_LENGTH: u32 = 32_768;
 /// Loads a GGUF model in-process and runs inference directly using the llama.cpp
 /// C library (via safe Rust bindings). No external server required.
 ///
-/// The model and context are created on the same thread during initialization
-/// to avoid Metal/GPU threading issues. The context is reused across requests
-/// behind a Mutex (one inference at a time).
+/// A fresh LlamaContext is created per inference call on the calling thread
+/// to satisfy Metal's thread affinity requirements. The model is loaded once
+/// and shared (read-only after loading).
 pub struct LlamaCppProvider {
-    #[allow(dead_code)]
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
-    ctx: Mutex<LlamaContext<'static>>,
     model_name: String,
     context_length: u32,
 }
 
-// SAFETY: LlamaBackend, LlamaModel, and LlamaContext hold raw pointers to C structs.
-// The context is protected by a Mutex ensuring single-threaded access.
-// The model is read-only after loading and safe to share.
+// SAFETY: LlamaBackend and LlamaModel hold raw pointers to thread-safe C structs.
+// The llama.cpp library supports concurrent reads on the model from multiple threads.
+// Each inference call creates its own LlamaContext on the calling thread.
 unsafe impl Send for LlamaCppProvider {}
 unsafe impl Sync for LlamaCppProvider {}
 
@@ -192,25 +189,11 @@ impl LlamaCppProvider {
         );
 
         let context_length = DEFAULT_CONTEXT_LENGTH;
-
-        // Create context from the Arc'd model/backend so the internal pointers
-        // remain valid when the struct is moved or accessed from other threads.
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(context_length));
-        let ctx = model
-            .new_context(&backend, ctx_params)
-            .map_err(|e| Error::Llm(format!("context creation failed: {e}")))?;
-
-        // SAFETY: The context borrows from model and backend which live in Arcs
-        // stored in the same struct — they won't move or be dropped before the context.
-        let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
-
         tracing::info!(model = model_name, n_ctx = context_length, "GGUF model loaded");
 
         Ok(Self {
             backend,
             model,
-            ctx: Mutex::new(ctx),
             model_name,
             context_length,
         })
@@ -268,14 +251,16 @@ impl LlamaCppProvider {
     }
 
     /// Run synchronous inference on the model.
+    ///
+    /// Creates a fresh context on the calling thread to satisfy Metal's
+    /// thread affinity requirements.
     fn generate(&self, prompt: &str, max_tokens: i32, temperature: f32) -> Result<(String, Usage)> {
+        let ctx_params =
+            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.context_length));
         let mut ctx = self
-            .ctx
-            .lock()
-            .map_err(|e| Error::Llm(format!("context lock failed: {e}")))?;
-
-        // Clear KV cache for fresh inference
-        ctx.clear_kv_cache();
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| Error::Llm(format!("context creation failed: {e}")))?;
 
         // Tokenize the prompt (no BOS — Qwen models don't use a BOS token)
         let tokens_list = self
