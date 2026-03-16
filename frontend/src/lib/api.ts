@@ -442,6 +442,8 @@ export interface AgentPreset {
 	role: string;
 	backend: string;
 	default_tools: string[];
+	default_mcp_servers: Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>;
+	recommended_llm: string;
 }
 
 export interface LiveConfig {

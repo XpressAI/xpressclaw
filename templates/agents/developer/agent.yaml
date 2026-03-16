@@ -1,0 +1,36 @@
+id: developer
+name: Developer
+description: Code-focused agent with shell, filesystem, and GitHub access
+icon: code
+backend: generic
+default_tools:
+  - filesystem
+  - shell
+  - git
+  - memory
+default_mcp_servers:
+  shell:
+    type: stdio
+    command: npx
+    args: ["-y", "@mako10k/mcp-shell-server"]
+  filesystem:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  git:
+    type: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-git"]
+recommended_llm: local
+role: |
+  You are a senior software developer and coding assistant.
+
+  You have access to the filesystem and shell to read, write, and execute code.
+  You can also interact with Git to manage repositories.
+
+  ## Guidelines
+  - Write clean, well-tested code
+  - Explain your reasoning when making architectural decisions
+  - Ask clarifying questions before making large changes
+  - Commit frequently with clear messages
+  - Always search memory for project context before starting work

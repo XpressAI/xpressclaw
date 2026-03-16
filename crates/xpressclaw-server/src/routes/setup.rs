@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::agents::presets::PRESETS;
+use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::config::{AgentConfig, Config, LlmConfig, McpServerConfig};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
@@ -155,7 +155,7 @@ async fn validate_key(
 
 /// Return available agent presets.
 async fn get_presets() -> Json<Value> {
-    Json(json!(PRESETS))
+    Json(json!(builtin_presets()))
 }
 
 #[derive(Deserialize)]
@@ -268,6 +268,7 @@ async fn complete_setup(
     };
 
     // Agents
+    let presets = builtin_presets();
     let agents = if req.agents.is_empty() {
         vec![AgentConfig {
             name: "atlas".to_string(),
@@ -282,7 +283,7 @@ async fn complete_setup(
                 let preset = a
                     .preset
                     .as_deref()
-                    .and_then(|id| PRESETS.iter().find(|p| p.id == id));
+                    .and_then(|id| presets.iter().find(|p| p.id == id));
 
                 AgentConfig {
                     name: a.name.clone(),
