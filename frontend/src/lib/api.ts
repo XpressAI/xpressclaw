@@ -452,9 +452,27 @@ export interface LiveConfig {
 		has_anthropic_key: boolean;
 		local_model: string | null;
 	};
-	agents: { name: string; backend: string; role: string; model: string | null; tools: string[] }[];
+	agents: {
+		name: string;
+		backend: string;
+		role: string;
+		model: string | null;
+		tools: string[];
+		volumes: string[];
+		budget?: { daily: string | null; monthly: string | null; on_exceeded: string };
+		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };
+		wake_on?: { schedule: string | null; event: string | null }[];
+	}[];
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
 	mcp_servers: string[];
+}
+
+export interface DownloadStatus {
+	status: 'Idle' | 'Downloading' | 'Complete' | 'Error';
+	filename: string;
+	downloaded_bytes: number;
+	total_bytes: number;
+	error: string | null;
 }
 
 export const setup = {
@@ -471,12 +489,13 @@ export const setup = {
 		}),
 	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
-		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string };
+		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
 		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 	}) =>
-		request<{ success: boolean; config_path: string }>('/api/setup/complete', {
+		request<{ success: boolean; downloading: boolean; config_path: string }>('/api/setup/complete', {
 			method: 'POST',
 			body: JSON.stringify(data)
-		})
+		}),
+	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status')
 };

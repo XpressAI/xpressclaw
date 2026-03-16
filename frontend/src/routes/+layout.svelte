@@ -30,9 +30,6 @@
 
 	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
-	let showNewChat = $state(false);
-	let newChatTitle = $state('');
-	let selectedAgents = $state<Set<string>>(new Set());
 
 	let { children } = $props();
 
@@ -54,26 +51,6 @@
 		const interval = setInterval(loadSidebar, 10000);
 		return () => clearInterval(interval);
 	});
-
-	async function createConversation() {
-		const agentIds = [...selectedAgents];
-		const conv = await conversations.create({
-			title: newChatTitle || undefined,
-			participant_ids: agentIds
-		});
-		showNewChat = false;
-		newChatTitle = '';
-		selectedAgents = new Set();
-		await loadSidebar();
-		goto(`/conversations/${conv.id}`);
-	}
-
-	function toggleAgent(id: string) {
-		const next = new Set(selectedAgents);
-		if (next.has(id)) next.delete(id);
-		else next.add(id);
-		selectedAgents = next;
-	}
 
 	function convIcon(conv: Conversation): string {
 		if (conv.icon) return conv.icon;
@@ -106,47 +83,12 @@
 			<!-- Conversations Section -->
 			<div class="flex items-center justify-between px-3 pt-3 pb-1">
 				<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Conversations</span>
-				<button
-					onclick={() => (showNewChat = !showNewChat)}
+				<a
+					href="/"
 					class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground text-sm"
 					title="New conversation"
-				>+</button>
+				>+</a>
 			</div>
-
-			{#if showNewChat}
-				<div class="mx-2 mb-2 rounded-lg border border-border bg-background p-2 space-y-2">
-					<input
-						type="text"
-						bind:value={newChatTitle}
-						placeholder="Conversation name..."
-						class="w-full rounded-md border border-border bg-card px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-					/>
-					<div class="text-xs text-muted-foreground">Add agents:</div>
-					<div class="space-y-1 max-h-28 overflow-y-auto">
-						{#each agentList as agent}
-							<label class="flex items-center gap-2 text-xs cursor-pointer hover:bg-accent/50 rounded px-1 py-0.5">
-								<input
-									type="checkbox"
-									checked={selectedAgents.has(agent.id)}
-									onchange={() => toggleAgent(agent.id)}
-									class="rounded border-border"
-								/>
-								<span class="truncate">{agent.name}</span>
-							</label>
-						{/each}
-					</div>
-					<div class="flex gap-1">
-						<button
-							onclick={createConversation}
-							class="flex-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
-						>Create</button>
-						<button
-							onclick={() => (showNewChat = false)}
-							class="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
-						>Cancel</button>
-					</div>
-				</div>
-			{/if}
 
 			<!-- Conversation list -->
 			<div class="flex-1 overflow-y-auto px-2 space-y-0.5">

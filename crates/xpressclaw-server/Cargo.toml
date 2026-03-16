@@ -6,8 +6,12 @@ license.workspace = true
 authors.workspace = true
 description = "Axum REST API server for xpressclaw"
 
+[features]
+default = ["local-llm"]
+local-llm = ["xpressclaw-core/local-llm"]
+
 [dependencies]
-xpressclaw-core = { path = "../xpressclaw-core" }
+xpressclaw-core = { path = "../xpressclaw-core", default-features = false }
 tokio = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }

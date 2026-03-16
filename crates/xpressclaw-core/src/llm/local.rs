@@ -102,6 +102,12 @@ impl LocalProvider {
     pub fn ollama(model_name: String) -> Self {
         Self::new("http://localhost:11434".to_string(), model_name)
     }
+
+    /// Create a provider using the config's local_base_url, falling back to Ollama's default.
+    pub fn from_config(model_name: String, base_url: Option<String>) -> Self {
+        let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+        Self::new(url, model_name)
+    }
 }
 
 #[async_trait::async_trait]

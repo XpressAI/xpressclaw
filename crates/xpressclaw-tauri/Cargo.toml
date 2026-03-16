@@ -10,14 +10,10 @@ description = "Tauri native desktop app for xpressclaw"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-xpressclaw-core = { path = "../xpressclaw-core" }
-xpressclaw-server = { path = "../xpressclaw-server" }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 reqwest = { workspace = true }

@@ -17,6 +17,13 @@ cargo build --release
 
 echo "==> Build complete: target/release/xpressclaw"
 
+# Copy CLI binary as Tauri sidecar
+echo "==> Copying CLI binary as Tauri sidecar..."
+TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
+mkdir -p crates/xpressclaw-tauri/binaries
+cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
+
 # Build the desktop app if tauri-cli is installed
 if command -v cargo-tauri &>/dev/null; then
     echo "==> Building Tauri desktop app..."

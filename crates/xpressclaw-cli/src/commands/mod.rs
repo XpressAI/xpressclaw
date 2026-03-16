@@ -33,6 +33,10 @@ pub enum Command {
         /// Port for the web UI and API
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
+
+        /// Working directory (where xpressclaw.yaml lives)
+        #[arg(short, long)]
+        workdir: Option<String>,
     },
 
     /// Stop all agents
@@ -119,7 +123,11 @@ pub enum Command {
 pub async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Init { path } => init::run(&path).await,
-        Command::Up { detach, port } => up::run(detach, port).await,
+        Command::Up {
+            detach,
+            port,
+            workdir,
+        } => up::run(detach, port, workdir).await,
         Command::Down { port } => down::run(port).await,
         Command::Status { port } => status::run(port).await,
         Command::Chat { agent, port } => chat::run(&agent, port).await,
