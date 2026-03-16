@@ -4,6 +4,14 @@
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import { marked } from 'marked';
+	import DOMPurify from 'dompurify';
+
+	// Configure marked for safe rendering
+	marked.setOptions({
+		breaks: true,
+		gfm: true
+	});
 
 	let conv = $state<Conversation | null>(null);
 	let messages = $state<ConversationMessage[]>([]);
@@ -177,24 +185,52 @@
 	function renderContent(content: string): string {
 		let result = content;
 
-		// Complete thinking block: <think>...</think> → collapsible
+		// Extract and replace thinking blocks before markdown parsing
+		const thinkingBlocks: string[] = [];
+
+		// Complete thinking block: <think>...</think> → placeholder
 		result = result.replace(/<think>([\s\S]*?)<\/think>/g, (_match: string, thinking: string) => {
 			const trimmed = thinking.trim();
 			if (!trimmed) return '';
-			const escaped = trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-			return `<details class="mb-2 rounded border border-border/50 bg-muted/30 text-xs"><summary class="cursor-pointer px-2 py-1 text-muted-foreground select-none">Thinking...</summary><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`;
+			const idx = thinkingBlocks.length;
+			thinkingBlocks.push(trimmed);
+			return `%%THINK_${idx}%%`;
 		});
 
 		// Incomplete thinking block while streaming: <think>... (no closing tag)
 		result = result.replace(/<think>([\s\S]*)$/g, (_match: string, thinking: string) => {
 			const trimmed = thinking.trim();
-			if (!trimmed) return '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
-			const escaped = trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
-			return `<div class="mb-2 rounded border border-border/50 bg-muted/30 text-xs"><div class="px-2 py-1 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`;
+			const idx = thinkingBlocks.length;
+			thinkingBlocks.push(trimmed || '');
+			return `%%THINKSTREAM_${idx}%%`;
 		});
 
-		// Replace @[AGENT:id:name] with styled badges
-		result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '<span class="inline-block rounded bg-blue-500/20 text-blue-400 px-1 text-xs font-medium">@$2</span>');
+		// Replace @[AGENT:id:name] before markdown parsing
+		result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '**@$2**');
+
+		// Render markdown
+		result = DOMPurify.sanitize(marked.parse(result) as string, {
+			ADD_TAGS: ['details', 'summary'],
+			ADD_ATTR: ['open']
+		});
+
+		// Restore thinking blocks as styled HTML
+		for (let i = 0; i < thinkingBlocks.length; i++) {
+			const thinking = thinkingBlocks[i];
+			const escaped = DOMPurify.sanitize(marked.parse(thinking) as string);
+
+			// Complete block → collapsible details
+			result = result.replace(
+				`%%THINK_${i}%%`,
+				`<details class="mb-2 rounded border border-border/50 bg-muted/30 text-xs not-prose"><summary class="cursor-pointer px-2 py-1 text-muted-foreground select-none">Thinking...</summary><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`
+			);
+
+			// Streaming block → open with pulse indicator
+			const streamHtml = thinking
+				? `<div class="mb-2 rounded border border-border/50 bg-muted/30 text-xs not-prose"><div class="px-2 py-1 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`
+				: '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
+			result = result.replace(`%%THINKSTREAM_${i}%%`, streamHtml);
+		}
 
 		return result;
 	}
@@ -349,7 +385,7 @@
 							<span class="text-xs font-medium">{msg.sender_name ?? msg.sender_id}</span>
 							<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
 						</div>
-						<div class="rounded-lg px-3 py-2 text-sm {isUser
+						<div class="rounded-lg px-3 py-2 text-sm prose-chat {isUser
 							? 'bg-primary text-primary-foreground'
 							: 'bg-accent text-accent-foreground'} {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
 							{@html renderContent(msg.content)}
@@ -377,7 +413,7 @@
 						<div class="flex items-center gap-2">
 							<span class="text-xs font-medium">{thinkingAgent}</span>
 						</div>
-						<div class="rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground">
+						<div class="rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground prose-chat">
 							{#if streamingContent}
 								{@html renderContent(streamingContent)}<span class="inline-block w-1.5 h-4 bg-foreground/60 animate-pulse ml-0.5 align-text-bottom"></span>
 							{:else}
