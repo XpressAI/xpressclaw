@@ -138,6 +138,21 @@ pub fn download_gguf_with_progress(
 /// Default context length for inference.
 const DEFAULT_CONTEXT_LENGTH: u32 = 32_768;
 
+/// Global LlamaBackend singleton — llama.cpp only allows one backend per process.
+static LLAMA_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+
+fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
+    if let Some(b) = LLAMA_BACKEND.get() {
+        return Ok(b.clone());
+    }
+    let backend =
+        LlamaBackend::init().map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?;
+    let arc = Arc::new(backend);
+    // Another thread might have initialized it between get() and here — that's fine.
+    let _ = LLAMA_BACKEND.set(arc.clone());
+    Ok(LLAMA_BACKEND.get().unwrap().clone())
+}
+
 /// Embedded llama.cpp LLM provider.
 ///
 /// Loads a GGUF model in-process and runs inference directly using the llama.cpp
@@ -172,10 +187,7 @@ impl LlamaCppProvider {
 
         tracing::info!(path = %path.display(), "loading GGUF model");
 
-        let backend = Arc::new(
-            LlamaBackend::init()
-                .map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?,
-        );
+        let backend = get_or_init_backend()?;
 
         let params = {
             let p = LlamaModelParams::default();
@@ -554,7 +566,7 @@ mod tests {
 
         let path = download_gguf(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE).expect("download failed");
 
-        let backend = LlamaBackend::init().unwrap();
+        let backend = get_or_init_backend().unwrap();
         // Force CPU-only (ngl=0) — Metal on x86_64 Mac produces incorrect results
         // with some quantization formats.
         let params = LlamaModelParams::default().with_n_gpu_layers(0);
