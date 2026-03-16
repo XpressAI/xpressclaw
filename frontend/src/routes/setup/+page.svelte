@@ -18,6 +18,7 @@
 	// -- Step 0: Docker --
 	let dockerStatus = $state<DockerStatus | null>(null);
 	let dockerLoading = $state(true);
+	let containerless = $state(false);
 
 	// -- Step 1: LLM --
 	let systemInfo = $state<SystemInfo | null>(null);
@@ -254,7 +255,8 @@
 					use_embedded: useEmbedded
 				},
 				agents: agentList,
-				mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined
+				mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
+				isolation: containerless ? 'none' : 'docker'
 			});
 
 			if (result.downloading) {
@@ -330,7 +332,7 @@
 				</div>
 			</div>
 			<div class="space-y-2 text-sm">
-				<p class="text-muted-foreground">Install Docker to continue:</p>
+				<p class="text-muted-foreground">Install Docker for full security isolation:</p>
 				<div class="flex gap-2">
 					<a
 						href="https://docs.docker.com/get-docker/"
@@ -350,12 +352,29 @@
 					class="mt-2 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
 				>Retry check</button>
 			</div>
+
+			<div class="mt-4 rounded-lg border border-border p-4 space-y-2">
+				<label class="flex items-start gap-3 cursor-pointer">
+					<input
+						type="checkbox"
+						bind:checked={containerless}
+						class="mt-0.5 rounded border-border"
+					/>
+					<div>
+						<div class="text-sm font-medium text-foreground">Continue without containers</div>
+						<div class="text-xs text-muted-foreground">
+							Agents will run without isolation. Only use this on a dedicated machine
+							or virtual machine where security isolation is not needed.
+						</div>
+					</div>
+				</label>
+			</div>
 		{/if}
 
 		<div class="mt-6 flex justify-end">
 			<button
 				onclick={() => goToStep(1)}
-				disabled={!dockerStatus?.available}
+				disabled={!dockerStatus?.available && !containerless}
 				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
 			>Continue</button>
 		</div>

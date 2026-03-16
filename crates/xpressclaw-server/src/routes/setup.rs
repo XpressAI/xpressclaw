@@ -165,6 +165,13 @@ struct CompleteSetupRequest {
     agents: Vec<AgentSetup>,
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    /// Isolation mode: "docker" (default) or "none" (containerless).
+    #[serde(default = "default_isolation")]
+    isolation: String,
+}
+
+fn default_isolation() -> String {
+    "docker".into()
 }
 
 #[derive(Deserialize)]
@@ -300,12 +307,13 @@ async fn complete_setup(
             .collect()
     };
 
-    let config = Config {
+    let mut config = Config {
         llm,
         agents,
         mcp_servers: req.mcp_servers,
         ..Default::default()
     };
+    config.system.isolation = req.isolation.clone();
 
     // Save config to disk
     config.save(&state.config_path).map_err(internal_error)?;

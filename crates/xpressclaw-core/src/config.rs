@@ -337,10 +337,10 @@ impl Config {
 
     /// Validate the config.
     fn validate(&self) -> Result<()> {
-        let valid_isolation = ["docker"];
+        let valid_isolation = ["docker", "none"];
         if !valid_isolation.contains(&self.system.isolation.as_str()) {
             return Err(Error::ConfigValidation(format!(
-                "invalid isolation mode: {}. Docker is required for security.",
+                "invalid isolation mode: {}. Valid: docker, none.",
                 self.system.isolation
             )));
         }
@@ -491,9 +491,16 @@ memory:
     }
 
     #[test]
-    fn test_validation_rejects_no_docker() {
+    fn test_validation_accepts_none_isolation() {
         let mut config = Config::default();
         config.system.isolation = "none".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_rejects_invalid_isolation() {
+        let mut config = Config::default();
+        config.system.isolation = "podman".to_string();
         assert!(config.validate().is_err());
     }
 }
