@@ -72,6 +72,17 @@
 
 			await tick();
 			scrollToBottom();
+
+			// Auto-send message if passed via query param (from new chat page)
+			const pendingMsg = $page.url.searchParams.get('msg');
+			if (pendingMsg) {
+				const url = new URL($page.url);
+				url.searchParams.delete('msg');
+				history.replaceState({}, '', url.pathname);
+				input = pendingMsg;
+				await tick();
+				sendMessage();
+			}
 		} catch (e) {
 			error = String(e);
 		}
