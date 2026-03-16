@@ -464,11 +464,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_approval_script_receives_env_vars() {
-        // Script that checks env vars are set
         #[cfg(windows)]
-        let script = r#"if "%TOOL_NAME%"=="my_tool" if "%AGENT_ID%"=="atlas" exit 0 else exit 1"#;
+        let script =
+            r#"if not "%TOOL_NAME%"=="my_tool" exit /b 1 & if not "%AGENT_ID%"=="atlas" exit /b 1"#;
         #[cfg(not(windows))]
         let script = r#"test "$TOOL_NAME" = "my_tool" && test "$AGENT_ID" = "atlas""#;
+
+        // Correct values should pass
         let result = ToolPolicyEngine::run_approval_script(script, "my_tool", "atlas").await;
         assert!(result.unwrap());
 
