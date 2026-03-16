@@ -662,12 +662,16 @@ mod tests {
         let db = Arc::new(Database::open_memory().unwrap());
         let mut registry = ToolRegistry::new(db.clone());
 
-        // Policy that approves via "true" (always approves)
+        // Policy that approves via exit 0 (always approves)
+        #[cfg(windows)]
+        let approve_cmd = "cmd /C exit 0";
+        #[cfg(not(windows))]
+        let approve_cmd = "true";
         let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
             pattern: "*".into(),
             action: PolicyAction::RequireApproval,
             approval: Some(crate::tools::policy::ApprovalMode::Script {
-                command: "true".into(),
+                command: approve_cmd.into(),
             }),
         }]));
 
@@ -698,12 +702,16 @@ mod tests {
         let db = Arc::new(Database::open_memory().unwrap());
         let registry = ToolRegistry::new(db.clone());
 
-        // Policy that denies via "false" (always denies)
+        // Policy that denies via exit 1 (always denies)
+        #[cfg(windows)]
+        let deny_cmd = "cmd /C exit 1";
+        #[cfg(not(windows))]
+        let deny_cmd = "false";
         let mut proxy = McpProxy::with_policy(ToolPolicyEngine::new(vec![ToolPolicyRule {
             pattern: "*".into(),
             action: PolicyAction::RequireApproval,
             approval: Some(crate::tools::policy::ApprovalMode::Script {
-                command: "false".into(),
+                command: deny_cmd.into(),
             }),
         }]));
 

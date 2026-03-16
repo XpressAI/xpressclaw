@@ -1,117 +1,137 @@
-use serde::Serialize;
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize)]
+use serde::{Deserialize, Serialize};
+
+/// Agent template loaded from a YAML file in templates/agents/*/agent.yaml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentPreset {
-    pub id: &'static str,
-    pub name: &'static str,
-    pub description: &'static str,
-    pub icon: &'static str,
-    pub role: &'static str,
-    pub backend: &'static str,
-    pub default_tools: &'static [&'static str],
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub icon: String,
+    pub role: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub default_tools: Vec<String>,
+    #[serde(default)]
+    pub default_mcp_servers: HashMap<String, crate::config::McpServerConfig>,
+    #[serde(default = "default_llm")]
+    pub recommended_llm: String,
 }
 
-pub const PRESETS: &[AgentPreset] = &[
-    AgentPreset {
-        id: "assistant",
-        name: "Assistant",
-        description: "General-purpose AI assistant with memory and learning",
-        icon: "brain",
-        role: r#"You are a helpful AI assistant.
+fn default_backend() -> String {
+    "generic".into()
+}
 
-## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
-You cannot form new long-term memories naturally. After each conversation ends,
-you will forget everything unless you explicitly save it.
+fn default_llm() -> String {
+    "local".into()
+}
 
-- **Before starting work:** Use `search_memory` to recall relevant context
-- **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts
-- **Be proactive:** If someone tells you about themselves or their work, SAVE IT"#,
-        backend: "generic",
-        default_tools: &["memory"],
-    },
-    AgentPreset {
-        id: "developer",
-        name: "Developer",
-        description: "Code-focused agent with shell, filesystem, and GitHub access",
-        icon: "code",
-        role: r#"You are a senior software developer and coding assistant.
-
-You have access to the filesystem and shell to read, write, and execute code.
-You can also interact with GitHub to manage repositories, issues, and pull requests.
-
-## Guidelines
-- Write clean, well-tested code
-- Explain your reasoning when making architectural decisions
-- Ask clarifying questions before making large changes
-- Commit frequently with clear messages
-- Always search memory for project context before starting work"#,
-        backend: "generic",
-        default_tools: &["filesystem", "shell", "github", "memory"],
-    },
-    AgentPreset {
-        id: "researcher",
-        name: "Researcher",
-        description: "Research agent with web search and note-taking",
-        icon: "search",
-        role: r#"You are a thorough research assistant.
-
-Your job is to find, synthesize, and organize information on topics the user asks about.
-You take detailed notes using the memory system so findings persist across conversations.
-
-## Guidelines
-- Search broadly first, then deep-dive into promising leads
-- Always cite sources
-- Save key findings to memory immediately
-- Present information in a structured, scannable format
-- Flag when information might be outdated or unreliable"#,
-        backend: "generic",
-        default_tools: &["web", "memory"],
-    },
-    AgentPreset {
-        id: "scheduler",
-        name: "Scheduler",
-        description: "Task management agent that runs on a schedule",
-        icon: "calendar",
-        role: r#"You are a task management and scheduling assistant.
-
-You help organize work, track progress, and ensure nothing falls through the cracks.
-You can create and manage tasks, set up schedules, and follow standard operating procedures.
-
-## Guidelines
-- Break large tasks into actionable sub-tasks
-- Set realistic priorities
-- Follow up on overdue items
-- Summarize progress at regular intervals"#,
-        backend: "generic",
-        default_tools: &["memory"],
-    },
+/// Built-in agent templates, embedded at compile time.
+static BUILTIN_YAML: &[(&str, &str)] = &[
+    (
+        "assistant",
+        include_str!("../../../../templates/agents/assistant/agent.yaml"),
+    ),
+    (
+        "developer",
+        include_str!("../../../../templates/agents/developer/agent.yaml"),
+    ),
+    (
+        "researcher",
+        include_str!("../../../../templates/agents/researcher/agent.yaml"),
+    ),
+    (
+        "scheduler",
+        include_str!("../../../../templates/agents/scheduler/agent.yaml"),
+    ),
 ];
+
+/// Load all built-in presets.
+pub fn builtin_presets() -> Vec<AgentPreset> {
+    BUILTIN_YAML
+        .iter()
+        .filter_map(|(id, yaml)| {
+            serde_yaml::from_str::<AgentPreset>(yaml)
+                .map_err(|e| tracing::warn!(id, error = %e, "failed to parse agent template"))
+                .ok()
+        })
+        .collect()
+}
+
+/// Load presets from a directory (e.g. ~/.xpressclaw/templates/agents/).
+/// Each subdirectory should contain an agent.yaml file.
+pub fn load_presets_from_dir(dir: &std::path::Path) -> Vec<AgentPreset> {
+    let mut presets = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return presets;
+    };
+    for entry in entries.flatten() {
+        let yaml_path = entry.path().join("agent.yaml");
+        if yaml_path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&yaml_path) {
+                match serde_yaml::from_str::<AgentPreset>(&contents) {
+                    Ok(preset) => presets.push(preset),
+                    Err(e) => tracing::warn!(
+                        path = %yaml_path.display(),
+                        error = %e,
+                        "failed to parse agent template"
+                    ),
+                }
+            }
+        }
+    }
+    presets
+}
+
+/// Copy built-in templates to a target directory so users can inspect/customize.
+pub fn install_builtin_templates(target_dir: &std::path::Path) {
+    for (id, yaml) in BUILTIN_YAML {
+        let dir = target_dir.join(id);
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("agent.yaml");
+        // Always overwrite with latest built-in version
+        std::fs::write(&path, yaml).ok();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_presets_exist() {
-        assert!(PRESETS.len() >= 3);
+    fn test_builtin_presets_load() {
+        let presets = builtin_presets();
+        assert!(presets.len() >= 3);
     }
 
     #[test]
     fn test_preset_ids_unique() {
-        let mut ids: Vec<&str> = PRESETS.iter().map(|p| p.id).collect();
+        let presets = builtin_presets();
+        let mut ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), PRESETS.len());
+        assert_eq!(ids.len(), presets.len());
     }
 
     #[test]
     fn test_preset_has_role() {
-        for preset in PRESETS {
+        for preset in builtin_presets() {
             assert!(
                 !preset.role.is_empty(),
                 "preset {} has empty role",
                 preset.id
             );
         }
+    }
+
+    #[test]
+    fn test_developer_has_mcp_servers() {
+        let presets = builtin_presets();
+        let dev = presets.iter().find(|p| p.id == "developer").unwrap();
+        assert!(!dev.default_mcp_servers.is_empty());
+        assert!(dev.default_mcp_servers.contains_key("shell"));
     }
 }

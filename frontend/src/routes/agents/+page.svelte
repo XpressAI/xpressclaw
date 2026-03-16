@@ -37,6 +37,10 @@
 			<h1 class="text-2xl font-bold">Agents</h1>
 			<p class="text-sm text-muted-foreground mt-1">{agentList.length} configured</p>
 		</div>
+		<a href="/setup?mode=add-agent"
+			class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">
+			+ Add Agent
+		</a>
 	</div>
 
 	{#if loading}

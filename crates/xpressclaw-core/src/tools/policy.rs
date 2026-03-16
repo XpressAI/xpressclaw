@@ -153,13 +153,23 @@ impl ToolPolicyEngine {
             "running approval script"
         );
 
-        let output = Command::new("sh")
+        #[cfg(windows)]
+        let output_future = Command::new("cmd")
+            .args(["/C", command])
+            .env("TOOL_NAME", tool_name)
+            .env("AGENT_ID", agent_id)
+            .stdin(std::process::Stdio::null())
+            .output();
+
+        #[cfg(not(windows))]
+        let output_future = Command::new("sh")
             .args(["-c", command])
             .env("TOOL_NAME", tool_name)
             .env("AGENT_ID", agent_id)
-            // Don't inherit stdin — script should be non-interactive
             .stdin(std::process::Stdio::null())
-            .output()
+            .output();
+
+        let output = output_future
             .await
             .map_err(|e| format!("failed to run approval script '{command}': {e}"))?;
 
@@ -432,22 +442,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_approval_script_approve() {
-        // "true" exits 0 = approved
-        let result = ToolPolicyEngine::run_approval_script("true", "test_tool", "atlas").await;
+        // Command that exits 0 = approved
+        #[cfg(windows)]
+        let cmd = "cmd /C exit 0";
+        #[cfg(not(windows))]
+        let cmd = "true";
+        let result = ToolPolicyEngine::run_approval_script(cmd, "test_tool", "atlas").await;
         assert!(result.unwrap());
     }
 
     #[tokio::test]
     async fn test_approval_script_deny() {
-        // "false" exits 1 = denied
-        let result = ToolPolicyEngine::run_approval_script("false", "test_tool", "atlas").await;
+        // Command that exits 1 = denied
+        #[cfg(windows)]
+        let cmd = "cmd /C exit 1";
+        #[cfg(not(windows))]
+        let cmd = "false";
+        let result = ToolPolicyEngine::run_approval_script(cmd, "test_tool", "atlas").await;
         assert!(!result.unwrap());
     }
 
     #[tokio::test]
     async fn test_approval_script_receives_env_vars() {
-        // Script that checks env vars are set
+        #[cfg(windows)]
+        let script =
+            r#"if not "%TOOL_NAME%"=="my_tool" exit /b 1 & if not "%AGENT_ID%"=="atlas" exit /b 1"#;
+        #[cfg(not(windows))]
         let script = r#"test "$TOOL_NAME" = "my_tool" && test "$AGENT_ID" = "atlas""#;
+
+        // Correct values should pass
         let result = ToolPolicyEngine::run_approval_script(script, "my_tool", "atlas").await;
         assert!(result.unwrap());
 

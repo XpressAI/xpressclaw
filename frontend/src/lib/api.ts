@@ -442,6 +442,8 @@ export interface AgentPreset {
 	role: string;
 	backend: string;
 	default_tools: string[];
+	default_mcp_servers: Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>;
+	recommended_llm: string;
 }
 
 export interface LiveConfig {
@@ -492,6 +494,7 @@ export const setup = {
 		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
 		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
+		isolation?: string;
 	}) =>
 		request<{ success: boolean; downloading: boolean; config_path: string }>('/api/setup/complete', {
 			method: 'POST',

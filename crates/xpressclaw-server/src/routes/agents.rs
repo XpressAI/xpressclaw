@@ -113,25 +113,33 @@ async fn start_agent(
         .update_status(&id, &AgentStatus::Starting, None)
         .map_err(internal_error)?;
 
-    // Connect to Docker
+    let config = state.config();
+    let isolation = config.system.isolation.as_str();
+
+    if isolation == "none" {
+        // Containerless mode: just mark the agent as running.
+        // The conversation handler calls the LLM router directly.
+        let record = registry
+            .update_status(&id, &AgentStatus::Running, None)
+            .map_err(internal_error)?;
+        return Ok(Json(json!(record)));
+    }
+
+    // Docker isolation mode
     let docker = DockerManager::connect().await.map_err(|e| {
-        // Revert status on failure
         let _ = registry.update_status(&id, &AgentStatus::Error(e.to_string()), None);
         internal_error(e)
     })?;
 
-    // Determine image
     let image = body
         .and_then(|b| b.image.clone())
         .unwrap_or_else(|| image_for_backend(&record.backend).to_string());
 
-    // Build container spec
     let mut spec = ContainerSpec {
         image,
         ..Default::default()
     };
 
-    // Pass agent config as environment
     spec.environment.push(format!("AGENT_ID={}", id));
     spec.environment.push(format!("AGENT_NAME={}", record.name));
     spec.environment
@@ -139,7 +147,6 @@ async fn start_agent(
     spec.environment
         .push(format!("AGENT_CONFIG={}", record.config));
 
-    // Launch container
     match docker.launch(&id, &spec).await {
         Ok(info) => {
             let record = registry

@@ -58,11 +58,9 @@
 				participant_ids: selectedAgent ? [selectedAgent] : []
 			});
 
-			// Send the first message
-			await conversations.sendMessage(conv.id, message.trim(), 'You');
-
-			// Navigate to conversation view
-			goto(`/conversations/${conv.id}`);
+			// Navigate immediately — pass the message as a query param
+			// so the conversation page can send it and stream the response
+			goto(`/conversations/${conv.id}?msg=${encodeURIComponent(message.trim())}`);
 		} catch (e) {
 			sending = false;
 		}
