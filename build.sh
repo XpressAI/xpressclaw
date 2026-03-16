@@ -21,7 +21,12 @@ echo "==> Build complete: target/release/xpressclaw"
 echo "==> Copying CLI binary as Tauri sidecar..."
 TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
 mkdir -p crates/xpressclaw-tauri/binaries
-cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+# Check both native and cross-compile paths
+if [ -f "target/release/xpressclaw" ]; then
+    cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+elif [ -f "target/${TARGET_TRIPLE}/release/xpressclaw" ]; then
+    cp "target/${TARGET_TRIPLE}/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+fi
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 # Build the desktop app if tauri-cli is installed
