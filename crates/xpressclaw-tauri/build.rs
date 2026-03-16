@@ -28,14 +28,30 @@ fn main() {
     };
     let dest = binaries_dir.join(format!("xpressclaw-{target_triple}{exe_suffix}"));
 
-    let src = workspace_root
-        .join("target")
-        .join(&profile)
-        .join(format!("xpressclaw{exe_suffix}"));
+    // Check multiple possible locations for the CLI binary:
+    // 1. target/{profile}/xpressclaw (native build)
+    // 2. target/{triple}/{profile}/xpressclaw (cross-compilation / cargo tauri build)
+    let candidates = [
+        workspace_root
+            .join("target")
+            .join(&profile)
+            .join(format!("xpressclaw{exe_suffix}")),
+        workspace_root
+            .join("target")
+            .join(&target_triple)
+            .join(&profile)
+            .join(format!("xpressclaw{exe_suffix}")),
+    ];
 
-    if src.exists() {
-        std::fs::copy(&src, &dest).ok();
-    } else if !dest.exists() {
+    let copied = candidates.iter().any(|src| {
+        if src.exists() {
+            std::fs::copy(src, &dest).is_ok()
+        } else {
+            false
+        }
+    });
+
+    if !copied && !dest.exists() {
         // Create a placeholder so tauri_build doesn't fail during CI/clippy.
         // The real binary must be built before running the app.
         std::fs::write(&dest, "placeholder").ok();
