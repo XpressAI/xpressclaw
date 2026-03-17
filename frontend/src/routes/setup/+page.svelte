@@ -276,12 +276,21 @@
 <div class="rounded-xl border border-border bg-card p-6">
 	<!-- Step 0: Agent Preset -->
 	{#if step === 0}
-		<h2 class="text-lg font-semibold text-foreground mb-1">
-			{mode === 'add-agent' ? 'Add Agent' : 'Choose Your Agent'}
-		</h2>
-		<p class="text-sm text-muted-foreground mb-6">
-			Pick a template to get started. You can customize everything in the next steps.
-		</p>
+		<div class="flex items-start justify-between mb-1">
+			<div>
+				<h2 class="text-lg font-semibold text-foreground">
+					{mode === 'add-agent' ? 'Add Agent' : 'Choose Your Agent'}
+				</h2>
+				<p class="text-sm text-muted-foreground mt-1">
+					Pick a template to get started. You can customize everything in the next steps.
+				</p>
+			</div>
+			{#if mode === 'add-agent'}
+				<button onclick={() => goto('/agents')} class="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground">
+					<span class="text-xl">&times;</span>
+				</button>
+			{/if}
+		</div>
 
 		<div class="grid grid-cols-2 gap-3 mb-6">
 			{#each presets as preset}
@@ -461,9 +470,12 @@
 		{/if}
 
 		<div class="mt-6 flex justify-between">
-			<button onclick={() => goToStep(0)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
-			<button onclick={() => goToStep(2)} disabled={!canProceedLlm()}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
+			{#if mode === 'add-agent'}
+				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
+			{:else}
+				<button onclick={() => goToStep(2)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
+			{/if}
+			<button onclick={() => goToStep(4)} class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
 		</div>
 
 	<!-- Step 2: Connectors -->
@@ -523,8 +535,13 @@
 		{/if}
 
 		<div class="mt-6 flex justify-between">
-			<button onclick={() => goToStep(1)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
-			<button onclick={() => goToStep(3)} class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
+			{#if mode === 'add-agent'}
+				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
+			{:else}
+				<div></div>
+			{/if}
+			<button onclick={() => goToStep(2)} disabled={!canProceedLlm()}
+				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
 		</div>
 
 	<!-- Step 3: Docker / Environment -->
@@ -576,12 +593,17 @@
 			</label>
 		{/if}
 
-		<div class="mt-6 flex justify-between">
+		<div class="mt-6 flex items-center justify-between">
 			<button onclick={() => goToStep(2)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
-			<button onclick={completeSetup} disabled={saving || (!dockerStatus?.available && !containerless)}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
-				{#if saving}Saving...{:else}Complete Setup{/if}
-			</button>
+			<div class="flex items-center gap-3">
+				{#if mode === 'add-agent'}
+					<button onclick={() => goto('/agents')} class="rounded-md px-4 py-2 text-sm hover:bg-accent">Cancel</button>
+				{/if}
+				<button onclick={completeSetup} disabled={saving || (!dockerStatus?.available && !containerless)}
+					class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
+					{#if saving}Saving...{:else}Complete Setup{/if}
+				</button>
+			</div>
 		</div>
 
 		{#if saveError}<p class="mt-2 text-xs text-red-500">{saveError}</p>{/if}
