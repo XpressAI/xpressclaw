@@ -2,6 +2,12 @@
 //!
 //! MCP stdio servers communicate via JSON-RPC over stdin/stdout.
 //! Each line on stdout is a complete JSON-RPC response.
+//!
+//! **Used in containerless mode only.** When Docker isolation is enabled,
+//! MCP servers run inside the agent container instead (the harness starts
+//! them from the `MCP_SERVERS` environment variable). This module is for
+//! advanced users who opt into `isolation: none` and want tool access
+//! without Docker.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};

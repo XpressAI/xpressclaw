@@ -1,7 +1,9 @@
-//! Manages MCP stdio server lifecycle.
+//! Manages MCP stdio server lifecycle on the host.
 //!
-//! Spawns configured MCP servers on startup, discovers their tools,
-//! and routes tool calls to the correct server.
+//! **Used in containerless mode only.** When Docker isolation is enabled,
+//! MCP servers run inside the agent container instead. This module is for
+//! `isolation: none` where the server needs to spawn and manage MCP
+//! processes directly on the host machine (requires Node.js/npx).
 
 use std::collections::HashMap;
 use std::sync::Arc;
