@@ -5,7 +5,8 @@ The agent executes tool calls (filesystem, shell, etc.) inside the container
 via the workspace volume mount at /workspace.
 
 Environment variables:
-  ANTHROPIC_API_KEY — Required. API key for Anthropic.
+  ANTHROPIC_API_KEY — API key for Anthropic (if using cloud Anthropic)
+  OPENAI_BASE_URL — OpenAI-compatible endpoint URL (if using local models)
   LLM_MODEL        — Model to use (default: claude-sonnet-4-20250514)
   WORKSPACE_DIR    — Agent workspace (default: /workspace)
 """
@@ -16,11 +17,18 @@ import sys
 
 sys.path.insert(0, "/app")
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 from claude_agent_sdk import Agent, AgentConfig, ToolConfig
 from server import BaseHarness, logger, AGENT_ID, AGENT_NAME
 
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
 
 class ClaudeSdkHarness(BaseHarness):
@@ -33,6 +41,23 @@ class ClaudeSdkHarness(BaseHarness):
         temperature: float,
         max_tokens: int,
     ) -> str:
+        # If OPENAI_BASE_URL is set, use OpenAI SDK to call the xpressclaw server
+        if OPENAI_BASE_URL and OpenAI:
+            logger.info("Using OpenAI-compatible endpoint: %s", OPENAI_BASE_URL)
+            client = OpenAI(base_url=OPENAI_BASE_URL, api_key="not-needed")
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as e:
+                logger.error("OpenAI API call failed: %s", e)
+                raise
+
+        # Otherwise, use Claude SDK (for cloud Anthropic)
         # Extract system prompt and user messages
         system_prompt = ""
         user_messages = []
