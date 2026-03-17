@@ -61,18 +61,41 @@ fn main() {
             std::fs::create_dir_all(&data_dir).ok();
             let workdir = data_dir.to_string_lossy().to_string();
 
-            // Resolve the sidecar binary path
+            // Resolve the sidecar binary path.
+            // Tauri bundles externalBin sidecars next to the main executable,
+            // while dev builds place them in a binaries/ subdirectory.
+            let cli_name = if cfg!(target_os = "windows") {
+                "xpressclaw.exe"
+            } else {
+                "xpressclaw"
+            };
+            let sidecar_name = sidecar_binary_name();
             let sidecar_path = app
                 .path()
                 .resource_dir()
                 .ok()
-                .map(|d| d.join("binaries").join(sidecar_binary_name()))
-                .filter(|p| p.exists())
+                .and_then(|d| {
+                    // Installed app: Tauri places sidecar next to the exe
+                    let flat = d.join(cli_name);
+                    if flat.exists() {
+                        return Some(flat);
+                    }
+                    // Also check with triple suffix and binaries/ subdir
+                    let with_triple = d.join(&sidecar_name);
+                    if with_triple.exists() {
+                        return Some(with_triple);
+                    }
+                    let in_subdir = d.join("binaries").join(&sidecar_name);
+                    if in_subdir.exists() {
+                        return Some(in_subdir);
+                    }
+                    None
+                })
                 .or_else(|| {
                     // Dev mode: look in the binaries/ directory next to the Tauri manifest
                     let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("binaries")
-                        .join(sidecar_binary_name());
+                        .join(&sidecar_name);
                     if dev_path.exists() {
                         Some(dev_path)
                     } else {
