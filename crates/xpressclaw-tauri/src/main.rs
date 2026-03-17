@@ -64,7 +64,11 @@ fn main() {
             // Resolve the sidecar binary path.
             // Tauri bundles externalBin sidecars next to the main executable,
             // while dev builds place them in a binaries/ subdirectory.
-            let cli_name = if cfg!(target_os = "windows") { "xpressclaw.exe" } else { "xpressclaw" };
+            let cli_name = if cfg!(target_os = "windows") {
+                "xpressclaw.exe"
+            } else {
+                "xpressclaw"
+            };
             let sidecar_name = sidecar_binary_name();
             let sidecar_path = app
                 .path()
@@ -73,12 +77,18 @@ fn main() {
                 .and_then(|d| {
                     // Installed app: Tauri places sidecar next to the exe
                     let flat = d.join(cli_name);
-                    if flat.exists() { return Some(flat); }
+                    if flat.exists() {
+                        return Some(flat);
+                    }
                     // Also check with triple suffix and binaries/ subdir
                     let with_triple = d.join(&sidecar_name);
-                    if with_triple.exists() { return Some(with_triple); }
+                    if with_triple.exists() {
+                        return Some(with_triple);
+                    }
                     let in_subdir = d.join("binaries").join(&sidecar_name);
-                    if in_subdir.exists() { return Some(in_subdir); }
+                    if in_subdir.exists() {
+                        return Some(in_subdir);
+                    }
                     None
                 })
                 .or_else(|| {
