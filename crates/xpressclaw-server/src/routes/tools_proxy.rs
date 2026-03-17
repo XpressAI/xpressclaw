@@ -11,8 +11,6 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::tools::registry::ToolRegistry;
-
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -21,59 +19,49 @@ pub fn routes() -> Router<AppState> {
         .route("/call", post(call_tool))
 }
 
-/// List available tools for an agent.
-/// Called by harnesses to discover what MCP tools they can use.
+/// List available tools across all MCP servers.
 async fn list_tools(State(state): State<AppState>) -> Json<Value> {
-    let registry = ToolRegistry::new(state.db.clone());
-
-    // Return all tools — the harness passes its agent_id and we filter by permissions.
-    // For now, return all registered tool schemas.
-    let schemas = registry.get_tool_schemas("*");
-
-    Json(json!({
-        "tools": schemas
-    }))
+    let schemas = state.mcp_manager.tool_schemas().await;
+    Json(json!({ "tools": schemas }))
 }
 
 #[derive(Deserialize)]
 struct CallToolRequest {
+    #[serde(default)]
     agent_id: String,
+    #[serde(alias = "name")]
     tool_name: String,
+    #[serde(default)]
     arguments: Value,
 }
 
-/// Execute a tool call on behalf of an agent.
-/// The server checks policies and routes to the appropriate MCP server.
+/// Execute a tool call, routing to the correct MCP server.
 async fn call_tool(
     State(state): State<AppState>,
     Json(req): Json<CallToolRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let registry = ToolRegistry::new(state.db.clone());
-
-    // Check if the tool exists and is allowed for this agent
-    if !registry.is_tool_allowed(&req.agent_id, &req.tool_name) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!("tool '{}' is not allowed for agent '{}'", req.tool_name, req.agent_id)
-            })),
-        ));
-    }
-
-    // TODO: Route to actual MCP server via McpProxy
-    // For now, return a stub response indicating the tool was called
-    // but MCP server execution is not yet wired up.
     tracing::info!(
         agent_id = req.agent_id,
         tool = req.tool_name,
-        "tool call requested (MCP execution pending)"
+        "tool call requested"
     );
 
-    Ok(Json(json!({
-        "content": [{
-            "type": "text",
-            "text": format!("Tool '{}' called with arguments: {}. (MCP execution not yet connected)", req.tool_name, req.arguments)
-        }],
-        "isError": false
-    })))
+    match state
+        .mcp_manager
+        .call_tool(&req.tool_name, req.arguments)
+        .await
+    {
+        Ok(result) => Ok(Json(json!(result))),
+        Err(e) => {
+            tracing::warn!(
+                tool = req.tool_name,
+                error = %e,
+                "tool call failed"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            ))
+        }
+    }
 }

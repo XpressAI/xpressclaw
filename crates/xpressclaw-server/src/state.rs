@@ -7,6 +7,7 @@ use xpressclaw_core::db::Database;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
+use xpressclaw_core::tools::mcp_manager::McpManager;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -25,6 +26,8 @@ pub struct AppState {
     /// GGUF model download progress (for setup wizard progress bar).
     #[cfg(feature = "local-llm")]
     pub download_progress: Arc<RwLock<DownloadProgress>>,
+    /// MCP tool server manager.
+    pub mcp_manager: Arc<McpManager>,
 }
 
 impl AppState {
@@ -46,6 +49,7 @@ impl AppState {
             setup_complete: Arc::new(RwLock::new(setup_complete)),
             #[cfg(feature = "local-llm")]
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
+            mcp_manager: Arc::new(McpManager::new()),
         }
     }
 
