@@ -24,19 +24,9 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Start the HTTP server.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
-    // Start MCP tool servers from config
-    let config = state.config();
-    if !config.mcp_servers.is_empty() {
-        info!(
-            count = config.mcp_servers.len(),
-            "starting MCP tool servers"
-        );
-        state.mcp_manager.start_servers(&config.mcp_servers).await;
-        info!(
-            running = state.mcp_manager.server_count().await,
-            "MCP servers ready"
-        );
-    }
+    // MCP tool servers run inside agent containers (not on the host).
+    // The server passes MCP configs to containers via environment variables.
+    // The /v1/tools endpoint is available for any external tool proxying.
 
     let app = create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
