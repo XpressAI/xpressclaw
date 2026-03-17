@@ -2,7 +2,7 @@ id: scheduler
 name: Scheduler
 description: Task management agent that runs on a schedule
 icon: calendar
-backend: generic
+backend: claude-sdk
 default_tools:
   - memory
 recommended_llm: local

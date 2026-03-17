@@ -22,7 +22,7 @@ pub struct AgentPreset {
 }
 
 fn default_backend() -> String {
-    "generic".into()
+    "claude-sdk".into()
 }
 
 fn default_llm() -> String {
