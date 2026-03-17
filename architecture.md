@@ -1,4 +1,6 @@
-# AgentKeeper Architecture
+# xpressclaw Architecture
+
+**NOTE**: This document describes the legacy AgentKeeper architecture. The current implementation is xpressclaw. See README.md and ADRs for current state.
 
 ## Overview
 
@@ -40,13 +42,15 @@ AgentKeeper is structured as a layered system where each layer can be developed 
 
 The user-facing interface. All operations go through here.
 
-- `agentkeeper init` - Initialize a new workspace
-- `agentkeeper up` - Start the daemon and agents
-- `agentkeeper down` - Stop gracefully
-- `agentkeeper status` - Show agent status, budget usage
-- `agentkeeper logs` - Stream or view agent logs
-- `agentkeeper memory` - Inspect/manage memory system
-- `agentkeeper chat` - Interactive session with an agent
+- `agentkeeper init` - Initialize a new workspace (legacy)
+- `agentkeeper up` - Start the daemon and agents (legacy)
+- `agentkeeper down` - Stop gracefully (legacy)
+- `agentkeeper status` - Show agent status, budget usage (legacy)
+- `agentkeeper logs` - Stream or view agent logs (legacy)
+- `agentkeeper memory` - Inspect/manage memory system (legacy)
+- `agentkeeper chat` - Interactive session with an agent (legacy)
+
+**Current xpressclaw commands**: See README.md for current `xpressclaw` CLI commands.
 
 ### Agent Manager
 
@@ -182,6 +186,13 @@ Persistent state management.
 ## Configuration Hierarchy
 
 ```
+**Current:**
+System defaults
+  └── Workspace config (xpressclaw.yaml)  
+       └── Agent config (agents/*.yaml)
+            └── Runtime overrides (CLI flags)
+
+**Legacy:**
 System defaults
   └── Workspace config (agentkeeper.yaml)
        └── Agent config (agents/*.yaml)
@@ -190,6 +201,12 @@ System defaults
 
 ## File Layout
 
+**Current:**
+```
+~/.xpressclaw/                     # Global config and cache
+```
+
+**Legacy:**
 ```
 ~/.agentkeeper/                    # Global config and cache
   config.yaml                      # Global defaults
@@ -197,7 +214,8 @@ System defaults
     qwen3-8b-q4_K_M.gguf
   
 my-workspace/                      # User's workspace
-  agentkeeper.yaml                 # Workspace config
+  xpressclaw.yaml                  # Workspace config (current)
+  agentkeeper.yaml                 # Legacy workspace config
   agents/
     main.yaml                      # Primary agent definition
     specialists/                   # Meeseeks templates

@@ -88,4 +88,6 @@ We will build **XpressAI**: an agent runtime that provides the infrastructure la
 
 ## Notes
 
-The name "XpressAI" connects to Xpress AI (Eduardo's company) while suggesting speed and simplicity. It positions as the express lane to running agents.
+The name "Xpressclaw" connects to Xpress AI (Eduardo's company) while suggesting speed and simplicity. It positions as the express lane to running agents.
+
+**Note**: This ADR describes the original vision. The implementation evolved to **xpressclaw** (Rust-based) while the Python code in `src/xpressai/` remains as a reference implementation.

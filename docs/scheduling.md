@@ -1,23 +1,25 @@
 # Scheduling Tasks
 
-XpressAI supports cron-style scheduling for recurring tasks. Agents automatically pick up scheduled tasks when they trigger.
+xpressclaw supports cron-style scheduling for recurring tasks. Agents automatically pick up scheduled tasks when they trigger.
 
 ## Quick Start
 
 ```bash
 # Schedule a task to run every day at 9am
-xpressai tasks atlas schedule "Check for updates" --cron "0 9 * * *"
+xpressclaw tasks create --agent atlas --description "Check for updates"
+
+# Use cron for recurring tasks
+xpressclaw tasks schedule "Check for updates" --agent atlas --cron "0 9 * * *"
 
 # List schedules
-xpressai tasks atlas schedules
+xpressclaw tasks list --agent atlas
 
-# Remove a schedule
-xpressai tasks atlas unschedule <schedule-id>
+# Remove a schedule (via xpressclaw tasks complete or edit)
 ```
 
 ## Cron Syntax
 
-XpressAI uses standard 5-field cron syntax:
+xpressclaw uses standard 5-field cron syntax:
 
 ```
 ┌───────────── minute (0-59)
@@ -53,7 +55,7 @@ XpressAI uses standard 5-field cron syntax:
 
 ## Template Variables
 
-Use placeholders in task titles that get replaced when the task is created:
+Use placeholders in task descriptions that get replaced when the task is created:
 
 | Variable | Description | Example Output |
 |----------|-------------|----------------|
@@ -63,7 +65,7 @@ Use placeholders in task titles that get replaced when the task is created:
 **Example:**
 
 ```bash
-xpressai tasks atlas schedule "Daily report for {date}" --cron "0 17 * * *"
+xpressclaw tasks schedule "Daily report for {date}" --agent atlas --cron "0 17 * * *"
 ```
 
 Creates tasks like:
@@ -75,47 +77,15 @@ Creates tasks like:
 Give schedules memorable names:
 
 ```bash
-xpressai tasks atlas schedule "Summarize HN" --cron "0 9 * * *" --name daily-hn
-```
-
-The name appears in `schedules` output and can make management easier.
-
-## Managing Schedules
-
-### List Schedules
-
-```bash
-xpressai tasks atlas schedules
-```
-
-Output:
-```
-Scheduled tasks for @atlas
-
-[enabled] daily-hn
-    ID: 9af0bf1b
-    Cron: 0 9 * * *
-    Task: Summarize top 10 HN stories
-    Next run: 2025-01-16 09:00
-    Run count: 5
-```
-
-### Remove a Schedule
-
-Use the schedule ID (or prefix):
-
-```bash
-xpressai tasks atlas unschedule 9af0bf1b
-# or just the prefix
-xpressai tasks atlas unschedule 9af0
+xpressclaw tasks schedule "Summarize HN" --agent atlas --cron "0 9 * * *" --name daily-hn
 ```
 
 ## How Scheduling Works
 
-1. **Daemon required** - Schedules only trigger when the daemon is running (`xpressai up -d`)
-2. **Persistence** - Schedules are saved to the database and survive restarts
-3. **Task creation** - When a schedule triggers, it creates a task on the task board
-4. **Agent execution** - The agent picks up the task like any other task
+1. **Run xpressclaw** - Schedules trigger while xpressclaw is running
+2. **Persistence** - Schedules are saved and survive restarts
+3. **Task creation** - When a schedule triggers, it creates a task
+4. **Agent execution** - The agent picks up the task like any other
 5. **Budget applies** - Scheduled tasks count against your budget
 
 ## Examples
@@ -123,30 +93,30 @@ xpressai tasks atlas unschedule 9af0
 ### Daily Code Review
 
 ```bash
-xpressai tasks coder schedule "Review open PRs and leave comments" --cron "0 10 * * 1-5"
+xpressclaw tasks schedule "Review open PRs" --agent coder --cron "0 10 * * 1-5"
 ```
 
 ### Weekly Summary
 
 ```bash
-xpressai tasks atlas schedule "Create weekly progress report for {date}" --cron "0 17 * * 5" --name weekly-report
+xpressclaw tasks schedule "Create weekly report for {date}" --agent atlas --cron "0 17 * * 5"
 ```
 
 ### Hourly Monitoring
 
 ```bash
-xpressai tasks monitor schedule "Check system health and alert on issues" --cron "0 * * * *"
+xpressclaw tasks schedule "Check system health" --agent monitor --cron "0 * * * *"
 ```
 
 ### Monthly Cleanup
 
 ```bash
-xpressai tasks atlas schedule "Archive old logs and clean temp files" --cron "0 2 1 * *"
+xpressclaw tasks schedule "Archive old logs" --agent atlas --cron "0 2 1 * *"
 ```
 
 ## Timezone
 
-Schedules use the system timezone where the daemon is running. To check:
+Schedules use the system timezone. To check:
 
 ```bash
 date +%Z
@@ -156,27 +126,12 @@ date +%Z
 
 ### Schedule not triggering
 
-1. Make sure the daemon is running:
+1. Make sure xpressclaw is running:
    ```bash
-   xpressai status
+   xpressclaw status
    ```
 
-2. Check the schedule is enabled:
+2. Check the task exists:
    ```bash
-   xpressai tasks atlas schedules
+   xpressclaw tasks list --agent atlas
    ```
-
-3. Verify the cron expression:
-   ```bash
-   # Use an online cron expression tester to verify
-   ```
-
-### Missed schedules
-
-If the daemon was stopped when a schedule was supposed to trigger, that run is skipped. The schedule will trigger at the next scheduled time.
-
-### Check logs
-
-```bash
-xpressai logs -f | grep -i schedule
-```

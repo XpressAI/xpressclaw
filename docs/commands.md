@@ -1,274 +1,171 @@
 # CLI Command Reference
 
-Complete reference for all `xpressai` commands.
+Complete reference for all `xpressclaw` commands.
 
 ## Core Commands
 
-### `xpressai init`
+### `xpressclaw init`
 
-Initialize a new XpressAI workspace.
+Initialize a new xpressclaw workspace.
 
 ```bash
-xpressai init
+xpressclaw init
 ```
 
-Creates an `xpressai.yaml` configuration file with sensible defaults.
-
-**Options:**
-- `--force` - Overwrite existing configuration
-
----
-
-### `xpressai up`
+### `xpressclaw up`
 
 Start the runtime and all configured agents.
 
 ```bash
-xpressai up        # Run in foreground
-xpressai up -d     # Run as background daemon
+xpressclaw up           # Run in foreground
+xpressclaw up --detach  # Run in background
 ```
 
 **Options:**
-- `-d, --daemon` - Run in background mode
+- `--detach` - Run in background mode
+- `--port` - Port for web UI and API (default: 8935)
 
-When running in daemon mode, use `xpressai down` to stop.
-
----
-
-### `xpressai down`
+### `xpressclaw down`
 
 Stop all running agents and the runtime.
 
 ```bash
-xpressai down
+xpressclaw down
 ```
 
----
-
-### `xpressai status`
+### `xpressclaw status`
 
 Show current status of agents and the runtime.
 
 ```bash
-xpressai status
+xpressclaw status
 ```
 
-**Output includes:**
-- Agent status (running/stopped)
-- Budget usage
-- Task counts
-
----
-
-### `xpressai logs`
+### `xpressclaw logs`
 
 View agent logs.
 
 ```bash
-xpressai logs              # View all logs
-xpressai logs atlas        # View logs for specific agent
-xpressai logs -f           # Follow logs in real-time
-xpressai logs atlas -f     # Follow specific agent
+xpressclaw logs              # View recent logs
+xpressclaw logs --agent NAME # View specific agent logs
+xpressclaw logs -f           # Follow logs in real-time
 ```
-
-**Options:**
-- `-f, --follow` - Stream logs continuously
-
----
 
 ## Task Commands
 
-All task commands require an agent name.
+### `xpressclaw tasks list`
 
-### `xpressai tasks <agent> list`
-
-List tasks for an agent.
+List tasks.
 
 ```bash
-xpressai tasks atlas list
+xpressclaw tasks list
+xpressclaw tasks list --agent NAME
 ```
 
-Shows tasks grouped by status (pending, in progress, completed).
+### `xpressclaw tasks create`
 
----
-
-### `xpressai tasks <agent> add`
-
-Add a new task for an agent.
+Create a new task.
 
 ```bash
-xpressai tasks atlas add "Refactor the auth module"
-xpressai tasks atlas add "Fix bug in login" --priority high
+xpressclaw tasks create "Refactor the auth module" --agent atlas
+xpressclaw tasks create "Fix login bug" --agent atlas --priority high
 ```
 
 **Options:**
-- `--priority` - Task priority: `high`, `medium`, `low` (default: medium)
+- `--priority` - `high`, `medium`, `low` (default: medium)
+- `--agent` - Agent to assign task to
 
----
-
-### `xpressai tasks <agent> complete`
-
-Mark a task as completed.
-
-```bash
-xpressai tasks atlas complete abc123
-```
-
-Use the task ID prefix (shown in `list`).
-
----
-
-### `xpressai tasks <agent> delete`
-
-Delete a task.
-
-```bash
-xpressai tasks atlas delete abc123
-```
-
----
-
-### `xpressai tasks <agent> schedule`
+### `xpressclaw tasks schedule`
 
 Create a recurring scheduled task.
 
 ```bash
-xpressai tasks atlas schedule "Daily standup summary" --cron "0 9 * * *"
-xpressai tasks atlas schedule "Weekly report" --cron "0 17 * * 5" --name weekly-report
+xpressclaw tasks schedule "Daily standup summary" --agent atlas --cron "0 9 * * *"
 ```
 
 **Options:**
 - `--cron` - Cron expression (required)
-- `--name` - Optional name for the schedule
 
-See [Scheduling](scheduling.md) for cron syntax.
+### `xpressclaw tasks complete`
 
----
-
-### `xpressai tasks <agent> schedules`
-
-List scheduled tasks for an agent.
+Mark a task as completed.
 
 ```bash
-xpressai tasks atlas schedules
+xpressclaw tasks complete TASK_ID
 ```
 
-Shows schedule ID, cron expression, next run time, and run count.
+## Memory Commands
 
----
+### `xpressclaw memory list`
 
-### `xpressai tasks <agent> unschedule`
-
-Remove a scheduled task.
+List memories.
 
 ```bash
-xpressai tasks atlas unschedule abc123
+xpressclaw memory list
+xpressclaw memory list --agent NAME
 ```
 
-Use the schedule ID prefix (shown in `schedules`).
+### `xpressclaw memory search`
 
----
+Search memories.
+
+```bash
+xpressclaw memory search "project deadlines"
+```
 
 ## Budget Commands
 
-### `xpressai budget`
+### `xpressclaw budget`
 
 Show budget status.
 
 ```bash
-xpressai budget
+xpressclaw budget
+xpressclaw budget --agent NAME
 ```
-
-Shows daily spending, limits, and usage by agent.
-
----
-
-## UI Commands
-
-### `xpressai dashboard`
-
-Launch the web dashboard.
-
-```bash
-xpressai dashboard
-```
-
-Opens a browser to the HTMX-based dashboard at `http://localhost:8935`.
-
----
-
-### `xpressai tui`
-
-Launch the terminal UI.
-
-```bash
-xpressai tui
-```
-
-Interactive terminal interface built with Textual.
-
-**Keyboard shortcuts:**
-- `q` - Quit
-- `l` - View logs
-- `t` - View tasks
-- `s` - View status
-
----
 
 ## SOP Commands
 
-Standard Operating Procedures for agents.
-
-### `xpressai sop list`
+### `xpressclaw sop list`
 
 List available SOPs.
 
 ```bash
-xpressai sop list
+xpressclaw sop list
 ```
 
----
-
-### `xpressai sop create`
+### `xpressclaw sop create`
 
 Create a new SOP.
 
 ```bash
-xpressai sop create deploy-process
+xpressclaw sop create deploy-process
 ```
 
-Opens an editor to define the SOP steps.
+### `xpressclaw sop run`
 
----
-
-### `xpressai sop show`
-
-Show details of an SOP.
+Execute an SOP.
 
 ```bash
-xpressai sop show deploy-process
+xpressclaw sop run deploy-process --agent atlas
 ```
 
----
+## Chat Commands
 
-### `xpressai sop delete`
+### `xpressclaw chat`
 
-Delete an SOP.
+Interactive chat with an agent.
 
 ```bash
-xpressai sop delete deploy-process
+xpressclaw chat atlas
 ```
-
----
 
 ## Global Options
-
-These options work with any command:
 
 | Option | Description |
 |--------|-------------|
 | `--help` | Show help for any command |
-| `--version` | Show XpressAI version |
+| `--version` | Show xpressclaw version |
 
 ## Examples
 
@@ -276,20 +173,19 @@ These options work with any command:
 
 ```bash
 # Initialize and start
-xpressai init
-xpressai up -d
+xpressclaw init
+xpressclaw up
 
-# Add some tasks
-xpressai tasks atlas add "Set up CI/CD pipeline"
-xpressai tasks atlas add "Write unit tests" --priority high
+# Add a task
+xpressclaw tasks create "Update dependencies" --agent atlas
 
 # Schedule recurring work
-xpressai tasks atlas schedule "Check for security updates" --cron "0 9 * * 1"
+xpressclaw tasks schedule "Check HN" --agent atlas --cron "0 9 * * 1-5"
 
 # Monitor
-xpressai status
-xpressai logs -f
+xpressclaw status
+xpressclaw logs -f
 
 # When done
-xpressai down
+xpressclaw down
 ```
