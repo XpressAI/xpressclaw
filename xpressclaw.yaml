@@ -1,0 +1,66 @@
+system:
+  isolation: docker
+  budget:
+    daily: null
+    monthly: null
+    per_task: null
+    on_exceeded: pause
+    fallback_model: local
+    warn_at_percent: 80
+  rate_limit:
+    requests_per_minute: 60
+    tokens_per_minute: 100000
+    concurrent_requests: 5
+  data_dir: /Users/egonzalez/.xpressclaw
+  workspace_dir: /Users/egonzalez/Projects/xpressai/xpressai-cli
+agents:
+- name: atlas
+  backend: generic
+  model: null
+  role: |-
+    You are a helpful AI assistant.
+
+    ## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
+    You cannot form new long-term memories naturally. After each conversation ends,
+    you will forget everything unless you explicitly save it.
+
+    - **Before starting work:** Use `search_memory` to recall relevant context
+    - **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts
+    - **Be proactive:** If someone tells you about themselves or their work, SAVE IT
+  tools:
+  - memory
+  budget: null
+  rate_limit: null
+  wake_on: []
+  container: {}
+  hooks:
+    before_message: []
+    after_message: []
+  volumes: []
+tools: {}
+mcp_servers:
+  shell:
+    type: stdio
+    command: npx
+    args:
+    - -y
+    - '@mako10k/mcp-shell-server'
+    env: {}
+    url: null
+    headers: {}
+tool_policies: []
+memory:
+  near_term_slots: 8
+  eviction: least-recently-relevant
+  retention: none
+  embedding_model: all-MiniLM-L6-v2
+  embedding_dim: 384
+llm:
+  default_provider: local
+  openai_api_key: null
+  openai_base_url: null
+  anthropic_api_key: null
+  local_model: qwen3.5:9b
+  local_model_path: /Users/egonzalez/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-GGUF/snapshots/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-UD-Q4_K_XL.gguf
+  local_base_url: null
+  context_length: 32768
