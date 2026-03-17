@@ -394,6 +394,7 @@ impl LlmProvider for LlamaCppProvider {
                 message: ChatMessage {
                     role: "assistant".into(),
                     content,
+                    ..Default::default()
                 },
                 finish_reason: Some("stop".into()),
             }],
@@ -647,6 +648,7 @@ mod tests {
             .format_prompt(&[ChatMessage {
                 role: "user".into(),
                 content: "Explain what a binary tree is in 2-3 sentences.".into(),
+                ..Default::default()
             }])
             .expect("format_prompt failed");
 
@@ -679,15 +681,10 @@ mod tests {
 
         let request = ChatCompletionRequest {
             model: "qwen3.5:0.8b".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "Say hello in exactly one word.".into(),
-            }],
+            messages: vec![ChatMessage::text("user", "Say hello in exactly one word.")],
             temperature: Some(0.0),
             max_tokens: Some(16),
-            stream: None,
-            top_p: None,
-            stop: None,
+            ..Default::default()
         };
 
         let response = provider.chat(&request).await.expect("chat failed");

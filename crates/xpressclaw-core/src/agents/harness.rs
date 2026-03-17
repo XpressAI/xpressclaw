@@ -42,10 +42,12 @@ impl HarnessClient {
                 ChatMessage {
                     role: "system".into(),
                     content: system_prompt.to_string(),
+                    ..Default::default()
                 },
                 ChatMessage {
                     role: "user".into(),
                     content: task_prompt.to_string(),
+                    ..Default::default()
                 },
             ],
             temperature: Some(0.7),
@@ -53,6 +55,7 @@ impl HarnessClient {
             stream: Some(false),
             top_p: None,
             stop: None,
+            ..Default::default()
         };
 
         self.chat(&request).await

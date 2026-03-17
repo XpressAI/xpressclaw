@@ -173,6 +173,7 @@ impl LlmProvider for AnthropicProvider {
                 message: ChatMessage {
                     role: "assistant".into(),
                     content,
+                    ..Default::default()
                 },
                 finish_reason,
             }],

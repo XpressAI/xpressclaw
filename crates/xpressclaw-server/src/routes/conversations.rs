@@ -272,6 +272,7 @@ async fn send_message(
             let mut llm_messages = vec![ChatMessage {
                 role: "system".into(),
                 content: role.to_string(),
+                ..Default::default()
             }];
 
             for m in &history {
@@ -282,17 +283,29 @@ async fn send_message(
                 llm_messages.push(ChatMessage {
                     role: r.to_string(),
                     content: m.content.clone(),
+                    ..Default::default()
                 });
             }
 
+            // Get tool schemas from the agent's configured tools
+            let tool_registry =
+                xpressclaw_core::tools::registry::ToolRegistry::new(state.db.clone());
+            let tool_schemas = tool_registry.get_tool_schemas(agent_id);
+            let tools = if tool_schemas.is_empty() {
+                None
+            } else {
+                Some(tool_schemas)
+            };
+
             let llm_req = ChatCompletionRequest {
                 model: model.clone(),
-                messages: llm_messages,
+                messages: llm_messages.clone(),
                 temperature: Some(0.7),
                 max_tokens: Some(4096),
                 stream: Some(false),
-                top_p: None,
-                stop: None,
+                tools: tools.clone(),
+                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                ..Default::default()
             };
 
             match llm_router.chat(&llm_req).await {
@@ -319,6 +332,41 @@ async fn send_message(
                     }
 
                     if let Some(choice) = resp.choices.first() {
+                        // Check if the LLM wants to call tools
+                        if let Some(ref tool_calls) = choice.message.tool_calls {
+                            if !tool_calls.is_empty() {
+                                // Format tool calls for display
+                                let mut tool_display = String::new();
+                                for tc in tool_calls {
+                                    tool_display.push_str(&format!(
+                                        "<tool_call name=\"{}\">{}</tool_call>\n",
+                                        tc.function.name, tc.function.arguments
+                                    ));
+                                }
+                                // TODO: Execute tools via MCP proxy and loop back
+                                // For now, show what the agent wanted to do
+                                let content = if choice.message.content.is_empty() {
+                                    format!("{tool_display}\n*Tool execution is not yet connected. The agent requested these tool calls but they were not executed.*")
+                                } else {
+                                    format!("{tool_display}\n{}", choice.message.content)
+                                };
+                                let agent_msg = mgr
+                                    .send_message(
+                                        &conv_id,
+                                        &SendMessage {
+                                            sender_type: "agent".into(),
+                                            sender_id: agent_id.clone(),
+                                            sender_name: Some(agent_id.clone()),
+                                            content,
+                                            message_type: None,
+                                        },
+                                    )
+                                    .map_err(internal_error)?;
+                                messages.push(json!(agent_msg));
+                                continue;
+                            }
+                        }
+
                         let agent_msg = mgr
                             .send_message(
                                 &conv_id,
@@ -486,8 +534,7 @@ async fn stream_message(
 
             let mut llm_messages = vec![ChatMessage {
                 role: "system".into(),
-                content: role.to_string(),
-            }];
+                content: role.to_string(), ..Default::default() }];
 
             for m in &history {
                 let r = match m.sender_type.as_str() {
@@ -496,8 +543,7 @@ async fn stream_message(
                 };
                 llm_messages.push(ChatMessage {
                     role: r.to_string(),
-                    content: m.content.clone(),
-                });
+                    content: m.content.clone(), ..Default::default() });
             }
 
             let llm_req = ChatCompletionRequest {
@@ -507,8 +553,7 @@ async fn stream_message(
                 max_tokens: Some(4096),
                 stream: Some(true),
                 top_p: None,
-                stop: None,
-            };
+                stop: None, ..Default::default() };
 
             // Send "thinking" event
             if let Ok(evt) = Event::default().event("thinking").json_data(json!({
