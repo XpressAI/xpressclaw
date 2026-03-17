@@ -246,7 +246,7 @@ async fn send_message(
                 continue;
             }
 
-            // Look up agent to get model config
+            // Look up agent to get config
             let agent = match registry.get(agent_id) {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -269,46 +269,63 @@ async fn send_message(
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
-            let mut llm_messages = vec![ChatMessage {
-                role: "system".into(),
-                content: role.to_string(),
-                ..Default::default()
-            }];
-
+            let mut llm_messages = vec![ChatMessage::text("system", role)];
             for m in &history {
                 let r = match m.sender_type.as_str() {
                     "agent" => "assistant",
                     _ => "user",
                 };
-                llm_messages.push(ChatMessage {
-                    role: r.to_string(),
-                    content: m.content.clone(),
-                    ..Default::default()
-                });
+                llm_messages.push(ChatMessage::text(r, &m.content));
             }
-
-            // Get tool schemas from the agent's configured tools
-            let tool_registry =
-                xpressclaw_core::tools::registry::ToolRegistry::new(state.db.clone());
-            let tool_schemas = tool_registry.get_tool_schemas(agent_id);
-            let tools = if tool_schemas.is_empty() {
-                None
-            } else {
-                Some(tool_schemas)
-            };
 
             let llm_req = ChatCompletionRequest {
                 model: model.clone(),
-                messages: llm_messages.clone(),
+                messages: llm_messages,
                 temperature: Some(0.7),
                 max_tokens: Some(4096),
-                stream: Some(false),
-                tools: tools.clone(),
-                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                 ..Default::default()
             };
 
-            match llm_router.chat(&llm_req).await {
+            // Route through harness container if running, otherwise LLM router directly.
+            // The harness handles the agent reasoning loop (tool calls, multi-step, etc.)
+            // and calls back to the server for LLM access and MCP tools.
+            let resp = if let Some(ref cid) = agent.container_id {
+                // Agent has a container — try to find its host_port
+                match xpressclaw_core::docker::manager::DockerManager::connect().await {
+                    Ok(docker) => match docker.get_container_port(cid).await {
+                        Some(port) => {
+                            let harness =
+                                xpressclaw_core::agents::harness::HarnessClient::new(port);
+                            tracing::info!(
+                                agent_id,
+                                port,
+                                "routing message through harness container"
+                            );
+                            harness.chat(&llm_req).await
+                        }
+                        None => {
+                            tracing::warn!(
+                                agent_id,
+                                container_id = cid,
+                                "container has no host port, falling back to LLM router"
+                            );
+                            llm_router.chat(&llm_req).await
+                        }
+                    },
+                    Err(_) => {
+                        tracing::warn!(
+                            agent_id,
+                            "Docker not available, falling back to LLM router"
+                        );
+                        llm_router.chat(&llm_req).await
+                    }
+                }
+            } else {
+                // No container (containerless mode) — call LLM router directly
+                llm_router.chat(&llm_req).await
+            };
+
+            match resp {
                 Ok(resp) => {
                     // Record usage and update budget
                     if let Some(ref usage) = resp.usage {
@@ -332,41 +349,6 @@ async fn send_message(
                     }
 
                     if let Some(choice) = resp.choices.first() {
-                        // Check if the LLM wants to call tools
-                        if let Some(ref tool_calls) = choice.message.tool_calls {
-                            if !tool_calls.is_empty() {
-                                // Format tool calls for display
-                                let mut tool_display = String::new();
-                                for tc in tool_calls {
-                                    tool_display.push_str(&format!(
-                                        "<tool_call name=\"{}\">{}</tool_call>\n",
-                                        tc.function.name, tc.function.arguments
-                                    ));
-                                }
-                                // TODO: Execute tools via MCP proxy and loop back
-                                // For now, show what the agent wanted to do
-                                let content = if choice.message.content.is_empty() {
-                                    format!("{tool_display}\n*Tool execution is not yet connected. The agent requested these tool calls but they were not executed.*")
-                                } else {
-                                    format!("{tool_display}\n{}", choice.message.content)
-                                };
-                                let agent_msg = mgr
-                                    .send_message(
-                                        &conv_id,
-                                        &SendMessage {
-                                            sender_type: "agent".into(),
-                                            sender_id: agent_id.clone(),
-                                            sender_name: Some(agent_id.clone()),
-                                            content,
-                                            message_type: None,
-                                        },
-                                    )
-                                    .map_err(internal_error)?;
-                                messages.push(json!(agent_msg));
-                                continue;
-                            }
-                        }
-
                         let agent_msg = mgr
                             .send_message(
                                 &conv_id,
