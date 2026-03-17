@@ -140,12 +140,57 @@ async fn start_agent(
         ..Default::default()
     };
 
+    // Agent identity
     spec.environment.push(format!("AGENT_ID={}", id));
     spec.environment.push(format!("AGENT_NAME={}", record.name));
     spec.environment
         .push(format!("AGENT_BACKEND={}", record.backend));
     spec.environment
         .push(format!("AGENT_CONFIG={}", record.config));
+
+    // Server callback URLs — the harness calls back for LLM access.
+    // Inside Docker, the host is reachable via host.docker.internal.
+    let server_port = std::env::var("XPRESSCLAW_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8935);
+    let server_base = format!("http://host.docker.internal:{server_port}");
+    spec.environment
+        .push(format!("LLM_BASE_URL={server_base}/v1"));
+    spec.environment
+        .push(format!("OPENAI_BASE_URL={server_base}/v1"));
+    // Placeholder API key for SDKs that require one
+    spec.environment
+        .push("OPENAI_API_KEY=sk-xpressclaw".to_string());
+
+    // Pass MCP server configs so the harness can start them inside the container.
+    // MCP servers run inside the container for isolation (third-party code).
+    if !config.mcp_servers.is_empty() {
+        if let Ok(mcp_json) = serde_json::to_string(&config.mcp_servers) {
+            spec.environment.push(format!("MCP_SERVERS={mcp_json}"));
+        }
+    }
+
+    // Pass the agent's allowed tools list from config
+    let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
+    if let Some(cfg) = agent_cfg {
+        if !cfg.tools.is_empty() {
+            if let Ok(tools_json) = serde_json::to_string(&cfg.tools) {
+                spec.environment.push(format!("AGENT_TOOLS={tools_json}"));
+            }
+        }
+    }
+
+    // Mount workspace volume if configured
+    let workspace_dir = config.system.workspace_dir.to_string_lossy().to_string();
+    if !workspace_dir.is_empty() && workspace_dir != "/" {
+        spec.volumes
+            .push(xpressclaw_core::docker::manager::VolumeMount {
+                source: workspace_dir,
+                target: "/workspace".to_string(),
+                read_only: false,
+            });
+    }
 
     match docker.launch(&id, &spec).await {
         Ok(info) => {

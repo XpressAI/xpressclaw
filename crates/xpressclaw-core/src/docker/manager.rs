@@ -229,20 +229,37 @@ impl DockerManager {
             .await
             .map_err(|e| Error::Docker(e.to_string()))?;
 
-        let infos = containers
-            .into_iter()
-            .filter_map(|c| {
-                let names = c.names?;
-                let name = names.first()?.trim_start_matches('/').to_string();
-                let agent_id = name.strip_prefix("xpressclaw-")?.to_string();
-                Some(ContainerInfo {
-                    container_id: c.id.unwrap_or_default(),
-                    agent_id,
-                    status: c.state.unwrap_or_default(),
-                    host_port: None,
-                })
-            })
-            .collect();
+        let mut infos = Vec::new();
+        for c in containers {
+            let names = match c.names {
+                Some(ref n) => n.clone(),
+                None => continue,
+            };
+            let name = match names.first() {
+                Some(n) => n.trim_start_matches('/').to_string(),
+                None => continue,
+            };
+            let agent_id = match name.strip_prefix("xpressclaw-") {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            let container_id = c.id.unwrap_or_default();
+            let status = c.state.unwrap_or_default();
+
+            // Retrieve the host port via inspect (needed to route to the harness)
+            let host_port = if status == "running" {
+                self.get_host_port(&container_id, Some(8080)).await
+            } else {
+                None
+            };
+
+            infos.push(ContainerInfo {
+                container_id,
+                agent_id,
+                status,
+                host_port,
+            });
+        }
 
         Ok(infos)
     }
@@ -309,6 +326,11 @@ impl DockerManager {
 
         info!(image, "pull complete");
         Ok(())
+    }
+
+    /// Get the host port for a container (public API for conversation routing).
+    pub async fn get_container_port(&self, container_id: &str) -> Option<u16> {
+        self.get_host_port(container_id, Some(8080)).await
     }
 
     async fn get_host_port(&self, container_id: &str, expose_port: Option<u16>) -> Option<u16> {

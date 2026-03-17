@@ -14,6 +14,7 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .nest("/api", routes::api_routes())
         .nest("/v1", routes::llm::routes())
+        .nest("/v1/tools", routes::tools_proxy_routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())
@@ -23,6 +24,10 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Start the HTTP server.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
+    // MCP tool servers run inside agent containers (not on the host).
+    // The server passes MCP configs to containers via environment variables.
+    // The /v1/tools endpoint is available for any external tool proxying.
+
     let app = create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

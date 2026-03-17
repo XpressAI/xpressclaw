@@ -12,14 +12,62 @@ use crate::error::{Error, Result};
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
 /// A chat message in OpenAI format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    /// Tool calls requested by the assistant (role=assistant, finish_reason=tool_calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool call ID this message is responding to (role=tool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Create a simple text message.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Create a tool result message.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// A tool call from the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "default_tool_type")]
+    pub call_type: String,
+    pub function: ToolCallFunction,
+}
+
+fn default_tool_type() -> String {
+    "function".into()
+}
+
+/// The function being called in a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 /// Request for chat completion (OpenAI-compatible).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -33,6 +81,12 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub stop: Option<Vec<String>>,
+    /// Available tools for the model to call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// How the model should choose tools: "auto", "none", or "required".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
 }
 
 /// Token usage stats.
@@ -294,10 +348,7 @@ mod tests {
                 model: request.model.clone(),
                 choices: vec![ChatChoice {
                     index: 0,
-                    message: ChatMessage {
-                        role: "assistant".into(),
-                        content: format!("Hello from {}", self.name),
-                    },
+                    message: ChatMessage::text("assistant", format!("Hello from {}", self.name)),
                     finish_reason: Some("stop".into()),
                 }],
                 usage: Some(Usage {
@@ -341,15 +392,8 @@ mod tests {
 
         let req = ChatCompletionRequest {
             model: "gpt-4o".into(),
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            top_p: None,
-            stop: None,
+            messages: vec![ChatMessage::text("user", "hi")],
+            ..Default::default()
         };
 
         let resp = router.chat(&req).await.unwrap();
@@ -376,6 +420,7 @@ mod tests {
             stream: None,
             top_p: None,
             stop: None,
+            ..Default::default()
         };
 
         assert!(router.chat(&req).await.is_err());

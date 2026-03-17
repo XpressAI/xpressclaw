@@ -1,7 +1,15 @@
 # ADR-002: Agent Backend Abstraction
 
 ## Status
-Accepted
+Superseded by ADR-003 (Container Isolation)
+
+> **Note:** This ADR was written for a Python in-process architecture.
+> The Rust implementation uses Docker container harnesses (ADR-003) as the
+> abstraction boundary instead of Rust trait objects. Each agent backend is
+> a Docker image (e.g., `xpressclaw-harness-generic`, `xpressclaw-harness-claude-sdk`)
+> that exposes an OpenAI-compatible HTTP API. The server routes messages to
+> the harness container, which handles the agent reasoning loop internally
+> and calls back to the server for LLM access and MCP tools.
 
 ## Context
 

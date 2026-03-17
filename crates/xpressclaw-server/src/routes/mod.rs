@@ -14,6 +14,11 @@ mod procedures;
 mod schedules;
 mod setup;
 mod tasks;
+mod tools_proxy;
+
+pub fn tools_proxy_routes() -> Router<AppState> {
+    tools_proxy::routes()
+}
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
