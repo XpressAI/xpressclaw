@@ -140,12 +140,41 @@ async fn start_agent(
         ..Default::default()
     };
 
+    // Agent identity
     spec.environment.push(format!("AGENT_ID={}", id));
     spec.environment.push(format!("AGENT_NAME={}", record.name));
     spec.environment
         .push(format!("AGENT_BACKEND={}", record.backend));
     spec.environment
         .push(format!("AGENT_CONFIG={}", record.config));
+
+    // Server callback URLs — the harness calls back to these for LLM and tools.
+    // Inside Docker, the host is reachable via host.docker.internal.
+    let server_port = std::env::var("XPRESSCLAW_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8935);
+    let server_base = format!("http://host.docker.internal:{server_port}");
+    spec.environment
+        .push(format!("LLM_BASE_URL={server_base}/v1"));
+    spec.environment
+        .push(format!("OPENAI_BASE_URL={server_base}/v1"));
+    spec.environment
+        .push(format!("MCP_SERVER_URL={server_base}/v1/tools"));
+    // Placeholder API key for SDKs that require one
+    spec.environment
+        .push("OPENAI_API_KEY=sk-xpressclaw".to_string());
+
+    // Mount workspace volume if configured
+    let workspace_dir = config.system.workspace_dir.to_string_lossy().to_string();
+    if !workspace_dir.is_empty() && workspace_dir != "/" {
+        spec.volumes
+            .push(xpressclaw_core::docker::manager::VolumeMount {
+                source: workspace_dir,
+                target: "/workspace".to_string(),
+                read_only: false,
+            });
+    }
 
     match docker.launch(&id, &spec).await {
         Ok(info) => {
