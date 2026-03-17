@@ -514,18 +514,13 @@ async fn stream_message(
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
-            let mut llm_messages = vec![ChatMessage {
-                role: "system".into(),
-                content: role.to_string(), ..Default::default() }];
-
+            let mut llm_messages = vec![ChatMessage::text("system", role)];
             for m in &history {
                 let r = match m.sender_type.as_str() {
                     "agent" => "assistant",
                     _ => "user",
                 };
-                llm_messages.push(ChatMessage {
-                    role: r.to_string(),
-                    content: m.content.clone(), ..Default::default() });
+                llm_messages.push(ChatMessage::text(r, &m.content));
             }
 
             let llm_req = ChatCompletionRequest {
@@ -534,8 +529,8 @@ async fn stream_message(
                 temperature: Some(0.7),
                 max_tokens: Some(4096),
                 stream: Some(true),
-                top_p: None,
-                stop: None, ..Default::default() };
+                ..Default::default()
+            };
 
             // Send "thinking" event
             if let Ok(evt) = Event::default().event("thinking").json_data(json!({
@@ -544,7 +539,53 @@ async fn stream_message(
                 yield Ok(evt);
             }
 
-            match llm_router.chat_stream(&llm_req).await {
+            // Route through harness container if running, otherwise LLM router
+            let stream_result = if let Some(ref cid) = agent.container_id {
+                match xpressclaw_core::docker::manager::DockerManager::connect().await {
+                    Ok(docker) => {
+                        match docker.get_container_port(cid).await {
+                            Some(port) => {
+                                // Harness doesn't support streaming yet — use non-streaming
+                                // and wrap the response as a single chunk.
+                                let harness = xpressclaw_core::agents::harness::HarnessClient::new(port);
+                                let mut non_stream_req = llm_req.clone();
+                                non_stream_req.stream = Some(false);
+                                match harness.chat(&non_stream_req).await {
+                                    Ok(resp) => {
+                                        // Wrap as a stream with a single chunk
+                                        let content = resp.choices.first()
+                                            .map(|c| c.message.content.clone())
+                                            .unwrap_or_default();
+                                        Ok(Box::pin(futures_util::stream::once(async move {
+                                            Ok(xpressclaw_core::llm::router::ChatCompletionChunk {
+                                                id: resp.id,
+                                                object: "chat.completion.chunk".into(),
+                                                created: resp.created,
+                                                model: resp.model,
+                                                choices: vec![xpressclaw_core::llm::router::ChunkChoice {
+                                                    index: 0,
+                                                    delta: xpressclaw_core::llm::router::ChunkDelta {
+                                                        role: Some("assistant".into()),
+                                                        content: Some(content),
+                                                    },
+                                                    finish_reason: Some("stop".into()),
+                                                }],
+                                            })
+                                        })) as xpressclaw_core::llm::router::ChatStream)
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            }
+                            None => llm_router.chat_stream(&llm_req).await,
+                        }
+                    }
+                    Err(_) => llm_router.chat_stream(&llm_req).await,
+                }
+            } else {
+                llm_router.chat_stream(&llm_req).await
+            };
+
+            match stream_result {
                 Ok(mut chunk_stream) => {
                     let mut full_content = String::new();
                     let mut total_tokens: i64 = 0;
