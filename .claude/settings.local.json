@@ -43,7 +43,8 @@
       "Bash(gh api:*)",
       "Bash(docker build:*)",
       "Bash(git:*)",
-      "WebFetch(domain:medium.com)"
+      "WebFetch(domain:medium.com)",
+      "Bash(gh run:*)"
     ]
   }
 }

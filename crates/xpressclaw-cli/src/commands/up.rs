@@ -205,13 +205,7 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
 
     let _ = port; // available for future use (e.g., logging)
 
-    let state = AppState::new(
-        config,
-        db,
-        Some(Arc::new(llm_router)),
-        config_path,
-        true,
-    );
+    let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
 
     // Start all agents that should be running
     // Create a separate runtime for startup
@@ -220,13 +214,13 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     // Get all agents and start those that are not stopped
     let registry = runtime.registry();
     let agents = registry.list().unwrap_or_default();
-    
+
     for agent in agents {
         // Skip explicitly stopped agents
         if agent.status == "stopped" {
             continue;
         }
-        
+
         // Check if container is actually running
         if agent.status == "running" {
             if let Some(ref container_id) = agent.container_id {
@@ -236,15 +230,18 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
                         let is_running = containers
                             .iter()
                             .any(|c| c.container_id == *container_id && c.status == "running");
-                        
+
                         if !is_running {
-                            warn!(agent_id = agent.id, "agent marked as running but container not found, will restart");
+                            warn!(
+                                agent_id = agent.id,
+                                "agent marked as running but container not found, will restart"
+                            );
                         }
                     }
                 }
             }
         }
-        
+
         // Start the agent (will detect and handle stopped containers)
         if let Err(e) = runtime.start_agent(&agent.id).await {
             warn!(agent_id = agent.id, error = %e, "failed to start agent");
