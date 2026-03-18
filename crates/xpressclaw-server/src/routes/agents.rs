@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -7,8 +9,9 @@ use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::agents::state::AgentStatus;
-use xpressclaw_core::docker::images::image_for_backend;
-use xpressclaw_core::docker::manager::{ContainerSpec, DockerManager};
+use xpressclaw_core::config::{default_mcp_servers, AgentConfig, McpServerConfig};
+use xpressclaw_core::docker::images::build_container_spec;
+use xpressclaw_core::docker::manager::{DockerManager, VolumeMount};
 
 use crate::state::AppState;
 
@@ -25,6 +28,7 @@ pub fn routes() -> Router<AppState> {
             "/{id}",
             get(get_agent).put(update_agent).delete(delete_agent),
         )
+        .route("/{id}/config", axum::routing::patch(update_agent_config))
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
 }
@@ -131,48 +135,68 @@ async fn start_agent(
         internal_error(e)
     })?;
 
-    let image = body
-        .and_then(|b| b.image.clone())
-        .unwrap_or_else(|| image_for_backend(&record.backend).to_string());
-
-    let mut spec = ContainerSpec {
-        image,
-        ..Default::default()
-    };
-
-    // Agent identity
-    spec.environment.push(format!("AGENT_ID={}", id));
-    spec.environment.push(format!("AGENT_NAME={}", record.name));
-    spec.environment
-        .push(format!("AGENT_BACKEND={}", record.backend));
-    spec.environment
-        .push(format!("AGENT_CONFIG={}", record.config));
-
-    // Server callback URLs — the harness calls back for LLM access.
-    // Inside Docker, the host is reachable via host.docker.internal.
     let server_port = std::env::var("XPRESSCLAW_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8935);
-    let server_base = format!("http://host.docker.internal:{server_port}");
-    spec.environment
-        .push(format!("LLM_BASE_URL={server_base}/v1"));
-    spec.environment
-        .push(format!("OPENAI_BASE_URL={server_base}/v1"));
-    // Placeholder API key for SDKs that require one
-    spec.environment
-        .push("OPENAI_API_KEY=sk-xpressclaw".to_string());
 
-    // Pass MCP server configs so the harness can start them inside the container.
-    // MCP servers run inside the container for isolation (third-party code).
-    if !config.mcp_servers.is_empty() {
-        if let Ok(mcp_json) = serde_json::to_string(&config.mcp_servers) {
+    // Build container spec from agent config (handles env vars, API keys, volumes)
+    let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
+    let mut spec = if let Some(cfg) = agent_cfg {
+        let mut s = build_container_spec(
+            cfg,
+            server_port,
+            config.llm.anthropic_api_key.as_deref(),
+            config.llm.openai_api_key.as_deref(),
+            config.llm.openai_base_url.as_deref(),
+        );
+        // Override image if requested
+        if let Some(ref b) = body {
+            if let Some(ref img) = b.image {
+                s.image = img.clone();
+            }
+        }
+        s
+    } else {
+        // Fallback for agents not in YAML config
+        use xpressclaw_core::docker::images::image_for_backend;
+        let image = body
+            .and_then(|b| b.image.clone())
+            .unwrap_or_else(|| image_for_backend(&record.backend).to_string());
+        let mut s = xpressclaw_core::docker::manager::ContainerSpec {
+            image,
+            ..Default::default()
+        };
+        let server_base = format!("http://host.docker.internal:{server_port}");
+        s.environment.push(format!("AGENT_ID={id}"));
+        s.environment.push(format!("AGENT_NAME={}", record.name));
+        s.environment
+            .push(format!("AGENT_BACKEND={}", record.backend));
+        s.environment.push(format!("LLM_BASE_URL={server_base}/v1"));
+        s.environment
+            .push(format!("OPENAI_BASE_URL={server_base}/v1"));
+        s.environment
+            .push("OPENAI_API_KEY=sk-xpressclaw".to_string());
+        s.environment
+            .push(format!("ANTHROPIC_BASE_URL={server_base}"));
+        s.environment
+            .push("ANTHROPIC_API_KEY=sk-ant-xpressclaw".to_string());
+        s
+    };
+
+    // Always pass the agent config JSON
+    spec.environment
+        .push(format!("AGENT_CONFIG={}", record.config));
+
+    // Filter MCP servers: always-on defaults + agent's tools matching global MCP servers
+    let filtered_mcp = filter_mcp_for_agent(agent_cfg, &config.mcp_servers);
+    if !filtered_mcp.is_empty() {
+        if let Ok(mcp_json) = serde_json::to_string(&filtered_mcp) {
             spec.environment.push(format!("MCP_SERVERS={mcp_json}"));
         }
     }
 
-    // Pass the agent's allowed tools list from config
-    let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
+    // Pass agent tools list
     if let Some(cfg) = agent_cfg {
         if !cfg.tools.is_empty() {
             if let Ok(tools_json) = serde_json::to_string(&cfg.tools) {
@@ -181,15 +205,28 @@ async fn start_agent(
         }
     }
 
-    // Mount workspace volume if configured
-    let workspace_dir = config.system.workspace_dir.to_string_lossy().to_string();
-    if !workspace_dir.is_empty() && workspace_dir != "/" {
-        spec.volumes
-            .push(xpressclaw_core::docker::manager::VolumeMount {
+    // If agent has no per-agent volumes, fall back to global workspace dir
+    if spec.volumes.is_empty() {
+        let workspace_dir = config.system.workspace_dir.to_string_lossy().to_string();
+        if !workspace_dir.is_empty() && workspace_dir != "/" {
+            spec.volumes.push(VolumeMount {
                 source: workspace_dir,
                 target: "/workspace".to_string(),
                 read_only: false,
             });
+        }
+    }
+
+    // Mount Docker socket if any MCP server needs docker access (e.g., GitHub MCP)
+    if filtered_mcp
+        .values()
+        .any(|s| s.command.as_deref() == Some("docker"))
+    {
+        spec.volumes.push(VolumeMount {
+            source: "/var/run/docker.sock".to_string(),
+            target: "/var/run/docker.sock".to_string(),
+            read_only: false,
+        });
     }
 
     match docker.launch(&id, &spec).await {
@@ -240,6 +277,121 @@ async fn stop_agent(
         .update_status(&id, &AgentStatus::Stopped, None)
         .map_err(internal_error)?;
     Ok(Json(json!(record)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAgentConfigRequest {
+    role: Option<String>,
+    model: Option<String>,
+    tools: Option<Vec<String>>,
+    volumes: Option<Vec<String>>,
+}
+
+/// Update an agent's configuration in the YAML config file and reload.
+async fn update_agent_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAgentConfigRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let registry = AgentRegistry::new(state.db.clone());
+    let record = registry.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+
+    let old_config = state.config();
+    let mut new_agents = old_config.agents.clone();
+
+    // Find or create the agent config entry
+    let agent_idx = new_agents.iter().position(|a| a.name == record.name);
+    let agent = if let Some(idx) = agent_idx {
+        &mut new_agents[idx]
+    } else {
+        new_agents.push(AgentConfig {
+            name: record.name.clone(),
+            backend: record.backend.clone(),
+            ..Default::default()
+        });
+        new_agents.last_mut().unwrap()
+    };
+
+    // Apply partial updates
+    if let Some(role) = req.role {
+        agent.role = role;
+    }
+    if let Some(model) = req.model {
+        agent.model = if model.is_empty() { None } else { Some(model) };
+    }
+    if let Some(mut tools) = req.tools {
+        // Ensure shell + filesystem are always present
+        for default_tool in ["filesystem", "shell"] {
+            if !tools.iter().any(|t| t == default_tool) {
+                tools.insert(0, default_tool.to_string());
+            }
+        }
+        agent.tools = tools;
+    }
+    if let Some(volumes) = req.volumes {
+        agent.volumes = volumes;
+    }
+
+    let needs_restart = record.status == "running";
+
+    // Save updated config
+    let new_config = xpressclaw_core::config::Config {
+        agents: new_agents,
+        llm: old_config.llm.clone(),
+        mcp_servers: old_config.mcp_servers.clone(),
+        system: old_config.system.clone(),
+        ..Default::default()
+    };
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+
+    // Reload config into AppState (keep existing LLM router)
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config.clone(), state.llm_router());
+
+    // Find the updated agent config to return
+    let updated = new_config
+        .agents
+        .iter()
+        .find(|a| a.name == record.name)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "agent": {
+            "name": updated.name,
+            "backend": updated.backend,
+            "role": updated.role,
+            "model": updated.model,
+            "tools": updated.tools,
+            "volumes": updated.volumes,
+        },
+        "needs_restart": needs_restart,
+    })))
+}
+
+/// Build the set of MCP servers for an agent: always-on defaults (shell, filesystem)
+/// plus any global MCP servers whose key appears in the agent's tools list.
+fn filter_mcp_for_agent(
+    agent_cfg: Option<&AgentConfig>,
+    global_mcp: &HashMap<String, McpServerConfig>,
+) -> HashMap<String, McpServerConfig> {
+    let mut result = default_mcp_servers();
+    if let Some(cfg) = agent_cfg {
+        for tool in &cfg.tools {
+            if let Some(server) = global_mcp.get(tool.as_str()) {
+                result.insert(tool.clone(), server.clone());
+            }
+        }
+    } else {
+        // No per-agent config: pass all global MCP servers
+        result.extend(global_mcp.clone());
+    }
+    result
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

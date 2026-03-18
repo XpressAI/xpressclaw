@@ -4,6 +4,8 @@ description: General-purpose AI assistant with memory and learning
 icon: brain
 backend: claude-sdk
 default_tools:
+  - filesystem
+  - shell
   - memory
 recommended_llm: local
 role: |
