@@ -193,6 +193,7 @@ struct AgentSetup {
     preset: Option<String>,
     role: Option<String>,
     backend: Option<String>,
+    model: Option<String>,
     tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
 }
@@ -310,6 +311,7 @@ async fn complete_setup(
                         .clone()
                         .or(preset.map(|p| p.role.to_string()))
                         .unwrap_or_default(),
+                    model: a.model.clone(),
                     tools,
                     volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()

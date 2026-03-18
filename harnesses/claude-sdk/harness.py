@@ -8,7 +8,7 @@ xpressclaw server exposes at /v1/messages, routing to any configured LLM.
 Environment variables:
   ANTHROPIC_API_KEY  — API key (real or placeholder for local models).
   ANTHROPIC_BASE_URL — API base URL (set by xpressclaw to route through server).
-  LLM_MODEL          — Model to use (default: claude-sonnet-4-20250514)
+  LLM_MODEL          — Model to use (default: claude-sonnet-4-6)
   WORKSPACE_DIR      — Agent workspace (default: /workspace)
   MCP_SERVERS        — JSON dict of MCP server configs (injected by xpressclaw)
 """
@@ -25,12 +25,15 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     AssistantMessage,
-    StreamEvent,
     query,
 )
+try:
+    from claude_agent_sdk import StreamEvent
+except ImportError:
+    from claude_agent_sdk.types import StreamEvent
 from server import BaseHarness, logger, AGENT_ID, AGENT_NAME
 
-LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
 WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 
 

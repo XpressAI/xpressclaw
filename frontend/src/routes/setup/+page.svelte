@@ -34,6 +34,13 @@
 	let llmBaseUrl = $state('');
 	let llmLocalModel = $state('');
 	let llmLocalBaseUrl = $state('');
+	let llmModel = $state('claude-sonnet-4-6');
+
+	const anthropicModels = [
+		{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', desc: 'Best balance of speed and intelligence' },
+		{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', desc: 'Most capable, higher cost' },
+		{ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', desc: 'Fastest, lowest cost' },
+	];
 	let keyValidating = $state(false);
 	let keyValid = $state<boolean | null>(null);
 	let keyError = $state('');
@@ -291,6 +298,7 @@
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
+					model: llmProvider === 'anthropic' ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
 					tools,
 					volumes: volumes.length > 0 ? volumes : undefined,
 				}],
@@ -515,6 +523,26 @@
 						{#if keyValid === true}<p class="mt-1 text-xs text-emerald-500">API key is valid</p>{/if}
 						{#if keyValid === false}<p class="mt-1 text-xs text-red-500">{keyError}</p>{/if}
 					</div>
+					{#if llmProvider === 'anthropic'}
+						<div>
+							<label class="block text-xs font-medium text-foreground mb-2">Model</label>
+							<div class="space-y-1">
+								{#each anthropicModels as m}
+									<button onclick={() => llmModel = m.id}
+										class="w-full flex items-center gap-3 rounded-md border p-2 text-left transition-colors {llmModel === m.id
+											? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}">
+										<div class="flex-1">
+											<div class="text-sm font-medium text-foreground">{m.name}</div>
+											<div class="text-xs text-muted-foreground">{m.desc}</div>
+										</div>
+										{#if llmModel === m.id}
+											<span class="text-xs text-primary">&#10003;</span>
+										{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/if}
 					{#if llmProvider === 'openai'}
 						<div>
 							<label for="openai-url" class="block text-xs font-medium text-foreground mb-1">
