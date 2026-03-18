@@ -2,7 +2,7 @@ id: researcher
 name: Researcher
 description: Research agent with web search and note-taking
 icon: search
-backend: generic
+backend: claude-sdk
 default_tools:
   - memory
   - fetch

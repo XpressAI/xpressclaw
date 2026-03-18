@@ -2,7 +2,7 @@ id: developer
 name: Developer
 description: Code-focused agent with shell, filesystem, and GitHub access
 icon: code
-backend: generic
+backend: claude-sdk
 default_tools:
   - filesystem
   - shell

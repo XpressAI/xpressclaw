@@ -1,10 +1,10 @@
-# Getting Started with XpressAI
+# Getting Started with xpressclaw
 
-This guide will help you set up XpressAI and run your first autonomous agent.
+This guide will help you set up xpressclaw and run your first autonomous agent.
 
 ## Prerequisites
 
-- Python 3.11 or higher
+- Rust toolchain (see [rustup.rs](https://rustup.rs/))
 - An API key for your chosen backend:
   - **Claude**: Set `ANTHROPIC_API_KEY` environment variable
   - **OpenAI**: Set `OPENAI_API_KEY` environment variable
@@ -13,14 +13,21 @@ This guide will help you set up XpressAI and run your first autonomous agent.
 
 ## Installation
 
+### Download Binary
+
+Grab the latest release from [GitHub Releases](https://github.com/XpressAI/xpressclaw/releases).
+
 ```bash
-pip install xpressai
+xpressclaw init
+xpressclaw up
 ```
 
-Or with uv (recommended):
+### Build from Source
 
 ```bash
-uv pip install xpressai
+git clone https://github.com/XpressAI/xpressclaw.git
+cd xpressclaw
+cargo build --release
 ```
 
 ## Quick Start
@@ -30,26 +37,23 @@ uv pip install xpressai
 Navigate to your project directory and run:
 
 ```bash
-xpressai init
+xpressclaw init
 ```
 
-This creates an `xpressai.yaml` configuration file with sensible defaults:
-- One agent named "atlas" using Claude
-- $20/day budget limit
-- Basic filesystem and shell tools enabled
+This creates an `xpressclaw.yaml` configuration file with sensible defaults.
 
 ### 2. Start the Runtime
 
 ```bash
-xpressai up
+xpressclaw up
 ```
 
-This starts your agent in the foreground. You'll see logs as the agent runs.
+This starts your agents. You'll see logs as they run.
 
 To run in the background:
 
 ```bash
-xpressai up -d
+xpressclaw up --detach
 ```
 
 ### 3. Give Your Agent a Task
@@ -57,26 +61,19 @@ xpressai up -d
 Open another terminal and add a task:
 
 ```bash
-xpressai tasks atlas add "Create a hello.txt file with a friendly greeting"
+xpressclaw tasks create "Refactor the auth module" --agent atlas
 ```
-
-Watch the logs to see your agent pick up and complete the task.
 
 ### 4. Check Status
 
 ```bash
-xpressai status
+xpressclaw status
 ```
-
-This shows:
-- Which agents are running
-- Current budget usage
-- Task counts (pending, in progress, completed)
 
 ### 5. Stop the Runtime
 
 ```bash
-xpressai down
+xpressclaw down
 ```
 
 ## Next Steps
@@ -86,14 +83,12 @@ xpressai down
 Have your agent do something every day:
 
 ```bash
-xpressai tasks atlas schedule "Check for security updates" --cron "0 9 * * *"
+xpressclaw tasks schedule "Check for security updates" --agent atlas --cron "0 9 * * *"
 ```
-
-See [Scheduling](scheduling.md) for cron syntax and more examples.
 
 ### Configure Your Agent
 
-Edit `xpressai.yaml` to customize:
+Edit `xpressclaw.yaml` to customize:
 
 ```yaml
 agents:
@@ -108,30 +103,15 @@ agents:
 
 See [Configuration](configuration.md) for all options.
 
-### Set Budget Limits
-
-Control spending with budget configuration:
-
-```yaml
-system:
-  budget:
-    daily: $10.00
-    on_exceeded: pause  # Agent pauses when budget is hit
-```
-
 ### Use the Dashboard
 
-Launch a web dashboard to monitor your agents:
+The web UI is built-in. Just run:
 
 ```bash
-xpressai dashboard
+xpressclaw up
 ```
 
-Or use the terminal UI:
-
-```bash
-xpressai tui
-```
+And visit http://localhost:8935.
 
 ## Example: Daily News Summary
 
@@ -139,10 +119,10 @@ Here's a complete example that summarizes Hacker News every morning:
 
 ```bash
 # Initialize
-xpressai init
+xpressclaw init
 
-# Configure the agent (edit xpressai.yaml)
-cat > xpressai.yaml << 'EOF'
+# Configure the agent (edit xpressclaw.yaml)
+cat > xpressclaw.yaml << 'EOF'
 system:
   budget:
     daily: $5.00
@@ -157,51 +137,16 @@ agents:
 EOF
 
 # Start in background
-xpressai up -d
+xpressclaw up --detach
 
 # Schedule daily summary at 8am
-xpressai tasks newsbot schedule "Summarize top 10 HN stories into hn-{date}.md" --cron "0 8 * * *"
+xpressclaw tasks schedule "Summarize top 10 HN stories" --agent newsbot --cron "0 8 * * *"
 
-# Check it's scheduled
-xpressai tasks newsbot schedules
-```
+# Check status
+xpressclaw status
 
-## Troubleshooting
-
-### Agent not picking up tasks
-
-Make sure the runtime is running:
-
-```bash
-xpressai status
-```
-
-If it shows "not connected to daemon", start it:
-
-```bash
-xpressai up -d
-```
-
-### API key errors
-
-Ensure your API key is set:
-
-```bash
-export ANTHROPIC_API_KEY="your-key-here"
-```
-
-Add it to your shell profile (`.bashrc`, `.zshrc`) to persist.
-
-### Check logs
-
-```bash
-xpressai logs atlas
-```
-
-Or follow logs in real-time:
-
-```bash
-xpressai logs -f
+# View logs
+xpressclaw logs newsbot
 ```
 
 ## Learn More
