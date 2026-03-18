@@ -14,7 +14,7 @@
 
 	// New flow: 0=agent, 1=llm, 2=connectors, 3=docker, 4=complete
 	let step = $state(0);
-	const steps = ['Agent', 'LLM', 'Connectors', 'Environment', 'Complete'];
+	const steps = ['Agent', 'LLM', 'Workspace', 'Environment', 'Complete'];
 
 	// Mode: 'setup' (full onboarding) or 'add-agent' (from agents page)
 	let mode = $derived($page.url.searchParams.get('mode') === 'add-agent' ? 'add-agent' : 'setup');
@@ -34,27 +34,40 @@
 	let llmBaseUrl = $state('');
 	let llmLocalModel = $state('');
 	let llmLocalBaseUrl = $state('');
+	let llmModel = $state('claude-sonnet-4-6');
+
+	const anthropicModels = [
+		{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', desc: 'Best balance of speed and intelligence' },
+		{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', desc: 'Most capable, higher cost' },
+		{ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', desc: 'Fastest, lowest cost' },
+	];
 	let keyValidating = $state(false);
 	let keyValid = $state<boolean | null>(null);
 	let keyError = $state('');
 	let llmLoading = $state(false);
 
-	// -- Step 2: Connectors --
+	// -- Step 2: Workspace & Tools --
 	let mcpServers = $state<Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>>({});
 	let showAddMcp = $state(false);
 	let newMcpName = $state('');
 	let newMcpCommand = $state('');
 	let newMcpArgs = $state('');
 
-	const mcpPresets = [
-		{ name: 'Shell', id: 'shell', command: 'npx', args: '-y @mako10k/mcp-shell-server', envKey: '' },
-		{ name: 'Filesystem', id: 'filesystem', command: 'npx', args: '-y @modelcontextprotocol/server-filesystem /workspace', envKey: '' },
-		{ name: 'Git', id: 'git', command: 'npx', args: '-y @modelcontextprotocol/server-git', envKey: '' },
-		{ name: 'GitHub', id: 'github', command: 'npx', args: '-y @modelcontextprotocol/server-github', envKey: 'GITHUB_PERSONAL_ACCESS_TOKEN' },
-		{ name: 'Brave Search', id: 'brave-search', command: 'npx', args: '-y @modelcontextprotocol/server-brave-search', envKey: 'BRAVE_API_KEY' },
-		{ name: 'Slack', id: 'slack', command: 'npx', args: '-y @modelcontextprotocol/server-slack', envKey: 'SLACK_BOT_TOKEN' },
-		{ name: 'Fetch', id: 'fetch', command: 'npx', args: '-y @modelcontextprotocol/server-fetch', envKey: '' },
-	];
+	// Workspace folders to mount into /workspace/{basename}
+	let workspaceFolders = $state<string[]>([]);
+	let newFolderPath = $state('');
+
+	// Optional tool toggles + config
+	let fetchEnabled = $state(false);
+	let fetchMode = $state<'allow' | 'block'>('block');
+	let fetchPatterns = $state('');
+	let gitEnabled = $state(false);
+	let gitSshKeyPath = $state('');
+	let githubEnabled = $state(false);
+	let githubPat = $state('');
+
+	// Legacy preset list for custom MCP servers only
+	const mcpPresets: { name: string; id: string; command: string; args: string; envKey: string }[] = [];
 
 	// -- Step 3: Docker --
 	let dockerStatus = $state<DockerStatus | null>(null);
@@ -95,10 +108,20 @@
 		if (!agentName) agentName = preset.id;
 		customRole = preset.role;
 
-		// Pre-fill MCP servers from preset
-		if (preset.default_mcp_servers && Object.keys(preset.default_mcp_servers).length > 0) {
-			mcpServers = { ...preset.default_mcp_servers };
+		// Pre-fill optional tools from preset
+		const tools = preset.default_tools || [];
+		const servers = preset.default_mcp_servers || {};
+		fetchEnabled = tools.includes('fetch') || 'fetch' in servers;
+		gitEnabled = tools.includes('git') || 'git' in servers;
+		githubEnabled = tools.includes('github') || 'github' in servers;
+
+		// Keep non-default MCP servers (custom ones)
+		const defaultKeys = new Set(['shell', 'filesystem', 'fetch', 'git', 'github']);
+		const custom: typeof mcpServers = {};
+		for (const [k, v] of Object.entries(servers)) {
+			if (!defaultKeys.has(k)) custom[k] = v;
 		}
+		mcpServers = custom;
 
 		// Pre-fill LLM from preset recommendation
 		if (preset.recommended_llm === 'local') {
@@ -222,6 +245,46 @@
 			const isLocal = llmProvider === 'local' || llmProvider === 'ollama';
 			const useEmbedded = isLocal && (!ollamaInfo?.available || !llmLocalBaseUrl);
 
+			// Build MCP servers from tool toggles + any custom servers
+			const allMcpServers = { ...mcpServers };
+			if (fetchEnabled) {
+				allMcpServers['fetch'] = {
+					type: 'stdio', command: 'npx',
+					args: ['-y', '@modelcontextprotocol/server-fetch'],
+					env: fetchPatterns.trim() ? {
+						[fetchMode === 'allow' ? 'FETCH_ALLOWED_URLS' : 'FETCH_BLOCKED_URLS']: fetchPatterns.trim()
+					} : {}
+				};
+			}
+			if (gitEnabled) {
+				allMcpServers['git'] = {
+					type: 'stdio', command: 'npx',
+					args: ['-y', '@modelcontextprotocol/server-git'],
+					env: gitSshKeyPath.trim() ? { SSH_KEY_PATH: gitSshKeyPath.trim() } : {}
+				};
+			}
+			if (githubEnabled && githubPat.trim()) {
+				allMcpServers['github'] = {
+					type: 'stdio', command: 'docker',
+					args: ['run', '-i', '--rm', '-e', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'ghcr.io/github/github-mcp-server'],
+					env: { GITHUB_PERSONAL_ACCESS_TOKEN: githubPat.trim() }
+				};
+			}
+
+			// Build volumes from workspace folders
+			const volumes = workspaceFolders
+				.filter(f => f.trim())
+				.map(f => {
+					const basename = f.trim().split('/').filter(Boolean).pop() || 'workspace';
+					return `${f.trim()}:/workspace/${basename}`;
+				});
+
+			// Build tools list from enabled toggles
+			const tools = ['filesystem', 'shell', 'memory'];
+			if (fetchEnabled) tools.push('fetch');
+			if (gitEnabled) tools.push('git');
+			if (githubEnabled) tools.push('github');
+
 			const result = await setup.complete({
 				llm: {
 					provider: llmProvider,
@@ -235,8 +298,11 @@
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
+					model: llmProvider === 'anthropic' ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
+					tools,
+					volumes: volumes.length > 0 ? volumes : undefined,
 				}],
-				mcp_servers: Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
+				mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
 				isolation: containerless ? 'none' : 'docker'
 			});
 
@@ -248,6 +314,7 @@
 			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
+			console.error('Setup failed:', e);
 		}
 		saving = false;
 	}
@@ -456,6 +523,26 @@
 						{#if keyValid === true}<p class="mt-1 text-xs text-emerald-500">API key is valid</p>{/if}
 						{#if keyValid === false}<p class="mt-1 text-xs text-red-500">{keyError}</p>{/if}
 					</div>
+					{#if llmProvider === 'anthropic'}
+						<div>
+							<label class="block text-xs font-medium text-foreground mb-2">Model</label>
+							<div class="space-y-1">
+								{#each anthropicModels as m}
+									<button onclick={() => llmModel = m.id}
+										class="w-full flex items-center gap-3 rounded-md border p-2 text-left transition-colors {llmModel === m.id
+											? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}">
+										<div class="flex-1">
+											<div class="text-sm font-medium text-foreground">{m.name}</div>
+											<div class="text-xs text-muted-foreground">{m.desc}</div>
+										</div>
+										{#if llmModel === m.id}
+											<span class="text-xs text-primary">&#10003;</span>
+										{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/if}
 					{#if llmProvider === 'openai'}
 						<div>
 							<label for="openai-url" class="block text-xs font-medium text-foreground mb-1">
@@ -473,52 +560,142 @@
 			{#if mode === 'add-agent'}
 				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
 			{:else}
-				<button onclick={() => goToStep(2)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
+				<button onclick={() => goToStep(0)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
 			{/if}
-			<button onclick={() => goToStep(4)} class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
+			<button onclick={() => goToStep(2)} disabled={!canProceedLlm()}
+				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
 		</div>
 
-	<!-- Step 2: Connectors -->
+	<!-- Step 2: Workspace & Tools -->
 	{:else if step === 2}
-		<h2 class="text-lg font-semibold text-foreground mb-1">Connectors</h2>
+		<h2 class="text-lg font-semibold text-foreground mb-1">Workspace & Tools</h2>
 		<p class="text-sm text-muted-foreground mb-6">
-			MCP tool servers for your agent. Pre-filled from the template.
+			Share folders with your agent and configure optional tools.
 		</p>
 
-		<div class="mb-4">
-			<div class="text-xs font-medium text-muted-foreground mb-2">Quick add:</div>
-			<div class="flex flex-wrap gap-2">
-				{#each mcpPresets as preset}
-					{@const added = preset.id in mcpServers}
-					<button onclick={() => added ? removeMcpServer(preset.id) : addMcpPreset(preset)}
-						class="rounded-md border px-3 py-1.5 text-xs transition-colors {added
-							? 'border-primary bg-primary/10 text-primary' : 'border-border hover:border-primary/40'}">
-						{preset.name} {added ? '✓' : '+'}
-					</button>
-				{/each}
+		<!-- Workspace Folders -->
+		<div class="mb-6">
+			<h3 class="text-sm font-medium text-foreground mb-2">Workspace Folders</h3>
+			<p class="text-xs text-muted-foreground mb-3">
+				Folders from your machine that the agent can read and write. Each folder is mounted at <code class="bg-muted px-1 rounded">/workspace/</code> in the container.
+			</p>
+			{#if workspaceFolders.length > 0}
+				<div class="space-y-2 mb-3">
+					{#each workspaceFolders as folder, i}
+						<div class="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
+							<span class="flex-1 text-sm font-mono text-foreground truncate">{folder}</span>
+							<span class="text-xs text-muted-foreground">/workspace/{folder.split('/').filter(Boolean).pop()}</span>
+							<button onclick={() => { workspaceFolders = workspaceFolders.filter((_, j) => j !== i); }}
+								class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground">&#x2715;</button>
+						</div>
+					{/each}
+				</div>
+			{/if}
+			<div class="flex gap-2">
+				<input type="text" bind:value={newFolderPath} placeholder="~/projects/my-app"
+					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
+					class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+				<button onclick={() => { if (newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
+					disabled={!newFolderPath.trim()}
+					class="rounded-md border border-border px-3 py-2 text-sm hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed">Add</button>
 			</div>
 		</div>
 
-		{#if Object.keys(mcpServers).length > 0}
-			<div class="space-y-2 mb-4">
-				{#each Object.entries(mcpServers) as [id, server]}
-					<div class="flex items-center justify-between rounded-lg border border-border p-3">
-						<div>
-							<div class="text-sm font-medium text-foreground">{id}</div>
-							<div class="text-xs text-muted-foreground">{server.command} {server.args?.join(' ') || ''}</div>
-						</div>
-						<button onclick={() => removeMcpServer(id)} class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground">&#x2715;</button>
-					</div>
-				{/each}
+		<!-- Default Tools -->
+		<div class="mb-4">
+			<h3 class="text-sm font-medium text-foreground mb-2">Default Tools</h3>
+			<div class="flex gap-2">
+				<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+					&#x1f4c1; Filesystem
+				</span>
+				<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
+					&#x1f4bb; Shell
+				</span>
 			</div>
-		{:else}
-			<div class="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground mb-4">
-				No connectors added yet. This is optional.
-			</div>
-		{/if}
+			<p class="text-xs text-muted-foreground mt-1">Always included for all agents.</p>
+		</div>
 
+		<!-- Optional Tools -->
+		<div class="mb-4">
+			<h3 class="text-sm font-medium text-foreground mb-3">Optional Tools</h3>
+			<div class="space-y-2">
+				<!-- Fetch -->
+				<div class="rounded-lg border {fetchEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" bind:checked={fetchEnabled} class="rounded border-border" />
+						<div>
+							<div class="text-sm font-medium text-foreground">Internet Access (Fetch)</div>
+							<div class="text-xs text-muted-foreground">Fetch web pages and APIs</div>
+						</div>
+					</label>
+					{#if fetchEnabled}
+						<div class="mt-3 ml-7 space-y-2">
+							<div class="flex gap-2">
+								<button onclick={() => fetchMode = 'block'}
+									class="rounded-md border px-2 py-1 text-xs {fetchMode === 'block' ? 'border-primary bg-primary/10' : 'border-border'}">
+									Block list
+								</button>
+								<button onclick={() => fetchMode = 'allow'}
+									class="rounded-md border px-2 py-1 text-xs {fetchMode === 'allow' ? 'border-primary bg-primary/10' : 'border-border'}">
+									Allow list
+								</button>
+							</div>
+							<textarea bind:value={fetchPatterns} rows="2"
+								placeholder={fetchMode === 'allow' ? 'Allowed URL patterns (one per line, e.g. *.github.com/*)' : 'Blocked URL patterns (one per line, leave empty to allow all)'}
+								class="w-full rounded-md border border-border bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"></textarea>
+						</div>
+					{/if}
+				</div>
+
+				<!-- Git -->
+				<div class="rounded-lg border {gitEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" bind:checked={gitEnabled} class="rounded border-border" />
+						<div>
+							<div class="text-sm font-medium text-foreground">Git</div>
+							<div class="text-xs text-muted-foreground">Interact with Git repositories</div>
+						</div>
+					</label>
+					{#if gitEnabled}
+						<div class="mt-3 ml-7">
+							<label for="git-ssh" class="block text-xs font-medium text-foreground mb-1">
+								SSH Key Path <span class="text-muted-foreground font-normal">(optional)</span>
+							</label>
+							<input id="git-ssh" type="text" bind:value={gitSshKeyPath} placeholder="~/.ssh/id_ed25519"
+								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+						</div>
+					{/if}
+				</div>
+
+				<!-- GitHub -->
+				<div class="rounded-lg border {githubEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" bind:checked={githubEnabled} class="rounded border-border" />
+						<div>
+							<div class="text-sm font-medium text-foreground">GitHub</div>
+							<div class="text-xs text-muted-foreground">Issues, PRs, repos via GitHub MCP Server</div>
+						</div>
+					</label>
+					{#if githubEnabled}
+						<div class="mt-3 ml-7">
+							<label for="github-pat" class="block text-xs font-medium text-foreground mb-1">Personal Access Token</label>
+							<input id="github-pat" type="password" bind:value={githubPat} placeholder="ghp_..."
+								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+							<p class="mt-1 text-xs text-muted-foreground">
+								Create a token at GitHub &rarr; Settings &rarr; Developer Settings &rarr; Personal Access Tokens
+							</p>
+						</div>
+					{/if}
+				</div>
+			</div>
+		</div>
+
+		<p class="text-xs text-muted-foreground mb-4">You can add and configure tools later from agent settings.</p>
+
+		<!-- Custom MCP connector (collapsed) -->
 		{#if showAddMcp}
 			<div class="rounded-lg border border-border p-3 space-y-2 mb-4">
+				<div class="text-xs font-medium text-foreground mb-1">Custom MCP Server</div>
 				<input type="text" bind:value={newMcpName} placeholder="Server name"
 					class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 				<input type="text" bind:value={newMcpCommand} placeholder="Command (e.g., npx)"
@@ -531,17 +708,28 @@
 				</div>
 			</div>
 		{:else}
-			<button onclick={() => showAddMcp = true} class="text-xs text-muted-foreground hover:text-foreground">+ Add custom connector</button>
+			<button onclick={() => showAddMcp = true} class="text-xs text-muted-foreground hover:text-foreground">+ Add custom MCP connector</button>
+		{/if}
+
+		{#if Object.keys(mcpServers).length > 0}
+			<div class="mt-3 space-y-2">
+				{#each Object.entries(mcpServers) as [id, server]}
+					<div class="flex items-center justify-between rounded-lg border border-border p-2">
+						<div class="text-xs text-foreground">{id} <span class="text-muted-foreground">({server.command} {server.args?.join(' ') || ''})</span></div>
+						<button onclick={() => removeMcpServer(id)} class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground text-xs">&#x2715;</button>
+					</div>
+				{/each}
+			</div>
 		{/if}
 
 		<div class="mt-6 flex justify-between">
 			{#if mode === 'add-agent'}
 				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
 			{:else}
-				<div></div>
+				<button onclick={() => goToStep(1)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
 			{/if}
-			<button onclick={() => goToStep(2)} disabled={!canProceedLlm()}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
+			<button onclick={() => goToStep(3)}
+				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
 		</div>
 
 	<!-- Step 3: Docker / Environment -->

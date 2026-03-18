@@ -130,6 +130,35 @@ impl Default for McpServerConfig {
     }
 }
 
+/// MCP servers that every agent gets regardless of configuration.
+/// Shell and filesystem are always available inside the container.
+pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
+    let mut servers = HashMap::new();
+    servers.insert(
+        "shell".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("npx".to_string()),
+            args: vec!["-y".into(), "@mako10k/mcp-shell-server".into()],
+            ..Default::default()
+        },
+    );
+    servers.insert(
+        "filesystem".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("npx".to_string()),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+                "/workspace".into(),
+            ],
+            ..Default::default()
+        },
+    );
+    servers
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WakeOnConfig {
     pub schedule: Option<String>,

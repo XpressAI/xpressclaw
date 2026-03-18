@@ -2,7 +2,10 @@ use reqwest::Client;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::llm::router::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage};
+use crate::llm::router::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatStream,
+    ChunkChoice, ChunkDelta,
+};
 
 /// Client for communicating with agent harness containers.
 ///
@@ -61,7 +64,7 @@ impl HarnessClient {
         self.chat(&request).await
     }
 
-    /// Send a raw chat completion request.
+    /// Send a raw chat completion request (non-streaming).
     pub async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
@@ -87,6 +90,41 @@ impl HarnessClient {
             .map_err(|e| Error::Agent(format!("failed to parse harness response: {e}")))
     }
 
+    /// Send a streaming chat completion request. Returns a stream of chunks.
+    pub async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        let mut stream_req = request.clone();
+        stream_req.stream = Some(true);
+
+        debug!(
+            url,
+            model = request.model,
+            "sending streaming request to harness"
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&stream_req)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|e| Error::Agent(format!("harness stream request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Agent(format!(
+                "harness stream error {status}: {body}"
+            )));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = parse_sse_stream(byte_stream);
+        Ok(Box::pin(stream))
+    }
+
     /// Check if the harness is healthy.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);
@@ -104,5 +142,74 @@ impl HarnessClient {
 
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+/// Parse an SSE byte stream into ChatCompletionChunk items.
+fn parse_sse_stream(
+    byte_stream: impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>>
+        + Send
+        + 'static,
+) -> impl futures_util::Stream<Item = Result<ChatCompletionChunk>> + Send {
+    async_stream::stream! {
+        use futures_util::StreamExt;
+
+        let mut buffer = String::new();
+
+        futures_util::pin_mut!(byte_stream);
+        while let Some(chunk_result) = byte_stream.next().await {
+            let bytes = match chunk_result {
+                Ok(b) => b,
+                Err(e) => {
+                    yield Err(Error::Agent(format!("SSE read error: {e}")));
+                    return;
+                }
+            };
+
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+            // Process complete SSE messages (separated by \n\n)
+            while let Some(pos) = buffer.find("\n\n") {
+                let message = buffer[..pos].to_string();
+                buffer = buffer[pos + 2..].to_string();
+
+                // Extract data line
+                let data = message
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap_or("")
+                    .trim();
+
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+
+                match serde_json::from_str::<ChatCompletionChunk>(data) {
+                    Ok(chunk) => yield Ok(chunk),
+                    Err(_) => {
+                        // Skip unparseable chunks (e.g., error objects)
+                        // Build a synthetic error chunk if it looks like an error
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                            if let Some(err_msg) = val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+                                yield Ok(ChatCompletionChunk {
+                                    id: "error".into(),
+                                    object: "chat.completion.chunk".into(),
+                                    created: 0,
+                                    model: String::new(),
+                                    choices: vec![ChunkChoice {
+                                        index: 0,
+                                        delta: ChunkDelta {
+                                            role: Some("assistant".into()),
+                                            content: Some(format!("Error: {err_msg}")),
+                                        },
+                                        finish_reason: Some("stop".into()),
+                                    }],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
