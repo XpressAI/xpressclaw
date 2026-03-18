@@ -14,7 +14,7 @@
 
 	// New flow: 0=agent, 1=llm, 2=connectors, 3=docker, 4=complete
 	let step = $state(0);
-	const steps = ['Agent', 'LLM', 'Connectors', 'Environment', 'Complete'];
+	const steps = ['Agent', 'LLM', 'Workspace', 'Environment', 'Complete'];
 
 	// Mode: 'setup' (full onboarding) or 'add-agent' (from agents page)
 	let mode = $derived($page.url.searchParams.get('mode') === 'add-agent' ? 'add-agent' : 'setup');
@@ -306,6 +306,7 @@
 			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
+			console.error('Setup failed:', e);
 		}
 		saving = false;
 	}
