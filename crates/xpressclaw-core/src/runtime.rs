@@ -69,10 +69,29 @@ impl Runtime {
         let registry = self.registry();
         let record = registry.get(agent_id)?;
 
+        // If agent status is "stopped" or explicitly marked, start it
+        // If "running", we still need to verify the container actually exists
         if record.status == "running" {
-            return Err(Error::AgentAlreadyRunning {
-                name: agent_id.to_string(),
-            });
+            // Check if container actually exists and is running
+            if let Some(container_id) = &record.container_id {
+                if let Some(docker) = &self.docker {
+                    if let Ok(containers) = docker.list().await {
+                        if containers
+                            .iter()
+                            .any(|c| c.container_id == *container_id && c.status == "running")
+                        {
+                            // Container is actually running, nothing to do
+                            return Ok(());
+                        }
+                    }
+                }
+                // Container is not running, we need to start it regardless of status
+            }
+        }
+
+        // If explicitly stopped, skip starting (user made this choice)
+        if record.status == "stopped" {
+            return Ok(());
         }
 
         let docker = self
@@ -395,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_agent_without_docker() {
-        let (_, _, runtime) = setup();
+        let (_, _db, runtime) = setup();
         let registry = runtime.registry();
 
         registry
@@ -404,6 +423,11 @@ mod tests {
                 backend: "generic".into(),
                 config: serde_json::json!({}),
             })
+            .unwrap();
+
+        // First mark as running (so it's not skipped due to "stopped" status)
+        registry
+            .update_status("atlas", &AgentStatus::Running, Some("abc123"))
             .unwrap();
 
         // Should fail because no Docker

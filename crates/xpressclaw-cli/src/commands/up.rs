@@ -5,6 +5,7 @@ use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::runtime::Runtime;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
@@ -204,11 +205,48 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
 
     let _ = port; // available for future use (e.g., logging)
 
-    Ok(AppState::new(
-        config,
-        db,
-        Some(Arc::new(llm_router)),
-        config_path,
-        true,
-    ))
+    let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
+
+    // Start all agents that should be running
+    // Create a separate runtime for startup
+    let runtime = Runtime::new(state.config(), state.db.clone()).await?;
+
+    // Get all agents and start those that are not stopped
+    let registry = runtime.registry();
+    let agents = registry.list().unwrap_or_default();
+
+    for agent in agents {
+        // Skip explicitly stopped agents
+        if agent.status == "stopped" {
+            continue;
+        }
+
+        // Check if container is actually running
+        if agent.status == "running" {
+            if let Some(ref container_id) = agent.container_id {
+                // Container should be running - check if it exists
+                if let Ok(docker) = DockerManager::connect().await {
+                    if let Ok(containers) = docker.list().await {
+                        let is_running = containers
+                            .iter()
+                            .any(|c| c.container_id == *container_id && c.status == "running");
+
+                        if !is_running {
+                            warn!(
+                                agent_id = agent.id,
+                                "agent marked as running but container not found, will restart"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Start the agent (will detect and handle stopped containers)
+        if let Err(e) = runtime.start_agent(&agent.id).await {
+            warn!(agent_id = agent.id, error = %e, "failed to start agent");
+        }
+    }
+
+    Ok(state)
 }

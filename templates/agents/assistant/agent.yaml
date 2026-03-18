@@ -2,7 +2,7 @@ id: assistant
 name: Assistant
 description: General-purpose AI assistant with memory and learning
 icon: brain
-backend: generic
+backend: claude-sdk
 default_tools:
   - memory
 recommended_llm: local

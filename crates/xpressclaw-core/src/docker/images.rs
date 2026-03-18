@@ -57,14 +57,21 @@ pub fn build_container_spec(
     env.push(format!("LLM_BASE_URL={llm_base_url}"));
     env.push(format!("OPENAI_BASE_URL={llm_base_url}"));
 
+    // Anthropic SDK appends /v1/messages to the base URL, so we must NOT include /v1 here.
+    // The server exposes POST /v1/messages as an Anthropic-compatible endpoint.
+    let anthropic_base_url = format!("http://host.docker.internal:{server_port}");
+    env.push(format!("ANTHROPIC_BASE_URL={anthropic_base_url}"));
+
     if let Some(model) = &agent.model {
         env.push(format!("LLM_MODEL={model}"));
     }
 
     // API keys for harnesses that call cloud APIs directly.
-    // Also set OPENAI_API_KEY (even as a placeholder) so OpenAI SDKs don't error.
+    // Set placeholder keys when none are provided — SDKs refuse to start without them.
     if let Some(key) = anthropic_api_key {
         env.push(format!("ANTHROPIC_API_KEY={key}"));
+    } else {
+        env.push("ANTHROPIC_API_KEY=sk-ant-xpressclaw".to_string());
     }
     if let Some(key) = openai_api_key {
         env.push(format!("OPENAI_API_KEY={key}"));
@@ -205,11 +212,20 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "OPENAI_BASE_URL=http://host.docker.internal:6969/v1"));
-        // Placeholder API key when no real key is provided
+        // ANTHROPIC_BASE_URL does NOT include /v1 — the SDK appends it
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "ANTHROPIC_BASE_URL=http://host.docker.internal:6969"));
+        // Placeholder API keys when no real keys are provided
         assert!(spec
             .environment
             .iter()
             .any(|e| e == "OPENAI_API_KEY=sk-xpressclaw"));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-xpressclaw"));
     }
 
     #[test]
