@@ -31,6 +31,8 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
+async-stream = "0.3"
+bytes = "1"
 sysinfo = "0.34"
 
 # Local LLM (optional, enabled by default via "local-llm" feature)

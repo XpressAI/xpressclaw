@@ -193,7 +193,9 @@ struct AgentSetup {
     preset: Option<String>,
     role: Option<String>,
     backend: Option<String>,
+    model: Option<String>,
     tools: Option<Vec<String>>,
+    volumes: Option<Vec<String>>,
 }
 
 /// Return current GGUF download progress.
@@ -285,6 +287,18 @@ async fn complete_setup(
                     .as_deref()
                     .and_then(|id| presets.iter().find(|p| p.id == id));
 
+                let mut tools = a
+                    .tools
+                    .clone()
+                    .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
+                    .unwrap_or_default();
+                // Shell + filesystem are always included
+                for default_tool in ["filesystem", "shell"] {
+                    if !tools.iter().any(|t| t == default_tool) {
+                        tools.insert(0, default_tool.to_string());
+                    }
+                }
+
                 AgentConfig {
                     name: a.name.clone(),
                     backend: a
@@ -297,11 +311,9 @@ async fn complete_setup(
                         .clone()
                         .or(preset.map(|p| p.role.to_string()))
                         .unwrap_or_default(),
-                    tools: a
-                        .tools
-                        .clone()
-                        .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
-                        .unwrap_or_default(),
+                    model: a.model.clone(),
+                    tools,
+                    volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()
                 }
             })

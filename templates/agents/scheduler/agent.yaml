@@ -4,6 +4,8 @@ description: Task management agent that runs on a schedule
 icon: calendar
 backend: claude-sdk
 default_tools:
+  - filesystem
+  - shell
   - memory
 recommended_llm: local
 role: |

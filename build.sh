@@ -29,13 +29,9 @@ elif [ -f "target/${TARGET_TRIPLE}/release/xpressclaw" ]; then
 fi
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
-# Build the desktop app if tauri-cli is installed
-if command -v cargo-tauri &>/dev/null; then
-    echo "==> Building Tauri desktop app..."
-    cargo tauri build
-else
-    echo "==> Skipping Tauri build (install with: cargo install tauri-cli)"
-fi
+# Build the desktop app via npx (no global tauri-cli install needed)
+echo "==> Building Tauri desktop app..."
+npx -y @tauri-apps/cli build
 
 # Build harness Docker images if docker is available
 if command -v docker &>/dev/null; then

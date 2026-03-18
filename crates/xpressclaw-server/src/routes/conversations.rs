@@ -545,36 +545,8 @@ async fn stream_message(
                     Ok(docker) => {
                         match docker.get_container_port(cid).await {
                             Some(port) => {
-                                // Harness doesn't support streaming yet — use non-streaming
-                                // and wrap the response as a single chunk.
                                 let harness = xpressclaw_core::agents::harness::HarnessClient::new(port);
-                                let mut non_stream_req = llm_req.clone();
-                                non_stream_req.stream = Some(false);
-                                match harness.chat(&non_stream_req).await {
-                                    Ok(resp) => {
-                                        // Wrap as a stream with a single chunk
-                                        let content = resp.choices.first()
-                                            .map(|c| c.message.content.clone())
-                                            .unwrap_or_default();
-                                        Ok(Box::pin(futures_util::stream::once(async move {
-                                            Ok(xpressclaw_core::llm::router::ChatCompletionChunk {
-                                                id: resp.id,
-                                                object: "chat.completion.chunk".into(),
-                                                created: resp.created,
-                                                model: resp.model,
-                                                choices: vec![xpressclaw_core::llm::router::ChunkChoice {
-                                                    index: 0,
-                                                    delta: xpressclaw_core::llm::router::ChunkDelta {
-                                                        role: Some("assistant".into()),
-                                                        content: Some(content),
-                                                    },
-                                                    finish_reason: Some("stop".into()),
-                                                }],
-                                            })
-                                        })) as xpressclaw_core::llm::router::ChatStream)
-                                    }
-                                    Err(e) => Err(e),
-                                }
+                                harness.chat_stream(&llm_req).await
                             }
                             None => llm_router.chat_stream(&llm_req).await,
                         }

@@ -179,7 +179,15 @@ export const agents = {
 	get: (id: string) => request<Agent>(`/api/agents/${id}`),
 	start: (id: string) => request<Agent>(`/api/agents/${id}/start`, { method: 'POST', body: '{}' }),
 	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST', body: '{}' }),
-	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' })
+	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' }),
+	updateConfig: (id: string, data: {
+		role?: string;
+		model?: string;
+		tools?: string[];
+		volumes?: string[];
+	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
+		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
+	)
 };
 
 // -- Tasks --
@@ -492,7 +500,7 @@ export const setup = {
 	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
 		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
-		agents: { name: string; preset?: string; role?: string; tools?: string[] }[];
+		agents: { name: string; preset?: string; role?: string; model?: string; tools?: string[]; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
