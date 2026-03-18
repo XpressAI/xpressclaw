@@ -354,11 +354,7 @@ fn anthropic_to_openai_request(req: AnthropicMessagesRequest) -> ChatCompletionR
 /// Parse an array of Anthropic content blocks into OpenAI ChatMessages.
 ///
 /// Handles text, tool_use (→ assistant tool_calls), and tool_result (→ tool messages).
-fn convert_anthropic_content_blocks(
-    role: &str,
-    blocks: &[Value],
-    messages: &mut Vec<ChatMessage>,
-) {
+fn convert_anthropic_content_blocks(role: &str, blocks: &[Value], messages: &mut Vec<ChatMessage>) {
     let mut text_parts = Vec::new();
     let mut tool_calls = Vec::new();
 

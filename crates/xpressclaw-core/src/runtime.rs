@@ -76,9 +76,10 @@ impl Runtime {
             if let Some(container_id) = &record.container_id {
                 if let Some(docker) = &self.docker {
                     if let Ok(containers) = docker.list().await {
-                        if containers.iter().any(|c| {
-                            c.container_id == *container_id && c.status == "running"
-                        }) {
+                        if containers
+                            .iter()
+                            .any(|c| c.container_id == *container_id && c.status == "running")
+                        {
                             // Container is actually running, nothing to do
                             return Ok(());
                         }
