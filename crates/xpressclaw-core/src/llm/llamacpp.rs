@@ -153,6 +153,13 @@ fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
     Ok(LLAMA_BACKEND.get().unwrap().clone())
 }
 
+/// Prompt with optional grammar for constrained tool-call decoding.
+struct PromptWithGrammar {
+    prompt: String,
+    grammar: Option<String>,
+    grammar_lazy: bool,
+}
+
 /// Embedded llama.cpp LLM provider.
 ///
 /// Loads a GGUF model in-process and runs inference directly using the llama.cpp
@@ -233,10 +240,16 @@ impl LlamaCppProvider {
         self
     }
 
-    /// Format chat messages into a prompt string using the model's built-in chat template.
+    /// Format chat messages with optional tool definitions.
     ///
-    /// Falls back to manual ChatML formatting if the model doesn't have a template.
-    fn format_prompt(&self, messages: &[ChatMessage]) -> Result<String> {
+    /// When tools are provided, uses `apply_chat_template_with_tools_oaicompat` which
+    /// renders tools into the prompt using the model's Jinja template and returns a
+    /// grammar for constrained decoding of tool calls.
+    fn format_prompt_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<PromptWithGrammar> {
         let chat_messages: Vec<LlamaChatMessage> = messages
             .iter()
             .map(|m| {
@@ -246,10 +259,40 @@ impl LlamaCppProvider {
             .collect::<Result<Vec<_>>>()?;
 
         match self.model.chat_template(None) {
-            Ok(tmpl) => self
-                .model
-                .apply_chat_template(&tmpl, &chat_messages, true)
-                .map_err(|e| Error::Llm(format!("chat template failed: {e}"))),
+            Ok(tmpl) => {
+                if let Some(tool_defs) = tools {
+                    if !tool_defs.is_empty() {
+                        let tools_json = serde_json::to_string(tool_defs)
+                            .map_err(|e| Error::Llm(format!("tools serialization: {e}")))?;
+                        let result = self
+                            .model
+                            .apply_chat_template_with_tools_oaicompat(
+                                &tmpl,
+                                &chat_messages,
+                                Some(&tools_json),
+                                None,
+                                true,
+                            )
+                            .map_err(|e| {
+                                Error::Llm(format!("chat template with tools failed: {e}"))
+                            })?;
+                        return Ok(PromptWithGrammar {
+                            prompt: result.prompt,
+                            grammar: result.grammar,
+                            grammar_lazy: result.grammar_lazy,
+                        });
+                    }
+                }
+                let prompt = self
+                    .model
+                    .apply_chat_template(&tmpl, &chat_messages, true)
+                    .map_err(|e| Error::Llm(format!("chat template failed: {e}")))?;
+                Ok(PromptWithGrammar {
+                    prompt,
+                    grammar: None,
+                    grammar_lazy: false,
+                })
+            }
             Err(_) => {
                 // Fallback: manual ChatML formatting
                 let mut prompt = String::new();
@@ -261,7 +304,11 @@ impl LlamaCppProvider {
                     prompt.push_str("<|im_end|>\n");
                 }
                 prompt.push_str("<|im_start|>assistant\n");
-                Ok(prompt)
+                Ok(PromptWithGrammar {
+                    prompt,
+                    grammar: None,
+                    grammar_lazy: false,
+                })
             }
         }
     }
@@ -269,8 +316,16 @@ impl LlamaCppProvider {
     /// Run synchronous inference on the model.
     ///
     /// Creates a fresh context on the calling thread to satisfy Metal's
-    /// thread affinity requirements.
-    fn generate(&self, prompt: &str, max_tokens: i32, temperature: f32) -> Result<(String, Usage)> {
+    /// thread affinity requirements. When a grammar is provided, it constrains
+    /// the model output to valid tool-call JSON.
+    fn generate(
+        &self,
+        prompt: &str,
+        max_tokens: i32,
+        temperature: f32,
+        grammar: Option<&str>,
+        grammar_lazy: bool,
+    ) -> Result<(String, Usage)> {
         let ctx_params =
             LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.context_length));
         let mut ctx = self
@@ -311,6 +366,20 @@ impl LlamaCppProvider {
             .map_err(|e| Error::Llm(format!("prompt decode failed: {e}")))?;
 
         // Sampling: repetition penalty to avoid degenerate loops, then top-k + temperature.
+        // When a grammar is provided, add a grammar sampler to constrain tool-call output.
+        let grammar_sampler = if let Some(grammar_str) = grammar {
+            if grammar_lazy {
+                // Lazy grammar: triggers on common tool-call markers
+                let trigger_words: Vec<&[u8]> = vec![b"{\"name\"", b"<tool_call>", b"```json"];
+                LlamaSampler::grammar_lazy(&self.model, grammar_str, "root", trigger_words, &[])
+                    .ok()
+            } else {
+                LlamaSampler::grammar(&self.model, grammar_str, "root").ok()
+            }
+        } else {
+            None
+        };
+
         let mut sampler = if temperature > 0.0 {
             LlamaSampler::chain_simple([
                 LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
@@ -325,6 +394,10 @@ impl LlamaCppProvider {
                 LlamaSampler::greedy(),
             ])
         };
+
+        if let Some(gs) = grammar_sampler {
+            sampler = LlamaSampler::chain_simple([sampler, gs]);
+        }
 
         // Generation loop
         let mut n_cur = batch.n_tokens();
@@ -378,11 +451,21 @@ impl LlamaCppProvider {
 #[async_trait::async_trait]
 impl LlmProvider for LlamaCppProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        let prompt = self.format_prompt(&request.messages)?;
+        let tools = request.tools.as_deref();
+        let pg = self.format_prompt_with_tools(&request.messages, tools)?;
         let max_tokens = request.max_tokens.unwrap_or(256) as i32;
         let temperature = request.temperature.unwrap_or(0.8) as f32;
 
-        let (content, usage) = self.generate(&prompt, max_tokens, temperature)?;
+        let (raw_output, usage) = self.generate(
+            &pg.prompt,
+            max_tokens,
+            temperature,
+            pg.grammar.as_deref(),
+            pg.grammar_lazy,
+        )?;
+
+        // Try to parse tool calls from the output (OpenAI-compatible JSON format)
+        let (content, tool_calls, finish_reason) = parse_tool_calls(&raw_output);
 
         Ok(ChatCompletionResponse {
             id: format!("llamacpp-{}", uuid::Uuid::new_v4()),
@@ -394,16 +477,20 @@ impl LlmProvider for LlamaCppProvider {
                 message: ChatMessage {
                     role: "assistant".into(),
                     content,
+                    tool_calls,
                     ..Default::default()
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(finish_reason),
             }],
             usage: Some(usage),
         })
     }
 
     async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
-        let prompt = self.format_prompt(&request.messages)?;
+        let tools = request.tools.as_deref();
+        let pg = self.format_prompt_with_tools(&request.messages, tools)?;
+        let prompt = pg.prompt;
+        // Note: grammar-constrained streaming not yet supported — would need per-token grammar sampling
         let max_tokens = request.max_tokens.unwrap_or(256) as i32;
         let temperature = request.temperature.unwrap_or(0.8) as f32;
 
@@ -548,6 +635,91 @@ impl LlmProvider for LlamaCppProvider {
     }
 }
 
+/// Parse tool calls from the model's raw output.
+///
+/// Qwen3.5 (and other models with Jinja tool templates) output tool calls as JSON.
+/// The format varies by model but typically follows one of:
+/// - A JSON object with `"name"` and `"arguments"` fields
+/// - A JSON array of tool call objects
+///
+/// Returns (text_content, optional_tool_calls, finish_reason).
+fn parse_tool_calls(raw: &str) -> (String, Option<Vec<super::router::ToolCall>>, String) {
+    let trimmed = raw.trim();
+
+    // Try to detect tool call JSON in the output.
+    // Models typically output tool calls as JSON objects/arrays, sometimes wrapped in
+    // <tool_call>...</tool_call> tags or similar markers.
+    let json_str = if let Some(inner) = extract_between(trimmed, "<tool_call>", "</tool_call>") {
+        inner
+    } else if let Some(inner) = extract_between(trimmed, "```json\n", "\n```") {
+        inner
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed
+    } else {
+        // No tool call detected — return as plain text
+        return (raw.to_string(), None, "stop".into());
+    };
+
+    // Try parsing as a single tool call object
+    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str) {
+        if let Some(calls) = parse_tool_call_value(&obj) {
+            if !calls.is_empty() {
+                return (String::new(), Some(calls), "tool_calls".into());
+            }
+        }
+    }
+
+    // Not valid tool call JSON — return as text
+    (raw.to_string(), None, "stop".into())
+}
+
+fn parse_tool_call_value(val: &serde_json::Value) -> Option<Vec<super::router::ToolCall>> {
+    use super::router::{ToolCall, ToolCallFunction};
+
+    match val {
+        serde_json::Value::Object(obj) => {
+            let name = obj.get("name")?.as_str()?.to_string();
+            let arguments = obj
+                .get("arguments")
+                .or_else(|| obj.get("parameters"))
+                .map(|v| {
+                    if v.is_string() {
+                        v.as_str().unwrap_or("{}").to_string()
+                    } else {
+                        serde_json::to_string(v).unwrap_or_default()
+                    }
+                })
+                .unwrap_or_else(|| "{}".to_string());
+
+            Some(vec![ToolCall {
+                id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                call_type: "function".into(),
+                function: ToolCallFunction { name, arguments },
+            }])
+        }
+        serde_json::Value::Array(arr) => {
+            let calls: Vec<ToolCall> = arr
+                .iter()
+                .filter_map(parse_tool_call_value)
+                .flatten()
+                .collect();
+            if calls.is_empty() {
+                None
+            } else {
+                Some(calls)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract content between two markers.
+fn extract_between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let start_idx = s.find(start)? + start.len();
+    let end_idx = s[start_idx..].find(end)? + start_idx;
+    Some(s[start_idx..end_idx].trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,18 +816,21 @@ mod tests {
         let provider = LlamaCppProvider::from_huggingface(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE)
             .expect("failed to load Qwen 3.5 0.8B");
 
-        let prompt = provider
-            .format_prompt(&[ChatMessage {
-                role: "user".into(),
-                content: "Explain what a binary tree is in 2-3 sentences.".into(),
-                ..Default::default()
-            }])
+        let pg = provider
+            .format_prompt_with_tools(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "Explain what a binary tree is in 2-3 sentences.".into(),
+                    ..Default::default()
+                }],
+                None,
+            )
             .expect("format_prompt failed");
 
-        eprintln!("Prompt: {prompt:?}");
+        eprintln!("Prompt: {:?}", pg.prompt);
 
         let (output, usage) = provider
-            .generate(&prompt, 128, 0.8)
+            .generate(&pg.prompt, 128, 0.8, None, false)
             .expect("inference failed");
 
         eprintln!("Output: {output:?}");

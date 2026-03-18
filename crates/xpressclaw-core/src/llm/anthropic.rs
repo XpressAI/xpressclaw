@@ -189,17 +189,17 @@ impl LlmProvider for AnthropicProvider {
     fn models(&self) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
-                id: "claude-opus-4-5-20251101".into(),
+                id: "claude-opus-4-6".into(),
                 object: "model".into(),
                 owned_by: "anthropic".into(),
             },
             ModelInfo {
-                id: "claude-sonnet-4-5-20251022".into(),
+                id: "claude-sonnet-4-6".into(),
                 object: "model".into(),
                 owned_by: "anthropic".into(),
             },
             ModelInfo {
-                id: "claude-haiku-4-5-20251022".into(),
+                id: "claude-haiku-4-5".into(),
                 object: "model".into(),
                 owned_by: "anthropic".into(),
             },
