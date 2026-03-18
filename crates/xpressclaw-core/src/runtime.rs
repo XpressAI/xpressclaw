@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_agent_without_docker() {
-        let (_, db, runtime) = setup();
+        let (_, _db, runtime) = setup();
         let registry = runtime.registry();
 
         registry
