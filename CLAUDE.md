@@ -1,6 +1,55 @@
 # Xpressclaw - AI Agent Runtime
 
-**NOTE**: This Python implementation was superseded by a Rust-based implementation. The current production code is in the `crates/` directory.
+## ⚠ BEFORE YOU DO ANYTHING — Read Git Notes
+
+You do not "know" — you predict. The git notes are your memory. **Read them first.**
+
+```bash
+# Read notes on recent commits to understand WHY things are the way they are
+git log --notes=refs/notes/agent --format="%H %s%n%N" -10
+```
+
+Do this at the start of every task and after every context compaction. Without this context, you are guessing — and guessing produces bad software.
+
+**After every commit, write a note:**
+
+```bash
+git notes --ref=refs/notes/agent add -m "your note here" HEAD
+```
+
+Capture: what you were thinking, why you made the choices you did, what alternatives you rejected, and anything a future agent would need to avoid re-learning the hard way. A commit without a note is context lost forever.
+
+See `docs/adr/ADR-000-version-control-workflow.md` for the full workflow.
+
+## How to Work in This Repo
+
+Stop guessing. Read the code, add logging, run the build, and inspect real values. Minimize surface area of changes. Prefer tiny, observable steps with a single hypothesis per step.
+
+### Prime Directives
+
+1. **Seek evidence first** — Before changing logic, log or print the values you're relying on. When something is broken, the correct tokens are no longer the most probable tokens; you must acquire evidence.
+2. **Honor existing architecture** — Read the ADRs in `docs/adr/` and this README. Preserve public APIs; change internals surgically.
+3. **Make state reconstructable** — Deterministic keys and context reconstruction prevent "ctx is null" classes of bugs. Avoid hidden global configuration; prefer per-request/per-entity data.
+
+### Safe Change Process
+
+1. Read git notes on recent commits (see top of this file)
+2. Read the relevant ADRs for the area you're changing
+3. Add precise logs. Reproduce. Capture evidence.
+4. Make a tiny change. Re-run. Compare output.
+5. Only then expand scope.
+6. After committing, write your git note. Always.
+
+### What Goes Wrong Without This
+
+- Assuming state or config will be ready; when it isn't, writing more assumptions on top.
+- Not inspecting actual values before changing logic.
+- Not persisting or reconstructing context deterministically.
+- Making large changes without verifying each step.
+
+If a value is unexpected, **stop and log which one**. Don't guess. One change, one measurement.
+
+---
 
 [Xpressclaw](https://github.com/XpressAI/xpressclaw) is an "Operating System for AI agents" - a simple, opinionated runtime that makes it easy to run, manage, and observe AI agents. Think of it as an agent operating system that handles isolation, memory, tools, budgets, and observability so you can focus on what your agents do, not how they run.
 
@@ -39,15 +88,15 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 
 ### UI Layers
 - **CLI** - Primary interface, `xpressclaw` command
-- **Web UI** - HTMX-based, server-rendered, embedded via rust-embed
+- **Web UI** - SvelteKit SPA, embedded via rust-embed
 - **Desktop** - Tauri-based native app with system tray
 
 ## Tech Stack
 
-- **Language**: Rust (production), Python 3.11+ (legacy reference)
+- **Language**: Rust
 - **Database**: SQLite + sqlite-vec for vector storage
 - **Container Runtime**: Docker (via bollard)
-- **Web Framework**: Axum + HTMX (server-rendered)
+- **Web Framework**: Axum + SvelteKit (static SPA embedded via rust-embed)
 - **Desktop**: Tauri v2 with system tray
 - **Agent SDK**: claude-agent-sdk (via containers)
 - **Local Model**: Qwen3-8B via llama-cpp-2 or Ollama
@@ -55,67 +104,13 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 ## Project Structure
 
 ```
-xpressai-cli/                # Current project directory
+xpressclaw/                  # Project root
 ├── crates/                  # Rust workspace
 │   ├── xpressclaw-core/     # Business logic (config, DB, agents, memory, tasks, budget, tools)
 │   ├── xpressclaw-server/   # Axum REST API + embedded frontend (rust-embed)
 │   ├── xpressclaw-cli/      # CLI commands via clap
 │   └── xpressclaw-tauri/    # Native desktop app (Tauri v2)
-├── src/xpressai/            # Legacy Python implementation (reference only)
-│   ├── __init__.py
-│   ├── cli/                 # CLI commands (click or typer)
-│   │   ├── __init__.py
-│   │   ├── main.py
-│   │   ├── init.py
-│   │   ├── up.py
-│   │   └── status.py
-│   ├── core/                # Core runtime
-│   │   ├── __init__.py
-│   │   ├── config.py        # Configuration loading/defaults
-│   │   ├── runtime.py       # Main runtime orchestrator
-│   │   └── lifecycle.py     # Agent lifecycle management
-│   ├── agents/              # Agent backend adapters
-│   │   ├── __init__.py
-│   │   ├── base.py          # Abstract agent interface
-│   │   ├── claude.py        # Claude Agent SDK adapter
-│   │   ├── local.py         # Local model (Qwen3-8B) adapter
-│   │   └── registry.py      # Backend discovery/registration
-│   ├── isolation/           # Container isolation
-│   │   ├── __init__.py
-│   │   ├── docker.py        # Docker container management
-│   │   └── sandbox.py       # Filesystem/network sandboxing
-│   ├── memory/              # Memory system
-│   │   ├── __init__.py
-│   │   ├── zettelkasten.py  # Note storage and linking
-│   │   ├── vector.py        # Vector search (sqlite-vec)
-│   │   ├── slots.py         # Near-term memory slots
-│   │   └── eviction.py      # Memory eviction strategies
-│   ├── tools/               # MCP tool system
-│   │   ├── __init__.py
-│   │   ├── registry.py      # Tool discovery and registration
-│   │   ├── mcp.py           # MCP server/client handling
-│   │   └── builtin/         # Built-in tools
-│   │       ├── filesystem.py
-│   │       ├── web.py
-│   │       └── shell.py
-│   ├── tasks/               # Task and SOP system
-│   │   ├── __init__.py
-│   │   ├── board.py         # Kanban task board
-│   │   ├── sop.py           # Standard operating procedures
-│   │   └── scheduler.py     # Task scheduling
-│   ├── budget/              # Budget and rate limiting
-│   │   ├── __init__.py
-│   │   ├── tracker.py       # Cost tracking
-│   │   ├── limits.py        # Budget enforcement
-│   │   └── policies.py      # On-exceed policies
-│   ├── web/                 # Web UI (HTMX)
-│   │   ├── __init__.py
-│   │   ├── app.py           # FastAPI app
-│   │   ├── routes/
-│   │   └── templates/       # Jinja2 + HTMX
-│   └── tui/                 # Terminal UI (Textual)
-│       ├── __init__.py
-│       └── app.py
+├── frontend/                # SvelteKit web UI (Svelte 5, Tailwind CSS)
 ├── tests/
 ├── docs/
 │   └── adr/                 # Architecture Decision Records
@@ -126,17 +121,14 @@ xpressai-cli/                # Current project directory
 ## Development Guidelines
 
 ### Git Version Control
-- Read ADR-000 and follow the instructions. We use git not just for source code versioning but also to store important notes about changes for later.
+See the top of this file. Read notes first, write notes after every commit. Non-negotiable.
 
 ### Code Style
-- Use type hints everywhere
 - Prefer composition over inheritance
 - Keep modules focused and small
-- Write docstrings for public APIs
 
 ### Error Handling
-- Use custom exception hierarchy rooted at `XpressAIError`
-- Never swallow exceptions silently
+- Never swallow errors silently
 - Log errors with context
 
 ### Configuration
@@ -146,10 +138,7 @@ xpressai-cli/                # Current project directory
 - Progressive disclosure: start simple, add complexity as needed
 
 ### Testing
-- pytest for all tests
-- Use fixtures for database/container setup
-- Mock external services (Docker, LLM APIs) in unit tests
-- Integration tests with real containers
+- Integration tests with real containers where appropriate
 
 ## Key Design Principles
 
@@ -170,8 +159,7 @@ We're building the MVP with this priority:
 3. Docker isolation
 4. SQLite + sqlite-vec memory
 5. Basic CLI (init, up, status, logs)
-6. Simple HTMX dashboard
-7. Textual TUI for interaction
+6. SvelteKit web dashboard
 
 ## Commands Reference
 
@@ -233,7 +221,7 @@ Before making significant changes, read the relevant ADRs in `docs/adr/`:
 - ADR-004: Memory system
 - ADR-005: MCP tool system
 - ADR-006: SQLite storage
-- ADR-007: HTMX web UI
+- ADR-007: Web UI
 - ADR-008: Textual TUI (legacy, replaced by web UI)
 - ADR-009: Task/SOP system
 - ADR-010: Budget controls
