@@ -214,32 +214,53 @@ async def _query_to_queue(
 ):
     """Run the Claude SDK query and push SSE chunks to a thread-safe queue."""
     sent_role = False
-    async for message in query(prompt=task, options=options):
-        if isinstance(message, StreamEvent):
-            event = message.event
-            if event.get("type") == "content_block_delta":
-                delta_obj = event.get("delta", {})
-                if delta_obj.get("type") == "text_delta":
-                    text = delta_obj.get("text", "")
-                    if text:
-                        delta = {"content": text}
-                        if not sent_role:
-                            delta["role"] = "assistant"
-                            sent_role = True
-                        q.put(_sse_chunk_raw(conv_id, model, delta, None))
+    try:
+        async for message in query(prompt=task, options=options):
+            logger.debug("SDK message type: %s", type(message).__name__)
 
-        elif isinstance(message, ResultMessage):
-            if message.is_error:
-                error_text = f"Agent error: {message.result or 'unknown error'}"
-                delta = {"content": error_text}
-                if not sent_role:
-                    delta["role"] = "assistant"
-                q.put(_sse_chunk_raw(conv_id, model, delta, None))
-            elif not sent_role and message.result:
-                q.put(_sse_chunk_raw(conv_id, model, {"role": "assistant", "content": message.result}, None))
-            q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
-            q.put("data: [DONE]\n\n")
-            return
+            if isinstance(message, StreamEvent):
+                event = message.event
+                if event.get("type") == "content_block_delta":
+                    delta_obj = event.get("delta", {})
+                    if delta_obj.get("type") == "text_delta":
+                        text = delta_obj.get("text", "")
+                        if text:
+                            delta = {"content": text}
+                            if not sent_role:
+                                delta["role"] = "assistant"
+                                sent_role = True
+                            q.put(_sse_chunk_raw(conv_id, model, delta, None))
+
+            elif isinstance(message, AssistantMessage):
+                # For non-streaming SDK responses (non-Claude models may not emit StreamEvent)
+                if hasattr(message, "content"):
+                    for block in message.content:
+                        if hasattr(block, "text") and block.text:
+                            delta = {"content": block.text}
+                            if not sent_role:
+                                delta["role"] = "assistant"
+                                sent_role = True
+                            q.put(_sse_chunk_raw(conv_id, model, delta, None))
+
+            elif isinstance(message, ResultMessage):
+                logger.info("ResultMessage: is_error=%s result_len=%d",
+                            message.is_error, len(message.result or ""))
+                if message.is_error:
+                    error_text = f"Agent error: {message.result or 'unknown error'}"
+                    delta = {"content": error_text}
+                    if not sent_role:
+                        delta["role"] = "assistant"
+                    q.put(_sse_chunk_raw(conv_id, model, delta, None))
+                elif not sent_role and message.result:
+                    q.put(_sse_chunk_raw(conv_id, model, {"role": "assistant", "content": message.result}, None))
+                q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
+                q.put("data: [DONE]\n\n")
+                return
+
+    except Exception as e:
+        logger.exception("_query_to_queue error")
+        error_payload = {"error": {"message": str(e), "type": "server_error"}}
+        q.put(f"data: {json.dumps(error_payload)}\n\n")
 
     # No ResultMessage
     if not sent_role:
