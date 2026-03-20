@@ -139,7 +139,24 @@ async fn anthropic_messages(
     let model = req.model.clone();
     let streaming = req.stream.unwrap_or(false);
 
-    debug!(model = %model, streaming, "anthropic messages request");
+    let num_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0);
+    let num_messages = req.messages.len();
+    let has_tool_choice = req.tool_choice.is_some();
+    debug!(
+        model = %model,
+        streaming,
+        num_tools,
+        num_messages,
+        has_tool_choice,
+        "anthropic messages request"
+    );
+    if num_tools > 0 {
+        if let Some(ref tools) = req.tools {
+            for tool in tools {
+                debug!(tool_name = ?tool.get("name"), "  tool");
+            }
+        }
+    }
 
     // For Claude models with an Anthropic API key: proxy directly to Anthropic API.
     // This preserves tools, tool_use/tool_result blocks, and streaming without lossy conversion.
