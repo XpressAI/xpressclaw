@@ -44,7 +44,9 @@
       "Bash(docker build:*)",
       "Bash(git:*)",
       "WebFetch(domain:medium.com)",
-      "Bash(gh run:*)"
+      "Bash(gh run:*)",
+      "Bash(/dev/null __NEW_LINE_5e34ade760505d78__ echo --- sleep 5 echo 'Docker containers:' docker ps --filter name=xpressclaw --format '  {{.Names}}: {{.Status}}' 2)",
+      "Bash(1 echo:*)"
     ]
   }
 }
