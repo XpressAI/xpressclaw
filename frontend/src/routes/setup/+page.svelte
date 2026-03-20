@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { setup, agents as agentsApi } from '$lib/api';
+	import { openUrl } from '@tauri-apps/plugin-opener';
 	import type {
 		DockerStatus,
 		SystemInfo,
@@ -793,10 +794,10 @@
 			</div>
 			<div class="space-y-2 text-sm mb-4">
 				<div class="flex gap-2">
-					<a href="https://docs.docker.com/get-docker/" target="_blank" rel="noopener noreferrer"
-						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Docker Desktop &#8599;</a>
-					<a href="https://podman.io/getting-started/installation" target="_blank" rel="noopener noreferrer"
-						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Podman &#8599;</a>
+					<button onclick={() => openUrl('https://docs.docker.com/get-docker/')}
+						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Docker Desktop &#8599;</button>
+					<button onclick={() => openUrl('https://podman.io/getting-started/installation')}
+						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Podman &#8599;</button>
 					<button onclick={recheckDocker}
 						class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Retry</button>
 				</div>
