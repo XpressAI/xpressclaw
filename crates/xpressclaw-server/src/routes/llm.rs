@@ -117,13 +117,39 @@ struct AnthropicUsageOut {
 
 /// Handle Anthropic Messages API requests.
 ///
-/// Accepts requests in Anthropic format, converts to OpenAI format internally,
-/// routes through the LLM router, then converts the response back to Anthropic format.
-/// Supports both non-streaming and streaming responses.
+/// Anthropic Messages API endpoint.
+///
+/// For Claude models: proxies directly to the Anthropic API, preserving the full
+/// request (tools, tool_use, tool_result, streaming) without lossy conversion.
+/// For non-Claude models: converts Anthropic→OpenAI, routes through LLM router,
+/// converts response back.
 async fn anthropic_messages(
     State(state): State<AppState>,
-    Json(req): Json<AnthropicMessagesRequest>,
+    body_bytes: axum::body::Bytes,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let req: AnthropicMessagesRequest =
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "type": "error", "error": { "type": "invalid_request", "message": e.to_string() } })),
+            )
+        })?;
+
+    let model = req.model.clone();
+    let streaming = req.stream.unwrap_or(false);
+
+    debug!(model = %model, streaming, "anthropic messages request");
+
+    // For Claude models with an Anthropic API key: proxy directly to Anthropic API.
+    // This preserves tools, tool_use/tool_result blocks, and streaming without lossy conversion.
+    let config = state.config();
+    if model.starts_with("claude") {
+        if let Some(ref api_key) = config.llm.anthropic_api_key {
+            return proxy_to_anthropic(api_key, &body_bytes, streaming).await;
+        }
+    }
+
+    // For non-Claude models: convert Anthropic→OpenAI→LLM router→Anthropic
     let router = state.llm_router().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -134,15 +160,9 @@ async fn anthropic_messages(
         )
     })?;
 
-    let streaming = req.stream.unwrap_or(false);
-    let model = req.model.clone();
-
-    debug!(model = %model, streaming, "anthropic messages request");
-
     let openai_req = anthropic_to_openai_request(req);
 
     if streaming {
-        // True streaming: convert OpenAI chunks to Anthropic SSE events in real-time
         let chunk_stream = router.chat_stream(&openai_req).await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -167,6 +187,64 @@ async fn anthropic_messages(
         let anthropic_resp = openai_to_anthropic_response(response);
         let body = serde_json::to_value(&anthropic_resp).unwrap_or(json!({}));
         Ok(Json(body).into_response())
+    }
+}
+
+/// Proxy an Anthropic Messages API request directly to api.anthropic.com.
+/// Preserves the full request body (tools, tool_use, tool_result, streaming) without conversion.
+async fn proxy_to_anthropic(
+    api_key: &str,
+    body: &[u8],
+    streaming: bool,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": { "type": "api_error", "message": format!("Anthropic proxy error: {e}") }
+                })),
+            )
+        })?;
+
+    let status =
+        axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    if streaming {
+        // Stream the SSE response directly through to the client
+        let byte_stream = resp.bytes_stream();
+        let body = axum::body::Body::from_stream(byte_stream);
+        Ok(axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(body)
+            .unwrap())
+    } else {
+        let response_bytes = resp.bytes().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": { "type": "api_error", "message": format!("Failed to read Anthropic response: {e}") }
+                })),
+            )
+        })?;
+        Ok(axum::response::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response_bytes))
+            .unwrap())
     }
 }
 
