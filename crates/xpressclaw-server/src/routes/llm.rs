@@ -529,6 +529,16 @@ fn openai_to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessag
     let mut content = Vec::new();
 
     if let Some(choice) = resp.choices.first() {
+        // Reasoning/thinking content (from reasoning models like o1, Qwen3.5)
+        if let Some(ref reasoning) = choice.message.reasoning_content {
+            if !reasoning.is_empty() {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": reasoning,
+                }));
+            }
+        }
+
         // Text content
         if !choice.message.content.is_empty() {
             content.push(json!({

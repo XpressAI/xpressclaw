@@ -453,6 +453,7 @@ impl LlamaCppProvider {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                ..Default::default()
             },
         ))
     }
@@ -531,6 +532,7 @@ impl LlmProvider for LlamaCppProvider {
                             } else {
                                 Some(content)
                             },
+                            ..Default::default()
                         },
                         finish_reason: finish,
                     }],
