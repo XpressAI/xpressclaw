@@ -138,7 +138,7 @@ async fn validate_key(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let result = match req.provider.as_str() {
         "openai" => OpenAiProvider::validate_key(&req.api_key, req.base_url.as_deref()).await,
-        "anthropic" => AnthropicProvider::validate_key(&req.api_key).await,
+        "anthropic" => AnthropicProvider::validate_key(&req.api_key, req.base_url.as_deref()).await,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -148,8 +148,66 @@ async fn validate_key(
     };
 
     match result {
-        Ok(valid) => Ok(Json(json!({ "valid": valid }))),
+        Ok(valid) => {
+            if !valid {
+                return Ok(Json(json!({ "valid": false, "error": "Invalid API key" })));
+            }
+            // Fetch available models from the provider
+            let models =
+                fetch_provider_models(&req.provider, &req.api_key, req.base_url.as_deref()).await;
+            Ok(Json(json!({ "valid": true, "models": models })))
+        }
         Err(e) => Ok(Json(json!({ "valid": false, "error": e }))),
+    }
+}
+
+/// Fetch available models from a provider's API.
+async fn fetch_provider_models(
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Vec<Value> {
+    let client = reqwest::Client::new();
+    let url = match provider {
+        "openai" => {
+            let base = base_url.unwrap_or("https://api.openai.com");
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        }
+        "anthropic" => {
+            let base = base_url.unwrap_or("https://api.anthropic.com");
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        }
+        _ => return vec![],
+    };
+
+    let mut req = client.get(&url);
+    match provider {
+        "anthropic" => {
+            req = req
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+        _ => {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+    }
+
+    match req.timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.json::<Value>().await {
+                if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                    return data
+                        .iter()
+                        .filter_map(|m| {
+                            let id = m.get("id")?.as_str()?;
+                            Some(json!({ "id": id }))
+                        })
+                        .collect();
+                }
+            }
+            vec![]
+        }
+        _ => vec![],
     }
 }
 
@@ -335,8 +393,18 @@ async fn complete_setup(
     // Apply config immediately — register agents and build LLM router
     let config = Arc::new(config);
 
-    // Register agents in the database
+    // Sync agents in the database to match the new config.
+    // Remove any agents not in the new config, then register the new ones.
     let registry = AgentRegistry::new(state.db.clone());
+    let existing_agents = registry.list().unwrap_or_default();
+    let new_agent_names: std::collections::HashSet<&str> =
+        config.agents.iter().map(|a| a.name.as_str()).collect();
+    for existing in &existing_agents {
+        if !new_agent_names.contains(existing.name.as_str()) {
+            info!(name = existing.name, "removing agent not in new config");
+            let _ = registry.delete(&existing.id);
+        }
+    }
     for agent_config in &config.agents {
         let mut agent_json = serde_json::Map::new();
         if !agent_config.role.is_empty() {
