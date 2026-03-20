@@ -28,6 +28,7 @@ tokio-stream = { workspace = true }
 futures-util = { workspace = true }
 async-stream = "0.3"
 rust-embed = { workspace = true }
+open = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

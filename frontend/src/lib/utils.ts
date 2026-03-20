@@ -22,6 +22,19 @@ export function formatCost(usd: number): string {
 	return `$${usd.toFixed(2)}`;
 }
 
+/** Open a URL in the system browser via the server, with browser fallback. */
+export async function openExternal(url: string): Promise<void> {
+	try {
+		await fetch('/api/open-url', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ url })
+		});
+	} catch {
+		window.open(url, '_blank');
+	}
+}
+
 export function statusColor(status: string): string {
 	switch (status) {
 		case 'running':
