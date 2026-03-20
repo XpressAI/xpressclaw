@@ -139,9 +139,7 @@ pub async fn connect(port: u16) -> Result<ApiClient> {
 
     // Sanity check: make sure it's our server, not something else on this port
     if health.get("status").is_none() {
-        anyhow::bail!(
-            "port {port} is in use by another application (not xpressclaw)"
-        );
+        anyhow::bail!("port {port} is in use by another application (not xpressclaw)");
     }
 
     Ok(client)
