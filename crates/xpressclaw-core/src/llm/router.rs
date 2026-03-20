@@ -11,11 +11,19 @@ use crate::error::{Error, Result};
 /// A boxed stream of chat completion chunks.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>>;
 
+/// Deserialize a string that may be null as an empty string.
+fn nullable_string<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
 /// A chat message in OpenAI format.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     pub content: String,
     /// Tool calls requested by the assistant (role=assistant, finish_reason=tool_calls).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23,6 +31,9 @@ pub struct ChatMessage {
     /// Tool call ID this message is responding to (role=tool).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Reasoning/thinking content from reasoning models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -71,15 +82,15 @@ pub struct ToolCallFunction {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     /// Available tools for the model to call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,11 +101,14 @@ pub struct ChatCompletionRequest {
 }
 
 /// Token usage stats.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// Tokens used for reasoning/thinking (reasoning models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i64>,
 }
 
 /// A choice in the completion response.
@@ -133,12 +147,40 @@ pub struct ChunkChoice {
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Reasoning/thinking content delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// Streaming tool call deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+/// A streaming tool call delta from OpenAI format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkToolCall {
+    #[serde(default)]
+    pub index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<ChunkToolCallFunction>,
+}
+
+/// Streaming function call delta.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkToolCallFunction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 /// Model info for /v1/models.
@@ -172,6 +214,7 @@ pub trait LlmProvider: Send + Sync {
                     delta: ChunkDelta {
                         role: Some(c.message.role),
                         content: Some(c.message.content),
+                        ..Default::default()
                     },
                     finish_reason: c.finish_reason,
                 })
@@ -355,6 +398,7 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
+                    ..Default::default()
                 }),
             })
         }

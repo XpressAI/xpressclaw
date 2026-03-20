@@ -7428,6 +7428,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "open",
+ "reqwest 0.12.28",
  "rust-embed",
  "serde",
  "serde_json",
