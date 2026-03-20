@@ -11,8 +11,9 @@ npm ci
 npm run build
 cd ..
 
-# Build the Rust binary
+# Build the Rust binary (touch frontend.rs to force re-embedding the frontend build)
 echo "==> Building Rust binary..."
+touch crates/xpressclaw-server/src/frontend.rs
 cargo build --release
 
 echo "==> Build complete: target/release/xpressclaw"
