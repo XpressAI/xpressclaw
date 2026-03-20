@@ -292,40 +292,109 @@ fn anthropic_live_streaming_response(
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
         let mut output_tokens = 0u64;
-        let mut text_started = false;
+        let mut block_index: i64 = 0;
+        let mut text_block_open = false;
+        let mut has_tool_calls = false;
 
-        // Start a text content block immediately
-        yield Ok(Event::default().event("content_block_start").data(
-            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
-        ));
+        // Track streaming tool call assembly (OpenAI sends them incrementally)
+        struct ToolCallState {
+            id: String,
+            name: String,
+            arguments: String,
+            block_index: i64,
+        }
+        let mut tool_calls: std::collections::HashMap<i64, ToolCallState> = std::collections::HashMap::new();
 
         futures_util::pin_mut!(chunk_stream);
         while let Some(chunk_result) = chunk_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     for choice in &chunk.choices {
-                        // Use content if available, otherwise fall back to reasoning_content.
-                        // Reasoning models (Qwen3.5, o1) stream all text through
-                        // reasoning_content with content always null during streaming.
+                        // Text content (including reasoning_content fallback)
                         let text = choice
                             .delta
                             .content
                             .as_deref()
                             .filter(|s| !s.is_empty())
                             .or_else(|| {
-                                choice
-                                    .delta
-                                    .reasoning_content
-                                    .as_deref()
-                                    .filter(|s| !s.is_empty())
+                                choice.delta.reasoning_content.as_deref().filter(|s| !s.is_empty())
                             });
 
                         if let Some(text) = text {
-                            text_started = true;
+                            if !text_block_open {
+                                yield Ok(Event::default().event("content_block_start").data(
+                                    json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "text", "text": "" } }).to_string()
+                                ));
+                                text_block_open = true;
+                            }
                             output_tokens += 1;
                             yield Ok(Event::default().event("content_block_delta").data(
-                                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }).to_string()
+                                json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "text_delta", "text": text } }).to_string()
                             ));
+                        }
+
+                        // Tool call deltas
+                        if let Some(ref tcs) = choice.delta.tool_calls {
+                            // Close text block if open
+                            if text_block_open {
+                                yield Ok(Event::default().event("content_block_stop").data(
+                                    json!({ "type": "content_block_stop", "index": block_index }).to_string()
+                                ));
+                                text_block_open = false;
+                                block_index += 1;
+                            }
+                            has_tool_calls = true;
+
+                            for tc in tcs {
+                                let tc_index = tc.index;
+                                let state = tool_calls.entry(tc_index).or_insert_with(|| {
+                                    let bi = block_index + tc_index;
+                                    ToolCallState {
+                                        id: String::new(),
+                                        name: String::new(),
+                                        arguments: String::new(),
+                                        block_index: bi,
+                                    }
+                                });
+
+                                if let Some(ref id) = tc.id {
+                                    state.id = id.clone();
+                                }
+                                if let Some(ref func) = tc.function {
+                                    if let Some(ref name) = func.name {
+                                        state.name = name.clone();
+                                        // Emit content_block_start for this tool_use
+                                        yield Ok(Event::default().event("content_block_start").data(
+                                            json!({
+                                                "type": "content_block_start",
+                                                "index": state.block_index,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": state.id,
+                                                    "name": state.name,
+                                                    "input": {}
+                                                }
+                                            }).to_string()
+                                        ));
+                                    }
+                                    if let Some(ref args) = func.arguments {
+                                        state.arguments.push_str(args);
+                                        // Emit input_json_delta
+                                        yield Ok(Event::default().event("content_block_delta").data(
+                                            json!({
+                                                "type": "content_block_delta",
+                                                "index": state.block_index,
+                                                "delta": { "type": "input_json_delta", "partial_json": args }
+                                            }).to_string()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check finish_reason for tool_calls
+                        if choice.finish_reason.as_deref() == Some("tool_calls") {
+                            has_tool_calls = true;
                         }
                     }
                 }
@@ -336,18 +405,38 @@ fn anthropic_live_streaming_response(
             }
         }
 
-        let _ = text_started; // suppress unused warning
+        // Close any open blocks
+        if text_block_open {
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": block_index }).to_string()
+            ));
+            block_index += 1;
+        }
 
-        // Close the text block
-        yield Ok(Event::default().event("content_block_stop").data(
-            json!({ "type": "content_block_stop", "index": 0 }).to_string()
-        ));
+        // Close tool_use blocks
+        for (_, state) in &tool_calls {
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": state.block_index }).to_string()
+            ));
+        }
+
+        // If no blocks were emitted at all, emit an empty text block
+        if block_index == 0 && tool_calls.is_empty() {
+            yield Ok(Event::default().event("content_block_start").data(
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
+            ));
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": 0 }).to_string()
+            ));
+        }
+
+        let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
 
         // message_delta
         yield Ok(Event::default().event("message_delta").data(
             json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                 "usage": { "output_tokens": output_tokens }
             }).to_string()
         ));
@@ -828,6 +917,78 @@ mod tests {
             "content should have at least one block"
         );
         eprintln!("Response: {}", serde_json::to_string_pretty(&json).unwrap());
+    }
+
+    /// Test /v1/messages with tool_choice=any forces tool use and returns tool_use blocks.
+    #[ignore = "requires OPENAI_BASE_URL and OPENAI_API_KEY"]
+    #[tokio::test]
+    async fn test_anthropic_messages_forced_tool_call() {
+        let app = match test_app_with_openai() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 2000,
+            "temperature": 0.1,
+            "tool_choice": {"type": "any"},
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a shell command and return the output",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string", "description": "The command to run"}},
+                    "required": ["command"]
+                }
+            }],
+            "messages": [{"role": "user", "content": "List files in /workspace"}]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let json = assert_ok(resp, "/v1/messages forced tool call").await;
+        assert_eq!(json["type"], "message");
+        let content = json["content"].as_array().expect("content should be array");
+        assert!(
+            !content.is_empty(),
+            "content should have at least one block"
+        );
+
+        // Should have a tool_use block
+        let has_tool_use = content.iter().any(|b| b["type"] == "tool_use");
+        assert!(
+            has_tool_use,
+            "response should contain a tool_use block, got: {}",
+            serde_json::to_string_pretty(&json["content"]).unwrap()
+        );
+
+        // Verify tool_use block structure
+        let tool_block = content.iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert_eq!(tool_block["name"], "Bash");
+        assert!(tool_block["id"].is_string(), "tool_use should have an id");
+        assert!(
+            tool_block["input"].is_object(),
+            "tool_use should have input"
+        );
+        assert_eq!(json["stop_reason"], "tool_use");
+
+        eprintln!(
+            "Tool call: {}",
+            serde_json::to_string_pretty(tool_block).unwrap()
+        );
     }
 
     /// Test /v1/models endpoint returns models from the provider.

@@ -156,6 +156,31 @@ pub struct ChunkDelta {
     /// Reasoning/thinking content delta.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Streaming tool call deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+/// A streaming tool call delta from OpenAI format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkToolCall {
+    #[serde(default)]
+    pub index: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<ChunkToolCallFunction>,
+}
+
+/// Streaming function call delta.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkToolCallFunction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 /// Model info for /v1/models.
