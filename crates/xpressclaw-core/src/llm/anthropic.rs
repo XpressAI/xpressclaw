@@ -191,6 +191,7 @@ impl LlmProvider for AnthropicProvider {
                 completion_tokens: anthropic_resp.usage.output_tokens,
                 total_tokens: anthropic_resp.usage.input_tokens
                     + anthropic_resp.usage.output_tokens,
+                ..Default::default()
             }),
         })
     }
