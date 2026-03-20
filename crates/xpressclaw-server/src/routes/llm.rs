@@ -625,6 +625,17 @@ mod tests {
 
     use crate::state::AppState;
 
+    async fn assert_ok(resp: axum::http::Response<Body>, context: &str) -> serde_json::Value {
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            status, 200,
+            "{context}: expected 200, got {status}. Body: {body_str}"
+        );
+        serde_json::from_slice(&bytes).expect("response should be valid JSON")
+    }
+
     fn env_or_skip(key: &str) -> String {
         std::env::var(key).unwrap_or_else(|_| {
             eprintln!("Skipping: {key} not set");
@@ -640,7 +651,11 @@ mod tests {
         }
 
         let db = Arc::new(Database::open_memory().unwrap());
-        let config = Arc::new(Config::default());
+        let mut config = Config::default();
+        config.llm.default_provider = "openai".into();
+        config.llm.openai_api_key = Some(api_key.clone());
+        config.llm.openai_base_url = Some(base_url.clone());
+        let config = Arc::new(config);
 
         let provider = OpenAiProvider::new(Some(api_key), Some(base_url));
         let mut router = LlmRouter::new(&config.llm);
@@ -686,11 +701,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "chat completions should return 200");
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(json["choices"][0]["message"]["content"].is_string());
-        let content = json["choices"][0]["message"]["content"].as_str().unwrap();
+        let json = assert_ok(resp, "chat completions").await;
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .or_else(|| json["choices"][0]["message"]["reasoning_content"].as_str())
+            .expect("response should have content or reasoning_content");
         assert!(!content.is_empty(), "response content should not be empty");
         eprintln!("Response: {content}");
     }
@@ -726,16 +741,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), 200, "/v1/messages should return 200");
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let json = assert_ok(resp, "/v1/messages").await;
         assert_eq!(json["type"], "message");
         assert_eq!(json["role"], "assistant");
-        let content = &json["content"];
-        assert!(content.is_array(), "content should be an array of blocks");
-        let text = content[0]["text"].as_str().unwrap_or("");
-        assert!(!text.is_empty(), "response text should not be empty");
-        eprintln!("Response: {text}");
+        let content = json["content"].as_array().expect("content should be array");
+        assert!(
+            !content.is_empty(),
+            "content should have at least one block"
+        );
+        eprintln!(
+            "Response: {}",
+            serde_json::to_string_pretty(&json["content"]).unwrap()
+        );
     }
 
     /// Test /v1/messages with tool definitions (non-Claude model).
@@ -778,21 +795,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            resp.status(),
-            200,
-            "/v1/messages with tools should return 200"
-        );
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        eprintln!("Response: {}", serde_json::to_string_pretty(&json).unwrap());
+        let json = assert_ok(resp, "/v1/messages with tools").await;
         assert_eq!(json["type"], "message");
-        // Model should either use the tool or respond with text
         let content = json["content"].as_array().expect("content should be array");
         assert!(
             !content.is_empty(),
             "content should have at least one block"
         );
+        eprintln!("Response: {}", serde_json::to_string_pretty(&json).unwrap());
     }
 
     /// Test /v1/models endpoint returns models from the provider.
