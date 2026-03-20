@@ -493,7 +493,7 @@ export const setup = {
 	checkOllama: () => request<OllamaInfo>('/api/setup/check-ollama'),
 	recommendModel: () => request<ModelRecommendation>('/api/setup/recommend-model'),
 	validateKey: (provider: string, apiKey: string, baseUrl?: string) =>
-		request<{ valid: boolean; error?: string }>('/api/setup/validate-key', {
+		request<{ valid: boolean; error?: string; models?: { id: string }[] }>('/api/setup/validate-key', {
 			method: 'POST',
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
@@ -508,5 +508,12 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify(data)
 		}),
-	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status')
+	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status'),
+	addAgent: (data: {
+		name: string; preset?: string; role?: string; model?: string;
+		backend?: string; tools?: string[]; volumes?: string[];
+	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
+		method: 'POST',
+		body: JSON.stringify(data)
+	})
 };

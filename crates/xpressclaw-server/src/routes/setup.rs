@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
+        .route("/add-agent", post(add_agent))
         .route("/download-status", get(download_status))
         .route("/config", get(get_config))
 }
@@ -138,7 +139,7 @@ async fn validate_key(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let result = match req.provider.as_str() {
         "openai" => OpenAiProvider::validate_key(&req.api_key, req.base_url.as_deref()).await,
-        "anthropic" => AnthropicProvider::validate_key(&req.api_key).await,
+        "anthropic" => AnthropicProvider::validate_key(&req.api_key, req.base_url.as_deref()).await,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -148,8 +149,66 @@ async fn validate_key(
     };
 
     match result {
-        Ok(valid) => Ok(Json(json!({ "valid": valid }))),
+        Ok(valid) => {
+            if !valid {
+                return Ok(Json(json!({ "valid": false, "error": "Invalid API key" })));
+            }
+            // Fetch available models from the provider
+            let models =
+                fetch_provider_models(&req.provider, &req.api_key, req.base_url.as_deref()).await;
+            Ok(Json(json!({ "valid": true, "models": models })))
+        }
         Err(e) => Ok(Json(json!({ "valid": false, "error": e }))),
+    }
+}
+
+/// Fetch available models from a provider's API.
+async fn fetch_provider_models(
+    provider: &str,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Vec<Value> {
+    let client = reqwest::Client::new();
+    let url = match provider {
+        "openai" => {
+            let base = base_url.unwrap_or("https://api.openai.com");
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        }
+        "anthropic" => {
+            let base = base_url.unwrap_or("https://api.anthropic.com");
+            format!("{}/v1/models", base.trim_end_matches('/'))
+        }
+        _ => return vec![],
+    };
+
+    let mut req = client.get(&url);
+    match provider {
+        "anthropic" => {
+            req = req
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+        _ => {
+            req = req.header("Authorization", format!("Bearer {api_key}"));
+        }
+    }
+
+    match req.timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(body) = resp.json::<Value>().await {
+                if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                    return data
+                        .iter()
+                        .filter_map(|m| {
+                            let id = m.get("id")?.as_str()?;
+                            Some(json!({ "id": id }))
+                        })
+                        .collect();
+                }
+            }
+            vec![]
+        }
+        _ => vec![],
     }
 }
 
@@ -335,8 +394,18 @@ async fn complete_setup(
     // Apply config immediately — register agents and build LLM router
     let config = Arc::new(config);
 
-    // Register agents in the database
+    // Sync agents in the database to match the new config.
+    // Remove any agents not in the new config, then register the new ones.
     let registry = AgentRegistry::new(state.db.clone());
+    let existing_agents = registry.list().unwrap_or_default();
+    let new_agent_names: std::collections::HashSet<&str> =
+        config.agents.iter().map(|a| a.name.as_str()).collect();
+    for existing in &existing_agents {
+        if !new_agent_names.contains(existing.name.as_str()) {
+            info!(name = existing.name, "removing agent not in new config");
+            let _ = registry.delete(&existing.id);
+        }
+    }
     for agent_config in &config.agents {
         let mut agent_json = serde_json::Map::new();
         if !agent_config.role.is_empty() {
@@ -457,6 +526,100 @@ async fn complete_setup(
         "success": true,
         "downloading": false,
         "config_path": state.config_path.display().to_string()
+    })))
+}
+
+/// Add a new agent to the existing configuration without replacing other agents.
+/// Used by the "+ Add Agent" flow (mode=add-agent) in the wizard.
+async fn add_agent(
+    State(state): State<AppState>,
+    Json(req): Json<AgentSetup>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let presets = builtin_presets();
+    let preset = req
+        .preset
+        .as_deref()
+        .and_then(|id| presets.iter().find(|p| p.id == id));
+
+    let mut tools = req
+        .tools
+        .clone()
+        .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
+        .unwrap_or_default();
+    for default_tool in ["filesystem", "shell"] {
+        if !tools.iter().any(|t| t == default_tool) {
+            tools.insert(0, default_tool.to_string());
+        }
+    }
+
+    let agent_config = AgentConfig {
+        name: req.name.clone(),
+        backend: req
+            .backend
+            .clone()
+            .or(preset.map(|p| p.backend.to_string()))
+            .unwrap_or("generic".to_string()),
+        role: req
+            .role
+            .clone()
+            .or(preset.map(|p| p.role.to_string()))
+            .unwrap_or_default(),
+        model: req.model.clone(),
+        tools,
+        volumes: req.volumes.clone().unwrap_or_default(),
+        ..Default::default()
+    };
+
+    // Append to existing config (don't replace)
+    let old_config = state.config();
+    let mut new_agents = old_config.agents.clone();
+
+    // Replace if agent with same name exists, otherwise append
+    if let Some(idx) = new_agents.iter().position(|a| a.name == agent_config.name) {
+        new_agents[idx] = agent_config.clone();
+    } else {
+        new_agents.push(agent_config.clone());
+    }
+
+    let new_config = Config {
+        agents: new_agents,
+        llm: old_config.llm.clone(),
+        mcp_servers: old_config.mcp_servers.clone(),
+        system: old_config.system.clone(),
+        ..Default::default()
+    };
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+    info!(name = agent_config.name, "added agent to configuration");
+
+    // Register in DB
+    let registry = AgentRegistry::new(state.db.clone());
+    let mut agent_json = serde_json::Map::new();
+    if !agent_config.role.is_empty() {
+        agent_json.insert(
+            "role".into(),
+            serde_json::Value::String(agent_config.role.clone()),
+        );
+    }
+    if let Some(ref model) = agent_config.model {
+        agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
+    }
+    registry
+        .register(&RegisterAgent {
+            name: agent_config.name.clone(),
+            backend: agent_config.backend.clone(),
+            config: serde_json::Value::Object(agent_json),
+        })
+        .map_err(internal_error)?;
+
+    // Reload config
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
+
+    Ok(Json(json!({
+        "success": true,
+        "agent": agent_config.name,
     })))
 }
 
