@@ -7427,6 +7427,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "http-body-util",
+ "open",
  "rust-embed",
  "serde",
  "serde_json",
