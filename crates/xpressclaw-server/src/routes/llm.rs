@@ -310,6 +310,7 @@ fn anthropic_live_streaming_response(
 
         let mut output_tokens = 0u64;
         let mut block_index: i64 = 0;
+        let mut thinking_block_open = false;
         let mut text_block_open = false;
         let mut has_tool_calls = false;
 
@@ -327,32 +328,56 @@ fn anthropic_live_streaming_response(
             match chunk_result {
                 Ok(chunk) => {
                     for choice in &chunk.choices {
-                        // Text content (including reasoning_content fallback)
-                        let text = choice
-                            .delta
-                            .content
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| {
-                                choice.delta.reasoning_content.as_deref().filter(|s| !s.is_empty())
-                            });
-
-                        if let Some(text) = text {
-                            if !text_block_open {
-                                yield Ok(Event::default().event("content_block_start").data(
-                                    json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "text", "text": "" } }).to_string()
+                        // Reasoning content → thinking block (separate from text)
+                        if let Some(ref reasoning) = choice.delta.reasoning_content {
+                            if !reasoning.is_empty() {
+                                if !thinking_block_open {
+                                    yield Ok(Event::default().event("content_block_start").data(
+                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "thinking", "thinking": "" } }).to_string()
+                                    ));
+                                    thinking_block_open = true;
+                                }
+                                output_tokens += 1;
+                                yield Ok(Event::default().event("content_block_delta").data(
+                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "thinking_delta", "thinking": reasoning } }).to_string()
                                 ));
-                                text_block_open = true;
                             }
-                            output_tokens += 1;
-                            yield Ok(Event::default().event("content_block_delta").data(
-                                json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "text_delta", "text": text } }).to_string()
-                            ));
+                        }
+
+                        // Text content → text block
+                        if let Some(ref text) = choice.delta.content {
+                            if !text.is_empty() {
+                                // Close thinking block first if transitioning
+                                if thinking_block_open {
+                                    yield Ok(Event::default().event("content_block_stop").data(
+                                        json!({ "type": "content_block_stop", "index": block_index }).to_string()
+                                    ));
+                                    thinking_block_open = false;
+                                    block_index += 1;
+                                }
+                                if !text_block_open {
+                                    yield Ok(Event::default().event("content_block_start").data(
+                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "text", "text": "" } }).to_string()
+                                    ));
+                                    text_block_open = true;
+                                }
+                                output_tokens += 1;
+                                yield Ok(Event::default().event("content_block_delta").data(
+                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "text_delta", "text": text } }).to_string()
+                                ));
+                            }
                         }
 
                         // Tool call deltas
                         if let Some(ref tcs) = choice.delta.tool_calls {
-                            // Close text block if open
+                            // Close any open blocks
+                            if thinking_block_open {
+                                yield Ok(Event::default().event("content_block_stop").data(
+                                    json!({ "type": "content_block_stop", "index": block_index }).to_string()
+                                ));
+                                thinking_block_open = false;
+                                block_index += 1;
+                            }
                             if text_block_open {
                                 yield Ok(Event::default().event("content_block_stop").data(
                                     json!({ "type": "content_block_stop", "index": block_index }).to_string()
@@ -423,6 +448,12 @@ fn anthropic_live_streaming_response(
         }
 
         // Close any open blocks
+        if thinking_block_open {
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": block_index }).to_string()
+            ));
+            block_index += 1;
+        }
         if text_block_open {
             yield Ok(Event::default().event("content_block_stop").data(
                 json!({ "type": "content_block_stop", "index": block_index }).to_string()
@@ -438,7 +469,7 @@ fn anthropic_live_streaming_response(
         }
 
         // If no blocks were emitted at all, emit an empty text block
-        if block_index == 0 && tool_calls.is_empty() {
+        if block_index == 0 && tool_calls.is_empty() && !thinking_block_open && !text_block_open {
             yield Ok(Event::default().event("content_block_start").data(
                 json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
             ));
