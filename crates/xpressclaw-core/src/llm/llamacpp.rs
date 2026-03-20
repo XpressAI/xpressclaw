@@ -141,17 +141,24 @@ pub fn download_gguf_with_progress(
 const DEFAULT_CONTEXT_LENGTH: u32 = 131_072;
 
 /// Global LlamaBackend singleton — llama.cpp only allows one backend per process.
+/// Uses a Mutex to prevent race conditions during initialization.
 static LLAMA_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+static LLAMA_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
+    if let Some(b) = LLAMA_BACKEND.get() {
+        return Ok(b.clone());
+    }
+    // Hold lock during init to prevent concurrent LlamaBackend::init() calls
+    let _guard = LLAMA_INIT_LOCK.lock().unwrap();
+    // Re-check after acquiring lock (another thread may have initialized)
     if let Some(b) = LLAMA_BACKEND.get() {
         return Ok(b.clone());
     }
     let backend =
         LlamaBackend::init().map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?;
     let arc = Arc::new(backend);
-    // Another thread might have initialized it between get() and here — that's fine.
-    let _ = LLAMA_BACKEND.set(arc.clone());
+    let _ = LLAMA_BACKEND.set(arc);
     Ok(LLAMA_BACKEND.get().unwrap().clone())
 }
 
