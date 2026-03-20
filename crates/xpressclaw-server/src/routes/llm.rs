@@ -291,27 +291,53 @@ fn anthropic_live_streaming_response(
         });
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
-        // content_block_start for index 0 (text)
-        yield Ok(Event::default().event("content_block_start").data(
-            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
-        ));
-
         let mut output_tokens = 0u64;
+        let mut block_index = 0i64;
+        let mut in_thinking = false;
+        let mut in_text = false;
 
         futures_util::pin_mut!(chunk_stream);
         while let Some(chunk_result) = chunk_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     for choice in &chunk.choices {
+                        // Handle reasoning_content (thinking) deltas
+                        if let Some(ref reasoning) = choice.delta.reasoning_content {
+                            if !reasoning.is_empty() {
+                                if !in_thinking {
+                                    yield Ok(Event::default().event("content_block_start").data(
+                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "thinking", "thinking": "" } }).to_string()
+                                    ));
+                                    in_thinking = true;
+                                }
+                                output_tokens += 1;
+                                yield Ok(Event::default().event("content_block_delta").data(
+                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "thinking_delta", "thinking": reasoning } }).to_string()
+                                ));
+                            }
+                        }
+
+                        // Handle text content deltas
                         if let Some(ref text) = choice.delta.content {
                             if !text.is_empty() {
+                                // Close thinking block if transitioning to text
+                                if in_thinking {
+                                    yield Ok(Event::default().event("content_block_stop").data(
+                                        json!({ "type": "content_block_stop", "index": block_index }).to_string()
+                                    ));
+                                    in_thinking = false;
+                                    block_index += 1;
+                                }
+                                if !in_text {
+                                    yield Ok(Event::default().event("content_block_start").data(
+                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "text", "text": "" } }).to_string()
+                                    ));
+                                    in_text = true;
+                                }
                                 output_tokens += 1;
-                                let delta = json!({
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": { "type": "text_delta", "text": text }
-                                });
-                                yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                                yield Ok(Event::default().event("content_block_delta").data(
+                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "text_delta", "text": text } }).to_string()
+                                ));
                             }
                         }
                     }
@@ -323,10 +349,20 @@ fn anthropic_live_streaming_response(
             }
         }
 
-        // content_block_stop
-        yield Ok(Event::default().event("content_block_stop").data(
-            json!({ "type": "content_block_stop", "index": 0 }).to_string()
-        ));
+        // Close any open block
+        if in_thinking || in_text {
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": block_index }).to_string()
+            ));
+        } else {
+            // No content at all — emit an empty text block so the response is valid
+            yield Ok(Event::default().event("content_block_start").data(
+                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
+            ));
+            yield Ok(Event::default().event("content_block_stop").data(
+                json!({ "type": "content_block_stop", "index": 0 }).to_string()
+            ));
+        }
 
         // message_delta
         yield Ok(Event::default().event("message_delta").data(
