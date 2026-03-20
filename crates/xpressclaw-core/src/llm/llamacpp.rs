@@ -136,20 +136,29 @@ pub fn download_gguf_with_progress(
 }
 
 /// Default context length for inference.
-const DEFAULT_CONTEXT_LENGTH: u32 = 32_768;
+/// Default context length. 128k supports tool-calling (Claude SDK sends ~18k tokens
+/// of tool definitions) with ample room for conversation. KV cache at 128k is ~4GB.
+const DEFAULT_CONTEXT_LENGTH: u32 = 131_072;
 
 /// Global LlamaBackend singleton — llama.cpp only allows one backend per process.
+/// Uses a Mutex to prevent race conditions during initialization.
 static LLAMA_BACKEND: std::sync::OnceLock<Arc<LlamaBackend>> = std::sync::OnceLock::new();
+static LLAMA_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
+    if let Some(b) = LLAMA_BACKEND.get() {
+        return Ok(b.clone());
+    }
+    // Hold lock during init to prevent concurrent LlamaBackend::init() calls
+    let _guard = LLAMA_INIT_LOCK.lock().unwrap();
+    // Re-check after acquiring lock (another thread may have initialized)
     if let Some(b) = LLAMA_BACKEND.get() {
         return Ok(b.clone());
     }
     let backend =
         LlamaBackend::init().map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?;
     let arc = Arc::new(backend);
-    // Another thread might have initialized it between get() and here — that's fine.
-    let _ = LLAMA_BACKEND.set(arc.clone());
+    let _ = LLAMA_BACKEND.set(arc);
     Ok(LLAMA_BACKEND.get().unwrap().clone())
 }
 
@@ -207,10 +216,17 @@ impl LlamaCppProvider {
                 .map_err(|e| Error::Llm(format!("failed to load model: {e}")))?,
         );
 
-        let context_length = DEFAULT_CONTEXT_LENGTH;
+        // Use the model's trained context length, capped at our default
+        let n_ctx_train = model.n_ctx_train();
+        let context_length = if n_ctx_train > 0 {
+            (n_ctx_train as u32).min(DEFAULT_CONTEXT_LENGTH)
+        } else {
+            DEFAULT_CONTEXT_LENGTH
+        };
         tracing::info!(
             model = model_name,
             n_ctx = context_length,
+            n_ctx_train,
             "GGUF model loaded"
         );
 
@@ -326,8 +342,9 @@ impl LlamaCppProvider {
         grammar: Option<&str>,
         grammar_lazy: bool,
     ) -> Result<(String, Usage)> {
-        let ctx_params =
-            LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.context_length));
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(self.context_length))
+            .with_n_batch(self.context_length);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
@@ -443,6 +460,7 @@ impl LlamaCppProvider {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                ..Default::default()
             },
         ))
     }
@@ -521,6 +539,7 @@ impl LlmProvider for LlamaCppProvider {
                             } else {
                                 Some(content)
                             },
+                            ..Default::default()
                         },
                         finish_reason: finish,
                     }],
@@ -529,8 +548,9 @@ impl LlmProvider for LlamaCppProvider {
             };
 
             // Create context
-            let ctx_params =
-                LlamaContextParams::default().with_n_ctx(NonZeroU32::new(context_length));
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(context_length))
+                .with_n_batch(context_length);
             let mut ctx = match model.new_context(&backend, ctx_params) {
                 Ok(c) => c,
                 Err(e) => {

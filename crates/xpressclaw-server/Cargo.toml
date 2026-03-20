@@ -12,6 +12,7 @@ local-llm = ["xpressclaw-core/local-llm"]
 
 [dependencies]
 xpressclaw-core = { path = "../xpressclaw-core", default-features = false }
+reqwest = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }

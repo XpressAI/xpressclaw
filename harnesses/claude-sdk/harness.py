@@ -13,9 +13,12 @@ Environment variables:
   MCP_SERVERS        — JSON dict of MCP server configs (injected by xpressclaw)
 """
 
+import asyncio
 import json
 import os
+import queue
 import sys
+import threading
 import time
 from uuid import uuid4
 
@@ -80,14 +83,29 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeA
 
 
 def _extract_task(messages: list[dict]) -> tuple[str, str]:
-    """Extract system prompt and last user message from chat messages."""
+    """Extract system prompt and build a conversation prompt from all messages.
+
+    The Claude SDK query() takes a single prompt string. We format the full
+    conversation history so the agent has context from prior exchanges.
+    """
     system_prompt = ""
-    task = ""
+    parts = []
     for msg in messages:
         if msg["role"] == "system":
             system_prompt = msg["content"]
         elif msg["role"] == "user":
-            task = msg["content"]
+            parts.append(f"User: {msg['content']}")
+        elif msg["role"] == "assistant":
+            parts.append(f"Assistant: {msg['content']}")
+
+    # If there's only one user message, use it directly (no "User:" prefix)
+    user_messages = [m for m in messages if m["role"] == "user"]
+    if len(user_messages) <= 1:
+        task = user_messages[-1]["content"] if user_messages else ""
+    else:
+        # Multiple turns: format as conversation, ask to continue
+        task = "\n\n".join(parts) + "\n\nContinue the conversation. Respond to the last user message."
+
     return system_prompt, task
 
 
@@ -137,8 +155,8 @@ class ClaudeSdkHarness(BaseHarness):
     ):
         """Stream OpenAI-format SSE chunks from the Claude SDK query.
 
-        Uses include_partial_messages=True to get raw Anthropic stream events
-        (content_block_delta) for true token-by-token streaming.
+        Runs the Claude SDK in a separate thread with its own event loop to
+        completely isolate anyio's cancel scopes from FastAPI's async context.
         """
         system_prompt, task = _extract_task(messages)
         if not task:
@@ -157,52 +175,131 @@ class ClaudeSdkHarness(BaseHarness):
         )
 
         conv_id = uuid4().hex[:16]
-        sent_role = False
+        q: queue.Queue[str | None] = queue.Queue()
 
-        try:
-            async for message in query(prompt=task, options=options):
-                if isinstance(message, StreamEvent):
-                    # Raw Anthropic API stream event
-                    event = message.event
-                    event_type = event.get("type", "")
+        def _run_in_thread():
+            """Run the Claude SDK query in a fresh event loop on a separate thread."""
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(_query_to_queue(q, conv_id, use_model, task, options))
+            except Exception as e:
+                logger.exception("query thread failed")
+                error_payload = {"error": {"message": str(e), "type": "server_error"}}
+                q.put(f"data: {json.dumps(error_payload)}\n\n")
+            finally:
+                q.put(None)  # sentinel
+                loop.close()
 
-                    if event_type == "content_block_delta":
-                        delta_obj = event.get("delta", {})
-                        delta_type = delta_obj.get("type", "")
+        thread = threading.Thread(target=_run_in_thread, daemon=True)
+        thread.start()
 
-                        if delta_type == "text_delta":
-                            text = delta_obj.get("text", "")
-                            if text:
-                                delta = {"content": text}
-                                if not sent_role:
-                                    delta["role"] = "assistant"
-                                    sent_role = True
-                                yield _sse_chunk_raw(conv_id, use_model, delta, None)
+        # Yield chunks from the thread-safe queue
+        while True:
+            try:
+                chunk = await asyncio.get_event_loop().run_in_executor(None, q.get, True, 300)
+            except Exception:
+                break
+            if chunk is None:
+                break
+            yield chunk
 
-                elif isinstance(message, ResultMessage):
-                    if message.is_error:
-                        error_text = f"Agent error: {message.result or 'unknown error'}"
-                        delta = {"content": error_text}
-                        if not sent_role:
-                            delta["role"] = "assistant"
-                        yield _sse_chunk_raw(conv_id, use_model, delta, None)
-                    elif not sent_role and message.result:
-                        # Fallback: send result if no stream events were received
-                        delta = {"role": "assistant", "content": message.result}
-                        yield _sse_chunk_raw(conv_id, use_model, delta, None)
-                    # Final stop chunk
-                    yield _sse_chunk_raw(conv_id, use_model, {}, "stop")
-                    yield "data: [DONE]\n\n"
-                    return
 
-            # If we get here without a ResultMessage, send stop
-            yield _sse_chunk_raw(conv_id, use_model, {}, "stop")
-            yield "data: [DONE]\n\n"
+async def _query_to_queue(
+    q: "queue.Queue[str | None]",
+    conv_id: str,
+    model: str,
+    task: str,
+    options: ClaudeAgentOptions,
+):
+    """Run the Claude SDK query and push SSE chunks to a thread-safe queue.
 
-        except Exception as e:
-            logger.exception("streaming completion failed")
-            error_payload = {"error": {"message": str(e), "type": "server_error"}}
-            yield f"data: {json.dumps(error_payload)}\n\n"
+    Wraps reasoning in <think> tags and tool calls in <tool_call> tags
+    so the frontend can render them as collapsible panels.
+    """
+    sent_role = False
+    in_thinking = False
+    in_tool_call = False
+
+    def _send(text: str):
+        nonlocal sent_role
+        delta = {"content": text}
+        if not sent_role:
+            delta["role"] = "assistant"
+            sent_role = True
+        q.put(_sse_chunk_raw(conv_id, model, delta, None))
+
+    try:
+        async for message in query(prompt=task, options=options):
+            if isinstance(message, StreamEvent):
+                event = message.event
+                event_type = event.get("type", "")
+
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    block_type = block.get("type", "")
+                    if block_type == "thinking":
+                        in_thinking = True
+                        _send("<think>")
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name", "tool")
+                        _send(f'<tool_call name="{tool_name}">')
+                        in_tool_call = True
+
+                elif event_type == "content_block_delta":
+                    delta_obj = event.get("delta", {})
+                    delta_type = delta_obj.get("type", "")
+
+                    if delta_type == "thinking_delta":
+                        text = delta_obj.get("thinking", "")
+                        if text:
+                            _send(text)
+                    elif delta_type == "text_delta":
+                        text = delta_obj.get("text", "")
+                        if text:
+                            _send(text)
+                    elif delta_type == "input_json_delta":
+                        text = delta_obj.get("partial_json", "")
+                        if text:
+                            _send(text)
+
+                elif event_type == "content_block_stop":
+                    if in_thinking:
+                        _send("</think>")
+                        in_thinking = False
+                    elif in_tool_call:
+                        _send("</tool_call>")
+                        in_tool_call = False
+
+            elif isinstance(message, AssistantMessage):
+                # Skip if we already streamed content via StreamEvent — AssistantMessage
+                # contains the same text that was already sent token-by-token.
+                if not sent_role and hasattr(message, "content"):
+                    for block in message.content:
+                        if hasattr(block, "text") and block.text:
+                            _send(block.text)
+
+            elif isinstance(message, ResultMessage):
+                logger.info("ResultMessage: is_error=%s result_len=%d",
+                            message.is_error, len(message.result or ""))
+                if message.is_error:
+                    _send(f"Agent error: {message.result or 'unknown error'}")
+                elif not sent_role and message.result:
+                    _send(message.result)
+                q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
+                q.put("data: [DONE]\n\n")
+                return
+
+    except Exception as e:
+        logger.exception("_query_to_queue error")
+        error_payload = {"error": {"message": str(e), "type": "server_error"}}
+        q.put(f"data: {json.dumps(error_payload)}\n\n")
+
+    # No ResultMessage
+    if not sent_role:
+        _send("No response from agent.")
+    q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
+    q.put("data: [DONE]\n\n")
 
 
 def _sse_chunk_raw(conv_id: str, model: str, delta: dict, finish_reason: str | None) -> str:

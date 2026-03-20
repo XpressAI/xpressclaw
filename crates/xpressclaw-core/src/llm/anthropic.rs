@@ -26,10 +26,19 @@ impl AnthropicProvider {
     }
 
     /// Validate an Anthropic API key by sending a minimal request.
-    pub async fn validate_key(api_key: &str) -> std::result::Result<bool, String> {
+    pub async fn validate_key(
+        api_key: &str,
+        base_url: Option<&str>,
+    ) -> std::result::Result<bool, String> {
         let client = Client::new();
+        let url = format!(
+            "{}/v1/messages",
+            base_url
+                .unwrap_or("https://api.anthropic.com")
+                .trim_end_matches('/')
+        );
         let resp = client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -182,6 +191,7 @@ impl LlmProvider for AnthropicProvider {
                 completion_tokens: anthropic_resp.usage.output_tokens,
                 total_tokens: anthropic_resp.usage.input_tokens
                     + anthropic_resp.usage.output_tokens,
+                ..Default::default()
             }),
         })
     }

@@ -201,6 +201,7 @@ fn parse_sse_stream(
                                         delta: ChunkDelta {
                                             role: Some("assistant".into()),
                                             content: Some(format!("Error: {err_msg}")),
+                                            ..Default::default()
                                         },
                                         finish_reason: Some("stop".into()),
                                     }],
