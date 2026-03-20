@@ -272,7 +272,9 @@ async def _query_to_queue(
                         in_tool_call = False
 
             elif isinstance(message, AssistantMessage):
-                if hasattr(message, "content"):
+                # Skip if we already streamed content via StreamEvent — AssistantMessage
+                # contains the same text that was already sent token-by-token.
+                if not sent_role and hasattr(message, "content"):
                     for block in message.content:
                         if hasattr(block, "text") and block.text:
                             _send(block.text)
