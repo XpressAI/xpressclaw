@@ -462,7 +462,7 @@ fn anthropic_live_streaming_response(
         }
 
         // Close tool_use blocks
-        for (_, state) in &tool_calls {
+        for state in tool_calls.values() {
             yield Ok(Event::default().event("content_block_stop").data(
                 json!({ "type": "content_block_stop", "index": state.block_index }).to_string()
             ));
