@@ -493,7 +493,7 @@ export const setup = {
 	checkOllama: () => request<OllamaInfo>('/api/setup/check-ollama'),
 	recommendModel: () => request<ModelRecommendation>('/api/setup/recommend-model'),
 	validateKey: (provider: string, apiKey: string, baseUrl?: string) =>
-		request<{ valid: boolean; error?: string }>('/api/setup/validate-key', {
+		request<{ valid: boolean; error?: string; models?: { id: string }[] }>('/api/setup/validate-key', {
 			method: 'POST',
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),

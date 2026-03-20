@@ -141,121 +141,109 @@ async fn anthropic_messages(
 
     let openai_req = anthropic_to_openai_request(req);
 
-    let response = router.chat(&openai_req).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "type": "error",
-                "error": { "type": "api_error", "message": e.to_string() }
-            })),
-        )
-    })?;
-
-    let anthropic_resp = openai_to_anthropic_response(response);
-
     if streaming {
-        Ok(anthropic_streaming_response(anthropic_resp).into_response())
+        // True streaming: convert OpenAI chunks to Anthropic SSE events in real-time
+        let chunk_stream = router.chat_stream(&openai_req).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": { "type": "api_error", "message": e.to_string() }
+                })),
+            )
+        })?;
+        Ok(anthropic_live_streaming_response(model, chunk_stream).into_response())
     } else {
+        let response = router.chat(&openai_req).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "type": "error",
+                    "error": { "type": "api_error", "message": e.to_string() }
+                })),
+            )
+        })?;
+
+        let anthropic_resp = openai_to_anthropic_response(response);
         let body = serde_json::to_value(&anthropic_resp).unwrap_or(json!({}));
         Ok(Json(body).into_response())
     }
 }
 
-/// Wrap a complete response in Anthropic SSE streaming format.
+/// True streaming: convert OpenAI chat completion chunks into Anthropic SSE events.
 ///
-/// Emits the standard event sequence: message_start → content_block_start →
-/// content_block_delta → content_block_stop (per block) → message_delta → message_stop.
-fn anthropic_streaming_response(
-    resp: AnthropicMessagesResponse,
+/// Each OpenAI chunk with text content becomes an Anthropic `content_block_delta`.
+/// This allows the Claude CLI to receive tokens as they're generated, preventing timeouts.
+fn anthropic_live_streaming_response(
+    model: String,
+    chunk_stream: xpressclaw_core::llm::router::ChatStream,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
-        // message_start — includes the message shell with empty content
+        use futures_util::StreamExt;
+
+        let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+
+        // message_start
         let message_start = json!({
             "type": "message_start",
             "message": {
-                "id": resp.id,
+                "id": msg_id,
                 "type": "message",
                 "role": "assistant",
                 "content": [],
-                "model": resp.model,
+                "model": model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": resp.usage.input_tokens,
-                    "output_tokens": 0,
-                }
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
             }
         });
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
-        // Emit each content block
-        for (idx, block) in resp.content.iter().enumerate() {
-            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("text");
+        // content_block_start for index 0 (text)
+        yield Ok(Event::default().event("content_block_start").data(
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
+        ));
 
-            // content_block_start
-            let start_block = match block_type {
-                "tool_use" => json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": block.get("id").unwrap_or(&json!("")),
-                        "name": block.get("name").unwrap_or(&json!("")),
-                        "input": {},
-                    }
-                }),
-                _ => json!({
-                    "type": "content_block_start",
-                    "index": idx,
-                    "content_block": { "type": "text", "text": "" }
-                }),
-            };
-            yield Ok(Event::default().event("content_block_start").data(start_block.to_string()));
+        let mut output_tokens = 0u64;
 
-            // content_block_delta — send the full content in one delta
-            let delta = match block_type {
-                "tool_use" => {
-                    let empty = json!({});
-                    let input = block.get("input").unwrap_or(&empty);
-                    let partial_json = serde_json::to_string(input).unwrap_or_default();
-                    json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": partial_json,
+        futures_util::pin_mut!(chunk_stream);
+        while let Some(chunk_result) = chunk_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    for choice in &chunk.choices {
+                        if let Some(ref text) = choice.delta.content {
+                            if !text.is_empty() {
+                                output_tokens += 1;
+                                let delta = json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": { "type": "text_delta", "text": text }
+                                });
+                                yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
+                            }
                         }
-                    })
+                    }
                 }
-                _ => {
-                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    json!({
-                        "type": "content_block_delta",
-                        "index": idx,
-                        "delta": { "type": "text_delta", "text": text }
-                    })
+                Err(e) => {
+                    tracing::warn!(error = %e, "stream chunk error");
+                    break;
                 }
-            };
-            yield Ok(Event::default().event("content_block_delta").data(delta.to_string()));
-
-            // content_block_stop
-            yield Ok(Event::default().event("content_block_stop").data(
-                json!({ "type": "content_block_stop", "index": idx }).to_string()
-            ));
+            }
         }
 
-        // message_delta — final stop reason + output token count
-        let message_delta = json!({
-            "type": "message_delta",
-            "delta": {
-                "stop_reason": resp.stop_reason,
-                "stop_sequence": resp.stop_sequence,
-            },
-            "usage": {
-                "output_tokens": resp.usage.output_tokens,
-            }
-        });
-        yield Ok(Event::default().event("message_delta").data(message_delta.to_string()));
+        // content_block_stop
+        yield Ok(Event::default().event("content_block_stop").data(
+            json!({ "type": "content_block_stop", "index": 0 }).to_string()
+        ));
+
+        // message_delta
+        yield Ok(Event::default().event("message_delta").data(
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "usage": { "output_tokens": output_tokens }
+            }).to_string()
+        ));
 
         // message_stop
         yield Ok(Event::default().event("message_stop").data(

@@ -289,7 +289,7 @@ impl Default for LlmConfig {
 }
 
 /// Root configuration for xpressclaw.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub system: SystemConfig,
@@ -305,25 +305,6 @@ pub struct Config {
     pub tool_policies: Vec<ToolPolicyRule>,
     pub memory: MemoryConfig,
     pub llm: LlmConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            system: SystemConfig::default(),
-            agents: vec![AgentConfig {
-                name: "atlas".to_string(),
-                backend: "generic".to_string(),
-                role: "You are a helpful AI assistant.".to_string(),
-                ..Default::default()
-            }],
-            tools: HashMap::new(),
-            mcp_servers: HashMap::new(),
-            tool_policies: Vec::new(),
-            memory: MemoryConfig::default(),
-            llm: LlmConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -486,8 +467,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.system.isolation, "docker");
-        assert_eq!(config.agents.len(), 1);
-        assert_eq!(config.agents[0].name, "atlas");
+        assert!(config.agents.is_empty());
         assert_eq!(config.memory.near_term_slots, 8);
     }
 

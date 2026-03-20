@@ -34,13 +34,8 @@
 	let llmBaseUrl = $state('');
 	let llmLocalModel = $state('');
 	let llmLocalBaseUrl = $state('');
-	let llmModel = $state('claude-sonnet-4-6');
-
-	const anthropicModels = [
-		{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', desc: 'Best balance of speed and intelligence' },
-		{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6', desc: 'Most capable, higher cost' },
-		{ id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', desc: 'Fastest, lowest cost' },
-	];
+	let llmModel = $state('');
+	let availableModels = $state<{ id: string }[]>([]);
 	let keyValidating = $state(false);
 	let keyValid = $state<boolean | null>(null);
 	let keyError = $state('');
@@ -151,11 +146,19 @@
 		keyValidating = true;
 		keyValid = null;
 		keyError = '';
+		availableModels = [];
 		try {
 			const result = await setup.validateKey(llmProvider, llmApiKey,
-				llmProvider === 'openai' && llmBaseUrl ? llmBaseUrl : undefined);
+				llmBaseUrl || undefined);
 			keyValid = result.valid;
-			if (!result.valid) keyError = result.error || 'Invalid API key';
+			if (!result.valid) {
+				keyError = result.error || 'Invalid API key';
+			} else if (result.models?.length) {
+				availableModels = result.models;
+				if (!llmModel && availableModels.length > 0) {
+					llmModel = availableModels[0].id;
+				}
+			}
 		} catch (e) {
 			keyValid = false;
 			keyError = e instanceof Error ? e.message : 'Validation failed';
@@ -191,12 +194,22 @@
 
 	async function goToStep(target: number) {
 		if (target === 1) await loadLlmInfo();
+		if (target === 3) recheckDocker();
 		step = target;
+	}
+
+	async function recheckDocker() {
+		dockerLoading = true;
+		try { dockerStatus = await setup.checkDocker(); } catch {
+			dockerStatus = { available: false, error: 'Failed to check' };
+		}
+		dockerLoading = false;
+		if (dockerStatus?.available) containerless = false;
 	}
 
 	function canProceedLlm(): boolean {
 		if (llmProvider === 'local' || llmProvider === 'ollama') return !!llmLocalModel;
-		if (llmProvider === 'openai' || llmProvider === 'anthropic') return !!llmApiKey && keyValid === true;
+		if (llmProvider === 'openai' || llmProvider === 'anthropic') return !!llmApiKey && keyValid === true && !!llmModel;
 		return false;
 	}
 
@@ -298,7 +311,7 @@
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
-					model: llmProvider === 'anthropic' ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
+					model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
 					tools,
 					volumes: volumes.length > 0 ? volumes : undefined,
 				}],
@@ -510,6 +523,14 @@
 			{:else if llmProvider === 'openai' || llmProvider === 'anthropic'}
 				<div class="space-y-3 rounded-lg border border-border p-4">
 					<div>
+						<label for="base-url" class="block text-xs font-medium text-foreground mb-1">
+							Base URL <span class="text-muted-foreground font-normal">(optional)</span>
+						</label>
+						<input id="base-url" type="text" bind:value={llmBaseUrl}
+							placeholder={llmProvider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com'}
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+					</div>
+					<div>
 						<label for="api-key" class="block text-xs font-medium text-foreground mb-1">API Key</label>
 						<div class="flex gap-2">
 							<input id="api-key" type="password" bind:value={llmApiKey}
@@ -523,36 +544,26 @@
 						{#if keyValid === true}<p class="mt-1 text-xs text-emerald-500">API key is valid</p>{/if}
 						{#if keyValid === false}<p class="mt-1 text-xs text-red-500">{keyError}</p>{/if}
 					</div>
-					{#if llmProvider === 'anthropic'}
+					{#if keyValid === true && availableModels.length > 0}
 						<div>
-							<label class="block text-xs font-medium text-foreground mb-2">Model</label>
-							<div class="space-y-1">
-								{#each anthropicModels as m}
-									<button onclick={() => llmModel = m.id}
-										class="w-full flex items-center gap-3 rounded-md border p-2 text-left transition-colors {llmModel === m.id
-											? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}">
-										<div class="flex-1">
-											<div class="text-sm font-medium text-foreground">{m.name}</div>
-											<div class="text-xs text-muted-foreground">{m.desc}</div>
-										</div>
-										{#if llmModel === m.id}
-											<span class="text-xs text-primary">&#10003;</span>
-										{/if}
-									</button>
+							<label for="model-select" class="block text-xs font-medium text-foreground mb-1">Model</label>
+							<select id="model-select" bind:value={llmModel}
+								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
+								{#each availableModels as m}
+									<option value={m.id}>{m.id}</option>
 								{/each}
-							</div>
+							</select>
 						</div>
-					{/if}
-					{#if llmProvider === 'openai'}
+					{:else if keyValid === true}
 						<div>
-							<label for="openai-url" class="block text-xs font-medium text-foreground mb-1">
-								Base URL <span class="text-muted-foreground font-normal">(optional)</span>
-							</label>
-							<input id="openai-url" type="text" bind:value={llmBaseUrl} placeholder="https://api.openai.com"
+							<label for="model-input" class="block text-xs font-medium text-foreground mb-1">Model</label>
+							<input id="model-input" type="text" bind:value={llmModel}
+								placeholder={llmProvider === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o'}
 								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 						</div>
 					{/if}
 				</div>
+
 			{/if}
 		{/if}
 
@@ -766,7 +777,7 @@
 						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Docker Desktop &#8599;</a>
 					<a href="https://podman.io/getting-started/installation" target="_blank" rel="noopener noreferrer"
 						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Podman &#8599;</a>
-					<button onclick={async () => { dockerLoading = true; dockerStatus = await setup.checkDocker(); dockerLoading = false; }}
+					<button onclick={recheckDocker}
 						class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Retry</button>
 				</div>
 			</div>

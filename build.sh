@@ -33,20 +33,14 @@ echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 echo "==> Building Tauri desktop app..."
 npx -y @tauri-apps/cli build
 
-# Build harness Docker images if docker is available
+# Build harness Docker images locally (CI handles pushing to GHCR)
 if command -v docker &>/dev/null; then
     echo "==> Building agent harness Docker images..."
-    cd harnesses
-    if command -v docker-buildx &>/dev/null || docker buildx version &>/dev/null 2>&1; then
-        docker buildx bake
-    else
-        docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest ./base
-        docker build -t ghcr.io/xpressai/xpressclaw-harness-generic:latest ./generic
-        docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest ./claude-sdk
-        docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest ./langchain
-        docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest ./xaibo
-    fi
-    cd ..
+    docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest harnesses/base
+    docker build -t ghcr.io/xpressai/xpressclaw-harness-generic:latest harnesses/generic
+    docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest harnesses/claude-sdk
+    docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest harnesses/langchain
+    docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest harnesses/xaibo
 else
     echo "==> Skipping harness builds (Docker not found)"
 fi
