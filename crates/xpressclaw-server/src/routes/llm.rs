@@ -684,7 +684,7 @@ mod tests {
         let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
         let body = serde_json::json!({
             "model": model,
-            "max_tokens": 50,
+            "max_tokens": 500,
             "temperature": 0.1,
             "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
         });
@@ -702,12 +702,18 @@ mod tests {
             .unwrap();
 
         let json = assert_ok(resp, "chat completions").await;
-        let content = json["choices"][0]["message"]["content"]
-            .as_str()
-            .or_else(|| json["choices"][0]["message"]["reasoning_content"].as_str())
-            .expect("response should have content or reasoning_content");
-        assert!(!content.is_empty(), "response content should not be empty");
-        eprintln!("Response: {content}");
+        let msg = &json["choices"][0]["message"];
+        let content = msg["content"].as_str().unwrap_or("");
+        let reasoning = msg["reasoning_content"].as_str().unwrap_or("");
+        assert!(
+            !content.is_empty() || !reasoning.is_empty(),
+            "response should have content or reasoning_content, got: {}",
+            serde_json::to_string_pretty(msg).unwrap()
+        );
+        eprintln!("Content: {content}");
+        if !reasoning.is_empty() {
+            eprintln!("Reasoning: {reasoning}");
+        }
     }
 
     /// Test Anthropic-compatible /v1/messages endpoint with a non-Claude model
