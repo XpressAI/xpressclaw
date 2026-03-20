@@ -125,6 +125,7 @@ struct AnthropicUsageOut {
 /// converts response back.
 async fn anthropic_messages(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let req: AnthropicMessagesRequest =
@@ -145,7 +146,7 @@ async fn anthropic_messages(
     let config = state.config();
     if model.starts_with("claude") {
         if let Some(ref api_key) = config.llm.anthropic_api_key {
-            return proxy_to_anthropic(api_key, &body_bytes, streaming).await;
+            return proxy_to_anthropic(api_key, &body_bytes, streaming, &headers).await;
         }
     }
 
@@ -196,26 +197,39 @@ async fn proxy_to_anthropic(
     api_key: &str,
     body: &[u8],
     streaming: bool,
+    client_headers: &axum::http::HeaderMap,
 ) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
     let client = reqwest::Client::new();
 
-    let resp = client
+    let mut req = client
         .post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "type": "error",
-                    "error": { "type": "api_error", "message": format!("Anthropic proxy error: {e}") }
-                })),
-            )
-        })?;
+        .header("content-type", "application/json");
+
+    // Forward Anthropic-specific headers from the CLI (version, beta features, etc.)
+    for key in [
+        "anthropic-version",
+        "anthropic-beta",
+        "anthropic-dangerous-direct-browser-access",
+    ] {
+        if let Some(val) = client_headers.get(key) {
+            req = req.header(key, val);
+        }
+    }
+    // Default version if the client didn't send one
+    if client_headers.get("anthropic-version").is_none() {
+        req = req.header("anthropic-version", "2023-06-01");
+    }
+
+    let resp = req.body(body.to_vec()).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": format!("Anthropic proxy error: {e}") }
+            })),
+        )
+    })?;
 
     let status =
         axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
