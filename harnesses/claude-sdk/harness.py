@@ -212,47 +212,78 @@ async def _query_to_queue(
     task: str,
     options: ClaudeAgentOptions,
 ):
-    """Run the Claude SDK query and push SSE chunks to a thread-safe queue."""
+    """Run the Claude SDK query and push SSE chunks to a thread-safe queue.
+
+    Wraps reasoning in <think> tags and tool calls in <tool_call> tags
+    so the frontend can render them as collapsible panels.
+    """
     sent_role = False
+    in_thinking = False
+    in_tool_call = False
+
+    def _send(text: str):
+        nonlocal sent_role
+        delta = {"content": text}
+        if not sent_role:
+            delta["role"] = "assistant"
+            sent_role = True
+        q.put(_sse_chunk_raw(conv_id, model, delta, None))
+
     try:
         async for message in query(prompt=task, options=options):
-            logger.debug("SDK message type: %s", type(message).__name__)
-
             if isinstance(message, StreamEvent):
                 event = message.event
-                if event.get("type") == "content_block_delta":
+                event_type = event.get("type", "")
+
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    block_type = block.get("type", "")
+                    if block_type == "thinking":
+                        in_thinking = True
+                        _send("<think>")
+                    elif block_type == "tool_use":
+                        tool_name = block.get("name", "tool")
+                        _send(f'<tool_call name="{tool_name}">')
+                        in_tool_call = True
+
+                elif event_type == "content_block_delta":
                     delta_obj = event.get("delta", {})
-                    if delta_obj.get("type") == "text_delta":
+                    delta_type = delta_obj.get("type", "")
+
+                    if delta_type == "thinking_delta":
+                        text = delta_obj.get("thinking", "")
+                        if text:
+                            _send(text)
+                    elif delta_type == "text_delta":
                         text = delta_obj.get("text", "")
                         if text:
-                            delta = {"content": text}
-                            if not sent_role:
-                                delta["role"] = "assistant"
-                                sent_role = True
-                            q.put(_sse_chunk_raw(conv_id, model, delta, None))
+                            _send(text)
+                    elif delta_type == "input_json_delta":
+                        text = delta_obj.get("partial_json", "")
+                        if text:
+                            _send(text)
+
+                elif event_type == "content_block_stop":
+                    if in_thinking:
+                        _send("</think>")
+                        in_thinking = False
+                    elif in_tool_call:
+                        _send("</tool_call>")
+                        in_tool_call = False
 
             elif isinstance(message, AssistantMessage):
-                # For non-streaming SDK responses (non-Claude models may not emit StreamEvent)
                 if hasattr(message, "content"):
                     for block in message.content:
                         if hasattr(block, "text") and block.text:
-                            delta = {"content": block.text}
-                            if not sent_role:
-                                delta["role"] = "assistant"
-                                sent_role = True
-                            q.put(_sse_chunk_raw(conv_id, model, delta, None))
+                            _send(block.text)
 
             elif isinstance(message, ResultMessage):
                 logger.info("ResultMessage: is_error=%s result_len=%d",
                             message.is_error, len(message.result or ""))
                 if message.is_error:
-                    error_text = f"Agent error: {message.result or 'unknown error'}"
-                    delta = {"content": error_text}
-                    if not sent_role:
-                        delta["role"] = "assistant"
-                    q.put(_sse_chunk_raw(conv_id, model, delta, None))
+                    _send(f"Agent error: {message.result or 'unknown error'}")
                 elif not sent_role and message.result:
-                    q.put(_sse_chunk_raw(conv_id, model, {"role": "assistant", "content": message.result}, None))
+                    _send(message.result)
                 q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
                 q.put("data: [DONE]\n\n")
                 return
@@ -264,7 +295,7 @@ async def _query_to_queue(
 
     # No ResultMessage
     if not sent_role:
-        q.put(_sse_chunk_raw(conv_id, model, {"role": "assistant", "content": "No response from agent."}, None))
+        _send("No response from agent.")
     q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
     q.put("data: [DONE]\n\n")
 
