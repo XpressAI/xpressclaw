@@ -292,53 +292,40 @@ fn anthropic_live_streaming_response(
         yield Ok(Event::default().event("message_start").data(message_start.to_string()));
 
         let mut output_tokens = 0u64;
-        let mut block_index = 0i64;
-        let mut in_thinking = false;
-        let mut in_text = false;
+        let mut text_started = false;
+
+        // Start a text content block immediately
+        yield Ok(Event::default().event("content_block_start").data(
+            json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
+        ));
 
         futures_util::pin_mut!(chunk_stream);
         while let Some(chunk_result) = chunk_stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     for choice in &chunk.choices {
-                        // Handle reasoning_content (thinking) deltas
-                        if let Some(ref reasoning) = choice.delta.reasoning_content {
-                            if !reasoning.is_empty() {
-                                if !in_thinking {
-                                    yield Ok(Event::default().event("content_block_start").data(
-                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "thinking", "thinking": "" } }).to_string()
-                                    ));
-                                    in_thinking = true;
-                                }
-                                output_tokens += 1;
-                                yield Ok(Event::default().event("content_block_delta").data(
-                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "thinking_delta", "thinking": reasoning } }).to_string()
-                                ));
-                            }
-                        }
+                        // Use content if available, otherwise fall back to reasoning_content.
+                        // Reasoning models (Qwen3.5, o1) stream all text through
+                        // reasoning_content with content always null during streaming.
+                        let text = choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                choice
+                                    .delta
+                                    .reasoning_content
+                                    .as_deref()
+                                    .filter(|s| !s.is_empty())
+                            });
 
-                        // Handle text content deltas
-                        if let Some(ref text) = choice.delta.content {
-                            if !text.is_empty() {
-                                // Close thinking block if transitioning to text
-                                if in_thinking {
-                                    yield Ok(Event::default().event("content_block_stop").data(
-                                        json!({ "type": "content_block_stop", "index": block_index }).to_string()
-                                    ));
-                                    in_thinking = false;
-                                    block_index += 1;
-                                }
-                                if !in_text {
-                                    yield Ok(Event::default().event("content_block_start").data(
-                                        json!({ "type": "content_block_start", "index": block_index, "content_block": { "type": "text", "text": "" } }).to_string()
-                                    ));
-                                    in_text = true;
-                                }
-                                output_tokens += 1;
-                                yield Ok(Event::default().event("content_block_delta").data(
-                                    json!({ "type": "content_block_delta", "index": block_index, "delta": { "type": "text_delta", "text": text } }).to_string()
-                                ));
-                            }
+                        if let Some(text) = text {
+                            text_started = true;
+                            output_tokens += 1;
+                            yield Ok(Event::default().event("content_block_delta").data(
+                                json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }).to_string()
+                            ));
                         }
                     }
                 }
@@ -349,20 +336,12 @@ fn anthropic_live_streaming_response(
             }
         }
 
-        // Close any open block
-        if in_thinking || in_text {
-            yield Ok(Event::default().event("content_block_stop").data(
-                json!({ "type": "content_block_stop", "index": block_index }).to_string()
-            ));
-        } else {
-            // No content at all — emit an empty text block so the response is valid
-            yield Ok(Event::default().event("content_block_start").data(
-                json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()
-            ));
-            yield Ok(Event::default().event("content_block_stop").data(
-                json!({ "type": "content_block_stop", "index": 0 }).to_string()
-            ));
-        }
+        let _ = text_started; // suppress unused warning
+
+        // Close the text block
+        yield Ok(Event::default().event("content_block_stop").data(
+            json!({ "type": "content_block_stop", "index": 0 }).to_string()
+        ));
 
         // message_delta
         yield Ok(Event::default().event("message_delta").data(
@@ -457,7 +436,7 @@ fn anthropic_to_openai_request(req: AnthropicMessagesRequest) -> ChatCompletionR
     ChatCompletionRequest {
         model: req.model,
         messages,
-        temperature: req.temperature,
+        temperature: Some(req.temperature.unwrap_or(1.0)),
         max_tokens: Some(req.max_tokens),
         stream: Some(false), // always non-streaming internally
         top_p: req.top_p,
@@ -565,21 +544,25 @@ fn openai_to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessag
     let mut content = Vec::new();
 
     if let Some(choice) = resp.choices.first() {
-        // Reasoning/thinking content (from reasoning models like o1, Qwen3.5)
-        if let Some(ref reasoning) = choice.message.reasoning_content {
-            if !reasoning.is_empty() {
-                content.push(json!({
-                    "type": "thinking",
-                    "thinking": reasoning,
-                }));
-            }
-        }
+        // Skip reasoning_content — the Claude CLI doesn't handle thinking blocks
+        // from non-Claude models. If content is empty but reasoning exists, use
+        // reasoning as the text content so the response isn't empty.
+        let text_content = if choice.message.content.is_empty() {
+            choice
+                .message
+                .reasoning_content
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            choice.message.content.clone()
+        };
 
         // Text content
-        if !choice.message.content.is_empty() {
+        if !text_content.is_empty() {
             content.push(json!({
                 "type": "text",
-                "text": choice.message.content,
+                "text": text_content,
             }));
         }
 
