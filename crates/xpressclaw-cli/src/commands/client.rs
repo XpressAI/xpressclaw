@@ -13,7 +13,11 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(port: u16) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             base_url: format!("http://127.0.0.1:{port}/api"),
         }
     }
@@ -123,11 +127,20 @@ impl ApiClient {
 pub async fn connect(port: u16) -> Result<ApiClient> {
     let client = ApiClient::new(port);
 
-    // Verify the server is running
-    let _: serde_json::Value = client
-        .get("/health")
-        .await
-        .context("xpressclaw is not running. Start it with `xpressclaw up`")?;
+    // Verify it's actually an xpressclaw server by hitting the health endpoint
+    let health: serde_json::Value = match client.get("/health").await {
+        Ok(h) => h,
+        Err(_) => {
+            anyhow::bail!(
+                "xpressclaw is not running on port {port}. Start it with `xpressclaw up`"
+            );
+        }
+    };
+
+    // Sanity check: make sure it's our server, not something else on this port
+    if health.get("status").is_none() {
+        anyhow::bail!("port {port} is in use by another application (not xpressclaw)");
+    }
 
     Ok(client)
 }

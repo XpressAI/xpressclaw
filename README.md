@@ -163,6 +163,7 @@ llm:
 ### Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
+- [LLVM](https://releases.llvm.org/) (provides `libclang`, required by llama.cpp bindings)
 - [Node.js](https://nodejs.org/) 18+ (for the frontend)
 - Docker (for running agents)
 
