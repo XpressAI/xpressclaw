@@ -508,5 +508,12 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify(data)
 		}),
-	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status')
+	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status'),
+	addAgent: (data: {
+		name: string; preset?: string; role?: string; model?: string;
+		backend?: string; tools?: string[]; volumes?: string[];
+	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
+		method: 'POST',
+		body: JSON.stringify(data)
+	})
 };

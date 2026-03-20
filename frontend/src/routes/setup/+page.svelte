@@ -298,32 +298,47 @@
 			if (gitEnabled) tools.push('git');
 			if (githubEnabled) tools.push('github');
 
-			const result = await setup.complete({
-				llm: {
-					provider: llmProvider,
-					api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
-					base_url: llmProvider === 'openai' && llmBaseUrl ? llmBaseUrl : undefined,
-					local_model: isLocal ? llmLocalModel : undefined,
-					local_base_url: isLocal && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
-					use_embedded: useEmbedded
-				},
-				agents: [{
+			if (mode === 'add-agent') {
+				// Add agent to existing config without replacing other agents
+				await setup.addAgent({
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
 					model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
 					tools,
 					volumes: volumes.length > 0 ? volumes : undefined,
-				}],
-				mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
-				isolation: containerless ? 'none' : 'docker'
-			});
-
-			if (result.downloading) {
-				startDownloadPolling();
-			} else {
+				});
 				step = 4;
 				autoStartAgents();
+			} else {
+				// Full setup: replace entire config
+				const result = await setup.complete({
+					llm: {
+						provider: llmProvider,
+						api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
+						base_url: llmBaseUrl || undefined,
+						local_model: isLocal ? llmLocalModel : undefined,
+						local_base_url: isLocal && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
+						use_embedded: useEmbedded
+					},
+					agents: [{
+						name: agentName,
+						preset: selectedPreset?.id,
+						role: customRole || undefined,
+						model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
+						tools,
+						volumes: volumes.length > 0 ? volumes : undefined,
+					}],
+					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
+					isolation: containerless ? 'none' : 'docker'
+				});
+
+				if (result.downloading) {
+					startDownloadPolling();
+				} else {
+					step = 4;
+					autoStartAgents();
+				}
 			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
