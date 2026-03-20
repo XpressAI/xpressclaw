@@ -607,3 +607,216 @@ impl IntoResponse for AnthropicMessagesResponse {
         Json(body).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::Router;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use xpressclaw_core::config::Config;
+    use xpressclaw_core::db::Database;
+    use xpressclaw_core::llm::openai::OpenAiProvider;
+    use xpressclaw_core::llm::router::LlmRouter;
+
+    use crate::state::AppState;
+
+    fn env_or_skip(key: &str) -> String {
+        std::env::var(key).unwrap_or_else(|_| {
+            eprintln!("Skipping: {key} not set");
+            String::new()
+        })
+    }
+
+    fn test_app_with_openai() -> Option<Router> {
+        let base_url = env_or_skip("OPENAI_BASE_URL");
+        let api_key = env_or_skip("OPENAI_API_KEY");
+        if base_url.is_empty() || api_key.is_empty() {
+            return None;
+        }
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::default());
+
+        let provider = OpenAiProvider::new(Some(api_key), Some(base_url));
+        let mut router = LlmRouter::new(&config.llm);
+        router.register_provider("openai", Arc::new(provider));
+
+        let state = AppState::new(
+            config,
+            db,
+            Some(Arc::new(router)),
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
+
+        Some(Router::new().nest("/v1", super::routes()).with_state(state))
+    }
+
+    /// Test OpenAI-compatible /v1/chat/completions endpoint.
+    #[ignore = "requires OPENAI_BASE_URL and OPENAI_API_KEY"]
+    #[tokio::test]
+    async fn test_openai_chat_completions() {
+        let app = match test_app_with_openai() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 50,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "chat completions should return 200");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["choices"][0]["message"]["content"].is_string());
+        let content = json["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(!content.is_empty(), "response content should not be empty");
+        eprintln!("Response: {content}");
+    }
+
+    /// Test Anthropic-compatible /v1/messages endpoint with a non-Claude model
+    /// (routes through OpenAI provider via conversion).
+    #[ignore = "requires OPENAI_BASE_URL and OPENAI_API_KEY"]
+    #[tokio::test]
+    async fn test_anthropic_messages_via_openai() {
+        let app = match test_app_with_openai() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 50,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": "Say hello in exactly 3 words."}]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200, "/v1/messages should return 200");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["role"], "assistant");
+        let content = &json["content"];
+        assert!(content.is_array(), "content should be an array of blocks");
+        let text = content[0]["text"].as_str().unwrap_or("");
+        assert!(!text.is_empty(), "response text should not be empty");
+        eprintln!("Response: {text}");
+    }
+
+    /// Test /v1/messages with tool definitions (non-Claude model).
+    #[ignore = "requires OPENAI_BASE_URL and OPENAI_API_KEY"]
+    #[tokio::test]
+    async fn test_anthropic_messages_with_tools() {
+        let app = match test_app_with_openai() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+        let body = serde_json::json!({
+            "model": model,
+            "max_tokens": 200,
+            "temperature": 0.1,
+            "tool_choice": {"type": "any"},
+            "tools": [{
+                "name": "get_weather",
+                "description": "Get current weather for a city",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }],
+            "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}]
+        });
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "/v1/messages with tools should return 200"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        eprintln!("Response: {}", serde_json::to_string_pretty(&json).unwrap());
+        assert_eq!(json["type"], "message");
+        // Model should either use the tool or respond with text
+        let content = json["content"].as_array().expect("content should be array");
+        assert!(
+            !content.is_empty(),
+            "content should have at least one block"
+        );
+    }
+
+    /// Test /v1/models endpoint returns models from the provider.
+    #[ignore = "requires OPENAI_BASE_URL and OPENAI_API_KEY"]
+    #[tokio::test]
+    async fn test_list_models() {
+        let app = match test_app_with_openai() {
+            Some(a) => a,
+            None => return,
+        };
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["data"].is_array());
+    }
+}
