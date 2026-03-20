@@ -254,6 +254,11 @@
 	async function completeSetup() {
 		saving = true;
 		saveError = '';
+		// Re-check Docker right before saving — if available, always use it
+		try {
+			const ds = await setup.checkDocker();
+			if (ds?.available) containerless = false;
+		} catch {}
 		try {
 			const isLocal = llmProvider === 'local' || llmProvider === 'ollama';
 			const useEmbedded = isLocal && (!ollamaInfo?.available || !llmLocalBaseUrl);
