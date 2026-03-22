@@ -532,11 +532,19 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
         return Ok(());
     }
 
-    // Deduplicate by agent (one task per agent per poll)
+    // Deduplicate by agent (one task per agent per poll).
+    // Only dispatch to agents that are actually running.
+    let registry = AgentRegistry::new(db.clone());
     let mut seen_agents = std::collections::HashSet::new();
     for item in &queued {
         if !seen_agents.insert(item.agent_id.clone()) {
             continue;
+        }
+
+        // Skip agents that aren't running — tasks stay queued until the agent starts
+        match registry.get(&item.agent_id) {
+            Ok(record) if record.status == "running" => {}
+            _ => continue,
         }
 
         // Claim the item atomically
@@ -571,10 +579,13 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                 debug!(task_id = claimed.task_id, "task skipped");
             }
             DriverResult::Requeue => {
-                // Put back in queue for next poll
+                // Put back in queue — will be picked up on next poll
                 let _ = queue.fail(claimed.id, "agent not ready");
                 let _ = queue.enqueue(&claimed.task_id, &claimed.agent_id);
-                debug!(task_id = claimed.task_id, "task requeued");
+                debug!(
+                    task_id = claimed.task_id,
+                    "task requeued (agent became unavailable mid-execution)"
+                );
             }
         }
     }
