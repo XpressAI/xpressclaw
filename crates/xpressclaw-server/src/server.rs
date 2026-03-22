@@ -43,6 +43,12 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             .await;
     });
 
+    // Start the cron schedule runner.
+    let scheduler_db = state.db.clone();
+    tokio::spawn(async move {
+        xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db).await;
+    });
+
     let app = create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
