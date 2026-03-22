@@ -6,11 +6,16 @@ backend: claude-sdk
 default_tools:
   - memory
   - fetch
+  - websearch
 default_mcp_servers:
   fetch:
     type: stdio
     command: npx
     args: ["-y", "@modelcontextprotocol/server-fetch"]
+  websearch:
+    type: stdio
+    command: npx
+    args: ["-y", "duckduckgo-mcp-server"]
 recommended_llm: local
 role: |
   You are a thorough research assistant.

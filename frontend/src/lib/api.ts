@@ -512,6 +512,7 @@ export const setup = {
 	addAgent: (data: {
 		name: string; preset?: string; role?: string; model?: string;
 		backend?: string; tools?: string[]; volumes?: string[];
+		mcp_servers?: Record<string, unknown>;
 	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
 		method: 'POST',
 		body: JSON.stringify(data)
