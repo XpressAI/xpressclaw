@@ -5,9 +5,7 @@ members = [
     "crates/xpressclaw-cli",
     "crates/xpressclaw-tauri",
 ]
-exclude = [
-    "external/ready-agent-cog",
-]
+exclude = ["external/ready-agent-cog"]
 resolver = "2"
 
 [workspace.package]
