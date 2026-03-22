@@ -185,6 +185,21 @@ export const agents = {
 		model?: string;
 		tools?: string[];
 		volumes?: string[];
+		budget?: {
+			daily: string | null;
+			monthly: string | null;
+			per_task: string | null;
+			on_exceeded: string;
+			fallback_model: string;
+			warn_at_percent: number;
+		} | null;
+		rate_limit?: {
+			requests_per_minute: number;
+			tokens_per_minute: number;
+			concurrent_requests: number;
+		} | null;
+		wake_on?: { schedule: string | null; event: string | null; condition: string | null }[];
+		hooks?: { before_message: string[]; after_message: string[] };
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
 	)
@@ -469,9 +484,10 @@ export interface LiveConfig {
 		model: string | null;
 		tools: string[];
 		volumes: string[];
-		budget?: { daily: string | null; monthly: string | null; on_exceeded: string };
+		budget?: { daily: string | null; monthly: string | null; per_task: string | null; on_exceeded: string; fallback_model: string; warn_at_percent: number };
 		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };
-		wake_on?: { schedule: string | null; event: string | null }[];
+		wake_on?: { schedule: string | null; event: string | null; condition: string | null }[];
+		hooks?: { before_message: string[]; after_message: string[] };
 	}[];
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
 	mcp_servers: string[];
