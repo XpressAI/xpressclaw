@@ -271,6 +271,20 @@ impl TaskBoard {
         self.get(task_id)
     }
 
+    pub fn list_subtasks(&self, parent_task_id: &str) -> Result<Vec<Task>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM tasks WHERE parent_task_id = ?1 ORDER BY priority DESC, created_at ASC",
+        )?;
+        let tasks = stmt
+            .query_map([parent_task_id], |row| Ok(row_to_task(row)))
+            .map_err(|e| Error::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tasks)
+    }
+
     pub fn delete(&self, task_id: &str) -> Result<()> {
         let conn = self.db.conn();
         conn.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
