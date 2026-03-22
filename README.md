@@ -8,6 +8,10 @@
 A single binary that gives you a complete AI agent runtime — chat with your agents, give them tasks, and let them work autonomously. Built-in memory, budget controls, scheduling, and a polished web UI.
 </p>
 
+<div align="center">
+  <img width="612" height="426" alt="XpressClaw-screenshot" src="https://github.com/user-attachments/assets/e38079ef-99f7-4e1e-91a0-fa14d39800ca" />
+</div>
+
 <p align="center">
 <a href="https://xpressclaw.ai">Website</a> &bull;
 <a href="https://hub.xpressclaw.ai">Hub</a> &bull;
