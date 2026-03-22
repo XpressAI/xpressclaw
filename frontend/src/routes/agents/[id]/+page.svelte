@@ -12,7 +12,6 @@
 	// Editable state
 	let editRole = $state('');
 	let editModel = $state('');
-	let llmOverrideEnabled = $state(false);
 	let editLlmProvider = $state('');
 	let editLlmApiKey = $state('');
 	let editLlmBaseUrl = $state('');
@@ -60,12 +59,9 @@
 			if (agentConfig) {
 				editRole = agentConfig.role;
 				editModel = agentConfig.model ?? '';
-				if (agentConfig.llm?.provider) {
-					llmOverrideEnabled = true;
-					editLlmProvider = agentConfig.llm.provider ?? '';
-					editLlmApiKey = ''; // Don't pre-fill masked keys
-					editLlmBaseUrl = agentConfig.llm.base_url ?? '';
-				}
+				editLlmProvider = agentConfig.llm?.provider ?? '';
+				editLlmApiKey = '';
+				editLlmBaseUrl = agentConfig.llm?.base_url ?? '';
 				editVolumes = [...(agentConfig.volumes || [])];
 				fetchEnabled = agentConfig.tools.includes('fetch');
 				gitEnabled = agentConfig.tools.includes('git');
@@ -140,16 +136,11 @@
 				tools,
 			};
 
-			if (llmOverrideEnabled && editLlmProvider) {
-				payload.llm = {
-					provider: editLlmProvider,
-					api_key: editLlmApiKey || null,
-					base_url: editLlmBaseUrl || null,
-				};
-			} else {
-				// Send empty provider to clear override
-				payload.llm = { provider: null, api_key: null, base_url: null };
-			}
+			payload.llm = {
+				provider: editLlmProvider || null,
+				api_key: editLlmApiKey || null,
+				base_url: editLlmBaseUrl || null,
+			};
 
 			if (budgetEnabled) {
 				payload.budget = {
@@ -334,40 +325,44 @@
 						class="w-full rounded-md border border-border bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"></textarea>
 				</div>
 
-				<!-- LLM / Model -->
+				<!-- LLM -->
 				<div class="rounded-lg border border-border bg-card p-4 space-y-3">
-					<h2 class="text-sm font-semibold">LLM / Model</h2>
-					<div>
-						<label class="block text-xs text-muted-foreground mb-1">Model name</label>
-						<input type="text" bind:value={editModel} placeholder="Leave empty for system default"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+					<h2 class="text-sm font-semibold">LLM</h2>
+					<div class="grid grid-cols-2 gap-3">
+						<div>
+							<label class="block text-xs text-muted-foreground mb-1">Provider</label>
+							<select bind:value={editLlmProvider}
+								class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
+								<option value="">Default</option>
+								<option value="openai">OpenAI-compatible</option>
+								<option value="anthropic">Anthropic</option>
+								<option value="local">Local</option>
+							</select>
+						</div>
+						<div>
+							<label class="block text-xs text-muted-foreground mb-1">Model</label>
+							<input type="text" bind:value={editModel} placeholder="e.g. gpt-4o, claude-sonnet-4-5"
+								class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+						</div>
 					</div>
-					<label class="flex items-center gap-2 cursor-pointer">
-						<input type="checkbox" bind:checked={llmOverrideEnabled} class="rounded border-border" />
-						<span class="text-sm">Override LLM provider for this agent</span>
-					</label>
-					{#if llmOverrideEnabled}
-						<div class="grid grid-cols-3 gap-3">
-							<div>
-								<label class="block text-xs text-muted-foreground mb-1">Provider</label>
-								<select bind:value={editLlmProvider}
-									class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
-									<option value="">System default</option>
-									<option value="openai">OpenAI</option>
-									<option value="anthropic">Anthropic</option>
-									<option value="local">Local</option>
-								</select>
-							</div>
+					{#if editLlmProvider === 'openai' || editLlmProvider === 'anthropic'}
+						<div class="grid grid-cols-2 gap-3">
 							<div>
 								<label class="block text-xs text-muted-foreground mb-1">API Key</label>
-								<input type="password" bind:value={editLlmApiKey} placeholder="Leave empty to use global key"
+								<input type="password" bind:value={editLlmApiKey} placeholder={agentConfig?.llm?.api_key ? '(set)' : '(uses global key)'}
 									class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 							</div>
 							<div>
 								<label class="block text-xs text-muted-foreground mb-1">Base URL</label>
-								<input type="text" bind:value={editLlmBaseUrl} placeholder="Leave empty for default"
+								<input type="text" bind:value={editLlmBaseUrl} placeholder="Default API endpoint"
 									class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 							</div>
+						</div>
+					{:else if editLlmProvider === 'local'}
+						<div>
+							<label class="block text-xs text-muted-foreground mb-1">Base URL</label>
+							<input type="text" bind:value={editLlmBaseUrl} placeholder="http://localhost:11434/v1"
+								class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 						</div>
 					{/if}
 				</div>
