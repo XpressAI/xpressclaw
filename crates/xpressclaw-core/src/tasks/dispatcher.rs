@@ -262,7 +262,7 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             prompt.push_str(&format!("Current step: {}\n", subtask.title));
             if let Some(ref desc) = subtask.description {
                 prompt.push_str(desc);
-                prompt.push_str("\n");
+                prompt.push('\n');
             }
         }
 
