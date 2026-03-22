@@ -635,7 +635,7 @@ mod tests {
         // check_budget should auto-resume
         let result = mgr.check_budget("atlas");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let state = mgr.get_state("atlas").unwrap();
         assert!(!state.is_paused);
