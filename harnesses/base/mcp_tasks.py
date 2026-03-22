@@ -210,6 +210,40 @@ TOOLS = [
             "required": ["schedule_id"],
         },
     },
+    {
+        "name": "list_procedures",
+        "description": "List all available standard operating procedures (SOPs).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "run_procedure",
+        "description": (
+            "Run a standard operating procedure (SOP) by name. "
+            "Creates a task from the procedure and assigns it to an agent. "
+            "The procedure's steps will be executed automatically."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Procedure name",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent to run the procedure (omit for yourself)",
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "Input values for the procedure (key-value pairs)",
+                },
+            },
+            "required": ["name"],
+        },
+    },
 ]
 
 
@@ -314,6 +348,28 @@ def handle_tool(name: str, arguments: dict) -> str:
             f"- [{t['status']}] {t['title']} (id: {t['id']})" for t in subtasks
         ]
         return f"{len(subtasks)} subtask(s):\n" + "\n".join(lines)
+
+    elif name == "list_procedures":
+        procedures = _api("GET", "/procedures")
+        if not procedures:
+            return "No procedures found."
+        lines = []
+        for p in procedures:
+            desc = p.get("description") or ""
+            lines.append(f"- {p['name']}: {desc}")
+        return f"{len(procedures)} procedure(s):\n" + "\n".join(lines)
+
+    elif name == "run_procedure":
+        proc_name = arguments["name"]
+        body = {
+            "agent_id": arguments.get("agent_id", AGENT_ID or None),
+            "inputs": arguments.get("inputs", {}),
+        }
+        task = _api("POST", f"/procedures/{proc_name}/run", body)
+        return (
+            f"Started procedure '{proc_name}' "
+            f"(task id: {task['id']}, agent: {task.get('agent_id') or 'unassigned'})"
+        )
 
     elif name == "create_schedule":
         body = {
