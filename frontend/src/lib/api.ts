@@ -391,7 +391,11 @@ export const budget = {
 		if (limit) params.set('limit', String(limit));
 		const qs = params.toString();
 		return request<UsageRecord[]>(`/api/budget/usage${qs ? `?${qs}` : ''}`);
-	}
+	},
+	resume: (agentId: string) =>
+		request<{ agent_id: string; is_paused: boolean; resumed: boolean }>(
+			`/api/budget/${agentId}/resume`, { method: 'POST' }
+		)
 };
 
 // -- Activity --

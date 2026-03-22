@@ -168,6 +168,14 @@ impl PricingTable {
     pub fn register(&mut self, model: String, pricing: ModelPricing) {
         self.pricing.insert(model, pricing);
     }
+
+    /// Merge custom pricing from config. Custom entries override built-in ones.
+    pub fn with_custom(mut self, custom: &HashMap<String, ModelPricing>) -> Self {
+        for (model, pricing) in custom {
+            self.pricing.insert(model.clone(), pricing.clone());
+        }
+        self
+    }
 }
 
 /// Default pricing for unknown models (Haiku 4.5 rates).

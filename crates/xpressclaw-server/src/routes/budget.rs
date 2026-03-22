@@ -21,6 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(budget_summary))
         .route("/usage", get(usage_history))
         .route("/{agent_id}", get(agent_budget))
+        .route("/{agent_id}/resume", axum::routing::post(resume_agent))
 }
 
 async fn budget_summary(
@@ -75,6 +76,20 @@ async fn usage_history(
         .get_usage(params.agent_id.as_deref(), limit)
         .map_err(internal_error)?;
     Ok(Json(json!(records)))
+}
+
+async fn resume_agent(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mgr = BudgetManager::new(state.db.clone(), state.config());
+    mgr.resume(&agent_id).map_err(internal_error)?;
+    let state_after = mgr.get_state(&agent_id).map_err(internal_error)?;
+    Ok(Json(json!({
+        "agent_id": agent_id,
+        "is_paused": state_after.is_paused,
+        "resumed": true,
+    })))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

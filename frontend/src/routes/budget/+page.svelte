@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { budget } from '$lib/api';
+	import { budget, agents } from '$lib/api';
 	import type { BudgetSummary, UsageRecord } from '$lib/api';
 	import { formatCost, timeAgo } from '$lib/utils';
 
@@ -8,7 +8,16 @@
 	let usageHistory = $state<UsageRecord[]>([]);
 	let loading = $state(true);
 
-	onMount(async () => {
+	// Resume dialog state
+	let showResumeDialog = $state(false);
+	let resumeAgentId = $state('');
+	let resumeNewDaily = $state('');
+	let resumeNewMonthly = $state('');
+	let resuming = $state(false);
+
+	onMount(load);
+
+	async function load() {
 		const [s, u] = await Promise.all([
 			budget.summary().catch(() => null),
 			budget.usage(undefined, 50).catch(() => [])
@@ -16,7 +25,42 @@
 		summary = s;
 		usageHistory = u;
 		loading = false;
-	});
+	}
+
+	function openResumeDialog(agentId: string) {
+		resumeAgentId = agentId;
+		resumeNewDaily = '';
+		resumeNewMonthly = '';
+		showResumeDialog = true;
+	}
+
+	async function handleResume() {
+		resuming = true;
+		try {
+			// Update budget if new limits provided
+			if (resumeNewDaily || resumeNewMonthly) {
+				const budgetUpdate: Record<string, unknown> = {
+					daily: resumeNewDaily ? `$${resumeNewDaily}` : null,
+					monthly: resumeNewMonthly ? `$${resumeNewMonthly}` : null,
+					on_exceeded: 'pause',
+					fallback_model: 'local',
+					warn_at_percent: 80,
+					per_task: null,
+				};
+				await agents.updateConfig(resumeAgentId, { budget: budgetUpdate as any });
+			}
+
+			// Resume the agent
+			await budget.resume(resumeAgentId);
+			showResumeDialog = false;
+
+			// Reload data
+			await load();
+		} catch (e) {
+			alert(String(e));
+		}
+		resuming = false;
+	}
 </script>
 
 <div class="p-6 space-y-6">
@@ -85,11 +129,21 @@
 									<span class="text-xs text-destructive">Paused (budget exceeded)</span>
 								{/if}
 							</div>
-							<div class="text-right text-sm">
-								<div class="font-medium">{formatCost(a.total_spent)}</div>
-								<div class="text-xs text-muted-foreground">
-									{formatCost(a.daily_spent)} today
+							<div class="flex items-center gap-3">
+								<div class="text-right text-sm">
+									<div class="font-medium">{formatCost(a.total_spent)}</div>
+									<div class="text-xs text-muted-foreground">
+										{formatCost(a.daily_spent)} today
+									</div>
 								</div>
+								{#if a.is_paused}
+									<button
+										onclick={() => openResumeDialog(a.agent_id)}
+										class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+									>
+										Resume
+									</button>
+								{/if}
 							</div>
 						</div>
 					{/each}
@@ -131,3 +185,43 @@
 		{/if}
 	{/if}
 </div>
+
+<!-- Resume dialog -->
+{#if showResumeDialog}
+	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+		<div class="rounded-lg border border-border bg-card p-6 shadow-lg w-96 space-y-4">
+			<h3 class="text-lg font-semibold">Resume Agent: {resumeAgentId}</h3>
+			<p class="text-sm text-muted-foreground">
+				This agent was paused because it exceeded its budget.
+				Set a new budget limit to resume, or resume with the current limit.
+			</p>
+			<div class="space-y-3">
+				<div>
+					<label class="block text-xs text-muted-foreground mb-1">New daily limit (optional)</label>
+					<input type="text" bind:value={resumeNewDaily} placeholder="e.g. 20.00"
+						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+				</div>
+				<div>
+					<label class="block text-xs text-muted-foreground mb-1">New monthly limit (optional)</label>
+					<input type="text" bind:value={resumeNewMonthly} placeholder="e.g. 500.00"
+						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+				</div>
+			</div>
+			<div class="flex gap-2 justify-end">
+				<button
+					onclick={() => { showResumeDialog = false; }}
+					class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent"
+				>
+					Cancel
+				</button>
+				<button
+					onclick={handleResume}
+					disabled={resuming}
+					class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+				>
+					{resuming ? 'Resuming...' : 'Resume Agent'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}

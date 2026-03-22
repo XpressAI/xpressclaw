@@ -297,6 +297,11 @@ pub struct LlmConfig {
     /// Defaults to Ollama's address (http://localhost:11434) if not set.
     pub local_base_url: Option<String>,
     pub context_length: u32,
+    /// Custom per-model pricing (per 1M tokens). Overrides built-in pricing.
+    /// Useful for proxy services (relay, OpenRouter) with different rates.
+    /// Example: `{ "xpress-qwen-3.5-27b": { "input": 0.50, "output": 2.00 } }`
+    #[serde(default)]
+    pub custom_pricing: HashMap<String, crate::llm::pricing::ModelPricing>,
 }
 
 impl Default for LlmConfig {
@@ -310,6 +315,7 @@ impl Default for LlmConfig {
             local_model_path: None,
             local_base_url: None,
             context_length: 32768,
+            custom_pricing: HashMap::new(),
         }
     }
 }

@@ -34,6 +34,17 @@ impl CostTracker {
         }
     }
 
+    /// Create a tracker with custom pricing merged in from config.
+    pub fn with_custom_pricing(
+        db: Arc<Database>,
+        custom: &std::collections::HashMap<String, crate::llm::pricing::ModelPricing>,
+    ) -> Self {
+        Self {
+            db,
+            pricing: PricingTable::new().with_custom(custom),
+        }
+    }
+
     pub fn record(
         &self,
         agent_id: &str,

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use chrono::{Datelike, Local, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{BudgetConfig, Config, OnExceeded};
 use crate::db::Database;
@@ -17,6 +18,7 @@ pub struct BudgetState {
     pub total_spent: f64,
     pub is_paused: bool,
     pub pause_reason: Option<String>,
+    pub degraded_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,8 +36,7 @@ pub struct BudgetSummary {
 /// Budget enforcement with per-agent inheritance from system defaults.
 ///
 /// Each agent can have its own budget config. If not set, the system-wide
-/// budget config is used as the default. This means you only need to
-/// configure budgets on agents that differ from the system default.
+/// budget config is used as the default.
 pub struct BudgetManager {
     db: Arc<Database>,
     config: Arc<Config>,
@@ -75,12 +76,13 @@ impl BudgetManager {
                     total_spent: row.get("total_spent")?,
                     is_paused: row.get::<_, i32>("is_paused")? != 0,
                     pause_reason: row.get("pause_reason")?,
+                    degraded_model: row.get("degraded_model").unwrap_or(None),
                 })
             })
         });
 
-        match result {
-            Ok(state) => Ok(state),
+        let mut state = match result {
+            Ok(state) => state,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 let state = BudgetState {
                     agent_id: agent_id.to_string(),
@@ -91,12 +93,20 @@ impl BudgetManager {
                     total_spent: 0.0,
                     is_paused: false,
                     pause_reason: None,
+                    degraded_model: None,
                 };
                 self.save_state(&state)?;
-                Ok(state)
+                state
             }
-            Err(e) => Err(Error::Database(e.to_string())),
+            Err(e) => return Err(Error::Database(e.to_string())),
+        };
+
+        // Apply daily/monthly resets if needed
+        if self.maybe_reset(&mut state) {
+            self.save_state(&state)?;
         }
+
+        Ok(state)
     }
 
     pub fn update_spending(&self, agent_id: &str, cost: f64) -> Result<BudgetState> {
@@ -118,19 +128,47 @@ impl BudgetManager {
         Ok(state)
     }
 
-    /// Check if an agent is within budget. Uses the agent's effective budget
-    /// (per-agent override or system default).
+    /// Check if an agent is within budget.
+    ///
+    /// Returns `Ok(true)` if within budget, `Ok(false)` if exceeded but allowed
+    /// to continue (alert mode), or `Err` if paused/stopped.
+    ///
+    /// Automatically resets daily/monthly counters when the period expires,
+    /// and auto-resumes paused agents that are now under budget.
     pub fn check_budget(&self, agent_id: &str) -> Result<bool> {
-        let state = self.get_state(agent_id)?;
-        let budget = self.effective_budget(agent_id);
+        let mut state = self.get_state(agent_id)?; // get_state already calls maybe_reset
 
+        // Auto-resume if paused but now under budget (e.g. after daily reset)
         if state.is_paused {
-            return Err(Error::Budget(format!(
-                "Agent {} is paused: {}",
-                agent_id,
-                state.pause_reason.as_deref().unwrap_or("budget exceeded")
-            )));
+            let budget = self.effective_budget(agent_id);
+            let under_daily = budget
+                .daily_amount()
+                .map(|l| state.daily_spent < l)
+                .unwrap_or(true);
+            let under_monthly = budget
+                .monthly_amount()
+                .map(|l| state.monthly_spent < l)
+                .unwrap_or(true);
+
+            if under_daily && under_monthly {
+                info!(agent_id, "auto-resuming agent (now under budget)");
+                self.resume(agent_id)?;
+                state.is_paused = false;
+                // Also clear degraded model
+                if state.degraded_model.is_some() {
+                    state.degraded_model = None;
+                    self.save_state(&state)?;
+                }
+            } else {
+                return Err(Error::Budget(format!(
+                    "Agent {} is paused: {}",
+                    agent_id,
+                    state.pause_reason.as_deref().unwrap_or("budget exceeded")
+                )));
+            }
         }
+
+        let budget = self.effective_budget(agent_id);
 
         if let Some(daily_limit) = budget.daily_amount() {
             if state.daily_spent >= daily_limit {
@@ -157,6 +195,12 @@ impl BudgetManager {
         }
 
         Ok(true)
+    }
+
+    /// Get the degraded model for an agent (if budget degradation is active).
+    pub fn degraded_model(&self, agent_id: &str) -> Result<Option<String>> {
+        let state = self.get_state(agent_id)?;
+        Ok(state.degraded_model)
     }
 
     fn check_limits(&self, agent_id: &str, state: &BudgetState) -> Result<()> {
@@ -202,10 +246,22 @@ impl BudgetManager {
                 warn!(agent_id, ?reason, "agent paused due to budget");
             }
             OnExceeded::Alert => {
-                warn!(agent_id, ?reason, "budget alert");
+                warn!(agent_id, ?reason, "budget alert (agent continues)");
             }
             OnExceeded::Degrade => {
-                debug!(agent_id, ?reason, "degrading to local model");
+                let fallback = &budget.fallback_model;
+                self.db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE budget_state SET degraded_model = ?1 WHERE agent_id = ?2",
+                        rusqlite::params![fallback, agent_id],
+                    )
+                })?;
+                info!(
+                    agent_id,
+                    fallback_model = fallback.as_str(),
+                    ?reason,
+                    "degrading to fallback model"
+                );
             }
             OnExceeded::Stop => {
                 return Err(Error::Budget(
@@ -219,7 +275,7 @@ impl BudgetManager {
     pub fn resume(&self, agent_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE budget_state SET is_paused = 0, pause_reason = NULL WHERE agent_id = ?1",
+                "UPDATE budget_state SET is_paused = 0, pause_reason = NULL, degraded_model = NULL WHERE agent_id = ?1",
                 [agent_id],
             )
         })?;
@@ -228,7 +284,6 @@ impl BudgetManager {
     }
 
     /// Get budget summary for an agent (or global if agent_id is None).
-    /// Limits are resolved from the agent's effective budget config.
     pub fn get_summary(&self, agent_id: Option<&str>) -> Result<BudgetSummary> {
         let budget = match agent_id {
             Some(aid) => self.effective_budget(aid),
@@ -249,22 +304,28 @@ impl BudgetManager {
         };
 
         let (input_tokens, output_tokens, request_count) = self.db.with_conn(|conn| {
-            let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(aid) = agent_id {
-                (
-                    "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) FROM usage_logs WHERE agent_id = ?1",
-                    vec![Box::new(aid.to_string())],
-                )
-            } else {
-                (
-                    "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) FROM usage_logs",
-                    vec![],
-                )
-            };
+            let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) =
+                if let Some(aid) = agent_id {
+                    (
+                        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) FROM usage_logs WHERE agent_id = ?1",
+                        vec![Box::new(aid.to_string())],
+                    )
+                } else {
+                    (
+                        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COUNT(*) FROM usage_logs",
+                        vec![],
+                    )
+                };
 
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
             let mut stmt = conn.prepare(sql)?;
             stmt.query_row(param_refs.as_slice(), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -296,6 +357,7 @@ impl BudgetManager {
                         total_spent: row.get("total_spent")?,
                         is_paused: row.get::<_, i32>("is_paused")? != 0,
                         pause_reason: row.get("pause_reason")?,
+                        degraded_model: row.get("degraded_model").unwrap_or(None),
                     })
                 })
                 .map_err(|e| Error::Database(e.to_string()))?
@@ -309,8 +371,8 @@ impl BudgetManager {
     fn save_state(&self, state: &BudgetState) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO budget_state (agent_id, daily_spent, daily_reset_at, monthly_spent, monthly_reset_at, total_spent, is_paused, pause_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR REPLACE INTO budget_state (agent_id, daily_spent, daily_reset_at, monthly_spent, monthly_reset_at, total_spent, is_paused, pause_reason, degraded_model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     state.agent_id,
                     state.daily_spent,
@@ -320,10 +382,67 @@ impl BudgetManager {
                     state.total_spent,
                     state.is_paused as i32,
                     state.pause_reason,
+                    state.degraded_model,
                 ],
             )
         })?;
         Ok(())
+    }
+
+    /// Reset daily/monthly counters if the period has expired.
+    /// Returns true if any reset was applied (caller should save state).
+    fn maybe_reset(&self, state: &mut BudgetState) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+
+        // Daily reset at local midnight
+        let needs_daily_reset = match &state.daily_reset_at {
+            Some(reset_str) => {
+                chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.and_utc() <= now)
+                    .unwrap_or(true)
+            }
+            None => true, // Never set — initialize it
+        };
+
+        if needs_daily_reset {
+            state.daily_spent = 0.0;
+            // Next reset: tomorrow midnight local time
+            let tomorrow = Local::now()
+                .date_naive()
+                .succ_opt()
+                .unwrap_or_else(|| Local::now().date_naive() + chrono::Duration::days(1));
+            let next_reset = tomorrow.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            state.daily_reset_at = Some(next_reset.format("%Y-%m-%d %H:%M:%S").to_string());
+            changed = true;
+        }
+
+        // Monthly reset on 1st of month
+        let needs_monthly_reset = match &state.monthly_reset_at {
+            Some(reset_str) => {
+                chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.and_utc() <= now)
+                    .unwrap_or(true)
+            }
+            None => true,
+        };
+
+        if needs_monthly_reset {
+            state.monthly_spent = 0.0;
+            // Next reset: 1st of next month local time
+            let today = Local::now().date_naive();
+            let next_month = if today.month() == 12 {
+                chrono::NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+            } else {
+                chrono::NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
+            }
+            .unwrap_or(today + chrono::Duration::days(30));
+            let next_reset = next_month.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            state.monthly_reset_at = Some(next_reset.format("%Y-%m-%d %H:%M:%S").to_string());
+            changed = true;
+        }
+
+        changed
     }
 }
 
@@ -347,6 +466,9 @@ mod tests {
         assert_eq!(state.agent_id, "atlas");
         assert!(state.daily_spent.abs() < 1e-10);
         assert!(!state.is_paused);
+        // Reset timestamps should be initialized
+        assert!(state.daily_reset_at.is_some());
+        assert!(state.monthly_reset_at.is_some());
     }
 
     #[test]
@@ -427,12 +549,26 @@ mod tests {
     }
 
     #[test]
+    fn test_degrade_policy() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$10.00".to_string());
+        config.system.budget.on_exceeded = OnExceeded::Degrade;
+        config.system.budget.fallback_model = "local".to_string();
+        let mgr = BudgetManager::new(db, Arc::new(config));
+
+        mgr.update_spending("atlas", 11.0).unwrap();
+
+        let state = mgr.get_state("atlas").unwrap();
+        assert_eq!(state.degraded_model.as_deref(), Some("local"));
+        assert!(!state.is_paused); // Not paused, just degraded
+    }
+
+    #[test]
     fn test_per_agent_budget_override() {
         let db = Arc::new(Database::open_memory().unwrap());
         let mut config = Config::default();
-        // System default: $10/day
         config.system.budget.daily = Some("$10.00".to_string());
-        // Agent "atlas" override: $5/day
         config.agents = vec![crate::config::AgentConfig {
             name: "atlas".to_string(),
             budget: Some(BudgetConfig {
@@ -443,20 +579,16 @@ mod tests {
         }];
         let mgr = BudgetManager::new(db, Arc::new(config));
 
-        // atlas has $5 limit
         let budget = mgr.effective_budget("atlas");
         assert!((budget.daily_amount().unwrap() - 5.0).abs() < 1e-10);
 
-        // unknown agent falls back to system $10
         let budget = mgr.effective_budget("hermes");
         assert!((budget.daily_amount().unwrap() - 10.0).abs() < 1e-10);
 
-        // atlas gets paused at $6 (over $5 limit)
         mgr.update_spending("atlas", 6.0).unwrap();
         let state = mgr.get_state("atlas").unwrap();
         assert!(state.is_paused);
 
-        // hermes is fine at $6 (under $10 limit)
         mgr.update_spending("hermes", 6.0).unwrap();
         let state = mgr.get_state("hermes").unwrap();
         assert!(!state.is_paused);
@@ -479,12 +611,33 @@ mod tests {
 
         mgr.update_spending("atlas", 2.0).unwrap();
 
-        // Agent summary shows agent's own limit
         let summary = mgr.get_summary(Some("atlas")).unwrap();
         assert!((summary.daily_limit.unwrap() - 5.0).abs() < 1e-10);
 
-        // Global summary shows system limit
         let summary = mgr.get_summary(None).unwrap();
         assert!((summary.daily_limit.unwrap() - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_auto_resume_after_reset() {
+        let (_db, mgr) = setup();
+
+        // Exceed budget — agent gets paused
+        mgr.update_spending("atlas", 11.0).unwrap();
+        assert!(mgr.check_budget("atlas").is_err());
+
+        // Simulate daily reset by manually clearing spent
+        let mut state = mgr.get_state("atlas").unwrap();
+        state.daily_spent = 0.0;
+        state.monthly_spent = 0.0;
+        mgr.save_state(&state).unwrap();
+
+        // check_budget should auto-resume
+        let result = mgr.check_budget("atlas");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true);
+
+        let state = mgr.get_state("atlas").unwrap();
+        assert!(!state.is_paused);
     }
 }

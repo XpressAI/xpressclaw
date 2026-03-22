@@ -204,7 +204,8 @@ async fn send_message(
     if let Some(llm_router) = state.llm_router() {
         let registry = AgentRegistry::new(state.db.clone());
         let budget_mgr = BudgetManager::new(state.db.clone(), state.config());
-        let cost_tracker = CostTracker::new(state.db.clone());
+        let cost_tracker =
+            CostTracker::with_custom_pricing(state.db.clone(), &state.config().llm.custom_pricing);
         let rate_limiter = state.rate_limiter();
 
         for agent_id in &target_agents {
@@ -447,6 +448,7 @@ async fn stream_message(
     let llm_router = state.llm_router();
     let db = state.db.clone();
     let config = state.config();
+    let custom_pricing = config.llm.custom_pricing.clone();
     let rate_limiter = state.rate_limiter();
 
     let stream = async_stream::stream! {
@@ -468,7 +470,7 @@ async fn stream_message(
         let registry = AgentRegistry::new(db.clone());
         let mgr = ConversationManager::new(db.clone());
         let budget_mgr = BudgetManager::new(db.clone(), config);
-        let cost_tracker = CostTracker::new(db.clone());
+        let cost_tracker = CostTracker::with_custom_pricing(db.clone(), &custom_pricing);
 
         for agent_id in &target_agents {
             // Check budget
@@ -593,7 +595,7 @@ async fn stream_message(
                                 if let Some(choice) = chunk.choices.first() {
                                     if let Some(ref text) = choice.delta.content {
                                         full_content.push_str(text);
-                                        total_tokens += 1; // approximate: 1 chunk ≈ 1 token
+                                        total_tokens += text.len() as i64; // accumulate chars for estimation
                                         if let Ok(evt) = Event::default().event("chunk").json_data(json!({
                                             "agent_id": agent_id,
                                             "content": text
@@ -619,7 +621,7 @@ async fn stream_message(
                     if !full_content.is_empty() {
                         // Estimate input tokens from message count (rough approximation)
                         let input_tokens = (llm_req.messages.iter().map(|m| m.content.len()).sum::<usize>() / 4) as i64;
-                        let output_tokens = total_tokens;
+                        let output_tokens = total_tokens / 4; // ~4 chars per token
                         let _ = cost_tracker.record(
                             agent_id, &model, input_tokens, output_tokens, "chat", Some(&conv_id),
                         );

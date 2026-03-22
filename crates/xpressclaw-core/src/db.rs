@@ -132,6 +132,7 @@ impl Database {
             (9, MIGRATION_V9),
             (10, MIGRATION_V10),
             (11, MIGRATION_V11),
+            (12, MIGRATION_V12),
         ];
 
         for &(target, sql) in migrations {
@@ -475,6 +476,12 @@ ALTER TABLE tasks ADD COLUMN conversation_id TEXT;
 CREATE INDEX idx_tasks_conversation ON tasks(conversation_id);
 ";
 
+const MIGRATION_V12: &str = "
+-- Add degraded_model column for budget degrade action.
+-- When on_exceeded=degrade, the fallback model name is stored here.
+ALTER TABLE budget_state ADD COLUMN degraded_model TEXT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,7 +499,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "11");
+        assert_eq!(version, "12");
     }
 
     #[test]
