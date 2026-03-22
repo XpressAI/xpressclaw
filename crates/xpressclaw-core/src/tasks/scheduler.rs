@@ -178,6 +178,7 @@ impl ScheduleManager {
             agent_id: Some(schedule.agent_id),
             parent_task_id: None,
             sop_id: None,
+            conversation_id: None,
             priority: None,
             context: None,
         })?;

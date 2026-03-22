@@ -111,6 +111,7 @@ async fn run_procedure(
             agent_id: Some(req.agent_id),
             parent_task_id: None,
             sop_id: Some(sop.id),
+            conversation_id: None,
             priority: req.priority,
             context: if req.inputs.is_empty() {
                 None

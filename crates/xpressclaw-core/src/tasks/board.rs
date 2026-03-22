@@ -53,6 +53,7 @@ pub struct Task {
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub sop_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -66,6 +67,7 @@ pub struct CreateTask {
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub sop_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub priority: Option<i32>,
     pub context: Option<serde_json::Value>,
 }
@@ -108,8 +110,8 @@ impl TaskBoard {
         {
             let conn = self.db.conn();
             conn.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, context, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     id,
                     req.title,
@@ -119,6 +121,7 @@ impl TaskBoard {
                     req.agent_id,
                     req.parent_task_id,
                     req.sop_id,
+                    req.conversation_id,
                     context_json,
                     now,
                     now,
@@ -350,6 +353,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         agent_id: row.get("agent_id")?,
         parent_task_id: row.get("parent_task_id")?,
         sop_id: row.get("sop_id")?,
+        conversation_id: row.get("conversation_id").unwrap_or(None),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
@@ -377,6 +381,7 @@ mod tests {
                 agent_id: Some("atlas".to_string()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: Some(5),
                 context: None,
             })
@@ -400,6 +405,7 @@ mod tests {
                 agent_id: None,
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })
@@ -426,6 +432,7 @@ mod tests {
                 agent_id: Some("atlas".to_string()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })
@@ -437,6 +444,7 @@ mod tests {
                 agent_id: Some("atlas".to_string()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })
@@ -462,6 +470,7 @@ mod tests {
                 agent_id: None,
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })

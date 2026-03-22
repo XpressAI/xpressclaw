@@ -15,8 +15,33 @@ use xpressclaw_core::budget::rate_limiter::RateLimitResult;
 use xpressclaw_core::budget::tracker::CostTracker;
 use xpressclaw_core::conversations::{ConversationManager, CreateConversation, SendMessage};
 use xpressclaw_core::llm::router::{ChatCompletionRequest, ChatMessage};
+use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
+use xpressclaw_core::tasks::queue::TaskQueue;
 
 use crate::state::AppState;
+
+/// Task continuation signal embedded in agent responses.
+#[derive(Debug, serde::Deserialize)]
+struct TaskSignal {
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    priority: Option<i32>,
+}
+
+/// Extract a `__TASK__` continuation signal from agent response content.
+/// Returns (clean_content, optional_task_signal).
+fn extract_task_signal(content: &str) -> (String, Option<TaskSignal>) {
+    if let Some(idx) = content.find("__TASK__") {
+        let clean = content[..idx].trim().to_string();
+        let json_str = content[idx + 8..].trim();
+        let signal = serde_json::from_str(json_str).ok();
+        (clean, signal)
+    } else {
+        (content.to_string(), None)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ListParams {
@@ -602,18 +627,60 @@ async fn stream_message(
                         let _ = budget_mgr.update_spending(agent_id, cost);
                         rate_limiter.record_request(agent_id, (input_tokens + output_tokens) as u32);
 
+                        // Check for task continuation signal
+                        let (clean_content, task_signal) = extract_task_signal(&full_content);
+
                         if let Ok(agent_msg) = mgr.send_message(
                             &conv_id,
                             &SendMessage {
                                 sender_type: "agent".into(),
                                 sender_id: agent_id.clone(),
                                 sender_name: Some(agent_id.clone()),
-                                content: full_content,
+                                content: clean_content,
                                 message_type: None,
                             },
                         ) {
                             if let Ok(evt) = Event::default().event("agent_message").json_data(json!(agent_msg)) {
                                 yield Ok(evt);
+                            }
+                        }
+
+                        // Create background task if continuation was signaled
+                        if let Some(task_req) = task_signal {
+                            let board = TaskBoard::new(db.clone());
+                            if let Ok(task) = board.create(&CreateTask {
+                                title: task_req.title.clone(),
+                                description: task_req.description,
+                                agent_id: Some(agent_id.clone()),
+                                parent_task_id: None,
+                                sop_id: None,
+                                conversation_id: Some(conv_id.clone()),
+                                priority: task_req.priority,
+                                context: None,
+                            }) {
+                                // Enqueue for dispatcher
+                                let queue = TaskQueue::new(db.clone());
+                                let _ = queue.enqueue(&task.id, agent_id);
+
+                                // Send task_status message to conversation
+                                if let Ok(task_msg) = mgr.send_message(
+                                    &conv_id,
+                                    &SendMessage {
+                                        sender_type: "system".into(),
+                                        sender_id: agent_id.clone(),
+                                        sender_name: Some(agent_id.clone()),
+                                        content: json!({
+                                            "task_id": task.id,
+                                            "title": task_req.title,
+                                            "status": "pending"
+                                        }).to_string(),
+                                        message_type: Some("task_status".into()),
+                                    },
+                                ) {
+                                    if let Ok(evt) = Event::default().event("agent_message").json_data(json!(task_msg)) {
+                                        yield Ok(evt);
+                                    }
+                                }
                             }
                         }
                     }

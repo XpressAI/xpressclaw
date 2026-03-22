@@ -17,9 +17,12 @@ use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
+use serde_json::json;
+
 use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
+use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::DockerManager;
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
@@ -459,6 +462,47 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+/// Send a task status notification back to the originating conversation.
+/// This lets the user (and the agent) know the background task finished.
+fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status: &str) {
+    let board = TaskBoard::new(db.clone());
+    let task = match board.get(task_id) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let conv_id = match task.conversation_id {
+        Some(ref id) => id.clone(),
+        None => return,
+    };
+
+    let mgr = ConversationManager::new(db.clone());
+    let content = json!({
+        "task_id": task.id,
+        "title": task.title,
+        "status": status,
+    })
+    .to_string();
+
+    if let Err(e) = mgr.send_message(
+        &conv_id,
+        &SendMessage {
+            sender_type: "system".into(),
+            sender_id: agent_id.to_string(),
+            sender_name: Some(agent_id.to_string()),
+            content,
+            message_type: Some("task_status".into()),
+        },
+    ) {
+        warn!(
+            task_id,
+            conv_id,
+            error = %e,
+            "failed to notify conversation of task completion"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Polling loop
 // ---------------------------------------------------------------------------
@@ -515,11 +559,12 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                 let _ = queue.complete(claimed.id, "completed");
                 let _ = board.update_status(&claimed.task_id, "completed", None);
                 info!(task_id = claimed.task_id, "task completed");
+                notify_conversation(db, &claimed.task_id, &claimed.agent_id, "completed");
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
-                // Don't auto-fail the task — leave it for the user to retry or cancel
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
+                notify_conversation(db, &claimed.task_id, &claimed.agent_id, "failed");
             }
             DriverResult::Skipped => {
                 let _ = queue.complete(claimed.id, "skipped");
@@ -558,6 +603,7 @@ mod tests {
                 agent_id: None,
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -572,6 +618,7 @@ mod tests {
                 agent_id: None,
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -586,6 +633,7 @@ mod tests {
                 agent_id: None,
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -608,6 +656,7 @@ mod tests {
             agent_id: None,
             parent_task_id: None,
             sop_id: None,
+            conversation_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
@@ -629,6 +678,7 @@ mod tests {
             agent_id: None,
             parent_task_id: None,
             sop_id: None,
+            conversation_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
@@ -658,6 +708,7 @@ mod tests {
                 agent_id: Some("atlas".into()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })

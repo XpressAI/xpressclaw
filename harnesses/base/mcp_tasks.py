@@ -43,6 +43,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Parent task ID to create this as a subtask",
                 },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Conversation ID to link this task to (for status notifications)",
+                },
                 "priority": {
                     "type": "integer",
                     "description": "0=low, 1=normal, 2=high, 3=urgent",
@@ -176,6 +180,8 @@ def handle_tool(name: str, arguments: dict) -> str:
         body["agent_id"] = arguments.get("agent_id", AGENT_ID or None)
         if "parent_task_id" in arguments:
             body["parent_task_id"] = arguments["parent_task_id"]
+        if "conversation_id" in arguments:
+            body["conversation_id"] = arguments["conversation_id"]
         if "priority" in arguments:
             body["priority"] = arguments["priority"]
 
