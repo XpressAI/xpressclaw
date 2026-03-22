@@ -870,7 +870,9 @@ mod tests {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(config, db, None, config_path.clone(), false);
-        let app = Router::new().nest("/setup", routes()).with_state(state.clone());
+        let app = Router::new()
+            .nest("/setup", routes())
+            .with_state(state.clone());
 
         // ── Step 1: full setup with researcher preset ──
         let resp = app
@@ -1019,7 +1021,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let config = Config::load(&config_path).unwrap();
-        let fetch_cfg = config.mcp_servers.get("fetch").expect("fetch MCP server missing");
+        let fetch_cfg = config
+            .mcp_servers
+            .get("fetch")
+            .expect("fetch MCP server missing");
         // Frontend's explicit config should win over preset default
         assert_eq!(
             fetch_cfg.env.get("FETCH_BLOCKED_URLS").map(|s| s.as_str()),
@@ -1095,7 +1100,10 @@ mod tests {
         assert_eq!(config.agents.len(), 2);
 
         // Frontend-provided fetch config should be used (not bare preset default)
-        let fetch_cfg = config.mcp_servers.get("fetch").expect("fetch MCP server missing");
+        let fetch_cfg = config
+            .mcp_servers
+            .get("fetch")
+            .expect("fetch MCP server missing");
         assert_eq!(
             fetch_cfg.env.get("FETCH_ALLOWED_URLS").map(|s| s.as_str()),
             Some("*.wikipedia.org,*.arxiv.org"),
