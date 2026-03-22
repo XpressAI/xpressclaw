@@ -48,10 +48,29 @@ pub fn build_container_spec(
         format!("AGENT_BACKEND={}", agent.backend),
     ];
 
+    // Per-agent LLM overrides take precedence over global config.
+    let agent_llm = agent.llm.as_ref();
+    let effective_base_url = agent_llm
+        .and_then(|l| l.base_url.as_deref())
+        .or(openai_base_url);
+    let effective_openai_key = agent_llm
+        .and_then(|l| l.api_key.as_deref())
+        .or(openai_api_key);
+    let effective_anthropic_key = agent_llm
+        .and_then(|l| {
+            // Only use agent key for anthropic if agent provider is anthropic
+            if l.provider.as_deref() == Some("anthropic") {
+                l.api_key.as_deref()
+            } else {
+                None
+            }
+        })
+        .or(anthropic_api_key);
+
     // LLM routing — harnesses call back to the server's built-in /v1/ router by default.
     // We set both the custom LLM_BASE_URL and the standard OPENAI_BASE_URL so that
     // any OpenAI-compatible SDK inside the container works out of the box.
-    let llm_base_url = openai_base_url
+    let llm_base_url = effective_base_url
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("http://host.docker.internal:{server_port}/v1"));
     env.push(format!("LLM_BASE_URL={llm_base_url}"));
@@ -68,12 +87,12 @@ pub fn build_container_spec(
 
     // API keys for harnesses that call cloud APIs directly.
     // Set placeholder keys when none are provided — SDKs refuse to start without them.
-    if let Some(key) = anthropic_api_key {
+    if let Some(key) = effective_anthropic_key {
         env.push(format!("ANTHROPIC_API_KEY={key}"));
     } else {
         env.push("ANTHROPIC_API_KEY=sk-ant-xpressclaw".to_string());
     }
-    if let Some(key) = openai_api_key {
+    if let Some(key) = effective_openai_key {
         env.push(format!("OPENAI_API_KEY={key}"));
         env.push(format!("LLM_API_KEY={key}"));
     } else {

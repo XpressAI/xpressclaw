@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
 use xpressclaw_core::agents::state::AgentStatus;
 use xpressclaw_core::config::{
-    default_mcp_servers, AgentConfig, BudgetConfig, HooksConfig, McpServerConfig, RateLimitConfig,
-    WakeOnConfig,
+    default_mcp_servers, AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, McpServerConfig,
+    RateLimitConfig, WakeOnConfig,
 };
 use xpressclaw_core::docker::images::build_container_spec;
 use xpressclaw_core::docker::manager::{DockerManager, VolumeMount};
@@ -286,6 +286,7 @@ async fn stop_agent(
 struct UpdateAgentConfigRequest {
     role: Option<String>,
     model: Option<String>,
+    llm: Option<AgentLlmConfig>,
     tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
     budget: Option<BudgetConfig>,
@@ -328,6 +329,14 @@ async fn update_agent_config(
     }
     if let Some(model) = req.model {
         agent.model = if model.is_empty() { None } else { Some(model) };
+    }
+    if let Some(llm) = req.llm {
+        // Empty provider means clear the override
+        if llm.provider.as_deref().is_some_and(|p| !p.is_empty()) {
+            agent.llm = Some(llm);
+        } else {
+            agent.llm = None;
+        }
     }
     if let Some(mut tools) = req.tools {
         // Ensure shell + filesystem are always present
@@ -388,6 +397,11 @@ async fn update_agent_config(
             "backend": updated.backend,
             "role": updated.role,
             "model": updated.model,
+            "llm": updated.llm.as_ref().map(|l| json!({
+                "provider": l.provider,
+                "api_key": l.api_key.as_ref().map(|_| "********"),
+                "base_url": l.base_url,
+            })),
             "tools": updated.tools,
             "volumes": updated.volumes,
             "budget": updated.budget.as_ref().map(|b| json!({

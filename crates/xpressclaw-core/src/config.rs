@@ -174,12 +174,28 @@ pub struct HooksConfig {
     pub after_message: Vec<String>,
 }
 
+/// Per-agent LLM override. When set, the agent uses this provider/key/url
+/// instead of the global LLM config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentLlmConfig {
+    /// Provider name: "openai", "anthropic", or "local".
+    pub provider: Option<String>,
+    /// API key for this agent (overrides global key for the chosen provider).
+    pub api_key: Option<String>,
+    /// Base URL for this agent (overrides global base URL).
+    pub base_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
     pub name: String,
     pub backend: String,
     pub model: Option<String>,
+    /// Per-agent LLM provider/key/url override.
+    #[serde(default)]
+    pub llm: Option<AgentLlmConfig>,
     pub role: String,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -201,6 +217,7 @@ impl Default for AgentConfig {
             name: "default".to_string(),
             backend: "generic".to_string(),
             model: None,
+            llm: None,
             role: String::new(),
             tools: Vec::new(),
             budget: None,

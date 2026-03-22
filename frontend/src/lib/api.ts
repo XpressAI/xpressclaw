@@ -183,6 +183,7 @@ export const agents = {
 	updateConfig: (id: string, data: {
 		role?: string;
 		model?: string;
+		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools?: string[];
 		volumes?: string[];
 		budget?: {
@@ -482,6 +483,7 @@ export interface LiveConfig {
 		backend: string;
 		role: string;
 		model: string | null;
+		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools: string[];
 		volumes: string[];
 		budget?: { daily: string | null; monthly: string | null; per_task: string | null; on_exceeded: string; fallback_model: string; warn_at_percent: number };
