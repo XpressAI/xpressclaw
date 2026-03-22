@@ -279,9 +279,12 @@ fn parse_cron(expr: &str) -> std::result::Result<croner::Cron, croner::errors::C
 
 /// Check if a schedule should trigger now based on its cron expression.
 ///
+/// Cron expressions are evaluated against the server's local time so that
+/// "0 9 * * *" means 9am in the user's timezone, not 9am UTC.
 /// Checks if a cron match occurred between last_run and now.
-/// If the schedule has never run, checks the last 2 minutes.
 fn should_trigger(schedule: &Schedule, now: chrono::DateTime<Utc>) -> bool {
+    // Convert to local time for cron matching
+    let now_local = now.with_timezone(&chrono::Local);
     let cron = match parse_cron(&schedule.cron) {
         Ok(c) => c,
         Err(e) => {
@@ -299,13 +302,14 @@ fn should_trigger(schedule: &Schedule, now: chrono::DateTime<Utc>) -> bool {
         .last_run
         .as_deref()
         .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
-        .map(|dt| dt.and_utc())
-        .unwrap_or_else(|| now - chrono::Duration::minutes(2));
+        .map(|dt| dt.and_utc().with_timezone(&chrono::Local))
+        .unwrap_or_else(|| now_local - chrono::Duration::minutes(2));
 
-    // Find the next cron match after last_run. If it's <= now, we should trigger.
+    // Find the next cron match after last_run (in local time).
+    // If it's <= now, we should trigger.
     let mut iter = cron.iter_after(check_from);
     match iter.next() {
-        Some(next) => next <= now,
+        Some(next) => next <= now_local,
         None => false,
     }
 }
