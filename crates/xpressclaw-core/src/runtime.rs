@@ -377,6 +377,7 @@ mod tests {
                 agent_id: Some("atlas".into()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })
@@ -399,6 +400,7 @@ mod tests {
                 agent_id: Some("atlas".into()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })
@@ -460,6 +462,7 @@ mod tests {
                 agent_id: Some("atlas".into()),
                 parent_task_id: None,
                 sop_id: None,
+                conversation_id: None,
                 priority: None,
                 context: None,
             })

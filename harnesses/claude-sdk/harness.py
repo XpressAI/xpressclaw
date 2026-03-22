@@ -189,6 +189,13 @@ class ClaudeSdkHarness(BaseHarness):
                 q.put(f"data: {json.dumps(error_payload)}\n\n")
             finally:
                 q.put(None)  # sentinel
+                # Clean up async generators before closing the loop.
+                # Without this, the query() generator gets destroyed mid-flight,
+                # killing the TCP connection before the server finishes reading.
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
                 loop.close()
 
         thread = threading.Thread(target=_run_in_thread, daemon=True)

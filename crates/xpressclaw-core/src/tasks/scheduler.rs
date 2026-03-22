@@ -2,11 +2,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
+use crate::tasks::queue::TaskQueue;
 
 /// A scheduled task definition stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +151,7 @@ impl ScheduleManager {
         self.get(id)
     }
 
-    /// Trigger a schedule immediately, creating a task from it.
+    /// Trigger a schedule immediately, creating a task and enqueuing it.
     ///
     /// Supports placeholders in the title:
     /// - `{date}` → current date (YYYY-MM-DD)
@@ -172,15 +174,28 @@ impl ScheduleManager {
                 .replace("{datetime}", &now.format("%Y-%m-%d %H:%M").to_string())
         });
 
+        let agent_id = schedule.agent_id.clone();
         let task = board.create(&CreateTask {
             title,
             description,
-            agent_id: Some(schedule.agent_id),
+            agent_id: Some(agent_id.clone()),
             parent_task_id: None,
             sop_id: None,
+            conversation_id: None,
             priority: None,
             context: None,
         })?;
+
+        // Enqueue for the dispatcher
+        let queue = TaskQueue::new(self.db.clone());
+        if let Err(e) = queue.enqueue(&task.id, &agent_id) {
+            warn!(
+                task_id = task.id.as_str(),
+                schedule_id = id,
+                error = %e,
+                "failed to enqueue scheduled task"
+            );
+        }
 
         // Update last_run and run_count
         let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -193,6 +208,109 @@ impl ScheduleManager {
         })?;
 
         Ok(task)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background cron runner
+// ---------------------------------------------------------------------------
+
+/// Start the schedule runner background loop.
+///
+/// Checks all enabled schedules every 60 seconds and triggers any whose
+/// cron expression matches the current time. Uses `croner` for cron parsing.
+pub async fn start_schedule_runner(db: Arc<Database>) {
+    info!("schedule runner started");
+
+    loop {
+        if let Err(e) = check_schedules(&db) {
+            error!(error = %e, "schedule check error");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+fn check_schedules(db: &Arc<Database>) -> Result<()> {
+    let mgr = ScheduleManager::new(db.clone());
+    let board = TaskBoard::new(db.clone());
+
+    let schedules = mgr.list(None, true)?; // enabled only
+    if schedules.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+
+    for schedule in &schedules {
+        if should_trigger(schedule, now) {
+            info!(
+                schedule_id = schedule.id.as_str(),
+                name = schedule.name.as_str(),
+                agent_id = schedule.agent_id.as_str(),
+                "triggering scheduled task"
+            );
+            match mgr.trigger(&schedule.id, &board) {
+                Ok(task) => {
+                    info!(
+                        schedule_id = schedule.id.as_str(),
+                        task_id = task.id.as_str(),
+                        "scheduled task created"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        schedule_id = schedule.id.as_str(),
+                        error = %e,
+                        "failed to trigger schedule"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a cron expression using croner.
+/// Supports both 5-field (standard) and 6-field (with seconds) expressions.
+fn parse_cron(expr: &str) -> std::result::Result<croner::Cron, croner::errors::CronError> {
+    croner::Cron::new(expr).parse()
+}
+
+/// Check if a schedule should trigger now based on its cron expression.
+///
+/// Cron expressions are evaluated against the server's local time so that
+/// "0 9 * * *" means 9am in the user's timezone, not 9am UTC.
+/// Checks if a cron match occurred between last_run and now.
+fn should_trigger(schedule: &Schedule, now: chrono::DateTime<Utc>) -> bool {
+    // Convert to local time for cron matching
+    let now_local = now.with_timezone(&chrono::Local);
+    let cron = match parse_cron(&schedule.cron) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                schedule_id = schedule.id.as_str(),
+                cron = schedule.cron.as_str(),
+                error = %e,
+                "invalid cron expression, skipping"
+            );
+            return false;
+        }
+    };
+
+    let check_from = schedule
+        .last_run
+        .as_deref()
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+        .map(|dt| dt.and_utc().with_timezone(&chrono::Local))
+        .unwrap_or_else(|| now_local - chrono::Duration::minutes(2));
+
+    // Find the next cron match after last_run (in local time).
+    // If it's <= now, we should trigger.
+    let mut iter = cron.iter_after(check_from);
+    match iter.next() {
+        Some(next) => next <= now_local,
+        None => false,
     }
 }
 
@@ -359,5 +477,76 @@ mod tests {
         let (_, mgr, _) = setup();
         let result = mgr.get("nonexistent");
         assert!(matches!(result, Err(Error::ScheduleNotFound { .. })));
+    }
+
+    #[test]
+    fn test_should_trigger_never_run() {
+        let schedule = Schedule {
+            id: "test".into(),
+            name: "Every minute".into(),
+            cron: "* * * * *".into(), // standard 5-field: every minute
+            agent_id: "atlas".into(),
+            title: "Test".into(),
+            description: None,
+            enabled: true,
+            last_run: None,
+            run_count: 0,
+            created_at: String::new(),
+        };
+
+        assert!(should_trigger(&schedule, Utc::now()));
+    }
+
+    #[test]
+    fn test_should_trigger_recently_run() {
+        // A schedule that just ran should not trigger again immediately
+        let now = Utc::now();
+        let schedule = Schedule {
+            id: "test".into(),
+            name: "Hourly".into(),
+            cron: "0 * * * *".into(), // standard 5-field: top of every hour
+            agent_id: "atlas".into(),
+            title: "Test".into(),
+            description: None,
+            enabled: true,
+            last_run: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
+            run_count: 1,
+            created_at: String::new(),
+        };
+
+        // Just ran — next match is next hour, so should not trigger now
+        assert!(!should_trigger(&schedule, now));
+    }
+
+    #[test]
+    fn test_should_trigger_invalid_cron() {
+        let schedule = Schedule {
+            id: "test".into(),
+            name: "Bad".into(),
+            cron: "not a cron".into(),
+            agent_id: "atlas".into(),
+            title: "Test".into(),
+            description: None,
+            enabled: true,
+            last_run: None,
+            run_count: 0,
+            created_at: String::new(),
+        };
+
+        assert!(!should_trigger(&schedule, Utc::now()));
+    }
+
+    #[test]
+    fn test_trigger_enqueues_task() {
+        let (db, mgr, board) = setup();
+        let schedule = create_schedule(&mgr);
+
+        let task = mgr.trigger(&schedule.id, &board).unwrap();
+
+        // Verify task was enqueued
+        let queue = TaskQueue::new(db);
+        let pending = queue.pending_count("atlas").unwrap();
+        assert_eq!(pending, 1);
+        assert_eq!(task.agent_id.as_deref(), Some("atlas"));
     }
 }

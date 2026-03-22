@@ -63,6 +63,20 @@ async fn create_task(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
     let task = board.create(&req).map_err(internal_error)?;
+
+    // Auto-enqueue for the dispatcher if the task has an assigned agent
+    if let Some(ref agent_id) = task.agent_id {
+        let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
+        if let Err(e) = queue.enqueue(&task.id, agent_id) {
+            tracing::warn!(
+                task_id = task.id,
+                agent_id,
+                error = %e,
+                "failed to enqueue task for dispatch"
+            );
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(json!(task))))
 }
 

@@ -52,6 +52,11 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "backend": a.backend,
                 "role": a.role,
                 "model": a.model,
+                "llm": a.llm.as_ref().map(|l| json!({
+                    "provider": l.provider,
+                    "api_key": l.api_key.as_ref().map(|_| "********"),
+                    "base_url": l.base_url,
+                })),
                 "tools": a.tools,
                 "volumes": a.volumes,
             });
@@ -59,7 +64,10 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 agent["budget"] = json!({
                     "daily": budget.daily,
                     "monthly": budget.monthly,
+                    "per_task": budget.per_task,
                     "on_exceeded": budget.on_exceeded,
+                    "fallback_model": budget.fallback_model,
+                    "warn_at_percent": budget.warn_at_percent,
                 });
             }
             if let Some(ref rl) = a.rate_limit {
@@ -73,8 +81,13 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 agent["wake_on"] = json!(a.wake_on.iter().map(|w| json!({
                     "schedule": w.schedule,
                     "event": w.event,
+                    "condition": w.condition,
                 })).collect::<Vec<_>>());
             }
+            agent["hooks"] = json!({
+                "before_message": a.hooks.before_message,
+                "after_message": a.hooks.after_message,
+            });
             agent
         }).collect::<Vec<_>>(),
         "system": {

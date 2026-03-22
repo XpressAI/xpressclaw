@@ -131,6 +131,7 @@ impl Database {
             (8, MIGRATION_V8),
             (9, MIGRATION_V9),
             (10, MIGRATION_V10),
+            (11, MIGRATION_V11),
         ];
 
         for &(target, sql) in migrations {
@@ -466,6 +467,14 @@ CREATE INDEX idx_conv_msg_conv ON conversation_messages(conversation_id);
 CREATE INDEX idx_conv_msg_created ON conversation_messages(created_at);
 ";
 
+const MIGRATION_V11: &str = "
+-- Link tasks to conversations for the continuation pattern.
+-- When a task is created from a conversation, completion/failure
+-- notifications are sent back to the originating conversation.
+ALTER TABLE tasks ADD COLUMN conversation_id TEXT;
+CREATE INDEX idx_tasks_conversation ON tasks(conversation_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,7 +492,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "10");
+        assert_eq!(version, "11");
     }
 
     #[test]

@@ -35,6 +35,20 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         state.mcp_manager.start_servers(&config.mcp_servers).await;
     }
 
+    // Start the task dispatcher background loop.
+    let dispatcher_db = state.db.clone();
+    let dispatcher_config = state.config();
+    tokio::spawn(async move {
+        xpressclaw_core::tasks::dispatcher::start_dispatcher(dispatcher_db, dispatcher_config)
+            .await;
+    });
+
+    // Start the cron schedule runner.
+    let scheduler_db = state.db.clone();
+    tokio::spawn(async move {
+        xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db).await;
+    });
+
     let app = create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

@@ -399,6 +399,38 @@
 		<!-- Messages -->
 		<div bind:this={messagesEl} class="flex-1 overflow-y-auto p-4 space-y-4">
 			{#each messages as msg (msg.id)}
+				{#if msg.message_type === 'task_status'}
+					{@const taskData = (() => { try { return JSON.parse(msg.content); } catch { return null; } })()}
+					{#if taskData}
+						<div class="flex gap-3">
+							<div class="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center text-xs bg-muted text-muted-foreground">
+								&#x2611;
+							</div>
+							<div class="flex-1 max-w-[70%]">
+								<div class="rounded-lg border px-3 py-2.5 text-sm
+									{taskData.status === 'completed' ? 'border-emerald-500/30 bg-emerald-500/5' :
+									 taskData.status === 'failed' ? 'border-red-500/30 bg-red-500/5' :
+									 taskData.status === 'in_progress' ? 'border-blue-500/30 bg-blue-500/5' :
+									 'border-amber-500/30 bg-amber-500/5'}">
+									<div class="flex items-center gap-2">
+										<span class="h-2 w-2 rounded-full
+											{taskData.status === 'completed' ? 'bg-emerald-400' :
+											 taskData.status === 'failed' ? 'bg-red-400' :
+											 taskData.status === 'in_progress' ? 'bg-blue-400 animate-pulse' :
+											 'bg-amber-400'}"></span>
+										<span class="font-medium">{taskData.title}</span>
+									</div>
+									<div class="text-xs text-muted-foreground mt-1 flex items-center gap-2">
+										<span>Task {taskData.status === 'in_progress' ? 'in progress' : taskData.status}</span>
+										<span>&middot;</span>
+										<span>{timeAgo(msg.created_at)}</span>
+										<a href="/tasks" class="underline hover:text-foreground ml-auto">View tasks</a>
+									</div>
+								</div>
+							</div>
+						</div>
+					{/if}
+				{:else}
 				{@const isUser = msg.sender_type === 'user'}
 				<div class="flex gap-3 {isUser ? 'flex-row-reverse' : ''}">
 					<!-- Avatar -->
@@ -423,6 +455,7 @@
 						</div>
 					</div>
 				</div>
+				{/if}
 			{:else}
 				<div class="flex h-full items-center justify-center text-muted-foreground text-sm">
 					<div class="text-center space-y-2">
