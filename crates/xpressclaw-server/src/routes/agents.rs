@@ -183,7 +183,7 @@ async fn start_agent(
         s.environment
             .push(format!("ANTHROPIC_BASE_URL={server_base}"));
         s.environment
-            .push("ANTHROPIC_API_KEY=sk-ant-xpressclaw".to_string());
+            .push(format!("ANTHROPIC_API_KEY=sk-ant-{}", record.name));
         s
     };
 

@@ -90,7 +90,8 @@ pub fn build_container_spec(
     if let Some(key) = effective_anthropic_key {
         env.push(format!("ANTHROPIC_API_KEY={key}"));
     } else {
-        env.push("ANTHROPIC_API_KEY=sk-ant-xpressclaw".to_string());
+        // Encode agent name in the placeholder key so the proxy can identify the agent.
+        env.push(format!("ANTHROPIC_API_KEY=sk-ant-{}", agent.name));
     }
     if let Some(key) = effective_openai_key {
         env.push(format!("OPENAI_API_KEY={key}"));
@@ -244,7 +245,7 @@ mod tests {
         assert!(spec
             .environment
             .iter()
-            .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-xpressclaw"));
+            .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-test-agent"));
     }
 
     #[test]

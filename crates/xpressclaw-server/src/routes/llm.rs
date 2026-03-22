@@ -30,8 +30,36 @@ pub fn routes() -> Router<AppState> {
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
+    headers: axum::http::HeaderMap,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Check for budget degraded model override via API key
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(agent_id) = auth
+        .strip_prefix("Bearer sk-ant-")
+        .or_else(|| auth.strip_prefix("Bearer sk-"))
+    {
+        // Only check placeholder keys (real keys won't start with sk-ant- or sk-)
+        if !agent_id.contains("xpressclaw") {
+            let budget_mgr = xpressclaw_core::budget::manager::BudgetManager::new(
+                state.db.clone(),
+                state.config(),
+            );
+            if let Ok(Some(fallback)) = budget_mgr.degraded_model(agent_id) {
+                debug!(
+                    agent_id,
+                    original_model = %req.model,
+                    fallback_model = %fallback,
+                    "budget degraded: switching model"
+                );
+                req.model = fallback;
+            }
+        }
+    }
+
     let router = state.llm_router().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -136,8 +164,28 @@ async fn anthropic_messages(
             )
         })?;
 
-    let model = req.model.clone();
+    let mut model = req.model.clone();
     let streaming = req.stream.unwrap_or(false);
+
+    // Check if this agent has a degraded model override (budget degrade action).
+    // Agent ID is encoded in the placeholder API key: "sk-ant-{agent_name}".
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(agent_id) = api_key.strip_prefix("sk-ant-") {
+        let budget_mgr =
+            xpressclaw_core::budget::manager::BudgetManager::new(state.db.clone(), state.config());
+        if let Ok(Some(fallback)) = budget_mgr.degraded_model(agent_id) {
+            debug!(
+                agent_id,
+                original_model = %model,
+                fallback_model = %fallback,
+                "budget degraded: switching model"
+            );
+            model = fallback;
+        }
+    }
 
     let num_tools = req.tools.as_ref().map(|t| t.len()).unwrap_or(0);
     let num_messages = req.messages.len();
