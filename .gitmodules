@@ -1,0 +1,3 @@
+[submodule "external/ready-agent-cog"]
+	path = external/ready-agent-cog
+	url = https://github.com/XpressAI/ready-agent-cog.git

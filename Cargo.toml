@@ -82,4 +82,4 @@ open = "5"
 encoding_rs = "0.8"
 
 # SOP/Procedure execution engine
-ready-agent-cog = { git = "https://github.com/XpressAI/ready-agent-cog" }
+ready-agent-cog = { path = "external/ready-agent-cog" }
