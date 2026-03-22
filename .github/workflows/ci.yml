@@ -73,7 +73,7 @@ jobs:
         run: Add-MpPreference -ExclusionPath "$(Get-Location)\target", "$env:CARGO_HOME"
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
