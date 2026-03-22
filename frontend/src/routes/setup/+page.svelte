@@ -313,6 +313,7 @@
 					model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
 					tools,
 					volumes: volumes.length > 0 ? volumes : undefined,
+					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
 				});
 				step = 4;
 				autoStartAgents();

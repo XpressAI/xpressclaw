@@ -255,6 +255,9 @@ struct AgentSetup {
     model: Option<String>,
     tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
+    /// MCP servers to merge into global config (used by add-agent flow).
+    #[serde(default)]
+    mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
 /// Return current GGUF download progress.
@@ -379,10 +382,27 @@ async fn complete_setup(
             .collect()
     };
 
+    // Merge preset default_mcp_servers as fallback for any tools that
+    // the frontend didn't explicitly configure MCP servers for.
+    let mut mcp_servers = req.mcp_servers;
+    for agent_setup in &req.agents {
+        if let Some(preset) = agent_setup
+            .preset
+            .as_deref()
+            .and_then(|id| presets.iter().find(|p| p.id == id))
+        {
+            for (name, server) in &preset.default_mcp_servers {
+                if !mcp_servers.contains_key(name) {
+                    mcp_servers.insert(name.clone(), server.clone());
+                }
+            }
+        }
+    }
+
     let mut config = Config {
         llm,
         agents,
-        mcp_servers: req.mcp_servers,
+        mcp_servers,
         ..Default::default()
     };
     config.system.isolation = req.isolation.clone();
@@ -581,10 +601,24 @@ async fn add_agent(
         new_agents.push(agent_config.clone());
     }
 
+    // Merge MCP servers: preset defaults first, then explicit overrides from frontend.
+    let mut new_mcp = old_config.mcp_servers.clone();
+    if let Some(preset) = preset {
+        for (name, server) in &preset.default_mcp_servers {
+            if !new_mcp.contains_key(name) {
+                new_mcp.insert(name.clone(), server.clone());
+            }
+        }
+    }
+    // Frontend-provided MCP servers override preset defaults (user may customize).
+    for (name, server) in req.mcp_servers {
+        new_mcp.insert(name, server);
+    }
+
     let new_config = Config {
         agents: new_agents,
         llm: old_config.llm.clone(),
-        mcp_servers: old_config.mcp_servers.clone(),
+        mcp_servers: new_mcp,
         system: old_config.system.clone(),
         ..Default::default()
     };
@@ -822,5 +856,259 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);
+    }
+
+    /// Verify the wizard writes a valid YAML config that round-trips through
+    /// Config::load, that preset MCP servers are merged, and that add-agent
+    /// also merges its preset's MCP servers.
+    #[tokio::test]
+    async fn test_wizard_writes_valid_config_with_mcp_servers() {
+        // Use a unique temp path to avoid collisions with other tests.
+        let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-mcp.yaml");
+        let _ = std::fs::remove_file(&config_path);
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let app = Router::new()
+            .nest("/setup", routes())
+            .with_state(state.clone());
+
+        // ── Step 1: full setup with researcher preset ──
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "llm": {
+                                "provider": "openai",
+                                "api_key": "sk-test"
+                            },
+                            "agents": [
+                                {
+                                    "name": "researcher",
+                                    "preset": "researcher",
+                                    "tools": ["filesystem", "shell", "memory", "fetch"]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Load and validate the written config
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "researcher");
+        assert!(
+            config.agents[0].tools.contains(&"fetch".to_string()),
+            "agent should have fetch tool"
+        );
+        // Preset default_mcp_servers should have been merged
+        assert!(
+            config.mcp_servers.contains_key("fetch"),
+            "fetch MCP server should be configured from preset"
+        );
+        let fetch_cfg = &config.mcp_servers["fetch"];
+        assert_eq!(fetch_cfg.server_type, "stdio");
+        assert_eq!(fetch_cfg.command.as_deref(), Some("npx"));
+
+        // Verify the YAML round-trips: save it again, reload, still valid
+        let roundtrip_path = std::env::temp_dir().join("test-xpressclaw-wizard-roundtrip.yaml");
+        config.save(&roundtrip_path).unwrap();
+        let reloaded = Config::load(&roundtrip_path).unwrap();
+        assert_eq!(reloaded.agents[0].name, "researcher");
+        assert!(reloaded.mcp_servers.contains_key("fetch"));
+        let _ = std::fs::remove_file(&roundtrip_path);
+
+        // ── Step 2: add developer agent via add-agent ──
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "developer",
+                            "preset": "developer",
+                            "tools": ["filesystem", "shell", "git", "memory"]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Reload config — should now have both agents and their MCP servers
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.agents.len(), 2);
+        let agent_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(agent_names.contains(&"researcher"));
+        assert!(agent_names.contains(&"developer"));
+
+        // Developer preset should have added git MCP server
+        assert!(
+            config.mcp_servers.contains_key("git"),
+            "git MCP server should be configured from developer preset"
+        );
+        // Researcher's fetch should still be there
+        assert!(
+            config.mcp_servers.contains_key("fetch"),
+            "fetch MCP server should be preserved"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// Frontend-provided MCP servers should override preset defaults,
+    /// and explicit env vars (like URL filters) should be preserved.
+    #[tokio::test]
+    async fn test_frontend_mcp_servers_override_preset_defaults() {
+        let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-override.yaml");
+        let _ = std::fs::remove_file(&config_path);
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        // Frontend sends explicit fetch config with custom env (URL filter)
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "llm": { "provider": "local" },
+                            "agents": [{
+                                "name": "researcher",
+                                "preset": "researcher",
+                                "tools": ["filesystem", "shell", "memory", "fetch"]
+                            }],
+                            "mcp_servers": {
+                                "fetch": {
+                                    "type": "stdio",
+                                    "command": "npx",
+                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
+                                    "env": { "FETCH_BLOCKED_URLS": "*.evil.com" }
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let config = Config::load(&config_path).unwrap();
+        let fetch_cfg = config
+            .mcp_servers
+            .get("fetch")
+            .expect("fetch MCP server missing");
+        // Frontend's explicit config should win over preset default
+        assert_eq!(
+            fetch_cfg.env.get("FETCH_BLOCKED_URLS").map(|s| s.as_str()),
+            Some("*.evil.com"),
+            "frontend env overrides should be preserved"
+        );
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// add-agent with frontend MCP servers should override preset defaults.
+    #[tokio::test]
+    async fn test_add_agent_frontend_mcp_overrides() {
+        let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");
+        let _ = std::fs::remove_file(&config_path);
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        // Initial setup with assistant (no extra MCP servers)
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "llm": { "provider": "local" },
+                            "agents": [{ "name": "assistant", "preset": "assistant" }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Add researcher with custom fetch config from frontend
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "researcher",
+                            "preset": "researcher",
+                            "tools": ["filesystem", "shell", "memory", "fetch"],
+                            "mcp_servers": {
+                                "fetch": {
+                                    "type": "stdio",
+                                    "command": "npx",
+                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
+                                    "env": { "FETCH_ALLOWED_URLS": "*.wikipedia.org,*.arxiv.org" }
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(config.agents.len(), 2);
+
+        // Frontend-provided fetch config should be used (not bare preset default)
+        let fetch_cfg = config
+            .mcp_servers
+            .get("fetch")
+            .expect("fetch MCP server missing");
+        assert_eq!(
+            fetch_cfg.env.get("FETCH_ALLOWED_URLS").map(|s| s.as_str()),
+            Some("*.wikipedia.org,*.arxiv.org"),
+        );
+
+        let _ = std::fs::remove_file(&config_path);
     }
 }
