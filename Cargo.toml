@@ -80,3 +80,6 @@ llama-cpp-2 = { git = "https://github.com/XpressAI/llama-cpp-rs", default-featur
 hf-hub = "0.5"
 open = "5"
 encoding_rs = "0.8"
+
+# SOP/Procedure execution engine
+ready-agent-cog = { git = "https://github.com/XpressAI/ready-agent-cog" }
