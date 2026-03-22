@@ -424,7 +424,7 @@
 										<span>Task {taskData.status === 'in_progress' ? 'in progress' : taskData.status}</span>
 										<span>&middot;</span>
 										<span>{timeAgo(msg.created_at)}</span>
-										<a href="/tasks" class="underline hover:text-foreground ml-auto">View tasks</a>
+										<a href="/tasks/{taskData.task_id}" class="underline hover:text-foreground ml-auto">View task</a>
 									</div>
 								</div>
 							</div>

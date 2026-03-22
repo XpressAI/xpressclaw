@@ -248,8 +248,23 @@ export const tasks = {
 			method: 'PATCH',
 			body: JSON.stringify({ status })
 		}),
-	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' })
+	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
+	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	addMessage: (id: string, role: string, content: string) =>
+		request<TaskMessage>(`/api/tasks/${id}/messages`, {
+			method: 'POST',
+			body: JSON.stringify({ role, content })
+		}),
+	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
 };
+
+export interface TaskMessage {
+	id: number;
+	task_id: string;
+	role: string;
+	content: string;
+	timestamp: string;
+}
 
 // -- Memory --
 
