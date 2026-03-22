@@ -509,10 +509,15 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
 
 /// Start the task dispatcher background loop.
 ///
-/// Polls the TaskQueue every few seconds for queued items, claims them,
-/// and runs each through the state machine. Runs until the process exits.
+/// On startup, recovers interrupted tasks (queue items stuck in 'running'
+/// state from a previous crash, and in_progress tasks with no queue entry).
+/// Then polls every few seconds for queued items and runs them.
 pub async fn start_dispatcher(db: Arc<Database>, config: Arc<Config>) {
     info!("task dispatcher started");
+
+    if let Err(e) = recover_on_startup(&db) {
+        error!(error = %e, "failed to recover tasks on startup");
+    }
 
     loop {
         if let Err(e) = poll_once(&db, &config).await {
@@ -520,6 +525,56 @@ pub async fn start_dispatcher(db: Arc<Database>, config: Arc<Config>) {
         }
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
     }
+}
+
+/// Recover tasks that were interrupted by a server restart.
+fn recover_on_startup(db: &Arc<Database>) -> crate::error::Result<()> {
+    let queue = TaskQueue::new(db.clone());
+    let board = TaskBoard::new(db.clone());
+
+    // 1. Reset 'running' queue items back to 'queued' — they were mid-execution
+    let running = queue.list(None, Some("running"), 100)?;
+    for item in &running {
+        let _ = queue.fail(item.id, "interrupted by restart");
+        let _ = queue.enqueue(&item.task_id, &item.agent_id);
+        info!(
+            task_id = item.task_id,
+            agent_id = item.agent_id,
+            "recovered interrupted queue item"
+        );
+    }
+
+    // 2. Re-enqueue in_progress tasks that have no active queue entry
+    let in_progress = board.list(Some("in_progress"), None, 100)?;
+    for task in &in_progress {
+        let agent_id = match &task.agent_id {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+
+        // Check if there's already a queued/running entry for this task
+        let existing = queue.list(None, Some("queued"), 100)?;
+        let already_queued = existing.iter().any(|q| q.task_id == task.id);
+        if already_queued {
+            continue;
+        }
+
+        let _ = queue.enqueue(&task.id, &agent_id);
+        info!(
+            task_id = task.id,
+            agent_id, "re-enqueued orphaned in_progress task"
+        );
+    }
+
+    if !running.is_empty() || !in_progress.is_empty() {
+        info!(
+            running_recovered = running.len(),
+            orphaned_recovered = in_progress.len(),
+            "task recovery complete"
+        );
+    }
+
+    Ok(())
 }
 
 async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<()> {
