@@ -150,6 +150,66 @@ TOOLS = [
             "required": ["parent_task_id"],
         },
     },
+    {
+        "name": "create_schedule",
+        "description": (
+            "Create a recurring scheduled task using a cron expression. "
+            "The task will be automatically created and assigned to an agent "
+            "each time the schedule fires. "
+            "Cron format: minute hour day-of-month month day-of-week "
+            "(e.g. '0 9 * * *' = daily at 9am, '0 9 * * 1-5' = weekdays at 9am)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Schedule name (e.g. 'Daily standup report')",
+                },
+                "cron": {
+                    "type": "string",
+                    "description": "Cron expression (e.g. '0 9 * * *' for daily at 9am)",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Task title template. Use {date}, {time}, {datetime} for placeholders.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Task description — what the agent should do each time",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent to assign (omit to assign to yourself)",
+                },
+            },
+            "required": ["name", "cron", "title"],
+        },
+    },
+    {
+        "name": "list_schedules",
+        "description": "List all scheduled tasks.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Filter by agent",
+                },
+            },
+        },
+    },
+    {
+        "name": "delete_schedule",
+        "description": "Delete a scheduled task by ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schedule_id": {"type": "string", "description": "Schedule ID to delete"},
+            },
+            "required": ["schedule_id"],
+        },
+    },
 ]
 
 
@@ -254,6 +314,45 @@ def handle_tool(name: str, arguments: dict) -> str:
             f"- [{t['status']}] {t['title']} (id: {t['id']})" for t in subtasks
         ]
         return f"{len(subtasks)} subtask(s):\n" + "\n".join(lines)
+
+    elif name == "create_schedule":
+        body = {
+            "name": arguments["name"],
+            "cron": arguments["cron"],
+            "title": arguments["title"],
+            "agent_id": arguments.get("agent_id", AGENT_ID or None),
+        }
+        if "description" in arguments:
+            body["description"] = arguments["description"]
+
+        schedule = _api("POST", "/schedules", body)
+        return (
+            f"Created schedule '{schedule['name']}' "
+            f"(id: {schedule['id']}, cron: {schedule['cron']}, "
+            f"agent: {schedule.get('agent_id') or 'unassigned'})"
+        )
+
+    elif name == "list_schedules":
+        params = {}
+        if "agent_id" in arguments:
+            params["agent_id"] = arguments["agent_id"]
+
+        schedules = _api("GET", "/schedules", params)
+        if not schedules:
+            return "No schedules found."
+        lines = []
+        for s in schedules:
+            status = "enabled" if s.get("enabled") else "disabled"
+            lines.append(
+                f"- [{status}] {s['name']} (id: {s['id']}, "
+                f"cron: {s['cron']}, agent: {s.get('agent_id')}, "
+                f"runs: {s.get('run_count', 0)})"
+            )
+        return f"{len(schedules)} schedule(s):\n" + "\n".join(lines)
+
+    elif name == "delete_schedule":
+        _api("DELETE", f"/schedules/{arguments['schedule_id']}")
+        return f"Deleted schedule {arguments['schedule_id']}"
 
     else:
         return f"Unknown tool: {name}"
