@@ -20,6 +20,8 @@
 	let saving = $state(false);
 	let saveMessage = $state('');
 	let needsRestart = $state(false);
+	let showDeleteConfirm = $state(false);
+	let deleting = $state(false);
 
 	// Tool toggles
 	let fetchEnabled = $state(false);
@@ -119,12 +121,16 @@
 	}
 
 	async function handleDelete() {
-		if (!agent) return;
-		if (!confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
+		if (!agent || deleting) return;
+		deleting = true;
 		try {
 			await agents.delete(agent.id);
 			window.location.href = '/agents';
-		} catch (e) { alert(String(e)); }
+		} catch (e) {
+			deleting = false;
+			showDeleteConfirm = false;
+			saveMessage = `Error deleting: ${e}`;
+		}
 	}
 
 	async function saveConfig() {
@@ -275,7 +281,7 @@
 						Start
 					</button>
 				{/if}
-				<button onclick={handleDelete}
+				<button onclick={() => { showDeleteConfirm = true; }}
 					class="rounded-md border border-destructive/50 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors">
 					Delete
 				</button>
@@ -633,3 +639,29 @@
 		<div class="text-sm text-muted-foreground">Loading...</div>
 	{/if}
 </div>
+
+{#if showDeleteConfirm && agent}
+	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+		<div class="rounded-lg border border-border bg-card p-6 shadow-lg w-96 space-y-4">
+			<h3 class="text-lg font-semibold">Delete Agent</h3>
+			<p class="text-sm text-muted-foreground">
+				Are you sure you want to delete <strong>{agent.name}</strong>? This will remove the agent and its configuration. This cannot be undone.
+			</p>
+			<div class="flex gap-2 justify-end">
+				<button
+					onclick={() => { showDeleteConfirm = false; }}
+					class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent"
+				>
+					Cancel
+				</button>
+				<button
+					onclick={handleDelete}
+					disabled={deleting}
+					class="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+				>
+					{deleting ? 'Deleting...' : 'Delete Agent'}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
