@@ -49,6 +49,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+          token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -64,18 +67,57 @@ jobs:
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
 
-      - name: Install tauri-cli
-        run: cargo install tauri-cli --version "^2"
+      # macOS: install certificate for signing
+      - name: Install Apple certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
-      - name: Build CLI sidecar binary
-        run: cargo build --release --target ${{ matrix.target }} -p xpressclaw-cli
+      # Build CLI sidecar for the target architecture
+      - name: Build CLI sidecar
+        run: |
+          cargo build --release --target ${{ matrix.target }} -p xpressclaw-cli
+          mkdir -p crates/xpressclaw-tauri/binaries
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/xpressclaw.exe \
+               crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}.exe
+          else
+            cp target/${{ matrix.target }}/release/xpressclaw \
+               crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}
+          fi
+        shell: bash
 
+      # Build Tauri app (with signing + notarization on macOS)
       - name: Build Tauri app
-        run: cargo tauri build --target ${{ matrix.target }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx @tauri-apps/cli build --target ${{ matrix.target }}
 
       # macOS: upload .dmg
       - name: Upload macOS DMG
@@ -132,8 +174,8 @@ jobs:
             Automated pre-release build from `main` at ${{ github.sha }}.
 
             **Downloads:**
-            - macOS (Apple Silicon): `.dmg` arm64
-            - macOS (Intel): `.dmg` x64
+            - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
+            - macOS (Intel): `.dmg` x64 — signed and notarized
             - Windows: `.msi` or `.exe` installer
           prerelease: true
           make_latest: false
