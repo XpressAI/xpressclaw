@@ -118,6 +118,15 @@
 		} catch (e) { alert(String(e)); }
 	}
 
+	async function handleDelete() {
+		if (!agent) return;
+		if (!confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
+		try {
+			await agents.delete(agent.id);
+			window.location.href = '/agents';
+		} catch (e) { alert(String(e)); }
+	}
+
 	async function saveConfig() {
 		if (!agent) return;
 		saving = true;
@@ -266,6 +275,10 @@
 						Start
 					</button>
 				{/if}
+				<button onclick={handleDelete}
+					class="rounded-md border border-destructive/50 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors">
+					Delete
+				</button>
 			</div>
 		</div>
 
