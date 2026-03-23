@@ -70,8 +70,9 @@ pub fn build_container_spec(
     // LLM routing — harnesses call back to the server's built-in /v1/ router by default.
     // We set both the custom LLM_BASE_URL and the standard OPENAI_BASE_URL so that
     // any OpenAI-compatible SDK inside the container works out of the box.
+    // Rewrite localhost URLs to host.docker.internal so they work inside containers.
     let llm_base_url = effective_base_url
-        .map(|s| s.to_string())
+        .map(rewrite_localhost_for_docker)
         .unwrap_or_else(|| format!("http://host.docker.internal:{server_port}/v1"));
     env.push(format!("LLM_BASE_URL={llm_base_url}"));
     env.push(format!("OPENAI_BASE_URL={llm_base_url}"));
@@ -145,6 +146,13 @@ pub fn build_container_spec(
         network_mode: Some("bridge".to_string()),
         expose_port: Some(8080),
     }
+}
+
+/// Rewrite localhost/127.0.0.1 URLs to host.docker.internal so they
+/// work inside Docker containers.
+fn rewrite_localhost_for_docker(url: &str) -> String {
+    url.replace("://localhost", "://host.docker.internal")
+        .replace("://127.0.0.1", "://host.docker.internal")
 }
 
 /// Expand `~` at the start of a path to the user's home directory.
