@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
-use xpressclaw_core::config::{AgentConfig, Config, LlmConfig, McpServerConfig};
+use xpressclaw_core::config::{AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
@@ -374,6 +374,22 @@ async fn complete_setup(
                     }
                 }
 
+                // Populate per-agent LLM config from wizard settings
+                let agent_llm = {
+                    let provider = req.llm.provider.clone();
+                    let api_key = req.llm.api_key.clone();
+                    let base_url = req.llm.base_url.clone().or(req.llm.local_base_url.clone());
+                    if !provider.is_empty() {
+                        Some(crate::routes::setup::AgentLlmConfig {
+                            provider: Some(provider),
+                            api_key,
+                            base_url,
+                        })
+                    } else {
+                        None
+                    }
+                };
+
                 AgentConfig {
                     name: a.name.clone(),
                     backend: a
@@ -387,6 +403,7 @@ async fn complete_setup(
                         .or(preset.map(|p| p.role.to_string()))
                         .unwrap_or_default(),
                     model: a.model.clone(),
+                    llm: agent_llm,
                     tools,
                     volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()
@@ -585,6 +602,22 @@ async fn add_agent(
         }
     }
 
+    // Inherit LLM config from the existing global config
+    let old_config = state.config();
+    let agent_llm = Some(AgentLlmConfig {
+        provider: Some(old_config.llm.default_provider.clone()),
+        api_key: old_config
+            .llm
+            .openai_api_key
+            .clone()
+            .or(old_config.llm.anthropic_api_key.clone()),
+        base_url: old_config
+            .llm
+            .openai_base_url
+            .clone()
+            .or(old_config.llm.local_base_url.clone()),
+    });
+
     let agent_config = AgentConfig {
         name: req.name.clone(),
         backend: req
@@ -598,6 +631,7 @@ async fn add_agent(
             .or(preset.map(|p| p.role.to_string()))
             .unwrap_or_default(),
         model: req.model.clone(),
+        llm: agent_llm,
         tools,
         volumes: req.volumes.clone().unwrap_or_default(),
         ..Default::default()
