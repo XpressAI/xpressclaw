@@ -5,6 +5,7 @@ members = [
     "crates/xpressclaw-cli",
     "crates/xpressclaw-tauri",
 ]
+exclude = ["external/ready-agent-cog"]
 resolver = "2"
 
 [workspace.package]
@@ -80,3 +81,6 @@ llama-cpp-2 = { git = "https://github.com/XpressAI/llama-cpp-rs", default-featur
 hf-hub = "0.5"
 open = "5"
 encoding_rs = "0.8"
+
+# SOP/Procedure execution engine
+ready-agent-cog = { path = "external/ready-agent-cog" }

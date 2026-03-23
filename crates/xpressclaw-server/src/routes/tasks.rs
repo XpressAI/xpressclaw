@@ -14,6 +14,7 @@ use crate::state::AppState;
 pub struct ListParams {
     pub status: Option<String>,
     pub agent_id: Option<String>,
+    pub parent_task_id: Option<String>,
     pub limit: Option<i64>,
 }
 
@@ -48,9 +49,13 @@ async fn list_tasks(
     let board = TaskBoard::new(state.db.clone());
     let limit = params.limit.unwrap_or(100);
 
-    let tasks = board
-        .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
-        .map_err(internal_error)?;
+    let tasks = if let Some(ref parent_id) = params.parent_task_id {
+        board.list_subtasks(parent_id).map_err(internal_error)?
+    } else {
+        board
+            .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
+            .map_err(internal_error)?
+    };
 
     let counts = board.counts().map_err(internal_error)?;
 

@@ -32,4 +32,5 @@ temp/
 # Models (too large for git)
 models/*.onnx
 models/*.gguf
-external/
+external/*
+!external/ready-agent-cog

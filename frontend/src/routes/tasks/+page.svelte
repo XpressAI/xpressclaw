@@ -172,7 +172,7 @@
 				</div>
 				<div class="p-2 space-y-2 min-h-[200px]">
 					{#each colTasks as task}
-						<div class="rounded-md border border-border bg-card p-3 space-y-2">
+						<a href="/tasks/{task.id}" class="block rounded-md border border-border bg-card p-3 space-y-2 hover:border-primary/30 transition-colors">
 							<div class="flex items-start justify-between gap-2">
 								<span class="text-sm font-medium">{task.title}</span>
 								<button
@@ -216,7 +216,7 @@
 									Created {timeAgo(task.created_at)}
 								</div>
 							{/if}
-						</div>
+						</a>
 					{:else}
 						<div class="text-center text-xs text-muted-foreground py-8">No tasks</div>
 					{/each}

@@ -1,0 +1,279 @@
+<script lang="ts">
+	import { onMount, onDestroy } from 'svelte';
+	import { page } from '$app/stores';
+	import { tasks } from '$lib/api';
+	import type { Task, TaskMessage } from '$lib/api';
+	import { timeAgo } from '$lib/utils';
+
+	let task = $state<Task | null>(null);
+	let messages = $state<TaskMessage[]>([]);
+	let subtaskList = $state<Task[]>([]);
+	let error = $state<string | null>(null);
+	let loading = $state(true);
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let messagesEl: HTMLDivElement;
+
+	onMount(async () => {
+		await load();
+		loading = false;
+		// Auto-poll while task is in progress
+		pollTimer = setInterval(async () => {
+			if (task && (task.status === 'in_progress' || task.status === 'pending')) {
+				await load();
+			}
+		}, 3000);
+	});
+
+	onDestroy(() => {
+		if (pollTimer) clearInterval(pollTimer);
+	});
+
+	async function load() {
+		try {
+			const id = $page.params.id!;
+			task = await tasks.get(id);
+			messages = await tasks.messages(id);
+			try {
+				const sub = await tasks.subtasks(id);
+				subtaskList = sub.tasks;
+			} catch { subtaskList = []; }
+			scrollToBottom();
+		} catch (e) {
+			error = String(e);
+		}
+	}
+
+	function scrollToBottom() {
+		setTimeout(() => {
+			if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+		}, 50);
+	}
+
+	async function updateStatus(status: string) {
+		if (!task) return;
+		try {
+			task = await tasks.updateStatus(task.id, status);
+			await load();
+		} catch (e) {
+			alert(String(e));
+		}
+	}
+
+	function statusColor(status: string): string {
+		switch (status) {
+			case 'completed': return 'text-emerald-400';
+			case 'in_progress': return 'text-blue-400';
+			case 'pending': return 'text-amber-400';
+			case 'blocked': return 'text-red-400';
+			case 'waiting_for_input': return 'text-orange-400';
+			case 'cancelled': return 'text-muted-foreground';
+			default: return 'text-muted-foreground';
+		}
+	}
+
+	function statusBg(status: string): string {
+		switch (status) {
+			case 'completed': return 'bg-emerald-500/10 border-emerald-500/30';
+			case 'in_progress': return 'bg-blue-500/10 border-blue-500/30';
+			case 'pending': return 'bg-amber-500/10 border-amber-500/30';
+			case 'blocked': return 'bg-red-500/10 border-red-500/30';
+			case 'waiting_for_input': return 'bg-orange-500/10 border-orange-500/30';
+			default: return 'bg-muted/10 border-border';
+		}
+	}
+
+	function priorityLabel(p: number): string {
+		if (p >= 3) return 'Urgent';
+		if (p >= 2) return 'High';
+		if (p >= 1) return 'Normal';
+		return 'Low';
+	}
+</script>
+
+<div class="flex h-full flex-col">
+	<!-- Header -->
+	<div class="border-b border-border p-4">
+		<div class="flex items-center gap-2 text-sm text-muted-foreground mb-2">
+			<a href="/tasks" class="hover:text-foreground">Tasks</a>
+			<span>/</span>
+			<span class="text-foreground truncate">{task?.title ?? '...'}</span>
+		</div>
+
+		{#if error}
+			<div class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>
+		{:else if task}
+			<div class="flex items-start justify-between">
+				<div>
+					<h1 class="text-xl font-bold">{task.title}</h1>
+					<div class="flex items-center gap-3 mt-1 text-sm">
+						<span class="flex items-center gap-1.5">
+							<span class="h-2 w-2 rounded-full {task.status === 'in_progress' ? 'animate-pulse' : ''}
+								{task.status === 'completed' ? 'bg-emerald-400' :
+								 task.status === 'in_progress' ? 'bg-blue-400' :
+								 task.status === 'pending' ? 'bg-amber-400' :
+								 task.status === 'blocked' ? 'bg-red-400' :
+								 'bg-muted-foreground'}"></span>
+							<span class="{statusColor(task.status)}">{task.status.replace('_', ' ')}</span>
+						</span>
+						{#if task.agent_id}
+							<span class="text-muted-foreground">{task.agent_id}</span>
+						{/if}
+						<span class="text-muted-foreground">{priorityLabel(task.priority)}</span>
+						<span class="text-xs text-muted-foreground">{timeAgo(task.created_at)}</span>
+					</div>
+				</div>
+				<div class="flex gap-2">
+					{#if task.status === 'pending'}
+						<button onclick={() => updateStatus('in_progress')}
+							class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+							Start
+						</button>
+					{/if}
+					{#if task.status === 'in_progress' || task.status === 'pending'}
+						<button onclick={() => updateStatus('completed')}
+							class="rounded-md border border-emerald-500/50 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-emerald-500/10">
+							Complete
+						</button>
+						<button onclick={() => updateStatus('cancelled')}
+							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-accent">
+							Cancel
+						</button>
+					{/if}
+				</div>
+			</div>
+		{/if}
+	</div>
+
+	{#if loading}
+		<div class="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading...</div>
+	{:else if task}
+		<div class="flex flex-1 overflow-hidden">
+			<!-- Left: conversation -->
+			<div class="flex-1 flex flex-col overflow-hidden">
+				<div bind:this={messagesEl} class="flex-1 overflow-y-auto p-4 space-y-3">
+					<!-- Task description -->
+					{#if task.description}
+						<div class="rounded-lg border {statusBg(task.status)} p-3 text-sm">
+							<div class="text-xs font-medium text-muted-foreground mb-1">Description</div>
+							<div class="whitespace-pre-wrap">{task.description}</div>
+						</div>
+					{/if}
+
+					<!-- Messages -->
+					{#each messages as msg (msg.id)}
+						{@const isSystem = msg.role === 'system'}
+						{@const isAssistant = msg.role === 'assistant'}
+						<div class="flex gap-3 {isSystem ? '' : isAssistant ? '' : 'flex-row-reverse'}">
+							<div class="flex-shrink-0 h-7 w-7 rounded-full flex items-center justify-center text-xs font-bold
+								{isSystem ? 'bg-muted text-muted-foreground' :
+								 isAssistant ? 'bg-accent text-accent-foreground' :
+								 'bg-primary text-primary-foreground'}">
+								{#if isSystem}S{:else if isAssistant}A{:else}U{/if}
+							</div>
+							<div class="max-w-[80%]">
+								<div class="flex items-center gap-2 mb-0.5">
+									<span class="text-xs font-medium {isSystem ? 'text-muted-foreground' : ''}">{msg.role}</span>
+									<span class="text-xs text-muted-foreground">{timeAgo(msg.timestamp)}</span>
+								</div>
+								<div class="rounded-lg px-3 py-2 text-sm whitespace-pre-wrap
+									{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
+									 isAssistant ? 'bg-accent text-accent-foreground' :
+									 'bg-primary text-primary-foreground'}">
+									{msg.content}
+								</div>
+							</div>
+						</div>
+					{:else}
+						{#if !task.description}
+							<div class="flex h-full items-center justify-center text-muted-foreground text-sm">
+								<div class="text-center space-y-1">
+									<div class="text-3xl">&#x1f4cb;</div>
+									<div>No activity yet</div>
+								</div>
+							</div>
+						{/if}
+					{/each}
+
+					<!-- Live indicator -->
+					{#if task.status === 'in_progress'}
+						<div class="flex items-center gap-2 text-xs text-muted-foreground">
+							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
+							Agent is working on this task...
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<!-- Right: details sidebar -->
+			<div class="w-72 border-l border-border p-4 overflow-y-auto space-y-4">
+				<!-- Details -->
+				<div class="space-y-2">
+					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
+					<dl class="space-y-1.5 text-sm">
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">ID</dt>
+							<dd class="font-mono text-xs truncate max-w-[140px]">{task.id}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Status</dt>
+							<dd class="{statusColor(task.status)}">{task.status.replace('_', ' ')}</dd>
+						</div>
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Priority</dt>
+							<dd>{priorityLabel(task.priority)}</dd>
+						</div>
+						{#if task.agent_id}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Agent</dt>
+								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{task.agent_id}</a></dd>
+							</div>
+						{/if}
+						<div class="flex justify-between">
+							<dt class="text-muted-foreground">Created</dt>
+							<dd class="text-xs">{timeAgo(task.created_at)}</dd>
+						</div>
+						{#if task.completed_at}
+							<div class="flex justify-between">
+								<dt class="text-muted-foreground">Completed</dt>
+								<dd class="text-xs">{timeAgo(task.completed_at)}</dd>
+							</div>
+						{/if}
+					</dl>
+				</div>
+
+				<!-- Subtasks -->
+				{#if subtaskList.length > 0}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+							Steps ({subtaskList.filter(s => s.status === 'completed').length}/{subtaskList.length})
+						</h3>
+						<div class="space-y-1">
+							{#each subtaskList as sub}
+								<a href="/tasks/{sub.id}" class="flex items-center gap-2 rounded p-1.5 hover:bg-accent text-sm">
+									<span class="h-1.5 w-1.5 rounded-full
+										{sub.status === 'completed' ? 'bg-emerald-400' :
+										 sub.status === 'in_progress' ? 'bg-blue-400 animate-pulse' :
+										 'bg-muted-foreground/30'}"></span>
+									<span class="truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : ''}">{sub.title}</span>
+								</a>
+							{/each}
+						</div>
+					</div>
+				{/if}
+
+				<!-- Conversation link -->
+				{#if task.context}
+					{@const ctx = typeof task.context === 'string' ? (() => { try { return JSON.parse(task.context); } catch { return null; } })() : task.context}
+					{#if ctx?.conversation_id}
+						<div class="space-y-2">
+							<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Linked Conversation</h3>
+							<a href="/conversations/{ctx.conversation_id}" class="text-sm underline hover:text-foreground">
+								Open conversation
+							</a>
+						</div>
+					{/if}
+				{/if}
+			</div>
+		</div>
+	{/if}
+</div>
