@@ -5,8 +5,10 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "xpressclaw-server",
     srcs = glob(["src/**/*.rs"]),
-    # Frontend build output is embedded via rust-embed at compile time
+    # Frontend must be built before the server (rust-embed reads frontend/build/)
     compile_data = ["//frontend:build"],
+    # Must run locally — rust-embed reads frontend/build/ at compile time
+    tags = ["local"],
     crate_features = ["local-llm"],
     edition = "2021",
     deps = [
@@ -35,6 +37,7 @@ rust_library(
 rust_test(
     name = "server_test",
     crate = ":xpressclaw-server",
+    tags = ["local"],
     deps = [
         "@crates//:http-body-util",
     ],

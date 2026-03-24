@@ -1,9 +1,5 @@
 # Frontend SvelteKit build
-# Wraps npm ci + npm run build as a genrule.
-# Output: build/ directory with static SPA files.
-
 exports_files([
-    "Cargo.toml",
     "package.json",
     "package-lock.json",
 ])
@@ -17,15 +13,16 @@ genrule(
         "*.json",
         "postcss.config.js",
     ]),
-    outs = ["build_output"],
+    outs = ["build_stamp"],
     cmd = """
-        # Run in the frontend directory
-        FRONTEND_DIR=$$(dirname $(location package.json))
-        cd $$FRONTEND_DIR
-        npm ci --silent 2>&1
+        set -e
+        OUT_FILE="$$PWD/$@"
+        FRONTEND=$$(cd $$(dirname $(location package.json)) && pwd -P)
+        cd "$$FRONTEND"
+        npm ci --silent 2>/dev/null
         npm run build 2>&1
-        # Copy output to where Bazel expects it
-        cp -r build $$OLDPWD/$@
+        echo "built" > "$$OUT_FILE"
     """,
+    local = True,
     visibility = ["//visibility:public"],
 )
