@@ -166,38 +166,49 @@ llm:
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable toolchain)
+- [Bazel](https://bazel.build/) 8.2+ (via [Bazelisk](https://github.com/bazelbuild/bazelisk))
+- [Rust](https://rustup.rs/) (stable toolchain, used by Bazel and for fmt/clippy)
 - [LLVM](https://releases.llvm.org/) (provides `libclang`, required by llama.cpp bindings)
+- [CMake](https://cmake.org/) (required by llama.cpp build)
 - [Node.js](https://nodejs.org/) 18+ (for the frontend)
 - Docker (for running agents)
 
-### Build the CLI
+### Build Everything
 
 ```bash
 git clone https://github.com/XpressAI/xpressclaw.git
 cd xpressclaw
 
-# Build the frontend first
-cd frontend && npm ci && npm run build && cd ..
+# Build CLI, core, and server (includes frontend)
+./build.sh
 
-# Build the Rust binary
-cargo build --release
+# Or with a clean build
+./build.sh --clean
+```
 
-# The binary is at target/release/xpressclaw
-./target/release/xpressclaw --help
+### Build Individual Targets
+
+```bash
+# CLI only
+bazel build //crates/xpressclaw-cli:xpressclaw
+
+# Core library
+bazel build //crates/xpressclaw-core:xpressclaw-core
+
+# Server
+bazel build //crates/xpressclaw-server:xpressclaw-server
+
+# The CLI binary is at bazel-bin/crates/xpressclaw-cli/xpressclaw
 ```
 
 ### Build the Desktop App (Tauri)
 
 ```bash
-# Install Tauri CLI
-cargo install tauri-cli
+# Build everything including the Tauri desktop app
+./build.sh
 
-# Build (this also builds the frontend)
-cargo tauri build
-
-# Output: target/release/bundle/macos/xpressclaw.app
-#         target/release/bundle/dmg/xpressclaw_0.1.0_x64.dmg
+# For signed/notarized macOS builds
+./build-signed.sh
 ```
 
 ### Build Agent Harness Images
@@ -219,11 +230,15 @@ docker build -t xpressclaw-harness-claude-sdk ./claude-sdk
 ### Run Tests
 
 ```bash
-# All Rust tests (184 tests)
-cargo test --workspace
+# Via Bazel
+bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
 
 # Frontend type check
 cd frontend && npm run check
+
+# Formatting and linting (still via Cargo)
+cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
+cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
 ```
 
 ### Development Mode
@@ -309,8 +324,7 @@ We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 ```bash
 git clone https://github.com/XpressAI/xpressclaw.git
 cd xpressclaw
-cd frontend && npm ci && npm run build && cd ..
-cargo test --workspace
+./build.sh
 ```
 
 ## Community
