@@ -298,18 +298,33 @@ impl LlamaCppProvider {
 
         match self.model.chat_template(None) {
             Ok(tmpl) => {
+                // Disable thinking for models 9B and smaller — they waste tokens
+                // on low-quality reasoning that hurts more than it helps.
+                let n_params = self.model.n_params();
+                let enable_thinking = n_params > 10_000_000_000; // >10B
+                if !enable_thinking {
+                    tracing::debug!(
+                        n_params,
+                        "thinking disabled for small model (<= 10B params)"
+                    );
+                }
+
                 let params = OpenAIChatTemplateParams {
                     messages_json: &messages_str,
                     tools_json: tools_str.as_deref(),
                     tool_choice: None,
                     json_schema: None,
                     grammar: None,
-                    reasoning_format: Some("deepseek"),
+                    reasoning_format: if enable_thinking {
+                        Some("deepseek")
+                    } else {
+                        None
+                    },
                     chat_template_kwargs: None,
                     add_generation_prompt: true,
                     use_jinja: true,
                     parallel_tool_calls: false,
-                    enable_thinking: true,
+                    enable_thinking,
                     add_bos: false,
                     add_eos: false,
                     parse_tool_calls: true,
@@ -409,11 +424,13 @@ impl LlamaCppProvider {
         let grammar_sampler: Option<LlamaSampler> = None;
         let _ = (grammar, grammar_lazy); // suppress unused warnings
 
+        // Sampling parameters follow Unsloth's Qwen3.5 recommendations:
+        // temp=1.0, top_p=0.95, top_k=20, min_p=0.0
         let mut sampler = if temperature > 0.0 {
             LlamaSampler::chain_simple([
                 LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
-                LlamaSampler::top_k(40),
-                LlamaSampler::min_p(0.05, 1),
+                LlamaSampler::top_k(20),
+                LlamaSampler::top_p(0.95, 1),
                 LlamaSampler::temp(temperature),
                 LlamaSampler::dist(1234),
             ])
