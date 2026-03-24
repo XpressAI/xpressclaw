@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Load non-secret signing config
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Load signing config
 if [ -f .env.signing ]; then
     source .env.signing
 fi
@@ -14,17 +17,48 @@ if [ -z "${APPLE_PASSWORD:-}" ]; then
     export APPLE_PASSWORD
 fi
 
-echo "==> Building frontend..."
-cd frontend && npm ci && npm run build && cd ..
-
-echo "==> Building CLI sidecar..."
 TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
-cargo build --release -p xpressclaw-cli
+echo "==> Target: ${TARGET_TRIPLE}"
+
+# 1. Build frontend
+echo "==> Building frontend..."
+cd frontend
+npm ci
+npm run build
+cd ..
+
+# 2. Touch frontend.rs to force re-embedding the frontend build
+touch crates/xpressclaw-server/src/frontend.rs
+
+# 3. Build the CLI sidecar (this is the server binary)
+echo "==> Building CLI sidecar..."
+cargo build --release --target "${TARGET_TRIPLE}" -p xpressclaw-cli
+
+# 4. Copy sidecar to where Tauri expects it
 mkdir -p crates/xpressclaw-tauri/binaries
-cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+SIDECAR_SRC="target/${TARGET_TRIPLE}/release/xpressclaw"
+SIDECAR_DST="crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+if [ ! -f "$SIDECAR_SRC" ]; then
+    # Fallback: non-target-specific path
+    SIDECAR_SRC="target/release/xpressclaw"
+fi
+cp "$SIDECAR_SRC" "$SIDECAR_DST"
+echo "    Sidecar: ${SIDECAR_DST}"
 
+# 5. Build Tauri desktop app with signing + notarization
 echo "==> Building Tauri app (signed + notarized)..."
-npx @tauri-apps/cli build
+echo "    Signing identity: ${APPLE_SIGNING_IDENTITY:-not set}"
+echo "    Team ID: ${APPLE_TEAM_ID:-not set}"
+npx @tauri-apps/cli build --target "${TARGET_TRIPLE}"
 
-echo "==> Done! DMG is at:"
-find target/release/bundle/dmg -name "*.dmg" 2>/dev/null
+# 6. Show output
+echo ""
+echo "==> Done!"
+echo ""
+DMG=$(find "target/${TARGET_TRIPLE}/release/bundle/dmg" -name "*.dmg" 2>/dev/null || find target/release/bundle/dmg -name "*.dmg" 2>/dev/null || echo "")
+if [ -n "$DMG" ]; then
+    echo "DMG: ${DMG}"
+    ls -lh $DMG
+else
+    echo "No DMG found. Check target/*/release/bundle/ for output."
+fi

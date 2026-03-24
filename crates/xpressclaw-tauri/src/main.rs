@@ -102,7 +102,16 @@ fn main() {
                         None
                     }
                 })
-                .expect("sidecar binary not found");
+                .unwrap_or_else(|| {
+                    // Sidecar not found in expected locations — use the name directly
+                    // and let the spawn fail gracefully below instead of panicking here
+                    // (panicking in the Tauri setup callback crashes the app with SIGABRT)
+                    warn!(
+                        sidecar_name,
+                        "sidecar binary not found in app bundle, will try PATH"
+                    );
+                    std::path::PathBuf::from(cli_name)
+                });
 
             info!(path = %sidecar_path.display(), "launching sidecar");
 
@@ -135,7 +144,20 @@ fn main() {
                 );
             }
 
-            let child = cmd.spawn().expect("failed to spawn sidecar");
+            let child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %sidecar_path.display(),
+                        "failed to spawn sidecar — the app will start but the server won't be running"
+                    );
+                    // Continue without sidecar — the window will show but server won't be available
+                    // This is better than crashing on startup
+                    tray::setup_tray(app, port)?;
+                    return Ok(());
+                }
+            };
 
             info!(pid = child.id(), "sidecar spawned");
 
