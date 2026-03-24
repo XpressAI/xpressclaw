@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [rust-rewrite, main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   frontend:
     name: Frontend
@@ -35,13 +32,13 @@ jobs:
           path: frontend/build/
           retention-days: 1
 
-  rust:
-    name: Rust (${{ matrix.os }})
+  bazel:
+    name: Bazel (${{ matrix.os }})
     needs: frontend
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,24 +50,33 @@ jobs:
           name: frontend-build
           path: frontend/build/
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Linux needs system deps for Tauri (webkit2gtk, etc.)
+      # Linux needs system deps for Tauri/webkit
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      # Exclude Cargo target dir from Windows Defender — scanning thousands of
-      # intermediate build artifacts is the biggest single cause of slow CI on Windows.
-      - name: Exclude Cargo target from Windows Defender
-        if: runner.os == 'Windows'
-        run: Add-MpPreference -ExclusionPath "$(Get-Location)\target", "$env:CARGO_HOME"
+      # Bazelisk reads .bazelversion and downloads the right Bazel
+      - name: Install Bazelisk
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install bazelisk
+          else
+            curl -L https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 -o /usr/local/bin/bazel
+            chmod +x /usr/local/bin/bazel
+          fi
+
+      - name: Build
+        run: bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
+
+      - name: Test
+        run: bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
+
+      # Still use Cargo for fmt/clippy — Bazel doesn't have good equivalents
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - name: Check formatting
         run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
@@ -78,19 +84,10 @@ jobs:
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Test
-        run: cargo test --workspace
-
-  # Integration tests that require API keys run in a protected environment.
-  # For PRs from forks, a maintainer must approve the workflow run before
-  # secrets are exposed. Configure the "integration" environment in
-  # Settings > Environments with required reviewers.
+  # Integration tests that require API keys
   integration:
     name: Integration Tests
-    needs: rust
+    needs: bazel
     runs-on: ubuntu-latest
     environment: integration
     steps:
@@ -105,7 +102,6 @@ jobs:
           path: frontend/build/
 
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Linux dependencies

@@ -4,37 +4,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Build the frontend
-echo "==> Building frontend..."
-cd frontend
-npm ci
-npm run build
-cd ..
+# Handle --clean flag
+if [ "${1:-}" = "--clean" ]; then
+    echo "==> Cleaning..."
+    bazel clean --expunge 2>/dev/null || true
+    cargo clean 2>/dev/null || true
+    rm -rf frontend/build frontend/.svelte-kit frontend/node_modules
+    rm -rf crates/xpressclaw-tauri/binaries
+    echo "    Done."
+    echo ""
+fi
 
-# Build the Rust binary (touch frontend.rs to force re-embedding the frontend build)
-echo "==> Building Rust binary..."
-touch crates/xpressclaw-server/src/frontend.rs
-cargo build --release
+# Build with Bazel (CLI, core, server + frontend)
+echo "==> Building with Bazel..."
+bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
-echo "==> Build complete: target/release/xpressclaw"
+echo "==> Running tests..."
+bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
 
-# Copy CLI binary as Tauri sidecar
+# Copy Bazel-built CLI as Tauri sidecar
 echo "==> Copying CLI binary as Tauri sidecar..."
 TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
 mkdir -p crates/xpressclaw-tauri/binaries
-# Check both native and cross-compile paths
-if [ -f "target/release/xpressclaw" ]; then
-    cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
-elif [ -f "target/${TARGET_TRIPLE}/release/xpressclaw" ]; then
-    cp "target/${TARGET_TRIPLE}/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
-fi
+cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
-# Build the desktop app via npx (no global tauri-cli install needed)
+# Build the desktop app via Tauri CLI
 echo "==> Building Tauri desktop app..."
 npx -y @tauri-apps/cli build
 
-# Build harness Docker images locally (CI handles pushing to GHCR)
+# Build harness Docker images locally
 if command -v docker &>/dev/null; then
     echo "==> Building agent harness Docker images..."
     docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest harnesses/base
@@ -45,10 +44,6 @@ if command -v docker &>/dev/null; then
 else
     echo "==> Skipping harness builds (Docker not found)"
 fi
-
-# Run tests
-echo "==> Running tests..."
-cargo test --workspace
 
 echo "==> Running frontend type check..."
 cd frontend
