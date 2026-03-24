@@ -8,10 +8,9 @@
 //! are exposed to Ready as a `ToolsModule` so plans can call them.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{debug, error, info};
 
@@ -59,84 +58,80 @@ impl McpToolsBridge {
     }
 }
 
+#[async_trait]
 impl ToolsModule for McpToolsBridge {
     fn tools(&self) -> &[ToolDescription] {
         &self.descriptions
     }
 
-    fn execute<'a>(
-        &'a self,
-        call: &'a ready::tools::models::ToolCall,
-    ) -> Pin<Box<dyn Future<Output = ready::Result<ToolResult>> + Send + 'a>> {
-        Box::pin(async move {
-            debug!(tool = call.tool_id, "executing MCP tool via bridge");
+    async fn execute(&self, call: &ready::tools::models::ToolCall) -> ready::Result<ToolResult> {
+        debug!(tool = call.tool_id, "executing MCP tool via bridge");
 
-            // Convert positional args to a JSON object using the tool's parameter names
-            let tool_desc = self
-                .descriptions
-                .iter()
-                .find(|d| d.id == call.tool_id)
-                .ok_or_else(|| ready::ReadyError::ToolNotFound(call.tool_id.clone()))?;
+        // Convert positional args to a JSON object using the tool's parameter names
+        let tool_desc = self
+            .descriptions
+            .iter()
+            .find(|d| d.id == call.tool_id)
+            .ok_or_else(|| ready::ReadyError::ToolNotFound(call.tool_id.clone()))?;
 
-            let mut arguments = serde_json::Map::new();
-            for (i, arg_desc) in tool_desc.arguments.iter().enumerate() {
-                if let Some(val) = call.args.get(i) {
-                    arguments.insert(arg_desc.name.clone(), val.clone());
-                }
+        let mut arguments = serde_json::Map::new();
+        for (i, arg_desc) in tool_desc.arguments.iter().enumerate() {
+            if let Some(val) = call.args.get(i) {
+                arguments.insert(arg_desc.name.clone(), val.clone());
             }
+        }
 
-            let client = reqwest::Client::new();
-            let resp = client
-                .post(format!("{}/v1/tools/call", self.base_url))
-                .json(&serde_json::json!({
-                    "agent_id": self.agent_id,
-                    "tool_name": call.tool_id,
-                    "arguments": Value::Object(arguments),
-                }))
-                .timeout(std::time::Duration::from_secs(120))
-                .send()
-                .await
-                .map_err(|e| ready::ReadyError::Tool {
-                    tool_id: call.tool_id.clone(),
-                    message: e.to_string(),
-                })?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(ready::ReadyError::Tool {
-                    tool_id: call.tool_id.clone(),
-                    message: format!("MCP tool call failed ({status}): {body}"),
-                });
-            }
-
-            let result: Value = resp.json().await.map_err(|e| ready::ReadyError::Tool {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/v1/tools/call", self.base_url))
+            .json(&serde_json::json!({
+                "agent_id": self.agent_id,
+                "tool_name": call.tool_id,
+                "arguments": Value::Object(arguments),
+            }))
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| ready::ReadyError::Tool {
                 tool_id: call.tool_id.clone(),
                 message: e.to_string(),
             })?;
 
-            // Extract text content from MCP result format
-            let text = result["content"]
-                .as_array()
-                .and_then(|arr| {
-                    arr.iter()
-                        .filter_map(|c| c["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .first()
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| result.to_string());
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ready::ReadyError::Tool {
+                tool_id: call.tool_id.clone(),
+                message: format!("MCP tool call failed ({status}): {body}"),
+            });
+        }
 
-            let is_error = result["isError"].as_bool().unwrap_or(false);
-            if is_error {
-                return Err(ready::ReadyError::Tool {
-                    tool_id: call.tool_id.clone(),
-                    message: text,
-                });
-            }
+        let result: Value = resp.json().await.map_err(|e| ready::ReadyError::Tool {
+            tool_id: call.tool_id.clone(),
+            message: e.to_string(),
+        })?;
 
-            Ok(ToolResult::Success(Value::String(text)))
-        })
+        // Extract text content from MCP result format
+        let text = result["content"]
+            .as_array()
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|c| c["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .first()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| result.to_string());
+
+        let is_error = result["isError"].as_bool().unwrap_or(false);
+        if is_error {
+            return Err(ready::ReadyError::Tool {
+                tool_id: call.tool_id.clone(),
+                message: text,
+            });
+        }
+
+        Ok(ToolResult::Success(Value::String(text)))
     }
 }
 

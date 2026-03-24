@@ -19,8 +19,11 @@ genrule(
         OUT_FILE="$$PWD/$@"
         FRONTEND=$$(cd $$(dirname $(location package.json)) && pwd -P)
         cd "$$FRONTEND"
-        npm ci --silent 2>/dev/null
-        npm run build 2>&1
+        # Skip if already built (e.g. CI downloads pre-built frontend artifact)
+        if [ ! -d build ] || [ ! -f build/index.html ]; then
+            npm ci --silent 2>/dev/null
+            npm run build 2>&1
+        fi
         echo "built" > "$$OUT_FILE"
     """,
     local = True,

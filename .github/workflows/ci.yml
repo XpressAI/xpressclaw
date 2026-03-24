@@ -50,6 +50,10 @@ jobs:
           name: frontend-build
           path: frontend/build/
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       # Linux needs system deps for Tauri/webkit
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
