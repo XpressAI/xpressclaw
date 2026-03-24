@@ -18,7 +18,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use super::router::{
@@ -167,6 +167,8 @@ struct PromptWithGrammar {
     prompt: String,
     grammar: Option<String>,
     grammar_lazy: bool,
+    /// Parsed template result for response parsing (tool calls, thinking blocks).
+    template_result: Option<llama_cpp_2::model::ChatTemplateResult>,
 }
 
 /// Embedded llama.cpp LLM provider.
@@ -258,55 +260,71 @@ impl LlamaCppProvider {
 
     /// Format chat messages with optional tool definitions.
     ///
-    /// When tools are provided, uses `apply_chat_template_with_tools_oaicompat` which
-    /// renders tools into the prompt using the model's Jinja template and returns a
-    /// grammar for constrained decoding of tool calls.
+    /// Uses the Jinja-based chat template API (`apply_chat_template_oaicompat`)
+    /// which properly renders tools, thinking blocks, and tool call grammars
+    /// for models like Qwen3.5. This is equivalent to `llama-server --jinja`.
     fn format_prompt_with_tools(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<PromptWithGrammar> {
-        let chat_messages: Vec<LlamaChatMessage> = messages
+        use llama_cpp_2::openai::OpenAIChatTemplateParams;
+
+        // Convert messages to OpenAI-compatible JSON
+        let messages_json: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                LlamaChatMessage::new(m.role.clone(), m.content.clone())
-                    .map_err(|e| Error::Llm(format!("invalid chat message: {e}")))
+                let mut obj = serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                });
+                if let Some(ref tc) = m.tool_calls {
+                    obj["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+                }
+                if let Some(ref tc_id) = m.tool_call_id {
+                    obj["tool_call_id"] = serde_json::Value::String(tc_id.clone());
+                }
+                obj
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+        let messages_str = serde_json::to_string(&messages_json)
+            .map_err(|e| Error::Llm(format!("messages serialization: {e}")))?;
+
+        let tools_str = tools
+            .filter(|t| !t.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Llm(format!("tools serialization: {e}")))?;
 
         match self.model.chat_template(None) {
             Ok(tmpl) => {
-                if let Some(tool_defs) = tools {
-                    if !tool_defs.is_empty() {
-                        let tools_json = serde_json::to_string(tool_defs)
-                            .map_err(|e| Error::Llm(format!("tools serialization: {e}")))?;
-                        let result = self
-                            .model
-                            .apply_chat_template_with_tools_oaicompat(
-                                &tmpl,
-                                &chat_messages,
-                                Some(&tools_json),
-                                None,
-                                true,
-                            )
-                            .map_err(|e| {
-                                Error::Llm(format!("chat template with tools failed: {e}"))
-                            })?;
-                        return Ok(PromptWithGrammar {
-                            prompt: result.prompt,
-                            grammar: result.grammar,
-                            grammar_lazy: result.grammar_lazy,
-                        });
-                    }
-                }
-                let prompt = self
-                    .model
-                    .apply_chat_template(&tmpl, &chat_messages, true)
-                    .map_err(|e| Error::Llm(format!("chat template failed: {e}")))?;
-                Ok(PromptWithGrammar {
-                    prompt,
+                let params = OpenAIChatTemplateParams {
+                    messages_json: &messages_str,
+                    tools_json: tools_str.as_deref(),
+                    tool_choice: None,
+                    json_schema: None,
                     grammar: None,
-                    grammar_lazy: false,
+                    reasoning_format: Some("deepseek"),
+                    chat_template_kwargs: None,
+                    add_generation_prompt: true,
+                    use_jinja: true,
+                    parallel_tool_calls: false,
+                    enable_thinking: true,
+                    add_bos: false,
+                    add_eos: false,
+                    parse_tool_calls: true,
+                };
+
+                let result = self
+                    .model
+                    .apply_chat_template_oaicompat(&tmpl, &params)
+                    .map_err(|e| Error::Llm(format!("chat template failed: {e}")))?;
+
+                Ok(PromptWithGrammar {
+                    prompt: result.prompt.clone(),
+                    grammar: result.grammar.clone(),
+                    grammar_lazy: result.grammar_lazy,
+                    template_result: Some(result),
                 })
             }
             Err(_) => {
@@ -324,6 +342,7 @@ impl LlamaCppProvider {
                     prompt,
                     grammar: None,
                     grammar_lazy: false,
+                    template_result: None,
                 })
             }
         }
@@ -471,7 +490,7 @@ impl LlmProvider for LlamaCppProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let tools = request.tools.as_deref();
         let pg = self.format_prompt_with_tools(&request.messages, tools)?;
-        let max_tokens = request.max_tokens.unwrap_or(256) as i32;
+        let max_tokens = request.max_tokens.unwrap_or(4096) as i32;
         let temperature = request.temperature.unwrap_or(0.8) as f32;
 
         let (raw_output, usage) = self.generate(
@@ -482,8 +501,22 @@ impl LlmProvider for LlamaCppProvider {
             pg.grammar_lazy,
         )?;
 
-        // Try to parse tool calls from the output (OpenAI-compatible JSON format)
-        let (content, tool_calls, finish_reason) = parse_tool_calls(&raw_output);
+        // Use the template's built-in response parser if available (handles tool calls
+        // and thinking blocks according to the model's chat format). Falls back to
+        // our manual parser for models without Jinja template support.
+        let (content, tool_calls, finish_reason, reasoning_content) =
+            if let Some(ref tmpl_result) = pg.template_result {
+                match tmpl_result.parse_response_oaicompat(&raw_output, false) {
+                    Ok(parsed_json) => parse_oaicompat_response(&parsed_json),
+                    Err(_) => {
+                        let (c, tc, fr) = parse_tool_calls(&raw_output);
+                        (c, tc, fr, None)
+                    }
+                }
+            } else {
+                let (c, tc, fr) = parse_tool_calls(&raw_output);
+                (c, tc, fr, None)
+            };
 
         Ok(ChatCompletionResponse {
             id: format!("llamacpp-{}", uuid::Uuid::new_v4()),
@@ -496,6 +529,7 @@ impl LlmProvider for LlamaCppProvider {
                     role: "assistant".into(),
                     content,
                     tool_calls,
+                    reasoning_content,
                     ..Default::default()
                 },
                 finish_reason: Some(finish_reason),
@@ -655,6 +689,69 @@ impl LlmProvider for LlamaCppProvider {
     }
 }
 
+/// Parse the OAI-compat response JSON from the template's built-in parser.
+///
+/// The parser returns a JSON object with `content`, `tool_calls`, and
+/// `reasoning_content` fields — matching the OpenAI chat completion format.
+fn parse_oaicompat_response(
+    json_str: &str,
+) -> (
+    String,
+    Option<Vec<super::router::ToolCall>>,
+    String,
+    Option<String>,
+) {
+    use super::router::{ToolCall, ToolCallFunction};
+
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return (json_str.to_string(), None, "stop".into(), None);
+    };
+
+    let content = val["content"].as_str().unwrap_or("").to_string();
+    let reasoning = val["reasoning_content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tool_calls = val["tool_calls"].as_array().and_then(|arr| {
+        let calls: Vec<ToolCall> = arr
+            .iter()
+            .filter_map(|tc| {
+                let id = tc["id"]
+                    .as_str()
+                    .unwrap_or(&format!("call_{}", uuid::Uuid::new_v4().simple()))
+                    .to_string();
+                let name = tc["function"]["name"].as_str()?.to_string();
+                let arguments = tc["function"]["arguments"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| serde_json::to_string(&tc["function"]["arguments"]).ok())
+                    .unwrap_or_else(|| "{}".to_string());
+
+                Some(ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                })
+            })
+            .collect();
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
+    });
+
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    }
+    .to_string();
+
+    (content, tool_calls, finish_reason, reasoning)
+}
+
 /// Parse tool calls from the model's raw output.
 ///
 /// Qwen3.5 (and other models with Jinja tool templates) output tool calls as JSON.
@@ -768,11 +865,11 @@ mod tests {
 
         // Use model's chat template
         let tmpl = model.chat_template(None).expect("no chat template");
-        let msgs =
-            vec![
-                LlamaChatMessage::new("user".into(), "What is 2+2? Answer briefly.".into())
-                    .unwrap(),
-            ];
+        let msgs = vec![llama_cpp_2::model::LlamaChatMessage::new(
+            "user".into(),
+            "What is 2+2? Answer briefly.".into(),
+        )
+        .unwrap()];
         let prompt = model
             .apply_chat_template(&tmpl, &msgs, true)
             .expect("template failed");
