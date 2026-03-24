@@ -1,5 +1,7 @@
 # Build settings
 build --incompatible_strict_action_env
+# Pass through PATH so build scripts can find cmake, pkg-config, etc.
+build --action_env=PATH
 
 # Rust clippy (enable when needed, disabled by default to avoid lint errors on deps)
 # build --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
