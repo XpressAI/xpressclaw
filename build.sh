@@ -4,6 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Handle --clean flag
+if [ "${1:-}" = "--clean" ]; then
+    echo "==> Cleaning..."
+    cargo clean
+    rm -rf frontend/build frontend/.svelte-kit frontend/node_modules
+    rm -rf crates/xpressclaw-tauri/binaries
+    echo "    Done."
+    echo ""
+fi
+
 # Build the frontend
 echo "==> Building frontend..."
 cd frontend
@@ -22,7 +32,6 @@ echo "==> Build complete: target/release/xpressclaw"
 echo "==> Copying CLI binary as Tauri sidecar..."
 TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
 mkdir -p crates/xpressclaw-tauri/binaries
-# Check both native and cross-compile paths
 if [ -f "target/release/xpressclaw" ]; then
     cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
 elif [ -f "target/${TARGET_TRIPLE}/release/xpressclaw" ]; then

@@ -4,6 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Handle --clean flag
+if [ "${1:-}" = "--clean" ]; then
+    echo "==> Cleaning..."
+    cargo clean
+    rm -rf frontend/build frontend/.svelte-kit frontend/node_modules
+    rm -rf crates/xpressclaw-tauri/binaries
+    echo "    Done."
+    echo ""
+fi
+
 # Load signing config
 if [ -f .env.signing ]; then
     source .env.signing

@@ -375,6 +375,17 @@ async fn send_message(
                     }
 
                     if let Some(choice) = resp.choices.first() {
+                        // Include reasoning/thinking content if present
+                        let mut content = String::new();
+                        if let Some(ref reasoning) = choice.message.reasoning_content {
+                            if !reasoning.is_empty() {
+                                content.push_str("<think>");
+                                content.push_str(reasoning);
+                                content.push_str("</think>\n\n");
+                            }
+                        }
+                        content.push_str(&choice.message.content);
+
                         let agent_msg = mgr
                             .send_message(
                                 &conv_id,
@@ -382,7 +393,7 @@ async fn send_message(
                                     sender_type: "agent".into(),
                                     sender_id: agent_id.clone(),
                                     sender_name: Some(agent_id.clone()),
-                                    content: choice.message.content.clone(),
+                                    content,
                                     message_type: None,
                                 },
                             )

@@ -18,7 +18,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use super::router::{
@@ -167,6 +167,8 @@ struct PromptWithGrammar {
     prompt: String,
     grammar: Option<String>,
     grammar_lazy: bool,
+    /// Parsed template result for response parsing (tool calls, thinking blocks).
+    template_result: Option<llama_cpp_2::model::ChatTemplateResult>,
 }
 
 /// Embedded llama.cpp LLM provider.
@@ -258,55 +260,86 @@ impl LlamaCppProvider {
 
     /// Format chat messages with optional tool definitions.
     ///
-    /// When tools are provided, uses `apply_chat_template_with_tools_oaicompat` which
-    /// renders tools into the prompt using the model's Jinja template and returns a
-    /// grammar for constrained decoding of tool calls.
+    /// Uses the Jinja-based chat template API (`apply_chat_template_oaicompat`)
+    /// which properly renders tools, thinking blocks, and tool call grammars
+    /// for models like Qwen3.5. This is equivalent to `llama-server --jinja`.
     fn format_prompt_with_tools(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[serde_json::Value]>,
     ) -> Result<PromptWithGrammar> {
-        let chat_messages: Vec<LlamaChatMessage> = messages
+        use llama_cpp_2::openai::OpenAIChatTemplateParams;
+
+        // Convert messages to OpenAI-compatible JSON
+        let messages_json: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                LlamaChatMessage::new(m.role.clone(), m.content.clone())
-                    .map_err(|e| Error::Llm(format!("invalid chat message: {e}")))
+                let mut obj = serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                });
+                if let Some(ref tc) = m.tool_calls {
+                    obj["tool_calls"] = serde_json::to_value(tc).unwrap_or_default();
+                }
+                if let Some(ref tc_id) = m.tool_call_id {
+                    obj["tool_call_id"] = serde_json::Value::String(tc_id.clone());
+                }
+                obj
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
+        let messages_str = serde_json::to_string(&messages_json)
+            .map_err(|e| Error::Llm(format!("messages serialization: {e}")))?;
+
+        let tools_str = tools
+            .filter(|t| !t.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Error::Llm(format!("tools serialization: {e}")))?;
 
         match self.model.chat_template(None) {
             Ok(tmpl) => {
-                if let Some(tool_defs) = tools {
-                    if !tool_defs.is_empty() {
-                        let tools_json = serde_json::to_string(tool_defs)
-                            .map_err(|e| Error::Llm(format!("tools serialization: {e}")))?;
-                        let result = self
-                            .model
-                            .apply_chat_template_with_tools_oaicompat(
-                                &tmpl,
-                                &chat_messages,
-                                Some(&tools_json),
-                                None,
-                                true,
-                            )
-                            .map_err(|e| {
-                                Error::Llm(format!("chat template with tools failed: {e}"))
-                            })?;
-                        return Ok(PromptWithGrammar {
-                            prompt: result.prompt,
-                            grammar: result.grammar,
-                            grammar_lazy: result.grammar_lazy,
-                        });
-                    }
+                // Disable thinking for models 9B and smaller — they waste tokens
+                // on low-quality reasoning that hurts more than it helps.
+                let n_params = self.model.n_params();
+                let enable_thinking = n_params > 10_000_000_000; // >10B
+                if !enable_thinking {
+                    tracing::debug!(
+                        n_params,
+                        "thinking disabled for small model (<= 10B params)"
+                    );
                 }
-                let prompt = self
-                    .model
-                    .apply_chat_template(&tmpl, &chat_messages, true)
-                    .map_err(|e| Error::Llm(format!("chat template failed: {e}")))?;
-                Ok(PromptWithGrammar {
-                    prompt,
+
+                let params = OpenAIChatTemplateParams {
+                    messages_json: &messages_str,
+                    tools_json: tools_str.as_deref(),
+                    tool_choice: None,
+                    json_schema: None,
                     grammar: None,
-                    grammar_lazy: false,
+                    reasoning_format: if enable_thinking {
+                        Some("deepseek")
+                    } else {
+                        None
+                    },
+                    chat_template_kwargs: None,
+                    add_generation_prompt: true,
+                    use_jinja: true,
+                    parallel_tool_calls: false,
+                    enable_thinking,
+                    add_bos: false,
+                    add_eos: false,
+                    parse_tool_calls: true,
+                };
+
+                let result = self
+                    .model
+                    .apply_chat_template_oaicompat(&tmpl, &params)
+                    .map_err(|e| Error::Llm(format!("chat template failed: {e}")))?;
+
+                Ok(PromptWithGrammar {
+                    prompt: result.prompt.clone(),
+                    grammar: result.grammar.clone(),
+                    grammar_lazy: result.grammar_lazy,
+                    template_result: Some(result),
                 })
             }
             Err(_) => {
@@ -324,6 +357,7 @@ impl LlamaCppProvider {
                     prompt,
                     grammar: None,
                     grammar_lazy: false,
+                    template_result: None,
                 })
             }
         }
@@ -382,26 +416,21 @@ impl LlamaCppProvider {
         ctx.decode(&mut batch)
             .map_err(|e| Error::Llm(format!("prompt decode failed: {e}")))?;
 
-        // Sampling: repetition penalty to avoid degenerate loops, then top-k + temperature.
-        // When a grammar is provided, add a grammar sampler to constrain tool-call output.
-        let grammar_sampler = if let Some(grammar_str) = grammar {
-            if grammar_lazy {
-                // Lazy grammar: triggers on common tool-call markers
-                let trigger_words: Vec<&[u8]> = vec![b"{\"name\"", b"<tool_call>", b"```json"];
-                LlamaSampler::grammar_lazy(&self.model, grammar_str, "root", trigger_words, &[])
-                    .ok()
-            } else {
-                LlamaSampler::grammar(&self.model, grammar_str, "root").ok()
-            }
-        } else {
-            None
-        };
+        // Grammar-constrained decoding is disabled for now.
+        // The Jinja template already guides the model to produce tool calls in the
+        // correct format, and the response parser (parse_response_oaicompat) handles
+        // extraction. Enabling grammar can cause SIGABRT in llama.cpp with some
+        // model/grammar combinations.
+        let grammar_sampler: Option<LlamaSampler> = None;
+        let _ = (grammar, grammar_lazy); // suppress unused warnings
 
+        // Sampling parameters follow Unsloth's Qwen3.5 recommendations:
+        // temp=1.0, top_p=0.95, top_k=20, min_p=0.0
         let mut sampler = if temperature > 0.0 {
             LlamaSampler::chain_simple([
                 LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
-                LlamaSampler::top_k(40),
-                LlamaSampler::min_p(0.05, 1),
+                LlamaSampler::top_k(20),
+                LlamaSampler::top_p(0.95, 1),
                 LlamaSampler::temp(temperature),
                 LlamaSampler::dist(1234),
             ])
@@ -471,9 +500,11 @@ impl LlmProvider for LlamaCppProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let tools = request.tools.as_deref();
         let pg = self.format_prompt_with_tools(&request.messages, tools)?;
-        let max_tokens = request.max_tokens.unwrap_or(256) as i32;
+        let max_tokens = request.max_tokens.unwrap_or(4096) as i32;
         let temperature = request.temperature.unwrap_or(0.8) as f32;
 
+        // Grammar-constrained decoding can crash with some model/grammar combinations.
+        // Use it when available but fall back gracefully.
         let (raw_output, usage) = self.generate(
             &pg.prompt,
             max_tokens,
@@ -482,8 +513,22 @@ impl LlmProvider for LlamaCppProvider {
             pg.grammar_lazy,
         )?;
 
-        // Try to parse tool calls from the output (OpenAI-compatible JSON format)
-        let (content, tool_calls, finish_reason) = parse_tool_calls(&raw_output);
+        // Use the template's built-in response parser if available (handles tool calls
+        // and thinking blocks according to the model's chat format). Falls back to
+        // our manual parser for models without Jinja template support.
+        let (content, tool_calls, finish_reason, reasoning_content) =
+            if let Some(ref tmpl_result) = pg.template_result {
+                match tmpl_result.parse_response_oaicompat(&raw_output, false) {
+                    Ok(parsed_json) => parse_oaicompat_response(&parsed_json),
+                    Err(_) => {
+                        let (c, tc, fr) = parse_tool_calls(&raw_output);
+                        (c, tc, fr, None)
+                    }
+                }
+            } else {
+                let (c, tc, fr) = parse_tool_calls(&raw_output);
+                (c, tc, fr, None)
+            };
 
         Ok(ChatCompletionResponse {
             id: format!("llamacpp-{}", uuid::Uuid::new_v4()),
@@ -496,6 +541,7 @@ impl LlmProvider for LlamaCppProvider {
                     role: "assistant".into(),
                     content,
                     tool_calls,
+                    reasoning_content,
                     ..Default::default()
                 },
                 finish_reason: Some(finish_reason),
@@ -655,6 +701,69 @@ impl LlmProvider for LlamaCppProvider {
     }
 }
 
+/// Parse the OAI-compat response JSON from the template's built-in parser.
+///
+/// The parser returns a JSON object with `content`, `tool_calls`, and
+/// `reasoning_content` fields — matching the OpenAI chat completion format.
+fn parse_oaicompat_response(
+    json_str: &str,
+) -> (
+    String,
+    Option<Vec<super::router::ToolCall>>,
+    String,
+    Option<String>,
+) {
+    use super::router::{ToolCall, ToolCallFunction};
+
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return (json_str.to_string(), None, "stop".into(), None);
+    };
+
+    let content = val["content"].as_str().unwrap_or("").to_string();
+    let reasoning = val["reasoning_content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tool_calls = val["tool_calls"].as_array().and_then(|arr| {
+        let calls: Vec<ToolCall> = arr
+            .iter()
+            .filter_map(|tc| {
+                let id = tc["id"]
+                    .as_str()
+                    .unwrap_or(&format!("call_{}", uuid::Uuid::new_v4().simple()))
+                    .to_string();
+                let name = tc["function"]["name"].as_str()?.to_string();
+                let arguments = tc["function"]["arguments"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| serde_json::to_string(&tc["function"]["arguments"]).ok())
+                    .unwrap_or_else(|| "{}".to_string());
+
+                Some(ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolCallFunction { name, arguments },
+                })
+            })
+            .collect();
+        if calls.is_empty() {
+            None
+        } else {
+            Some(calls)
+        }
+    });
+
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    }
+    .to_string();
+
+    (content, tool_calls, finish_reason, reasoning)
+}
+
 /// Parse tool calls from the model's raw output.
 ///
 /// Qwen3.5 (and other models with Jinja tool templates) output tool calls as JSON.
@@ -768,11 +877,11 @@ mod tests {
 
         // Use model's chat template
         let tmpl = model.chat_template(None).expect("no chat template");
-        let msgs =
-            vec![
-                LlamaChatMessage::new("user".into(), "What is 2+2? Answer briefly.".into())
-                    .unwrap(),
-            ];
+        let msgs = vec![llama_cpp_2::model::LlamaChatMessage::new(
+            "user".into(),
+            "What is 2+2? Answer briefly.".into(),
+        )
+        .unwrap()];
         let prompt = model
             .apply_chat_template(&tmpl, &msgs, true)
             .expect("template failed");
@@ -894,5 +1003,155 @@ mod tests {
         assert!(response.usage.is_some());
 
         eprintln!("Response: {:?}", response.choices[0].message.content);
+    }
+
+    /// Test that the model produces tool calls when given tools.
+    #[ignore = "requires cached GGUF model"]
+    #[tokio::test]
+    async fn test_llamacpp_tool_calling() {
+        let provider = LlamaCppProvider::from_huggingface(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE)
+            .expect("failed to load model");
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": { "type": "string", "description": "City name" }
+                    },
+                    "required": ["city"]
+                }
+            }
+        })];
+
+        let request = ChatCompletionRequest {
+            model: "qwen3.5:0.8b".into(),
+            messages: vec![ChatMessage::text("user", "What's the weather in Tokyo?")],
+            temperature: Some(0.0),
+            max_tokens: Some(512),
+            tools: Some(tools),
+            ..Default::default()
+        };
+
+        let response = provider.chat(&request).await.expect("chat failed");
+        let choice = &response.choices[0];
+
+        eprintln!("Content: {:?}", choice.message.content);
+        eprintln!("Tool calls: {:?}", choice.message.tool_calls);
+        eprintln!("Reasoning: {:?}", choice.message.reasoning_content);
+        eprintln!("Finish reason: {:?}", choice.finish_reason);
+
+        // The model should produce a tool call for get_weather
+        assert!(
+            choice.message.tool_calls.is_some(),
+            "expected tool call but got none. Content: {:?}",
+            choice.message.content
+        );
+        let tool_calls = choice.message.tool_calls.as_ref().unwrap();
+        assert!(!tool_calls.is_empty(), "tool calls array is empty");
+        assert_eq!(
+            tool_calls[0].function.name, "get_weather",
+            "expected get_weather tool call"
+        );
+
+        // Arguments should contain "Tokyo"
+        let args = &tool_calls[0].function.arguments;
+        assert!(
+            args.contains("Tokyo") || args.contains("tokyo"),
+            "expected Tokyo in arguments: {args}"
+        );
+    }
+
+    /// Test that the model produces thinking blocks when enabled.
+    #[ignore = "requires cached GGUF model"]
+    #[tokio::test]
+    async fn test_llamacpp_thinking() {
+        let provider = LlamaCppProvider::from_huggingface(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE)
+            .expect("failed to load model");
+
+        let request = ChatCompletionRequest {
+            model: "qwen3.5:0.8b".into(),
+            messages: vec![ChatMessage::text(
+                "user",
+                "What is 15 * 37? Think step by step.",
+            )],
+            temperature: Some(0.0),
+            max_tokens: Some(512),
+            ..Default::default()
+        };
+
+        let response = provider.chat(&request).await.expect("chat failed");
+        let choice = &response.choices[0];
+
+        eprintln!("Content: {:?}", choice.message.content);
+        eprintln!("Reasoning: {:?}", choice.message.reasoning_content);
+
+        // The model should produce either content or reasoning (or both).
+        // With small models and limited tokens, thinking may consume all tokens.
+        let has_content = !choice.message.content.is_empty();
+        let has_reasoning = choice.message.reasoning_content.is_some();
+        assert!(
+            has_content || has_reasoning,
+            "expected content or reasoning, got neither"
+        );
+        eprintln!("Has content: {has_content}, has reasoning: {has_reasoning}");
+    }
+
+    /// Test that format_prompt_with_tools produces a valid prompt with Jinja.
+    #[ignore = "requires cached GGUF model"]
+    #[test]
+    fn test_llamacpp_jinja_template_with_tools() {
+        let provider = LlamaCppProvider::from_huggingface(DEFAULT_GGUF_REPO, DEFAULT_GGUF_FILE)
+            .expect("failed to load model");
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })];
+
+        let pg = provider
+            .format_prompt_with_tools(
+                &[ChatMessage::text("user", "Search for rust programming")],
+                Some(&tools),
+            )
+            .expect("format_prompt failed");
+
+        eprintln!("Prompt:\n{}", pg.prompt);
+        eprintln!(
+            "Grammar: {:?}",
+            pg.grammar.as_deref().map(|g| &g[..100.min(g.len())])
+        );
+        eprintln!("Template result present: {}", pg.template_result.is_some());
+
+        // Prompt should contain the tool definition
+        assert!(
+            pg.prompt.contains("search") || pg.prompt.contains("Search"),
+            "prompt should contain tool name"
+        );
+
+        // Should have a template result for response parsing
+        assert!(
+            pg.template_result.is_some(),
+            "template_result should be set"
+        );
+
+        // Grammar should be generated for tool calling
+        assert!(
+            pg.grammar.is_some(),
+            "grammar should be generated for tools"
+        );
     }
 }
