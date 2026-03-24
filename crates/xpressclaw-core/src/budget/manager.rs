@@ -395,51 +395,67 @@ impl BudgetManager {
         let now = Utc::now();
         let mut changed = false;
 
-        // Daily reset at local midnight
-        let needs_daily_reset = match &state.daily_reset_at {
-            Some(reset_str) => {
-                chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
-                    .map(|dt| dt.and_utc() <= now)
-                    .unwrap_or(true)
-            }
-            None => true, // Never set — initialize it
-        };
+        // Compute next daily reset: tomorrow midnight in local time, stored as UTC
+        let tomorrow_local = Local::now()
+            .date_naive()
+            .succ_opt()
+            .unwrap_or_else(|| Local::now().date_naive() + chrono::Duration::days(1));
+        let next_daily = tomorrow_local
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+            .with_timezone(&Utc);
 
-        if needs_daily_reset {
-            state.daily_spent = 0.0;
-            // Next reset: tomorrow midnight local time
-            let tomorrow = Local::now()
-                .date_naive()
-                .succ_opt()
-                .unwrap_or_else(|| Local::now().date_naive() + chrono::Duration::days(1));
-            let next_reset = tomorrow.and_hms_opt(0, 0, 0).unwrap().and_utc();
-            state.daily_reset_at = Some(next_reset.format("%Y-%m-%d %H:%M:%S").to_string());
-            changed = true;
+        match &state.daily_reset_at {
+            Some(reset_str) => {
+                let expired = chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.and_utc() <= now)
+                    .unwrap_or(false);
+                if expired {
+                    state.daily_spent = 0.0;
+                    state.daily_reset_at = Some(next_daily.format("%Y-%m-%d %H:%M:%S").to_string());
+                    changed = true;
+                }
+            }
+            None => {
+                // First time — set the timestamp but don't zero spending (already 0)
+                state.daily_reset_at = Some(next_daily.format("%Y-%m-%d %H:%M:%S").to_string());
+                changed = true;
+            }
         }
 
-        // Monthly reset on 1st of month
-        let needs_monthly_reset = match &state.monthly_reset_at {
-            Some(reset_str) => {
-                chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
-                    .map(|dt| dt.and_utc() <= now)
-                    .unwrap_or(true)
-            }
-            None => true,
-        };
+        // Compute next monthly reset: 1st of next month in local time, stored as UTC
+        let today = Local::now().date_naive();
+        let next_month = if today.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
+        }
+        .unwrap_or(today + chrono::Duration::days(30));
+        let next_monthly = next_month
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .unwrap()
+            .with_timezone(&Utc);
 
-        if needs_monthly_reset {
-            state.monthly_spent = 0.0;
-            // Next reset: 1st of next month local time
-            let today = Local::now().date_naive();
-            let next_month = if today.month() == 12 {
-                chrono::NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-            } else {
-                chrono::NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
+        match &state.monthly_reset_at {
+            Some(reset_str) => {
+                let expired = chrono::NaiveDateTime::parse_from_str(reset_str, "%Y-%m-%d %H:%M:%S")
+                    .map(|dt| dt.and_utc() <= now)
+                    .unwrap_or(false);
+                if expired {
+                    state.monthly_spent = 0.0;
+                    state.monthly_reset_at =
+                        Some(next_monthly.format("%Y-%m-%d %H:%M:%S").to_string());
+                    changed = true;
+                }
             }
-            .unwrap_or(today + chrono::Duration::days(30));
-            let next_reset = next_month.and_hms_opt(0, 0, 0).unwrap().and_utc();
-            state.monthly_reset_at = Some(next_reset.format("%Y-%m-%d %H:%M:%S").to_string());
-            changed = true;
+            None => {
+                state.monthly_reset_at = Some(next_monthly.format("%Y-%m-%d %H:%M:%S").to_string());
+                changed = true;
+            }
         }
 
         changed
