@@ -1,31 +1,28 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary")
-
 exports_files(["Cargo.toml"])
 
-rust_binary(
+# Tauri desktop app — built via npx @tauri-apps/cli because Tauri's
+# build system is tightly coupled to Cargo (build scripts, env vars,
+# code signing, DMG creation). The CLI, server, and frontend are built
+# by Bazel; this target wraps them into the desktop app.
+genrule(
     name = "xpressclaw-desktop",
-    srcs = glob(["src/**/*.rs"]),
-    edition = "2021",
-    # Sidecar CLI binary must be built first
-    data = [
+    srcs = [
         "//crates/xpressclaw-cli:xpressclaw",
-    ] + glob(["icons/**"]),
-    compile_data = glob(["icons/**"]),
-    deps = [
-        "@crates//:dirs",
-        "@crates//:open",
-        "@crates//:reqwest",
-        "@crates//:serde_json",
-        "@crates//:tauri",
-        "@crates//:tauri-plugin-clipboard-manager",
-        "@crates//:tauri-plugin-dialog",
-        "@crates//:tauri-plugin-fs",
-        "@crates//:tauri-plugin-opener",
-        "@crates//:tauri-plugin-shell",
-        "@crates//:tauri-plugin-single-instance",
-        "@crates//:tokio",
-        "@crates//:tracing",
-        "@crates//:tracing-subscriber",
-    ],
+        "//frontend:build",
+    ] + glob(["src/**/*.rs", "icons/**", "*.json", "build.rs"]),
+    outs = ["desktop_stamp"],
+    cmd = """
+        set -e
+        TAURI_DIR=$$(cd $$(dirname $(location tauri.conf.json)) && pwd -P)
+        cd "$$TAURI_DIR/../.."
+        # Copy sidecar
+        TARGET_TRIPLE=$$(rustc --print host-tuple 2>/dev/null || echo x86_64-apple-darwin)
+        mkdir -p crates/xpressclaw-tauri/binaries
+        cp $(location //crates/xpressclaw-cli:xpressclaw) crates/xpressclaw-tauri/binaries/xpressclaw-$$TARGET_TRIPLE
+        # Build desktop app
+        npx @tauri-apps/cli build --target $$TARGET_TRIPLE 2>&1
+        echo "built" > $$OLDPWD/$@
+    """,
+    local = True,
     visibility = ["//visibility:public"],
 )
