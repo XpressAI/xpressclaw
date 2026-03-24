@@ -1,0 +1,12 @@
+# Root BUILD file for xpressclaw
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+filegroup(
+    name = "templates",
+    srcs = glob(["templates/**"]),
+    visibility = ["//visibility:public"],
+)

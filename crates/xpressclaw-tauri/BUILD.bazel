@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+exports_files(["Cargo.toml"])
+
+rust_binary(
+    name = "xpressclaw-desktop",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2021",
+    # Sidecar CLI binary must be built first
+    data = [
+        "//crates/xpressclaw-cli:xpressclaw",
+    ] + glob(["icons/**"]),
+    compile_data = glob(["icons/**"]),
+    deps = [
+        "@crates//:dirs",
+        "@crates//:open",
+        "@crates//:reqwest",
+        "@crates//:serde_json",
+        "@crates//:tauri",
+        "@crates//:tauri-plugin-clipboard-manager",
+        "@crates//:tauri-plugin-dialog",
+        "@crates//:tauri-plugin-fs",
+        "@crates//:tauri-plugin-opener",
+        "@crates//:tauri-plugin-shell",
+        "@crates//:tauri-plugin-single-instance",
+        "@crates//:tokio",
+        "@crates//:tracing",
+        "@crates//:tracing-subscriber",
+    ],
+    visibility = ["//visibility:public"],
+)
