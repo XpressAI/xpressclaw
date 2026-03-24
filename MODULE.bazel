@@ -1,0 +1,44 @@
+module(
+    name = "xpressclaw",
+    version = "0.1.0",
+)
+
+# Rust toolchain and crate_universe
+bazel_dep(name = "rules_rust", version = "0.61.0")
+
+# Pin Rust toolchain to match local version (needs edition2024 support)
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.88.0"],
+    extra_target_triples = [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+    ],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Rust crate_universe — generates Rust dependency targets from Cargo.toml
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    supported_platform_triples = [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+    ],
+    manifests = [
+        "//:Cargo.toml",
+        "//crates/xpressclaw-core:Cargo.toml",
+        "//crates/xpressclaw-server:Cargo.toml",
+        "//crates/xpressclaw-cli:Cargo.toml",
+        "//crates/xpressclaw-tauri:Cargo.toml",
+        "//external/ready-agent-cog:Cargo.toml",
+    ],
+)
+use_repo(crate, "crates")

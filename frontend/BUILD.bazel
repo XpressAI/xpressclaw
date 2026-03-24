@@ -1,0 +1,31 @@
+# Frontend SvelteKit build
+exports_files([
+    "package.json",
+    "package-lock.json",
+])
+
+genrule(
+    name = "build",
+    srcs = glob([
+        "src/**",
+        "static/**",
+        "*.config.*",
+        "*.json",
+        "postcss.config.js",
+    ]),
+    outs = ["build_stamp"],
+    cmd = """
+        set -e
+        OUT_FILE="$$PWD/$@"
+        FRONTEND=$$(cd $$(dirname $(location package.json)) && pwd -P)
+        cd "$$FRONTEND"
+        # Skip if already built (e.g. CI downloads pre-built frontend artifact)
+        if [ ! -d build ] || [ ! -f build/index.html ]; then
+            npm ci --silent 2>/dev/null
+            npm run build 2>&1
+        fi
+        echo "built" > "$$OUT_FILE"
+    """,
+    local = True,
+    visibility = ["//visibility:public"],
+)

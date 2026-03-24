@@ -1,0 +1,44 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "xpressclaw-server",
+    srcs = glob(["src/**/*.rs"]),
+    # Frontend must be built before the server (rust-embed reads frontend/build/)
+    compile_data = ["//frontend:build"],
+    # Must run locally — rust-embed reads frontend/build/ at compile time
+    tags = ["local"],
+    crate_features = ["local-llm"],
+    edition = "2021",
+    deps = [
+        "//crates/xpressclaw-core",
+        "@crates//:anyhow",
+        "@crates//:async-stream",
+        "@crates//:axum",
+        "@crates//:axum-extra",
+        "@crates//:chrono",
+        "@crates//:futures-util",
+        "@crates//:open",
+        "@crates//:reqwest",
+        "@crates//:rust-embed",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:tokio",
+        "@crates//:tokio-stream",
+        "@crates//:tower",
+        "@crates//:tower-http",
+        "@crates//:tracing",
+        "@crates//:uuid",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "server_test",
+    crate = ":xpressclaw-server",
+    tags = ["local"],
+    deps = [
+        "@crates//:http-body-util",
+    ],
+)
