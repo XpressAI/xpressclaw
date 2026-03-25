@@ -94,6 +94,23 @@ async fn delete_agent(
         }
     }
     registry.delete(&id).map_err(internal_error)?;
+
+    // Remove from YAML config
+    let old_config = state.config();
+    let new_agents: Vec<_> = old_config.agents.iter().filter(|a| a.name != id).cloned().collect();
+    let new_config = xpressclaw_core::config::Config {
+        agents: new_agents,
+        llm: old_config.llm.clone(),
+        mcp_servers: old_config.mcp_servers.clone(),
+        system: old_config.system.clone(),
+        tools: old_config.tools.clone(),
+        tool_policies: old_config.tool_policies.clone(),
+        memory: old_config.memory.clone(),
+    };
+    let _ = new_config.save(&state.config_path);
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
+
     Ok(StatusCode::NO_CONTENT)
 }
 
