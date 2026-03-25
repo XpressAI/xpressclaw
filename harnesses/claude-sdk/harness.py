@@ -43,8 +43,8 @@ WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 def load_mcp_servers() -> dict:
     """Load MCP server configs from the MCP_SERVERS environment variable.
 
-    For the 'xpressclaw' server, we use create_sdk_mcp_server() for in-process
-    execution instead of stdio subprocess — this avoids CLI connection issues.
+    Writes a JSON config file and returns it as a path for --mcp-config.
+    The SDK passes this to the CLI which manages the MCP server processes.
     """
     raw = os.environ.get("MCP_SERVERS", "")
     if not raw:
@@ -55,77 +55,34 @@ def load_mcp_servers() -> dict:
         logger.warning("failed to parse MCP_SERVERS env var")
         return {}
 
-    sdk_servers = {}
+    # Build the mcpServers dict for the CLI config file format
+    cli_servers = {}
     for name, config in servers.items():
         server_type = config.get("type", "stdio")
         if server_type == "stdio" and config.get("command"):
-            # Check if this is our unified xpressclaw server — use SDK server
-            args = config.get("args", [])
-            if any("mcp_xpressclaw" in a for a in args):
-                sdk_server = _create_xpressclaw_sdk_server()
-                if sdk_server:
-                    sdk_servers[name] = sdk_server
-                    continue
             entry: dict = {
                 "command": config["command"],
-                "args": args,
+                "args": config.get("args", []),
             }
             if config.get("env"):
                 entry["env"] = config["env"]
-            sdk_servers[name] = entry
+            cli_servers[name] = entry
         elif server_type == "sse" and config.get("url"):
-            sdk_servers[name] = {"url": config["url"]}
-    return sdk_servers
+            cli_servers[name] = {"type": "sse", "url": config["url"]}
 
+    if not cli_servers:
+        return {}
 
-def _create_xpressclaw_sdk_server():
-    """Create an in-process SDK MCP server for all xpressclaw tools."""
-    try:
-        from claude_agent_sdk import tool, create_sdk_mcp_server
-    except ImportError:
-        logger.warning("create_sdk_mcp_server not available")
-        return None
+    # Write config file for --mcp-config
+    config_path = "/tmp/mcp-servers.json"
+    with open(config_path, "w") as f:
+        json.dump({"mcpServers": cli_servers}, f)
 
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("mcp_xpressclaw", "/app/mcp_xpressclaw.py")
-    if not spec or not spec.loader:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    logger.info("MCP config written to %s with %d servers: %s",
+                config_path, len(cli_servers), list(cli_servers.keys()))
 
-    sdk_tools = []
-    for tool_def in mod.ALL_TOOLS:
-        tool_name = tool_def["name"]
-        tool_desc = tool_def.get("description", "")
-        schema = tool_def.get("inputSchema", {})
-        handler_fn = mod.HANDLERS.get(tool_name)
-        if not handler_fn:
-            continue
-
-        # Create a closure that captures the handler.
-        # Run sync httpx calls in a thread to avoid blocking the event loop.
-        def make_handler(name, fn):
-            async def handler(args):
-                import asyncio
-                loop = asyncio.get_event_loop()
-                try:
-                    result = await loop.run_in_executor(None, fn, name, args)
-                    return {"content": [{"type": "text", "text": str(result)}]}
-                except Exception as e:
-                    return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
-            return handler
-
-        sdk_tools.append(
-            tool(tool_name, tool_desc, schema.get("properties", {}))(
-                make_handler(tool_name, handler_fn)
-            )
-        )
-
-    return create_sdk_mcp_server(
-        name="xpressclaw",
-        version="0.1.0",
-        tools=sdk_tools,
-    )
+    # Return as a path string — the SDK passes it to CLI as --mcp-config <path>
+    return config_path
 
 
 def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeAgentOptions:
