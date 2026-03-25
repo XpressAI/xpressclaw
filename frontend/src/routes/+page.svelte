@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { setup, conversations, agents as agentsApi } from '$lib/api';
 	import type { Agent } from '$lib/api';
+	import { agentAvatar } from '$lib/utils';
 
 	let status_text = $state('Connecting to server...');
 	let loading = $state(true);
@@ -48,18 +49,16 @@
 		return 'Good evening';
 	}
 
+	let selectedAgentObj = $derived(agentList.find(a => a.id === selectedAgent));
+
 	async function send() {
 		if (!message.trim() || sending) return;
 		sending = true;
 
 		try {
-			// Create conversation with selected agent
 			const conv = await conversations.create({
 				participant_ids: selectedAgent ? [selectedAgent] : []
 			});
-
-			// Navigate immediately — pass the message as a query param
-			// so the conversation page can send it and stream the response
 			goto(`/conversations/${conv.id}?msg=${encodeURIComponent(message.trim())}`);
 		} catch (e) {
 			sending = false;
@@ -88,39 +87,44 @@
 			</h1>
 
 			<!-- Input box -->
-			<div class="rounded-xl border border-border bg-card shadow-sm">
+			<div class="rounded-2xl border border-border bg-card shadow-lg shadow-black/10">
 				<textarea
 					bind:value={message}
 					onkeydown={handleKeydown}
 					placeholder="How can I help you today?"
 					rows="3"
 					disabled={sending}
-					class="w-full resize-none rounded-t-xl bg-transparent px-4 pt-4 pb-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
+					class="w-full resize-none rounded-t-2xl bg-transparent px-5 pt-5 pb-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
 				></textarea>
-				<div class="flex items-center justify-between px-3 pb-3">
+				<div class="flex items-center justify-between px-4 pb-4">
 					<div></div>
-					<div class="flex items-center gap-2">
+					<div class="flex items-center gap-3">
 						{#if agentList.length > 0}
-							<select
-								bind:value={selectedAgent}
-								class="rounded-md border border-border bg-background px-2 py-1 text-xs text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-							>
-								{#each agentList as agent}
-									<option value={agent.id}>
-										{agent.name}
-									</option>
-								{/each}
-							</select>
+							<div class="flex items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
+								{#if selectedAgentObj}
+									<img src={agentAvatar(selectedAgentObj)} alt="" class="h-5 w-5 rounded-full object-cover" />
+								{/if}
+								<select
+									bind:value={selectedAgent}
+									class="bg-transparent text-xs text-foreground focus:outline-none cursor-pointer"
+								>
+									{#each agentList as agent}
+										<option value={agent.id}>
+											{agent.name}
+										</option>
+									{/each}
+								</select>
+							</div>
 						{/if}
 						<button
 							onclick={send}
 							disabled={!message.trim() || sending}
-							class="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+							class="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shadow-lg shadow-primary/20"
 						>
 							{#if sending}
 								<span class="h-4 w-4 animate-spin rounded-full border-2 border-primary-foreground border-t-transparent"></span>
 							{:else}
-								<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/></svg>
+								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
 							{/if}
 						</button>
 					</div>

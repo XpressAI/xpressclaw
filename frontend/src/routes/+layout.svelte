@@ -5,16 +5,19 @@
 	import { onMount } from 'svelte';
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, Agent } from '$lib/api';
+	import { agentAvatar } from '$lib/utils';
 
-	const nav = [
-		{ href: '/dashboard', label: 'Dashboard', icon: '⊞' },
-		{ href: '/agents', label: 'Agents', icon: '◉' },
-		{ href: '/tasks', label: 'Tasks', icon: '☐' },
-		{ href: '/memory', label: 'Knowledge', icon: '✿' },
-		{ href: '/schedules', label: 'Schedules', icon: '⏱' },
-		{ href: '/procedures', label: 'Procedures', icon: '≡' },
-		{ href: '/budget', label: 'Budget', icon: '◆' },
-		{ href: '/settings', label: 'Settings', icon: '⚙' }
+	const bottomNav = [
+		{ href: '/dashboard', label: 'Reports', icon: 'M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
+		{ href: '/tasks', label: 'Tasks', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
+		{ href: '/schedules', label: 'Schedules', icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
+		{ href: '/budget', label: 'Budget', icon: 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
+	];
+
+	const moreNav = [
+		{ href: '/memory', label: 'Knowledge' },
+		{ href: '/procedures', label: 'Procedures' },
+		{ href: '/settings', label: 'Settings' },
 	];
 
 	function isActive(href: string, pathname: string): boolean {
@@ -24,6 +27,10 @@
 
 	function isConvActive(id: string, pathname: string): boolean {
 		return pathname === `/conversations/${id}`;
+	}
+
+	function isAgentActive(id: string, pathname: string): boolean {
+		return pathname === `/agents/${id}`;
 	}
 
 	let isSetupRoute = $derived($page.url.pathname.startsWith('/setup'));
@@ -43,11 +50,8 @@
 	}
 
 	onMount(() => {
-		// Skip sidebar loading during setup
 		if (isSetupRoute) return;
-
 		loadSidebar();
-		// Refresh sidebar periodically
 		const interval = setInterval(loadSidebar, 10000);
 		return () => clearInterval(interval);
 	});
@@ -65,27 +69,51 @@
 			.map(p => p.participant_id);
 		return agentNames.length > 0 ? agentNames.join(', ') : 'New Chat';
 	}
+
+	function convAgent(conv: Conversation): Agent | undefined {
+		const agentId = conv.participants.find(p => p.participant_type === 'agent')?.participant_id;
+		return agentId ? agentList.find(a => a.id === agentId) : undefined;
+	}
+
+	function agentIcon(agent: Agent): string {
+		const icons: Record<string, string> = {
+			'claude-sdk': '🤖',
+			'generic': '🧑‍💻',
+			'langchain': '🔗',
+		};
+		return icons[agent.backend] ?? '🤖';
+	}
 </script>
 
 {#if isSetupRoute}
-	<!-- Setup wizard: full-screen, no sidebar -->
 	{@render children()}
 {:else}
 	<div class="flex h-screen">
 		<!-- Sidebar -->
-		<aside class="flex w-60 flex-col border-r border-border bg-card">
+		<aside class="flex w-64 flex-col" style="background: hsl(var(--sidebar))">
 			<!-- Header -->
-			<div class="flex h-14 items-center gap-2 border-b border-border px-4">
+			<div class="flex h-14 items-center gap-2.5 px-4">
 				<img src="/icon-32.png" alt="xpressclaw" class="h-7 w-7 rounded-md" />
-				<span class="text-sm font-semibold">xpressclaw</span>
+				<span class="text-sm font-semibold text-foreground">xpressclaw</span>
+			</div>
+
+			<!-- Workspace -->
+			<div class="px-3 pb-2">
+				<a href="/dashboard" class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors
+					{isActive('/dashboard', $page.url.pathname)
+						? 'bg-[hsl(var(--sidebar-active))] text-foreground'
+						: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}">
+					<img src="/icon-32.png" alt="" class="h-5 w-5 rounded" />
+					<span>xpressclaw</span>
+				</a>
 			</div>
 
 			<!-- Conversations Section -->
-			<div class="flex items-center justify-between px-3 pt-3 pb-1">
-				<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Conversations</span>
+			<div class="flex items-center justify-between px-4 pt-2 pb-1.5">
+				<span class="text-[11px] font-semibold text-muted-foreground uppercase tracking-widest">Conversations</span>
 				<a
 					href="/"
-					class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground text-sm"
+					class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] text-sm transition-colors"
 					title="New conversation"
 				>+</a>
 			</div>
@@ -94,13 +122,18 @@
 			<div class="flex-1 overflow-y-auto px-2 space-y-0.5">
 				{#each convList as conv}
 					{@const active = isConvActive(conv.id, $page.url.pathname)}
+					{@const agent = convAgent(conv)}
 					<a
 						href="/conversations/{conv.id}"
-						class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors {active
-							? 'bg-accent text-accent-foreground font-medium'
-							: 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'}"
+						class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors {active
+							? 'bg-[hsl(var(--sidebar-active))] text-foreground font-medium'
+							: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
 					>
-						<span class="text-xs flex-shrink-0">{convIcon(conv)}</span>
+						{#if agent}
+							<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover" />
+						{:else}
+							<span class="flex h-5 w-5 items-center justify-center rounded-full text-xs flex-shrink-0 bg-muted">{convIcon(conv)}</span>
+						{/if}
 						<span class="truncate">{convLabel(conv)}</span>
 					</a>
 				{:else}
@@ -111,43 +144,63 @@
 			</div>
 
 			<!-- Agents Section -->
-			<div class="border-t border-border">
-				<div class="px-3 pt-2 pb-1">
-					<span class="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Agents</span>
+			<div class="border-t border-border/50">
+				<div class="flex items-center justify-between px-4 pt-2.5 pb-1.5">
+					<span class="text-[11px] font-semibold text-muted-foreground uppercase tracking-widest">Agents</span>
+					<a
+						href="/setup?mode=add-agent"
+						class="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] text-sm transition-colors"
+						title="Add agent"
+					>+</a>
 				</div>
-				<div class="px-2 pb-1 space-y-0.5 max-h-28 overflow-y-auto">
+				<div class="px-2 pb-2 space-y-0.5 max-h-44 overflow-y-auto">
 					{#each agentList as agent}
+						{@const active = isAgentActive(agent.id, $page.url.pathname)}
 						<a
 							href="/agents/{agent.id}"
-							class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+							class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors {active
+								? 'bg-[hsl(var(--sidebar-active))] text-foreground font-medium'
+								: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
 						>
-							<span class="h-1.5 w-1.5 rounded-full flex-shrink-0 {agent.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
+							<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover" />
 							<span class="truncate">{agent.name}</span>
 						</a>
 					{/each}
 				</div>
 			</div>
 
-			<!-- Navigation Section -->
-			<div class="border-t border-border">
-				<nav class="p-1.5 space-y-0.5">
-					{#each nav as item}
+			<!-- More nav links (small) -->
+			<div class="border-t border-border/50 px-2 py-1.5">
+				{#each moreNav as item}
+					{@const active = isActive(item.href, $page.url.pathname)}
+					<a
+						href={item.href}
+						class="block rounded-md px-2.5 py-1 text-xs transition-colors {active
+							? 'text-foreground font-medium'
+							: 'text-muted-foreground hover:text-foreground'}"
+					>{item.label}</a>
+				{/each}
+			</div>
+
+			<!-- Bottom Navigation Bar -->
+			<div class="border-t border-border/50 px-2 py-2">
+				<div class="flex items-center justify-around">
+					{#each bottomNav as item}
 						{@const active = isActive(item.href, $page.url.pathname)}
 						<a
 							href={item.href}
-							class="flex items-center gap-2 rounded-md px-2 py-1 text-xs transition-colors {active
-								? 'bg-accent text-accent-foreground font-medium'
-								: 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'}"
+							class="flex flex-col items-center gap-1 rounded-lg px-3 py-1.5 text-[10px] transition-colors {active
+								? 'text-primary'
+								: 'text-muted-foreground hover:text-foreground'}"
+							title={item.label}
 						>
-							<span class="w-3 text-center opacity-60">{item.icon}</span>
-							{item.label}
+							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+								<path stroke-linecap="round" stroke-linejoin="round" d={item.icon} />
+							</svg>
+							<span>{item.label}</span>
 						</a>
 					{/each}
-				</nav>
-			</div>
-
-			<div class="border-t border-border p-2 text-xs text-muted-foreground text-center">
-				v0.1.0
+				</div>
 			</div>
 		</aside>
 
