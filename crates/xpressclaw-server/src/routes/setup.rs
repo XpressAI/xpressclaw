@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::AgentRegistry;
-use xpressclaw_core::config::{AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig};
+use xpressclaw_core::config::{
+    default_mcp_servers, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
+};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
@@ -589,7 +591,8 @@ async fn add_agent(
         }
     }
 
-    // Inherit LLM config from the existing global config
+    // LLM config: use global defaults (provider, key, base_url)
+    // The agent inherits these but can override later via the agent editor.
     let old_config = state.config();
     let agent_llm = Some(AgentLlmConfig {
         provider: Some(old_config.llm.default_provider.clone()),
@@ -598,12 +601,15 @@ async fn add_agent(
             .openai_api_key
             .clone()
             .or(old_config.llm.anthropic_api_key.clone()),
-        base_url: old_config
-            .llm
-            .openai_base_url
-            .clone()
-            .or(old_config.llm.local_base_url.clone()),
+        base_url: old_config.llm.openai_base_url.clone(),
     });
+
+    // Default skills for new agents
+    let default_skills = vec![
+        "memory-system".to_string(),
+        "task-management".to_string(),
+        "build-app".to_string(),
+    ];
 
     let agent_config = AgentConfig {
         name: req.name.clone(),
@@ -620,6 +626,7 @@ async fn add_agent(
         model: req.model.clone(),
         llm: agent_llm,
         tools,
+        skills: default_skills,
         volumes: req.volumes.clone().unwrap_or_default(),
         ..Default::default()
     };
@@ -635,8 +642,15 @@ async fn add_agent(
         new_agents.push(agent_config.clone());
     }
 
-    // Merge MCP servers: preset defaults first, then explicit overrides from frontend.
+    // Merge MCP servers: built-in defaults + preset + existing + frontend overrides.
     let mut new_mcp = old_config.mcp_servers.clone();
+    // Add built-in defaults (tasks, memory, apps, skills, shell, filesystem)
+    for (name, server) in default_mcp_servers() {
+        if !new_mcp.contains_key(&name) {
+            new_mcp.insert(name, server);
+        }
+    }
+    // Add preset-specific MCP servers
     if let Some(preset) = preset {
         for (name, server) in &preset.default_mcp_servers {
             if !new_mcp.contains_key(name) {
@@ -644,7 +658,7 @@ async fn add_agent(
             }
         }
     }
-    // Frontend-provided MCP servers override preset defaults (user may customize).
+    // Frontend-provided MCP servers override defaults.
     for (name, server) in req.mcp_servers {
         new_mcp.insert(name, server);
     }
