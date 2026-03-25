@@ -403,8 +403,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_routes_by_prefix() {
-        let config = LlmConfig::default();
+    async fn test_router_uses_default_provider() {
+        let mut config = LlmConfig::default();
+        config.default_provider = "openai".into();
         let mut router = LlmRouter::new(&config);
 
         router.register_provider(
@@ -420,21 +421,22 @@ mod tests {
             }),
         );
 
+        // All models go to default provider regardless of name
         let req = ChatCompletionRequest {
             model: "gpt-4o".into(),
             messages: vec![ChatMessage::text("user", "hi")],
             ..Default::default()
         };
-
         let resp = router.chat(&req).await.unwrap();
         assert!(resp.choices[0].message.content.contains("openai"));
 
         let req2 = ChatCompletionRequest {
-            model: "claude-sonnet-4.5".into(),
-            ..req
+            model: "qwen3.5-27b".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            ..Default::default()
         };
         let resp2 = router.chat(&req2).await.unwrap();
-        assert!(resp2.choices[0].message.content.contains("anthropic"));
+        assert!(resp2.choices[0].message.content.contains("openai"));
     }
 
     #[tokio::test]

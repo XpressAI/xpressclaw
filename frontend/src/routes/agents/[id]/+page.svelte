@@ -153,6 +153,7 @@
 
 			payload.llm = {
 				provider: editLlmProvider || null,
+				// null = keep existing key (backend merges with existing)
 				api_key: editLlmApiKey || null,
 				base_url: editLlmBaseUrl || null,
 			};
