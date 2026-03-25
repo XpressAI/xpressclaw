@@ -1,0 +1,1 @@
+ADR-015 documents the actual frontend: SvelteKit 2 + Svelte 5 + Tailwind + rust-embed. ADR-007 (HTMX) and ADR-013 (enhanced chat) marked superseded. Also added .claude/settings.json with SessionStart hook (injects git notes) and PreToolUse hook (injects file history before Edit/Write).
