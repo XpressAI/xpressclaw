@@ -408,6 +408,11 @@ async fn complete_setup(
                     model: a.model.clone(),
                     llm: agent_llm,
                     tools,
+                    skills: vec![
+                        "memory-system".to_string(),
+                        "task-management".to_string(),
+                        "build-app".to_string(),
+                    ],
                     volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()
                 }
@@ -415,9 +420,15 @@ async fn complete_setup(
             .collect()
     };
 
-    // Merge preset default_mcp_servers as fallback for any tools that
-    // the frontend didn't explicitly configure MCP servers for.
+    // Merge MCP servers: built-in defaults + preset + frontend overrides.
     let mut mcp_servers = req.mcp_servers;
+    // Built-in defaults (tasks, memory, skills, apps, shell, filesystem)
+    for (name, server) in default_mcp_servers() {
+        if !mcp_servers.contains_key(&name) {
+            mcp_servers.insert(name, server);
+        }
+    }
+    // Preset-specific servers
     for agent_setup in &req.agents {
         if let Some(preset) = agent_setup
             .preset
@@ -887,6 +898,33 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.llm.default_provider, "local");
         assert_eq!(config.agents[0].name, "atlas");
+
+        // Verify agent has default skills
+        assert!(
+            config.agents[0].skills.contains(&"memory-system".to_string()),
+            "agent should have memory-system skill, got: {:?}",
+            config.agents[0].skills
+        );
+        assert!(
+            config.agents[0].skills.contains(&"task-management".to_string()),
+            "agent should have task-management skill"
+        );
+        assert!(
+            config.agents[0].skills.contains(&"build-app".to_string()),
+            "agent should have build-app skill"
+        );
+
+        // Verify default MCP servers are present
+        assert!(
+            config.mcp_servers.contains_key("tasks"),
+            "should have tasks MCP server, got: {:?}",
+            config.mcp_servers.keys().collect::<Vec<_>>()
+        );
+        assert!(config.mcp_servers.contains_key("memory"), "should have memory MCP server");
+        assert!(config.mcp_servers.contains_key("skills"), "should have skills MCP server");
+        assert!(config.mcp_servers.contains_key("apps"), "should have apps MCP server");
+        assert!(config.mcp_servers.contains_key("shell"), "should have shell MCP server");
+        assert!(config.mcp_servers.contains_key("filesystem"), "should have filesystem MCP server");
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);

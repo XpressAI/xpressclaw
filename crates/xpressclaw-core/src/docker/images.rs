@@ -57,6 +57,8 @@ pub fn build_container_spec_with_mcp(
         format!("AGENT_ID={}", agent.name),
         format!("AGENT_NAME={}", agent.name),
         format!("AGENT_BACKEND={}", agent.backend),
+        "HOME=/workspace".to_string(),
+        "WORKSPACE_DIR=/workspace".to_string(),
     ];
 
     // Per-agent LLM overrides take precedence over global config.
