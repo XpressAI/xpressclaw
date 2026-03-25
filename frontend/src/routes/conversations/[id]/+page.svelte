@@ -304,6 +304,91 @@
 		}
 		return undefined;
 	}
+
+	// --- AskUserQuestion support ---
+	interface AskQuestion {
+		header?: string;
+		question: string;
+		multiSelect: boolean;
+		options: { label: string; description?: string }[];
+	}
+
+	function parseAskUserQuestion(content: string): AskQuestion[] | null {
+		// Look for AskUserQuestion tool call with JSON payload
+		const match = content.match(/<tool_call name="AskUserQuestion">([\s\S]*?)<\/tool_call>/);
+		if (!match) return null;
+		try {
+			const data = JSON.parse(match[1].trim());
+			if (data.questions && Array.isArray(data.questions)) {
+				return data.questions;
+			}
+		} catch {}
+		return null;
+	}
+
+	// Track selections and current page per message
+	let questionSelections = $state<Record<string, Record<number, Set<number>>>>({});
+	let questionPage = $state<Record<string, number>>({});
+
+	function getPage(msgId: string): number {
+		return questionPage[msgId] ?? 0;
+	}
+
+	function setPage(msgId: string, page: number) {
+		questionPage = { ...questionPage, [msgId]: page };
+	}
+
+	function toggleOption(msgId: string, qIdx: number, optIdx: number, multiSelect: boolean) {
+		if (!questionSelections[msgId]) questionSelections[msgId] = {};
+		if (!questionSelections[msgId][qIdx]) questionSelections[msgId][qIdx] = new Set();
+
+		const sel = questionSelections[msgId][qIdx];
+		if (multiSelect) {
+			if (sel.has(optIdx)) sel.delete(optIdx);
+			else sel.add(optIdx);
+		} else {
+			sel.clear();
+			sel.add(optIdx);
+		}
+		questionSelections = { ...questionSelections };
+	}
+
+	function isSelected(msgId: string, qIdx: number, optIdx: number): boolean {
+		return questionSelections[msgId]?.[qIdx]?.has(optIdx) ?? false;
+	}
+
+	function getSelectionLabels(msgId: string, qIdx: number, options: { label: string }[]): string[] {
+		const sel = questionSelections[msgId]?.[qIdx];
+		if (!sel) return [];
+		return [...sel].map(i => options[i]?.label).filter(Boolean);
+	}
+
+	async function submitQuestionResponse(msgId: string, questions: AskQuestion[]) {
+		if (!conv) return;
+		const parts: string[] = [];
+		for (let qi = 0; qi < questions.length; qi++) {
+			const q = questions[qi];
+			const labels = getSelectionLabels(msgId, qi, q.options);
+			if (labels.length === 0) continue;
+			if (q.header) {
+				parts.push(`${q.header}: ${labels.join(', ')}`);
+			} else {
+				parts.push(labels.join(', '));
+			}
+		}
+		if (parts.length === 0) return;
+		input = parts.join('\n');
+		await sendMessage();
+	}
+
+	function stripAskUserQuestion(content: string): string {
+		// Remove the AskUserQuestion tool call and its duplicate JSON from the content
+		// Often the raw JSON appears twice — once in tool_call tags and once raw
+		let result = content.replace(/<tool_call name="AskUserQuestion">[\s\S]*?<\/tool_call>/g, '');
+		// Also remove raw JSON blocks that look like AskUserQuestion payloads
+		result = result.replace(/\{[\s\S]*?"questions"[\s\S]*?"options"[\s\S]*?\}\s*$/g, '');
+		return result.trim();
+	}
 </script>
 
 {#if error && !conv}
@@ -452,20 +537,107 @@
 					<!-- Message bubble -->
 					<div class="max-w-[75%] space-y-1">
 						{#if !isUser}
+							{@const askQuestions = parseAskUserQuestion(msg.content)}
+							{@const msgKey = msg.id.toString()}
 							<div class="flex items-center gap-2">
 								<span class="text-xs font-semibold text-foreground">{msg.sender_name ?? msg.sender_id}</span>
 								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
 							</div>
+
+							{@const displayContent = askQuestions ? stripAskUserQuestion(msg.content) : msg.content}
+							{#if displayContent.trim()}
+								<div class="rounded-2xl px-4 py-2.5 text-sm prose-chat bg-[hsl(var(--bubble-agent))] text-foreground border border-border/50 {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
+									{@html renderContent(displayContent)}
+								</div>
+							{/if}
+
+							{#if askQuestions}
+								{@const page = getPage(msgKey)}
+								{@const totalPages = askQuestions.length}
+								{@const isReviewPage = page >= totalPages}
+								<div class="rounded-2xl border border-primary/30 bg-primary/5 px-4 py-3 space-y-3">
+									{#if isReviewPage}
+										<!-- Review page -->
+										<div class="text-xs font-semibold text-primary">Review your answers</div>
+										{#each askQuestions as q, qi}
+											{@const labels = getSelectionLabels(msgKey, qi, q.options)}
+											<div class="space-y-1">
+												<div class="text-sm font-medium">{q.header ?? q.question}</div>
+												{#if labels.length > 0}
+													<div class="text-sm text-primary">{labels.join(', ')}</div>
+												{:else}
+													<div class="text-sm text-muted-foreground italic">No selection</div>
+												{/if}
+											</div>
+										{/each}
+										<div class="flex gap-2 pt-1">
+											<button
+												onclick={() => setPage(msgKey, totalPages - 1)}
+												class="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-secondary transition-colors"
+											>Back</button>
+											<button
+												onclick={() => submitQuestionResponse(msgKey, askQuestions)}
+												disabled={sending}
+												class="rounded-lg bg-primary px-4 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+											>Submit</button>
+										</div>
+									{:else}
+										<!-- Question page -->
+										{@const q = askQuestions[page]}
+										<div class="flex items-center justify-between">
+											{#if q.header}
+												<div class="text-xs font-semibold text-primary">{q.header}</div>
+											{/if}
+											<div class="text-xs text-muted-foreground">{page + 1} / {totalPages}</div>
+										</div>
+										<div class="text-sm font-medium">{q.question}</div>
+										<div class="space-y-1.5">
+											{#each q.options as opt, oi}
+												<button
+													onclick={() => toggleOption(msgKey, page, oi, q.multiSelect)}
+													class="flex items-start gap-2.5 w-full text-left rounded-lg px-3 py-2 text-sm transition-colors {isSelected(msgKey, page, oi)
+														? 'bg-primary/20 border border-primary/40'
+														: 'bg-secondary/50 border border-transparent hover:bg-secondary'}"
+												>
+													<span class="flex-shrink-0 mt-0.5 h-4 w-4 rounded-{q.multiSelect ? 'sm' : 'full'} border {isSelected(msgKey, page, oi)
+														? 'border-primary bg-primary'
+														: 'border-muted-foreground/40'} flex items-center justify-center">
+														{#if isSelected(msgKey, page, oi)}
+															<svg class="h-2.5 w-2.5 text-primary-foreground" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
+														{/if}
+													</span>
+													<div>
+														<div class="font-medium">{opt.label}</div>
+														{#if opt.description}
+															<div class="text-xs text-muted-foreground">{opt.description}</div>
+														{/if}
+													</div>
+												</button>
+											{/each}
+										</div>
+										<div class="flex gap-2 pt-1">
+											{#if page > 0}
+												<button
+													onclick={() => setPage(msgKey, page - 1)}
+													class="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-secondary transition-colors"
+												>Back</button>
+											{/if}
+											<button
+												onclick={() => setPage(msgKey, page + 1)}
+												class="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 transition-colors ml-auto"
+											>{page < totalPages - 1 ? 'Next' : 'Review'}</button>
+										</div>
+									{/if}
+								</div>
+							{/if}
 						{:else}
 							<div class="flex items-center gap-2 flex-row-reverse">
 								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
 							</div>
+							<div class="rounded-2xl px-4 py-2.5 text-sm prose-chat bg-[hsl(var(--bubble-user))] text-white {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
+								{@html renderContent(msg.content)}
+							</div>
 						{/if}
-						<div class="rounded-2xl px-4 py-2.5 text-sm prose-chat {isUser
-							? 'bg-[hsl(var(--bubble-user))] text-white'
-							: 'bg-[hsl(var(--bubble-agent))] text-foreground border border-border/50'} {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
-							{@html renderContent(msg.content)}
-						</div>
 					</div>
 				</div>
 				{/if}
