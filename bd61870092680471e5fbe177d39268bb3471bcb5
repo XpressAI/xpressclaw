@@ -1,0 +1,1 @@
+ADR-016 implemented: 4 bottom tabs (Agents/Tasks/Workflows/Settings). Sidebar content is tab-dependent. Settings page split into sub-pages: /settings (profile), /settings/server, /settings/llm, /settings/connectors (placeholder). Workflows page is placeholder. Active tab derived from current route.
