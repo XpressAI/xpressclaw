@@ -31,7 +31,7 @@ Write-Host "    Copied to $binDir\xpressclaw-$triple.exe"
 
 # Build Tauri desktop app
 Write-Host "==> Building Tauri desktop app..."
-npx -y @tauri-apps/cli build
+npx -y @tauri-apps/cli build --target $triple
 
 # Run frontend type check
 Write-Host "==> Running frontend type check..."
