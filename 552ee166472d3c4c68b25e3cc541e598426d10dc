@@ -1,0 +1,1 @@
+Fixed streaming timeout. reqwest::Client::new() has a default 30s read timeout. Long-running agent tasks (building apps, multi-turn tool use) would timeout and produce 'SSE read error: error decoding response body'. Now using ClientBuilder with connect_timeout(30s) only — no read timeout. The SSE keep-alive handles liveness.
