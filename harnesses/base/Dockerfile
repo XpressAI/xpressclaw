@@ -2,6 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# System dependencies for skills (PDF, DOCX, XLSX, PPTX)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install base dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
