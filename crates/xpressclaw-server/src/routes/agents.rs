@@ -334,13 +334,7 @@ async fn update_agent_config(
     if let Some(llm) = req.llm {
         // Empty provider means clear the override
         if llm.provider.as_deref().is_some_and(|p| !p.is_empty()) {
-            // Merge with existing: preserve api_key if not provided
-            let existing = agent.llm.take().unwrap_or_default();
-            agent.llm = Some(AgentLlmConfig {
-                provider: llm.provider.or(existing.provider),
-                api_key: llm.api_key.or(existing.api_key),
-                base_url: llm.base_url.or(existing.base_url),
-            });
+            agent.llm = Some(llm);
         } else {
             agent.llm = None;
         }
@@ -406,7 +400,7 @@ async fn update_agent_config(
             "model": updated.model,
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
-                "api_key": l.api_key.as_ref().map(|_| "********"),
+                "api_key": l.api_key,
                 "base_url": l.base_url,
             })),
             "tools": updated.tools,

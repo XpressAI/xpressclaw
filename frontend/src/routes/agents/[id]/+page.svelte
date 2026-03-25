@@ -62,7 +62,7 @@
 				editRole = agentConfig.role;
 				editModel = agentConfig.model ?? '';
 				editLlmProvider = agentConfig.llm?.provider ?? '';
-				editLlmApiKey = '';
+				editLlmApiKey = agentConfig.llm?.api_key ?? '';
 				editLlmBaseUrl = agentConfig.llm?.base_url ?? '';
 				editVolumes = [...(agentConfig.volumes || [])];
 				fetchEnabled = agentConfig.tools.includes('fetch');
@@ -153,7 +153,6 @@
 
 			payload.llm = {
 				provider: editLlmProvider || null,
-				// null = keep existing key (backend merges with existing)
 				api_key: editLlmApiKey || null,
 				base_url: editLlmBaseUrl || null,
 			};

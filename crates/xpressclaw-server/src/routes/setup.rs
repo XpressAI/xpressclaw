@@ -54,7 +54,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "model": a.model,
                 "llm": a.llm.as_ref().map(|l| json!({
                     "provider": l.provider,
-                    "api_key": l.api_key.as_ref().map(|_| "********"),
+                    "api_key": l.api_key,
                     "base_url": l.base_url,
                 })),
                 "tools": a.tools,
