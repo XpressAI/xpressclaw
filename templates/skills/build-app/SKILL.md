@@ -5,6 +5,8 @@ description: Build and publish a web app for the user. Use when asked to create 
 
 # Building Apps
 
+**IMPORTANT: When the user asks you to create, build, or make any app, website, dashboard, tracker, tool, or interactive web interface — you MUST use the `create_app_workspace` tool first, then `publish_app` when done. Do NOT write files directly with the Write tool. The app system handles containerization and deployment.**
+
 You can create web apps that the user interacts with directly in the xpressclaw UI. Apps appear in the sidebar under "Apps" and are displayed via iframe.
 
 ## Tools Available

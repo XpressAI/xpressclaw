@@ -102,12 +102,15 @@ def _create_xpressclaw_sdk_server():
         if not handler_fn:
             continue
 
-        # Create a closure that captures the handler
+        # Create a closure that captures the handler.
+        # Run sync httpx calls in a thread to avoid blocking the event loop.
         def make_handler(name, fn):
             async def handler(args):
+                import asyncio
+                loop = asyncio.get_event_loop()
                 try:
-                    result = fn(name, args)
-                    return {"content": [{"type": "text", "text": result}]}
+                    result = await loop.run_in_executor(None, fn, name, args)
+                    return {"content": [{"type": "text", "text": str(result)}]}
                 except Exception as e:
                     return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
             return handler
