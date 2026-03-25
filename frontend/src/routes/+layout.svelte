@@ -8,7 +8,7 @@
 	import { agentAvatar } from '$lib/utils';
 
 	const bottomNav = [
-		{ href: '/dashboard', label: 'Reports', icon: 'M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z' },
+		{ href: '/dashboard', label: 'Apps', icon: 'M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z' },
 		{ href: '/tasks', label: 'Tasks', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
 		{ href: '/schedules', label: 'Schedules', icon: 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' },
 		{ href: '/budget', label: 'Budget', icon: 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z' },
@@ -74,15 +74,6 @@
 		const agentId = conv.participants.find(p => p.participant_type === 'agent')?.participant_id;
 		return agentId ? agentList.find(a => a.id === agentId) : undefined;
 	}
-
-	function agentIcon(agent: Agent): string {
-		const icons: Record<string, string> = {
-			'claude-sdk': '🤖',
-			'generic': '🧑‍💻',
-			'langchain': '🔗',
-		};
-		return icons[agent.backend] ?? '🤖';
-	}
 </script>
 
 {#if isSetupRoute}
@@ -91,20 +82,23 @@
 	<div class="flex h-screen">
 		<!-- Sidebar -->
 		<aside class="flex w-64 flex-col" style="background: hsl(var(--sidebar))">
-			<!-- Header -->
-			<div class="flex h-14 items-center gap-2.5 px-4">
-				<img src="/icon-32.png" alt="xpressclaw" class="h-7 w-7 rounded-md" />
-				<span class="text-sm font-semibold text-foreground">xpressclaw</span>
+			<!-- Titlebar drag region with logo -->
+			<div class="flex h-11 items-center gap-2 px-4" style="-webkit-app-region: drag">
+				<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded" />
+				<span class="text-xs font-medium text-muted-foreground">xpressclaw</span>
 			</div>
 
-			<!-- Workspace -->
-			<div class="px-3 pb-2">
+			<!-- Apps Section -->
+			<div class="px-3 pb-1">
+				<div class="flex items-center justify-between px-1 pb-1.5">
+					<span class="text-[11px] font-semibold text-muted-foreground uppercase tracking-widest">Apps</span>
+				</div>
 				<a href="/dashboard" class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors
 					{isActive('/dashboard', $page.url.pathname)
-						? 'bg-[hsl(var(--sidebar-active))] text-foreground'
+						? 'bg-[hsl(var(--sidebar-active))] text-foreground font-medium'
 						: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}">
-					<img src="/icon-32.png" alt="" class="h-5 w-5 rounded" />
-					<span>xpressclaw</span>
+					<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zm9.75 0A2.25 2.25 0 0115.75 3.75H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zm9.75 0A2.25 2.25 0 0115.75 13.5H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" /></svg>
+					<span>Dashboard</span>
 				</a>
 			</div>
 

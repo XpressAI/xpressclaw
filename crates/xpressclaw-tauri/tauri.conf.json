@@ -20,7 +20,9 @@
         "minHeight": 600,
         "url": "http://localhost:8935",
         "visible": false,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "decorations": false,
+        "transparent": false
       }
     ],
     "trayIcon": {
