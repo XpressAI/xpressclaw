@@ -20,14 +20,20 @@ impl HarnessClient {
     /// Create a client pointing to a harness container.
     pub fn new(host_port: u16) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             base_url: format!("http://127.0.0.1:{host_port}"),
         }
     }
 
     pub fn from_url(base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             base_url,
         }
     }
@@ -107,7 +113,6 @@ impl HarnessClient {
             .client
             .post(&url)
             .json(&stream_req)
-            .timeout(std::time::Duration::from_secs(300))
             .send()
             .await
             .map_err(|e| Error::Agent(format!("harness stream request failed: {e}")))?;
