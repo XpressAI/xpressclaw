@@ -1,0 +1,1 @@
+Agent delete now removes from YAML config too. Root issue: dual source of truth (YAML + SQLite) for agents. YAML defines config, DB tracks runtime state. Every mutation must update both. This is a design smell — ideally agents would live in one place. User flagged this as bad design.
