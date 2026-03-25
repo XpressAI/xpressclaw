@@ -1,7 +1,7 @@
 # ADR-007: HTMX Web UI
 
 ## Status
-Accepted
+Superseded by ADR-015 (SvelteKit Web UI)
 
 ## Context
 
