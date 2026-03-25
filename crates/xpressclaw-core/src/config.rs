@@ -166,6 +166,15 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
         },
     );
     servers.insert(
+        "skills".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("python".to_string()),
+            args: vec!["/app/mcp_skills.py".into()],
+            ..Default::default()
+        },
+    );
+    servers.insert(
         "apps".to_string(),
         McpServerConfig {
             server_type: "stdio".to_string(),
@@ -217,6 +226,9 @@ pub struct AgentConfig {
     pub role: String,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Skills available to this agent (names matching templates/skills/{name}/).
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub budget: Option<BudgetConfig>,
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
@@ -238,6 +250,7 @@ impl Default for AgentConfig {
             llm: None,
             role: String::new(),
             tools: Vec::new(),
+            skills: Vec::new(),
             budget: None,
             rate_limit: None,
             wake_on: Vec::new(),

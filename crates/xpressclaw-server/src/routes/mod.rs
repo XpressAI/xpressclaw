@@ -15,6 +15,7 @@ mod open_url;
 mod procedures;
 mod schedules;
 mod settings;
+mod skills;
 mod setup;
 mod tasks;
 mod tools_proxy;
@@ -41,5 +42,6 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/schedules", schedules::routes())
         .nest("/procedures", procedures::routes())
         .nest("/settings", settings::routes())
+        .nest("/skills", skills::routes())
         .nest("/setup", setup::routes())
 }
