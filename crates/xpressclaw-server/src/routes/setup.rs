@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
-use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
+use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -459,27 +459,13 @@ async fn complete_setup(
     }
     for agent_config in &config.agents {
         let mut agent_json = serde_json::Map::new();
-        if !agent_config.role.is_empty() {
-            agent_json.insert(
-                "role".into(),
-                serde_json::Value::String(agent_config.role.clone()),
-            );
-        }
-        if let Some(ref model) = agent_config.model {
-            agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-
-        match registry.register(&RegisterAgent {
-            name: agent_config.name.clone(),
-            backend: agent_config.backend.clone(),
-            config: serde_json::Value::Object(agent_json),
-        }) {
+        match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => info!(
                 name = record.name,
                 backend = record.backend,
-                "registered agent"
+                "synced agent"
             ),
-            Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
+            Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }
 
@@ -677,22 +663,8 @@ async fn add_agent(
 
     // Register in DB
     let registry = AgentRegistry::new(state.db.clone());
-    let mut agent_json = serde_json::Map::new();
-    if !agent_config.role.is_empty() {
-        agent_json.insert(
-            "role".into(),
-            serde_json::Value::String(agent_config.role.clone()),
-        );
-    }
-    if let Some(ref model) = agent_config.model {
-        agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
-    }
     registry
-        .register(&RegisterAgent {
-            name: agent_config.name.clone(),
-            backend: agent_config.backend.clone(),
-            config: serde_json::Value::Object(agent_json),
-        })
+        .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
 
     // Reload config

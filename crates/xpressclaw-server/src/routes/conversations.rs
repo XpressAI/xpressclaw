@@ -179,6 +179,7 @@ async fn send_message(
     Json(req): Json<SendMessageInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
+    let config = state.config();
 
     // Store user message
     let user_msg = mgr
@@ -272,14 +273,15 @@ async fn send_message(
                 continue;
             }
 
-            // Look up agent to get config
+            // Look up agent runtime state (DB) + config (YAML)
             let agent = match registry.get(agent_id) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent.config["model"]
-                .as_str()
+            let model = agent_cfg
+                .and_then(|c| c.model.as_deref())
                 .map(String::from)
                 .unwrap_or_else(|| {
                     llm_router
@@ -289,8 +291,8 @@ async fn send_message(
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            let role = agent.config["role"]
-                .as_str()
+            let role = agent_cfg
+                .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
@@ -480,7 +482,7 @@ async fn stream_message(
 
         let registry = AgentRegistry::new(db.clone());
         let mgr = ConversationManager::new(db.clone());
-        let budget_mgr = BudgetManager::new(db.clone(), config);
+        let budget_mgr = BudgetManager::new(db.clone(), config.clone());
         let cost_tracker = CostTracker::with_custom_pricing(db.clone(), &custom_pricing);
 
         for agent_id in &target_agents {
@@ -534,9 +536,10 @@ async fn stream_message(
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent.config["model"]
-                .as_str()
+            let model = agent_cfg
+                .and_then(|c| c.model.as_deref())
                 .map(String::from)
                 .unwrap_or_else(|| {
                     llm_router
@@ -546,8 +549,8 @@ async fn stream_message(
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            let role = agent.config["role"]
-                .as_str()
+            let role = agent_cfg
+                .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();

@@ -273,11 +273,10 @@ impl Runtime {
             return Err(Error::Agent(err));
         }
 
-        // Build prompt from task
-        let system_prompt = agent
-            .config
-            .get("role")
-            .and_then(|v| v.as_str())
+        // Build prompt from task — config comes from YAML, not DB
+        let agent_cfg = self.config.agents.iter().find(|a| a.name == agent_id);
+        let system_prompt = agent_cfg
+            .map(|c| c.role.as_str())
             .unwrap_or("You are a helpful assistant.");
 
         let task_prompt = if let Some(desc) = &task.description {
@@ -286,10 +285,8 @@ impl Runtime {
             format!("Task: {}", task.title)
         };
 
-        let model = agent
-            .config
-            .get("model")
-            .and_then(|v| v.as_str())
+        let model = agent_cfg
+            .and_then(|c| c.model.as_deref())
             .unwrap_or("default");
 
         // Send to harness
@@ -337,7 +334,6 @@ mod tests {
         })
     }
     use super::*;
-    use crate::agents::registry::RegisterAgent;
     use crate::tasks::board::CreateTask;
 
     fn setup() -> (Arc<Config>, Arc<Database>, Runtime) {
@@ -352,13 +348,7 @@ mod tests {
         let (_, _, runtime) = setup();
         let registry = runtime.registry();
 
-        registry
-            .register(&RegisterAgent {
-                name: "atlas".into(),
-                backend: "generic".into(),
-                config: serde_json::json!({"role": "test agent"}),
-            })
-            .unwrap();
+        registry.ensure("atlas", "generic").unwrap();
 
         let agents = registry.list().unwrap();
         assert_eq!(agents.len(), 1);
@@ -419,13 +409,7 @@ mod tests {
         let (_, _db, runtime) = setup();
         let registry = runtime.registry();
 
-        registry
-            .register(&RegisterAgent {
-                name: "atlas".into(),
-                backend: "generic".into(),
-                config: serde_json::json!({}),
-            })
-            .unwrap();
+        registry.ensure("atlas", "generic").unwrap();
 
         // First mark as running (so it's not skipped due to "stopped" status)
         registry
@@ -446,13 +430,7 @@ mod tests {
         let (_, db, runtime) = setup();
         let registry = runtime.registry();
 
-        registry
-            .register(&RegisterAgent {
-                name: "atlas".into(),
-                backend: "generic".into(),
-                config: serde_json::json!({}),
-            })
-            .unwrap();
+        registry.ensure("atlas", "generic").unwrap();
 
         let board = TaskBoard::new(db);
         let task = board
