@@ -823,31 +823,59 @@ fn load_skill_index(config_path: &std::path::Path) -> Vec<(String, String)> {
     entries
 }
 
-/// Append skill index to the agent's system prompt, filtered by agent's skills list.
+/// Append skill content directly to the agent's system prompt.
+/// Critical skills (like build-app) are injected in full so the agent
+/// doesn't need to call read_skill first.
 fn append_skills(base_role: &str, agent_skills: &[String], config_path: &std::path::Path) -> String {
     if agent_skills.is_empty() {
         return base_role.to_string();
     }
-    let all = load_skill_index(config_path);
-    if all.is_empty() {
+
+    let skills_dir = config_path
+        .parent()
+        .map(|d| d.join("skills"))
+        .unwrap_or_default();
+
+    if !skills_dir.is_dir() {
         return base_role.to_string();
     }
-    // Filter to only skills the agent has
-    let filtered: Vec<&(String, String)> = all
-        .iter()
-        .filter(|(name, _)| agent_skills.contains(name))
-        .collect();
-    if filtered.is_empty() {
+
+    let mut sections = Vec::new();
+
+    if let Ok(dirs) = std::fs::read_dir(&skills_dir) {
+        for entry in dirs.flatten() {
+            let skill_file = entry.path().join("SKILL.md");
+            if !skill_file.is_file() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&skill_file) {
+                if !content.starts_with("---") {
+                    continue;
+                }
+                let parts: Vec<&str> = content.splitn(3, "---").collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                let fm = parts[1];
+                let body = parts[2].trim();
+                let mut name = String::new();
+                for line in fm.lines() {
+                    if let Some(v) = line.strip_prefix("name:") {
+                        name = v.trim().to_string();
+                    }
+                }
+                if !name.is_empty() && agent_skills.contains(&name) {
+                    sections.push(body.to_string());
+                }
+            }
+        }
+    }
+
+    if sections.is_empty() {
         return base_role.to_string();
     }
-    let list: Vec<String> = filtered
-        .iter()
-        .map(|(name, desc)| format!("- **{}**: {}", name, desc))
-        .collect();
-    format!(
-        "{base_role}\n\n## Available Skills\n\nYou have access to these skills. Use the `read_skill` MCP tool to load a skill's full instructions before using it.\n\n{}",
-        list.join("\n")
-    )
+
+    format!("{base_role}\n\n{}", sections.join("\n\n---\n\n"))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
