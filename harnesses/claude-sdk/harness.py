@@ -73,7 +73,6 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeA
         model=model,
         system_prompt=system_prompt or f"You are {AGENT_NAME}, an AI assistant.",
         permission_mode="bypassPermissions",
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         cwd=WORKSPACE_DIR,
         max_turns=25,
     )
