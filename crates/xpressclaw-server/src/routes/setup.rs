@@ -293,6 +293,7 @@ async fn complete_setup(
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
+    #[allow(unused_variables)]
     let needs_download = is_local && req.llm.use_embedded;
 
     // Resolve GGUF source if needed (for config, even before download completes)

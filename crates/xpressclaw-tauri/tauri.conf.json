@@ -21,7 +21,7 @@
         "url": "http://localhost:8935",
         "visible": false,
         "dragDropEnabled": true,
-        "titleBarStyle": "overlay",
+        "titleBarStyle": "Overlay",
         "hiddenTitle": true
       }
     ],
