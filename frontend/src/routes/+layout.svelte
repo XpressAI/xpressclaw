@@ -70,10 +70,6 @@
 		return agentNames.length > 0 ? agentNames.join(', ') : 'New Chat';
 	}
 
-	function convAgent(conv: Conversation): Agent | undefined {
-		const agentId = conv.participants.find(p => p.participant_type === 'agent')?.participant_id;
-		return agentId ? agentList.find(a => a.id === agentId) : undefined;
-	}
 </script>
 
 {#if isSetupRoute}
@@ -116,18 +112,13 @@
 			<div class="flex-1 overflow-y-auto px-2 space-y-0.5">
 				{#each convList as conv}
 					{@const active = isConvActive(conv.id, $page.url.pathname)}
-					{@const agent = convAgent(conv)}
 					<a
 						href="/conversations/{conv.id}"
 						class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors {active
 							? 'bg-[hsl(var(--sidebar-active))] text-foreground font-medium'
 							: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
 					>
-						{#if agent}
-							<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover" />
-						{:else}
-							<span class="flex h-5 w-5 items-center justify-center rounded-full text-xs flex-shrink-0 bg-muted">{convIcon(conv)}</span>
-						{/if}
+						<span class="text-xs flex-shrink-0">{convIcon(conv)}</span>
 						<span class="truncate">{convLabel(conv)}</span>
 					</a>
 				{:else}
@@ -156,7 +147,7 @@
 								? 'bg-[hsl(var(--sidebar-active))] text-foreground font-medium'
 								: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
 						>
-							<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover" />
+							<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover ring-2 {agent.status === 'running' ? 'ring-emerald-400' : agent.status === 'starting' ? 'ring-amber-400' : 'ring-red-400'}" />
 							<span class="truncate">{agent.name}</span>
 						</a>
 					{/each}
