@@ -1,0 +1,1 @@
+AskUserQuestion tool calls now render as interactive paged wizard in the conversation UI. Questions shown one-per-page with radio/checkbox options, Back/Next navigation, and a review page before submit. Selections are sent as a formatted text message. The raw JSON payload and duplicates are stripped from the displayed message content.
