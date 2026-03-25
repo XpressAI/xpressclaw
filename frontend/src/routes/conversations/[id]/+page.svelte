@@ -3,7 +3,7 @@
 	import { onMount, tick } from 'svelte';
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
-	import { timeAgo, agentAvatar } from '$lib/utils';
+	import { timeAgo, agentAvatar, getUserProfile } from '$lib/utils';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 
@@ -26,6 +26,7 @@
 	let stoppedAgents = $state<Agent[]>([]);
 	let showStartDialog = $state(false);
 	let startingAgents = $state(false);
+	let userProfile = $state(getUserProfile());
 
 	let participantAgents = $derived(
 		conv?.participants.filter(p => p.participant_type === 'agent').map(p => p.participant_id) ?? []
@@ -96,7 +97,7 @@
 		thinkingAgent = null;
 		streamingContent = '';
 
-		const abort = conversations.streamMessage(conv.id, content, 'You', {
+		const abort = conversations.streamMessage(conv.id, content, userProfile.name, {
 			onUserMessage: async (msg) => {
 				messages = [...messages, msg];
 				await tick();
@@ -422,9 +423,13 @@
 				<div class="flex gap-3 {isUser ? 'flex-row-reverse' : ''}">
 					<!-- Avatar -->
 					{#if isUser}
-						<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs font-bold bg-primary/20 text-primary overflow-hidden">
-							<img src="/avatars/00.jpg" alt="" class="h-full w-full object-cover" />
-						</div>
+						{#if userProfile.avatar}
+							<img src={userProfile.avatar} alt="" class="flex-shrink-0 h-9 w-9 rounded-full object-cover" />
+						{:else}
+							<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs font-bold bg-primary/20 text-primary">
+								{userProfile.name[0].toUpperCase()}
+							</div>
+						{/if}
 					{:else if agent}
 						<img src={agentAvatar(agent)} alt="" class="flex-shrink-0 h-9 w-9 rounded-full object-cover" />
 					{:else}

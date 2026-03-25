@@ -49,6 +49,19 @@ export function agentAvatar(agent: { name: string; id: string }): string {
 	return `/avatars/${idx.toString().padStart(2, '0')}.jpg`;
 }
 
+/** Get/set user profile stored in localStorage. */
+export function getUserProfile(): { name: string; avatar: string | null } {
+	try {
+		const stored = localStorage.getItem('xpressclaw_user_profile');
+		if (stored) return JSON.parse(stored);
+	} catch {}
+	return { name: 'You', avatar: null };
+}
+
+export function setUserProfile(profile: { name: string; avatar: string | null }) {
+	localStorage.setItem('xpressclaw_user_profile', JSON.stringify(profile));
+}
+
 export function statusColor(status: string): string {
 	switch (status) {
 		case 'running':
