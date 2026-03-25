@@ -13,6 +13,7 @@ mod memory;
 mod open_url;
 mod procedures;
 mod schedules;
+mod settings;
 mod setup;
 mod tasks;
 mod tools_proxy;
@@ -33,5 +34,6 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/memory", memory::routes())
         .nest("/schedules", schedules::routes())
         .nest("/procedures", procedures::routes())
+        .nest("/settings", settings::routes())
         .nest("/setup", setup::routes())
 }

@@ -21,8 +21,8 @@
         "url": "http://localhost:8935",
         "visible": false,
         "dragDropEnabled": true,
-        "decorations": false,
-        "transparent": false
+        "titleBarStyle": "overlay",
+        "hiddenTitle": true
       }
     ],
     "trayIcon": {

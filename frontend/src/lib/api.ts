@@ -555,3 +555,17 @@ export const setup = {
 		body: JSON.stringify(data)
 	})
 };
+
+export interface UserProfile {
+	name: string;
+	avatar: string | null;
+}
+
+export const settings = {
+	getProfile: () => request<UserProfile>('/api/settings/profile'),
+	putProfile: (profile: UserProfile) =>
+		request<UserProfile>('/api/settings/profile', {
+			method: 'PUT',
+			body: JSON.stringify(profile)
+		})
+};

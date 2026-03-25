@@ -3,7 +3,8 @@
 	import { onMount, tick } from 'svelte';
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
-	import { timeAgo, agentAvatar, getUserProfile } from '$lib/utils';
+	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
+	import { settings } from '$lib/api';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 
@@ -26,7 +27,17 @@
 	let stoppedAgents = $state<Agent[]>([]);
 	let showStartDialog = $state(false);
 	let startingAgents = $state(false);
-	let userProfile = $state(getUserProfile());
+	let userProfile = $state(getCachedProfile());
+
+	onMount(async () => {
+		if (!isProfileLoaded()) {
+			const p = await settings.getProfile().catch(() => null);
+			if (p) {
+				setCachedProfile(p);
+				userProfile = p;
+			}
+		}
+	});
 
 	let participantAgents = $derived(
 		conv?.participants.filter(p => p.participant_type === 'agent').map(p => p.participant_id) ?? []

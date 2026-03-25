@@ -1,55 +1,96 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { health, setup } from '$lib/api';
+	import { health, setup, settings } from '$lib/api';
 	import type { LiveConfig } from '$lib/api';
-	import { getUserProfile, setUserProfile } from '$lib/utils';
+	import { setCachedProfile } from '$lib/utils';
 
 	let serverInfo = $state<{ status: string; version: string } | null>(null);
 	let config = $state<LiveConfig | null>(null);
 
-	let userProfile = $state(getUserProfile());
+	let userProfile = $state<{ name: string; avatar: string | null }>({ name: 'You', avatar: null });
 	let editingProfile = $state(false);
 	let profileName = $state('');
 	let profileSaved = $state(false);
-	let showAvatarPicker = $state(false);
-
-	const AVATAR_COUNT = 32;
-	const avatarPaths = Array.from({ length: AVATAR_COUNT }, (_, i) => `/avatars/${i.toString().padStart(2, '0')}.jpg`);
+	let fileInput: HTMLInputElement;
 
 	function startEditProfile() {
 		profileName = userProfile.name;
 		editingProfile = true;
 	}
 
-	function saveProfile() {
+	async function saveProfile() {
 		userProfile = { ...userProfile, name: profileName.trim() || 'You' };
-		setUserProfile(userProfile);
+		await persistProfile();
 		editingProfile = false;
-		profileSaved = true;
-		setTimeout(() => (profileSaved = false), 2000);
 	}
 
-	function selectAvatar(path: string) {
-		userProfile = { ...userProfile, avatar: path };
-		setUserProfile(userProfile);
-		showAvatarPicker = false;
-		profileSaved = true;
-		setTimeout(() => (profileSaved = false), 2000);
+	function triggerUpload() {
+		fileInput?.click();
 	}
 
-	function clearAvatar() {
+	async function handleFileUpload(e: Event) {
+		const target = e.target as HTMLInputElement;
+		const file = target.files?.[0];
+		if (!file) return;
+
+		// Resize to 128x128 and convert to data URI
+		const dataUri = await resizeImage(file, 128);
+		userProfile = { ...userProfile, avatar: dataUri };
+		await persistProfile();
+		target.value = '';
+	}
+
+	function resizeImage(file: File, size: number): Promise<string> {
+		return new Promise((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => {
+				const img = new Image();
+				img.onload = () => {
+					const canvas = document.createElement('canvas');
+					canvas.width = size;
+					canvas.height = size;
+					const ctx = canvas.getContext('2d')!;
+
+					// Crop to square from center
+					const min = Math.min(img.width, img.height);
+					const sx = (img.width - min) / 2;
+					const sy = (img.height - min) / 2;
+					ctx.drawImage(img, sx, sy, min, min, 0, 0, size, size);
+
+					resolve(canvas.toDataURL('image/jpeg', 0.85));
+				};
+				img.src = reader.result as string;
+			};
+			reader.readAsDataURL(file);
+		});
+	}
+
+	async function removeAvatar() {
 		userProfile = { ...userProfile, avatar: null };
-		setUserProfile(userProfile);
-		showAvatarPicker = false;
-		profileSaved = true;
-		setTimeout(() => (profileSaved = false), 2000);
+		await persistProfile();
+	}
+
+	async function persistProfile() {
+		try {
+			await settings.putProfile(userProfile);
+			setCachedProfile(userProfile);
+			profileSaved = true;
+			setTimeout(() => (profileSaved = false), 2000);
+		} catch {}
 	}
 
 	onMount(async () => {
-		[serverInfo, config] = await Promise.all([
+		const [si, cfg, profile] = await Promise.all([
 			health.check().catch(() => null),
-			setup.getConfig().catch(() => null)
+			setup.getConfig().catch(() => null),
+			settings.getProfile().catch(() => null)
 		]);
+		serverInfo = si;
+		config = cfg;
+		if (profile) {
+			userProfile = profile;
+			setCachedProfile(profile);
+		}
 	});
 </script>
 
@@ -68,9 +109,11 @@
 			{/if}
 		</div>
 
+		<input type="file" accept="image/*" bind:this={fileInput} onchange={handleFileUpload} class="hidden" />
+
 		<div class="flex items-center gap-4">
 			<!-- Avatar -->
-			<button onclick={() => (showAvatarPicker = !showAvatarPicker)} class="relative group flex-shrink-0" title="Change avatar">
+			<button onclick={triggerUpload} class="relative group flex-shrink-0" title="Upload picture">
 				{#if userProfile.avatar}
 					<img src={userProfile.avatar} alt="" class="h-14 w-14 rounded-full object-cover" />
 				{:else}
@@ -102,32 +145,15 @@
 						<span class="text-sm font-medium">{userProfile.name}</span>
 						<button onclick={startEditProfile} class="text-xs text-muted-foreground hover:text-foreground transition-colors">Edit</button>
 					</div>
-					<p class="text-xs text-muted-foreground mt-0.5">Shown in conversations</p>
+					<div class="flex items-center gap-2 mt-0.5">
+						<p class="text-xs text-muted-foreground">Shown in conversations</p>
+						{#if userProfile.avatar}
+							<button onclick={removeAvatar} class="text-xs text-muted-foreground hover:text-destructive transition-colors">Remove picture</button>
+						{/if}
+					</div>
 				{/if}
 			</div>
 		</div>
-
-		<!-- Avatar Picker -->
-		{#if showAvatarPicker}
-			<div class="border-t border-border pt-3">
-				<div class="flex items-center justify-between mb-2">
-					<span class="text-xs text-muted-foreground">Choose an avatar</span>
-					{#if userProfile.avatar}
-						<button onclick={clearAvatar} class="text-xs text-muted-foreground hover:text-foreground transition-colors">Use initial instead</button>
-					{/if}
-				</div>
-				<div class="grid grid-cols-8 gap-2">
-					{#each avatarPaths as path}
-						<button
-							onclick={() => selectAvatar(path)}
-							class="rounded-full overflow-hidden border-2 transition-colors {userProfile.avatar === path ? 'border-primary' : 'border-transparent hover:border-primary/50'}"
-						>
-							<img src={path} alt="" class="h-10 w-10 object-cover" />
-						</button>
-					{/each}
-				</div>
-			</div>
-		{/if}
 	</div>
 
 	<!-- Server -->

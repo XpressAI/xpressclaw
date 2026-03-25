@@ -49,17 +49,21 @@ export function agentAvatar(agent: { name: string; id: string }): string {
 	return `/avatars/${idx.toString().padStart(2, '0')}.jpg`;
 }
 
-/** Get/set user profile stored in localStorage. */
-export function getUserProfile(): { name: string; avatar: string | null } {
-	try {
-		const stored = localStorage.getItem('xpressclaw_user_profile');
-		if (stored) return JSON.parse(stored);
-	} catch {}
-	return { name: 'You', avatar: null };
+/** Get cached user profile (loaded from server, cached in memory). */
+let _cachedProfile: { name: string; avatar: string | null } = { name: 'You', avatar: null };
+let _profileLoaded = false;
+
+export function getCachedProfile(): { name: string; avatar: string | null } {
+	return _cachedProfile;
 }
 
-export function setUserProfile(profile: { name: string; avatar: string | null }) {
-	localStorage.setItem('xpressclaw_user_profile', JSON.stringify(profile));
+export function setCachedProfile(profile: { name: string; avatar: string | null }) {
+	_cachedProfile = profile;
+	_profileLoaded = true;
+}
+
+export function isProfileLoaded(): boolean {
+	return _profileLoaded;
 }
 
 export function statusColor(status: string): string {
