@@ -1,0 +1,1 @@
+User profile: name + avatar upload to SQLite config table via PUT /api/settings/profile. Replaces localStorage approach. Avatar resized to 128x128 JPEG data URI client-side before upload.
