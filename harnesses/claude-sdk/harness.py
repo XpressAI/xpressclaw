@@ -93,6 +93,9 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeA
         permission_mode="bypassPermissions",
         cwd=WORKSPACE_DIR,
         max_turns=25,
+        # AskUserQuestion auto-skips in bypassPermissions mode (no terminal).
+        # The agent should ask via regular text messages in the conversation.
+        disallowed_tools=["AskUserQuestion"],
     )
     if mcp_servers:
         options.mcp_servers = mcp_servers

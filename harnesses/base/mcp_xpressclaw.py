@@ -77,8 +77,9 @@ def _read_message():
 def _write_message(obj: dict):
     body = json.dumps(obj)
     header = f"Content-Length: {len(body)}\r\n\r\n"
-    sys.stdout.write(header + body)
-    sys.stdout.flush()
+    # Write as bytes to avoid buffering issues when stdout is piped
+    sys.stdout.buffer.write((header + body).encode())
+    sys.stdout.buffer.flush()
 
 
 def _response(msg_id, result):

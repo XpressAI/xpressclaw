@@ -429,7 +429,7 @@ def _read_message() -> dict | None:
 def _write_message(msg: dict):
     """Write a JSON-RPC message to stdout."""
     sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    sys.stdout.buffer.flush()
 
 
 def _response(id, result):
