@@ -146,12 +146,13 @@ async fn start_agent(
     // Build container spec from agent config (handles env vars, API keys, volumes)
     let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
     let mut spec = if let Some(cfg) = agent_cfg {
-        let mut s = build_container_spec(
+        let mut s = xpressclaw_core::docker::images::build_container_spec_with_mcp(
             cfg,
             server_port,
             config.llm.anthropic_api_key.as_deref(),
             config.llm.openai_api_key.as_deref(),
             config.llm.openai_base_url.as_deref(),
+            Some(&config.mcp_servers),
         );
         // Override image if requested
         if let Some(ref b) = body {

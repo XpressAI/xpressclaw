@@ -40,6 +40,17 @@ pub fn build_container_spec(
     openai_api_key: Option<&str>,
     openai_base_url: Option<&str>,
 ) -> ContainerSpec {
+    build_container_spec_with_mcp(agent, server_port, anthropic_api_key, openai_api_key, openai_base_url, None)
+}
+
+pub fn build_container_spec_with_mcp(
+    agent: &AgentConfig,
+    server_port: u16,
+    anthropic_api_key: Option<&str>,
+    openai_api_key: Option<&str>,
+    openai_base_url: Option<&str>,
+    mcp_servers: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
+) -> ContainerSpec {
     let image = image_for_backend(&agent.backend);
 
     let mut env = vec![
@@ -111,6 +122,24 @@ pub fn build_container_spec(
             "tools": agent.tools,
         })) {
             env.push(format!("AGENT_CONFIG={json}"));
+        }
+    }
+
+    // MCP servers — merge defaults with config-provided servers and inject as JSON env var.
+    // Agents need these to call tasks, apps, memory, etc.
+    if let Some(servers) = mcp_servers {
+        let mut all_servers = crate::config::default_mcp_servers();
+        for (name, cfg) in servers {
+            all_servers.insert(name.clone(), cfg.clone());
+        }
+        if let Ok(json) = serde_json::to_string(&all_servers) {
+            env.push(format!("MCP_SERVERS={json}"));
+        }
+    } else {
+        // No servers provided — still inject defaults
+        let defaults = crate::config::default_mcp_servers();
+        if let Ok(json) = serde_json::to_string(&defaults) {
+            env.push(format!("MCP_SERVERS={json}"));
         }
     }
 
