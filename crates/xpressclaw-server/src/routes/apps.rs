@@ -319,7 +319,7 @@ async fn launch_app_container(
 
     // Update DB with container info
     let conn = db.conn();
-    let host_port_str = info.host_port.map(|p| p.to_string()).unwrap_or_default();
+    let _host_port = info.host_port;
     let _ = conn.execute(
         "UPDATE apps SET container_id = ?1, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
         [&info.container_id, app_id],

@@ -19,7 +19,7 @@
 		(() => {
 			const p = $page.url.pathname;
 			if (p.startsWith('/tasks') || p.startsWith('/schedules')) return 'tasks';
-			if (p.startsWith('/procedures') || p.startsWith('/workflows')) return 'workflows';
+			if (p.startsWith('/procedures') || p.startsWith('/workflows') || p.startsWith('/skills')) return 'workflows';
 			if (p.startsWith('/settings') || p.startsWith('/budget')) return 'settings';
 			return 'agents'; // default: /, /dashboard, /conversations/*, /agents/*, /memory
 		})()

@@ -471,7 +471,6 @@ async fn complete_setup(
         }
     }
     for agent_config in &config.agents {
-        let mut agent_json = serde_json::Map::new();
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => info!(
                 name = record.name,

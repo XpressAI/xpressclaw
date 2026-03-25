@@ -13,7 +13,6 @@ use xpressclaw_core::config::{
     default_mcp_servers, AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, McpServerConfig,
     RateLimitConfig, WakeOnConfig,
 };
-use xpressclaw_core::docker::images::build_container_spec;
 use xpressclaw_core::docker::manager::{DockerManager, VolumeMount};
 
 use crate::state::AppState;
