@@ -50,6 +50,7 @@ fn agent_json(record: &AgentRecord, config: &xpressclaw_core::config::Config) ->
             "model": c.model,
             "llm": c.llm,
             "tools": c.tools,
+            "skills": c.skills,
             "volumes": c.volumes,
             "budget": c.budget,
             "rate_limit": c.rate_limit,
@@ -313,6 +314,7 @@ struct UpdateAgentConfigRequest {
     model: Option<String>,
     llm: Option<AgentLlmConfig>,
     tools: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
     budget: Option<BudgetConfig>,
     rate_limit: Option<RateLimitConfig>,
@@ -371,6 +373,9 @@ async fn update_agent_config(
             }
         }
         agent.tools = tools;
+    }
+    if let Some(skills) = req.skills {
+        agent.skills = skills;
     }
     if let Some(volumes) = req.volumes {
         agent.volumes = volumes;

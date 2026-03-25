@@ -60,6 +60,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                     "base_url": l.base_url,
                 })),
                 "tools": a.tools,
+                "skills": a.skills,
                 "volumes": a.volumes,
             });
             if let Some(ref budget) = a.budget {

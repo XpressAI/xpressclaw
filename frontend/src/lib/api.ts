@@ -185,6 +185,7 @@ export const agents = {
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools?: string[];
+		skills?: string[];
 		volumes?: string[];
 		budget?: {
 			daily: string | null;
@@ -504,6 +505,7 @@ export interface LiveConfig {
 		model: string | null;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools: string[];
+		skills: string[];
 		volumes: string[];
 		budget?: { daily: string | null; monthly: string | null; per_task: string | null; on_exceeded: string; fallback_model: string; warn_at_percent: number };
 		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };

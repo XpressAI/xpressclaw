@@ -6,7 +6,7 @@ rust_library(
     name = "xpressclaw-server",
     srcs = glob(["src/**/*.rs"]),
     # Frontend must be built before the server (rust-embed reads frontend/build/)
-    compile_data = ["//frontend:build"],
+    compile_data = ["//frontend:build", "//:templates"],
     # Must run locally — rust-embed reads frontend/build/ at compile time
     tags = ["local"],
     crate_features = ["local-llm"],
