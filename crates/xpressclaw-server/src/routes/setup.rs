@@ -916,13 +916,10 @@ mod tests {
 
         // Verify default MCP servers are present
         assert!(
-            config.mcp_servers.contains_key("tasks"),
-            "should have tasks MCP server, got: {:?}",
+            config.mcp_servers.contains_key("xpressclaw"),
+            "should have xpressclaw MCP server (unified tasks/memory/skills/apps), got: {:?}",
             config.mcp_servers.keys().collect::<Vec<_>>()
         );
-        assert!(config.mcp_servers.contains_key("memory"), "should have memory MCP server");
-        assert!(config.mcp_servers.contains_key("skills"), "should have skills MCP server");
-        assert!(config.mcp_servers.contains_key("apps"), "should have apps MCP server");
         assert!(config.mcp_servers.contains_key("shell"), "should have shell MCP server");
         assert!(config.mcp_servers.contains_key("filesystem"), "should have filesystem MCP server");
 

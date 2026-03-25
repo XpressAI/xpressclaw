@@ -156,39 +156,14 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
+    // Single unified MCP server for all xpressclaw tools (tasks, memory, skills, apps).
+    // Consolidated into one server because Claude CLI has limited MCP server connections.
     servers.insert(
-        "tasks".to_string(),
+        "xpressclaw".to_string(),
         McpServerConfig {
             server_type: "stdio".to_string(),
             command: Some("python".to_string()),
-            args: vec!["/app/mcp_tasks.py".into()],
-            ..Default::default()
-        },
-    );
-    servers.insert(
-        "memory".to_string(),
-        McpServerConfig {
-            server_type: "stdio".to_string(),
-            command: Some("python".to_string()),
-            args: vec!["/app/mcp_memory.py".into()],
-            ..Default::default()
-        },
-    );
-    servers.insert(
-        "skills".to_string(),
-        McpServerConfig {
-            server_type: "stdio".to_string(),
-            command: Some("python".to_string()),
-            args: vec!["/app/mcp_skills.py".into()],
-            ..Default::default()
-        },
-    );
-    servers.insert(
-        "apps".to_string(),
-        McpServerConfig {
-            server_type: "stdio".to_string(),
-            command: Some("python".to_string()),
-            args: vec!["/app/mcp_apps.py".into()],
+            args: vec!["/app/mcp_xpressclaw.py".into()],
             ..Default::default()
         },
     );
