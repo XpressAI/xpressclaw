@@ -295,7 +295,7 @@ async fn send_message(
                 .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
             let agent_skills = agent_cfg.map(|c| &c.skills[..]).unwrap_or(&[]);
-            let role = append_skills(base_role, agent_skills);
+            let role = append_skills(base_role, agent_skills, &state.config_path);
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
@@ -555,7 +555,7 @@ async fn stream_message(
                 .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
             let agent_skills = agent_cfg.map(|c| &c.skills[..]).unwrap_or(&[]);
-            let role = append_skills(base_role, agent_skills);
+            let role = append_skills(base_role, agent_skills, &state.config_path);
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
@@ -781,49 +781,42 @@ async fn remove_participant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load skill index (names + descriptions) from templates/skills/.
-fn load_skill_index() -> Vec<(String, String)> {
-    let skill_dirs = [
-        std::path::Path::new("templates/skills").to_path_buf(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("../Resources/templates/skills")))
-            .unwrap_or_default(),
-    ];
+/// Load skill index (names + descriptions) from the data directory.
+fn load_skill_index(config_path: &std::path::Path) -> Vec<(String, String)> {
+    let skills_dir = config_path
+        .parent()
+        .map(|d| d.join("skills"))
+        .unwrap_or_default();
+
+    if !skills_dir.is_dir() {
+        return Vec::new();
+    }
 
     let mut entries = Vec::new();
 
-    for base in &skill_dirs {
-        if !base.is_dir() {
-            continue;
-        }
-        if let Ok(dirs) = std::fs::read_dir(base) {
-            for entry in dirs.flatten() {
-                let skill_file = entry.path().join("SKILL.md");
-                if skill_file.is_file() {
-                    if let Ok(content) = std::fs::read_to_string(&skill_file) {
-                        if content.starts_with("---") {
-                            if let Some(fm) = content.splitn(3, "---").nth(1) {
-                                let mut name = String::new();
-                                let mut desc = String::new();
-                                for line in fm.lines() {
-                                    if let Some(v) = line.strip_prefix("name:") {
-                                        name = v.trim().to_string();
-                                    } else if let Some(v) = line.strip_prefix("description:") {
-                                        desc = v.trim().to_string();
-                                    }
+    if let Ok(dirs) = std::fs::read_dir(&skills_dir) {
+        for entry in dirs.flatten() {
+            let skill_file = entry.path().join("SKILL.md");
+            if skill_file.is_file() {
+                if let Ok(content) = std::fs::read_to_string(&skill_file) {
+                    if content.starts_with("---") {
+                        if let Some(fm) = content.splitn(3, "---").nth(1) {
+                            let mut name = String::new();
+                            let mut desc = String::new();
+                            for line in fm.lines() {
+                                if let Some(v) = line.strip_prefix("name:") {
+                                    name = v.trim().to_string();
+                                } else if let Some(v) = line.strip_prefix("description:") {
+                                    desc = v.trim().to_string();
                                 }
-                                if !name.is_empty() {
-                                    entries.push((name, desc));
-                                }
+                            }
+                            if !name.is_empty() {
+                                entries.push((name, desc));
                             }
                         }
                     }
                 }
             }
-        }
-        if !entries.is_empty() {
-            break;
         }
     }
 
@@ -831,11 +824,11 @@ fn load_skill_index() -> Vec<(String, String)> {
 }
 
 /// Append skill index to the agent's system prompt, filtered by agent's skills list.
-fn append_skills(base_role: &str, agent_skills: &[String]) -> String {
+fn append_skills(base_role: &str, agent_skills: &[String], config_path: &std::path::Path) -> String {
     if agent_skills.is_empty() {
         return base_role.to_string();
     }
-    let all = load_skill_index();
+    let all = load_skill_index(config_path);
     if all.is_empty() {
         return base_role.to_string();
     }
