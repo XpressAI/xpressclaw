@@ -1,0 +1,1 @@
+Added create_app_workspace MCP tool. Two-step workflow: create workspace with scaffold (node/python/static), agent develops iteratively, then publish_app deploys. Scaffold uses _write_if_missing so re-running doesn't overwrite agent's changes. Response includes directory listing and next-steps instructions to guide the agent.
