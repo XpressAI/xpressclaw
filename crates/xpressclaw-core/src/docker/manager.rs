@@ -333,6 +333,35 @@ impl DockerManager {
         self.get_host_port(container_id, Some(8080)).await
     }
 
+    /// Get the host port for a container with a specific internal port.
+    pub async fn get_container_port_for(&self, container_id: &str, internal_port: u16) -> Option<u16> {
+        self.get_host_port(container_id, Some(internal_port)).await
+    }
+
+    /// Inspect a container and return its host port for any exposed port.
+    pub async fn inspect(&self, container_id: &str) -> Result<Option<u16>> {
+        let info = self.docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| Error::Container(format!("inspect failed: {e}")))?;
+        let port = info.network_settings
+            .and_then(|ns| ns.ports)
+            .and_then(|ports| {
+                // Return the first mapped port
+                for (_key, bindings) in ports.iter() {
+                    if let Some(bindings) = bindings {
+                        if let Some(binding) = bindings.first() {
+                            if let Some(hp) = &binding.host_port {
+                                return hp.parse().ok();
+                            }
+                        }
+                    }
+                }
+                None
+            });
+        Ok(port)
+    }
+
     async fn get_host_port(&self, container_id: &str, expose_port: Option<u16>) -> Option<u16> {
         let port = expose_port?;
         let info = self

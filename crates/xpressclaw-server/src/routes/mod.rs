@@ -23,6 +23,10 @@ pub fn tools_proxy_routes() -> Router<AppState> {
     tools_proxy::routes()
 }
 
+pub fn app_proxy_routes() -> Router<AppState> {
+    apps::proxy_routes()
+}
+
 pub fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health::health_check))

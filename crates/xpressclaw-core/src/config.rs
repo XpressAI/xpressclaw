@@ -165,6 +165,15 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
+    servers.insert(
+        "apps".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("python".to_string()),
+            args: vec!["/app/mcp_apps.py".into()],
+            ..Default::default()
+        },
+    );
     servers
 }
 

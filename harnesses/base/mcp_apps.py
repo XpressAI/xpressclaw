@@ -1,0 +1,238 @@
+"""MCP stdio server for xpressclaw agent-published apps.
+
+Provides tools for agents to publish, update, and manage web apps that
+appear in the xpressclaw UI. Apps run in containers and are displayed
+via iframe.
+
+Environment variables:
+  XPRESSCLAW_URL  — Base URL of the xpressclaw server
+  AGENT_ID        — Current agent's ID
+"""
+
+import json
+import os
+import sys
+
+import httpx
+
+BASE_URL = os.environ.get(
+    "XPRESSCLAW_URL",
+    f"http://host.docker.internal:{os.environ.get('XPRESSCLAW_PORT', '8935')}",
+)
+AGENT_ID = os.environ.get("AGENT_ID", "")
+
+TOOLS = [
+    {
+        "name": "publish_app",
+        "description": (
+            "Publish a web app for the user. The app will appear in the xpressclaw "
+            "sidebar and be displayed via iframe. Write your app code to a directory "
+            "in /workspace first, then call this tool to publish it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Unique app identifier (lowercase, no spaces, e.g. 'stocks')",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Display name shown in the sidebar (e.g. 'Stock Portfolio')",
+                },
+                "icon": {
+                    "type": "string",
+                    "description": "Emoji icon for the sidebar (e.g. '📈')",
+                },
+                "source_dir": {
+                    "type": "string",
+                    "description": "Path to app source in /workspace (e.g. '/workspace/apps/stocks')",
+                },
+                "port": {
+                    "type": "integer",
+                    "description": "Port the app server listens on (default 3000)",
+                    "default": 3000,
+                },
+                "start_command": {
+                    "type": "string",
+                    "description": "Command to start the server (e.g. 'node server.js' or 'python app.py')",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What this app does (shown in the app header)",
+                },
+            },
+            "required": ["name", "title", "source_dir", "start_command"],
+        },
+    },
+    {
+        "name": "list_apps",
+        "description": "List all published apps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "delete_app",
+        "description": "Delete a published app and stop its container.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "App identifier to delete",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+]
+
+
+def _api(method: str, path: str, body: dict | None = None) -> dict:
+    url = f"{BASE_URL}/api{path}"
+    with httpx.Client(timeout=30) as client:
+        if method == "GET":
+            r = client.get(url)
+        elif method == "POST":
+            r = client.post(url, json=body)
+        elif method == "DELETE":
+            r = client.delete(url)
+        else:
+            raise ValueError(f"unsupported method: {method}")
+        r.raise_for_status()
+        return r.json()
+
+
+def handle_tool(name: str, arguments: dict) -> str:
+    if name == "publish_app":
+        body = {
+            "id": arguments["name"],
+            "title": arguments["title"],
+            "icon": arguments.get("icon"),
+            "description": arguments.get("description"),
+            "agent_id": AGENT_ID,
+            "port": arguments.get("port", 3000),
+            "source_dir": arguments.get("source_dir"),
+            "start_command": arguments.get("start_command"),
+        }
+        result = _api("POST", "/apps/publish", body)
+        return f"Published app '{arguments['title']}' (id: {arguments['name']}). It will appear in the Apps section of the sidebar."
+
+    elif name == "list_apps":
+        apps = _api("GET", "/apps")
+        if not apps:
+            return "No apps published yet."
+        lines = []
+        for app in apps:
+            status = app.get("status", "unknown")
+            lines.append(f"- {app['title']} ({app['id']}) [{status}] v{app.get('source_version', 1)}")
+        return "\n".join(lines)
+
+    elif name == "delete_app":
+        _api("DELETE", f"/apps/{arguments['name']}")
+        return f"Deleted app '{arguments['name']}'."
+
+    raise ValueError(f"unknown tool: {name}")
+
+
+# --- MCP stdio protocol ---
+
+def _read_message():
+    header = ""
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        header += line
+        if header.endswith("\r\n\r\n") or header.endswith("\n\n"):
+            break
+    length = 0
+    for h in header.strip().split("\n"):
+        if h.lower().startswith("content-length:"):
+            length = int(h.split(":", 1)[1].strip())
+    if length == 0:
+        return None
+    body = sys.stdin.read(length)
+    return json.loads(body)
+
+
+def _write_message(obj: dict):
+    body = json.dumps(obj)
+    header = f"Content-Length: {len(body)}\r\n\r\n"
+    sys.stdout.write(header + body)
+    sys.stdout.flush()
+
+
+def _response(msg_id, result):
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _error_response(msg_id, code, message):
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+
+def main():
+    while True:
+        msg = _read_message()
+        if msg is None:
+            break
+
+        msg_id = msg.get("id")
+        method = msg.get("method", "")
+        params = msg.get("params", {})
+
+        if method == "initialize":
+            _write_message(
+                _response(
+                    msg_id,
+                    {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {
+                            "name": "xpressclaw-apps",
+                            "version": "0.1.0",
+                        },
+                    },
+                )
+            )
+        elif method == "notifications/initialized":
+            pass
+        elif method == "tools/list":
+            _write_message(_response(msg_id, {"tools": TOOLS}))
+        elif method == "tools/call":
+            tool_name = params.get("name", "")
+            arguments = params.get("arguments", {})
+            try:
+                result_text = handle_tool(tool_name, arguments)
+                _write_message(
+                    _response(
+                        msg_id,
+                        {
+                            "content": [{"type": "text", "text": result_text}],
+                            "isError": False,
+                        },
+                    )
+                )
+            except Exception as e:
+                _write_message(
+                    _response(
+                        msg_id,
+                        {
+                            "content": [{"type": "text", "text": f"Error: {e}"}],
+                            "isError": True,
+                        },
+                    )
+                )
+        elif method == "notifications/cancelled":
+            pass
+        else:
+            if msg_id is not None:
+                _write_message(
+                    _error_response(msg_id, -32601, f"method not found: {method}")
+                )
+
+
+if __name__ == "__main__":
+    main()

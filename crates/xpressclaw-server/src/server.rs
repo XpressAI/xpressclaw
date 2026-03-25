@@ -15,6 +15,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/api", routes::api_routes())
         .nest("/v1", routes::llm::routes())
         .nest("/v1/tools", routes::tools_proxy_routes())
+        .nest("/apps", routes::app_proxy_routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())
