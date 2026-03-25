@@ -1,0 +1,1 @@
+Added skills picker UI to agent config page. Checkboxes for all available skills loaded from /api/skills. Skills are saved to YAML via PATCH /agents/{id}/config. Also: skills field added to agent_json response, setup config response, LiveConfig TS type, and Bazel BUILD compile_data for templates/.
