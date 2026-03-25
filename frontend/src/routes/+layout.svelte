@@ -2,8 +2,8 @@
 	import '../app.css';
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
-	import { conversations, agents } from '$lib/api';
-	import type { Conversation, Agent } from '$lib/api';
+	import { conversations, agents, apps as appsApi } from '$lib/api';
+	import type { Conversation, Agent, App } from '$lib/api';
 	import { agentAvatar } from '$lib/utils';
 
 	// Bottom tabs per ADR-016
@@ -42,16 +42,19 @@
 
 	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
+	let appList = $state<App[]>([]);
 
 	let { children } = $props();
 
 	async function loadSidebar() {
-		const [c, a] = await Promise.all([
+		const [c, a, ap] = await Promise.all([
 			conversations.list().catch(() => []),
-			agents.list().catch(() => [])
+			agents.list().catch(() => []),
+			appsApi.list().catch(() => [])
 		]);
 		convList = c;
 		agentList = a;
+		appList = ap;
 	}
 
 	onMount(() => {
@@ -113,6 +116,12 @@
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zm9.75 0A2.25 2.25 0 0115.75 3.75H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zm9.75 0A2.25 2.25 0 0115.75 13.5H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" /></svg>
 							<span>Dashboard</span>
 						</a>
+						{#each appList as app}
+							<a href="/apps/{app.id}" class={linkClass($page.url.pathname === `/apps/${app.id}`)}>
+								<span class="text-sm flex-shrink-0">{app.icon ?? '📦'}</span>
+								<span class="truncate">{app.title}</span>
+							</a>
+						{/each}
 					</div>
 
 					<!-- Conversations -->

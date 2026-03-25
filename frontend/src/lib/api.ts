@@ -569,3 +569,26 @@ export const settings = {
 			body: JSON.stringify(profile)
 		})
 };
+
+export interface App {
+	id: string;
+	title: string;
+	icon: string | null;
+	description: string | null;
+	agent_id: string;
+	conversation_id: string | null;
+	container_id: string | null;
+	port: number;
+	source_version: number;
+	status: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export const apps = {
+	list: () => request<App[]>('/api/apps'),
+	get: (id: string) => request<App>(`/api/apps/${id}`),
+	create: (data: { id: string; title: string; icon?: string; description?: string; agent_id: string; port?: number }) =>
+		request<App>('/api/apps', { method: 'POST', body: JSON.stringify(data) }),
+	delete: (id: string) => request<{ deleted: boolean }>(`/api/apps/${id}`, { method: 'DELETE' }),
+};
