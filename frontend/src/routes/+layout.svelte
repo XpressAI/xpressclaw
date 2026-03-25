@@ -83,7 +83,7 @@
 		<!-- Sidebar -->
 		<aside class="flex w-64 flex-col" style="background: hsl(var(--sidebar))">
 			<!-- Titlebar drag region with logo (padded for macOS traffic lights) -->
-			<div class="flex h-11 items-center gap-2 pl-[76px] pr-4" data-tauri-drag-region>
+			<div class="flex h-11 items-center gap-2 pl-[76px] pr-4 titlebar-drag">
 				<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded pointer-events-none" />
 				<span class="text-xs font-medium text-muted-foreground pointer-events-none">xpressclaw</span>
 			</div>
@@ -201,7 +201,7 @@
 		<!-- Main content -->
 		<main class="flex-1 overflow-auto">
 			<!-- Drag region for main area titlebar -->
-			<div class="h-11 w-full" data-tauri-drag-region></div>
+			<div class="h-11 w-full titlebar-drag"></div>
 			<div class="h-[calc(100%-2.75rem)] overflow-auto">
 				{@render children()}
 			</div>

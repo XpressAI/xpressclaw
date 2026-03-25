@@ -144,6 +144,20 @@
 	all: revert;
 }
 
+/* Titlebar drag region for Tauri (works with external URLs via WebKit) */
+.titlebar-drag {
+	-webkit-app-region: drag;
+	app-region: drag;
+}
+.titlebar-drag a,
+.titlebar-drag button,
+.titlebar-drag input,
+.titlebar-drag select,
+.titlebar-drag textarea {
+	-webkit-app-region: no-drag;
+	app-region: no-drag;
+}
+
 /* Custom scrollbar for dark theme */
 .dark ::-webkit-scrollbar {
 	width: 6px;
