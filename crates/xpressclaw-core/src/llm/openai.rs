@@ -21,8 +21,23 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
         let base_url = base_url.unwrap_or_else(|| "https://api.openai.com".to_string());
+        let is_openrouter = base_url.contains("openrouter.ai");
+
+        // Add OpenRouter-specific headers for rankings
+        let client = if is_openrouter {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("HTTP-Referer", "https://xpressclaw.ai".parse().unwrap());
+            headers.insert("X-Title", "Xpressclaw".parse().unwrap());
+            Client::builder()
+                .default_headers(headers)
+                .build()
+                .unwrap_or_default()
+        } else {
+            Client::new()
+        };
+
         Self {
-            client: Client::new(),
+            client,
             api_key,
             base_url,
             available_models: vec![
