@@ -79,6 +79,8 @@ async fn launch_chrome(
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
+            // Allow CDP connections from Docker containers (host.docker.internal)
+            "--remote-allow-origins=*",
             "about:blank",
         ])
         .stdin(std::process::Stdio::null())

@@ -9,38 +9,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  frontend:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - run: npm ci
-      - run: npm run build
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: frontend-build
-          path: frontend/build/
-          retention-days: 1
-
   build-tauri:
-    needs: frontend
     strategy:
       matrix:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
             label: macOS-arm64
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             label: macOS-x64
           - os: windows-latest
@@ -53,26 +29,31 @@ jobs:
           submodules: true
           token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: frontend-build
-          path: frontend/build/
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
 
+      # System dependencies
       - name: Install macOS build deps
         if: runner.os == 'macOS'
         run: brew install cmake bazelisk
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install bazelisk -y
+          # cmake is pre-installed on windows-latest
+          # Point Bazel to Git Bash for genrule shell commands
+          echo "BAZEL_SH=C:/Program Files/Git/bin/bash.exe" >> "$GITHUB_ENV"
 
       # macOS: install certificate for signing
       - name: Install Apple certificate
@@ -97,24 +78,21 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
+      # Install frontend dependencies so Bazel genrule skips npm ci
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
-      # Build CLI sidecar via Bazel (same as build.sh)
+      # Build CLI sidecar via Bazel — handles frontend, Rust, and C++ deps.
+      # Each runner builds natively for its own architecture (no cross-compilation).
       - name: Build CLI sidecar
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cargo build --release --target ${{ matrix.target }} -p xpressclaw-cli
-            mkdir -p crates/xpressclaw-tauri/binaries
-            cp target/${{ matrix.target }}/release/xpressclaw.exe \
-               crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}.exe
-          else
-            bazel build //crates/xpressclaw-cli:xpressclaw
-            mkdir -p crates/xpressclaw-tauri/binaries
-            cp bazel-bin/crates/xpressclaw-cli/xpressclaw \
-               crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}
-          fi
         shell: bash
+        run: |
+          bazel build //crates/xpressclaw-cli:xpressclaw
+          mkdir -p crates/xpressclaw-tauri/binaries
+          EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
+          cp "bazel-bin/crates/xpressclaw-cli/xpressclaw${EXT}" \
+             "crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}${EXT}"
 
       # macOS: write App Store Connect API key for notarization
       - name: Write API key
