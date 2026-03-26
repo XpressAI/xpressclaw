@@ -27,7 +27,7 @@ Stop guessing. Read the code, add logging, run the build, and inspect real value
 
 ### Prime Directives
 
-1. **Seek evidence first** — Before changing logic, log or print the values you're relying on. When something is broken, the correct tokens are no longer the most probable tokens; you must acquire evidence.
+1. **Seek evidence first** — **Seek evidence first** I mean it! Before changing logic, log or print the values you're relying on. When something is broken, the correct tokens are no longer the most probable tokens; you must acquire evidence.
 2. **Honor existing architecture** — Read the ADRs in `docs/adr/` and this README. Preserve public APIs; change internals surgically.
 3. **Make state reconstructable** — Deterministic keys and context reconstruction prevent "ctx is null" classes of bugs. Avoid hidden global configuration; prefer per-request/per-entity data.
 4. **Read documentation before guessing** — When integrating with external libraries, SDKs, or APIs, **always** read their official documentation first. Use WebFetch to pull docs pages. Do not assume how an API works based on parameter names or type signatures — read the actual docs, examples, and changelogs. This applies to: Claude Agent SDK, Tauri, Bazel, MCP protocol, Docker API, any npm/crate dependency. Your training data is stale; the docs are current. Every hour spent debugging a wrong assumption could have been avoided by 5 minutes of reading docs.
@@ -49,6 +49,10 @@ Stop guessing. Read the code, add logging, run the build, and inspect real value
 - Making large changes without verifying each step.
 
 If a value is unexpected, **stop and log which one**. Don't guess. One change, one measurement.
+
+### Comprehensive Changes Only
+
+When implementing something, do it completely across ALL platforms, ALL code paths, and ALL configurations. No half-implementations. If you add Bazel support for macOS, add it for Windows too. If you change a protocol, change ALL servers using that protocol. If you fix a bug in one route, check for the same bug in all routes. A partial implementation is worse than no implementation — it creates inconsistency and "works on my machine" problems. Before marking a task done, ask: "Did I handle every variant? Every platform? Every edge case?"
 
 ### No AI Branding
 
@@ -231,3 +235,7 @@ Before making significant changes, read the relevant ADRs in `docs/adr/`:
 - ADR-009: Task/SOP system
 - ADR-010: Budget controls
 - ADR-011: Default local model
+
+## Seek evidence first
+
+**Seek evidence first** **Seek evidence first** **Seek evidence first**

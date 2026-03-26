@@ -18,6 +18,9 @@ frontend/.svelte-kit/
 *.swp
 *.swo
 
+# Claude Code
+.claude/settings.local.json
+
 # Secrets
 .env
 .env.*

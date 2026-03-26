@@ -7,6 +7,7 @@ on:
     branches: [rust-rewrite, main]
 
 jobs:
+  # Frontend type checking (independent of Bazel)
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -26,15 +27,9 @@ jobs:
       - run: npm run check
       - run: npm run build
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: frontend-build
-          path: frontend/build/
-          retention-days: 1
-
+  # Bazel builds everything — frontend, Rust, C++ — from one graph
   bazel:
     name: Bazel (${{ matrix.os }})
-    needs: frontend
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -45,14 +40,11 @@ jobs:
           submodules: true
           token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: frontend-build
-          path: frontend/build/
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       # System dependencies
       - name: Install Linux dependencies
@@ -74,6 +66,10 @@ jobs:
             sudo curl -L https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 -o /usr/local/bin/bazel
             sudo chmod +x /usr/local/bin/bazel
           fi
+
+      # Install frontend deps so Bazel genrule skips npm ci
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
 
       - name: Build
         run: bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
@@ -104,10 +100,11 @@ jobs:
           submodules: true
           token: ${{ secrets.PRIVATE_REPOS_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-node@v4
         with:
-          name: frontend-build
-          path: frontend/build/
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -116,6 +113,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # Build frontend for rust-embed (integration tests use Cargo)
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
 
       - name: Run integration tests
         env:
