@@ -1,0 +1,1 @@
+Agent details page now shows all 9 built-in tools as tags with tooltips: Filesystem, Shell, Tasks, Memory, Apps, Skills, Office, Browser, Logs. These are always available via the unified mcp_xpressclaw server — not toggleable.
