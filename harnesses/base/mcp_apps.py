@@ -141,6 +141,136 @@ TOOLS = [
         },
     },
     {
+        "name": "office_run",
+        "description": (
+            "Run a script against an Office application (Word, Excel, PowerPoint). "
+            "On macOS, provide AppleScript. On Windows, provide PowerShell. "
+            "Use $DOCUMENTS_DIR in your script to reference the documents folder. "
+            "Files are stored in a managed documents directory — use file_name not full paths."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "app": {
+                    "type": "string",
+                    "enum": ["word", "excel", "powerpoint"],
+                    "description": "Which Office application to use",
+                },
+                "script": {
+                    "type": "string",
+                    "description": "The script to execute. Use $DOCUMENTS_DIR for the documents folder path.",
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "Document file name (e.g. 'report.docx'). Resolved to the documents directory.",
+                },
+            },
+            "required": ["app", "script"],
+        },
+    },
+    {
+        "name": "office_read",
+        "description": (
+            "Read the text content of a document (docx, xlsx, pptx) "
+            "from the documents directory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                    "type": "string",
+                    "description": "Document file name (e.g. 'report.docx')",
+                },
+            },
+            "required": ["file_name"],
+        },
+    },
+    {
+        "name": "office_export",
+        "description": (
+            "Export a document to a different format (e.g., docx to PDF). "
+            "Both source and output are in the documents directory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_name": {
+                    "type": "string",
+                    "description": "Source document name (e.g. 'report.docx')",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["pdf", "html"],
+                    "description": "Target format",
+                },
+                "output_name": {
+                    "type": "string",
+                    "description": "Output file name (defaults to same name with new extension)",
+                },
+            },
+            "required": ["file_name", "format"],
+        },
+    },
+    {
+        "name": "list_documents",
+        "description": "List all documents in the documents directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "browser_screenshot",
+        "description": (
+            "Take a screenshot of a web page using Playwright. "
+            "The screenshot is saved to the agent's screenshots directory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to screenshot"},
+                "file_name": {"type": "string", "description": "Output file name (default: screenshot.png)"},
+                "wait_for": {"type": "string", "description": "CSS selector to wait for before screenshot"},
+                "full_page": {"type": "boolean", "description": "Capture full page (default: false)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_fetch",
+        "description": (
+            "Navigate to a URL and extract text content using a real browser (Playwright). "
+            "Unlike HTTP fetch, this renders JavaScript and dynamic content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to fetch"},
+                "selector": {"type": "string", "description": "CSS selector to extract text from (optional)"},
+                "wait_for": {"type": "string", "description": "CSS selector to wait for before extracting"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_run",
+        "description": (
+            "Run a custom Playwright Python script on the host machine. "
+            "Use $SCREENSHOTS_DIR in your script for the screenshots output path. "
+            "The script should use playwright.sync_api."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "Python script using playwright.sync_api",
+                },
+            },
+            "required": ["script"],
+        },
+    },
+    {
         "name": "get_agent_logs",
         "description": (
             "Get your own agent container logs. "
@@ -336,6 +466,60 @@ def handle_tool(name: str, arguments: dict) -> str:
         _api("DELETE", f"/apps/{arguments['name']}")
         return f"Deleted app '{arguments['name']}'."
 
+    elif name == "office_run":
+        body = {
+            "app": arguments["app"],
+            "script": arguments["script"],
+            "file_name": arguments.get("file_name"),
+            "agent_id": AGENT_ID,
+        }
+        result = _api("POST", "/office/run", body)
+        if result.get("success"):
+            output = result.get("output", "Script executed successfully.")
+            docs_dir = result.get("documents_dir", "")
+            return f"{output}\n\nDocuments directory: {docs_dir}"
+        else:
+            error = result.get("error", "Unknown error")
+            return f"Script error: {error}\n\nTry adjusting the script syntax and retrying."
+
+    elif name == "office_read":
+        result = _api("POST", "/office/read", {"file_name": arguments["file_name"], "agent_id": AGENT_ID})
+        if result.get("success") is False:
+            return f"Error reading document: {result.get('error', 'unknown')}"
+        return result.get("content", "No content extracted.")
+
+    elif name == "office_export":
+        body = {
+            "file_name": arguments["file_name"],
+            "format": arguments["format"],
+            "output_name": arguments.get("output_name"),
+            "agent_id": AGENT_ID,
+        }
+        result = _api("POST", "/office/export", body)
+        if result.get("success") is False:
+            return f"Export error: {result.get('error', 'unknown')}"
+        return f"Exported to: {result.get('exported', 'unknown')}"
+
+    elif name == "list_documents":
+        docs = _api("GET", f"/office/documents?agent_id={AGENT_ID}")
+        if not docs:
+            return "No documents in the documents directory."
+        lines = []
+        for d in docs:
+            size = d.get("size", 0)
+            size_str = f"{size / 1024:.1f} KB" if size > 1024 else f"{size} bytes"
+            lines.append(f"- {d['name']} ({size_str})")
+        return "\n".join(lines)
+
+    elif name == "browser_screenshot":
+        return _run_browser_screenshot(arguments)
+
+    elif name == "browser_fetch":
+        return _run_browser_fetch(arguments)
+
+    elif name == "browser_run":
+        return _run_browser_script(arguments)
+
     elif name == "get_app_logs":
         result = _api("GET", f"/apps/{arguments['name']}/logs")
         logs = result.get("logs", "No logs available.")
@@ -347,6 +531,115 @@ def handle_tool(name: str, arguments: dict) -> str:
         return f"Agent logs:\n{logs}"
 
     raise ValueError(f"unknown tool: {name}")
+
+
+def _resolve_cdp_url():
+    """Resolve CDP URL using IP address instead of hostname.
+    Chrome's CDP server rejects non-localhost hostnames in the Host header."""
+    import socket
+    try:
+        ip = socket.gethostbyname("host.docker.internal")
+        return f"http://{ip}:9222"
+    except socket.gaierror:
+        return "http://host.docker.internal:9222"
+
+CDP_URL = _resolve_cdp_url()
+SCREENSHOTS_DIR = os.path.join(WORKSPACE, "screenshots")
+
+
+def _ensure_chrome():
+    """Ensure Chrome is running on the host with remote debugging."""
+    _api("POST", "/browser/launch", {})
+    # Always use the IP-resolved CDP_URL, not the hostname from the API response
+    return CDP_URL
+
+
+def _run_browser_screenshot(arguments: dict) -> str:
+    """Take a screenshot via Playwright connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    url = arguments["url"]
+    file_name = arguments.get("file_name", "screenshot.png")
+    full_page = arguments.get("full_page", False)
+    wait_for = arguments.get("wait_for")
+
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+    output_path = os.path.join(SCREENSHOTS_DIR, file_name)
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            if wait_for:
+                page.wait_for_selector(wait_for, timeout=10000)
+            page.screenshot(path=output_path, full_page=full_page)
+            context.close()
+        return f"Screenshot saved: {output_path}"
+    except ImportError:
+        return "Error: playwright is not installed. Run: pip install playwright"
+    except Exception as e:
+        return f"Screenshot error: {e}"
+
+
+def _run_browser_fetch(arguments: dict) -> str:
+    """Fetch page content via Playwright connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    url = arguments["url"]
+    selector = arguments.get("selector")
+    wait_for = arguments.get("wait_for")
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            if wait_for:
+                page.wait_for_selector(wait_for, timeout=10000)
+            if selector:
+                content = page.text_content(selector) or ""
+            else:
+                content = page.content()
+            context.close()
+        return content
+    except ImportError:
+        return "Error: playwright is not installed. Run: pip install playwright"
+    except Exception as e:
+        return f"Fetch error: {e}"
+
+
+def _run_browser_script(arguments: dict) -> str:
+    """Run a custom Playwright script connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    script = arguments["script"]
+
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+    # Inject CDP_URL and SCREENSHOTS_DIR into the script
+    script = script.replace("$CDP_URL", cdp_url)
+    script = script.replace("${CDP_URL}", cdp_url)
+    script = script.replace("$SCREENSHOTS_DIR", SCREENSHOTS_DIR)
+    script = script.replace("${SCREENSHOTS_DIR}", SCREENSHOTS_DIR)
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python3", "-c", script],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "CDP_URL": cdp_url, "SCREENSHOTS_DIR": SCREENSHOTS_DIR},
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            if output:
+                return f"{output}\n\n[Warning: {error}]"
+            return f"Script error: {error}"
+        return output or "Script executed successfully."
+    except Exception as e:
+        return f"Script error: {e}"
 
 
 def _write_if_missing(path: str, content: str):

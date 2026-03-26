@@ -6,7 +6,6 @@ backend: claude-sdk
 default_tools:
   - filesystem
   - shell
-  - git
   - memory
 default_mcp_servers:
   shell:
@@ -17,10 +16,6 @@ default_mcp_servers:
     type: stdio
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
-  git:
-    type: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-git"]
 recommended_llm: local
 role: |
   You are a senior software developer and coding assistant.

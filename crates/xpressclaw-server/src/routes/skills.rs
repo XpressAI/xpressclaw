@@ -2,14 +2,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_skills))
-        .route("/{name}", get(get_skill))
+        .route("/", get(list_skills).post(create_skill))
+        .route("/{name}", get(get_skill).delete(delete_skill))
 }
 
 async fn list_skills(State(state): State<AppState>) -> Json<Vec<Value>> {
@@ -43,6 +44,74 @@ async fn get_skill(
             Json(json!({ "error": format!("Skill '{}' not found", name) })),
         )),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSkillRequest {
+    name: String,
+    description: String,
+    content: String,
+}
+
+async fn create_skill(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSkillRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let skills_dir = state
+        .config_path
+        .parent()
+        .map(|d| d.join("skills"))
+        .unwrap_or_default();
+
+    let skill_dir = skills_dir.join(&req.name);
+    std::fs::create_dir_all(&skill_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let skill_md = format!(
+        "---\nname: {}\ndescription: {}\n---\n\n{}",
+        req.name, req.description, req.content
+    );
+
+    std::fs::write(skill_dir.join("SKILL.md"), &skill_md).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(Json(json!({ "created": true, "name": req.name })))
+}
+
+async fn delete_skill(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let skills_dir = state
+        .config_path
+        .parent()
+        .map(|d| d.join("skills"))
+        .unwrap_or_default();
+
+    let skill_dir = skills_dir.join(&name);
+    if !skill_dir.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Skill '{}' not found", name) })),
+        ));
+    }
+
+    std::fs::remove_dir_all(&skill_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    Ok(Json(json!({ "deleted": true, "name": name })))
 }
 
 /// Load all skills from the data directory (~/.xpressclaw/skills/).

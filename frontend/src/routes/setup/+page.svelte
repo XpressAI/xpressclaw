@@ -31,6 +31,7 @@
 	let ollamaInfo = $state<OllamaInfo | null>(null);
 	let modelRec = $state<ModelRecommendation | null>(null);
 	let llmProvider = $state('local');
+	let isOpenRouter = $state(false);
 	let llmApiKey = $state('');
 	let llmBaseUrl = $state('');
 	let llmLocalModel = $state('');
@@ -475,7 +476,7 @@
 
 			<div class="space-y-2 mb-4">
 				<button
-					onclick={() => { llmProvider = 'local'; keyValid = null; }}
+					onclick={() => { llmProvider = 'local'; isOpenRouter = false; keyValid = null; }}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'local' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F4BB;</div>
@@ -488,8 +489,8 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'openai'; keyValid = null; llmApiKey = ''; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'openai' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
+					onclick={() => { llmProvider = 'openai'; isOpenRouter = false; keyValid = null; llmApiKey = ''; llmBaseUrl = ''; }}
+					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'openai' && !isOpenRouter ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x2601;</div>
 					<div>
@@ -498,13 +499,23 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'anthropic'; keyValid = null; llmApiKey = ''; }}
+					onclick={() => { llmProvider = 'anthropic'; isOpenRouter = false; keyValid = null; llmApiKey = ''; }}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'anthropic' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x2728;</div>
 					<div>
 						<div class="text-sm font-medium text-foreground">Anthropic</div>
 						<div class="text-xs text-muted-foreground">Claude Opus, Sonnet, Haiku. Requires API key.</div>
+					</div>
+				</button>
+				<button
+					onclick={() => { llmProvider = 'openai'; isOpenRouter = true; keyValid = null; llmApiKey = ''; llmBaseUrl = 'https://openrouter.ai/api/v1'; }}
+					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {isOpenRouter ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
+				>
+					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F310;</div>
+					<div>
+						<div class="text-sm font-medium text-foreground">OpenRouter</div>
+						<div class="text-xs text-muted-foreground">Access 200+ models via a single API. OpenAI-compatible.</div>
 					</div>
 				</button>
 			</div>
@@ -636,14 +647,14 @@
 
 		<!-- Default Tools -->
 		<div class="mb-4">
-			<h3 class="text-sm font-medium text-foreground mb-2">Default Tools</h3>
-			<div class="flex gap-2">
-				<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
-					&#x1f4c1; Filesystem
-				</span>
-				<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
-					&#x1f4bb; Shell
-				</span>
+			<h3 class="text-sm font-medium text-foreground mb-2">Built-in Tools</h3>
+			<div class="flex flex-wrap gap-1.5">
+				{#each [
+					'Filesystem', 'Shell', 'Tasks', 'Memory', 'Apps', 'Skills',
+					'Office', 'Browser', 'Logs'
+				] as tool}
+					<span class="inline-flex items-center rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">{tool}</span>
+				{/each}
 			</div>
 			<p class="text-xs text-muted-foreground mt-1">Always included for all agents.</p>
 		</div>

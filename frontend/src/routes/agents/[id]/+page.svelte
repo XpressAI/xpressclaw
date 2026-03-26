@@ -429,14 +429,27 @@
 				<!-- Tools -->
 				<div class="rounded-lg border border-border bg-card p-4 space-y-3">
 					<h2 class="text-sm font-semibold">Tools</h2>
-					<div class="flex gap-2 mb-2">
-						<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
-							Filesystem
-						</span>
-						<span class="inline-flex items-center gap-1 rounded-md bg-muted px-2.5 py-1 text-xs text-muted-foreground">
-							Shell
-						</span>
-						<span class="text-xs text-muted-foreground self-center">always included</span>
+					<div class="space-y-2 mb-3">
+						<div class="flex items-center gap-1.5 mb-1">
+							<span class="text-xs text-muted-foreground">Always included:</span>
+						</div>
+						<div class="flex flex-wrap gap-1.5">
+							{#each [
+								{ name: 'Filesystem', desc: 'Read, write, edit files' },
+								{ name: 'Shell', desc: 'Run commands' },
+								{ name: 'Tasks', desc: 'Create, track, schedule tasks' },
+								{ name: 'Memory', desc: 'Search and save long-term memory' },
+								{ name: 'Apps', desc: 'Build and publish web apps' },
+								{ name: 'Skills', desc: 'Read skill instructions' },
+								{ name: 'Office', desc: 'Word, Excel, PowerPoint via AppleScript' },
+								{ name: 'Browser', desc: 'Screenshots, scraping via Playwright' },
+								{ name: 'Logs', desc: 'View agent and app container logs' },
+							] as tool}
+								<span class="inline-flex items-center rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground" title={tool.desc}>
+									{tool.name}
+								</span>
+							{/each}
+						</div>
 					</div>
 					<div class="space-y-2">
 						<label class="flex items-center gap-3 cursor-pointer rounded-md border border-border p-2 hover:bg-accent/50">

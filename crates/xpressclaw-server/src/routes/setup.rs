@@ -1031,11 +1031,6 @@ mod tests {
         assert!(agent_names.contains(&"researcher"));
         assert!(agent_names.contains(&"developer"));
 
-        // Developer preset should have added git MCP server
-        assert!(
-            config.mcp_servers.contains_key("git"),
-            "git MCP server should be configured from developer preset"
-        );
         // Researcher's fetch should still be there
         assert!(
             config.mcp_servers.contains_key("fetch"),
