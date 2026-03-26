@@ -1,0 +1,1 @@
+Chrome was ignoring --remote-debugging-port because it detected an existing Chrome instance and just opened a new window in it. Fix: --user-data-dir=~/.xpressclaw/chrome-debug-profile/ forces a separate Chrome instance. Now the debug port always binds. The 'Chrome is being controlled' banner will show in this instance.
