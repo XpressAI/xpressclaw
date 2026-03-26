@@ -1,5 +1,6 @@
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -12,6 +13,21 @@ pub fn routes() -> Router<AppState> {
         .route("/run", post(run_office_script))
         .route("/read", post(read_document))
         .route("/export", post(export_document))
+        .route("/documents", get(list_documents))
+        .route("/documents/{name}", get(download_document))
+}
+
+/// Get the documents directory for an agent (~/.xpressclaw/{agent_id}/documents/).
+/// Each agent has its own documents directory to prevent cross-agent access.
+fn documents_dir(state: &AppState, agent_id: &str) -> std::path::PathBuf {
+    let dir = state
+        .config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(agent_id)
+        .join("documents");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 #[derive(Debug, Deserialize)]
@@ -20,53 +36,87 @@ struct RunScriptRequest {
     app: String,
     /// Script to execute (AppleScript on macOS, PowerShell on Windows)
     script: String,
-    /// Optional file path to operate on
-    file_path: Option<String>,
+    /// Document name (resolved to ~/.xpressclaw/{agent_id}/documents/{name})
+    file_name: Option<String>,
+    /// Agent ID (for per-agent document directory)
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReadDocumentRequest {
-    file_path: String,
+    file_name: String,
+    agent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExportDocumentRequest {
-    file_path: String,
-    format: String, // "pdf", "html", etc.
-    output_path: Option<String>,
+    file_name: String,
+    format: String,
+    output_name: Option<String>,
+    agent_id: Option<String>,
 }
 
 async fn run_office_script(
+    State(state): State<AppState>,
     Json(req): Json<RunScriptRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let platform = std::env::consts::OS;
+    let agent_id = req.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+
+    let file_path = req
+        .file_name
+        .as_ref()
+        .map(|name| docs_dir.join(name).to_string_lossy().to_string());
+
+    // Inject the documents directory path into the script as a variable
+    // so the agent can reference it without knowing the absolute path
+    let docs_path = docs_dir.to_string_lossy().to_string();
+    let script = req
+        .script
+        .replace("$DOCUMENTS_DIR", &docs_path)
+        .replace("${DOCUMENTS_DIR}", &docs_path);
 
     let result = match platform {
-        "macos" => run_applescript(&req.app, &req.script, req.file_path.as_deref()).await,
-        "windows" => run_powershell(&req.app, &req.script, req.file_path.as_deref()).await,
-        "linux" => Err("Office automation requires macOS or Windows. Linux support via LibreOffice CLI is planned.".to_string()),
+        "macos" => run_applescript(&req.app, &script, file_path.as_deref()).await,
+        "windows" => run_powershell(&req.app, &script, file_path.as_deref()).await,
+        "linux" => Err("Office automation requires macOS or Windows.".to_string()),
         _ => Err(format!("Unsupported platform: {platform}")),
     };
 
     match result {
         Ok(output) => {
             info!(app = %req.app, "office script executed");
-            Ok(Json(json!({ "success": true, "output": output })))
+            Ok(Json(json!({
+                "success": true,
+                "output": output,
+                "documents_dir": docs_path,
+            })))
         }
         Err(e) => {
             warn!(app = %req.app, error = %e, "office script failed");
-            // Return 200 with error details so the agent can read and adapt,
-            // rather than a 500 that the MCP tool treats as a transport failure.
             Ok(Json(json!({ "success": false, "error": e })))
         }
     }
 }
 
 async fn read_document(
+    State(state): State<AppState>,
     Json(req): Json<ReadDocumentRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let platform = std::env::consts::OS;
-    let ext = std::path::Path::new(&req.file_path)
+    let agent_id = req.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let file_path = docs_dir.join(&req.file_name).to_string_lossy().to_string();
+
+    if !docs_dir.join(&req.file_name).exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Document '{}' not found", req.file_name) })),
+        ));
+    }
+
+    let ext = std::path::Path::new(&req.file_name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -85,8 +135,8 @@ async fn read_document(
     };
 
     let script = match platform {
-        "macos" => generate_read_applescript(app, &req.file_path),
-        "windows" => generate_read_powershell(app, &req.file_path),
+        "macos" => generate_read_applescript(app, &file_path),
+        "windows" => generate_read_powershell(app, &file_path),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -96,27 +146,27 @@ async fn read_document(
     };
 
     let result = match platform {
-        "macos" => run_applescript(app, &script, Some(&req.file_path)).await,
-        "windows" => run_powershell(app, &script, Some(&req.file_path)).await,
-        _ => Err("Unsupported platform".to_string()),
+        "macos" => run_applescript(app, &script, Some(&file_path)).await,
+        "windows" => run_powershell(app, &script, Some(&file_path)).await,
+        _ => Err("Unsupported".to_string()),
     };
 
     match result {
-        Ok(content) => Ok(Json(
-            json!({ "content": content, "file": req.file_path, "app": app }),
-        )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )),
+        Ok(content) => Ok(Json(json!({ "content": content, "file": req.file_name }))),
+        Err(e) => Ok(Json(json!({ "success": false, "error": e }))),
     }
 }
 
 async fn export_document(
+    State(state): State<AppState>,
     Json(req): Json<ExportDocumentRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let platform = std::env::consts::OS;
-    let ext = std::path::Path::new(&req.file_path)
+    let agent_id = req.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let file_path = docs_dir.join(&req.file_name).to_string_lossy().to_string();
+
+    let ext = std::path::Path::new(&req.file_name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -129,19 +179,24 @@ async fn export_document(
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("Unsupported file type: .{ext}") })),
+                Json(json!({ "error": format!("Unsupported: .{ext}") })),
             ))
         }
     };
 
-    let output_path = req.output_path.unwrap_or_else(|| {
-        let p = std::path::Path::new(&req.file_path);
-        p.with_extension(&req.format).to_string_lossy().to_string()
+    let output_name = req.output_name.unwrap_or_else(|| {
+        let p = std::path::Path::new(&req.file_name);
+        p.with_extension(&req.format)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
     });
+    let output_path = docs_dir.join(&output_name).to_string_lossy().to_string();
 
     let script = match platform {
-        "macos" => generate_export_applescript(app, &req.file_path, &output_path, &req.format),
-        "windows" => generate_export_powershell(app, &req.file_path, &output_path, &req.format),
+        "macos" => generate_export_applescript(app, &file_path, &output_path, &req.format),
+        "windows" => generate_export_powershell(app, &file_path, &output_path, &req.format),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -151,20 +206,98 @@ async fn export_document(
     };
 
     let result = match platform {
-        "macos" => run_applescript(app, &script, Some(&req.file_path)).await,
-        "windows" => run_powershell(app, &script, Some(&req.file_path)).await,
+        "macos" => run_applescript(app, &script, Some(&file_path)).await,
+        "windows" => run_powershell(app, &script, Some(&file_path)).await,
         _ => Err("Unsupported".to_string()),
     };
 
     match result {
         Ok(_) => Ok(Json(
-            json!({ "exported": output_path, "format": req.format }),
+            json!({ "exported": output_name, "format": req.format }),
         )),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e })),
-        )),
+        Err(e) => Ok(Json(json!({ "success": false, "error": e }))),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct DocumentsQuery {
+    agent_id: Option<String>,
+}
+
+/// List all documents in the agent's documents directory.
+async fn list_documents(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Json<Vec<Value>> {
+    let agent_id = query.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let mut docs = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&docs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                docs.push(json!({
+                    "name": name,
+                    "size": size,
+                    "url": format!("/api/office/documents/{}", name),
+                }));
+            }
+        }
+    }
+
+    Json(docs)
+}
+
+/// Download a document by name.
+async fn download_document(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let agent_id = query.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let file_path = docs_dir.join(&name);
+
+    if !file_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Document not found" })),
+        ));
+    }
+
+    let bytes = std::fs::read(&file_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let content_type = match file_path.extension().and_then(|e| e.to_str()) {
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        _ => "application/octet-stream",
+    };
+
+    Ok(axum::response::Response::builder()
+        .header("content-type", content_type)
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{name}\""),
+        )
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +316,6 @@ async fn run_applescript(
         _ => return Err(format!("Unknown app: {app}")),
     };
 
-    // Wrap the user script in a tell block if it doesn't already have one
     let full_script = if script.contains("tell application") {
         script.to_string()
     } else {
@@ -203,8 +335,6 @@ async fn run_applescript(
     if output.status.success() {
         Ok(stdout)
     } else if !stdout.is_empty() {
-        // Script partially succeeded (e.g. Word opened and wrote the file,
-        // but a subsequent command failed). Return output with warning.
         Ok(format!("{stdout}\n\n[Warning: {stderr}]"))
     } else {
         Err(format!("AppleScript error: {stderr}"))
@@ -227,7 +357,6 @@ async fn run_powershell(
         _ => return Err(format!("Unknown app: {app}")),
     };
 
-    // Wrap in COM object creation if not already done
     let full_script = if script.contains("New-Object") || script.contains("$app") {
         script.to_string()
     } else {
@@ -242,16 +371,20 @@ async fn run_powershell(
         .await
         .map_err(|e| format!("Failed to run PowerShell: {e}"))?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(stdout)
+    } else if !stdout.is_empty() {
+        Ok(format!("{stdout}\n\n[Warning: {stderr}]"))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("PowerShell error: {stderr}"))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Script generators for common operations
+// Script generators
 // ---------------------------------------------------------------------------
 
 fn generate_read_applescript(app: &str, file_path: &str) -> String {
@@ -368,10 +501,7 @@ end tell"#
   close active presentation saving no
 end tell"#
         ),
-        _ => format!(
-            r#"-- Export to {format} not directly supported for {app}
--- Try using the run endpoint with a custom script"#
-        ),
+        _ => format!("-- Export to {format} not directly supported for {app}"),
     }
 }
 
@@ -385,7 +515,7 @@ fn generate_export_powershell(
         ("word", "pdf") => format!(
             r#"$app = New-Object -ComObject Word.Application
 $doc = $app.Documents.Open("{file_path}")
-$doc.SaveAs2("{output_path}", 17) # 17 = wdFormatPDF
+$doc.SaveAs2("{output_path}", 17)
 $doc.Close($false)
 $app.Quit()
 [System.Runtime.Interopservices.Marshal]::ReleaseComObject($app) | Out-Null"#
@@ -393,7 +523,7 @@ $app.Quit()
         ("excel", "pdf") => format!(
             r#"$app = New-Object -ComObject Excel.Application
 $wb = $app.Workbooks.Open("{file_path}")
-$wb.ExportAsFixedFormat(0, "{output_path}") # 0 = xlTypePDF
+$wb.ExportAsFixedFormat(0, "{output_path}")
 $wb.Close($false)
 $app.Quit()
 [System.Runtime.Interopservices.Marshal]::ReleaseComObject($app) | Out-Null"#

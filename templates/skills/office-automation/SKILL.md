@@ -9,13 +9,16 @@ You can create and edit Word, Excel, and PowerPoint documents using the actual O
 
 ## Tools Available
 
-- `office_run(app, script, file_path)` — Run a script against an Office app
-- `office_read(file_path)` — Extract text content from a document
-- `office_export(file_path, format)` — Export a document (e.g., to PDF)
+- `office_run(app, script, file_name)` — Run a script against an Office app
+- `office_read(file_name)` — Extract text content from a document
+- `office_export(file_name, format)` — Export a document (e.g., to PDF)
+- `list_documents()` — List all documents in your documents directory
 
 ## How It Works
 
-The scripts run on the **host machine** (not in your container). On macOS, you write AppleScript. On Windows, you write PowerShell with COM objects. The xpressclaw server executes the script and returns the result.
+Documents are stored in a per-agent directory (`~/.xpressclaw/{agent_id}/documents/`). Use **file names only** (e.g. `report.docx`), not full paths. Use `$DOCUMENTS_DIR` in your scripts to reference the directory path.
+
+The scripts run on the **host machine** (not in your container). On macOS, you write AppleScript. On Windows, you write PowerShell with COM objects. The xpressclaw server resolves file names and executes the script.
 
 ## macOS: AppleScript Examples
 
@@ -33,7 +36,7 @@ tell application "Microsoft Word"
   set font size of font object of myRange to 24
   set bold of font object of myRange to true
 
-  save as newDoc file name POSIX file "/Users/me/Desktop/report.docx"
+  save as newDoc file name POSIX file "$DOCUMENTS_DIR/report.docx"
 end tell
 ```
 
@@ -62,7 +65,7 @@ tell application "Microsoft Excel"
   -- Formula
   set value of cell "B4" of ws to "=SUM(B2:B3)"
 
-  save wb in POSIX file "/Users/me/Desktop/sales.xlsx"
+  save wb in POSIX file "$DOCUMENTS_DIR/sales.xlsx"
 end tell
 ```
 
@@ -85,7 +88,7 @@ tell application "Microsoft PowerPoint"
 • Growth: 15%
 • Customers: 450"
 
-  save pres in POSIX file "/Users/me/Desktop/review.pptx"
+  save pres in POSIX file "$DOCUMENTS_DIR/review.pptx"
 end tell
 ```
 
@@ -93,7 +96,7 @@ end tell
 
 ```applescript
 tell application "Microsoft Word"
-  open POSIX file "/Users/me/Desktop/report.docx"
+  open POSIX file "$DOCUMENTS_DIR/report.docx"
 
   -- Find and replace
   tell find object of selection
@@ -130,7 +133,7 @@ $selection.TypeParagraph()
 $selection.Style = $doc.Styles.Item("Normal")
 $selection.TypeText("This is the report content.")
 
-$doc.SaveAs2("C:\Users\me\Desktop\report.docx")
+$doc.SaveAs2("$DOCUMENTS_DIR/report.docx")
 $doc.Close()
 $word.Quit()
 ```
@@ -157,15 +160,15 @@ $ws.Cells(3,2).Value = 275.50
 # Formula
 $ws.Cells(4,2).Formula = "=SUM(B2:B3)"
 
-$wb.SaveAs("C:\Users\me\Desktop\sales.xlsx")
+$wb.SaveAs("$DOCUMENTS_DIR/sales.xlsx")
 $wb.Close()
 $excel.Quit()
 ```
 
 ## Rules
 
-- File paths must be absolute paths on the host machine
-- The Office app will open visually on the user's screen
+- **Use file names only** (e.g. `report.docx`), not full paths. Files are in `$DOCUMENTS_DIR`.
+- The Office app will open visually on the user's screen.
 - Always close documents after editing to avoid locking
 - Use `office_read` first to understand existing document structure before editing
 - Use `office_export` to convert to PDF — don't try to create PDFs directly

@@ -143,10 +143,10 @@ TOOLS = [
     {
         "name": "office_run",
         "description": (
-            "Run a script against an Office application (Word, Excel, PowerPoint) "
-            "on the host machine. On macOS, provide an AppleScript. On Windows, "
-            "provide a PowerShell script using COM automation. The script is "
-            "executed on the host where Office is installed, not in the container."
+            "Run a script against an Office application (Word, Excel, PowerPoint). "
+            "On macOS, provide AppleScript. On Windows, provide PowerShell. "
+            "Use $DOCUMENTS_DIR in your script to reference the documents folder. "
+            "Files are stored in a managed documents directory — use file_name not full paths."
         ),
         "inputSchema": {
             "type": "object",
@@ -158,11 +158,11 @@ TOOLS = [
                 },
                 "script": {
                     "type": "string",
-                    "description": "The script to execute (AppleScript on macOS, PowerShell on Windows)",
+                    "description": "The script to execute. Use $DOCUMENTS_DIR for the documents folder path.",
                 },
-                "file_path": {
+                "file_name": {
                     "type": "string",
-                    "description": "Optional file path to open/create",
+                    "description": "Document file name (e.g. 'report.docx'). Resolved to the documents directory.",
                 },
             },
             "required": ["app", "script"],
@@ -171,44 +171,52 @@ TOOLS = [
     {
         "name": "office_read",
         "description": (
-            "Read the text content of a document file (docx, xlsx, pptx) "
-            "using the installed Office application on the host."
+            "Read the text content of a document (docx, xlsx, pptx) "
+            "from the documents directory."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {
+                "file_name": {
                     "type": "string",
-                    "description": "Path to the document file on the host",
+                    "description": "Document file name (e.g. 'report.docx')",
                 },
             },
-            "required": ["file_path"],
+            "required": ["file_name"],
         },
     },
     {
         "name": "office_export",
         "description": (
-            "Export a document to a different format (e.g., export docx to PDF) "
-            "using the installed Office application on the host."
+            "Export a document to a different format (e.g., docx to PDF). "
+            "Both source and output are in the documents directory."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "file_path": {
+                "file_name": {
                     "type": "string",
-                    "description": "Path to the source document",
+                    "description": "Source document name (e.g. 'report.docx')",
                 },
                 "format": {
                     "type": "string",
                     "enum": ["pdf", "html"],
                     "description": "Target format",
                 },
-                "output_path": {
+                "output_name": {
                     "type": "string",
-                    "description": "Optional output path (defaults to same name with new extension)",
+                    "description": "Output file name (defaults to same name with new extension)",
                 },
             },
-            "required": ["file_path", "format"],
+            "required": ["file_name", "format"],
+        },
+    },
+    {
+        "name": "list_documents",
+        "description": "List all documents in the documents directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
         },
     },
     {
@@ -411,27 +419,46 @@ def handle_tool(name: str, arguments: dict) -> str:
         body = {
             "app": arguments["app"],
             "script": arguments["script"],
-            "file_path": arguments.get("file_path"),
+            "file_name": arguments.get("file_name"),
+            "agent_id": AGENT_ID,
         }
         result = _api("POST", "/office/run", body)
         if result.get("success"):
-            return result.get("output", "Script executed successfully.")
+            output = result.get("output", "Script executed successfully.")
+            docs_dir = result.get("documents_dir", "")
+            return f"{output}\n\nDocuments directory: {docs_dir}"
         else:
             error = result.get("error", "Unknown error")
-            return f"Script error: {error}\n\nTry adjusting the AppleScript syntax and retrying."
+            return f"Script error: {error}\n\nTry adjusting the script syntax and retrying."
 
     elif name == "office_read":
-        result = _api("POST", "/office/read", {"file_path": arguments["file_path"]})
+        result = _api("POST", "/office/read", {"file_name": arguments["file_name"], "agent_id": AGENT_ID})
+        if result.get("success") is False:
+            return f"Error reading document: {result.get('error', 'unknown')}"
         return result.get("content", "No content extracted.")
 
     elif name == "office_export":
         body = {
-            "file_path": arguments["file_path"],
+            "file_name": arguments["file_name"],
             "format": arguments["format"],
-            "output_path": arguments.get("output_path"),
+            "output_name": arguments.get("output_name"),
+            "agent_id": AGENT_ID,
         }
         result = _api("POST", "/office/export", body)
+        if result.get("success") is False:
+            return f"Export error: {result.get('error', 'unknown')}"
         return f"Exported to: {result.get('exported', 'unknown')}"
+
+    elif name == "list_documents":
+        docs = _api("GET", f"/office/documents?agent_id={AGENT_ID}")
+        if not docs:
+            return "No documents in the documents directory."
+        lines = []
+        for d in docs:
+            size = d.get("size", 0)
+            size_str = f"{size / 1024:.1f} KB" if size > 1024 else f"{size} bytes"
+            lines.append(f"- {d['name']} ({size_str})")
+        return "\n".join(lines)
 
     elif name == "get_app_logs":
         result = _api("GET", f"/apps/{arguments['name']}/logs")
