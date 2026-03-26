@@ -512,39 +512,13 @@ def handle_tool(name: str, arguments: dict) -> str:
         return "\n".join(lines)
 
     elif name == "browser_screenshot":
-        body = {
-            "url": arguments["url"],
-            "file_name": arguments.get("file_name"),
-            "wait_for": arguments.get("wait_for"),
-            "full_page": arguments.get("full_page"),
-            "agent_id": AGENT_ID,
-        }
-        result = _api("POST", "/browser/screenshot", body)
-        if result.get("success"):
-            return f"Screenshot saved: {result.get('file', 'screenshot.png')}"
-        return f"Screenshot error: {result.get('error', 'unknown')}"
+        return _run_browser_screenshot(arguments)
 
     elif name == "browser_fetch":
-        body = {
-            "url": arguments["url"],
-            "selector": arguments.get("selector"),
-            "wait_for": arguments.get("wait_for"),
-            "agent_id": AGENT_ID,
-        }
-        result = _api("POST", "/browser/fetch", body)
-        if result.get("success"):
-            return result.get("content", "No content extracted.")
-        return f"Fetch error: {result.get('error', 'unknown')}"
+        return _run_browser_fetch(arguments)
 
     elif name == "browser_run":
-        body = {
-            "script": arguments["script"],
-            "agent_id": AGENT_ID,
-        }
-        result = _api("POST", "/browser/run", body)
-        if result.get("success"):
-            return result.get("output", "Script executed successfully.")
-        return f"Script error: {result.get('error', 'unknown')}"
+        return _run_browser_script(arguments)
 
     elif name == "get_app_logs":
         result = _api("GET", f"/apps/{arguments['name']}/logs")
@@ -557,6 +531,104 @@ def handle_tool(name: str, arguments: dict) -> str:
         return f"Agent logs:\n{logs}"
 
     raise ValueError(f"unknown tool: {name}")
+
+
+CDP_URL = f"http://host.docker.internal:9222"
+SCREENSHOTS_DIR = os.path.join(WORKSPACE, "screenshots")
+
+
+def _ensure_chrome():
+    """Ensure Chrome is running on the host with remote debugging."""
+    result = _api("POST", "/browser/launch", {})
+    return result.get("cdp_url", CDP_URL)
+
+
+def _run_browser_screenshot(arguments: dict) -> str:
+    """Take a screenshot via Playwright connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    url = arguments["url"]
+    file_name = arguments.get("file_name", "screenshot.png")
+    full_page = arguments.get("full_page", False)
+    wait_for = arguments.get("wait_for")
+
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+    output_path = os.path.join(SCREENSHOTS_DIR, file_name)
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            if wait_for:
+                page.wait_for_selector(wait_for, timeout=10000)
+            page.screenshot(path=output_path, full_page=full_page)
+            context.close()
+        return f"Screenshot saved: {output_path}"
+    except ImportError:
+        return "Error: playwright is not installed. Run: pip install playwright"
+    except Exception as e:
+        return f"Screenshot error: {e}"
+
+
+def _run_browser_fetch(arguments: dict) -> str:
+    """Fetch page content via Playwright connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    url = arguments["url"]
+    selector = arguments.get("selector")
+    wait_for = arguments.get("wait_for")
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(cdp_url)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle")
+            if wait_for:
+                page.wait_for_selector(wait_for, timeout=10000)
+            if selector:
+                content = page.text_content(selector) or ""
+            else:
+                content = page.content()
+            context.close()
+        return content
+    except ImportError:
+        return "Error: playwright is not installed. Run: pip install playwright"
+    except Exception as e:
+        return f"Fetch error: {e}"
+
+
+def _run_browser_script(arguments: dict) -> str:
+    """Run a custom Playwright script connecting to Chrome on the host."""
+    cdp_url = _ensure_chrome()
+    script = arguments["script"]
+
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+
+    # Inject CDP_URL and SCREENSHOTS_DIR into the script
+    script = script.replace("$CDP_URL", cdp_url)
+    script = script.replace("${CDP_URL}", cdp_url)
+    script = script.replace("$SCREENSHOTS_DIR", SCREENSHOTS_DIR)
+    script = script.replace("${SCREENSHOTS_DIR}", SCREENSHOTS_DIR)
+
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python3", "-c", script],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "CDP_URL": cdp_url, "SCREENSHOTS_DIR": SCREENSHOTS_DIR},
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            if output:
+                return f"{output}\n\n[Warning: {error}]"
+            return f"Script error: {error}"
+        return output or "Script executed successfully."
+    except Exception as e:
+        return f"Script error: {e}"
 
 
 def _write_if_missing(path: str, content: str):

@@ -1,199 +1,168 @@
-use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::{info, warn};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+use tracing::info;
 
 use crate::state::AppState;
 
+/// Chrome debug port — exposed to containers via host.docker.internal
+const CHROME_DEBUG_PORT: u16 = 9222;
+
+/// Track the Chrome process
+static CHROME_PROCESS: OnceLock<Mutex<Option<tokio::process::Child>>> = OnceLock::new();
+
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/run", post(run_browser_script))
-        .route("/screenshot", post(take_screenshot))
-        .route("/fetch", post(fetch_page))
+        .route("/launch", post(launch_chrome))
+        .route("/status", get(chrome_status))
+        .route("/stop", post(stop_chrome))
 }
 
-/// Per-agent screenshots directory.
-fn screenshots_dir(state: &AppState, agent_id: &str) -> std::path::PathBuf {
-    let dir = state
-        .config_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join(agent_id)
-        .join("screenshots");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
+/// Launch Chrome with remote debugging enabled.
+/// Agents connect via CDP from inside their containers.
+async fn launch_chrome() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mutex = CHROME_PROCESS.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().await;
 
-#[derive(Debug, Deserialize)]
-struct BrowserScriptRequest {
-    /// Python script using playwright.sync_api
-    script: String,
-    agent_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ScreenshotRequest {
-    /// URL to screenshot
-    url: String,
-    /// Output file name (e.g. "page.png")
-    file_name: Option<String>,
-    /// Wait for selector before screenshot
-    wait_for: Option<String>,
-    /// Full page screenshot
-    full_page: Option<bool>,
-    agent_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FetchPageRequest {
-    /// URL to fetch
-    url: String,
-    /// CSS selector to extract text from (optional, extracts full page if omitted)
-    selector: Option<String>,
-    /// Wait for selector before extracting
-    wait_for: Option<String>,
-}
-
-async fn run_browser_script(
-    State(state): State<AppState>,
-    Json(req): Json<BrowserScriptRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let agent_id = req.agent_id.as_deref().unwrap_or("default");
-    let screenshots = screenshots_dir(&state, agent_id);
-    let screenshots_path = screenshots.to_string_lossy().to_string();
-
-    // Inject $SCREENSHOTS_DIR into the script
-    let script = req
-        .script
-        .replace("$SCREENSHOTS_DIR", &screenshots_path)
-        .replace("${SCREENSHOTS_DIR}", &screenshots_path);
-
-    let result = run_python_playwright(&script).await;
-
-    match result {
-        Ok(output) => {
-            info!("browser script executed");
-            Ok(Json(json!({
-                "success": true,
-                "output": output,
-                "screenshots_dir": screenshots_path,
-            })))
-        }
-        Err(e) => {
-            warn!(error = %e, "browser script failed");
-            Ok(Json(json!({ "success": false, "error": e })))
+    // Check if already running
+    if let Some(ref mut child) = *guard {
+        match child.try_wait() {
+            Ok(None) => {
+                // Still running
+                return Ok(Json(json!({
+                    "status": "already_running",
+                    "cdp_url": format!("http://host.docker.internal:{CHROME_DEBUG_PORT}"),
+                    "port": CHROME_DEBUG_PORT,
+                })));
+            }
+            _ => {
+                // Dead, will relaunch
+            }
         }
     }
-}
 
-async fn take_screenshot(
-    State(state): State<AppState>,
-    Json(req): Json<ScreenshotRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let agent_id = req.agent_id.as_deref().unwrap_or("default");
-    let screenshots = screenshots_dir(&state, agent_id);
-    let file_name = req
-        .file_name
-        .unwrap_or_else(|| "screenshot.png".to_string());
-    let output_path = screenshots.join(&file_name).to_string_lossy().to_string();
-    let full_page = req.full_page.unwrap_or(false);
-
-    let wait_code = req
-        .wait_for
-        .as_ref()
-        .map(|s| format!("page.wait_for_selector('{s}', timeout=10000)"))
-        .unwrap_or_default();
-
-    let script = format!(
-        r#"
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    page = browser.new_page()
-    page.goto("{url}", wait_until="networkidle")
-    {wait_code}
-    page.screenshot(path="{output_path}", full_page={full_page_py})
-    browser.close()
-print("saved")
-"#,
-        url = req.url,
-        output_path = output_path,
-        full_page_py = if full_page { "True" } else { "False" },
-    );
-
-    let result = run_python_playwright(&script).await;
-
-    match result {
-        Ok(_) => Ok(Json(json!({
-            "success": true,
-            "file": file_name,
-            "path": output_path,
-        }))),
-        Err(e) => Ok(Json(json!({ "success": false, "error": e }))),
-    }
-}
-
-async fn fetch_page(
-    Json(req): Json<FetchPageRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let wait_code = req
-        .wait_for
-        .as_ref()
-        .map(|s| format!("page.wait_for_selector('{s}', timeout=10000)"))
-        .unwrap_or_default();
-
-    let extract_code = if let Some(ref selector) = req.selector {
-        format!("page.text_content('{selector}') or ''")
-    } else {
-        "page.content()".to_string()
+    // Find Chrome binary
+    let chrome_path = find_chrome();
+    let Some(chrome) = chrome_path else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(
+                json!({ "error": "Chrome/Chromium not found. Install Google Chrome or Chromium." }),
+            ),
+        ));
     };
 
-    let script = format!(
-        r#"
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    page = browser.new_page()
-    page.goto("{url}", wait_until="networkidle")
-    {wait_code}
-    content = {extract_code}
-    browser.close()
-print(content)
-"#,
-        url = req.url,
-    );
+    info!(chrome = %chrome, port = CHROME_DEBUG_PORT, "launching Chrome with remote debugging");
 
-    let result = run_python_playwright(&script).await;
+    let child = tokio::process::Command::new(&chrome)
+        .args([
+            &format!("--remote-debugging-port={CHROME_DEBUG_PORT}"),
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            // Start with a blank page
+            "about:blank",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to launch Chrome: {e}") })),
+            )
+        })?;
 
-    match result {
-        Ok(content) => Ok(Json(json!({
-            "success": true,
-            "content": content,
-            "url": req.url,
-        }))),
-        Err(e) => Ok(Json(json!({ "success": false, "error": e }))),
-    }
+    *guard = Some(child);
+
+    // Give Chrome a moment to start the debug server
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    Ok(Json(json!({
+        "status": "launched",
+        "cdp_url": format!("http://host.docker.internal:{CHROME_DEBUG_PORT}"),
+        "port": CHROME_DEBUG_PORT,
+    })))
 }
 
-/// Execute a Python script that uses playwright.sync_api.
-async fn run_python_playwright(script: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("python3")
-        .args(["-c", script])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run python3: {e}"))?;
+/// Check if Chrome is running with debug port.
+async fn chrome_status() -> Json<Value> {
+    let mutex = CHROME_PROCESS.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().await;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-    if output.status.success() {
-        Ok(stdout)
-    } else if !stdout.is_empty() {
-        Ok(format!("{stdout}\n\n[Warning: {stderr}]"))
-    } else {
-        Err(format!("Playwright error: {stderr}"))
+    if let Some(ref mut child) = *guard {
+        match child.try_wait() {
+            Ok(None) => {
+                return Json(json!({
+                    "running": true,
+                    "cdp_url": format!("http://host.docker.internal:{CHROME_DEBUG_PORT}"),
+                    "port": CHROME_DEBUG_PORT,
+                }));
+            }
+            _ => {
+                *guard = None;
+            }
+        }
     }
+
+    Json(json!({ "running": false }))
+}
+
+/// Stop Chrome.
+async fn stop_chrome() -> Json<Value> {
+    let mutex = CHROME_PROCESS.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().await;
+
+    if let Some(ref mut child) = *guard {
+        let _ = child.kill().await;
+        info!("stopped Chrome");
+    }
+    *guard = None;
+
+    Json(json!({ "stopped": true }))
+}
+
+/// Find Chrome/Chromium binary on the host.
+fn find_chrome() -> Option<String> {
+    let candidates = match std::env::consts::OS {
+        "macos" => vec![
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ],
+        "windows" => vec![
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "linux" => vec![
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ],
+        _ => vec![],
+    };
+
+    for path in candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+        // On Linux, check PATH
+        if std::env::consts::OS == "linux" {
+            if let Ok(output) = std::process::Command::new("which").arg(path).output() {
+                if output.status.success() {
+                    return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
