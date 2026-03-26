@@ -70,27 +70,40 @@ fn main() {
                 "xpressclaw"
             };
             let sidecar_name = sidecar_binary_name();
-            let sidecar_path = app
-                .path()
-                .resource_dir()
-                .ok()
-                .and_then(|d| {
-                    // Installed app: Tauri places sidecar next to the exe
-                    let flat = d.join(cli_name);
-                    if flat.exists() {
-                        return Some(flat);
-                    }
-                    // Also check with triple suffix and binaries/ subdir
-                    let with_triple = d.join(&sidecar_name);
-                    if with_triple.exists() {
-                        return Some(with_triple);
-                    }
-                    let in_subdir = d.join("binaries").join(&sidecar_name);
-                    if in_subdir.exists() {
-                        return Some(in_subdir);
-                    }
-                    None
-                })
+            let sidecar_path =
+                // Check next to the executable (Contents/MacOS/) — where Tauri bundles sidecars
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+                    .and_then(|d| {
+                        let flat = d.join(cli_name);
+                        if flat.exists() {
+                            return Some(flat);
+                        }
+                        let with_triple = d.join(&sidecar_name);
+                        if with_triple.exists() {
+                            return Some(with_triple);
+                        }
+                        None
+                    })
+                    // Also check resource_dir (Contents/Resources/)
+                    .or_else(|| {
+                        app.path().resource_dir().ok().and_then(|d| {
+                            let flat = d.join(cli_name);
+                            if flat.exists() {
+                                return Some(flat);
+                            }
+                            let with_triple = d.join(&sidecar_name);
+                            if with_triple.exists() {
+                                return Some(with_triple);
+                            }
+                            let in_subdir = d.join("binaries").join(&sidecar_name);
+                            if in_subdir.exists() {
+                                return Some(in_subdir);
+                            }
+                            None
+                        })
+                    })
                 .or_else(|| {
                     // Dev mode: look in the binaries/ directory next to the Tauri manifest
                     let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
