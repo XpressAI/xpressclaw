@@ -1,3 +1,4 @@
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -23,7 +24,9 @@ pub fn routes() -> Router<AppState> {
 
 /// Launch Chrome with remote debugging enabled.
 /// Agents connect via CDP from inside their containers.
-async fn launch_chrome() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn launch_chrome(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mutex = CHROME_PROCESS.get_or_init(|| Mutex::new(None));
     let mut guard = mutex.lock().await;
 
@@ -57,15 +60,25 @@ async fn launch_chrome() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 
     info!(chrome = %chrome, port = CHROME_DEBUG_PORT, "launching Chrome with remote debugging");
 
+    // Use a separate user data directory so this Chrome instance is
+    // independent of any existing Chrome windows. Without this, Chrome
+    // reuses the existing process and ignores --remote-debugging-port.
+    let data_dir = state
+        .config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("chrome-debug-profile");
+    let _ = std::fs::create_dir_all(&data_dir);
+
     let child = tokio::process::Command::new(&chrome)
         .args([
             &format!("--remote-debugging-port={CHROME_DEBUG_PORT}"),
+            &format!("--user-data-dir={}", data_dir.to_string_lossy()),
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            // Start with a blank page
             "about:blank",
         ])
         .stdin(std::process::Stdio::null())
