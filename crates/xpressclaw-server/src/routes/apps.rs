@@ -240,9 +240,10 @@ async fn publish_app(
         let cmd = start_command.clone();
         let db_clone = state.db.clone();
 
-        // Resolve source directory — if it came from an agent workspace,
-        // find the agent container's volume mount to get the host path.
-        let host_source = resolve_host_path(&state, &req.agent_id, &source).await;
+        // The agent's workspace is a Docker named volume shared between the agent
+        // and app containers. The app source at /workspace/apps/{name}/ is accessible
+        // from the same volume mounted in the app container.
+        let volume_name = workspace_volume_name(&req.agent_id);
 
         // Detect image from start command
         let image = if cmd.starts_with("node") || cmd.starts_with("npm") || cmd.starts_with("npx") {
@@ -262,12 +263,16 @@ async fn publish_app(
                 format!("PORT={app_port}"),
             ],
             volumes: vec![VolumeMount {
-                source: host_source.clone(),
-                target: "/app".to_string(),
-                read_only: false,
+                // Mount the agent's workspace volume — the app source is at
+                // /workspace/apps/{name}/ inside this volume
+                source: volume_name,
+                target: "/workspace".to_string(),
+                read_only: true,
             }],
             network_mode: Some("bridge".to_string()),
             expose_port: Some(app_port),
+            cmd: None,       // Set by launch_app_container
+            working_dir: None, // Set by launch_app_container
         };
 
         // Launch in background
@@ -304,14 +309,16 @@ async fn launch_app_container(
     // Stop existing container if any
     let _ = docker.stop(&format!("app-{app_id}")).await;
 
-    // Create a modified spec with the start command as entrypoint
     let mut launch_spec = spec.clone();
-    // We'll override the container command via Docker config
-    // The launch() method uses the spec image's default entrypoint,
-    // so we need a custom approach. For now, use a wrapper.
-    launch_spec.environment.push(format!("START_COMMAND={start_command}"));
+    // Set the command and working directory for the app
+    // The app source is at /workspace/apps/{app_id}/ in the shared volume
+    launch_spec.cmd = Some(vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        start_command.to_string(),
+    ]);
+    launch_spec.working_dir = Some(format!("/workspace/apps/{app_id}"));
 
-    // Use sh -c to run the start command in /app
     let info = docker
         .launch(&format!("app-{app_id}"), &launch_spec)
         .await
@@ -326,6 +333,13 @@ async fn launch_app_container(
     );
 
     Ok(info.container_id)
+}
+
+/// Get the workspace volume name for an agent.
+/// The agent's /workspace is a Docker named volume shared between the agent
+/// and its app containers, so apps can read the agent's source code directly.
+fn workspace_volume_name(agent_id: &str) -> String {
+    format!("xpressclaw-workspace-{agent_id}")
 }
 
 /// Resolve a container path to the host path by checking agent volume mounts.

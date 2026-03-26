@@ -26,6 +26,10 @@ pub struct ContainerSpec {
     pub network_mode: Option<String>,
     /// Port to expose from the container (harness HTTP port).
     pub expose_port: Option<u16>,
+    /// Command to run (overrides image CMD).
+    pub cmd: Option<Vec<String>>,
+    /// Working directory inside the container.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +49,8 @@ impl Default for ContainerSpec {
             volumes: Vec::new(),
             network_mode: Some("bridge".to_string()),
             expose_port: Some(8080),
+            cmd: None,
+            working_dir: None,
         }
     }
 }
@@ -88,16 +94,20 @@ impl DockerManager {
         // Remove existing container if present
         let _ = self.remove(&container_name).await;
 
-        // Build mounts
+        // Build mounts — detect named volumes vs bind mounts
         let mounts: Vec<Mount> = spec
             .volumes
             .iter()
-            .map(|v| Mount {
-                target: Some(v.target.clone()),
-                source: Some(v.source.clone()),
-                typ: Some(MountTypeEnum::BIND),
-                read_only: Some(v.read_only),
-                ..Default::default()
+            .map(|v| {
+                // Named volumes don't start with / or ~ (they're just names like "xpressclaw-workspace-dev")
+                let is_named_volume = !v.source.starts_with('/') && !v.source.starts_with('~');
+                Mount {
+                    target: Some(v.target.clone()),
+                    source: Some(v.source.clone()),
+                    typ: Some(if is_named_volume { MountTypeEnum::VOLUME } else { MountTypeEnum::BIND }),
+                    read_only: Some(v.read_only),
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -146,6 +156,8 @@ impl DockerManager {
             } else {
                 Some(exposed_ports)
             },
+            cmd: spec.cmd.clone(),
+            working_dir: spec.working_dir.clone(),
             ..Default::default()
         };
 

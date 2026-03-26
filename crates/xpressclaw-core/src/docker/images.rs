@@ -146,7 +146,7 @@ pub fn build_container_spec_with_mcp(
     }
 
     // Volume mounts from agent config (format: "host_path:container_path" or "host_path:container_path:ro")
-    let volumes: Vec<VolumeMount> = agent
+    let mut volumes: Vec<VolumeMount> = agent
         .volumes
         .iter()
         .filter_map(|v| {
@@ -164,6 +164,18 @@ pub fn build_container_spec_with_mcp(
         })
         .collect();
 
+    // Add a named volume for /workspace if the user hasn't already mounted something there.
+    // This lets agents and their app containers share files via a Docker named volume.
+    let has_workspace_mount = volumes.iter().any(|v| v.target == "/workspace");
+    if !has_workspace_mount {
+        let workspace_vol = format!("xpressclaw-workspace-{}", agent.name);
+        volumes.push(VolumeMount {
+            source: workspace_vol,
+            target: "/workspace".to_string(),
+            read_only: false,
+        });
+    }
+
     // Memory/CPU limits from agent container config
     let memory_limit = agent.container.get("memory_limit").and_then(|v| v.as_i64());
     let cpu_limit = agent.container.get("cpu_limit").and_then(|v| v.as_i64());
@@ -176,6 +188,8 @@ pub fn build_container_spec_with_mcp(
         volumes,
         network_mode: Some("bridge".to_string()),
         expose_port: Some(8080),
+        cmd: None,
+        working_dir: None,
     }
 }
 
