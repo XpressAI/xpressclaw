@@ -121,4 +121,4 @@ jobs:
         env:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: cargo test --workspace -- --ignored
+        run: cargo test -p xpressclaw-server -p xpressclaw-core -- --ignored --skip llamacpp

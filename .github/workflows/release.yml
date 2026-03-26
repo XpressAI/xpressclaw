@@ -70,6 +70,10 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install cmake bazelisk
+
       # macOS: install certificate for signing
       - name: Install Apple certificate
         if: runner.os == 'macOS'
@@ -96,16 +100,18 @@ jobs:
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
-      # Build CLI sidecar for the target architecture
+      # Build CLI sidecar via Bazel (same as build.sh)
       - name: Build CLI sidecar
         run: |
-          cargo build --release --target ${{ matrix.target }} -p xpressclaw-cli
-          mkdir -p crates/xpressclaw-tauri/binaries
           if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo build --release --target ${{ matrix.target }} -p xpressclaw-cli
+            mkdir -p crates/xpressclaw-tauri/binaries
             cp target/${{ matrix.target }}/release/xpressclaw.exe \
                crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}.exe
           else
-            cp target/${{ matrix.target }}/release/xpressclaw \
+            bazel build //crates/xpressclaw-cli:xpressclaw
+            mkdir -p crates/xpressclaw-tauri/binaries
+            cp bazel-bin/crates/xpressclaw-cli/xpressclaw \
                crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}
           fi
         shell: bash
