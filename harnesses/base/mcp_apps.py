@@ -141,6 +141,77 @@ TOOLS = [
         },
     },
     {
+        "name": "office_run",
+        "description": (
+            "Run a script against an Office application (Word, Excel, PowerPoint) "
+            "on the host machine. On macOS, provide an AppleScript. On Windows, "
+            "provide a PowerShell script using COM automation. The script is "
+            "executed on the host where Office is installed, not in the container."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "app": {
+                    "type": "string",
+                    "enum": ["word", "excel", "powerpoint"],
+                    "description": "Which Office application to use",
+                },
+                "script": {
+                    "type": "string",
+                    "description": "The script to execute (AppleScript on macOS, PowerShell on Windows)",
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Optional file path to open/create",
+                },
+            },
+            "required": ["app", "script"],
+        },
+    },
+    {
+        "name": "office_read",
+        "description": (
+            "Read the text content of a document file (docx, xlsx, pptx) "
+            "using the installed Office application on the host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the document file on the host",
+                },
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "office_export",
+        "description": (
+            "Export a document to a different format (e.g., export docx to PDF) "
+            "using the installed Office application on the host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the source document",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["pdf", "html"],
+                    "description": "Target format",
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Optional output path (defaults to same name with new extension)",
+                },
+            },
+            "required": ["file_path", "format"],
+        },
+    },
+    {
         "name": "get_agent_logs",
         "description": (
             "Get your own agent container logs. "
@@ -335,6 +406,28 @@ def handle_tool(name: str, arguments: dict) -> str:
     elif name == "delete_app":
         _api("DELETE", f"/apps/{arguments['name']}")
         return f"Deleted app '{arguments['name']}'."
+
+    elif name == "office_run":
+        body = {
+            "app": arguments["app"],
+            "script": arguments["script"],
+            "file_path": arguments.get("file_path"),
+        }
+        result = _api("POST", "/office/run", body)
+        return result.get("output", "Script executed successfully.")
+
+    elif name == "office_read":
+        result = _api("POST", "/office/read", {"file_path": arguments["file_path"]})
+        return result.get("content", "No content extracted.")
+
+    elif name == "office_export":
+        body = {
+            "file_path": arguments["file_path"],
+            "format": arguments["format"],
+            "output_path": arguments.get("output_path"),
+        }
+        result = _api("POST", "/office/export", body)
+        return f"Exported to: {result.get('exported', 'unknown')}"
 
     elif name == "get_app_logs":
         result = _api("GET", f"/apps/{arguments['name']}/logs")

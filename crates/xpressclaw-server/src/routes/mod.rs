@@ -11,6 +11,7 @@ mod conversations;
 mod health;
 pub mod llm;
 mod memory;
+mod office;
 mod open_url;
 mod procedures;
 mod schedules;
@@ -44,4 +45,5 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/settings", settings::routes())
         .nest("/skills", skills::routes())
         .nest("/setup", setup::routes())
+        .nest("/office", office::routes())
 }
