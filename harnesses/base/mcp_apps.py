@@ -549,8 +549,9 @@ SCREENSHOTS_DIR = os.path.join(WORKSPACE, "screenshots")
 
 def _ensure_chrome():
     """Ensure Chrome is running on the host with remote debugging."""
-    result = _api("POST", "/browser/launch", {})
-    return result.get("cdp_url", CDP_URL)
+    _api("POST", "/browser/launch", {})
+    # Always use the IP-resolved CDP_URL, not the hostname from the API response
+    return CDP_URL
 
 
 def _run_browser_screenshot(arguments: dict) -> str:
