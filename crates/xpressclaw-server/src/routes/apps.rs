@@ -16,6 +16,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_apps).post(create_app))
         .route("/{id}", get(get_app).delete(delete_app))
         .route("/publish", axum::routing::post(publish_app))
+        .route("/{id}/logs", get(get_app_logs))
 }
 
 /// Proxy routes mounted at /apps/{name}/ — forwards to app containers.
@@ -333,6 +334,18 @@ async fn launch_app_container(
     );
 
     Ok(info.container_id)
+}
+
+async fn get_app_logs(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let docker = DockerManager::connect().await.map_err(|e| {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": e.to_string() })))
+    })?;
+    let logs = docker.logs(&format!("app-{id}"), 100).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+    })?;
+    Ok(Json(json!({ "logs": logs })))
 }
 
 /// Get the workspace volume name for an agent.

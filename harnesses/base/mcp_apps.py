@@ -123,6 +123,34 @@ TOOLS = [
             "required": ["name"],
         },
     },
+    {
+        "name": "get_app_logs",
+        "description": (
+            "Get the container logs for a published app. "
+            "Use to debug why an app is in an error state or not working."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "App identifier",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "get_agent_logs",
+        "description": (
+            "Get your own agent container logs. "
+            "Useful for debugging startup issues or errors."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 
@@ -307,6 +335,16 @@ def handle_tool(name: str, arguments: dict) -> str:
     elif name == "delete_app":
         _api("DELETE", f"/apps/{arguments['name']}")
         return f"Deleted app '{arguments['name']}'."
+
+    elif name == "get_app_logs":
+        result = _api("GET", f"/apps/{arguments['name']}/logs")
+        logs = result.get("logs", "No logs available.")
+        return f"App '{arguments['name']}' logs:\n{logs}"
+
+    elif name == "get_agent_logs":
+        result = _api("GET", f"/agents/{AGENT_ID}/logs")
+        logs = result.get("logs", "No logs available.")
+        return f"Agent logs:\n{logs}"
 
     raise ValueError(f"unknown tool: {name}")
 

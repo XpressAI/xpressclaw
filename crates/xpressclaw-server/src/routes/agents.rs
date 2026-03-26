@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -30,6 +30,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/config", axum::routing::patch(update_agent_config))
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
+        .route("/{id}/logs", get(get_agent_logs))
 }
 
 /// Build a JSON response for an agent by merging YAML config with DB runtime state.
@@ -475,6 +476,21 @@ fn filter_mcp_for_agent(
         result.extend(global_mcp.clone());
     }
     result
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+}
+
+async fn get_agent_logs(
+    Path(id): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tail = query.tail.unwrap_or(100);
+    let docker = DockerManager::connect().await.map_err(internal_error)?;
+    let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
+    Ok(Json(json!({ "logs": logs })))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
