@@ -54,6 +54,8 @@ jobs:
           # cmake is pre-installed on windows-latest
           # Point Bazel to Git Bash for genrule shell commands
           echo "BAZEL_SH=C:/Program Files/Git/bin/bash.exe" >> "$GITHUB_ENV"
+          # Enable long paths — llama.cpp submodule paths exceed Windows 260-char limit
+          git config --system core.longpaths true
 
       # macOS: install certificate for signing
       - name: Install Apple certificate
