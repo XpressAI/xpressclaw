@@ -43,8 +43,8 @@ WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 def load_mcp_servers() -> dict:
     """Load MCP server configs from the MCP_SERVERS environment variable.
 
-    Writes a JSON config file and returns it as a path for --mcp-config.
-    The SDK passes this to the CLI which manages the MCP server processes.
+    Returns a dict of {name: McpStdioServerConfig} for the SDK.
+    The SDK passes these to the CLI via --mcp-config.
     """
     raw = os.environ.get("MCP_SERVERS", "")
     if not raw:
@@ -55,8 +55,7 @@ def load_mcp_servers() -> dict:
         logger.warning("failed to parse MCP_SERVERS env var")
         return {}
 
-    # Build the mcpServers dict for the CLI config file format
-    cli_servers = {}
+    sdk_servers = {}
     for name, config in servers.items():
         server_type = config.get("type", "stdio")
         if server_type == "stdio" and config.get("command"):
@@ -66,23 +65,12 @@ def load_mcp_servers() -> dict:
             }
             if config.get("env"):
                 entry["env"] = config["env"]
-            cli_servers[name] = entry
+            sdk_servers[name] = entry
         elif server_type == "sse" and config.get("url"):
-            cli_servers[name] = {"type": "sse", "url": config["url"]}
+            sdk_servers[name] = {"type": "sse", "url": config["url"]}
 
-    if not cli_servers:
-        return {}
-
-    # Write config file for --mcp-config
-    config_path = "/tmp/mcp-servers.json"
-    with open(config_path, "w") as f:
-        json.dump({"mcpServers": cli_servers}, f)
-
-    logger.info("MCP config written to %s with %d servers: %s",
-                config_path, len(cli_servers), list(cli_servers.keys()))
-
-    # Return as a path string — the SDK passes it to CLI as --mcp-config <path>
-    return config_path
+    logger.info("MCP servers loaded: %s", list(sdk_servers.keys()))
+    return sdk_servers
 
 
 def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeAgentOptions:
@@ -96,6 +84,9 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeA
         # AskUserQuestion auto-skips in bypassPermissions mode (no terminal).
         # The agent should ask via regular text messages in the conversation.
         disallowed_tools=["AskUserQuestion"],
+        # Enable project settings so MCP servers and skills can load.
+        # Without this, the SDK sets --setting-sources "" which may block MCP.
+        setting_sources=["project", "user"],
     )
     if mcp_servers:
         options.mcp_servers = mcp_servers

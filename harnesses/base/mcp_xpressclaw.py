@@ -20,12 +20,6 @@ import mcp_memory
 import mcp_skills
 import mcp_apps
 
-BASE_URL = os.environ.get(
-    "XPRESSCLAW_URL",
-    f"http://host.docker.internal:{os.environ.get('XPRESSCLAW_PORT', '8935')}",
-)
-AGENT_ID = os.environ.get("AGENT_ID", "")
-
 # Merge all tools from all modules
 ALL_TOOLS = (
     mcp_tasks.TOOLS +
@@ -53,33 +47,18 @@ def handle_tool(name: str, arguments: dict) -> str:
     return handler(name, arguments)
 
 
-# --- MCP stdio protocol ---
+# --- MCP stdio protocol (newline-delimited JSON) ---
 
 def _read_message():
-    header = ""
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        header += line
-        if header.endswith("\r\n\r\n") or header.endswith("\n\n"):
-            break
-    length = 0
-    for h in header.strip().split("\n"):
-        if h.lower().startswith("content-length:"):
-            length = int(h.split(":", 1)[1].strip())
-    if length == 0:
+    line = sys.stdin.readline()
+    if not line:
         return None
-    body = sys.stdin.read(length)
-    return json.loads(body)
+    return json.loads(line.strip())
 
 
 def _write_message(obj: dict):
-    body = json.dumps(obj)
-    header = f"Content-Length: {len(body)}\r\n\r\n"
-    # Write as bytes to avoid buffering issues when stdout is piped
-    sys.stdout.buffer.write((header + body).encode())
-    sys.stdout.buffer.flush()
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
 
 
 def _response(msg_id, result):
@@ -127,7 +106,7 @@ def main():
                     _response(
                         msg_id,
                         {
-                            "content": [{"type": "text", "text": result_text}],
+                            "content": [{"type": "text", "text": str(result_text)}],
                             "isError": False,
                         },
                     )

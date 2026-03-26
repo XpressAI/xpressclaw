@@ -173,29 +173,17 @@ def handle_tool(name: str, arguments: dict) -> str:
 # --- MCP stdio protocol ---
 
 def _read_message():
-    header = ""
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            return None
-        header += line
-        if header.endswith("\r\n\r\n") or header.endswith("\n\n"):
-            break
-    length = 0
-    for h in header.strip().split("\n"):
-        if h.lower().startswith("content-length:"):
-            length = int(h.split(":", 1)[1].strip())
-    if length == 0:
+    line = sys.stdin.readline()
+    if not line:
         return None
-    body = sys.stdin.read(length)
-    return json.loads(body)
+    return json.loads(line.strip())
 
 
 def _write_message(obj: dict):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
     body = json.dumps(obj)
     header = f"Content-Length: {len(body)}\r\n\r\n"
-    sys.stdout.buffer.write((header + body).encode())
-    sys.stdout.buffer.flush()
 
 
 def _response(msg_id, result):
