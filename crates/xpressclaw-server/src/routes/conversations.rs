@@ -781,48 +781,6 @@ async fn remove_participant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Load skill index (names + descriptions) from the data directory.
-fn load_skill_index(config_path: &std::path::Path) -> Vec<(String, String)> {
-    let skills_dir = config_path
-        .parent()
-        .map(|d| d.join("skills"))
-        .unwrap_or_default();
-
-    if !skills_dir.is_dir() {
-        return Vec::new();
-    }
-
-    let mut entries = Vec::new();
-
-    if let Ok(dirs) = std::fs::read_dir(&skills_dir) {
-        for entry in dirs.flatten() {
-            let skill_file = entry.path().join("SKILL.md");
-            if skill_file.is_file() {
-                if let Ok(content) = std::fs::read_to_string(&skill_file) {
-                    if content.starts_with("---") {
-                        if let Some(fm) = content.splitn(3, "---").nth(1) {
-                            let mut name = String::new();
-                            let mut desc = String::new();
-                            for line in fm.lines() {
-                                if let Some(v) = line.strip_prefix("name:") {
-                                    name = v.trim().to_string();
-                                } else if let Some(v) = line.strip_prefix("description:") {
-                                    desc = v.trim().to_string();
-                                }
-                            }
-                            if !name.is_empty() {
-                                entries.push((name, desc));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    entries
-}
-
 /// Append skill content directly to the agent's system prompt.
 /// Critical skills (like build-app) are injected in full so the agent
 /// doesn't need to call read_skill first.

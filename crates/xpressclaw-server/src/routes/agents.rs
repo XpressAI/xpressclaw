@@ -566,7 +566,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
-        assert!(body.as_array().unwrap().len() >= 1);
+        assert!(!body.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

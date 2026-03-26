@@ -425,9 +425,7 @@ async fn complete_setup(
     let mut mcp_servers = req.mcp_servers;
     // Built-in defaults (tasks, memory, skills, apps, shell, filesystem)
     for (name, server) in default_mcp_servers() {
-        if !mcp_servers.contains_key(&name) {
-            mcp_servers.insert(name, server);
-        }
+        mcp_servers.entry(name).or_insert(server);
     }
     // Preset-specific servers
     for agent_setup in &req.agents {
@@ -653,9 +651,7 @@ async fn add_agent(
     let mut new_mcp = old_config.mcp_servers.clone();
     // Add built-in defaults (tasks, memory, apps, skills, shell, filesystem)
     for (name, server) in default_mcp_servers() {
-        if !new_mcp.contains_key(&name) {
-            new_mcp.insert(name, server);
-        }
+        new_mcp.entry(name).or_insert(server);
     }
     // Add preset-specific MCP servers
     if let Some(preset) = preset {

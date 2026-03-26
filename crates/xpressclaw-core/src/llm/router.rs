@@ -404,8 +404,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_uses_default_provider() {
-        let mut config = LlmConfig::default();
-        config.default_provider = "openai".into();
+        let config = LlmConfig {
+            default_provider: "openai".into(),
+            ..Default::default()
+        };
         let mut router = LlmRouter::new(&config);
 
         router.register_provider(

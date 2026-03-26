@@ -245,7 +245,7 @@ async fn publish_app(
     // If source_dir and start_command provided, launch a container
     if let (Some(source_dir), Some(start_command)) = (&req.source_dir, &req.start_command) {
         let app_id = req.id.clone();
-        let source = source_dir.clone();
+        let _source = source_dir.clone();
         let cmd = start_command.clone();
         let db_clone = state.db.clone();
 
@@ -362,26 +362,6 @@ async fn get_app_logs(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
 /// and its app containers, so apps can read the agent's source code directly.
 fn workspace_volume_name(agent_id: &str) -> String {
     format!("xpressclaw-workspace-{agent_id}")
-}
-
-/// Resolve a container path to the host path by checking agent volume mounts.
-async fn resolve_host_path(state: &AppState, agent_id: &str, container_path: &str) -> String {
-    // The agent's workspace is mounted from the host. Look at the agent config
-    // to find the volume mapping that contains this path.
-    let config = state.config();
-    if let Some(agent_cfg) = config.agents.iter().find(|a| a.name == agent_id) {
-        for vol in &agent_cfg.volumes {
-            // Volumes are in format "host_path:container_path" or just "host_path"
-            if let Some((host, container)) = vol.split_once(':') {
-                if container_path.starts_with(container) {
-                    let relative = container_path.strip_prefix(container).unwrap_or("");
-                    return format!("{host}{relative}");
-                }
-            }
-        }
-    }
-    // Fallback: assume path is already a host path
-    container_path.to_string()
 }
 
 // ---------------------------------------------------------------------------
