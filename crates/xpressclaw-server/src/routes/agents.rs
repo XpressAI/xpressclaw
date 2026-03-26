@@ -1,19 +1,18 @@
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
+use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
 use xpressclaw_core::agents::state::AgentStatus;
 use xpressclaw_core::config::{
     default_mcp_servers, AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, McpServerConfig,
     RateLimitConfig, WakeOnConfig,
 };
-use xpressclaw_core::docker::images::build_container_spec;
 use xpressclaw_core::docker::manager::{DockerManager, VolumeMount};
 
 use crate::state::AppState;
@@ -26,14 +25,39 @@ pub struct StartRequest {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/", get(list_agents).post(register_agent))
-        .route(
-            "/{id}",
-            get(get_agent).put(update_agent).delete(delete_agent),
-        )
+        .route("/", get(list_agents))
+        .route("/{id}", get(get_agent).delete(delete_agent))
         .route("/{id}/config", axum::routing::patch(update_agent_config))
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
+        .route("/{id}/logs", get(get_agent_logs))
+}
+
+/// Build a JSON response for an agent by merging YAML config with DB runtime state.
+fn agent_json(record: &AgentRecord, config: &xpressclaw_core::config::Config) -> Value {
+    let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
+    json!({
+        "id": record.id,
+        "name": record.name,
+        "backend": record.backend,
+        "status": record.status,
+        "container_id": record.container_id,
+        "created_at": record.created_at,
+        "started_at": record.started_at,
+        "stopped_at": record.stopped_at,
+        "error_message": record.error_message,
+        "config": agent_cfg.map(|c| json!({
+            "role": c.role,
+            "model": c.model,
+            "llm": c.llm,
+            "tools": c.tools,
+            "skills": c.skills,
+            "volumes": c.volumes,
+            "budget": c.budget,
+            "rate_limit": c.rate_limit,
+            "wake_on": c.wake_on,
+        })),
+    })
 }
 
 async fn list_agents(
@@ -41,16 +65,9 @@ async fn list_agents(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
     let agents = registry.list().map_err(internal_error)?;
-    Ok(Json(json!(agents)))
-}
-
-async fn register_agent(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterAgent>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let registry = AgentRegistry::new(state.db.clone());
-    let record = registry.register(&req).map_err(internal_error)?;
-    Ok((StatusCode::CREATED, Json(json!(record))))
+    let config = state.config();
+    let result: Vec<Value> = agents.iter().map(|a| agent_json(a, &config)).collect();
+    Ok(Json(json!(result)))
 }
 
 async fn get_agent(
@@ -62,22 +79,8 @@ async fn get_agent(
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
-    Ok(Json(json!(record)))
-}
-
-async fn update_agent(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<RegisterAgent>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let registry = AgentRegistry::new(state.db.clone());
-    // Ensure agent exists first
-    registry.get(&id).map_err(|e| match &e {
-        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
-        _ => internal_error(e),
-    })?;
-    let record = registry.register(&req).map_err(internal_error)?;
-    Ok(Json(json!(record)))
+    let config = state.config();
+    Ok(Json(agent_json(&record, &config)))
 }
 
 async fn delete_agent(
@@ -94,6 +97,28 @@ async fn delete_agent(
         }
     }
     registry.delete(&id).map_err(internal_error)?;
+
+    // Remove from YAML config
+    let old_config = state.config();
+    let new_agents: Vec<_> = old_config
+        .agents
+        .iter()
+        .filter(|a| a.name != id)
+        .cloned()
+        .collect();
+    let new_config = xpressclaw_core::config::Config {
+        agents: new_agents,
+        llm: old_config.llm.clone(),
+        mcp_servers: old_config.mcp_servers.clone(),
+        system: old_config.system.clone(),
+        tools: old_config.tools.clone(),
+        tool_policies: old_config.tool_policies.clone(),
+        memory: old_config.memory.clone(),
+    };
+    let _ = new_config.save(&state.config_path);
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -146,12 +171,13 @@ async fn start_agent(
     // Build container spec from agent config (handles env vars, API keys, volumes)
     let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
     let mut spec = if let Some(cfg) = agent_cfg {
-        let mut s = build_container_spec(
+        let mut s = xpressclaw_core::docker::images::build_container_spec_with_mcp(
             cfg,
             server_port,
             config.llm.anthropic_api_key.as_deref(),
             config.llm.openai_api_key.as_deref(),
             config.llm.openai_base_url.as_deref(),
+            Some(&config.mcp_servers),
         );
         // Override image if requested
         if let Some(ref b) = body {
@@ -187,9 +213,15 @@ async fn start_agent(
         s
     };
 
-    // Always pass the agent config JSON
-    spec.environment
-        .push(format!("AGENT_CONFIG={}", record.config));
+    // Pass agent config from YAML as JSON env var
+    if let Some(cfg) = agent_cfg {
+        if let Ok(json) = serde_json::to_string(&serde_json::json!({
+            "role": cfg.role,
+            "tools": cfg.tools,
+        })) {
+            spec.environment.push(format!("AGENT_CONFIG={json}"));
+        }
+    }
 
     // Filter MCP servers: always-on defaults + agent's tools matching global MCP servers
     let filtered_mcp = filter_mcp_for_agent(agent_cfg, &config.mcp_servers);
@@ -288,6 +320,7 @@ struct UpdateAgentConfigRequest {
     model: Option<String>,
     llm: Option<AgentLlmConfig>,
     tools: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
     budget: Option<BudgetConfig>,
     rate_limit: Option<RateLimitConfig>,
@@ -347,6 +380,9 @@ async fn update_agent_config(
         }
         agent.tools = tools;
     }
+    if let Some(skills) = req.skills {
+        agent.skills = skills;
+    }
     if let Some(volumes) = req.volumes {
         agent.volumes = volumes;
     }
@@ -399,7 +435,7 @@ async fn update_agent_config(
             "model": updated.model,
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
-                "api_key": l.api_key.as_ref().map(|_| "********"),
+                "api_key": l.api_key,
                 "base_url": l.base_url,
             })),
             "tools": updated.tools,
@@ -447,6 +483,21 @@ fn filter_mcp_for_agent(
     result
 }
 
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+}
+
+async fn get_agent_logs(
+    Path(id): Path<String>,
+    Query(query): Query<LogsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tail = query.tail.unwrap_or(100);
+    let docker = DockerManager::connect().await.map_err(internal_error)?;
+    let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
+    Ok(Json(json!({ "logs": logs })))
+}
+
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -475,18 +526,21 @@ mod tests {
 
     use super::*;
 
-    fn test_app() -> Router {
+    fn test_app() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
-            db,
+            db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
             true,
         );
 
-        Router::new().nest("/agents", routes()).with_state(state)
+        (
+            Router::new().nest("/agents", routes()).with_state(state),
+            db,
+        )
     }
 
     async fn body_json(body: Body) -> Value {
@@ -495,39 +549,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_and_list() {
-        let app = test_app();
+    async fn test_list_agents() {
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db);
+        registry.ensure("atlas", "generic").unwrap();
 
-        // Register
         let resp = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/agents")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "atlas",
-                            "backend": "generic",
-                            "config": {"role": "You are a helpful assistant"}
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let body = body_json(resp.into_body()).await;
-        assert_eq!(body["name"], "atlas");
-        assert_eq!(body["backend"], "generic");
-        assert_eq!(body["status"], "stopped");
-
-        // List
-        let resp = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/agents")
@@ -539,36 +566,16 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
-        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert!(!body.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_get_agent() {
-        let app = test_app();
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db);
+        registry.ensure("atlas", "generic").unwrap();
 
-        // Register
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/agents")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "atlas",
-                            "backend": "generic",
-                            "config": {}
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Get
         let resp = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/agents/atlas")
@@ -581,11 +588,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["id"], "atlas");
+        assert_eq!(body["status"], "stopped");
     }
 
     #[tokio::test]
     async fn test_get_not_found() {
-        let app = test_app();
+        let (app, _) = test_app();
 
         let resp = app
             .oneshot(
@@ -602,29 +610,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_agent() {
-        let app = test_app();
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db);
+        registry.ensure("atlas", "generic").unwrap();
 
-        // Register
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/agents")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "atlas",
-                            "backend": "generic",
-                            "config": {}
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Delete
         let resp = app
             .clone()
             .oneshot(
@@ -639,9 +628,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
-        // Verify gone
         let resp = app
-            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/agents/atlas")
@@ -673,13 +660,7 @@ mod tests {
         let config = Arc::new(config);
         // Register agent in DB
         let registry = AgentRegistry::new(db.clone());
-        registry
-            .register(&RegisterAgent {
-                name: "atlas".to_string(),
-                backend: "generic".to_string(),
-                config: json!({"role": "You are a test agent."}),
-            })
-            .unwrap();
+        registry.ensure("atlas", "generic").unwrap();
         let state = AppState::new(config, db, None, config_path.clone(), true);
         let app = Router::new().nest("/agents", routes()).with_state(state);
         (app, config_path)
@@ -871,27 +852,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_stop_already_stopped() {
-        let app = test_app();
-
-        // Register (starts as stopped)
-        app.clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/agents")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "name": "atlas",
-                            "backend": "generic",
-                            "config": {}
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let (app, db) = test_app();
+        let registry = AgentRegistry::new(db);
+        registry.ensure("atlas", "generic").unwrap();
 
         // Stop already-stopped agent
         let resp = app

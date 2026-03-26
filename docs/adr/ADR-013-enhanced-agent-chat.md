@@ -1,7 +1,7 @@
 # ADR-013: Enhanced Agent Chat UI
 
 ## Status
-Accepted
+Superseded by ADR-015 (SvelteKit Web UI)
 
 ## Context
 

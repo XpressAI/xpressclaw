@@ -9,8 +9,10 @@ use serde_json::{json, Value};
 
 use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
-use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
-use xpressclaw_core::config::{AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig};
+use xpressclaw_core::agents::registry::AgentRegistry;
+use xpressclaw_core::config::{
+    default_mcp_servers, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
+};
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
@@ -54,10 +56,11 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "model": a.model,
                 "llm": a.llm.as_ref().map(|l| json!({
                     "provider": l.provider,
-                    "api_key": l.api_key.as_ref().map(|_| "********"),
+                    "api_key": l.api_key,
                     "base_url": l.base_url,
                 })),
                 "tools": a.tools,
+                "skills": a.skills,
                 "volumes": a.volumes,
             });
             if let Some(ref budget) = a.budget {
@@ -293,6 +296,7 @@ async fn complete_setup(
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
+    #[allow(unused_variables)]
     let needs_download = is_local && req.llm.use_embedded;
 
     // Resolve GGUF source if needed (for config, even before download completes)
@@ -405,6 +409,11 @@ async fn complete_setup(
                     model: a.model.clone(),
                     llm: agent_llm,
                     tools,
+                    skills: vec![
+                        "memory-system".to_string(),
+                        "task-management".to_string(),
+                        "build-app".to_string(),
+                    ],
                     volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()
                 }
@@ -412,9 +421,13 @@ async fn complete_setup(
             .collect()
     };
 
-    // Merge preset default_mcp_servers as fallback for any tools that
-    // the frontend didn't explicitly configure MCP servers for.
+    // Merge MCP servers: built-in defaults + preset + frontend overrides.
     let mut mcp_servers = req.mcp_servers;
+    // Built-in defaults (tasks, memory, skills, apps, shell, filesystem)
+    for (name, server) in default_mcp_servers() {
+        mcp_servers.entry(name).or_insert(server);
+    }
+    // Preset-specific servers
     for agent_setup in &req.agents {
         if let Some(preset) = agent_setup
             .preset
@@ -457,28 +470,9 @@ async fn complete_setup(
         }
     }
     for agent_config in &config.agents {
-        let mut agent_json = serde_json::Map::new();
-        if !agent_config.role.is_empty() {
-            agent_json.insert(
-                "role".into(),
-                serde_json::Value::String(agent_config.role.clone()),
-            );
-        }
-        if let Some(ref model) = agent_config.model {
-            agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-
-        match registry.register(&RegisterAgent {
-            name: agent_config.name.clone(),
-            backend: agent_config.backend.clone(),
-            config: serde_json::Value::Object(agent_json),
-        }) {
-            Ok(record) => info!(
-                name = record.name,
-                backend = record.backend,
-                "registered agent"
-            ),
-            Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
+        match registry.ensure(&agent_config.name, &agent_config.backend) {
+            Ok(record) => info!(name = record.name, backend = record.backend, "synced agent"),
+            Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }
 
@@ -602,7 +596,8 @@ async fn add_agent(
         }
     }
 
-    // Inherit LLM config from the existing global config
+    // LLM config: use global defaults (provider, key, base_url)
+    // The agent inherits these but can override later via the agent editor.
     let old_config = state.config();
     let agent_llm = Some(AgentLlmConfig {
         provider: Some(old_config.llm.default_provider.clone()),
@@ -611,12 +606,15 @@ async fn add_agent(
             .openai_api_key
             .clone()
             .or(old_config.llm.anthropic_api_key.clone()),
-        base_url: old_config
-            .llm
-            .openai_base_url
-            .clone()
-            .or(old_config.llm.local_base_url.clone()),
+        base_url: old_config.llm.openai_base_url.clone(),
     });
+
+    // Default skills for new agents
+    let default_skills = vec![
+        "memory-system".to_string(),
+        "task-management".to_string(),
+        "build-app".to_string(),
+    ];
 
     let agent_config = AgentConfig {
         name: req.name.clone(),
@@ -633,6 +631,7 @@ async fn add_agent(
         model: req.model.clone(),
         llm: agent_llm,
         tools,
+        skills: default_skills,
         volumes: req.volumes.clone().unwrap_or_default(),
         ..Default::default()
     };
@@ -648,8 +647,13 @@ async fn add_agent(
         new_agents.push(agent_config.clone());
     }
 
-    // Merge MCP servers: preset defaults first, then explicit overrides from frontend.
+    // Merge MCP servers: built-in defaults + preset + existing + frontend overrides.
     let mut new_mcp = old_config.mcp_servers.clone();
+    // Add built-in defaults (tasks, memory, apps, skills, shell, filesystem)
+    for (name, server) in default_mcp_servers() {
+        new_mcp.entry(name).or_insert(server);
+    }
+    // Add preset-specific MCP servers
     if let Some(preset) = preset {
         for (name, server) in &preset.default_mcp_servers {
             if !new_mcp.contains_key(name) {
@@ -657,7 +661,7 @@ async fn add_agent(
             }
         }
     }
-    // Frontend-provided MCP servers override preset defaults (user may customize).
+    // Frontend-provided MCP servers override defaults.
     for (name, server) in req.mcp_servers {
         new_mcp.insert(name, server);
     }
@@ -676,22 +680,8 @@ async fn add_agent(
 
     // Register in DB
     let registry = AgentRegistry::new(state.db.clone());
-    let mut agent_json = serde_json::Map::new();
-    if !agent_config.role.is_empty() {
-        agent_json.insert(
-            "role".into(),
-            serde_json::Value::String(agent_config.role.clone()),
-        );
-    }
-    if let Some(ref model) = agent_config.model {
-        agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
-    }
     registry
-        .register(&RegisterAgent {
-            name: agent_config.name.clone(),
-            backend: agent_config.backend.clone(),
-            config: serde_json::Value::Object(agent_json),
-        })
+        .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
 
     // Reload config
@@ -900,6 +890,40 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.llm.default_provider, "local");
         assert_eq!(config.agents[0].name, "atlas");
+
+        // Verify agent has default skills
+        assert!(
+            config.agents[0]
+                .skills
+                .contains(&"memory-system".to_string()),
+            "agent should have memory-system skill, got: {:?}",
+            config.agents[0].skills
+        );
+        assert!(
+            config.agents[0]
+                .skills
+                .contains(&"task-management".to_string()),
+            "agent should have task-management skill"
+        );
+        assert!(
+            config.agents[0].skills.contains(&"build-app".to_string()),
+            "agent should have build-app skill"
+        );
+
+        // Verify default MCP servers are present
+        assert!(
+            config.mcp_servers.contains_key("xpressclaw"),
+            "should have xpressclaw MCP server (unified tasks/memory/skills/apps), got: {:?}",
+            config.mcp_servers.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            config.mcp_servers.contains_key("shell"),
+            "should have shell MCP server"
+        );
+        assert!(
+            config.mcp_servers.contains_key("filesystem"),
+            "should have filesystem MCP server"
+        );
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);

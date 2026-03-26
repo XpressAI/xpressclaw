@@ -156,12 +156,13 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
+    // Unified MCP server for all xpressclaw tools (tasks, memory, skills, apps).
     servers.insert(
-        "tasks".to_string(),
+        "xpressclaw".to_string(),
         McpServerConfig {
             server_type: "stdio".to_string(),
-            command: Some("python".to_string()),
-            args: vec!["/app/mcp_tasks.py".into()],
+            command: Some("python3".to_string()),
+            args: vec!["-u".into(), "/app/mcp_xpressclaw.py".into()],
             ..Default::default()
         },
     );
@@ -208,6 +209,9 @@ pub struct AgentConfig {
     pub role: String,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Skills available to this agent (names matching templates/skills/{name}/).
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub budget: Option<BudgetConfig>,
     pub rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
@@ -229,6 +233,7 @@ impl Default for AgentConfig {
             llm: None,
             role: String::new(),
             tools: Vec::new(),
+            skills: Vec::new(),
             budget: None,
             rate_limit: None,
             wake_on: Vec::new(),

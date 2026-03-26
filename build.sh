@@ -31,7 +31,7 @@ echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 # Build the desktop app via Tauri CLI
 echo "==> Building Tauri desktop app..."
-npx -y @tauri-apps/cli build
+npx -y @tauri-apps/cli build --target "${TARGET_TRIPLE}"
 
 # Build harness Docker images locally
 if command -v docker &>/dev/null; then

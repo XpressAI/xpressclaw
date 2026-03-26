@@ -3,15 +3,12 @@
 	import { onMount, tick } from 'svelte';
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
-	import { timeAgo } from '$lib/utils';
+	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
+	import { settings } from '$lib/api';
 	import { marked } from 'marked';
 	import DOMPurify from 'dompurify';
 
-	// Configure marked for safe rendering
-	marked.setOptions({
-		breaks: true,
-		gfm: true
-	});
+	marked.setOptions({ breaks: true, gfm: true });
 
 	let conv = $state<Conversation | null>(null);
 	let messages = $state<ConversationMessage[]>([]);
@@ -30,8 +27,18 @@
 	let stoppedAgents = $state<Agent[]>([]);
 	let showStartDialog = $state(false);
 	let startingAgents = $state(false);
+	let userProfile = $state(getCachedProfile());
 
-	// Participant agent names for @mention
+	onMount(async () => {
+		if (!isProfileLoaded()) {
+			const p = await settings.getProfile().catch(() => null);
+			if (p) {
+				setCachedProfile(p);
+				userProfile = p;
+			}
+		}
+	});
+
 	let participantAgents = $derived(
 		conv?.participants.filter(p => p.participant_type === 'agent').map(p => p.participant_id) ?? []
 	);
@@ -43,8 +50,13 @@
 		)
 	);
 
+	let primaryAgent = $derived(
+		participantAgents.length > 0
+			? agentList.find(a => a.id === participantAgents[0])
+			: undefined
+	);
+
 	$effect(() => {
-		// Reload when conversation ID changes
 		const id = $page.params.id;
 		if (id) load(id);
 	});
@@ -61,7 +73,6 @@
 			agentList = a;
 			error = null;
 
-			// Check if any participant agents are stopped
 			const participantIds = c.participants
 				.filter(p => p.participant_type === 'agent')
 				.map(p => p.participant_id);
@@ -73,7 +84,6 @@
 			await tick();
 			scrollToBottom();
 
-			// Auto-send message if passed via query param (from new chat page)
 			const pendingMsg = $page.url.searchParams.get('msg');
 			if (pendingMsg) {
 				const url = new URL($page.url);
@@ -98,7 +108,7 @@
 		thinkingAgent = null;
 		streamingContent = '';
 
-		const abort = conversations.streamMessage(conv.id, content, 'You', {
+		const abort = conversations.streamMessage(conv.id, content, userProfile.name, {
 			onUserMessage: async (msg) => {
 				messages = [...messages, msg];
 				await tick();
@@ -164,7 +174,6 @@
 		const val = target.value;
 		const cursorPos = target.selectionStart;
 
-		// Check if user just typed @
 		const textBefore = val.slice(0, cursorPos);
 		const atMatch = textBefore.match(/@(\w*)$/);
 		if (atMatch) {
@@ -196,10 +205,8 @@
 	function renderContent(content: string): string {
 		let result = content;
 
-		// Extract and replace thinking blocks before markdown parsing
 		const thinkingBlocks: string[] = [];
 
-		// Complete thinking block: <think>...</think> → placeholder
 		result = result.replace(/<think>([\s\S]*?)<\/think>/g, (_match: string, thinking: string) => {
 			const trimmed = thinking.trim();
 			if (!trimmed) return '';
@@ -208,7 +215,6 @@
 			return `%%THINK_${idx}%%`;
 		});
 
-		// Incomplete thinking block while streaming: <think>... (no closing tag)
 		result = result.replace(/<think>([\s\S]*)$/g, (_match: string, thinking: string) => {
 			const trimmed = thinking.trim();
 			const idx = thinkingBlocks.length;
@@ -216,7 +222,6 @@
 			return `%%THINKSTREAM_${idx}%%`;
 		});
 
-		// Extract tool call blocks: <tool_call name="...">...</tool_call>
 		const toolCallBlocks: { name: string; args: string }[] = [];
 		result = result.replace(/<tool_call name="([^"]*)">([\s\S]*?)<\/tool_call>/g, (_match: string, name: string, args: string) => {
 			const idx = toolCallBlocks.length;
@@ -224,34 +229,28 @@
 			return `%%TOOL_${idx}%%`;
 		});
 
-		// Replace @[AGENT:id:name] before markdown parsing
 		result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '**@$2**');
 
-		// Render markdown
 		result = DOMPurify.sanitize(marked.parse(result) as string, {
 			ADD_TAGS: ['details', 'summary'],
 			ADD_ATTR: ['open']
 		});
 
-		// Restore thinking blocks as styled HTML
 		for (let i = 0; i < thinkingBlocks.length; i++) {
 			const thinking = thinkingBlocks[i];
 			const escaped = DOMPurify.sanitize(marked.parse(thinking) as string);
 
-			// Complete block → collapsible details
 			result = result.replace(
 				`%%THINK_${i}%%`,
-				`<details class="mb-2 rounded border border-border/50 bg-muted/30 text-xs not-prose"><summary class="cursor-pointer px-2 py-1 text-muted-foreground select-none">Thinking...</summary><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`
+				`<details class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-muted-foreground select-none">Thinking...</summary><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`
 			);
 
-			// Streaming block → open with pulse indicator
 			const streamHtml = thinking
-				? `<div class="mb-2 rounded border border-border/50 bg-muted/30 text-xs not-prose"><div class="px-2 py-1 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-2 py-1.5 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`
+				? `<div class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><div class="px-3 py-1.5 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`
 				: '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
 			result = result.replace(`%%THINKSTREAM_${i}%%`, streamHtml);
 		}
 
-		// Restore tool call blocks as styled HTML
 		for (let i = 0; i < toolCallBlocks.length; i++) {
 			const { name, args } = toolCallBlocks[i];
 			let prettyArgs = args;
@@ -259,16 +258,11 @@
 			const escapedArgs = prettyArgs.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 			result = result.replace(
 				`%%TOOL_${i}%%`,
-				`<details class="mb-2 rounded border border-blue-500/30 bg-blue-500/5 text-xs not-prose"><summary class="cursor-pointer px-2 py-1 text-blue-400 select-none flex items-center gap-1.5"><span>&#x1f527;</span> ${name}</summary><pre class="px-2 py-1.5 text-muted-foreground/80 border-t border-blue-500/20 overflow-x-auto">${escapedArgs}</pre></details>`
+				`<details class="mb-2 rounded-lg border border-blue-500/30 bg-blue-500/5 text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-blue-400 select-none flex items-center gap-1.5"><span>&#x1f527;</span> ${name}</summary><pre class="px-3 py-2 text-muted-foreground/80 border-t border-blue-500/20 overflow-x-auto">${escapedArgs}</pre></details>`
 			);
 		}
 
 		return result;
-	}
-
-	function isThinking(agentId: string): boolean {
-		if (!sending) return false;
-		return participantAgents.includes(agentId);
 	}
 
 	function convTitle(): string {
@@ -287,7 +281,6 @@
 		startingAgents = true;
 		try {
 			await Promise.all(stoppedAgents.map(a => agents.start(a.id)));
-			// Refresh agent list to get updated statuses
 			agentList = await agents.list().catch(() => agentList);
 			stoppedAgents = [];
 			showStartDialog = false;
@@ -304,6 +297,98 @@
 		await conversations.delete(conv.id);
 		window.location.href = '/dashboard';
 	}
+
+	function getAgentForMessage(msg: ConversationMessage): Agent | undefined {
+		if (msg.sender_type === 'agent') {
+			return agentList.find(a => a.id === msg.sender_id);
+		}
+		return undefined;
+	}
+
+	// --- AskUserQuestion support ---
+	interface AskQuestion {
+		header?: string;
+		question: string;
+		multiSelect: boolean;
+		options: { label: string; description?: string }[];
+	}
+
+	function parseAskUserQuestion(content: string): AskQuestion[] | null {
+		// Look for AskUserQuestion tool call with JSON payload
+		const match = content.match(/<tool_call name="AskUserQuestion">([\s\S]*?)<\/tool_call>/);
+		if (!match) return null;
+		try {
+			const data = JSON.parse(match[1].trim());
+			if (data.questions && Array.isArray(data.questions)) {
+				return data.questions;
+			}
+		} catch {}
+		return null;
+	}
+
+	// Track selections and current page per message
+	let questionSelections = $state<Record<string, Record<number, Set<number>>>>({});
+	let questionPage = $state<Record<string, number>>({});
+
+	function getPage(msgId: string): number {
+		return questionPage[msgId] ?? 0;
+	}
+
+	function setPage(msgId: string, page: number) {
+		questionPage = { ...questionPage, [msgId]: page };
+	}
+
+	function toggleOption(msgId: string, qIdx: number, optIdx: number, multiSelect: boolean) {
+		if (!questionSelections[msgId]) questionSelections[msgId] = {};
+		if (!questionSelections[msgId][qIdx]) questionSelections[msgId][qIdx] = new Set();
+
+		const sel = questionSelections[msgId][qIdx];
+		if (multiSelect) {
+			if (sel.has(optIdx)) sel.delete(optIdx);
+			else sel.add(optIdx);
+		} else {
+			sel.clear();
+			sel.add(optIdx);
+		}
+		questionSelections = { ...questionSelections };
+	}
+
+	function isSelected(msgId: string, qIdx: number, optIdx: number): boolean {
+		return questionSelections[msgId]?.[qIdx]?.has(optIdx) ?? false;
+	}
+
+	function getSelectionLabels(msgId: string, qIdx: number, options: { label: string }[]): string[] {
+		const sel = questionSelections[msgId]?.[qIdx];
+		if (!sel) return [];
+		return [...sel].map(i => options[i]?.label).filter(Boolean);
+	}
+
+	async function submitQuestionResponse(msgId: string, questions: AskQuestion[]) {
+		if (!conv) return;
+		const parts: string[] = [];
+		for (let qi = 0; qi < questions.length; qi++) {
+			const q = questions[qi];
+			const labels = getSelectionLabels(msgId, qi, q.options);
+			if (labels.length === 0) continue;
+			if (q.header) {
+				parts.push(`${q.header}: ${labels.join(', ')}`);
+			} else {
+				parts.push(labels.join(', '));
+			}
+		}
+		if (parts.length === 0) return;
+		input = parts.join('\n');
+		await sendMessage();
+	}
+
+	function stripAskUserQuestion(content: string): string {
+		// Remove the AskUserQuestion tool call and its duplicate JSON from the content
+		// Often the raw JSON appears twice — once in tool_call tags and once raw
+		let result = content.replace(/<tool_call name="AskUserQuestion">[\s\S]*?<\/tool_call>/g, '');
+		// Also remove raw JSON blocks that look like AskUserQuestion payloads
+		result = result.replace(/\{[\s\S]*?"questions"[\s\S]*?"options"[\s\S]*?\}\s*$/g, '');
+		return result.trim();
+	}
 </script>
 
 {#if error && !conv}
@@ -319,8 +404,8 @@
 {:else}
 	<!-- Start agents dialog -->
 	{#if showStartDialog}
-		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-			<div class="mx-4 w-full max-w-sm rounded-lg border border-border bg-card p-5 shadow-lg space-y-4">
+		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+			<div class="mx-4 w-full max-w-sm rounded-xl border border-border bg-card p-5 shadow-2xl space-y-4">
 				<h3 class="text-sm font-semibold">Agents are stopped</h3>
 				<p class="text-sm text-muted-foreground">
 					{#if stoppedAgents.length === 1}
@@ -333,18 +418,14 @@
 				<div class="flex justify-end gap-2">
 					<button
 						onclick={() => (showStartDialog = false)}
-						class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+						class="rounded-lg border border-border px-3 py-1.5 text-xs hover:bg-secondary transition-colors"
 					>Not now</button>
 					<button
 						onclick={startStoppedAgents}
 						disabled={startingAgents}
-						class="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+						class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
 					>
-						{#if startingAgents}
-							Starting...
-						{:else}
-							Start {stoppedAgents.length === 1 ? stoppedAgents[0].name : 'all'}
-						{/if}
+						{#if startingAgents}Starting...{:else}Start {stoppedAgents.length === 1 ? stoppedAgents[0].name : 'all'}{/if}
 					</button>
 				</div>
 			</div>
@@ -353,14 +434,14 @@
 
 	<div class="flex h-full flex-col">
 		<!-- Conversation Header -->
-		<div class="flex items-center gap-3 border-b border-border px-4 py-3">
+		<div class="flex items-center gap-3 border-b border-border px-5 py-3">
 			<div class="flex-1 min-w-0">
 				{#if editingTitle}
 					<form onsubmit={(e) => { e.preventDefault(); saveTitle(); }} class="flex items-center gap-2">
 						<input
 							type="text"
 							bind:value={titleInput}
-							class="rounded-md border border-border bg-card px-2 py-1 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+							class="rounded-lg border border-border bg-secondary px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 							autofocus
 						/>
 						<button type="submit" class="text-xs text-primary hover:underline">Save</button>
@@ -369,7 +450,7 @@
 				{:else}
 					<button
 						onclick={() => { editingTitle = true; titleInput = conv?.title ?? ''; }}
-						class="text-base font-semibold hover:text-primary transition-colors text-left"
+						class="text-lg font-semibold hover:text-primary transition-colors text-left"
 					>
 						{convTitle()}
 					</button>
@@ -377,37 +458,39 @@
 				<div class="flex items-center gap-2 text-xs text-muted-foreground mt-0.5">
 					{#each participantAgents as agentId}
 						{@const agent = agentList.find(a => a.id === agentId)}
-						<span class="inline-flex items-center gap-1">
-							<span class="h-1.5 w-1.5 rounded-full {agent?.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
+						<span class="inline-flex items-center gap-1.5">
+							<span class="h-2 w-2 rounded-full {agent?.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
 							{agentId}
 						</span>
 					{/each}
-					{#if participantAgents.length === 0}
-						<span>No agents in this conversation</span>
-					{/if}
 				</div>
 			</div>
-			<button
-				onclick={deleteConversation}
-				class="rounded-md p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
-				title="Delete conversation"
-			>
-				<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-			</button>
+			<div class="flex items-center gap-1">
+				<a href="/tasks" class="rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" title="Tasks">
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+				</a>
+				<button
+					onclick={deleteConversation}
+					class="rounded-lg p-2 text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
+					title="Delete conversation"
+				>
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+				</button>
+			</div>
 		</div>
 
 		<!-- Messages -->
-		<div bind:this={messagesEl} class="flex-1 overflow-y-auto p-4 space-y-4">
+		<div bind:this={messagesEl} class="flex-1 overflow-y-auto px-6 py-5 space-y-5">
 			{#each messages as msg (msg.id)}
 				{#if msg.message_type === 'task_status'}
 					{@const taskData = (() => { try { return JSON.parse(msg.content); } catch { return null; } })()}
 					{#if taskData}
 						<div class="flex gap-3">
-							<div class="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center text-xs bg-muted text-muted-foreground">
+							<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs bg-secondary text-muted-foreground">
 								&#x2611;
 							</div>
-							<div class="flex-1 max-w-[70%]">
-								<div class="rounded-lg border px-3 py-2.5 text-sm
+							<div class="flex-1 max-w-[75%]">
+								<div class="rounded-xl border px-4 py-3 text-sm
 									{taskData.status === 'completed' ? 'border-emerald-500/30 bg-emerald-500/5' :
 									 taskData.status === 'failed' ? 'border-red-500/30 bg-red-500/5' :
 									 taskData.status === 'in_progress' ? 'border-blue-500/30 bg-blue-500/5' :
@@ -420,7 +503,7 @@
 											 'bg-amber-400'}"></span>
 										<span class="font-medium">{taskData.title}</span>
 									</div>
-									<div class="text-xs text-muted-foreground mt-1 flex items-center gap-2">
+									<div class="text-xs text-muted-foreground mt-1.5 flex items-center gap-2">
 										<span>Task {taskData.status === 'in_progress' ? 'in progress' : taskData.status}</span>
 										<span>&middot;</span>
 										<span>{timeAgo(msg.created_at)}</span>
@@ -432,34 +515,141 @@
 					{/if}
 				{:else}
 				{@const isUser = msg.sender_type === 'user'}
+				{@const agent = getAgentForMessage(msg)}
 				<div class="flex gap-3 {isUser ? 'flex-row-reverse' : ''}">
 					<!-- Avatar -->
-					<div class="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center text-xs font-bold {isUser ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'}">
-						{#if isUser}
-							Y
+					{#if isUser}
+						{#if userProfile.avatar}
+							<img src={userProfile.avatar} alt="" class="flex-shrink-0 h-9 w-9 rounded-full object-cover" />
 						{:else}
-							{(msg.sender_id ?? '?')[0].toUpperCase()}
+							<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs font-bold bg-primary/20 text-primary">
+								{userProfile.name[0].toUpperCase()}
+							</div>
 						{/if}
-					</div>
+					{:else if agent}
+						<img src={agentAvatar(agent)} alt="" class="flex-shrink-0 h-9 w-9 rounded-full object-cover" />
+					{:else}
+						<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs font-bold bg-secondary text-foreground">
+							{(msg.sender_id ?? '?')[0].toUpperCase()}
+						</div>
+					{/if}
 
 					<!-- Message bubble -->
-					<div class="max-w-[70%] space-y-1">
-						<div class="flex items-center gap-2 {isUser ? 'flex-row-reverse' : ''}">
-							<span class="text-xs font-medium">{msg.sender_name ?? msg.sender_id}</span>
-							<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
-						</div>
-						<div class="rounded-lg px-3 py-2 text-sm prose-chat {isUser
-							? 'bg-primary text-primary-foreground'
-							: 'bg-accent text-accent-foreground'} {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
-							{@html renderContent(msg.content)}
-						</div>
+					<div class="max-w-[75%] space-y-1">
+						{#if !isUser}
+							{@const askQuestions = parseAskUserQuestion(msg.content)}
+							{@const msgKey = msg.id.toString()}
+							<div class="flex items-center gap-2">
+								<span class="text-xs font-semibold text-foreground">{msg.sender_name ?? msg.sender_id}</span>
+								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
+							</div>
+
+							{@const displayContent = askQuestions ? stripAskUserQuestion(msg.content) : msg.content}
+							{#if displayContent.trim()}
+								<div class="rounded-2xl px-4 py-2.5 text-sm prose-chat bg-[hsl(var(--bubble-agent))] text-foreground border border-border/50 {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
+									{@html renderContent(displayContent)}
+								</div>
+							{/if}
+
+							{#if askQuestions}
+								{@const page = getPage(msgKey)}
+								{@const totalPages = askQuestions.length}
+								{@const isReviewPage = page >= totalPages}
+								<div class="rounded-2xl border border-primary/30 bg-primary/5 px-4 py-3 space-y-3">
+									{#if isReviewPage}
+										<!-- Review page -->
+										<div class="text-xs font-semibold text-primary">Review your answers</div>
+										{#each askQuestions as q, qi}
+											{@const labels = getSelectionLabels(msgKey, qi, q.options)}
+											<div class="space-y-1">
+												<div class="text-sm font-medium">{q.header ?? q.question}</div>
+												{#if labels.length > 0}
+													<div class="text-sm text-primary">{labels.join(', ')}</div>
+												{:else}
+													<div class="text-sm text-muted-foreground italic">No selection</div>
+												{/if}
+											</div>
+										{/each}
+										<div class="flex gap-2 pt-1">
+											<button
+												onclick={() => setPage(msgKey, totalPages - 1)}
+												class="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-secondary transition-colors"
+											>Back</button>
+											<button
+												onclick={() => submitQuestionResponse(msgKey, askQuestions)}
+												disabled={sending}
+												class="rounded-lg bg-primary px-4 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50"
+											>Submit</button>
+										</div>
+									{:else}
+										<!-- Question page -->
+										{@const q = askQuestions[page]}
+										<div class="flex items-center justify-between">
+											{#if q.header}
+												<div class="text-xs font-semibold text-primary">{q.header}</div>
+											{/if}
+											<div class="text-xs text-muted-foreground">{page + 1} / {totalPages}</div>
+										</div>
+										<div class="text-sm font-medium">{q.question}</div>
+										<div class="space-y-1.5">
+											{#each q.options as opt, oi}
+												<button
+													onclick={() => toggleOption(msgKey, page, oi, q.multiSelect)}
+													class="flex items-start gap-2.5 w-full text-left rounded-lg px-3 py-2 text-sm transition-colors {isSelected(msgKey, page, oi)
+														? 'bg-primary/20 border border-primary/40'
+														: 'bg-secondary/50 border border-transparent hover:bg-secondary'}"
+												>
+													<span class="flex-shrink-0 mt-0.5 h-4 w-4 rounded-{q.multiSelect ? 'sm' : 'full'} border {isSelected(msgKey, page, oi)
+														? 'border-primary bg-primary'
+														: 'border-muted-foreground/40'} flex items-center justify-center">
+														{#if isSelected(msgKey, page, oi)}
+															<svg class="h-2.5 w-2.5 text-primary-foreground" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" /></svg>
+														{/if}
+													</span>
+													<div>
+														<div class="font-medium">{opt.label}</div>
+														{#if opt.description}
+															<div class="text-xs text-muted-foreground">{opt.description}</div>
+														{/if}
+													</div>
+												</button>
+											{/each}
+										</div>
+										<div class="flex gap-2 pt-1">
+											{#if page > 0}
+												<button
+													onclick={() => setPage(msgKey, page - 1)}
+													class="rounded-lg border border-border px-3 py-1.5 text-sm hover:bg-secondary transition-colors"
+												>Back</button>
+											{/if}
+											<button
+												onclick={() => setPage(msgKey, page + 1)}
+												class="rounded-lg bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 transition-colors ml-auto"
+											>{page < totalPages - 1 ? 'Next' : 'Review'}</button>
+										</div>
+									{/if}
+								</div>
+							{/if}
+						{:else}
+							<div class="flex items-center gap-2 flex-row-reverse">
+								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
+							</div>
+							<div class="rounded-2xl px-4 py-2.5 text-sm prose-chat bg-[hsl(var(--bubble-user))] text-white {msg.message_type === 'system' ? 'italic opacity-70' : ''}">
+								{@html renderContent(msg.content)}
+							</div>
+						{/if}
 					</div>
 				</div>
 				{/if}
 			{:else}
 				<div class="flex h-full items-center justify-center text-muted-foreground text-sm">
-					<div class="text-center space-y-2">
-						<div class="text-4xl">💬</div>
+					<div class="text-center space-y-3">
+						{#if primaryAgent}
+							<img src={agentAvatar(primaryAgent)} alt="" class="h-16 w-16 rounded-full mx-auto object-cover" />
+							<div class="font-medium text-foreground">{primaryAgent.name}</div>
+						{:else}
+							<div class="text-4xl">💬</div>
+						{/if}
 						<div>Start a conversation</div>
 						{#if participantAgents.length > 0}
 							<div class="text-xs">Type a message or use @{participantAgents[0]} to mention an agent</div>
@@ -469,17 +659,22 @@
 			{/each}
 
 			{#if thinkingAgent}
+				{@const thinkingAgentObj = agentList.find(a => a.id === thinkingAgent)}
 				<div class="flex gap-3">
-					<div class="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center text-xs font-bold bg-accent text-accent-foreground">
-						{thinkingAgent[0].toUpperCase()}
-					</div>
-					<div class="max-w-[70%] space-y-1">
-						<div class="flex items-center gap-2">
-							<span class="text-xs font-medium">{thinkingAgent}</span>
+					{#if thinkingAgentObj}
+						<img src={agentAvatar(thinkingAgentObj)} alt="" class="flex-shrink-0 h-9 w-9 rounded-full object-cover" />
+					{:else}
+						<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs font-bold bg-secondary text-foreground">
+							{(thinkingAgent ?? '?')[0].toUpperCase()}
 						</div>
-						<div class="rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground prose-chat">
+					{/if}
+					<div class="max-w-[75%] space-y-1">
+						<div class="flex items-center gap-2">
+							<span class="text-xs font-semibold text-foreground">{thinkingAgent}</span>
+						</div>
+						<div class="rounded-2xl bg-[hsl(var(--bubble-agent))] border border-border/50 px-4 py-2.5 text-sm text-foreground prose-chat">
 							{#if streamingContent}
-								{@html renderContent(streamingContent)}<span class="inline-block w-1.5 h-4 bg-foreground/60 animate-pulse ml-0.5 align-text-bottom"></span>
+								{@html renderContent(streamingContent)}<span class="inline-block w-1.5 h-4 bg-primary/60 animate-pulse ml-0.5 align-text-bottom rounded-sm"></span>
 							{:else}
 								<span class="text-muted-foreground">{thinkingAgent} is thinking<span class="inline-flex gap-0.5 ml-1"><span class="animate-bounce" style="animation-delay: 0ms">.</span><span class="animate-bounce" style="animation-delay: 150ms">.</span><span class="animate-bounce" style="animation-delay: 300ms">.</span></span></span>
 							{/if}
@@ -491,45 +686,47 @@
 
 		<!-- Error bar -->
 		{#if error}
-			<div class="px-4 py-2 bg-destructive/10 text-destructive text-xs border-t border-destructive/20">
+			<div class="px-5 py-2 bg-destructive/10 text-destructive text-xs border-t border-destructive/20">
 				{error}
 			</div>
 		{/if}
 
 		<!-- Input Area -->
-		<div class="border-t border-border p-3">
+		<div class="px-5 pb-4 pt-2">
 			<div class="relative">
 				<!-- @mention picker -->
 				{#if showMentionPicker && filteredAgents.length > 0}
-					<div class="absolute bottom-full left-0 mb-1 w-48 rounded-lg border border-border bg-card shadow-lg overflow-hidden z-10">
+					<div class="absolute bottom-full left-0 mb-1 w-52 rounded-xl border border-border bg-card shadow-xl overflow-hidden z-10">
 						{#each filteredAgents as agent}
 							<button
 								onclick={() => insertMention(agent.id)}
-								class="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent text-left"
+								class="flex w-full items-center gap-2.5 px-3 py-2.5 text-sm hover:bg-secondary text-left transition-colors"
 							>
-								<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
+								<img src={agentAvatar(agent)} alt="" class="h-6 w-6 rounded-full object-cover" />
 								{agent.name}
 							</button>
 						{/each}
 					</div>
 				{/if}
 
-				<div class="flex items-end gap-2">
-					<textarea
-						bind:value={input}
-						oninput={handleInput}
-						onkeydown={handleKeydown}
-						placeholder={participantAgents.length > 0 ? `Message ${participantAgents.join(', ')}... (@ to mention)` : 'Write your message...'}
-						rows={1}
-						class="flex-1 resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground max-h-32"
-						disabled={sending}
-					></textarea>
+				<div class="flex items-end gap-3">
+					<div class="flex-1 rounded-xl border border-border bg-secondary/50 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/30 transition-all">
+						<textarea
+							bind:value={input}
+							oninput={handleInput}
+							onkeydown={handleKeydown}
+							placeholder={participantAgents.length > 0 ? `Message ${participantAgents[0]}...  (@ to mention)` : 'Write your message...'}
+							rows={1}
+							class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"
+							disabled={sending}
+						></textarea>
+					</div>
 					<button
 						onclick={sendMessage}
 						disabled={!input.trim() || sending}
-						class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+						class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
 					>
-						<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/></svg>
+						<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
 					</button>
 				</div>
 			</div>

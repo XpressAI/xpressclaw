@@ -15,6 +15,7 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/api", routes::api_routes())
         .nest("/v1", routes::llm::routes())
         .nest("/v1/tools", routes::tools_proxy_routes())
+        .nest("/apps", routes::app_proxy_routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())
@@ -24,15 +25,35 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Start the HTTP server.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
-    // Start host-side MCP servers from config.
-    // These are available to harnesses via /v1/tools.
+    // Extract built-in skills to the data directory
+    if let Some(data_dir) = state.config_path.parent() {
+        crate::skills::extract_skills(data_dir);
+    }
+
+    // Start host-side MCP servers in background.
+    // Skip servers with container-only paths — those only run inside Docker.
     let config = state.config();
-    if !config.mcp_servers.is_empty() {
+    let host_servers: std::collections::HashMap<String, _> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, cfg)| {
+            // Skip servers whose command or args reference container paths
+            !cfg.args
+                .iter()
+                .any(|a| a.starts_with("/app/") || a.starts_with("/workspace"))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if !host_servers.is_empty() {
+        let mcp_mgr = state.mcp_manager.clone();
         info!(
-            count = config.mcp_servers.len(),
-            "starting MCP tool servers"
+            count = host_servers.len(),
+            servers = ?host_servers.keys().collect::<Vec<_>>(),
+            "starting host MCP tool servers in background"
         );
-        state.mcp_manager.start_servers(&config.mcp_servers).await;
+        tokio::spawn(async move {
+            mcp_mgr.start_servers(&host_servers).await;
+        });
     }
 
     // Start the task dispatcher background loop.

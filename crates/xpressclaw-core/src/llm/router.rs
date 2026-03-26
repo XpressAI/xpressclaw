@@ -328,32 +328,18 @@ impl LlmRouter {
     }
 
     fn resolve_provider(&self, model: &str) -> Result<&Arc<dyn LlmProvider>> {
-        // Check explicit model→provider mapping
+        // Check explicit model→provider mapping first
         if let Some(provider_name) = self.model_to_provider.get(model) {
             if let Some(provider) = self.providers.get(provider_name) {
                 return Ok(provider);
             }
         }
 
-        // Route by model name prefix
-        let provider_name = if model.starts_with("claude") {
-            "anthropic"
-        } else if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
-            "openai"
-        } else if model == "local"
-            || model.starts_with("Qwen/")
-            || model.starts_with("qwen")
-            || model.starts_with("llama")
-            || model.starts_with("meta-llama/")
-        {
-            "local"
-        } else {
-            &self.default_provider
-        };
-
-        self.providers.get(provider_name).ok_or_else(|| {
+        // Use the default provider for everything
+        self.providers.get(&self.default_provider).ok_or_else(|| {
             Error::Llm(format!(
-                "no provider registered for model '{model}' (tried '{provider_name}')"
+                "no provider registered for model '{model}' (default provider '{}')",
+                self.default_provider
             ))
         })
     }
@@ -417,8 +403,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_routes_by_prefix() {
-        let config = LlmConfig::default();
+    async fn test_router_uses_default_provider() {
+        let config = LlmConfig {
+            default_provider: "openai".into(),
+            ..Default::default()
+        };
         let mut router = LlmRouter::new(&config);
 
         router.register_provider(
@@ -434,21 +423,22 @@ mod tests {
             }),
         );
 
+        // All models go to default provider regardless of name
         let req = ChatCompletionRequest {
             model: "gpt-4o".into(),
             messages: vec![ChatMessage::text("user", "hi")],
             ..Default::default()
         };
-
         let resp = router.chat(&req).await.unwrap();
         assert!(resp.choices[0].message.content.contains("openai"));
 
         let req2 = ChatCompletionRequest {
-            model: "claude-sonnet-4.5".into(),
-            ..req
+            model: "qwen3.5-27b".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            ..Default::default()
         };
         let resp2 = router.chat(&req2).await.unwrap();
-        assert!(resp2.choices[0].message.content.contains("anthropic"));
+        assert!(resp2.choices[0].message.content.contains("openai"));
     }
 
     #[tokio::test]

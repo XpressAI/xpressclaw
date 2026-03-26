@@ -38,3 +38,9 @@ models/*.onnx
 models/*.gguf
 external/*
 !external/ready-agent-cog
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-xpressclaw
+MODULE.bazel.lock
+logs/

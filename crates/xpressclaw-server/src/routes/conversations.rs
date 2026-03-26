@@ -179,6 +179,7 @@ async fn send_message(
     Json(req): Json<SendMessageInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
+    let config = state.config();
 
     // Store user message
     let user_msg = mgr
@@ -272,14 +273,15 @@ async fn send_message(
                 continue;
             }
 
-            // Look up agent to get config
+            // Look up agent runtime state (DB) + config (YAML)
             let agent = match registry.get(agent_id) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent.config["model"]
-                .as_str()
+            let model = agent_cfg
+                .and_then(|c| c.model.as_deref())
                 .map(String::from)
                 .unwrap_or_else(|| {
                     llm_router
@@ -289,13 +291,15 @@ async fn send_message(
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            let role = agent.config["role"]
-                .as_str()
+            let base_role = agent_cfg
+                .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
+            let agent_skills = agent_cfg.map(|c| &c.skills[..]).unwrap_or(&[]);
+            let role = append_skills(base_role, agent_skills, &state.config_path);
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
-            let mut llm_messages = vec![ChatMessage::text("system", role)];
+            let mut llm_messages = vec![ChatMessage::text("system", &role)];
             for m in &history {
                 let r = match m.sender_type.as_str() {
                     "agent" => "assistant",
@@ -480,7 +484,7 @@ async fn stream_message(
 
         let registry = AgentRegistry::new(db.clone());
         let mgr = ConversationManager::new(db.clone());
-        let budget_mgr = BudgetManager::new(db.clone(), config);
+        let budget_mgr = BudgetManager::new(db.clone(), config.clone());
         let cost_tracker = CostTracker::with_custom_pricing(db.clone(), &custom_pricing);
 
         for agent_id in &target_agents {
@@ -534,9 +538,10 @@ async fn stream_message(
                 Ok(a) => a,
                 Err(_) => continue,
             };
+            let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent.config["model"]
-                .as_str()
+            let model = agent_cfg
+                .and_then(|c| c.model.as_deref())
                 .map(String::from)
                 .unwrap_or_else(|| {
                     llm_router
@@ -546,13 +551,15 @@ async fn stream_message(
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            let role = agent.config["role"]
-                .as_str()
+            let base_role = agent_cfg
+                .map(|c| c.role.as_str())
                 .unwrap_or("You are a helpful AI assistant.");
+            let agent_skills = agent_cfg.map(|c| &c.skills[..]).unwrap_or(&[]);
+            let role = append_skills(base_role, agent_skills, &state.config_path);
 
             let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
 
-            let mut llm_messages = vec![ChatMessage::text("system", role)];
+            let mut llm_messages = vec![ChatMessage::text("system", &role)];
             for m in &history {
                 let r = match m.sender_type.as_str() {
                     "agent" => "assistant",
@@ -772,6 +779,65 @@ async fn remove_participant(
     mgr.remove_participant(&id, "agent", &participant_id)
         .map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Append skill content directly to the agent's system prompt.
+/// Critical skills (like build-app) are injected in full so the agent
+/// doesn't need to call read_skill first.
+fn append_skills(
+    base_role: &str,
+    agent_skills: &[String],
+    config_path: &std::path::Path,
+) -> String {
+    if agent_skills.is_empty() {
+        return base_role.to_string();
+    }
+
+    let skills_dir = config_path
+        .parent()
+        .map(|d| d.join("skills"))
+        .unwrap_or_default();
+
+    if !skills_dir.is_dir() {
+        return base_role.to_string();
+    }
+
+    let mut sections = Vec::new();
+
+    if let Ok(dirs) = std::fs::read_dir(&skills_dir) {
+        for entry in dirs.flatten() {
+            let skill_file = entry.path().join("SKILL.md");
+            if !skill_file.is_file() {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&skill_file) {
+                if !content.starts_with("---") {
+                    continue;
+                }
+                let parts: Vec<&str> = content.splitn(3, "---").collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                let fm = parts[1];
+                let body = parts[2].trim();
+                let mut name = String::new();
+                for line in fm.lines() {
+                    if let Some(v) = line.strip_prefix("name:") {
+                        name = v.trim().to_string();
+                    }
+                }
+                if !name.is_empty() && agent_skills.contains(&name) {
+                    sections.push(body.to_string());
+                }
+            }
+        }
+    }
+
+    if sections.is_empty() {
+        return base_role.to_string();
+    }
+
+    format!("{base_role}\n\n{}", sections.join("\n\n---\n\n"))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

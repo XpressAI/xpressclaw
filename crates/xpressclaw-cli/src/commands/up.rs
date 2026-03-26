@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tracing::{info, warn};
-use xpressclaw_core::agents::registry::{AgentRegistry, RegisterAgent};
+use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
@@ -168,31 +168,21 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
-    // Register agents from config
+    // Sync agents from YAML config into DB runtime state table.
+    // Config (role, model, tools, llm, etc.) always comes from the YAML.
+    // The DB only tracks runtime state (status, container_id, timestamps).
     let registry = AgentRegistry::new(db.clone());
+    let valid_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
+    registry.remove_stale(&valid_names).unwrap_or_default();
     for agent_config in &config.agents {
-        let mut agent_json = serde_json::Map::new();
-        if !agent_config.role.is_empty() {
-            agent_json.insert(
-                "role".into(),
-                serde_json::Value::String(agent_config.role.clone()),
-            );
-        }
-        if let Some(ref model) = agent_config.model {
-            agent_json.insert("model".into(), serde_json::Value::String(model.clone()));
-        }
-
-        match registry.register(&RegisterAgent {
-            name: agent_config.name.clone(),
-            backend: agent_config.backend.clone(),
-            config: serde_json::Value::Object(agent_json),
-        }) {
+        match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => info!(
                 name = record.name,
                 backend = record.backend,
-                "registered agent"
+                status = record.status,
+                "synced agent"
             ),
-            Err(e) => warn!(name = agent_config.name, error = %e, "failed to register agent"),
+            Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }
 

@@ -25,24 +25,29 @@
 	}
 
 	.dark {
-		--background: 240 10% 3.9%;
-		--foreground: 0 0% 98%;
-		--card: 240 10% 3.9%;
-		--card-foreground: 0 0% 98%;
-		--primary: 0 0% 98%;
-		--primary-foreground: 240 5.9% 10%;
-		--secondary: 240 3.7% 15.9%;
-		--secondary-foreground: 0 0% 98%;
-		--muted: 240 3.7% 15.9%;
-		--muted-foreground: 240 5% 64.9%;
-		--accent: 240 3.7% 15.9%;
-		--accent-foreground: 0 0% 98%;
-		--destructive: 0 62.8% 30.6%;
+		--background: 228 25% 8%;
+		--foreground: 220 20% 92%;
+		--card: 228 22% 11%;
+		--card-foreground: 220 20% 92%;
+		--primary: 225 65% 55%;
+		--primary-foreground: 0 0% 100%;
+		--secondary: 228 20% 16%;
+		--secondary-foreground: 220 20% 92%;
+		--muted: 228 18% 14%;
+		--muted-foreground: 225 15% 55%;
+		--accent: 225 50% 25%;
+		--accent-foreground: 220 20% 92%;
+		--destructive: 0 62.8% 45%;
 		--destructive-foreground: 0 0% 98%;
-		--border: 240 3.7% 15.9%;
-		--input: 240 3.7% 15.9%;
-		--ring: 240 4.9% 83.9%;
+		--border: 225 18% 18%;
+		--input: 225 18% 18%;
+		--ring: 225 65% 55%;
 		--radius: 0.5rem;
+
+		--sidebar: 228 25% 10%;
+		--sidebar-active: 225 50% 30%;
+		--bubble-user: 260 60% 45%;
+		--bubble-agent: 228 22% 15%;
 	}
 }
 
@@ -137,4 +142,19 @@
 }
 .prose-chat .not-prose, .prose-chat details {
 	all: revert;
+}
+
+/* Custom scrollbar for dark theme */
+.dark ::-webkit-scrollbar {
+	width: 6px;
+}
+.dark ::-webkit-scrollbar-track {
+	background: transparent;
+}
+.dark ::-webkit-scrollbar-thumb {
+	background: hsl(225 18% 25%);
+	border-radius: 3px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+	background: hsl(225 18% 35%);
 }

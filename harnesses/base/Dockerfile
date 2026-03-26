@@ -8,6 +8,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
 COPY mcp_tasks.py .
+COPY mcp_apps.py .
+COPY mcp_memory.py .
+COPY mcp_skills.py .
+COPY mcp_xpressclaw.py .
+COPY run_mcp.sh .
 
 EXPOSE 8080
 

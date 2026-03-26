@@ -41,7 +41,11 @@ WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 
 
 def load_mcp_servers() -> dict:
-    """Load MCP server configs from the MCP_SERVERS environment variable."""
+    """Load MCP server configs from the MCP_SERVERS environment variable.
+
+    Returns a dict of {name: McpStdioServerConfig} for the SDK.
+    The SDK passes these to the CLI via --mcp-config.
+    """
     raw = os.environ.get("MCP_SERVERS", "")
     if not raw:
         return {}
@@ -63,7 +67,9 @@ def load_mcp_servers() -> dict:
                 entry["env"] = config["env"]
             sdk_servers[name] = entry
         elif server_type == "sse" and config.get("url"):
-            sdk_servers[name] = {"url": config["url"]}
+            sdk_servers[name] = {"type": "sse", "url": config["url"]}
+
+    logger.info("MCP servers loaded: %s", list(sdk_servers.keys()))
     return sdk_servers
 
 
@@ -73,9 +79,14 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeA
         model=model,
         system_prompt=system_prompt or f"You are {AGENT_NAME}, an AI assistant.",
         permission_mode="bypassPermissions",
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
         cwd=WORKSPACE_DIR,
         max_turns=25,
+        # AskUserQuestion auto-skips in bypassPermissions mode (no terminal).
+        # The agent should ask via regular text messages in the conversation.
+        disallowed_tools=["AskUserQuestion"],
+        # Enable project settings so MCP servers and skills can load.
+        # Without this, the SDK sets --setting-sources "" which may block MCP.
+        setting_sources=["project", "user"],
     )
     if mcp_servers:
         options.mcp_servers = mcp_servers

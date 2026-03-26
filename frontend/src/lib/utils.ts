@@ -35,6 +35,37 @@ export async function openExternal(url: string): Promise<void> {
 	}
 }
 
+const AVATAR_COUNT = 32;
+
+/** Get a deterministic avatar path for an agent based on its name. */
+export function agentAvatar(agent: { name: string; id: string }): string {
+	// Simple hash of the agent name to pick a consistent avatar
+	let hash = 0;
+	const key = agent.name || agent.id;
+	for (let i = 0; i < key.length; i++) {
+		hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
+	}
+	const idx = ((hash % AVATAR_COUNT) + AVATAR_COUNT) % AVATAR_COUNT;
+	return `/avatars/${idx.toString().padStart(2, '0')}.jpg`;
+}
+
+/** Get cached user profile (loaded from server, cached in memory). */
+let _cachedProfile: { name: string; avatar: string | null } = { name: 'You', avatar: null };
+let _profileLoaded = false;
+
+export function getCachedProfile(): { name: string; avatar: string | null } {
+	return _cachedProfile;
+}
+
+export function setCachedProfile(profile: { name: string; avatar: string | null }) {
+	_cachedProfile = profile;
+	_profileLoaded = true;
+}
+
+export function isProfileLoaded(): boolean {
+	return _profileLoaded;
+}
+
 export function statusColor(status: string): string {
 	switch (status) {
 		case 'running':

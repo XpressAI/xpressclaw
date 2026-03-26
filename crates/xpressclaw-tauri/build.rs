@@ -28,32 +28,35 @@ fn main() {
     };
     let dest = binaries_dir.join(format!("xpressclaw-{target_triple}{exe_suffix}"));
 
-    // Try to find and copy the CLI binary (skip silently in Bazel)
-    if let Some(workspace_root) = std::path::Path::new(&manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-    {
-        let candidates = [
-            workspace_root
-                .join("target")
-                .join(&profile)
-                .join(format!("xpressclaw{exe_suffix}")),
-            workspace_root
-                .join("target")
-                .join(&target_triple)
-                .join(&profile)
-                .join(format!("xpressclaw{exe_suffix}")),
-        ];
+    // If the sidecar already exists (placed by build.sh from Bazel), don't overwrite it.
+    // Only copy from Cargo's target/ during `cargo tauri dev` when no sidecar is present.
+    if !dest.exists() {
+        if let Some(workspace_root) = std::path::Path::new(&manifest_dir)
+            .parent()
+            .and_then(|p| p.parent())
+        {
+            let candidates = [
+                workspace_root
+                    .join("target")
+                    .join(&profile)
+                    .join(format!("xpressclaw{exe_suffix}")),
+                workspace_root
+                    .join("target")
+                    .join(&target_triple)
+                    .join(&profile)
+                    .join(format!("xpressclaw{exe_suffix}")),
+            ];
 
-        let copied = candidates
-            .iter()
-            .any(|src| src.exists() && std::fs::copy(src, &dest).is_ok());
+            let copied = candidates
+                .iter()
+                .any(|src| src.exists() && std::fs::copy(src, &dest).is_ok());
 
-        if !copied && !dest.exists() {
+            if !copied {
+                let _ = std::fs::write(&dest, "placeholder");
+            }
+        } else {
             let _ = std::fs::write(&dest, "placeholder");
         }
-    } else if !dest.exists() {
-        let _ = std::fs::write(&dest, "placeholder");
     }
 
     tauri_build::build()

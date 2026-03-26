@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '=== GIT NOTES (read these before doing anything) ===' && git log --notes=refs/notes/agent --format='%h %s%n%N' -10 && echo '=== ADR LIST ===' && ls docs/adr/ && echo '=== REMINDER: You MUST read relevant ADRs before writing code. Write a git note after every commit. ==='",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('file_path',''))\" 2>/dev/null) && if [ -n \"$FILE\" ] && git ls-files --error-unmatch \"$FILE\" 2>/dev/null; then echo \"=== RECENT CHANGES TO $FILE ===\"; git log --notes=refs/notes/agent --format='%h %s (%ar)%n%N' -5 -- \"$FILE\"; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

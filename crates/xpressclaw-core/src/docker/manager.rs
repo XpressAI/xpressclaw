@@ -26,6 +26,10 @@ pub struct ContainerSpec {
     pub network_mode: Option<String>,
     /// Port to expose from the container (harness HTTP port).
     pub expose_port: Option<u16>,
+    /// Command to run (overrides image CMD).
+    pub cmd: Option<Vec<String>>,
+    /// Working directory inside the container.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +49,8 @@ impl Default for ContainerSpec {
             volumes: Vec::new(),
             network_mode: Some("bridge".to_string()),
             expose_port: Some(8080),
+            cmd: None,
+            working_dir: None,
         }
     }
 }
@@ -88,16 +94,24 @@ impl DockerManager {
         // Remove existing container if present
         let _ = self.remove(&container_name).await;
 
-        // Build mounts
+        // Build mounts — detect named volumes vs bind mounts
         let mounts: Vec<Mount> = spec
             .volumes
             .iter()
-            .map(|v| Mount {
-                target: Some(v.target.clone()),
-                source: Some(v.source.clone()),
-                typ: Some(MountTypeEnum::BIND),
-                read_only: Some(v.read_only),
-                ..Default::default()
+            .map(|v| {
+                // Named volumes don't start with / or ~ (they're just names like "xpressclaw-workspace-dev")
+                let is_named_volume = !v.source.starts_with('/') && !v.source.starts_with('~');
+                Mount {
+                    target: Some(v.target.clone()),
+                    source: Some(v.source.clone()),
+                    typ: Some(if is_named_volume {
+                        MountTypeEnum::VOLUME
+                    } else {
+                        MountTypeEnum::BIND
+                    }),
+                    read_only: Some(v.read_only),
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -146,6 +160,8 @@ impl DockerManager {
             } else {
                 Some(exposed_ports)
             },
+            cmd: spec.cmd.clone(),
+            working_dir: spec.working_dir.clone(),
             ..Default::default()
         };
 
@@ -331,6 +347,41 @@ impl DockerManager {
     /// Get the host port for a container (public API for conversation routing).
     pub async fn get_container_port(&self, container_id: &str) -> Option<u16> {
         self.get_host_port(container_id, Some(8080)).await
+    }
+
+    /// Get the host port for a container with a specific internal port.
+    pub async fn get_container_port_for(
+        &self,
+        container_id: &str,
+        internal_port: u16,
+    ) -> Option<u16> {
+        self.get_host_port(container_id, Some(internal_port)).await
+    }
+
+    /// Inspect a container and return its host port for any exposed port.
+    pub async fn inspect(&self, container_id: &str) -> Result<Option<u16>> {
+        let info = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| Error::Container(format!("inspect failed: {e}")))?;
+        let port = info
+            .network_settings
+            .and_then(|ns| ns.ports)
+            .and_then(|ports| {
+                // Return the first mapped port
+                for (_key, bindings) in ports.iter() {
+                    if let Some(bindings) = bindings {
+                        if let Some(binding) = bindings.first() {
+                            if let Some(hp) = &binding.host_port {
+                                return hp.parse().ok();
+                            }
+                        }
+                    }
+                }
+                None
+            });
+        Ok(port)
     }
 
     async fn get_host_port(&self, container_id: &str, expose_port: Option<u16>) -> Option<u16> {

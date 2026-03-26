@@ -29,6 +29,10 @@
 	let githubEnabled = $state(false);
 	let websearchEnabled = $state(false);
 
+	// Skills
+	let editSkills = $state<string[]>([]);
+	let availableSkills = $state<{ name: string; description: string }[]>([]);
+
 	// Budget override
 	let budgetEnabled = $state(false);
 	let editBudgetDaily = $state('');
@@ -62,13 +66,14 @@
 				editRole = agentConfig.role;
 				editModel = agentConfig.model ?? '';
 				editLlmProvider = agentConfig.llm?.provider ?? '';
-				editLlmApiKey = '';
+				editLlmApiKey = agentConfig.llm?.api_key ?? '';
 				editLlmBaseUrl = agentConfig.llm?.base_url ?? '';
 				editVolumes = [...(agentConfig.volumes || [])];
 				fetchEnabled = agentConfig.tools.includes('fetch');
 				gitEnabled = agentConfig.tools.includes('git');
 				githubEnabled = agentConfig.tools.includes('github');
 				websearchEnabled = agentConfig.tools.includes('websearch');
+				editSkills = [...(agentConfig.skills || [])];
 
 				if (agentConfig.budget) {
 					budgetEnabled = true;
@@ -99,6 +104,12 @@
 		} catch (e) {
 			error = String(e);
 		}
+
+		// Load available skills
+		try {
+			const resp = await fetch('/api/skills');
+			availableSkills = await resp.json();
+		} catch {}
 	});
 
 	async function handleStart() {
@@ -149,6 +160,7 @@
 				model: editModel || undefined,
 				volumes: editVolumes,
 				tools,
+				skills: editSkills,
 			};
 
 			payload.llm = {
@@ -457,6 +469,37 @@
 						</label>
 					</div>
 				</div>
+
+				<!-- Skills -->
+				{#if availableSkills.length > 0}
+					<div class="rounded-lg border border-border bg-card p-4 space-y-3">
+						<h2 class="text-sm font-semibold">Skills</h2>
+						<p class="text-xs text-muted-foreground">Skills teach the agent how to perform specific tasks.</p>
+						<div class="space-y-2">
+							{#each availableSkills as skill}
+								{@const enabled = editSkills.includes(skill.name)}
+								<label class="flex items-center gap-3 cursor-pointer rounded-md border border-border p-2 hover:bg-accent/50 {enabled ? 'border-primary/30 bg-primary/5' : ''}">
+									<input
+										type="checkbox"
+										checked={enabled}
+										onchange={() => {
+											if (enabled) {
+												editSkills = editSkills.filter(s => s !== skill.name);
+											} else {
+												editSkills = [...editSkills, skill.name];
+											}
+										}}
+										class="rounded border-border"
+									/>
+									<div>
+										<span class="text-sm font-medium text-foreground">{skill.name}</span>
+										<span class="text-xs text-muted-foreground ml-1 line-clamp-1">{skill.description}</span>
+									</div>
+								</label>
+							{/each}
+						</div>
+					</div>
+				{/if}
 
 				<!-- Budget Override -->
 				<details class="rounded-lg border border-border bg-card" open={budgetEnabled}>

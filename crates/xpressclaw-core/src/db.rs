@@ -133,6 +133,7 @@ impl Database {
             (10, MIGRATION_V10),
             (11, MIGRATION_V11),
             (12, MIGRATION_V12),
+            (13, MIGRATION_V13),
         ];
 
         for &(target, sql) in migrations {
@@ -482,6 +483,24 @@ const MIGRATION_V12: &str = "
 ALTER TABLE budget_state ADD COLUMN degraded_model TEXT;
 ";
 
+const MIGRATION_V13: &str = "
+-- Agent-published apps (ADR-017).
+CREATE TABLE IF NOT EXISTS apps (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    icon TEXT,
+    description TEXT,
+    agent_id TEXT NOT NULL,
+    conversation_id TEXT,
+    container_id TEXT,
+    port INTEGER DEFAULT 3000,
+    source_version INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'stopped',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +518,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "12");
+        assert_eq!(version, "13");
     }
 
     #[test]

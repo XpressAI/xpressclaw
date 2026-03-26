@@ -40,12 +40,32 @@ pub fn build_container_spec(
     openai_api_key: Option<&str>,
     openai_base_url: Option<&str>,
 ) -> ContainerSpec {
+    build_container_spec_with_mcp(
+        agent,
+        server_port,
+        anthropic_api_key,
+        openai_api_key,
+        openai_base_url,
+        None,
+    )
+}
+
+pub fn build_container_spec_with_mcp(
+    agent: &AgentConfig,
+    server_port: u16,
+    anthropic_api_key: Option<&str>,
+    openai_api_key: Option<&str>,
+    openai_base_url: Option<&str>,
+    mcp_servers: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
+) -> ContainerSpec {
     let image = image_for_backend(&agent.backend);
 
     let mut env = vec![
         format!("AGENT_ID={}", agent.name),
         format!("AGENT_NAME={}", agent.name),
         format!("AGENT_BACKEND={}", agent.backend),
+        "HOME=/workspace".to_string(),
+        "WORKSPACE_DIR=/workspace".to_string(),
     ];
 
     // Per-agent LLM overrides take precedence over global config.
@@ -114,8 +134,26 @@ pub fn build_container_spec(
         }
     }
 
+    // MCP servers — merge defaults with config-provided servers and inject as JSON env var.
+    // Agents need these to call tasks, apps, memory, etc.
+    if let Some(servers) = mcp_servers {
+        let mut all_servers = crate::config::default_mcp_servers();
+        for (name, cfg) in servers {
+            all_servers.insert(name.clone(), cfg.clone());
+        }
+        if let Ok(json) = serde_json::to_string(&all_servers) {
+            env.push(format!("MCP_SERVERS={json}"));
+        }
+    } else {
+        // No servers provided — still inject defaults
+        let defaults = crate::config::default_mcp_servers();
+        if let Ok(json) = serde_json::to_string(&defaults) {
+            env.push(format!("MCP_SERVERS={json}"));
+        }
+    }
+
     // Volume mounts from agent config (format: "host_path:container_path" or "host_path:container_path:ro")
-    let volumes: Vec<VolumeMount> = agent
+    let mut volumes: Vec<VolumeMount> = agent
         .volumes
         .iter()
         .filter_map(|v| {
@@ -133,6 +171,18 @@ pub fn build_container_spec(
         })
         .collect();
 
+    // Add a named volume for /workspace if the user hasn't already mounted something there.
+    // This lets agents and their app containers share files via a Docker named volume.
+    let has_workspace_mount = volumes.iter().any(|v| v.target == "/workspace");
+    if !has_workspace_mount {
+        let workspace_vol = format!("xpressclaw-workspace-{}", agent.name);
+        volumes.push(VolumeMount {
+            source: workspace_vol,
+            target: "/workspace".to_string(),
+            read_only: false,
+        });
+    }
+
     // Memory/CPU limits from agent container config
     let memory_limit = agent.container.get("memory_limit").and_then(|v| v.as_i64());
     let cpu_limit = agent.container.get("cpu_limit").and_then(|v| v.as_i64());
@@ -145,6 +195,8 @@ pub fn build_container_spec(
         volumes,
         network_mode: Some("bridge".to_string()),
         expose_port: Some(8080),
+        cmd: None,
+        working_dir: None,
     }
 }
 

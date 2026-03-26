@@ -185,6 +185,7 @@ export const agents = {
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools?: string[];
+		skills?: string[];
 		volumes?: string[];
 		budget?: {
 			daily: string | null;
@@ -504,6 +505,7 @@ export interface LiveConfig {
 		model: string | null;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		tools: string[];
+		skills: string[];
 		volumes: string[];
 		budget?: { daily: string | null; monthly: string | null; per_task: string | null; on_exceeded: string; fallback_model: string; warn_at_percent: number };
 		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };
@@ -554,4 +556,41 @@ export const setup = {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})
+};
+
+export interface UserProfile {
+	name: string;
+	avatar: string | null;
+}
+
+export const settings = {
+	getProfile: () => request<UserProfile>('/api/settings/profile'),
+	putProfile: (profile: UserProfile) =>
+		request<UserProfile>('/api/settings/profile', {
+			method: 'PUT',
+			body: JSON.stringify(profile)
+		})
+};
+
+export interface App {
+	id: string;
+	title: string;
+	icon: string | null;
+	description: string | null;
+	agent_id: string;
+	conversation_id: string | null;
+	container_id: string | null;
+	port: number;
+	source_version: number;
+	status: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export const apps = {
+	list: () => request<App[]>('/api/apps'),
+	get: (id: string) => request<App>(`/api/apps/${id}`),
+	create: (data: { id: string; title: string; icon?: string; description?: string; agent_id: string; port?: number }) =>
+		request<App>('/api/apps', { method: 'POST', body: JSON.stringify(data) }),
+	delete: (id: string) => request<{ deleted: boolean }>(`/api/apps/${id}`, { method: 'DELETE' }),
 };
