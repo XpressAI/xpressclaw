@@ -73,7 +73,9 @@ impl AgentRegistry {
             });
             match record {
                 Ok(r) => Ok(r),
-                Err(_) => Err(Error::AgentNotFound { name: agent_id.to_string() }),
+                Err(_) => Err(Error::AgentNotFound {
+                    name: agent_id.to_string(),
+                }),
             }
         })
     }

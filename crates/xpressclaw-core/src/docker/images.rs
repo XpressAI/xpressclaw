@@ -40,7 +40,14 @@ pub fn build_container_spec(
     openai_api_key: Option<&str>,
     openai_base_url: Option<&str>,
 ) -> ContainerSpec {
-    build_container_spec_with_mcp(agent, server_port, anthropic_api_key, openai_api_key, openai_base_url, None)
+    build_container_spec_with_mcp(
+        agent,
+        server_port,
+        anthropic_api_key,
+        openai_api_key,
+        openai_base_url,
+        None,
+    )
 }
 
 pub fn build_container_spec_with_mcp(

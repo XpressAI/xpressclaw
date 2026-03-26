@@ -21,8 +21,7 @@ pub fn routes() -> Router<AppState> {
 
 /// Proxy routes mounted at /apps/{name}/ — forwards to app containers.
 pub fn proxy_routes() -> Router<AppState> {
-    Router::new()
-        .route("/{*rest}", get(proxy_handler).post(proxy_handler))
+    Router::new().route("/{*rest}", get(proxy_handler).post(proxy_handler))
 }
 
 #[derive(Debug, Serialize)]
@@ -103,7 +102,12 @@ async fn get_app(
         },
     )
     .map(Json)
-    .map_err(|_| (StatusCode::NOT_FOUND, Json(json!({ "error": "App not found" }))))
+    .map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "App not found" })),
+        )
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,9 +157,13 @@ async fn delete_app(
     // Look up container before any .await
     let container_id: Option<String> = {
         let db = state.db.conn();
-        db.query_row("SELECT container_id FROM apps WHERE id = ?1", [&id], |row| row.get(0))
-            .ok()
-            .flatten()
+        db.query_row(
+            "SELECT container_id FROM apps WHERE id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten()
     };
 
     // Stop container if running (now safe to .await — MutexGuard dropped)
@@ -259,10 +267,7 @@ async fn publish_app(
             image: image.to_string(),
             memory_limit: Some(512 * 1024 * 1024), // 512MB
             cpu_limit: None,
-            environment: vec![
-                format!("APP_ID={app_id}"),
-                format!("PORT={app_port}"),
-            ],
+            environment: vec![format!("APP_ID={app_id}"), format!("PORT={app_port}")],
             volumes: vec![VolumeMount {
                 // Mount the agent's workspace volume — the app source is at
                 // /workspace/apps/{name}/ inside this volume
@@ -272,7 +277,7 @@ async fn publish_app(
             }],
             network_mode: Some("bridge".to_string()),
             expose_port: Some(app_port),
-            cmd: None,       // Set by launch_app_container
+            cmd: None,         // Set by launch_app_container
             working_dir: None, // Set by launch_app_container
         };
 
@@ -336,14 +341,18 @@ async fn launch_app_container(
     Ok(info.container_id)
 }
 
-async fn get_app_logs(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn get_app_logs(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let docker = DockerManager::connect().await.map_err(|e| {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": e.to_string() })))
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": e.to_string() })),
+        )
     })?;
     let logs = docker.logs(&format!("app-{id}"), 100).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
     })?;
     Ok(Json(json!({ "logs": logs })))
 }
@@ -405,7 +414,13 @@ async fn proxy_handler(
         db.query_row(
             "SELECT container_id, port, status FROM apps WHERE id = ?1",
             [app_id],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
     };
 
@@ -430,7 +445,12 @@ async fn proxy_handler(
 
     let host_port = match docker.inspect(&container_id).await {
         Ok(Some(p)) => p,
-        _ => return err_response(StatusCode::SERVICE_UNAVAILABLE, "Container port not available"),
+        _ => {
+            return err_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Container port not available",
+            )
+        }
     };
 
     let target_url = format!("http://127.0.0.1:{host_port}/{path}");
@@ -458,7 +478,8 @@ async fn proxy_handler(
         Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("proxy: {e}")),
     };
 
-    let resp_status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let resp_status =
+        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
     let resp_body = match resp.bytes().await {
         Ok(b) => b,
@@ -473,5 +494,7 @@ async fn proxy_handler(
     }
     response
         .body(axum::body::Body::from(resp_body))
-        .unwrap_or_else(|_| err_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+        .unwrap_or_else(|_| {
+            err_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        })
 }

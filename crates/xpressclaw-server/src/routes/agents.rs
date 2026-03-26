@@ -100,7 +100,12 @@ async fn delete_agent(
 
     // Remove from YAML config
     let old_config = state.config();
-    let new_agents: Vec<_> = old_config.agents.iter().filter(|a| a.name != id).cloned().collect();
+    let new_agents: Vec<_> = old_config
+        .agents
+        .iter()
+        .filter(|a| a.name != id)
+        .cloned()
+        .collect();
     let new_config = xpressclaw_core::config::Config {
         agents: new_agents,
         llm: old_config.llm.clone(),
@@ -532,7 +537,10 @@ mod tests {
             true,
         );
 
-        (Router::new().nest("/agents", routes()).with_state(state), db)
+        (
+            Router::new().nest("/agents", routes()).with_state(state),
+            db,
+        )
     }
 
     async fn body_json(body: Body) -> Value {

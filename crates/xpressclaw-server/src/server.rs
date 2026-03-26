@@ -38,7 +38,9 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         .iter()
         .filter(|(_, cfg)| {
             // Skip servers whose command or args reference container paths
-            !cfg.args.iter().any(|a| a.starts_with("/app/") || a.starts_with("/workspace"))
+            !cfg.args
+                .iter()
+                .any(|a| a.starts_with("/app/") || a.starts_with("/workspace"))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();

@@ -473,11 +473,7 @@ async fn complete_setup(
     }
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
-            Ok(record) => info!(
-                name = record.name,
-                backend = record.backend,
-                "synced agent"
-            ),
+            Ok(record) => info!(name = record.name, backend = record.backend, "synced agent"),
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }
@@ -901,12 +897,16 @@ mod tests {
 
         // Verify agent has default skills
         assert!(
-            config.agents[0].skills.contains(&"memory-system".to_string()),
+            config.agents[0]
+                .skills
+                .contains(&"memory-system".to_string()),
             "agent should have memory-system skill, got: {:?}",
             config.agents[0].skills
         );
         assert!(
-            config.agents[0].skills.contains(&"task-management".to_string()),
+            config.agents[0]
+                .skills
+                .contains(&"task-management".to_string()),
             "agent should have task-management skill"
         );
         assert!(
@@ -920,8 +920,14 @@ mod tests {
             "should have xpressclaw MCP server (unified tasks/memory/skills/apps), got: {:?}",
             config.mcp_servers.keys().collect::<Vec<_>>()
         );
-        assert!(config.mcp_servers.contains_key("shell"), "should have shell MCP server");
-        assert!(config.mcp_servers.contains_key("filesystem"), "should have filesystem MCP server");
+        assert!(
+            config.mcp_servers.contains_key("shell"),
+            "should have shell MCP server"
+        );
+        assert!(
+            config.mcp_servers.contains_key("filesystem"),
+            "should have filesystem MCP server"
+        );
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);

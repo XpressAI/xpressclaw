@@ -15,8 +15,8 @@ mod open_url;
 mod procedures;
 mod schedules;
 mod settings;
-mod skills;
 mod setup;
+mod skills;
 mod tasks;
 mod tools_proxy;
 

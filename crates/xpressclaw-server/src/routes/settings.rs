@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/profile", get(get_profile).put(put_profile))
+    Router::new().route("/profile", get(get_profile).put(put_profile))
 }
 
 #[derive(Serialize, Deserialize)]

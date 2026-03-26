@@ -826,7 +826,11 @@ fn load_skill_index(config_path: &std::path::Path) -> Vec<(String, String)> {
 /// Append skill content directly to the agent's system prompt.
 /// Critical skills (like build-app) are injected in full so the agent
 /// doesn't need to call read_skill first.
-fn append_skills(base_role: &str, agent_skills: &[String], config_path: &std::path::Path) -> String {
+fn append_skills(
+    base_role: &str,
+    agent_skills: &[String],
+    config_path: &std::path::Path,
+) -> String {
     if agent_skills.is_empty() {
         return base_role.to_string();
     }
