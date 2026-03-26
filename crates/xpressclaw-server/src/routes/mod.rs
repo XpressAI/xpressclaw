@@ -6,6 +6,7 @@ use crate::state::AppState;
 mod activity;
 mod agents;
 mod apps;
+mod browser;
 mod budget;
 mod conversations;
 mod health;
@@ -46,4 +47,5 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/skills", skills::routes())
         .nest("/setup", setup::routes())
         .nest("/office", office::routes())
+        .nest("/browser", browser::routes())
 }

@@ -220,6 +220,57 @@ TOOLS = [
         },
     },
     {
+        "name": "browser_screenshot",
+        "description": (
+            "Take a screenshot of a web page using Playwright. "
+            "The screenshot is saved to the agent's screenshots directory."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to screenshot"},
+                "file_name": {"type": "string", "description": "Output file name (default: screenshot.png)"},
+                "wait_for": {"type": "string", "description": "CSS selector to wait for before screenshot"},
+                "full_page": {"type": "boolean", "description": "Capture full page (default: false)"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_fetch",
+        "description": (
+            "Navigate to a URL and extract text content using a real browser (Playwright). "
+            "Unlike HTTP fetch, this renders JavaScript and dynamic content."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL to fetch"},
+                "selector": {"type": "string", "description": "CSS selector to extract text from (optional)"},
+                "wait_for": {"type": "string", "description": "CSS selector to wait for before extracting"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "browser_run",
+        "description": (
+            "Run a custom Playwright Python script on the host machine. "
+            "Use $SCREENSHOTS_DIR in your script for the screenshots output path. "
+            "The script should use playwright.sync_api."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "Python script using playwright.sync_api",
+                },
+            },
+            "required": ["script"],
+        },
+    },
+    {
         "name": "get_agent_logs",
         "description": (
             "Get your own agent container logs. "
@@ -459,6 +510,41 @@ def handle_tool(name: str, arguments: dict) -> str:
             size_str = f"{size / 1024:.1f} KB" if size > 1024 else f"{size} bytes"
             lines.append(f"- {d['name']} ({size_str})")
         return "\n".join(lines)
+
+    elif name == "browser_screenshot":
+        body = {
+            "url": arguments["url"],
+            "file_name": arguments.get("file_name"),
+            "wait_for": arguments.get("wait_for"),
+            "full_page": arguments.get("full_page"),
+            "agent_id": AGENT_ID,
+        }
+        result = _api("POST", "/browser/screenshot", body)
+        if result.get("success"):
+            return f"Screenshot saved: {result.get('file', 'screenshot.png')}"
+        return f"Screenshot error: {result.get('error', 'unknown')}"
+
+    elif name == "browser_fetch":
+        body = {
+            "url": arguments["url"],
+            "selector": arguments.get("selector"),
+            "wait_for": arguments.get("wait_for"),
+            "agent_id": AGENT_ID,
+        }
+        result = _api("POST", "/browser/fetch", body)
+        if result.get("success"):
+            return result.get("content", "No content extracted.")
+        return f"Fetch error: {result.get('error', 'unknown')}"
+
+    elif name == "browser_run":
+        body = {
+            "script": arguments["script"],
+            "agent_id": AGENT_ID,
+        }
+        result = _api("POST", "/browser/run", body)
+        if result.get("success"):
+            return result.get("output", "Script executed successfully.")
+        return f"Script error: {result.get('error', 'unknown')}"
 
     elif name == "get_app_logs":
         result = _api("GET", f"/apps/{arguments['name']}/logs")
