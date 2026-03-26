@@ -533,7 +533,17 @@ def handle_tool(name: str, arguments: dict) -> str:
     raise ValueError(f"unknown tool: {name}")
 
 
-CDP_URL = f"http://host.docker.internal:9222"
+def _resolve_cdp_url():
+    """Resolve CDP URL using IP address instead of hostname.
+    Chrome's CDP server rejects non-localhost hostnames in the Host header."""
+    import socket
+    try:
+        ip = socket.gethostbyname("host.docker.internal")
+        return f"http://{ip}:9222"
+    except socket.gaierror:
+        return "http://host.docker.internal:9222"
+
+CDP_URL = _resolve_cdp_url()
 SCREENSHOTS_DIR = os.path.join(WORKSPACE, "screenshots")
 
 
