@@ -1,0 +1,1 @@
+Added full design system to build-app skill: color table (background #0f172a, surface #1e293b, border #334155, text #e2e8f0, accent #3b82f6, etc.), CSS starter template, typography rules. Also added get_app_logs to the tools list and debugging step to the workflow.
