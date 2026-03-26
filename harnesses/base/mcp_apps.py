@@ -414,7 +414,11 @@ def handle_tool(name: str, arguments: dict) -> str:
             "file_path": arguments.get("file_path"),
         }
         result = _api("POST", "/office/run", body)
-        return result.get("output", "Script executed successfully.")
+        if result.get("success"):
+            return result.get("output", "Script executed successfully.")
+        else:
+            error = result.get("error", "Unknown error")
+            return f"Script error: {error}\n\nTry adjusting the AppleScript syntax and retrying."
 
     elif name == "office_read":
         result = _api("POST", "/office/read", {"file_path": arguments["file_path"]})

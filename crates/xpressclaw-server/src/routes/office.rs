@@ -55,10 +55,9 @@ async fn run_office_script(
         }
         Err(e) => {
             warn!(app = %req.app, error = %e, "office script failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e })),
-            ))
+            // Return 200 with error details so the agent can read and adapt,
+            // rather than a 500 that the MCP tool treats as a transport failure.
+            Ok(Json(json!({ "success": false, "error": e })))
         }
     }
 }
@@ -198,10 +197,16 @@ async fn run_applescript(
         .await
         .map_err(|e| format!("Failed to run osascript: {e}"))?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(stdout)
+    } else if !stdout.is_empty() {
+        // Script partially succeeded (e.g. Word opened and wrote the file,
+        // but a subsequent command failed). Return output with warning.
+        Ok(format!("{stdout}\n\n[Warning: {stderr}]"))
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("AppleScript error: {stderr}"))
     }
 }
