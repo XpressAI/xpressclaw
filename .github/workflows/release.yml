@@ -96,10 +96,18 @@ jobs:
       - name: Install frontend dependencies
         run: cd frontend && npm ci
 
+      # Pre-warm cargo's git cache — llama-cpp-rs downloads the large
+      # llama.cpp submodule. cargo-bazel's default 600s timeout isn't
+      # enough on cold Windows CI runners.
+      - name: Fetch Cargo dependencies
+        run: cargo fetch
+
       # Build CLI sidecar via Bazel — handles frontend, Rust, and C++ deps.
       # Each runner builds natively for its own architecture (no cross-compilation).
       - name: Build CLI sidecar
         shell: bash
+        env:
+          CARGO_BAZEL_GENERATOR_TIMEOUT: "1800"
         run: |
           BAZEL_ARGS=""
           if [ "$RUNNER_OS" = "Windows" ]; then

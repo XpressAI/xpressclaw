@@ -30,8 +30,14 @@ Push-Location frontend
 npm ci
 Pop-Location
 
+# Pre-warm cargo's git cache — llama-cpp-rs + llama.cpp submodule is large
+# and cargo-bazel's default timeout (600s) isn't enough on cold Windows builds
+Write-Host "==> Fetching Cargo dependencies..."
+cargo fetch
+
 # Build with Bazel
 Write-Host "==> Building with Bazel..."
+$env:CARGO_BAZEL_GENERATOR_TIMEOUT = "1800"
 bazel --output_base=$outputBase build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
