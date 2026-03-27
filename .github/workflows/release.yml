@@ -19,9 +19,11 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             label: macOS-x64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            label: Windows-x64
+          # Windows disabled — rules_rust crate_universe has path length
+          # issues with llama.cpp on Windows (os error 123). Tracked in XCLAW-13.
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   label: Windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -45,29 +47,6 @@ jobs:
       - name: Install macOS build deps
         if: runner.os == 'macOS'
         run: brew install cmake bazelisk
-
-      - name: Install Windows build deps
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          choco install bazelisk -y
-          # cmake is pre-installed on windows-latest
-          # Point Bazel to Git Bash for genrule shell commands
-          echo "BAZEL_SH=C:/Program Files/Git/bin/bash.exe" >> "$GITHUB_ENV"
-          # Enable long paths — llama.cpp submodule paths exceed Windows 260-char limit
-          git config --system core.longpaths true
-
-      # Windows: shorten Bazel output base to avoid path length issues.
-      # Default is C:/users/runneradmin/_bazel_runneradmin/<hash>/ which,
-      # combined with crate_universe's cargo home and llama.cpp's deep tree,
-      # exceeds Windows MAX_PATH even with longpaths enabled.
-      - name: Enable Windows long paths (OS level)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
-            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
-          mkdir C:\b -Force
 
       # macOS: install certificate for signing
       - name: Install Apple certificate
@@ -109,16 +88,10 @@ jobs:
         env:
           CARGO_BAZEL_TIMEOUT: "1800"
         run: |
-          BAZEL_ARGS=""
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            BAZEL_ARGS="--output_base=C:/b"
-          fi
-          bazel $BAZEL_ARGS build //crates/xpressclaw-cli:xpressclaw
+          bazel build //crates/xpressclaw-cli:xpressclaw
           mkdir -p crates/xpressclaw-tauri/binaries
-          EXT=""
-          if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
-          cp "bazel-bin/crates/xpressclaw-cli/xpressclaw${EXT}" \
-             "crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}${EXT}"
+          cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" \
+             "crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}"
 
       # macOS: write App Store Connect API key for notarization
       - name: Write API key
@@ -137,28 +110,25 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: npx @tauri-apps/cli build --target ${{ matrix.target }}
 
-      # macOS: upload .dmg
       - name: Upload macOS DMG
-        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: xpressclaw-${{ matrix.label }}.dmg
           path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
-      # Windows: upload .msi and .exe (NSIS)
-      - name: Upload Windows MSI
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: xpressclaw-${{ matrix.label }}.msi
-          path: target/${{ matrix.target }}/release/bundle/msi/*.msi
+      # Windows disabled — re-enable when rules_rust crate_universe
+      # path issues are resolved (XCLAW-13)
+      # - name: Upload Windows MSI
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: xpressclaw-${{ matrix.label }}.msi
+      #     path: target/${{ matrix.target }}/release/bundle/msi/*.msi
 
-      - name: Upload Windows NSIS installer
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: xpressclaw-${{ matrix.label }}.exe
-          path: target/${{ matrix.target }}/release/bundle/nsis/*.exe
+      # - name: Upload Windows NSIS installer
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: xpressclaw-${{ matrix.label }}.exe
+      #     path: target/${{ matrix.target }}/release/bundle/nsis/*.exe
 
   pre-release:
     needs: build-tauri
@@ -194,7 +164,7 @@ jobs:
             **Downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
             - macOS (Intel): `.dmg` x64 — signed and notarized
-            - Windows: `.msi` or `.exe` installer
+            - Windows: coming soon (Bazel path issues, XCLAW-13)
           prerelease: true
           make_latest: false
           files: release-assets/*
