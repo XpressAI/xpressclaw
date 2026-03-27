@@ -37,7 +37,7 @@ cargo fetch
 
 # Build with Bazel
 Write-Host "==> Building with Bazel..."
-$env:CARGO_BAZEL_GENERATOR_TIMEOUT = "1800"
+$env:CARGO_BAZEL_TIMEOUT = "1800"
 bazel --output_base=$outputBase build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

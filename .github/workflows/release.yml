@@ -107,7 +107,7 @@ jobs:
       - name: Build CLI sidecar
         shell: bash
         env:
-          CARGO_BAZEL_GENERATOR_TIMEOUT: "1800"
+          CARGO_BAZEL_TIMEOUT: "1800"
         run: |
           BAZEL_ARGS=""
           if [ "$RUNNER_OS" = "Windows" ]; then
