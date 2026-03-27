@@ -4,7 +4,7 @@ module(
 )
 
 # Rust toolchain and crate_universe
-bazel_dep(name = "rules_rust", version = "0.61.0")
+bazel_dep(name = "rules_rust", version = "0.64.0")
 
 # Pin Rust toolchain to match local version (needs edition2024 support)
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
