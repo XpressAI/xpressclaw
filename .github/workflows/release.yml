@@ -57,6 +57,18 @@ jobs:
           # Enable long paths — llama.cpp submodule paths exceed Windows 260-char limit
           git config --system core.longpaths true
 
+      # Windows: shorten Bazel output base to avoid path length issues.
+      # Default is C:/users/runneradmin/_bazel_runneradmin/<hash>/ which,
+      # combined with crate_universe's cargo home and llama.cpp's deep tree,
+      # exceeds Windows MAX_PATH even with longpaths enabled.
+      - name: Enable Windows long paths (OS level)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+          mkdir C:\b -Force
+
       # macOS: install certificate for signing
       - name: Install Apple certificate
         if: runner.os == 'macOS'
@@ -89,7 +101,11 @@ jobs:
       - name: Build CLI sidecar
         shell: bash
         run: |
-          bazel build //crates/xpressclaw-cli:xpressclaw
+          BAZEL_ARGS=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BAZEL_ARGS="--output_base=C:/b"
+          fi
+          bazel $BAZEL_ARGS build //crates/xpressclaw-cli:xpressclaw
           mkdir -p crates/xpressclaw-tauri/binaries
           EXT=""
           if [ "$RUNNER_OS" = "Windows" ]; then EXT=".exe"; fi
