@@ -136,12 +136,7 @@ impl Runtime {
         // Mount the agent's documents directory into the container so files
         // created at /workspace/Documents/ are visible to host-side office tools
         // (which resolve to ~/.xpressclaw/{agent_id}/documents/).
-        let docs_dir = self
-            .config
-            .system
-            .data_dir
-            .join(agent_id)
-            .join("documents");
+        let docs_dir = self.config.system.data_dir.join(agent_id).join("documents");
         let _ = std::fs::create_dir_all(&docs_dir);
         spec.volumes.push(VolumeMount {
             source: docs_dir.display().to_string(),
