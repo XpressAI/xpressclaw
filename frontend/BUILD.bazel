@@ -29,3 +29,12 @@ genrule(
     local = True,
     visibility = ["//visibility:public"],
 )
+
+# Pre-built frontend output — glob'd so Bazel tracks the actual files
+# as compile_data for the server crate (rust-embed reads them at compile time).
+# Must be built before `bazel build` (e.g. `cd frontend && npm run build`).
+filegroup(
+    name = "build_output",
+    srcs = glob(["build/**"]),
+    visibility = ["//visibility:public"],
+)
