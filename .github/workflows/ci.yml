@@ -67,9 +67,11 @@ jobs:
             sudo chmod +x /usr/local/bin/bazel
           fi
 
-      # Install frontend deps so Bazel genrule skips npm ci
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
+      # Build frontend so the files exist at Bazel analysis time.
+      # The filegroup glob in frontend/BUILD.bazel picks them up as
+      # compile_data for the server crate (rust-embed reads at compile time).
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
 
       - name: Build
         run: bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server

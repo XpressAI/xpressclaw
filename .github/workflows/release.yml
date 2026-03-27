@@ -71,9 +71,11 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
-      # Install frontend dependencies so Bazel genrule skips npm ci
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
+      # Build frontend so the files exist at Bazel analysis time.
+      # The filegroup glob in frontend/BUILD.bazel picks them up as
+      # compile_data for the server crate (rust-embed reads at compile time).
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
 
       # Pre-warm cargo's git cache — llama-cpp-rs downloads the large
       # llama.cpp submodule. cargo-bazel's default 600s timeout isn't
