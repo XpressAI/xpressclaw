@@ -71,31 +71,16 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
-      # Build frontend so the files exist at Bazel analysis time.
-      # The filegroup glob in frontend/BUILD.bazel picks them up as
-      # compile_data for the server crate (rust-embed reads at compile time).
-      - name: Build frontend
-        run: cd frontend && npm ci && npm run build
-
-      # Pre-warm cargo's git cache — llama-cpp-rs downloads the large
-      # llama.cpp submodule. cargo-bazel's default 600s timeout isn't
-      # enough on cold Windows CI runners.
+      # cargo fetch: pre-warm git cache — llama-cpp-rs submodule download
+      # can exceed crate_universe's default 600s timeout on cold runners.
       - name: Fetch Cargo dependencies
         run: cargo fetch
 
-      # Build CLI sidecar via Bazel — handles frontend, Rust, and C++ deps.
-      # Each runner builds natively for its own architecture (no cross-compilation).
-      - name: Build CLI sidecar
-        shell: bash
-        env:
-          CARGO_BAZEL_TIMEOUT: "1800"
-        run: |
-          bazel build //crates/xpressclaw-cli:xpressclaw
-          mkdir -p crates/xpressclaw-tauri/binaries
-          cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" \
-             "crates/xpressclaw-tauri/binaries/xpressclaw-${{ matrix.target }}"
+      # npm ci: install frontend deps so the Bazel genrule can skip it.
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
 
-      # macOS: write App Store Connect API key for notarization
+      # Write notarization API key before build (macOS signing requires it).
       - name: Write API key
         if: runner.os == 'macOS'
         env:
@@ -104,13 +89,16 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # Build Tauri app (with signing + notarization on macOS)
-      - name: Build Tauri app
+      # build.sh with --skip-test (CI job handles that), --skip-docker
+      # (no Docker needed for release artifacts), --skip-check (CI job),
+      # and --target to set the matrix target triple.
+      - name: Build
         env:
+          CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
-        run: npx @tauri-apps/cli build --target ${{ matrix.target }}
+        run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
