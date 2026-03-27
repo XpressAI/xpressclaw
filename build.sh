@@ -34,6 +34,31 @@ done
 echo "==> Building with Bazel..."
 bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
+# Verify the binary has frontend assets embedded
+echo "==> Verifying frontend is embedded in CLI binary..."
+EXEC_ROOT=$(bazel info execution_root 2>/dev/null)
+echo "    Exec root: $EXEC_ROOT"
+echo "    frontend/ is: $(file "$EXEC_ROOT/frontend" 2>/dev/null || echo 'missing')"
+echo "    frontend/build/index.html: $(ls -la "$EXEC_ROOT/frontend/build/index.html" 2>&1)"
+echo "    CARGO_MANIFEST_DIR would resolve to: $EXEC_ROOT/crates/xpressclaw-server/../../frontend/build/"
+echo "    Files there: $(ls "$EXEC_ROOT/crates/xpressclaw-server/../../frontend/build/" 2>&1 | head -5)"
+# Quick check: run the binary and curl it
+bazel-bin/crates/xpressclaw-cli/xpressclaw up --port 19999 &
+VERIFY_PID=$!
+sleep 3
+VERIFY_RESP=$(curl -s http://localhost:19999/ 2>/dev/null | head -1)
+kill $VERIFY_PID 2>/dev/null
+wait $VERIFY_PID 2>/dev/null
+if echo "$VERIFY_RESP" | grep -q "doctype"; then
+    echo "    ✓ Frontend is embedded"
+else
+    echo "    ✗ Frontend NOT embedded! Response: $VERIFY_RESP"
+    echo "    Dumping exec root frontend structure:"
+    ls -la "$EXEC_ROOT/frontend/" 2>&1
+    echo "    ---"
+    ls -la "$EXEC_ROOT/frontend/build/" 2>&1 | head -10
+fi
+
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
     bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
