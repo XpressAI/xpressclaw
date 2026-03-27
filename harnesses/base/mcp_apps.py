@@ -475,9 +475,18 @@ def handle_tool(name: str, arguments: dict) -> str:
         }
         result = _api("POST", "/office/run", body)
         if result.get("success"):
-            output = result.get("output", "Script executed successfully.")
+            output = result.get("output", "").strip()
             docs_dir = result.get("documents_dir", "")
-            return f"{output}\n\nDocuments directory: {docs_dir}"
+            # List documents after execution so the agent can verify the file exists
+            docs = _api("GET", f"/office/documents?agent_id={AGENT_ID}")
+            doc_list = ", ".join(
+                f"{d['name']} ({d['size']} bytes)" for d in docs
+            ) if isinstance(docs, list) and docs else "No documents found"
+            parts = ["Script executed successfully."]
+            if output:
+                parts.append(f"Output: {output}")
+            parts.append(f"Documents in directory: {doc_list}")
+            return "\n".join(parts)
         else:
             error = result.get("error", "Unknown error")
             return f"Script error: {error}\n\nTry adjusting the script syntax and retrying."
