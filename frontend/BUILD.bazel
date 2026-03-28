@@ -24,6 +24,11 @@ genrule(
             npm ci --silent 2>/dev/null
             npm run build 2>&1
         fi
+        # Copy build output next to the stamp file in bazel-out/.
+        # rust-embed resolves #[folder] relative to CARGO_MANIFEST_DIR which
+        # rules_rust sets to bazel-out/.../bin/crates/xpressclaw-server/.
+        # From there, ../../frontend/build/ lands in bazel-out/.../bin/frontend/build/.
+        cp -r build "$$(dirname "$$OUT_FILE")/build"
         echo "built" > "$$OUT_FILE"
     """,
     local = True,
