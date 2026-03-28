@@ -24,7 +24,9 @@ pub fn log_frontend_status() {
         // List first few files if iter works
         for (i, name) in FrontendAssets::iter().enumerate() {
             tracing::warn!(file = %name, "embedded file");
-            if i >= 5 { break; }
+            if i >= 5 {
+                break;
+            }
         }
     }
 }
