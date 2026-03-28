@@ -13,6 +13,13 @@ use rust_embed::Embed;
 #[prefix = ""]
 struct FrontendAssets;
 
+// DEBUG: compile-time probe — if rustc can see frontend/build/index.html,
+// this compiles. If not, the build fails with a clear error.
+// Remove once the embedding issue is resolved.
+// include_bytes! resolves relative to this source file (src/frontend.rs),
+// so needs ../../../ (up from src/, xpressclaw-server/, crates/ → workspace root)
+const _FRONTEND_PROBE: &[u8] = include_bytes!("../../../frontend/build/index.html");
+
 /// Axum handler that serves embedded static files.
 ///
 /// For SPA routing: if the requested path doesn't match a static file,
