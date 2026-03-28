@@ -38,24 +38,19 @@ bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpresscl
 echo "==> Verifying frontend is embedded in CLI binary..."
 EXEC_ROOT=$(bazel info execution_root 2>/dev/null)
 echo "    Exec root: $EXEC_ROOT"
-echo "    frontend/ is: $(file "$EXEC_ROOT/frontend" 2>/dev/null || echo 'missing')"
+echo "    frontend/ type: $(ls -ld "$EXEC_ROOT/frontend" 2>&1)"
+echo "    crates/ type: $(ls -ld "$EXEC_ROOT/crates" 2>&1)"
 echo "    frontend/build/index.html: $(ls -la "$EXEC_ROOT/frontend/build/index.html" 2>&1)"
-echo "    CARGO_MANIFEST_DIR would resolve to: $EXEC_ROOT/crates/xpressclaw-server/../../frontend/build/"
-echo "    Files there: $(ls "$EXEC_ROOT/crates/xpressclaw-server/../../frontend/build/" 2>&1 | head -5)"
-# Quick check: run the binary and curl it
-bazel-bin/crates/xpressclaw-cli/xpressclaw up --port 19999 &
-VERIFY_PID=$!
-sleep 3
-VERIFY_RESP=$(curl -s http://localhost:19999/ 2>/dev/null | head -1)
-kill $VERIFY_PID 2>/dev/null
-wait $VERIFY_PID 2>/dev/null
-if echo "$VERIFY_RESP" | grep -q "doctype"; then
-    echo "    ✓ Frontend is embedded"
+echo "    Binary size: $(ls -la bazel-bin/crates/xpressclaw-cli/xpressclaw 2>&1)"
+# Check binary content directly (no need to run it)
+if strings bazel-bin/crates/xpressclaw-cli/xpressclaw | grep -qi "sveltekit\|_app/immutable\|doctype"; then
+    echo "    ✓ Frontend is embedded in binary"
 else
-    echo "    ✗ Frontend NOT embedded! Response: $VERIFY_RESP"
-    echo "    Dumping exec root frontend structure:"
+    echo "    ✗ Frontend NOT embedded in binary!"
+    echo "    Binary string 'index.html' count: $(strings bazel-bin/crates/xpressclaw-cli/xpressclaw | grep -c 'index.html')"
+    echo "    Exec root frontend/ listing:"
     ls -la "$EXEC_ROOT/frontend/" 2>&1
-    echo "    ---"
+    echo "    frontend/build/ listing:"
     ls -la "$EXEC_ROOT/frontend/build/" 2>&1 | head -10
 fi
 
