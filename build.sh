@@ -34,26 +34,6 @@ done
 echo "==> Building with Bazel..."
 bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
-# Verify the binary has frontend assets embedded
-echo "==> Verifying frontend is embedded in CLI binary..."
-EXEC_ROOT=$(bazel info execution_root 2>/dev/null)
-echo "    Exec root: $EXEC_ROOT"
-echo "    frontend/ type: $(ls -ld "$EXEC_ROOT/frontend" 2>&1)"
-echo "    crates/ type: $(ls -ld "$EXEC_ROOT/crates" 2>&1)"
-echo "    frontend/build/index.html: $(ls -la "$EXEC_ROOT/frontend/build/index.html" 2>&1)"
-echo "    Binary size: $(ls -la bazel-bin/crates/xpressclaw-cli/xpressclaw 2>&1)"
-# Check binary content directly (no need to run it)
-if strings bazel-bin/crates/xpressclaw-cli/xpressclaw | grep -qi "sveltekit\|_app/immutable\|doctype"; then
-    echo "    ✓ Frontend is embedded in binary"
-else
-    echo "    ✗ Frontend NOT embedded in binary!"
-    echo "    Binary string 'index.html' count: $(strings bazel-bin/crates/xpressclaw-cli/xpressclaw | grep -c 'index.html')"
-    echo "    Exec root frontend/ listing:"
-    ls -la "$EXEC_ROOT/frontend/" 2>&1
-    echo "    frontend/build/ listing:"
-    ls -la "$EXEC_ROOT/frontend/build/" 2>&1 | head -10
-fi
-
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
     bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
