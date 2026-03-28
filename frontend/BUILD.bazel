@@ -28,8 +28,11 @@ genrule(
         # rust-embed resolves #[folder] relative to CARGO_MANIFEST_DIR which
         # rules_rust sets to bazel-out/.../bin/crates/xpressclaw-server/.
         # From there, ../../frontend/build/ lands in bazel-out/.../bin/frontend/build/.
+        rm -rf "$$(dirname "$$OUT_FILE")/build"
         cp -r build "$$(dirname "$$OUT_FILE")/build"
-        echo "built" > "$$OUT_FILE"
+        # Stamp file contains a hash of the build output so Bazel's disk cache
+        # invalidates the server compilation when frontend content changes.
+        find build -type f | sort | xargs cat | shasum -a 256 | cut -d' ' -f1 > "$$OUT_FILE"
     """,
     local = True,
     visibility = ["//visibility:public"],
