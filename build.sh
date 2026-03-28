@@ -36,12 +36,7 @@ echo "==> Building with Bazel..."
 # frontend files instead of reading them from the filesystem at runtime.
 bazel build -c opt //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
-if [ "$SKIP_TEST" = false ]; then
-    echo "==> Running tests..."
-    bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
-fi
-
-# Copy Bazel-built CLI as Tauri sidecar
+# Copy Bazel-built CLI as Tauri sidecar (before tests, which reset bazel-bin symlink)
 echo "==> Copying CLI binary as Tauri sidecar..."
 if [ -n "$TARGET_OVERRIDE" ]; then
     TARGET_TRIPLE="$TARGET_OVERRIDE"
@@ -50,6 +45,11 @@ else
 fi
 mkdir -p crates/xpressclaw-tauri/binaries
 cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+
+if [ "$SKIP_TEST" = false ]; then
+    echo "==> Running tests..."
+    bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
+fi
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TAURI" = false ]; then
