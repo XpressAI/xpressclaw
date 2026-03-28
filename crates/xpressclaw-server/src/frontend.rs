@@ -13,6 +13,22 @@ use rust_embed::Embed;
 #[prefix = ""]
 struct FrontendAssets;
 
+/// Log how many frontend assets are embedded (debug diagnostic).
+pub fn log_frontend_status() {
+    let count = FrontendAssets::iter().count();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    if count > 0 {
+        tracing::info!(count, manifest_dir, "frontend assets embedded");
+    } else {
+        tracing::warn!(manifest_dir, "NO frontend assets embedded — UI will show 'frontend not built'");
+        // List first few files if iter works
+        for (i, name) in FrontendAssets::iter().enumerate() {
+            tracing::warn!(file = %name, "embedded file");
+            if i >= 5 { break; }
+        }
+    }
+}
+
 /// Axum handler that serves embedded static files.
 ///
 /// For SPA routing: if the requested path doesn't match a static file,

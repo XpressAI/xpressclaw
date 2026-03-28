@@ -25,6 +25,9 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Start the HTTP server.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
+    // Log frontend embed status (debug diagnostic)
+    crate::frontend::log_frontend_status();
+
     // Extract built-in skills to the data directory
     if let Some(data_dir) = state.config_path.parent() {
         crate::skills::extract_skills(data_dir);
