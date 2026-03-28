@@ -51,9 +51,12 @@ cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" "crates/xpressclaw-tauri/binarie
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TAURI" = false ]; then
-    # Build the desktop app via Tauri CLI
+    # Build the desktop app via Tauri CLI.
+    # TAURI_BUNDLER_DMG_IGNORE_CI: without this, Tauri detects CI=true and
+    # skips the AppleScript that styles the DMG (icon positioning, background,
+    # Applications folder shortcut). This is what tauri-action sets by default.
     echo "==> Building Tauri desktop app..."
-    npx -y @tauri-apps/cli build --target "${TARGET_TRIPLE}"
+    TAURI_BUNDLER_DMG_IGNORE_CI=true npx -y @tauri-apps/cli build --target "${TARGET_TRIPLE}"
 fi
 
 if [ "$SKIP_DOCKER" = false ] && command -v docker &>/dev/null; then
