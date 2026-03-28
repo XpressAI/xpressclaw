@@ -43,6 +43,39 @@ fn extract_task_signal(content: &str) -> (String, Option<TaskSignal>) {
     }
 }
 
+/// Detect XML-style tool call attempts in model output.
+///
+/// Some models (e.g. Qwen) produce `<parameter=name>value</parameter>` or
+/// `<tool_call>` with XML parameters instead of JSON tool calls. This happens
+/// more as conversations get longer and the model forgets the correct format.
+/// Returns a hint message if detected, so it can be injected into the
+/// conversation and the model can retry.
+fn detect_malformed_tool_call(content: &str) -> Option<String> {
+    // Match <parameter=...>...</parameter> patterns
+    if content.contains("<parameter=") && content.contains("</parameter>") {
+        return Some(
+            "[System: Your last message used XML-style `<parameter=name>value</parameter>` \
+             syntax for a tool call. This format is not supported. Please retry using the \
+             correct JSON format inside `<tool_call name=\"tool_name\">{...}</tool_call>` tags. \
+             For example:\n\
+             <tool_call name=\"office_run\">\n\
+             {\"app\": \"word\", \"script\": \"tell application \\\"Microsoft Word\\\"\\n  activate\\nend tell\"}\n\
+             </tool_call>]"
+                .to_string(),
+        );
+    }
+    // Match <|tool_call|> or similar model-specific markers without proper JSON
+    if content.contains("<|tool_call|>") && !content.contains("<tool_call name=") {
+        return Some(
+            "[System: Your last message contained a malformed tool call marker. \
+             Please use the correct format: \
+             <tool_call name=\"tool_name\">{\"arg\": \"value\"}</tool_call>]"
+                .to_string(),
+        );
+    }
+    None
+}
+
 #[derive(Deserialize)]
 pub struct ListParams {
     pub limit: Option<i64>,
@@ -662,6 +695,25 @@ async fn stream_message(
                         ) {
                             if let Ok(evt) = Event::default().event("agent_message").json_data(json!(agent_msg)) {
                                 yield Ok(evt);
+                            }
+                        }
+
+                        // Detect malformed tool calls (e.g. XML-style <parameter=...>)
+                        // and inject a hint so the model can correct itself next turn.
+                        if let Some(hint) = detect_malformed_tool_call(&full_content) {
+                            if let Ok(hint_msg) = mgr.send_message(
+                                &conv_id,
+                                &SendMessage {
+                                    sender_type: "system".into(),
+                                    sender_id: "xpressclaw".into(),
+                                    sender_name: Some("system".into()),
+                                    content: hint,
+                                    message_type: None,
+                                },
+                            ) {
+                                if let Ok(evt) = Event::default().event("agent_message").json_data(json!(hint_msg)) {
+                                    yield Ok(evt);
+                                }
                             }
                         }
 

@@ -316,8 +316,20 @@ async fn run_applescript(
         _ => return Err(format!("Unknown app: {app}")),
     };
 
+    // Always ensure `activate` is present so the app launches if not running.
+    // Agents often send `tell application "..."` but forget `activate`.
     let full_script = if script.contains("tell application") {
-        script.to_string()
+        if script.contains("activate") {
+            script.to_string()
+        } else {
+            // Inject `activate` right after the `tell application "X"` line
+            if let Some(pos) = script.find('\n') {
+                let (first_line, rest) = script.split_at(pos);
+                format!("{first_line}\n  activate{rest}")
+            } else {
+                script.to_string()
+            }
+        }
     } else {
         format!("tell application \"{office_app}\"\n  activate\n  {script}\nend tell")
     };

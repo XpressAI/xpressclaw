@@ -133,6 +133,19 @@ impl Runtime {
             read_only: false,
         });
 
+        // Mount the agent's documents directory into the container so files
+        // created at /workspace/Documents/ are visible to host-side office tools
+        // (which resolve to ~/.xpressclaw/{agent_id}/documents/).
+        let docs_dir = self.config.system.data_dir.join(agent_id).join("documents");
+        let _ = std::fs::create_dir_all(&docs_dir);
+        spec.volumes.push(VolumeMount {
+            source: docs_dir.display().to_string(),
+            target: "/workspace/Documents".to_string(),
+            read_only: false,
+        });
+        spec.environment
+            .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
+
         match docker.launch(agent_id, &spec).await {
             Ok(info) => {
                 info!(agent_id, container_id = %info.container_id, "agent container started");
