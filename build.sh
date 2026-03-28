@@ -32,7 +32,9 @@ done
 
 # Build with Bazel (CLI, core, server + frontend)
 echo "==> Building with Bazel..."
-bazel build //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
+# -c opt: disables debug_assertions so rust-embed statically embeds
+# frontend files instead of reading them from the filesystem at runtime.
+bazel build -c opt //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
