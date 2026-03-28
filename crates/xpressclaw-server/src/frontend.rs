@@ -20,7 +20,10 @@ pub fn log_frontend_status() {
     if count > 0 {
         tracing::info!(count, manifest_dir, "frontend assets embedded");
     } else {
-        tracing::warn!(manifest_dir, "NO frontend assets embedded — UI will show 'frontend not built'");
+        tracing::warn!(
+            manifest_dir,
+            "NO frontend assets embedded — UI will show 'frontend not built'"
+        );
         // List first few files if iter works
         for (i, name) in FrontendAssets::iter().enumerate() {
             tracing::warn!(file = %name, "embedded file");
