@@ -131,6 +131,13 @@ fn main() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
 
+            // On Windows, prevent the sidecar from opening a visible console window.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
             // On macOS, clear environment to avoid inheriting state that can
             // cause issues in the child process, then re-add essentials.
             #[cfg(target_os = "macos")]
