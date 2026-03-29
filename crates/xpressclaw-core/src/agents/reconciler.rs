@@ -46,7 +46,7 @@ async fn reconcile_once(
     let docker = match DockerManager::connect().await {
         Ok(d) => d,
         Err(e) => {
-            debug!(error = %e, "Docker not available, skipping reconciliation");
+            warn!(error = %e, "Docker not available, skipping reconciliation");
             return Ok(());
         }
     };
@@ -91,6 +91,13 @@ async fn reconcile_agents(
             Ok(a) => a,
             Err(_) => continue, // Not in DB yet (setup hasn't run)
         };
+
+        debug!(
+            agent = agent.id,
+            desired = agent.desired_status,
+            restart_count = agent.restart_count,
+            "reconciling agent"
+        );
 
         let container_name = format!("xpressclaw-{}", agent.id);
         let is_running = docker.is_container_running(&container_name).await;
