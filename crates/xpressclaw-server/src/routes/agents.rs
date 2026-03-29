@@ -8,12 +8,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
-use xpressclaw_core::agents::state::AgentStatus;
+use xpressclaw_core::agents::state::{DesiredStatus, ObservedStatus};
 use xpressclaw_core::config::{
     default_mcp_servers, AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, McpServerConfig,
     RateLimitConfig, WakeOnConfig,
 };
-use xpressclaw_core::docker::manager::{DockerManager, VolumeMount};
+use xpressclaw_core::docker::manager::DockerManager;
 
 use crate::state::AppState;
 
@@ -33,19 +33,32 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/logs", get(get_agent_logs))
 }
 
-/// Build a JSON response for an agent by merging YAML config with DB runtime state.
-fn agent_json(record: &AgentRecord, config: &xpressclaw_core::config::Config) -> Value {
+/// Build a JSON response for an agent by merging YAML config, DB desired state,
+/// and live Docker observed state.
+fn agent_json(
+    record: &AgentRecord,
+    config: &xpressclaw_core::config::Config,
+    observed: &xpressclaw_core::agents::state::ObservedStatus,
+) -> Value {
     let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
+    let desired: xpressclaw_core::agents::state::DesiredStatus = record
+        .desired_status
+        .parse()
+        .unwrap_or(xpressclaw_core::agents::state::DesiredStatus::Stopped);
+    let status = xpressclaw_core::agents::state::compute_status(&desired, observed);
     json!({
         "id": record.id,
         "name": record.name,
         "backend": record.backend,
-        "status": record.status,
+        "status": status,
+        "desired_status": record.desired_status,
+        "observed_status": observed.to_string(),
         "container_id": record.container_id,
         "created_at": record.created_at,
         "started_at": record.started_at,
         "stopped_at": record.stopped_at,
         "error_message": record.error_message,
+        "restart_count": record.restart_count,
         "config": agent_cfg.map(|c| json!({
             "role": c.role,
             "model": c.model,
@@ -60,13 +73,35 @@ fn agent_json(record: &AgentRecord, config: &xpressclaw_core::config::Config) ->
     })
 }
 
+/// Query live observed status from Docker for an agent.
+async fn observe(agent_id: &str) -> ObservedStatus {
+    let container_name = format!("xpressclaw-{agent_id}");
+    match DockerManager::connect().await {
+        Ok(docker) => {
+            if docker.is_container_running(&container_name).await {
+                ObservedStatus::Running
+            } else if docker.inspect_by_name(&container_name).await.is_some() {
+                ObservedStatus::Exited
+            } else {
+                ObservedStatus::NotFound
+            }
+        }
+        Err(_) => ObservedStatus::DockerUnavailable,
+    }
+}
+
 async fn list_agents(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
-    let result: Vec<Value> = agents.iter().map(|a| agent_json(a, &config)).collect();
+
+    let mut result = Vec::new();
+    for a in &agents {
+        let observed = observe(&a.id).await;
+        result.push(agent_json(a, &config, &observed));
+    }
     Ok(Json(json!(result)))
 }
 
@@ -80,7 +115,8 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    Ok(Json(agent_json(&record, &config)))
+    let observed = observe(&record.id).await;
+    Ok(Json(agent_json(&record, &config, &observed)))
 }
 
 async fn delete_agent(
@@ -88,13 +124,11 @@ async fn delete_agent(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
-    // Stop container if running
-    if let Ok(record) = registry.get(&id) {
-        if record.status == "running" {
-            if let Ok(docker) = DockerManager::connect().await {
-                let _ = docker.stop(&id).await;
-            }
-        }
+    // Set desired=stopped so the reconciler stops the container
+    let _ = registry.set_desired_status(&id, &DesiredStatus::Stopped);
+    // Also stop immediately for responsiveness
+    if let Ok(docker) = DockerManager::connect().await {
+        let _ = docker.stop(&id).await;
     }
     registry.delete(&id).map_err(internal_error)?;
 
@@ -122,10 +156,12 @@ async fn delete_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Start an agent: sets desired_status to 'running'.
+/// The reconciler handles image pulling and container launch.
 async fn start_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    body: Option<Json<StartRequest>>,
+    _body: Option<Json<StartRequest>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry.get(&id).map_err(|e| match &e {
@@ -133,185 +169,52 @@ async fn start_agent(
         _ => internal_error(e),
     })?;
 
-    if record.status == "running" {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": format!("agent '{}' is already running", id) })),
-        ));
-    }
-
-    // Mark as starting
     registry
-        .update_status(&id, &AgentStatus::Starting, None)
+        .set_desired_status(&id, &DesiredStatus::Running)
         .map_err(internal_error)?;
 
+    // Also set old status for backward compat during transition
+    #[allow(deprecated)]
+    let _ = registry.update_status(
+        &id,
+        &xpressclaw_core::agents::state::AgentStatus::Starting,
+        None,
+    );
+
     let config = state.config();
-    let isolation = config.system.isolation.as_str();
-
-    if isolation == "none" {
-        // Containerless mode: just mark the agent as running.
-        // The conversation handler calls the LLM router directly.
-        let record = registry
-            .update_status(&id, &AgentStatus::Running, None)
-            .map_err(internal_error)?;
-        return Ok(Json(json!(record)));
-    }
-
-    // Docker isolation mode
-    let docker = DockerManager::connect().await.map_err(|e| {
-        let _ = registry.update_status(&id, &AgentStatus::Error(e.to_string()), None);
-        internal_error(e)
-    })?;
-
-    let server_port = std::env::var("XPRESSCLAW_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8935);
-
-    // Build container spec from agent config (handles env vars, API keys, volumes)
-    let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
-    let mut spec = if let Some(cfg) = agent_cfg {
-        let mut s = xpressclaw_core::docker::images::build_container_spec_with_mcp(
-            cfg,
-            server_port,
-            config.llm.anthropic_api_key.as_deref(),
-            config.llm.openai_api_key.as_deref(),
-            config.llm.openai_base_url.as_deref(),
-            Some(&config.mcp_servers),
-        );
-        // Override image if requested
-        if let Some(ref b) = body {
-            if let Some(ref img) = b.image {
-                s.image = img.clone();
-            }
-        }
-        s
-    } else {
-        // Fallback for agents not in YAML config
-        use xpressclaw_core::docker::images::image_for_backend;
-        let image = body
-            .and_then(|b| b.image.clone())
-            .unwrap_or_else(|| image_for_backend(&record.backend).to_string());
-        let mut s = xpressclaw_core::docker::manager::ContainerSpec {
-            image,
-            ..Default::default()
-        };
-        let server_base = format!("http://host.docker.internal:{server_port}");
-        s.environment.push(format!("AGENT_ID={id}"));
-        s.environment.push(format!("AGENT_NAME={}", record.name));
-        s.environment
-            .push(format!("AGENT_BACKEND={}", record.backend));
-        s.environment.push(format!("LLM_BASE_URL={server_base}/v1"));
-        s.environment
-            .push(format!("OPENAI_BASE_URL={server_base}/v1"));
-        s.environment
-            .push("OPENAI_API_KEY=sk-xpressclaw".to_string());
-        s.environment
-            .push(format!("ANTHROPIC_BASE_URL={server_base}"));
-        s.environment
-            .push(format!("ANTHROPIC_API_KEY=sk-ant-{}", record.name));
-        s
-    };
-
-    // Pass agent config from YAML as JSON env var
-    if let Some(cfg) = agent_cfg {
-        if let Ok(json) = serde_json::to_string(&serde_json::json!({
-            "role": cfg.role,
-            "tools": cfg.tools,
-        })) {
-            spec.environment.push(format!("AGENT_CONFIG={json}"));
-        }
-    }
-
-    // Filter MCP servers: always-on defaults + agent's tools matching global MCP servers
-    let filtered_mcp = filter_mcp_for_agent(agent_cfg, &config.mcp_servers);
-    if !filtered_mcp.is_empty() {
-        if let Ok(mcp_json) = serde_json::to_string(&filtered_mcp) {
-            spec.environment.push(format!("MCP_SERVERS={mcp_json}"));
-        }
-    }
-
-    // Pass agent tools list
-    if let Some(cfg) = agent_cfg {
-        if !cfg.tools.is_empty() {
-            if let Ok(tools_json) = serde_json::to_string(&cfg.tools) {
-                spec.environment.push(format!("AGENT_TOOLS={tools_json}"));
-            }
-        }
-    }
-
-    // If agent has no per-agent volumes, fall back to global workspace dir
-    if spec.volumes.is_empty() {
-        let workspace_dir = config.system.workspace_dir.to_string_lossy().to_string();
-        if !workspace_dir.is_empty() && workspace_dir != "/" {
-            spec.volumes.push(VolumeMount {
-                source: workspace_dir,
-                target: "/workspace".to_string(),
-                read_only: false,
-            });
-        }
-    }
-
-    // Mount Docker socket if any MCP server needs docker access (e.g., GitHub MCP)
-    if filtered_mcp
-        .values()
-        .any(|s| s.command.as_deref() == Some("docker"))
-    {
-        spec.volumes.push(VolumeMount {
-            source: "/var/run/docker.sock".to_string(),
-            target: "/var/run/docker.sock".to_string(),
-            read_only: false,
-        });
-    }
-
-    match docker.launch(&id, &spec).await {
-        Ok(info) => {
-            let record = registry
-                .update_status(&id, &AgentStatus::Running, Some(&info.container_id))
-                .map_err(internal_error)?;
-            Ok(Json(json!(record)))
-        }
-        Err(e) => {
-            let record = registry
-                .update_status(&id, &AgentStatus::Error(e.to_string()), None)
-                .map_err(internal_error)?;
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": e.to_string(),
-                    "agent": record,
-                })),
-            ))
-        }
-    }
+    let record = registry.get(&id).map_err(internal_error)?;
+    let observed = observe(&record.id).await;
+    Ok(Json(agent_json(&record, &config, &observed)))
 }
 
+/// Stop an agent: sets desired_status to 'stopped'.
+/// The reconciler handles container shutdown.
 async fn stop_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
-    let record = registry.get(&id).map_err(|e| match &e {
+    let _record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
 
-    if record.status == "stopped" {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({ "error": format!("agent '{}' is already stopped", id) })),
-        ));
-    }
-
-    // Stop the container
-    if let Ok(docker) = DockerManager::connect().await {
-        let _ = docker.stop(&id).await;
-    }
-
-    let record = registry
-        .update_status(&id, &AgentStatus::Stopped, None)
+    registry
+        .set_desired_status(&id, &DesiredStatus::Stopped)
         .map_err(internal_error)?;
-    Ok(Json(json!(record)))
+
+    // Also set old status for backward compat during transition
+    #[allow(deprecated)]
+    let _ = registry.update_status(
+        &id,
+        &xpressclaw_core::agents::state::AgentStatus::Stopped,
+        None,
+    );
+
+    let config = state.config();
+    let record = registry.get(&id).map_err(internal_error)?;
+    let observed = observe(&record.id).await;
+    Ok(Json(agent_json(&record, &config, &observed)))
 }
 
 #[derive(Debug, Deserialize)]
