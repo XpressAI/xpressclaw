@@ -138,24 +138,39 @@ async fn reconcile_agents(
                     config.llm.openai_base_url.as_deref(),
                 );
 
-                // Mount workspace
-                let workspace = config.system.workspace_dir.display().to_string();
-                spec.volumes.push(VolumeMount {
-                    source: workspace,
-                    target: "/workspace".to_string(),
-                    read_only: false,
-                });
+                // Mount workspace if not already mounted by build_container_spec
+                let has_workspace = spec.volumes.iter().any(|v| v.target == "/workspace");
+                if !has_workspace {
+                    let workspace = config.system.workspace_dir.display().to_string();
+                    spec.volumes.push(VolumeMount {
+                        source: workspace,
+                        target: "/workspace".to_string(),
+                        read_only: false,
+                    });
+                }
 
                 // Mount documents directory
                 let docs_dir = config.system.data_dir.join(&agent.id).join("documents");
                 let _ = std::fs::create_dir_all(&docs_dir);
-                spec.volumes.push(VolumeMount {
-                    source: docs_dir.display().to_string(),
-                    target: "/workspace/Documents".to_string(),
-                    read_only: false,
-                });
-                spec.environment
-                    .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
+                if !spec
+                    .volumes
+                    .iter()
+                    .any(|v| v.target == "/workspace/Documents")
+                {
+                    spec.volumes.push(VolumeMount {
+                        source: docs_dir.display().to_string(),
+                        target: "/workspace/Documents".to_string(),
+                        read_only: false,
+                    });
+                }
+                if !spec
+                    .environment
+                    .iter()
+                    .any(|e| e.starts_with("DOCUMENTS_DIR="))
+                {
+                    spec.environment
+                        .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
+                }
 
                 match docker.launch(&agent.id, &spec).await {
                     Ok(info) => {
