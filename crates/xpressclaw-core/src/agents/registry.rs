@@ -175,6 +175,22 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Reset all agent runtime state on startup.
+    ///
+    /// On fresh start no containers are running — any "running" status in the
+    /// DB is stale from a previous session that crashed or was killed. Reset
+    /// everything so the UI doesn't lie about what's actually happening.
+    pub fn reset_all_on_startup(&self) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET status = 'stopped', container_id = NULL, error_message = NULL",
+                [],
+            )
+        })?;
+        debug!("reset all agent statuses to stopped on startup");
+        Ok(())
+    }
+
     /// Remove agents from DB that are no longer in the YAML config.
     pub fn remove_stale(&self, valid_names: &[&str]) -> Result<()> {
         let existing = self.list()?;

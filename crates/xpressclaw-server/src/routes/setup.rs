@@ -458,8 +458,11 @@ async fn complete_setup(
     let config = Arc::new(config);
 
     // Sync agents in the database to match the new config.
-    // Remove any agents not in the new config, then register the new ones.
+    // First reset all statuses — on startup, nothing is running yet.
     let registry = AgentRegistry::new(state.db.clone());
+    if let Err(e) = registry.reset_all_on_startup() {
+        warn!(error = %e, "failed to reset agent statuses");
+    }
     let existing_agents = registry.list().unwrap_or_default();
     let new_agent_names: std::collections::HashSet<&str> =
         config.agents.iter().map(|a| a.name.as_str()).collect();
