@@ -344,6 +344,50 @@ impl DockerManager {
         Ok(())
     }
 
+    /// Check if an image exists locally.
+    pub async fn has_image(&self, image: &str) -> bool {
+        self.docker.inspect_image(image).await.is_ok()
+    }
+
+    /// Check if a named container is running.
+    pub async fn is_container_running(&self, container_name: &str) -> bool {
+        match self.docker.inspect_container(container_name, None).await {
+            Ok(info) => info.state.and_then(|s| s.running).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Get container uptime in seconds (0 if not running or not found).
+    pub async fn container_uptime_secs(&self, container_name: &str) -> u64 {
+        match self.docker.inspect_container(container_name, None).await {
+            Ok(info) => {
+                let started = info
+                    .state
+                    .and_then(|s| s.started_at)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok());
+                match started {
+                    Some(t) => chrono::Utc::now()
+                        .signed_duration_since(t)
+                        .num_seconds()
+                        .max(0) as u64,
+                    None => 0,
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Inspect a container by name, returning None if not found.
+    pub async fn inspect_by_name(
+        &self,
+        container_name: &str,
+    ) -> Option<bollard::models::ContainerInspectResponse> {
+        self.docker
+            .inspect_container(container_name, None)
+            .await
+            .ok()
+    }
+
     /// Get the host port for a container (public API for conversation routing).
     pub async fn get_container_port(&self, container_id: &str) -> Option<u16> {
         self.get_host_port(container_id, Some(8080)).await

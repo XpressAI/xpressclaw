@@ -134,6 +134,7 @@ impl Database {
             (11, MIGRATION_V11),
             (12, MIGRATION_V12),
             (13, MIGRATION_V13),
+            (14, MIGRATION_V14),
         ];
 
         for &(target, sql) in migrations {
@@ -501,6 +502,20 @@ CREATE TABLE IF NOT EXISTS apps (
 );
 ";
 
+const MIGRATION_V14: &str = "
+-- ADR-018: Desired-state reconciliation.
+-- The DB stores desired state (what the user wants), not observed state
+-- (what Docker reports). Observed state is queried live from Docker.
+ALTER TABLE agents ADD COLUMN desired_status TEXT NOT NULL DEFAULT 'stopped';
+ALTER TABLE agents ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN last_attempt_at TIMESTAMP;
+
+-- Migrate: agents that were 'running' or 'starting' should have
+-- desired_status='running' (the user wanted them running).
+UPDATE agents SET desired_status = 'running'
+    WHERE status IN ('running', 'starting');
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,7 +533,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "13");
+        assert_eq!(version, "14");
     }
 
     #[test]
