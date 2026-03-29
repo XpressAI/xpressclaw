@@ -1,15 +1,24 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
 	import { statusColor, timeAgo } from '$lib/utils';
 
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 	onMount(async () => {
 		agentList = await agents.list().catch(() => []);
 		loading = false;
+		// Poll every 5s so reconciler progress is visible
+		pollTimer = setInterval(async () => {
+			agentList = await agents.list().catch(() => agentList);
+		}, 5000);
+	});
+
+	onDestroy(() => {
+		if (pollTimer) clearInterval(pollTimer);
 	});
 
 	async function handleStart(id: string) {
@@ -60,8 +69,11 @@
 							<div class="text-xs text-muted-foreground mt-0.5">{agent.backend}</div>
 						</div>
 						<span class="inline-flex items-center gap-1.5 text-xs {statusColor(agent.status)}">
-							<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : agent.status === 'error' ? 'bg-red-400' : 'bg-muted-foreground/30'}"></span>
+							<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : agent.status === 'starting' || agent.status === 'stopping' ? 'bg-amber-400 animate-pulse' : agent.status === 'error' ? 'bg-red-400' : 'bg-muted-foreground/30'}"></span>
 							{agent.status}
+							{#if agent.restart_count > 0 && agent.desired_status === 'running' && agent.status !== 'running'}
+								<span class="text-muted-foreground">(attempt {agent.restart_count})</span>
+							{/if}
 						</span>
 					</div>
 
@@ -77,7 +89,7 @@
 					</div>
 
 					<div class="flex gap-2">
-						{#if agent.status === 'running'}
+						{#if agent.desired_status === 'running'}
 							<button
 								onclick={() => handleStop(agent.id)}
 								class="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent transition-colors"

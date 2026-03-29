@@ -71,6 +71,8 @@ export function statusColor(status: string): string {
 		case 'running':
 		case 'completed':
 			return 'text-emerald-400';
+		case 'starting':
+		case 'stopping':
 		case 'pending':
 		case 'queued':
 			return 'text-yellow-400';
@@ -81,6 +83,9 @@ export function statusColor(status: string): string {
 			return 'text-red-400';
 		case 'stopped':
 		case 'blocked':
+		case 'docker_unavailable':
+		case 'not_found':
+		case 'exited':
 			return 'text-muted-foreground';
 		default:
 			return 'text-muted-foreground';

@@ -166,12 +166,15 @@ export interface Agent {
 	name: string;
 	backend: string;
 	status: string;
+	desired_status: string;
+	observed_status: string;
 	container_id: string | null;
 	config: string;
 	created_at: string;
 	started_at: string | null;
 	stopped_at: string | null;
 	error_message: string | null;
+	restart_count: number;
 }
 
 export const agents = {
