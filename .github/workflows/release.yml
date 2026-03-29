@@ -24,11 +24,9 @@ jobs:
           - os: macos-15-intel
             target: x86_64-apple-darwin
             label: macOS-x64
-          # Windows disabled — rules_rust crate_universe has path length
-          # issues with llama.cpp on Windows (os error 123). Tracked in XCLAW-13.
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   label: Windows-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: Windows-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +50,10 @@ jobs:
       - name: Install macOS build deps
         if: runner.os == 'macOS'
         run: brew install cmake bazelisk
+
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
 
       # macOS: install certificate for signing
       - name: Install Apple certificate
@@ -94,10 +96,9 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # build.sh with --skip-test (CI job handles that), --skip-docker
-      # (no Docker needed for release artifacts), --skip-check (CI job),
-      # and --target to set the matrix target triple.
-      - name: Build
+      # macOS: build with build.sh (Bazel + Tauri)
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
         env:
           CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -105,25 +106,31 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
+      # Windows: build with build-cargo.ps1 (Cargo, bypasses Bazel path issues)
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: powershell -File build-cargo.ps1 --skip-docker --target=${{ matrix.target }}
+
       - name: Upload macOS DMG
+        if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: xpressclaw-${{ matrix.label }}.dmg
           path: target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
-      # Windows disabled — re-enable when rules_rust crate_universe
-      # path issues are resolved (XCLAW-13)
-      # - name: Upload Windows MSI
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: xpressclaw-${{ matrix.label }}.msi
-      #     path: target/${{ matrix.target }}/release/bundle/msi/*.msi
+      - name: Upload Windows MSI
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpressclaw-${{ matrix.label }}.msi
+          path: target/${{ matrix.target }}/release/bundle/msi/*.msi
 
-      # - name: Upload Windows NSIS installer
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: xpressclaw-${{ matrix.label }}.exe
-      #     path: target/${{ matrix.target }}/release/bundle/nsis/*.exe
+      - name: Upload Windows NSIS installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpressclaw-${{ matrix.label }}.exe
+          path: target/${{ matrix.target }}/release/bundle/nsis/*.exe
 
   pre-release:
     needs: build-tauri
@@ -159,7 +166,7 @@ jobs:
             **Downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
             - macOS (Intel): `.dmg` x64 — signed and notarized
-            - Windows: coming soon (Bazel path issues, XCLAW-13)
+            - Windows: `.exe` NSIS installer, `.msi` MSI installer
           prerelease: true
           make_latest: false
           files: release-assets/*
