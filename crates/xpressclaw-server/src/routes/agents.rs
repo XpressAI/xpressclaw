@@ -70,19 +70,15 @@ fn agent_json(
 }
 
 /// Query live observed status from Docker for an agent.
-async fn observe(agent_id: &str) -> ObservedStatus {
+/// Query live observed status from Docker for an agent.
+async fn observe_with(docker: &DockerManager, agent_id: &str) -> ObservedStatus {
     let container_name = format!("xpressclaw-{agent_id}");
-    match DockerManager::connect().await {
-        Ok(docker) => {
-            if docker.is_container_running(&container_name).await {
-                ObservedStatus::Running
-            } else if docker.inspect_by_name(&container_name).await.is_some() {
-                ObservedStatus::Exited
-            } else {
-                ObservedStatus::NotFound
-            }
-        }
-        Err(_) => ObservedStatus::DockerUnavailable,
+    if docker.is_container_running(&container_name).await {
+        ObservedStatus::Running
+    } else if docker.inspect_by_name(&container_name).await.is_some() {
+        ObservedStatus::Exited
+    } else {
+        ObservedStatus::NotFound
     }
 }
 
@@ -93,9 +89,14 @@ async fn list_agents(
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
 
+    // Single Docker connection for all agents
+    let docker = DockerManager::connect().await.ok();
     let mut result = Vec::new();
     for a in &agents {
-        let observed = observe(&a.id).await;
+        let observed = match &docker {
+            Some(d) => observe_with(d, &a.id).await,
+            None => ObservedStatus::DockerUnavailable,
+        };
         result.push(agent_json(a, &config, &observed));
     }
     Ok(Json(json!(result)))
@@ -111,7 +112,10 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    let observed = observe(&record.id).await;
+    let observed = match DockerManager::connect().await {
+        Ok(d) => observe_with(&d, &record.id).await,
+        Err(_) => ObservedStatus::DockerUnavailable,
+    };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -179,7 +183,10 @@ async fn start_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = observe(&record.id).await;
+    let observed = match DockerManager::connect().await {
+        Ok(d) => observe_with(&d, &record.id).await,
+        Err(_) => ObservedStatus::DockerUnavailable,
+    };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -208,7 +215,10 @@ async fn stop_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = observe(&record.id).await;
+    let observed = match DockerManager::connect().await {
+        Ok(d) => observe_with(&d, &record.id).await,
+        Err(_) => ObservedStatus::DockerUnavailable,
+    };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -297,7 +307,7 @@ async fn update_agent_config(
         agent.hooks = hooks;
     }
 
-    let needs_restart = record.status == "running";
+    let needs_restart = record.desired_status == "running";
 
     // Save updated config — preserve all top-level fields
     let new_config = xpressclaw_core::config::Config {

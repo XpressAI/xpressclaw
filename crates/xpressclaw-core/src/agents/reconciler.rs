@@ -4,7 +4,7 @@
 //! (Docker) and takes the minimum action to converge: pulling images,
 //! starting containers, stopping containers, re-queuing orphaned tasks.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
@@ -21,20 +21,27 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 const STABLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
 
 /// Start the reconciliation loop as a background task.
-pub async fn start(db: Arc<Database>, config: Arc<Config>) {
+/// Takes the config behind a RwLock so it always sees the latest
+/// config after user changes (add/remove agents, update API keys, etc.)
+pub async fn start(db: Arc<Database>, config: Arc<RwLock<Arc<Config>>>, server_port: u16) {
     info!(
         "starting desired-state reconciler ({}s interval)",
         RECONCILE_INTERVAL.as_secs()
     );
     loop {
-        if let Err(e) = reconcile_once(&db, &config).await {
+        let config_snapshot = config.read().unwrap().clone();
+        if let Err(e) = reconcile_once(&db, &config_snapshot, server_port).await {
             warn!(error = %e, "reconciliation cycle failed");
         }
         tokio::time::sleep(RECONCILE_INTERVAL).await;
     }
 }
 
-async fn reconcile_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<()> {
+async fn reconcile_once(
+    db: &Arc<Database>,
+    config: &Config,
+    server_port: u16,
+) -> crate::error::Result<()> {
     // Connect to Docker — if unavailable, skip this cycle
     let docker = match DockerManager::connect().await {
         Ok(d) => d,
@@ -45,7 +52,7 @@ async fn reconcile_once(db: &Arc<Database>, config: &Config) -> crate::error::Re
     };
 
     reconcile_images(config, &docker).await;
-    reconcile_agents(db, config, &docker).await;
+    reconcile_agents(db, config, &docker, server_port).await;
     reconcile_tasks(db, &docker).await;
 
     Ok(())
@@ -71,7 +78,12 @@ async fn reconcile_images(config: &Config, docker: &DockerManager) {
 }
 
 /// Reconcile agent containers against desired state.
-async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerManager) {
+async fn reconcile_agents(
+    db: &Arc<Database>,
+    config: &Config,
+    docker: &DockerManager,
+    server_port: u16,
+) {
     let registry = AgentRegistry::new(db.clone());
 
     for agent_config in &config.agents {
@@ -101,7 +113,7 @@ async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerMa
             // Desired running, not running → start (with backoff)
             ("running", false) => {
                 if !should_attempt(agent.restart_count, agent.last_attempt_at.as_deref()) {
-                    return; // Backoff not elapsed
+                    continue; // Backoff not elapsed, check next agent
                 }
 
                 info!(
@@ -113,7 +125,7 @@ async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerMa
                 // Build container spec
                 let mut spec = build_container_spec(
                     agent_config,
-                    8935,
+                    server_port,
                     config.llm.anthropic_api_key.as_deref(),
                     config.llm.openai_api_key.as_deref(),
                     config.llm.openai_base_url.as_deref(),
@@ -194,13 +206,28 @@ async fn reconcile_tasks(db: &Arc<Database>, docker: &DockerManager) {
         Err(_) => return,
     };
 
+    let registry = AgentRegistry::new(db.clone());
     for task in tasks {
         if let Some(ref agent_id) = task.agent_id {
             let container_name = format!("xpressclaw-{agent_id}");
             if !docker.is_container_running(&container_name).await {
-                info!(task_id = task.id, agent_id, "re-queuing orphaned task");
+                // Only re-queue if the agent is supposed to be running.
+                // If desired=stopped, move task to pending without re-queuing
+                // to the same agent (it won't come back).
                 let _ = board.update_status(&task.id, "pending", None);
-                let _ = queue.enqueue(&task.id, agent_id);
+                let agent_desired_running = registry
+                    .get(agent_id)
+                    .map(|a| a.desired_status == "running")
+                    .unwrap_or(false);
+                if agent_desired_running {
+                    let _ = queue.enqueue(&task.id, agent_id);
+                    info!(task_id = task.id, agent_id, "re-queued orphaned task");
+                } else {
+                    info!(
+                        task_id = task.id,
+                        agent_id, "unassigned orphaned task (agent stopped)"
+                    );
+                }
             }
         }
     }
