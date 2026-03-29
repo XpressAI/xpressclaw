@@ -91,6 +91,12 @@ impl DockerManager {
     pub async fn launch(&self, agent_id: &str, spec: &ContainerSpec) -> Result<ContainerInfo> {
         let container_name = format!("xpressclaw-{agent_id}");
 
+        // Pull the image if not available locally
+        if !self.has_image(&spec.image).await {
+            info!(image = %spec.image, "image not found locally, pulling");
+            self.pull_image(&spec.image).await?;
+        }
+
         // Remove existing container if present
         let _ = self.remove(&container_name).await;
 
@@ -305,6 +311,11 @@ impl DockerManager {
         }
 
         Ok(output)
+    }
+
+    /// Check if an image exists locally.
+    pub async fn has_image(&self, image: &str) -> bool {
+        self.docker.inspect_image(image).await.is_ok()
     }
 
     /// Check if a container is running.
