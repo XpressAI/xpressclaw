@@ -13,13 +13,20 @@ pub struct AgentRecord {
     pub id: String,
     pub name: String,
     pub backend: String,
-    /// Runtime state from DB
+    /// Old status column — will be removed once all callers migrate.
     pub status: String,
     pub container_id: Option<String>,
     pub created_at: Option<String>,
     pub started_at: Option<String>,
     pub stopped_at: Option<String>,
     pub error_message: Option<String>,
+    /// Desired state: what the user wants ('running' or 'stopped').
+    pub desired_status: String,
+    /// How many times the reconciler has tried to start this agent
+    /// since it last ran stably. Used for exponential backoff.
+    pub restart_count: i32,
+    /// When the reconciler last attempted to start this agent.
+    pub last_attempt_at: Option<String>,
 }
 
 /// Manages agent runtime state in the database.
@@ -55,7 +62,8 @@ impl AgentRegistry {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, backend, status, container_id, created_at,
-                        started_at, stopped_at, error_message
+                        started_at, stopped_at, error_message,
+                        desired_status, restart_count, last_attempt_at
                  FROM agents WHERE id = ?1",
             )?;
             let record = stmt.query_row([agent_id], |row| {
@@ -69,6 +77,9 @@ impl AgentRegistry {
                     started_at: row.get(6)?,
                     stopped_at: row.get(7)?,
                     error_message: row.get(8)?,
+                    desired_status: row.get(9)?,
+                    restart_count: row.get(10)?,
+                    last_attempt_at: row.get(11)?,
                 })
             });
             match record {
@@ -84,7 +95,8 @@ impl AgentRegistry {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, name, backend, status, container_id, created_at,
-                        started_at, stopped_at, error_message
+                        started_at, stopped_at, error_message,
+                        desired_status, restart_count, last_attempt_at
                  FROM agents ORDER BY name",
             )?;
             let records = stmt
@@ -99,6 +111,9 @@ impl AgentRegistry {
                         started_at: row.get(6)?,
                         stopped_at: row.get(7)?,
                         error_message: row.get(8)?,
+                        desired_status: row.get(9)?,
+                        restart_count: row.get(10)?,
+                        last_attempt_at: row.get(11)?,
                     })
                 })
                 .map_err(|e| Error::Database(e.to_string()))?
@@ -172,6 +187,60 @@ impl AgentRegistry {
     pub fn delete(&self, agent_id: &str) -> Result<()> {
         self.db
             .with_conn(|conn| conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]))?;
+        Ok(())
+    }
+
+    // -- Desired-state methods (ADR-018) --
+
+    /// Set the desired status for an agent. Resets restart backoff.
+    pub fn set_desired_status(
+        &self,
+        agent_id: &str,
+        desired: &crate::agents::state::DesiredStatus,
+    ) -> Result<()> {
+        let s = desired.to_string();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET desired_status = ?1, restart_count = 0,
+                 last_attempt_at = NULL, error_message = NULL WHERE id = ?2",
+                rusqlite::params![s, agent_id],
+            )
+        })?;
+        debug!(agent_id, desired_status = s, "set desired status");
+        Ok(())
+    }
+
+    /// Record a reconciliation attempt (success or failure).
+    pub fn record_attempt(&self, agent_id: &str, error: Option<&str>) -> Result<()> {
+        if let Some(err) = error {
+            self.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET restart_count = restart_count + 1,
+                     last_attempt_at = CURRENT_TIMESTAMP,
+                     error_message = ?1 WHERE id = ?2",
+                    rusqlite::params![err, agent_id],
+                )
+            })?;
+        } else {
+            self.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE agents SET last_attempt_at = CURRENT_TIMESTAMP,
+                     error_message = NULL WHERE id = ?1",
+                    [agent_id],
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Reset restart count (agent has been running stably).
+    pub fn reset_restart_count(&self, agent_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET restart_count = 0, error_message = NULL WHERE id = ?1",
+                [agent_id],
+            )
+        })?;
         Ok(())
     }
 

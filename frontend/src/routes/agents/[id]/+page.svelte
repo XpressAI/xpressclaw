@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
@@ -110,6 +110,18 @@
 			const resp = await fetch('/api/skills');
 			availableSkills = await resp.json();
 		} catch {}
+
+		// Poll agent status every 5s so reconciler progress is visible
+		pollTimer = setInterval(async () => {
+			try {
+				agent = await agents.get($page.params.id!);
+			} catch {}
+		}, 5000);
+	});
+
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	onDestroy(() => {
+		if (pollTimer) clearInterval(pollTimer);
 	});
 
 	async function handleStart() {
@@ -272,11 +284,14 @@
 				<h1 class="text-2xl font-bold">{agent.name}</h1>
 				<p class="text-sm text-muted-foreground mt-1">
 					<span class="{statusColor(agent.status)}">{agent.status}</span>
+					{#if agent.restart_count > 0 && agent.desired_status === 'running' && agent.status !== 'running'}
+						<span class="text-amber-500">(restarting, attempt {agent.restart_count})</span>
+					{/if}
 					&middot; {agent.backend}
 				</p>
 			</div>
 			<div class="flex gap-2">
-				{#if agent.status === 'running'}
+				{#if agent.desired_status === 'running'}
 					{#if needsRestart}
 						<button onclick={handleRestart}
 							class="rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 transition-colors">

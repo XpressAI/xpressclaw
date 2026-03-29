@@ -73,6 +73,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db).await;
     });
 
+    // Start the desired-state reconciler (ADR-018).
+    // Continuously converges agents, images, and tasks toward desired state.
+    // Passes the RwLock config so the reconciler always sees the latest config
+    // after user changes (add/remove agents, update API keys, etc.)
+    let reconciler_db = state.db.clone();
+    let reconciler_config = state.config.clone(); // Arc<RwLock<Arc<Config>>>
+    tokio::spawn(async move {
+        xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port).await;
+    });
+
     let app = create_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
