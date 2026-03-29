@@ -734,7 +734,7 @@ mod tests {
         let registry = AgentRegistry::new(db);
         registry.ensure("atlas", "generic").unwrap();
 
-        // Stop already-stopped agent
+        // Stop already-stopped agent — idempotent, returns 200
         let resp = app
             .clone()
             .oneshot(
@@ -747,6 +747,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
