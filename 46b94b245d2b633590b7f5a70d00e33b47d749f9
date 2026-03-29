@@ -1,0 +1,5 @@
+ADR-018 proposes a Kubernetes-style reconciliation loop.
+Key concepts: desired_status vs observed_status in DB, 10s reconcile
+interval, exponential backoff restarts, image pull on every launch,
+task recovery for orphaned in_progress tasks. No special startup code —
+the controller discovers actual state and converges.
