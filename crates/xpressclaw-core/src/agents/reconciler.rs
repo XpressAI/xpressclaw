@@ -147,7 +147,6 @@ async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerMa
                         );
                         let _ = registry.record_attempt(&agent.id, None);
                         // Also update old status column for backward compat
-                        #[allow(deprecated)]
                         let _ = registry.update_status(
                             &agent.id,
                             &crate::agents::state::AgentStatus::Running,
@@ -157,7 +156,6 @@ async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerMa
                     Err(e) => {
                         error!(agent = agent.id, error = %e, "failed to start agent");
                         let _ = registry.record_attempt(&agent.id, Some(&e.to_string()));
-                        #[allow(deprecated)]
                         let _ = registry.update_status(
                             &agent.id,
                             &crate::agents::state::AgentStatus::Error(e.to_string()),
@@ -171,7 +169,6 @@ async fn reconcile_agents(db: &Arc<Database>, config: &Config, docker: &DockerMa
             ("stopped", true) => {
                 info!(agent = agent.id, "stopping agent (desired=stopped)");
                 let _ = docker.stop(&agent.id).await;
-                #[allow(deprecated)]
                 let _ = registry.update_status(
                     &agent.id,
                     &crate::agents::state::AgentStatus::Stopped,

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -10,8 +8,7 @@ use serde_json::{json, Value};
 use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
 use xpressclaw_core::agents::state::{DesiredStatus, ObservedStatus};
 use xpressclaw_core::config::{
-    default_mcp_servers, AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, McpServerConfig,
-    RateLimitConfig, WakeOnConfig,
+    AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, RateLimitConfig, WakeOnConfig,
 };
 use xpressclaw_core::docker::manager::DockerManager;
 
@@ -19,8 +16,7 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct StartRequest {
-    /// Override the harness image (optional).
-    pub image: Option<String>,
+    // Reserved for future use (image override, etc.)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -164,7 +160,8 @@ async fn start_agent(
     _body: Option<Json<StartRequest>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
-    let record = registry.get(&id).map_err(|e| match &e {
+    // Validate agent exists
+    registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
@@ -174,7 +171,6 @@ async fn start_agent(
         .map_err(internal_error)?;
 
     // Also set old status for backward compat during transition
-    #[allow(deprecated)]
     let _ = registry.update_status(
         &id,
         &xpressclaw_core::agents::state::AgentStatus::Starting,
@@ -204,7 +200,6 @@ async fn stop_agent(
         .map_err(internal_error)?;
 
     // Also set old status for backward compat during transition
-    #[allow(deprecated)]
     let _ = registry.update_status(
         &id,
         &xpressclaw_core::agents::state::AgentStatus::Stopped,
@@ -364,26 +359,6 @@ async fn update_agent_config(
         },
         "needs_restart": needs_restart,
     })))
-}
-
-/// Build the set of MCP servers for an agent: always-on defaults (shell, filesystem)
-/// plus any global MCP servers whose key appears in the agent's tools list.
-fn filter_mcp_for_agent(
-    agent_cfg: Option<&AgentConfig>,
-    global_mcp: &HashMap<String, McpServerConfig>,
-) -> HashMap<String, McpServerConfig> {
-    let mut result = default_mcp_servers();
-    if let Some(cfg) = agent_cfg {
-        for tool in &cfg.tools {
-            if let Some(server) = global_mcp.get(tool.as_str()) {
-                result.insert(tool.clone(), server.clone());
-            }
-        }
-    } else {
-        // No per-agent config: pass all global MCP servers
-        result.extend(global_mcp.clone());
-    }
-    result
 }
 
 #[derive(Debug, Deserialize)]
