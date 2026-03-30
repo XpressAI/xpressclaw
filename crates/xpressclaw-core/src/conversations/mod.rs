@@ -1,3 +1,5 @@
+pub mod event_bus;
+
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -364,6 +366,108 @@ impl ConversationManager {
             .collect();
 
         Ok(participants)
+    }
+
+    // -- Background processing methods (ADR-019) --
+
+    /// Store a user message as unprocessed (processed=0).
+    /// The background task will pick it up.
+    pub fn send_user_message(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+    ) -> Result<ConversationMessage> {
+        self.db.with_conn(|conn| {
+            let message_type = msg.message_type.as_deref().unwrap_or("message");
+
+            conn.execute(
+                "INSERT INTO conversation_messages (conversation_id, sender_type, sender_id, sender_name, content, message_type, processed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                rusqlite::params![conv_id, msg.sender_type, msg.sender_id, msg.sender_name, msg.content, message_type],
+            )?;
+
+            let id = conn.last_insert_rowid();
+
+            conn.execute(
+                "UPDATE conversations SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [conv_id],
+            )?;
+
+            let mut stmt = conn.prepare("SELECT * FROM conversation_messages WHERE id = ?1")?;
+            stmt.query_row([id], row_to_message)
+                .map_err(|e| Error::Database(e.to_string()))
+        })
+    }
+
+    /// Check if there are unprocessed user messages in a conversation.
+    pub fn has_unprocessed(&self, conv_id: &str) -> bool {
+        self.db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_messages
+                     WHERE conversation_id = ?1 AND sender_type = 'user' AND processed = 0",
+                    [conv_id],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Mark all unprocessed user messages as processed.
+    pub fn mark_processed(&self, conv_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE conversation_messages SET processed = 1
+                 WHERE conversation_id = ?1 AND sender_type = 'user' AND processed = 0",
+                [conv_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Get messages after a given message ID (for SSE replay).
+    pub fn get_messages_after(
+        &self,
+        conv_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM conversation_messages
+                 WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id ASC",
+            )?;
+            let msgs = stmt
+                .query_map(rusqlite::params![conv_id, after_id], row_to_message)?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(msgs)
+        })
+    }
+
+    /// Set the processing status of a conversation.
+    pub fn set_processing_status(&self, conv_id: &str, status: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE conversations SET processing_status = ?1 WHERE id = ?2",
+                rusqlite::params![status, conv_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Check if a conversation is currently being processed.
+    pub fn is_processing(&self, conv_id: &str) -> bool {
+        self.db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT processing_status FROM conversations WHERE id = ?1",
+                    [conv_id],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap_or_else(|_| "idle".to_string())
+            == "processing"
     }
 }
 
