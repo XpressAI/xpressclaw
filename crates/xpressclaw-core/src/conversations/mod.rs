@@ -1,4 +1,5 @@
 pub mod event_bus;
+pub mod processor;
 
 use std::sync::Arc;
 
