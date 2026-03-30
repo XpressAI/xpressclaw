@@ -46,13 +46,14 @@ async fn reconcile_once(
     let docker = match DockerManager::connect().await {
         Ok(d) => d,
         Err(e) => {
-            debug!(error = %e, "Docker not available, skipping reconciliation");
+            warn!(error = %e, "Docker not available, skipping reconciliation");
             return Ok(());
         }
     };
 
     reconcile_images(config, &docker).await;
     reconcile_agents(db, config, &docker, server_port).await;
+    reconcile_apps(db, &docker).await;
     reconcile_tasks(db, &docker).await;
 
     Ok(())
@@ -91,6 +92,13 @@ async fn reconcile_agents(
             Ok(a) => a,
             Err(_) => continue, // Not in DB yet (setup hasn't run)
         };
+
+        debug!(
+            agent = agent.id,
+            desired = agent.desired_status,
+            restart_count = agent.restart_count,
+            "reconciling agent"
+        );
 
         let container_name = format!("xpressclaw-{}", agent.id);
         let is_running = docker.is_container_running(&container_name).await;
@@ -131,24 +139,39 @@ async fn reconcile_agents(
                     config.llm.openai_base_url.as_deref(),
                 );
 
-                // Mount workspace
-                let workspace = config.system.workspace_dir.display().to_string();
-                spec.volumes.push(VolumeMount {
-                    source: workspace,
-                    target: "/workspace".to_string(),
-                    read_only: false,
-                });
+                // Mount workspace if not already mounted by build_container_spec
+                let has_workspace = spec.volumes.iter().any(|v| v.target == "/workspace");
+                if !has_workspace {
+                    let workspace = config.system.workspace_dir.display().to_string();
+                    spec.volumes.push(VolumeMount {
+                        source: workspace,
+                        target: "/workspace".to_string(),
+                        read_only: false,
+                    });
+                }
 
                 // Mount documents directory
                 let docs_dir = config.system.data_dir.join(&agent.id).join("documents");
                 let _ = std::fs::create_dir_all(&docs_dir);
-                spec.volumes.push(VolumeMount {
-                    source: docs_dir.display().to_string(),
-                    target: "/workspace/Documents".to_string(),
-                    read_only: false,
-                });
-                spec.environment
-                    .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
+                if !spec
+                    .volumes
+                    .iter()
+                    .any(|v| v.target == "/workspace/Documents")
+                {
+                    spec.volumes.push(VolumeMount {
+                        source: docs_dir.display().to_string(),
+                        target: "/workspace/Documents".to_string(),
+                        read_only: false,
+                    });
+                }
+                if !spec
+                    .environment
+                    .iter()
+                    .any(|e| e.starts_with("DOCUMENTS_DIR="))
+                {
+                    spec.environment
+                        .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
+                }
 
                 match docker.launch(&agent.id, &spec).await {
                     Ok(info) => {
@@ -192,6 +215,86 @@ async fn reconcile_agents(
             ("stopped", false) => {}
 
             _ => {}
+        }
+    }
+}
+
+/// Reconcile published app containers — restart any that should be running but aren't.
+async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
+    // Query apps that were running or starting
+    let apps: Vec<(String, String, Option<String>, Option<String>, i64)> = {
+        let conn = db.conn();
+        let mut stmt = match conn.prepare(
+            "SELECT id, agent_id, start_command, image, port FROM apps
+             WHERE status IN ('running', 'starting') AND start_command IS NOT NULL",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .unwrap_or_else(|_| panic!("query apps"))
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    for (app_id, agent_id, start_command, image, port) in apps {
+        let container_name = format!("app-{app_id}");
+        if docker.is_container_running(&container_name).await {
+            continue; // Already running
+        }
+
+        let Some(cmd) = start_command else { continue };
+        let image = image.unwrap_or_else(|| "node:20-alpine".to_string());
+        let app_port = port as u16;
+
+        info!(app_id, "restarting app container");
+
+        let volume_name = format!("xpressclaw-workspace-{agent_id}");
+        let spec = crate::docker::manager::ContainerSpec {
+            image,
+            memory_limit: Some(512 * 1024 * 1024),
+            cpu_limit: None,
+            environment: vec![format!("APP_ID={app_id}"), format!("PORT={app_port}")],
+            volumes: vec![VolumeMount {
+                source: volume_name,
+                target: "/workspace".to_string(),
+                read_only: true,
+            }],
+            network_mode: Some("bridge".to_string()),
+            expose_port: Some(app_port),
+            cmd: Some(vec!["sh".to_string(), "-c".to_string(), cmd]),
+            working_dir: Some(format!("/workspace/apps/{app_id}")),
+        };
+
+        match docker.launch(&container_name, &spec).await {
+            Ok(info) => {
+                let conn = db.conn();
+                let _ = conn.execute(
+                    "UPDATE apps SET container_id = ?1, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                    rusqlite::params![info.container_id, app_id],
+                );
+                info!(
+                    app_id,
+                    container_id = &info.container_id[..12],
+                    "app restarted"
+                );
+            }
+            Err(e) => {
+                warn!(app_id, error = %e, "failed to restart app");
+                let conn = db.conn();
+                let _ = conn.execute(
+                    "UPDATE apps SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [&app_id],
+                );
+            }
         }
     }
 }
