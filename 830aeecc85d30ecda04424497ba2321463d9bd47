@@ -1,0 +1,5 @@
+ADR-019: background conversations.
+Key concepts: fire-and-forget POST, event bus with broadcast channels,
+SSE reconnect with after_message_id replay, processing loop that checks
+for queued messages, conversation state machine (idle/processing/closed).
+Enables: navigate away, queue messages, agent handoffs, cron jobs.
