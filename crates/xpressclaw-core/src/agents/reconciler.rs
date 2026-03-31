@@ -219,11 +219,17 @@ async fn reconcile_agents(
     }
 }
 
+struct AppRow {
+    id: String,
+    agent_id: String,
+    start_command: Option<String>,
+    image: Option<String>,
+    port: i64,
+}
+
 /// Reconcile published app containers — restart any that should be running but aren't.
-#[allow(clippy::type_complexity)]
 async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
-    // Query apps that were running or starting
-    let apps: Vec<(String, String, Option<String>, Option<String>, i64)> = {
+    let apps: Vec<AppRow> = {
         let conn = db.conn();
         let mut stmt = match conn.prepare(
             "SELECT id, agent_id, start_command, image, port FROM apps
@@ -233,28 +239,32 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             Err(_) => return,
         };
         stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
+            Ok(AppRow {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                start_command: row.get(2)?,
+                image: row.get(3)?,
+                port: row.get(4)?,
+            })
         })
         .unwrap_or_else(|_| panic!("query apps"))
         .filter_map(|r| r.ok())
         .collect()
     };
 
-    for (app_id, agent_id, start_command, image, port) in apps {
+    for app in apps {
+        let app_id = &app.id;
+        let agent_id = &app.agent_id;
         let container_name = format!("app-{app_id}");
         if docker.is_container_running(&container_name).await {
             continue; // Already running
         }
 
-        let Some(cmd) = start_command else { continue };
-        let image = image.unwrap_or_else(|| "node:20-alpine".to_string());
-        let app_port = port as u16;
+        let Some(cmd) = app.start_command else {
+            continue;
+        };
+        let image = app.image.unwrap_or_else(|| "node:20-alpine".to_string());
+        let app_port = app.port as u16;
 
         info!(app_id, "restarting app container");
 
