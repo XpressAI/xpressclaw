@@ -1,0 +1,8 @@
+ADR-019 background conversations implemented:
+- DB migration v16: processed flag on messages, processing_status on conversations
+- ConversationEventBus: per-conversation broadcast channels
+- Processor: background task loops on unprocessed messages, broadcasts events
+- send_message: fire-and-forget, stores user msg, spawns processor
+- GET /conversations/{id}/events: SSE with replay from after_message_id
+- Frontend: EventSource subscription, dedup on replay, cleanup on unmount
+- Old stream_message kept for backward compat
