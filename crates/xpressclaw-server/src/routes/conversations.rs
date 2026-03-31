@@ -116,6 +116,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/messages", get(get_messages).post(send_message))
         .route("/{id}/messages/stream", axum::routing::post(stream_message))
+        .route("/{id}/events", get(subscribe_events))
         .route(
             "/{id}/participants",
             get(get_participants).post(add_participant),
@@ -206,17 +207,19 @@ async fn get_messages(
     Ok(Json(json!(msgs)))
 }
 
+/// Fire-and-forget message send (ADR-019).
+/// Stores the user message, spawns a background task for agent response,
+/// and returns immediately with the stored user message.
 async fn send_message(
     State(state): State<AppState>,
     Path(conv_id): Path<String>,
     Json(req): Json<SendMessageInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
-    let config = state.config();
 
-    // Store user message
+    // Store user message as unprocessed
     let user_msg = mgr
-        .send_message(
+        .send_user_message(
             &conv_id,
             &SendMessage {
                 sender_type: "user".into(),
@@ -228,239 +231,112 @@ async fn send_message(
         )
         .map_err(internal_error)?;
 
-    let mut messages = vec![json!(user_msg)];
+    // Broadcast the user message to any connected event subscribers
+    state.event_bus.send(
+        &conv_id,
+        xpressclaw_core::conversations::event_bus::ConversationEvent::Message {
+            message: json!(user_msg),
+        },
+    );
 
-    // Resolve which agents should respond
-    let target_agents = mgr
-        .resolve_target_agents(&conv_id, &req.content)
-        .map_err(internal_error)?;
+    // Spawn background processor if not already running
+    if !mgr.is_processing(&conv_id) {
+        if let Some(llm_router) = state.llm_router() {
+            let config = state.config();
+            let agent_skills_map = config
+                .agents
+                .iter()
+                .map(|a| {
+                    let role = append_skills(&a.role, &a.skills, &state.config_path);
+                    (a.name.clone(), role)
+                })
+                .collect();
 
-    if let Some(llm_router) = state.llm_router() {
-        let registry = AgentRegistry::new(state.db.clone());
-        let budget_mgr = BudgetManager::new(state.db.clone(), state.config());
-        let cost_tracker =
-            CostTracker::with_custom_pricing(state.db.clone(), &state.config().llm.custom_pricing);
-        let rate_limiter = state.rate_limiter();
-
-        for agent_id in &target_agents {
-            // Check budget before calling LLM
-            match budget_mgr.check_budget(agent_id) {
-                Ok(false) => {
-                    let err_msg = mgr
-                        .send_message(
-                            &conv_id,
-                            &SendMessage {
-                                sender_type: "agent".into(),
-                                sender_id: agent_id.clone(),
-                                sender_name: Some(agent_id.clone()),
-                                content: format!(
-                                    "*Budget exceeded for agent {}. Message not sent.*",
-                                    agent_id
-                                ),
-                                message_type: Some("system".into()),
-                            },
-                        )
-                        .map_err(internal_error)?;
-                    messages.push(json!(err_msg));
-                    continue;
-                }
-                Err(e) => {
-                    let err_msg = mgr
-                        .send_message(
-                            &conv_id,
-                            &SendMessage {
-                                sender_type: "agent".into(),
-                                sender_id: agent_id.clone(),
-                                sender_name: Some(agent_id.clone()),
-                                content: format!("*{}*", e),
-                                message_type: Some("system".into()),
-                            },
-                        )
-                        .map_err(internal_error)?;
-                    messages.push(json!(err_msg));
-                    continue;
-                }
-                Ok(true) => {} // within budget
-            }
-
-            // Check rate limits
-            if let RateLimitResult::RequestsExceeded { limit, .. }
-            | RateLimitResult::TokensExceeded { limit, .. } = rate_limiter.check(agent_id)
-            {
-                let err_msg = mgr
-                    .send_message(
-                        &conv_id,
-                        &SendMessage {
-                            sender_type: "agent".into(),
-                            sender_id: agent_id.clone(),
-                            sender_name: Some(agent_id.clone()),
-                            content: format!(
-                                "*Rate limit reached for agent {} ({}/min). Please wait.*",
-                                agent_id, limit
-                            ),
-                            message_type: Some("system".into()),
-                        },
-                    )
-                    .map_err(internal_error)?;
-                messages.push(json!(err_msg));
-                continue;
-            }
-
-            // Look up agent runtime state (DB) + config (YAML)
-            let agent = match registry.get(agent_id) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
-
-            let model = agent_cfg
-                .and_then(|c| c.model.as_deref())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    llm_router
-                        .models()
-                        .first()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_else(|| "local".to_string())
-                });
-
-            let base_role = agent_cfg
-                .map(|c| c.role.as_str())
-                .unwrap_or("You are a helpful AI assistant.");
-            let agent_skills = agent_cfg.map(|c| &c.skills[..]).unwrap_or(&[]);
-            let role = append_skills(base_role, agent_skills, &state.config_path);
-
-            let history = mgr.get_messages(&conv_id, 20, None).unwrap_or_default();
-
-            let mut llm_messages = vec![ChatMessage::text("system", &role)];
-            for m in &history {
-                let r = match m.sender_type.as_str() {
-                    "agent" => "assistant",
-                    _ => "user",
-                };
-                llm_messages.push(ChatMessage::text(r, &m.content));
-            }
-
-            let llm_req = ChatCompletionRequest {
-                model: model.clone(),
-                messages: llm_messages,
-                temperature: Some(0.7),
-                max_tokens: Some(4096),
-                ..Default::default()
-            };
-
-            // Route through harness container if running, otherwise LLM router directly.
-            // The harness handles the agent reasoning loop (tool calls, multi-step, etc.)
-            // and calls back to the server for LLM access and MCP tools.
-            let resp = if let Some(ref cid) = agent.container_id {
-                // Agent has a container — try to find its host_port
-                match xpressclaw_core::docker::manager::DockerManager::connect().await {
-                    Ok(docker) => match docker.get_container_port(cid).await {
-                        Some(port) => {
-                            let harness =
-                                xpressclaw_core::agents::harness::HarnessClient::new(port);
-                            tracing::info!(
-                                agent_id,
-                                port,
-                                "routing message through harness container"
-                            );
-                            harness.chat(&llm_req).await
-                        }
-                        None => {
-                            tracing::warn!(
-                                agent_id,
-                                container_id = cid,
-                                "container has no host port, falling back to LLM router"
-                            );
-                            llm_router.chat(&llm_req).await
-                        }
-                    },
-                    Err(_) => {
-                        tracing::warn!(
-                            agent_id,
-                            "Docker not available, falling back to LLM router"
-                        );
-                        llm_router.chat(&llm_req).await
-                    }
-                }
-            } else {
-                // No container (containerless mode) — call LLM router directly
-                llm_router.chat(&llm_req).await
-            };
-
-            match resp {
-                Ok(resp) => {
-                    // Record usage and update budget
-                    if let Some(ref usage) = resp.usage {
-                        let _ = cost_tracker.record(
-                            agent_id,
-                            &model,
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            "chat",
-                            Some(&conv_id),
-                        );
-                        let cost = cost_tracker.pricing().calculate(
-                            &model,
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            0,
-                            0,
-                        );
-                        let _ = budget_mgr.update_spending(agent_id, cost);
-                        rate_limiter.record_request(agent_id, usage.total_tokens as u32);
-                    }
-
-                    if let Some(choice) = resp.choices.first() {
-                        // Include reasoning/thinking content if present
-                        let mut content = String::new();
-                        if let Some(ref reasoning) = choice.message.reasoning_content {
-                            if !reasoning.is_empty() {
-                                content.push_str("<think>");
-                                content.push_str(reasoning);
-                                content.push_str("</think>\n\n");
-                            }
-                        }
-                        content.push_str(&choice.message.content);
-
-                        let agent_msg = mgr
-                            .send_message(
-                                &conv_id,
-                                &SendMessage {
-                                    sender_type: "agent".into(),
-                                    sender_id: agent_id.clone(),
-                                    sender_name: Some(agent_id.clone()),
-                                    content,
-                                    message_type: None,
-                                },
-                            )
-                            .map_err(internal_error)?;
-                        messages.push(json!(agent_msg));
-                    }
-                }
-                Err(e) => {
-                    let err_msg = mgr
-                        .send_message(
-                            &conv_id,
-                            &SendMessage {
-                                sender_type: "agent".into(),
-                                sender_id: agent_id.clone(),
-                                sender_name: Some(agent_id.clone()),
-                                content: format!("*Error: {e}*"),
-                                message_type: Some("system".into()),
-                            },
-                        )
-                        .map_err(internal_error)?;
-                    messages.push(json!(err_msg));
-                }
-            }
+            xpressclaw_core::conversations::processor::spawn(
+                conv_id.clone(),
+                xpressclaw_core::conversations::processor::ProcessorContext {
+                    db: state.db.clone(),
+                    config,
+                    llm_router,
+                    event_bus: state.event_bus.clone(),
+                    rate_limiter: state.rate_limiter(),
+                    agent_roles: agent_skills_map,
+                },
+            );
         }
     }
 
-    Ok((StatusCode::CREATED, Json(json!(messages))))
+    // Return immediately with the user message — agent response
+    // will be processed in the background and delivered via SSE events.
+    Ok((StatusCode::CREATED, Json(json!([user_msg]))))
 }
 
 /// Streaming version of send_message. Returns SSE events:
+/// SSE event subscription for a conversation (ADR-019).
+/// Replays messages after `after` ID, then streams live events.
+/// The client can disconnect and reconnect — missed messages are
+/// replayed from the DB on reconnect.
+#[derive(Deserialize)]
+struct EventsQuery {
+    after: Option<i64>,
+}
+
+async fn subscribe_events(
+    State(state): State<AppState>,
+    Path(conv_id): Path<String>,
+    Query(query): Query<EventsQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let after_id = query.after.unwrap_or(0);
+    let db = state.db.clone();
+    let event_bus = state.event_bus.clone();
+
+    let stream = async_stream::stream! {
+        // Replay missed messages from DB
+        let mgr = ConversationManager::new(db.clone());
+        if let Ok(missed) = mgr.get_messages_after(&conv_id, after_id) {
+            for msg in missed {
+                if let Ok(evt) = Event::default().event("message").json_data(json!(msg)) {
+                    yield Ok(evt);
+                }
+            }
+        }
+
+        // Subscribe to live events
+        let mut rx = event_bus.subscribe(&conv_id);
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let event_type = match &event {
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Thinking { .. } => "thinking",
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Chunk { .. } => "chunk",
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Message { .. } => "message",
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Error { .. } => "error",
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Done => "done",
+                    };
+                    if let Ok(data) = serde_json::to_string(&event) {
+                        yield Ok(Event::default().event(event_type).data(data));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Slow consumer — send a hint to reconnect with after_id
+                    tracing::warn!(conv_id = %conv_id, lagged = n, "SSE consumer lagged, events dropped");
+                    if let Ok(evt) = Event::default().event("error").json_data(json!({
+                        "type": "error",
+                        "error": format!("Missed {n} events. Refresh to catch up."),
+                    })) {
+                        yield Ok(evt);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Streaming version of send_message (legacy — kept for backward compat).
+/// Returns SSE events:
 /// - `user_message`: the stored user message
 /// - `thinking`: agent is about to generate a response
 /// - `chunk`: a token chunk from the agent
