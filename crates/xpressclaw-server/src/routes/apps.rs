@@ -221,18 +221,28 @@ async fn publish_app(
     {
         let icon = req.icon.as_deref().unwrap_or("");
         let desc = req.description.as_deref().unwrap_or("");
+        let start_cmd = req.start_command.as_deref().unwrap_or("");
         let db = state.db.conn();
         db.execute(
-            "INSERT INTO apps (id, title, icon, description, agent_id, port, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting')
+            "INSERT INTO apps (id, title, icon, description, agent_id, port, status, start_command)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 icon = excluded.icon,
                 description = excluded.description,
+                start_command = excluded.start_command,
                 source_version = source_version + 1,
                 status = 'starting',
                 updated_at = CURRENT_TIMESTAMP",
-            [&req.id, &req.title, icon, desc, &req.agent_id, &port_str],
+            [
+                &req.id,
+                &req.title,
+                icon,
+                desc,
+                &req.agent_id,
+                &port_str,
+                start_cmd,
+            ],
         )
         .map_err(|e| {
             (
@@ -262,6 +272,12 @@ async fn publish_app(
         } else {
             "alpine:latest"
         };
+
+        // Persist image for reconciler restarts
+        {
+            let db = state.db.conn();
+            let _ = db.execute("UPDATE apps SET image = ?1 WHERE id = ?2", [image, &req.id]);
+        }
 
         let spec = ContainerSpec {
             image: image.to_string(),

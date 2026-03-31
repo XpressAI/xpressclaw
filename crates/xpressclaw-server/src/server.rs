@@ -83,13 +83,47 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port).await;
     });
 
-    let app = create_router(state);
+    let app = create_router(state.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     info!("xpressclaw server listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Graceful shutdown: stop all agent and app containers
+    info!("shutting down — stopping containers");
+    if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
+        let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
+        if let Ok(agents) = registry.list() {
+            for agent in &agents {
+                let _ = docker.stop(&agent.id).await;
+            }
+        }
+        // Stop app containers
+        let apps: Vec<String> = {
+            let conn = state.db.conn();
+            conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))
+                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        };
+        for app_id in &apps {
+            let _ = docker.stop(&format!("app-{app_id}")).await;
+        }
+        info!("all containers stopped");
+    }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
+    info!("received shutdown signal");
 }

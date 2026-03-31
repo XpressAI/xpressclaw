@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
+use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
@@ -28,6 +29,8 @@ pub struct AppState {
     pub download_progress: Arc<RwLock<DownloadProgress>>,
     /// MCP tool server manager.
     pub mcp_manager: Arc<McpManager>,
+    /// Per-conversation event broadcast channels (ADR-019).
+    pub event_bus: Arc<ConversationEventBus>,
 }
 
 impl AppState {
@@ -50,6 +53,7 @@ impl AppState {
             #[cfg(feature = "local-llm")]
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
+            event_bus: Arc::new(ConversationEventBus::new()),
         }
     }
 

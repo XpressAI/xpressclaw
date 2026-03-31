@@ -135,6 +135,8 @@ impl Database {
             (12, MIGRATION_V12),
             (13, MIGRATION_V13),
             (14, MIGRATION_V14),
+            (15, MIGRATION_V15),
+            (16, MIGRATION_V16),
         ];
 
         for &(target, sql) in migrations {
@@ -516,6 +518,23 @@ UPDATE agents SET desired_status = 'running'
     WHERE status IN ('running', 'starting');
 ";
 
+const MIGRATION_V15: &str = "
+-- Store app start_command so the reconciler can restart apps.
+ALTER TABLE apps ADD COLUMN start_command TEXT;
+ALTER TABLE apps ADD COLUMN image TEXT;
+";
+
+const MIGRATION_V16: &str = "
+-- ADR-019: Background conversations.
+-- Track which messages have been processed by the agent so the
+-- background task knows what to respond to.
+ALTER TABLE conversation_messages ADD COLUMN processed INTEGER NOT NULL DEFAULT 1;
+-- New user messages start as unprocessed (0). Existing messages are already processed.
+
+-- Track whether a background task is active for a conversation.
+ALTER TABLE conversations ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'idle';
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +552,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "14");
+        assert_eq!(version, "16");
     }
 
     #[test]
