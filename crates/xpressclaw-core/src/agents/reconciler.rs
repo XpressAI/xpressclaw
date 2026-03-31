@@ -220,6 +220,7 @@ async fn reconcile_agents(
 }
 
 /// Reconcile published app containers — restart any that should be running but aren't.
+#[allow(clippy::type_complexity)]
 async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
     // Query apps that were running or starting
     let apps: Vec<(String, String, Option<String>, Option<String>, i64)> = {

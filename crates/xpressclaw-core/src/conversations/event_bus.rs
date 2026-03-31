@@ -4,7 +4,7 @@
 //! events are dropped — the stored message in the DB is the source of truth.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 use serde::Serialize;
 use tokio::sync::broadcast;
