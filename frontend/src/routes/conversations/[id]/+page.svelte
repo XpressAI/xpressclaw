@@ -84,6 +84,9 @@
 			await tick();
 			scrollToBottom();
 
+			// Subscribe to live events (ADR-019)
+			subscribeToEvents();
+
 			const pendingMsg = $page.url.searchParams.get('msg');
 			if (pendingMsg) {
 				const url = new URL($page.url);
@@ -96,27 +99,23 @@
 		} catch (e) {
 			error = String(e);
 		}
+
+		return () => {
+			// Cleanup SSE subscription on unmount
+			if (cancelStream) cancelStream();
+		};
 	}
 
-	async function sendMessage() {
-		if (!input.trim() || sending || !conv) return;
-
-		const content = input.trim();
-		input = '';
-		sending = true;
-		error = null;
-		thinkingAgent = null;
-		streamingContent = '';
-
-		const abort = conversations.streamMessage(conv.id, content, userProfile.name, {
-			onUserMessage: async (msg) => {
-				messages = [...messages, msg];
-				await tick();
-				scrollToBottom();
-			},
+	// Subscribe to SSE events for this conversation (ADR-019).
+	// Handles thinking, chunks, messages, and errors from the background processor.
+	function subscribeToEvents() {
+		if (!conv) return;
+		const lastId = messages.length > 0 ? messages[messages.length - 1].id : 0;
+		cancelStream = conversations.subscribeEvents(conv.id, lastId, {
 			onThinking: async (agentId) => {
 				thinkingAgent = agentId;
 				streamingContent = '';
+				sending = true;
 				await tick();
 				scrollToBottom();
 			},
@@ -128,7 +127,10 @@
 			onAgentMessage: async (msg) => {
 				thinkingAgent = null;
 				streamingContent = '';
-				messages = [...messages, msg];
+				// Avoid duplicates (replay can send messages we already have)
+				if (!messages.some(m => m.id === msg.id)) {
+					messages = [...messages, msg];
+				}
 				await tick();
 				scrollToBottom();
 			},
@@ -139,11 +141,37 @@
 				sending = false;
 				thinkingAgent = null;
 				streamingContent = '';
-				cancelStream = null;
 			}
 		});
+	}
 
-		cancelStream = abort;
+	async function sendMessage() {
+		if (!input.trim() || !conv) return;
+
+		const content = input.trim();
+		input = '';
+		error = null;
+
+		try {
+			// Fire-and-forget: store user message, background processor handles the rest
+			const result = await conversations.sendMessage(conv.id, content, userProfile.name);
+			// Add user message to local list (result is [userMsg])
+			if (Array.isArray(result) && result.length > 0) {
+				const userMsg = result[0];
+				if (!messages.some(m => m.id === userMsg.id)) {
+					messages = [...messages, userMsg];
+				}
+			}
+			await tick();
+			scrollToBottom();
+
+			// Ensure we're subscribed to events (reconnect if needed)
+			if (!cancelStream) {
+				subscribeToEvents();
+			}
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
 	}
 
 	function scrollToBottom() {

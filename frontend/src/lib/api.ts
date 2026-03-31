@@ -150,6 +150,36 @@ export const conversations = {
 
 		return () => controller.abort();
 	},
+	/** Subscribe to conversation events via SSE (ADR-019).
+	 * Replays missed messages from DB, then streams live events.
+	 * Returns a cleanup function to close the connection. */
+	subscribeEvents: (id: string, afterMessageId: number, callbacks: StreamCallbacks): (() => void) => {
+		const url = `${BASE}/api/conversations/${id}/events?after=${afterMessageId}`;
+		const eventSource = new EventSource(url);
+
+		eventSource.addEventListener('thinking', (e) => {
+			try { callbacks.onThinking?.(JSON.parse(e.data).agent_id); } catch {}
+		});
+		eventSource.addEventListener('chunk', (e) => {
+			try {
+				const d = JSON.parse(e.data);
+				callbacks.onChunk?.(d.agent_id, d.content);
+			} catch {}
+		});
+		eventSource.addEventListener('message', (e) => {
+			try { callbacks.onAgentMessage?.(JSON.parse(e.data)); } catch {}
+		});
+		eventSource.addEventListener('error', (e) => {
+			if (e instanceof MessageEvent) {
+				try { const d = JSON.parse(e.data); callbacks.onError?.(d.agent_id ?? null, d.error); } catch {}
+			}
+		});
+		eventSource.addEventListener('done', () => {
+			callbacks.onDone?.();
+		});
+
+		return () => eventSource.close();
+	},
 	addParticipant: (id: string, participantType: string, participantId: string) =>
 		request<void>(`/api/conversations/${id}/participants`, {
 			method: 'POST',
