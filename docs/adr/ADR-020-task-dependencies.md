@@ -167,24 +167,67 @@ fn topological_sort(tasks: &[Task]) -> Vec<&Task> {
 
 ### 7. MCP Tool Changes
 
-**`create_task`** — add `depends_on` parameter:
+**`create_tasks`** — batch creation with inline dependencies:
+
+A single tool call creates an entire task graph. This is critical for small models — one call instead of N sequential calls with dependency wiring.
+
 ```json
 {
-    "name": "create_task",
+    "name": "create_tasks",
+    "description": "Create one or more tasks with dependencies. Use local IDs (any string) to reference tasks within this batch. Dependencies can reference local IDs (for tasks in this batch) or existing task UUIDs.",
     "inputSchema": {
+        "type": "object",
         "properties": {
-            "title": { "type": "string" },
-            "depends_on": {
+            "tasks": {
                 "type": "array",
-                "items": { "type": "string" },
-                "description": "Task IDs that must complete before this task can start"
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Local ID for referencing within this batch (e.g. 'build', 'test'). The system assigns real UUIDs." },
+                        "title": { "type": "string" },
+                        "description": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "depends_on": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Local IDs or existing task UUIDs that must complete first"
+                        }
+                    },
+                    "required": ["title"]
+                }
+            },
+            "parent_task_id": {
+                "type": "string",
+                "description": "If set, all tasks in this batch become subtasks of this parent"
             }
-        }
+        },
+        "required": ["tasks"]
     }
 }
 ```
 
-**`add_dependency`** — new tool:
+Example — model creates a deploy pipeline in one call:
+```json
+{
+    "tasks": [
+        { "id": "build", "title": "Build frontend", "agent_id": "dev" },
+        { "id": "test", "title": "Run unit tests", "agent_id": "dev", "depends_on": ["build"] },
+        { "id": "lint", "title": "Run linter", "agent_id": "dev", "depends_on": ["build"] },
+        { "id": "deploy", "title": "Deploy to staging", "agent_id": "ops", "depends_on": ["test", "lint"] }
+    ]
+}
+```
+
+The system:
+1. Validates the graph (no cycles)
+2. Maps local IDs → real UUIDs
+3. Creates all tasks atomically
+4. Inserts all dependency edges
+5. Returns the created tasks with real IDs
+
+The old `create_task` (singular) still works for simple cases — it's equivalent to `create_tasks` with a single-element array.
+
+**`add_dependency`** — for adding dependencies to existing tasks:
 ```json
 {
     "name": "add_dependency",
