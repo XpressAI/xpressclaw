@@ -1,12 +1,50 @@
 use reqwest::Client;
+use serde::Serialize;
 use tracing::debug;
 
 use crate::error::{Error, Result};
 
 use super::router::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatStream, LlmProvider,
-    ModelInfo,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatStream,
+    LlmProvider, ModelInfo,
 };
+
+/// OpenAI API request body using `max_completion_tokens` (required by newer models).
+#[derive(Debug, Clone, Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+}
+
+impl From<&ChatCompletionRequest> for OpenAiRequest {
+    fn from(req: &ChatCompletionRequest) -> Self {
+        Self {
+            model: req.model.clone(),
+            messages: req.messages.clone(),
+            temperature: req.temperature,
+            max_completion_tokens: req.max_tokens,
+            stream: req.stream,
+            top_p: req.top_p,
+            stop: req.stop.clone(),
+            tools: req.tools.clone(),
+            tool_choice: req.tool_choice.clone(),
+        }
+    }
+}
 
 /// OpenAI-compatible provider.
 ///
@@ -79,7 +117,8 @@ impl LlmProvider for OpenAiProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
-        let mut req = self.client.post(&url).json(request);
+        let openai_req = OpenAiRequest::from(request);
+        let mut req = self.client.post(&url).json(&openai_req);
 
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
@@ -113,10 +152,10 @@ impl LlmProvider for OpenAiProvider {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         // Force stream=true
-        let mut stream_req = request.clone();
-        stream_req.stream = Some(true);
+        let mut openai_req = OpenAiRequest::from(request);
+        openai_req.stream = Some(true);
 
-        let mut req = self.client.post(&url).json(&stream_req);
+        let mut req = self.client.post(&url).json(&openai_req);
 
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
