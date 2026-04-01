@@ -8,11 +8,26 @@ fn main() {
     let build_dir = frontend_dir.join("build");
 
     // Tell Cargo to rerun this script if any frontend source changes
-    println!("cargo:rerun-if-changed={}", frontend_dir.join("src").display());
-    println!("cargo:rerun-if-changed={}", frontend_dir.join("static").display());
-    println!("cargo:rerun-if-changed={}", frontend_dir.join("svelte.config.js").display());
-    println!("cargo:rerun-if-changed={}", frontend_dir.join("vite.config.ts").display());
-    println!("cargo:rerun-if-changed={}", frontend_dir.join("package.json").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend_dir.join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend_dir.join("static").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend_dir.join("svelte.config.js").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend_dir.join("vite.config.ts").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        frontend_dir.join("package.json").display()
+    );
 
     // Skip frontend build if already built (e.g. CI pre-builds it)
     if build_dir.join("index.html").exists() {
