@@ -5,7 +5,7 @@ exports_files(["Cargo.toml"])
 rust_library(
     name = "xpressclaw-server",
     srcs = glob(["src/**/*.rs"]),
-    # Frontend must be built before the server (rust-embed reads frontend/build/)
+    # Frontend tree artifact — Bazel tracks its contents for cache invalidation.
     compile_data = ["//frontend:build", "//:templates"],
     # Must run locally — rust-embed reads frontend/build/ at compile time
     tags = ["local"],

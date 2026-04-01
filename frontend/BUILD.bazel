@@ -1,10 +1,15 @@
-# Frontend SvelteKit build
+load("//frontend:frontend.bzl", "frontend_build")
+
 exports_files([
     "package.json",
     "package-lock.json",
 ])
 
-genrule(
+# Builds the SvelteKit frontend as a tree artifact.
+# Bazel tracks the entire build/ directory contents, so downstream
+# crates (xpressclaw-server via rust-embed) properly invalidate
+# when frontend assets change.
+frontend_build(
     name = "build",
     srcs = glob([
         "src/**",
@@ -13,27 +18,6 @@ genrule(
         "*.json",
         "postcss.config.js",
     ]),
-    outs = ["build_stamp"],
-    cmd = """
-        set -e
-        OUT_FILE="$$PWD/$@"
-        FRONTEND=$$(cd $$(dirname $(location package.json)) && pwd -P)
-        cd "$$FRONTEND"
-        # Skip if already built (e.g. CI downloads pre-built frontend artifact)
-        if [ ! -d build ] || [ ! -f build/index.html ]; then
-            npm ci --silent 2>/dev/null
-            npm run build 2>&1
-        fi
-        # Copy build output next to the stamp file in bazel-out/.
-        # rust-embed resolves #[folder] relative to CARGO_MANIFEST_DIR which
-        # rules_rust sets to bazel-out/.../bin/crates/xpressclaw-server/.
-        # From there, ../../frontend/build/ lands in bazel-out/.../bin/frontend/build/.
-        rm -rf "$$(dirname "$$OUT_FILE")/build"
-        cp -r build "$$(dirname "$$OUT_FILE")/build"
-        # Stamp file contains a hash of the build output so Bazel's disk cache
-        # invalidates the server compilation when frontend content changes.
-        find build -type f | sort | xargs cat | shasum -a 256 | cut -d' ' -f1 > "$$OUT_FILE"
-    """,
-    local = True,
+    package_json = "package.json",
     visibility = ["//visibility:public"],
 )

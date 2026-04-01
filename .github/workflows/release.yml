@@ -49,7 +49,7 @@ jobs:
       # System dependencies
       - name: Install macOS build deps
         if: runner.os == 'macOS'
-        run: brew install cmake
+        run: brew install cmake bazelisk
 
       - name: Install Windows build deps
         if: runner.os == 'Windows'
@@ -91,10 +91,11 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # macOS: build with build.sh (Cargo + Tauri)
+      # macOS: build with build.sh (Bazel + Tauri)
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
+          CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}

@@ -15,6 +15,7 @@ for arg in "$@"; do
     case "$arg" in
         --clean)
             echo "==> Cleaning..."
+            bazel clean --expunge 2>/dev/null || true
             cargo clean 2>/dev/null || true
             rm -rf frontend/build frontend/.svelte-kit frontend/node_modules
             rm -rf crates/xpressclaw-tauri/binaries
@@ -29,19 +30,17 @@ for arg in "$@"; do
     esac
 done
 
-# Build frontend (SvelteKit → frontend/build/)
-echo "==> Building frontend..."
-cd frontend
-npm ci --silent 2>/dev/null || npm install --silent
-npm run build
-cd ..
+# Install frontend deps so the Bazel frontend_build rule can skip npm ci
+echo "==> Installing frontend dependencies..."
+cd frontend && npm ci --silent 2>/dev/null && cd ..
 
-# Build CLI with Cargo (release mode disables debug_assertions so
-# rust-embed statically embeds frontend/build/ into the binary).
-echo "==> Building CLI..."
-cargo build --release -p xpressclaw-cli
+# Build with Bazel
+# -c opt disables debug_assertions so rust-embed statically embeds
+# frontend files instead of reading them from the filesystem at runtime.
+echo "==> Building with Bazel..."
+bazel build -c opt //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
 
-# Copy CLI as Tauri sidecar
+# Copy Bazel-built CLI as Tauri sidecar (before tests, which reset bazel-bin symlink)
 echo "==> Copying CLI binary as Tauri sidecar..."
 if [ -n "$TARGET_OVERRIDE" ]; then
     TARGET_TRIPLE="$TARGET_OVERRIDE"
@@ -49,12 +48,12 @@ else
     TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
 fi
 mkdir -p crates/xpressclaw-tauri/binaries
-cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
 echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
-    cargo test -p xpressclaw-core -p xpressclaw-server
+    bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
 fi
 
 if [ "$SKIP_TAURI" = false ]; then
