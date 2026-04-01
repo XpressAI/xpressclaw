@@ -250,6 +250,41 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             prompt.push('\n');
         }
 
+        // Include completed dependency context (ADR-020).
+        // Show the agent what its prerequisite tasks produced.
+        let board = TaskBoard::new(db.clone());
+        let deps = board.get_dependencies(&ctx.task.id).unwrap_or_default();
+        if !deps.is_empty() {
+            let mut dep_context = Vec::new();
+            for dep_id in &deps {
+                if let Ok(dep_task) = board.get(dep_id) {
+                    let last_msg = conv
+                        .get_messages(dep_id)
+                        .unwrap_or_default()
+                        .last()
+                        .map(|m| m.content.clone())
+                        .unwrap_or_else(|| "(no output)".to_string());
+                    dep_context.push(format!(
+                        "- ✅ \"{}\" — {}\n",
+                        dep_task.title,
+                        if last_msg.len() > 200 {
+                            format!("{}...", &last_msg[..200])
+                        } else {
+                            last_msg
+                        }
+                    ));
+                }
+            }
+            if !dep_context.is_empty() {
+                prompt.push_str("## Completed Prerequisites\n");
+                prompt.push_str("These tasks completed before yours. Their results:\n");
+                for line in &dep_context {
+                    prompt.push_str(line);
+                }
+                prompt.push('\n');
+            }
+        }
+
         prompt.push_str(
             "Work on this task using the tools available to you. \
              When you are done, use the `complete_task` tool to mark it complete.",
@@ -607,6 +642,18 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             Some(c) => c,
             None => continue,
         };
+
+        // Check dependencies before dispatching (ADR-020).
+        // If not all dependencies are completed, skip this task for now.
+        if !board.is_ready(&claimed.task_id).unwrap_or(true) {
+            debug!(
+                task_id = claimed.task_id,
+                "task has unmet dependencies, re-queuing"
+            );
+            let _ = queue.fail(claimed.id, "dependencies not met");
+            let _ = queue.enqueue(&claimed.task_id, &claimed.agent_id);
+            continue;
+        }
 
         info!(
             task_id = claimed.task_id,
