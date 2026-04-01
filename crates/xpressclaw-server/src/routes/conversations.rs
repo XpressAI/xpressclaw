@@ -292,10 +292,11 @@ async fn subscribe_events(
 
     let stream = async_stream::stream! {
         // Replay missed messages from DB
+        // Use "agent_message" (not "message") to avoid EventSource default handler collision
         let mgr = ConversationManager::new(db.clone());
         if let Ok(missed) = mgr.get_messages_after(&conv_id, after_id) {
             for msg in missed {
-                if let Ok(evt) = Event::default().event("message").json_data(json!(msg)) {
+                if let Ok(evt) = Event::default().event("agent_message").json_data(json!(msg)) {
                     yield Ok(evt);
                 }
             }
@@ -306,10 +307,12 @@ async fn subscribe_events(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // Use "agent_message" instead of "message" to avoid EventSource
+                    // default handler collision (EventSource treats "message" specially)
                     let event_type = match &event {
                         xpressclaw_core::conversations::event_bus::ConversationEvent::Thinking { .. } => "thinking",
                         xpressclaw_core::conversations::event_bus::ConversationEvent::Chunk { .. } => "chunk",
-                        xpressclaw_core::conversations::event_bus::ConversationEvent::Message { .. } => "message",
+                        xpressclaw_core::conversations::event_bus::ConversationEvent::Message { .. } => "agent_message",
                         xpressclaw_core::conversations::event_bus::ConversationEvent::Error { .. } => "error",
                         xpressclaw_core::conversations::event_bus::ConversationEvent::Done => "done",
                     };
