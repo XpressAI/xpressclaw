@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "CLI for xpressclaw — the AI agent OS"
 
+[features]
+default = []
+cuda = ["xpressclaw-core/cuda", "xpressclaw-server/cuda"]
+metal = ["xpressclaw-core/metal", "xpressclaw-server/metal"]
+
 [[bin]]
 name = "xpressclaw"
 path = "src/main.rs"
