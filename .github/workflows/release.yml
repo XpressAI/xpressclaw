@@ -49,7 +49,7 @@ jobs:
       # System dependencies
       - name: Install macOS build deps
         if: runner.os == 'macOS'
-        run: brew install cmake bazelisk
+        run: brew install cmake
 
       - name: Install Windows build deps
         if: runner.os == 'Windows'
@@ -78,14 +78,9 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
-      # cargo fetch: pre-warm git cache — llama-cpp-rs submodule download
-      # can exceed crate_universe's default 600s timeout on cold runners.
+      # Pre-warm cargo git cache for llama-cpp-rs submodule.
       - name: Fetch Cargo dependencies
         run: cargo fetch
-
-      # npm ci: install frontend deps so the Bazel genrule can skip it.
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
 
       # Write notarization API key before build (macOS signing requires it).
       - name: Write API key
@@ -96,11 +91,10 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # macOS: build with build.sh (Bazel + Tauri)
+      # macOS: build with build.sh (Cargo + Tauri)
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
-          CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}

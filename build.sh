@@ -15,7 +15,6 @@ for arg in "$@"; do
     case "$arg" in
         --clean)
             echo "==> Cleaning..."
-            bazel clean --expunge 2>/dev/null || true
             cargo clean 2>/dev/null || true
             rm -rf frontend/build frontend/.svelte-kit frontend/node_modules
             rm -rf crates/xpressclaw-tauri/binaries
@@ -30,13 +29,19 @@ for arg in "$@"; do
     esac
 done
 
-# Build with Bazel (CLI, core, server + frontend)
-echo "==> Building with Bazel..."
-# -c opt: disables debug_assertions so rust-embed statically embeds
-# frontend files instead of reading them from the filesystem at runtime.
-bazel build -c opt //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
+# Build frontend (SvelteKit → frontend/build/)
+echo "==> Building frontend..."
+cd frontend
+npm ci --silent 2>/dev/null || npm install --silent
+npm run build
+cd ..
 
-# Copy Bazel-built CLI as Tauri sidecar (before tests, which reset bazel-bin symlink)
+# Build CLI with Cargo (release mode disables debug_assertions so
+# rust-embed statically embeds frontend/build/ into the binary).
+echo "==> Building CLI..."
+cargo build --release -p xpressclaw-cli
+
+# Copy CLI as Tauri sidecar
 echo "==> Copying CLI binary as Tauri sidecar..."
 if [ -n "$TARGET_OVERRIDE" ]; then
     TARGET_TRIPLE="$TARGET_OVERRIDE"
@@ -44,19 +49,15 @@ else
     TARGET_TRIPLE=$(rustc --print host-tuple 2>/dev/null || rustc -vV | grep host | cut -d' ' -f2)
 fi
 mkdir -p crates/xpressclaw-tauri/binaries
-cp "bazel-bin/crates/xpressclaw-cli/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+cp "target/release/xpressclaw" "crates/xpressclaw-tauri/binaries/xpressclaw-${TARGET_TRIPLE}"
+echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TEST" = false ]; then
     echo "==> Running tests..."
-    bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
+    cargo test -p xpressclaw-core -p xpressclaw-server
 fi
-echo "    Copied to binaries/xpressclaw-${TARGET_TRIPLE}"
 
 if [ "$SKIP_TAURI" = false ]; then
-    # Build the desktop app via Tauri CLI.
-    # TAURI_BUNDLER_DMG_IGNORE_CI: without this, Tauri detects CI=true and
-    # skips the AppleScript that styles the DMG (icon positioning, background,
-    # Applications folder shortcut). This is what tauri-action sets by default.
     echo "==> Building Tauri desktop app..."
     TAURI_BUNDLER_DMG_IGNORE_CI=true npx -y @tauri-apps/cli build --target "${TARGET_TRIPLE}"
 fi
