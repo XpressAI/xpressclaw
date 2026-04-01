@@ -49,7 +49,7 @@ jobs:
       # System dependencies
       - name: Install macOS build deps
         if: runner.os == 'macOS'
-        run: brew install cmake bazelisk
+        run: brew install cmake
 
       - name: Install Windows build deps
         if: runner.os == 'Windows'
@@ -91,20 +91,19 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # macOS: build with build.sh (Bazel + Tauri)
+      # macOS: build with build.sh (Cargo + Tauri)
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
-          CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
-      # Windows: build with build-cargo.ps1 (Cargo, bypasses Bazel path issues)
+      # Windows
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: powershell -File build-cargo.ps1 --skip-docker --target=${{ matrix.target }}
+        run: powershell -File build.ps1 --skip-docker --skip-check --target=${{ matrix.target }}
 
       - name: Upload macOS DMG
         if: runner.os == 'macOS'

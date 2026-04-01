@@ -12,7 +12,6 @@ foreach ($arg in $args) {
     switch -Regex ($arg) {
         "^--clean$" {
             Write-Host "==> Cleaning..."
-            bazel clean --expunge 2>$null
             cargo clean 2>$null
             Remove-Item -Recurse -Force frontend\build, frontend\.svelte-kit, frontend\node_modules -ErrorAction SilentlyContinue
             Remove-Item -Recurse -Force crates\xpressclaw-tauri\binaries -ErrorAction SilentlyContinue
@@ -26,28 +25,12 @@ foreach ($arg in $args) {
     }
 }
 
-# Ensure Bazel can find bash for genrules
-if (-not $env:BAZEL_SH) {
-    $gitBash = "C:\Program Files\Git\bin\bash.exe"
-    if (Test-Path $gitBash) {
-        $env:BAZEL_SH = $gitBash
-    }
-}
-
-# Use short output base to mitigate Windows path length issues.
-# cargo-bazel's canonicalize() produces \\?\ paths that break cargo/MSVC.
-$outputBase = "C:\b"
-New-Item -ItemType Directory -Force -Path $outputBase | Out-Null
-
-# Build with Bazel
-# -c opt: disables debug_assertions so rust-embed statically embeds
-# frontend files instead of reading them from the filesystem at runtime.
-Write-Host "==> Building with Bazel..."
-$env:CARGO_BAZEL_TIMEOUT = "1800"
-bazel --output_base=$outputBase build -c opt //crates/xpressclaw-cli:xpressclaw //crates/xpressclaw-core:xpressclaw-core //crates/xpressclaw-server:xpressclaw-server
+# Build CLI with Cargo (build.rs auto-builds frontend if needed)
+Write-Host "==> Building CLI..."
+cargo build --release -p xpressclaw-cli
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# Copy Bazel-built CLI as Tauri sidecar (before tests, which reset bazel-bin)
+# Copy CLI as Tauri sidecar
 Write-Host "==> Copying CLI binary as Tauri sidecar..."
 if ($TargetOverride) {
     $triple = $TargetOverride
@@ -56,12 +39,12 @@ if ($TargetOverride) {
 }
 $binDir = "crates\xpressclaw-tauri\binaries"
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
-Copy-Item "bazel-bin\crates\xpressclaw-cli\xpressclaw.exe" "$binDir\xpressclaw-$triple.exe"
+Copy-Item "target\release\xpressclaw.exe" "$binDir\xpressclaw-$triple.exe"
 Write-Host "    Copied to $binDir\xpressclaw-$triple.exe"
 
 if (-not $SkipTest) {
     Write-Host "==> Running tests..."
-    bazel --output_base=$outputBase test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
+    cargo test -p xpressclaw-core -p xpressclaw-server
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 

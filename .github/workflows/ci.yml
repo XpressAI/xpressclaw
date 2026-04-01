@@ -38,8 +38,8 @@ jobs:
       - run: npm run build
 
   # Bazel builds everything — frontend, Rust, C++ — from one graph
-  bazel:
-    name: Bazel (${{ matrix.os }})
+  build:
+    name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -67,29 +67,15 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake
 
-      # Bazelisk reads .bazelversion and downloads the right Bazel
-      - name: Install Bazelisk
-        run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            brew install bazelisk
-          else
-            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 -o /usr/local/bin/bazel
-            sudo chmod +x /usr/local/bin/bazel
-          fi
-
-      # npm ci: install frontend deps so the Bazel genrule can skip it.
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
-
-      # build.sh with --skip-tauri (CI doesn't build desktop app),
-      # --skip-docker (no Docker images needed), --skip-check (separate step below).
-      - name: Build and test
-        run: bash build.sh --skip-tauri --skip-docker --skip-check
-
-      # Still use Cargo for fmt/clippy — Bazel doesn't have good equivalents
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build and test with Cargo (build.rs auto-builds frontend)
+      - name: Build and test
+        run: bash build.sh --skip-tauri --skip-docker --skip-check
 
       - name: Check formatting
         run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
@@ -100,7 +86,7 @@ jobs:
   # Integration tests that require API keys
   integration:
     name: Integration Tests
-    needs: bazel
+    needs: build
     runs-on: ubuntu-latest
     environment: integration
     steps:
