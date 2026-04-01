@@ -5,6 +5,7 @@ use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
+use xpressclaw_core::docker::manager::DockerManager;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
@@ -31,6 +32,8 @@ pub struct AppState {
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
+    /// Shared Docker connection (reused across all requests).
+    pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
 }
 
 impl AppState {
@@ -54,6 +57,7 @@ impl AppState {
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
+            docker: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -70,6 +74,27 @@ impl AppState {
     /// Get the rate limiter.
     pub fn rate_limiter(&self) -> Arc<RateLimiter> {
         self.rate_limiter.read().unwrap().clone()
+    }
+
+    /// Get the shared Docker connection, creating it on first use.
+    /// Returns None if Docker is unavailable.
+    pub async fn docker(&self) -> Option<Arc<DockerManager>> {
+        // Fast path: already connected
+        {
+            let guard = self.docker.read().unwrap();
+            if let Some(ref d) = *guard {
+                return Some(d.clone());
+            }
+        }
+        // Slow path: try to connect
+        match DockerManager::connect().await {
+            Ok(d) => {
+                let d = Arc::new(d);
+                *self.docker.write().unwrap() = Some(d.clone());
+                Some(d)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Check if setup is complete.

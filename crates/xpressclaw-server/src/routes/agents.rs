@@ -89,8 +89,8 @@ async fn list_agents(
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
 
-    // Single Docker connection for all agents
-    let docker = DockerManager::connect().await.ok();
+    // Use shared Docker connection from AppState
+    let docker = state.docker().await;
     let mut result = Vec::new();
     for a in &agents {
         let observed = match &docker {
@@ -112,9 +112,9 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    let observed = match DockerManager::connect().await {
-        Ok(d) => observe_with(&d, &record.id).await,
-        Err(_) => ObservedStatus::DockerUnavailable,
+    let observed = match state.docker().await {
+        Some(d) => observe_with(&d, &record.id).await,
+        None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
@@ -127,7 +127,7 @@ async fn delete_agent(
     // Set desired=stopped so the reconciler stops the container
     let _ = registry.set_desired_status(&id, &DesiredStatus::Stopped);
     // Also stop immediately for responsiveness
-    if let Ok(docker) = DockerManager::connect().await {
+    if let Some(docker) = state.docker().await {
         let _ = docker.stop(&id).await;
     }
     registry.delete(&id).map_err(internal_error)?;
@@ -183,9 +183,9 @@ async fn start_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match DockerManager::connect().await {
-        Ok(d) => observe_with(&d, &record.id).await,
-        Err(_) => ObservedStatus::DockerUnavailable,
+    let observed = match state.docker().await {
+        Some(d) => observe_with(&d, &record.id).await,
+        None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
@@ -215,9 +215,9 @@ async fn stop_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match DockerManager::connect().await {
-        Ok(d) => observe_with(&d, &record.id).await,
-        Err(_) => ObservedStatus::DockerUnavailable,
+    let observed = match state.docker().await {
+        Some(d) => observe_with(&d, &record.id).await,
+        None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
 }
@@ -377,11 +377,15 @@ struct LogsQuery {
 }
 
 async fn get_agent_logs(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tail = query.tail.unwrap_or(100);
-    let docker = DockerManager::connect().await.map_err(internal_error)?;
+    let docker = state
+        .docker()
+        .await
+        .ok_or_else(|| internal_error("Docker not available"))?;
     let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
     Ok(Json(json!({ "logs": logs })))
 }
