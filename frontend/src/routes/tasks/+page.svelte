@@ -53,9 +53,7 @@
 	}
 
 	/** Existing incomplete tasks that can be selected as dependencies. */
-	function availableDeps(): Task[] {
-		return taskList.filter(t => t.status !== 'completed' && t.status !== 'cancelled');
-	}
+	let availableDeps = $derived(taskList.filter(t => t.status !== 'completed' && t.status !== 'cancelled'));
 
 	function toggleDep(id: string) {
 		if (newDependsOn.includes(id)) {
@@ -161,11 +159,11 @@
 					</select>
 				</div>
 			</div>
-			{#if availableDeps().length > 0}
+			{#if availableDeps.length > 0}
 				<div>
 					<label class="block text-xs text-muted-foreground mb-1">Depends on (optional)</label>
 					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
-						{#each availableDeps() as dep}
+						{#each availableDeps as dep}
 							<button
 								type="button"
 								onclick={() => toggleDep(dep.id)}
