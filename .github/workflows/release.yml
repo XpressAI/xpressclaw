@@ -133,6 +133,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for release number
 
       - uses: actions/download-artifact@v4
         with:
@@ -145,17 +147,25 @@ jobs:
           find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Compute release number
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          # Count releases so far (tags matching beta-* or v*) + 1
+          RELEASE_COUNT=$(git tag -l 'beta-*' 'v*' | wc -l | tr -d ' ')
+          NEXT_NUM=$((RELEASE_COUNT + 1))
+          TAG="beta-${NEXT_NUM}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG (commit $SHORT_SHA)"
 
-      - name: Create or update pre-release
+      - name: Create pre-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly
-          name: "Nightly (${{ steps.sha.outputs.short }})"
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Beta ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.sha }})"
           body: |
-            Automated pre-release build from `main` at ${{ github.sha }}.
+            Pre-release build from `main` at ${{ github.sha }}.
 
             **Downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
