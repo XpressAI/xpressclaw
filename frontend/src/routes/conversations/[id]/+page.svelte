@@ -58,7 +58,14 @@
 
 	$effect(() => {
 		const id = $page.params.id;
-		if (id) load(id);
+		if (id) {
+			// Close previous subscription when conversation changes
+			if (cancelStream) {
+				cancelStream();
+				cancelStream = null;
+			}
+			load(id);
+		}
 	});
 
 	async function load(id: string) {
@@ -108,8 +115,22 @@
 
 	// Subscribe to SSE events for this conversation (ADR-019).
 	// Handles thinking, chunks, messages, and errors from the background processor.
+	// Always closes any existing subscription first to prevent duplicate streams.
 	function subscribeToEvents() {
 		if (!conv) return;
+
+		// Close any existing subscription — prevents duplicate streams
+		// when navigating away and back.
+		if (cancelStream) {
+			cancelStream();
+			cancelStream = null;
+		}
+
+		// Reset streaming state
+		thinkingAgent = null;
+		streamingContent = '';
+		sending = false;
+
 		const lastId = messages.length > 0 ? messages[messages.length - 1].id : 0;
 		cancelStream = conversations.subscribeEvents(conv.id, lastId, {
 			onThinking: async (agentId) => {
