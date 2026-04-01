@@ -1,6 +1,16 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Returns the npm command name for the current platform.
+/// Windows needs "npm.cmd" because npm is a batch script.
+fn npm() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "npm.cmd"
+    } else {
+        "npm"
+    }
+}
+
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_root = Path::new(&manifest_dir).parent().unwrap().parent().unwrap();
@@ -37,19 +47,20 @@ fn main() {
     // Install deps if needed
     if !frontend_dir.join("node_modules").exists() {
         println!("cargo:warning=Installing frontend dependencies...");
-        let status = Command::new("npm")
+        let status = Command::new(npm())
             .args(["ci", "--silent"])
             .current_dir(&frontend_dir)
             .status();
-        if let Err(e) = status {
-            println!("cargo:warning=npm ci failed: {e} (frontend will not be embedded)");
-            return;
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => panic!("npm ci failed with status {s}"),
+            Err(e) => panic!("npm ci failed: {e} — is Node.js installed?"),
         }
     }
 
     // Build frontend
     println!("cargo:warning=Building frontend...");
-    let status = Command::new("npm")
+    let status = Command::new(npm())
         .args(["run", "build"])
         .current_dir(&frontend_dir)
         .status();
@@ -58,11 +69,7 @@ fn main() {
         Ok(s) if s.success() => {
             println!("cargo:warning=Frontend built successfully");
         }
-        Ok(s) => {
-            println!("cargo:warning=Frontend build failed with status {s}");
-        }
-        Err(e) => {
-            println!("cargo:warning=Failed to run npm: {e}");
-        }
+        Ok(s) => panic!("Frontend build failed with status {s}"),
+        Err(e) => panic!("Failed to run npm: {e} — is Node.js installed?"),
     }
 }
