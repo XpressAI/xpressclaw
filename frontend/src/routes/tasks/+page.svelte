@@ -13,6 +13,7 @@
 	let newDesc = $state('');
 	let newAgentId = $state('');
 	let newPriority = $state(0);
+	let newDependsOn = $state<string[]>([]);
 
 	const columns: { key: keyof TaskCounts; label: string; color: string }[] = [
 		{ key: 'pending', label: 'Pending', color: 'text-yellow-400' },
@@ -51,18 +52,36 @@
 		return counts[key];
 	}
 
+	/** Existing incomplete tasks that can be selected as dependencies. */
+	function availableDeps(): Task[] {
+		return taskList.filter(t => t.status !== 'completed' && t.status !== 'cancelled');
+	}
+
+	function toggleDep(id: string) {
+		if (newDependsOn.includes(id)) {
+			newDependsOn = newDependsOn.filter(d => d !== id);
+		} else {
+			newDependsOn = [...newDependsOn, id];
+		}
+	}
+
 	async function createTask() {
 		if (!newTitle.trim()) return;
-		await tasks.create({
+		const task = await tasks.create({
 			title: newTitle,
 			description: newDesc || undefined,
 			agent_id: newAgentId || undefined,
 			priority: newPriority || undefined
 		});
+		// Add dependencies after creation
+		for (const depId of newDependsOn) {
+			await tasks.addDependency(task.id, depId).catch(() => {});
+		}
 		newTitle = '';
 		newDesc = '';
 		newAgentId = '';
 		newPriority = 0;
+		newDependsOn = [];
 		showCreate = false;
 		await load();
 	}
@@ -142,6 +161,30 @@
 					</select>
 				</div>
 			</div>
+			{#if availableDeps().length > 0}
+				<div>
+					<label class="block text-xs text-muted-foreground mb-1">Depends on (optional)</label>
+					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+						{#each availableDeps() as dep}
+							<button
+								type="button"
+								onclick={() => toggleDep(dep.id)}
+								class="rounded-md border px-2 py-1 text-xs transition-colors
+									{newDependsOn.includes(dep.id)
+										? 'border-primary bg-primary/10 text-primary'
+										: 'border-border text-muted-foreground hover:border-primary/50'}"
+							>
+								{dep.title}
+							</button>
+						{/each}
+					</div>
+					{#if newDependsOn.length > 0}
+						<div class="text-xs text-muted-foreground mt-1">
+							This task will wait for {newDependsOn.length} task{newDependsOn.length > 1 ? 's' : ''} to complete.
+						</div>
+					{/if}
+				</div>
+			{/if}
 			<div class="flex gap-2">
 				<button
 					onclick={createTask}
