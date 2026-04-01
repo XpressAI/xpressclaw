@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/stores';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import { conversations, agents } from '$lib/api';
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
 	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
@@ -28,6 +28,11 @@
 	let showStartDialog = $state(false);
 	let startingAgents = $state(false);
 	let userProfile = $state(getCachedProfile());
+	let pendingMsgHandled = false;
+
+	// Derive just the ID string so the $effect below only re-runs
+	// when the actual ID changes, not on every $page store emission.
+	let convId = $derived($page.params.id);
 
 	onMount(async () => {
 		if (!isProfileLoaded()) {
@@ -57,13 +62,16 @@
 	);
 
 	$effect(() => {
-		const id = $page.params.id;
+		const id = convId;
 		if (id) {
-			// Close previous subscription when conversation changes
-			if (cancelStream) {
-				cancelStream();
-				cancelStream = null;
-			}
+			// Clean up previous subscription without creating a
+			// reactive dependency on cancelStream.
+			untrack(() => {
+				if (cancelStream) {
+					cancelStream();
+					cancelStream = null;
+				}
+			});
 			load(id);
 		}
 	});
@@ -94,14 +102,19 @@
 			// Subscribe to live events (ADR-019)
 			subscribeToEvents();
 
-			const pendingMsg = $page.url.searchParams.get('msg');
-			if (pendingMsg) {
-				const url = new URL($page.url);
-				url.searchParams.delete('msg');
-				history.replaceState({}, '', url.pathname);
-				input = pendingMsg;
-				await tick();
-				sendMessage();
+			// Handle ?msg= query param exactly once (e.g. from "new conversation" flow).
+			// Read from window.location (not $page) and guard with a flag to
+			// avoid re-triggering if the effect ever re-runs.
+			if (!pendingMsgHandled) {
+				const params = new URLSearchParams(window.location.search);
+				const pendingMsg = params.get('msg');
+				if (pendingMsg) {
+					pendingMsgHandled = true;
+					window.history.replaceState(window.history.state, '', window.location.pathname);
+					input = pendingMsg;
+					await tick();
+					sendMessage();
+				}
 			}
 		} catch (e) {
 			error = String(e);
