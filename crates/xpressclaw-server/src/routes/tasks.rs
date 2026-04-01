@@ -33,6 +33,7 @@ pub struct MessageInput {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
+        .route("/batch", axum::routing::post(create_tasks_batch))
         .route("/counts", get(task_counts))
         .route(
             "/{id}",
@@ -40,6 +41,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/status", patch(update_task_status))
         .route("/{id}/messages", get(get_messages).post(add_message))
+        .route("/{id}/dependencies", axum::routing::post(add_dependency))
 }
 
 async fn list_tasks(
@@ -97,7 +99,17 @@ async fn get_task(
         ),
         _ => internal_error(e),
     })?;
-    Ok(Json(json!(task)))
+    // Enrich with dependency info (ADR-020)
+    let depends_on = board.get_dependencies(&id).unwrap_or_default();
+    let dependents = board.get_dependents(&id).unwrap_or_default();
+    let blocked_by = board.get_blockers(&id).unwrap_or_default();
+    let ready = board.is_ready(&id).unwrap_or(true);
+    let mut result = json!(task);
+    result["depends_on"] = json!(depends_on);
+    result["dependents"] = json!(dependents);
+    result["blocked_by"] = json!(blocked_by);
+    result["ready"] = json!(ready);
+    Ok(Json(result))
 }
 
 async fn update_task(
@@ -174,6 +186,51 @@ async fn add_message(
         .add_message(&id, &req.role, &req.content)
         .map_err(internal_error)?;
     Ok((StatusCode::CREATED, Json(json!(msg))))
+}
+
+/// Batch create tasks with ref-based dependencies (ADR-020).
+async fn create_tasks_batch(
+    State(state): State<AppState>,
+    Json(req): Json<BatchCreateRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let board = TaskBoard::new(state.db.clone());
+    let tasks = board
+        .create_batch(&req.tasks, req.parent_task_id.as_deref())
+        .map_err(internal_error)?;
+
+    // Enqueue tasks that have agents assigned
+    let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
+    for task in &tasks {
+        if let Some(ref agent_id) = task.agent_id {
+            let _ = queue.enqueue(&task.id, agent_id);
+        }
+    }
+
+    Ok((StatusCode::CREATED, Json(json!(tasks))))
+}
+
+#[derive(Deserialize)]
+struct BatchCreateRequest {
+    tasks: Vec<xpressclaw_core::tasks::board::BatchTaskInput>,
+    parent_task_id: Option<String>,
+}
+
+/// Add a dependency to an existing task.
+#[derive(Deserialize)]
+struct AddDependencyRequest {
+    depends_on: String,
+}
+
+async fn add_dependency(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<AddDependencyRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let board = TaskBoard::new(state.db.clone());
+    board
+        .add_dependency(&id, &req.depends_on)
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "task_id": id, "depends_on": req.depends_on })))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
