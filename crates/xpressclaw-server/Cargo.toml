@@ -9,6 +9,8 @@ description = "Axum REST API server for xpressclaw"
 [features]
 default = ["local-llm"]
 local-llm = ["xpressclaw-core/local-llm"]
+cuda = ["xpressclaw-core/cuda"]
+metal = ["xpressclaw-core/metal"]
 
 [dependencies]
 xpressclaw-core = { path = "../xpressclaw-core", default-features = false }

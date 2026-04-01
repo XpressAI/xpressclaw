@@ -29,11 +29,21 @@ for arg in "$@"; do
     esac
 done
 
+# Detect GPU acceleration
+CARGO_FEATURES=""
+if command -v nvcc &>/dev/null; then
+    CARGO_FEATURES="--features cuda"
+    echo "==> CUDA detected, enabling GPU acceleration"
+elif [[ "$(uname)" == "Darwin" ]]; then
+    CARGO_FEATURES="--features metal"
+    echo "==> macOS detected, enabling Metal acceleration"
+fi
+
 # Build CLI (release mode — disables debug_assertions so rust-embed
 # embeds statically. The server's build.rs auto-builds the frontend
 # if frontend/build/ doesn't exist.)
 echo "==> Building CLI..."
-cargo build --release -p xpressclaw-cli
+cargo build --release -p xpressclaw-cli $CARGO_FEATURES
 
 # Copy CLI as Tauri sidecar
 echo "==> Copying CLI binary as Tauri sidecar..."
