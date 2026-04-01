@@ -17,7 +17,21 @@ on:
       - '.gitignore'
 
 jobs:
-  # Frontend type checking (independent of Bazel)
+  # Fast checks first — fail early before spending time compiling
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
+
+  # Frontend type checking (independent of Rust)
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
@@ -37,13 +51,11 @@ jobs:
       - run: npm run check
       - run: npm run build
 
-  # Bazel builds everything — frontend, Rust, C++ — from one graph
-  bazel:
-    name: Bazel (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-latest]
+  # Build + test + clippy (only ubuntu — macOS is only needed for release)
+  build:
+    name: Build & Test
+    needs: lint
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,43 +68,20 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      # System dependencies
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf cmake
 
-      - name: Install macOS dependencies
-        if: runner.os == 'macOS'
-        run: brew install cmake
-
-      # Bazelisk reads .bazelversion and downloads the right Bazel
-      - name: Install Bazelisk
-        run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            brew install bazelisk
-          else
-            sudo curl -L https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 -o /usr/local/bin/bazel
-            sudo chmod +x /usr/local/bin/bazel
-          fi
-
-      # npm ci: install frontend deps so the Bazel genrule can skip it.
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
-
-      # build.sh with --skip-tauri (CI doesn't build desktop app),
-      # --skip-docker (no Docker images needed), --skip-check (separate step below).
-      - name: Build and test
-        run: bash build.sh --skip-tauri --skip-docker --skip-check
-
-      # Still use Cargo for fmt/clippy — Bazel doesn't have good equivalents
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
 
-      - name: Check formatting
-        run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
+      - uses: Swatinem/rust-cache@v2
+
+      # Build and test (build.rs auto-builds frontend)
+      - name: Build and test
+        run: bash build.sh --skip-tauri --skip-docker --skip-check
 
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
@@ -100,7 +89,7 @@ jobs:
   # Integration tests that require API keys
   integration:
     name: Integration Tests
-    needs: bazel
+    needs: build
     runs-on: ubuntu-latest
     environment: integration
     steps:
@@ -123,7 +112,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      # Build frontend for rust-embed (integration tests use Cargo)
       - name: Build frontend
         run: cd frontend && npm ci && npm run build
 

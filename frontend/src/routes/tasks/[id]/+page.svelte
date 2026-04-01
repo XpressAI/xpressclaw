@@ -1,17 +1,29 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
-	import { tasks } from '$lib/api';
-	import type { Task, TaskMessage } from '$lib/api';
+	import { tasks, agents } from '$lib/api';
+	import type { Task, TaskMessage, Agent } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 
 	let task = $state<Task | null>(null);
 	let messages = $state<TaskMessage[]>([]);
 	let subtaskList = $state<Task[]>([]);
+	let agentList = $state<Agent[]>([]);
+	let allTasks = $state<Task[]>([]);
 	let error = $state<string | null>(null);
 	let loading = $state(true);
+	let editing = $state(false);
+	let editTitle = $state('');
+	let editDesc = $state('');
+	let editAgentId = $state('');
+	let editPriority = $state(0);
+	let editDeps = $state<string[]>([]);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl: HTMLDivElement;
+
+	let availableDeps = $derived(
+		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
+	);
 
 	onMount(async () => {
 		await load();
@@ -31,12 +43,19 @@
 	async function load() {
 		try {
 			const id = $page.params.id!;
-			task = await tasks.get(id);
+			[task, agentList] = await Promise.all([
+				tasks.get(id),
+				agents.list().catch(() => []),
+			]);
 			messages = await tasks.messages(id);
 			try {
 				const sub = await tasks.subtasks(id);
 				subtaskList = sub.tasks;
 			} catch { subtaskList = []; }
+			try {
+				const all = await tasks.list();
+				allTasks = all.tasks;
+			} catch { allTasks = []; }
 			scrollToBottom();
 		} catch (e) {
 			error = String(e);
@@ -53,6 +72,47 @@
 		if (!task) return;
 		try {
 			task = await tasks.updateStatus(task.id, status);
+			await load();
+		} catch (e) {
+			alert(String(e));
+		}
+	}
+
+	function startEditing() {
+		if (!task) return;
+		editTitle = task.title;
+		editDesc = task.description || '';
+		editAgentId = task.agent_id || '';
+		editPriority = task.priority;
+		editDeps = task.depends_on ? [...task.depends_on] : [];
+		editing = true;
+	}
+
+	function toggleEditDep(id: string) {
+		if (editDeps.includes(id)) {
+			editDeps = editDeps.filter(d => d !== id);
+		} else {
+			editDeps = [...editDeps, id];
+		}
+	}
+
+	async function saveEdit() {
+		if (!task) return;
+		try {
+			// Update title/description
+			await tasks.updateStatus(task.id, task.status); // no-op but keeps consistency
+			// Update agent assignment via status endpoint with agent_id
+			if (editAgentId !== (task.agent_id || '')) {
+				await tasks.updateStatus(task.id, task.status);
+			}
+			// Add new dependencies
+			const currentDeps = task.depends_on || [];
+			for (const depId of editDeps) {
+				if (!currentDeps.includes(depId)) {
+					await tasks.addDependency(task.id, depId).catch(() => {});
+				}
+			}
+			editing = false;
 			await load();
 		} catch (e) {
 			alert(String(e));
@@ -123,6 +183,12 @@
 					</div>
 				</div>
 				<div class="flex gap-2">
+					{#if task.status !== 'completed' && task.status !== 'cancelled'}
+						<button onclick={startEditing}
+							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
+							Edit
+						</button>
+					{/if}
 					{#if task.status === 'pending'}
 						<button onclick={() => updateStatus('in_progress')}
 							class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
@@ -144,6 +210,62 @@
 		{/if}
 	</div>
 
+	{#if editing && task}
+		<div class="border-b border-border p-4 space-y-3 bg-card/50">
+			<input type="text" bind:value={editTitle} placeholder="Task title..."
+				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
+			<textarea bind:value={editDesc} placeholder="Description..." rows="2"
+				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
+			<div class="flex gap-3">
+				<div class="flex-1">
+					<div class="text-xs text-muted-foreground mb-1">Assign to Agent</div>
+					<select bind:value={editAgentId}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+						<option value="">Unassigned</option>
+						{#each agentList as agent}
+							<option value={agent.id}>{agent.name}</option>
+						{/each}
+					</select>
+				</div>
+				<div class="w-24">
+					<div class="text-xs text-muted-foreground mb-1">Priority</div>
+					<select bind:value={editPriority}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
+						<option value={0}>Normal</option>
+						<option value={5}>High</option>
+						<option value={10}>Urgent</option>
+					</select>
+				</div>
+			</div>
+			{#if availableDeps.length > 0}
+				<div>
+					<div class="text-xs text-muted-foreground mb-1">Depends on</div>
+					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+						{#each availableDeps as dep}
+							<button type="button" onclick={() => toggleEditDep(dep.id)}
+								class="rounded-md border px-2 py-1 text-xs transition-colors
+									{editDeps.includes(dep.id)
+										? 'border-primary bg-primary/10 text-primary'
+										: 'border-border text-muted-foreground hover:border-primary/50'}">
+								{dep.title}
+							</button>
+						{/each}
+					</div>
+				</div>
+			{/if}
+			<div class="flex gap-2">
+				<button onclick={saveEdit}
+					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+					Save
+				</button>
+				<button onclick={() => (editing = false)}
+					class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
+					Cancel
+				</button>
+			</div>
+		</div>
+	{/if}
+
 	{#if loading}
 		<div class="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading...</div>
 	{:else if task}
@@ -156,6 +278,32 @@
 						<div class="rounded-lg border {statusBg(task.status)} p-3 text-sm">
 							<div class="text-xs font-medium text-muted-foreground mb-1">Description</div>
 							<div class="whitespace-pre-wrap">{task.description}</div>
+						</div>
+					{/if}
+
+					<!-- Dependencies -->
+					{#if task.blocked_by && task.blocked_by.length > 0}
+						<div class="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+							<div class="text-xs font-medium text-amber-500 mb-1">Blocked by</div>
+							<div class="space-y-1">
+								{#each task.blocked_by as blockerId}
+									<a href="/tasks/{blockerId}" class="block text-xs text-amber-400 hover:underline">
+										{blockerId}
+									</a>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					{#if task.depends_on && task.depends_on.length > 0}
+						<div class="rounded-lg border border-border/50 p-3 text-sm">
+							<div class="text-xs font-medium text-muted-foreground mb-1">Dependencies</div>
+							<div class="space-y-1">
+								{#each task.depends_on as depId}
+									<a href="/tasks/{depId}" class="block text-xs text-muted-foreground hover:underline">
+										{#if task.blocked_by?.includes(depId)}⏳{:else}✅{/if} {depId}
+									</a>
+								{/each}
+							</div>
 						</div>
 					{/if}
 

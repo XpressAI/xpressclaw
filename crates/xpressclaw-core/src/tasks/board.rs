@@ -60,7 +60,7 @@ pub struct Task {
     pub context: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CreateTask {
     pub title: String,
     pub description: Option<String>,
@@ -334,6 +334,166 @@ impl TaskBoard {
 
         Ok(counts)
     }
+
+    // -- Dependency methods (ADR-020) --
+
+    /// Add a dependency: task_id cannot start until depends_on_id completes.
+    /// Returns error if this would create a cycle.
+    pub fn add_dependency(&self, task_id: &str, depends_on_id: &str) -> Result<()> {
+        if task_id == depends_on_id {
+            return Err(Error::Task("a task cannot depend on itself".into()));
+        }
+        // Cycle detection: DFS from depends_on_id — can we reach task_id?
+        if self.would_create_cycle(task_id, depends_on_id)? {
+            return Err(Error::Task(format!(
+                "cannot add dependency: would create a cycle ({task_id} → {depends_on_id} → ... → {task_id})"
+            )));
+        }
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_id) VALUES (?1, ?2)",
+                rusqlite::params![task_id, depends_on_id],
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Check if adding task_id → depends_on_id would create a cycle.
+    fn would_create_cycle(&self, task_id: &str, depends_on_id: &str) -> Result<bool> {
+        // DFS from depends_on_id: can we reach task_id?
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![depends_on_id.to_string()];
+        while let Some(current) = stack.pop() {
+            if current == task_id {
+                return Ok(true);
+            }
+            if visited.insert(current.clone()) {
+                for dep in self.get_dependencies(&current)? {
+                    stack.push(dep);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Get task IDs that this task depends on (must complete before this task).
+    pub fn get_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
+        self.db.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT depends_on_id FROM task_dependencies WHERE task_id = ?1")?;
+            let deps = stmt
+                .query_map([task_id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(deps)
+        })
+    }
+
+    /// Get task IDs that depend on this task (will be unblocked when this completes).
+    pub fn get_dependents(&self, task_id: &str) -> Result<Vec<String>> {
+        self.db.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT task_id FROM task_dependencies WHERE depends_on_id = ?1")?;
+            let deps = stmt
+                .query_map([task_id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(deps)
+        })
+    }
+
+    /// Check if all dependencies of a task are completed.
+    pub fn is_ready(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            // Count dependencies that are NOT completed
+            let unmet: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM task_dependencies d
+                 JOIN tasks t ON t.id = d.depends_on_id
+                 WHERE d.task_id = ?1 AND t.status != 'completed'",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            Ok(unmet == 0)
+        })
+    }
+
+    /// Get IDs of incomplete dependencies (for the blocked_by field).
+    pub fn get_blockers(&self, task_id: &str) -> Result<Vec<String>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT d.depends_on_id FROM task_dependencies d
+                 JOIN tasks t ON t.id = d.depends_on_id
+                 WHERE d.task_id = ?1 AND t.status != 'completed'",
+            )?;
+            let blockers = stmt
+                .query_map([task_id], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(blockers)
+        })
+    }
+
+    /// Batch-create tasks with ref-based dependencies (ADR-020).
+    /// Each task has an optional `ref` string for cross-referencing within
+    /// the batch, and `depends_on` lists ref strings of prerequisite tasks.
+    pub fn create_batch(
+        &self,
+        tasks: &[BatchTaskInput],
+        parent_task_id: Option<&str>,
+    ) -> Result<Vec<Task>> {
+        let mut ref_to_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut created = Vec::new();
+
+        // First pass: create all tasks and map refs to UUIDs
+        for input in tasks {
+            let task = self.create(&CreateTask {
+                title: input.title.clone(),
+                description: input.description.clone(),
+                agent_id: input.agent_id.clone(),
+                parent_task_id: parent_task_id.map(|s| s.to_string()),
+                sop_id: None,
+                conversation_id: None,
+                priority: input.priority,
+                context: None,
+            })?;
+            if let Some(ref r) = input.ref_name {
+                ref_to_id.insert(r.clone(), task.id.clone());
+            }
+            created.push(task);
+        }
+
+        // Second pass: add dependency edges
+        for (i, input) in tasks.iter().enumerate() {
+            if let Some(ref deps) = input.depends_on {
+                let task_id = &created[i].id;
+                for dep_ref in deps {
+                    // Resolve ref to UUID — could be a batch ref or an existing task UUID
+                    let dep_id = ref_to_id
+                        .get(dep_ref)
+                        .cloned()
+                        .unwrap_or_else(|| dep_ref.clone());
+                    self.add_dependency(task_id, &dep_id)?;
+                }
+            }
+        }
+
+        Ok(created)
+    }
+}
+
+/// Input for batch task creation.
+#[derive(Debug, Deserialize)]
+pub struct BatchTaskInput {
+    /// Local reference name for cross-referencing within the batch.
+    #[serde(rename = "ref")]
+    pub ref_name: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub agent_id: Option<String>,
+    pub priority: Option<i32>,
+    /// Ref names or existing task UUIDs that must complete first.
+    pub depends_on: Option<Vec<String>>,
 }
 
 fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
@@ -478,5 +638,110 @@ mod tests {
 
         board.delete(&task.id).unwrap();
         assert!(board.get(&task.id).is_err());
+    }
+
+    #[test]
+    fn test_dependencies() {
+        let (_, board) = setup();
+        let a = board
+            .create(&CreateTask {
+                title: "Build".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let b = board
+            .create(&CreateTask {
+                title: "Test".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // B depends on A
+        board.add_dependency(&b.id, &a.id).unwrap();
+        assert!(!board.is_ready(&b.id).unwrap()); // A not completed
+        assert!(board.is_ready(&a.id).unwrap()); // A has no deps
+
+        // Complete A → B becomes ready
+        board.update_status(&a.id, "completed", None).unwrap();
+        assert!(board.is_ready(&b.id).unwrap());
+
+        // Check getters
+        assert_eq!(board.get_dependencies(&b.id).unwrap(), vec![a.id.clone()]);
+        assert_eq!(board.get_dependents(&a.id).unwrap(), vec![b.id.clone()]);
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let (_, board) = setup();
+        let a = board
+            .create(&CreateTask {
+                title: "A".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let b = board
+            .create(&CreateTask {
+                title: "B".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        board.add_dependency(&b.id, &a.id).unwrap(); // B → A ok
+        assert!(board.add_dependency(&a.id, &b.id).is_err()); // A → B cycle!
+        assert!(board.add_dependency(&a.id, &a.id).is_err()); // self-cycle
+    }
+
+    #[test]
+    fn test_batch_create() {
+        let (_, board) = setup();
+        let tasks = board
+            .create_batch(
+                &[
+                    BatchTaskInput {
+                        ref_name: Some("build".into()),
+                        title: "Build".into(),
+                        description: None,
+                        agent_id: None,
+                        priority: None,
+                        depends_on: None,
+                    },
+                    BatchTaskInput {
+                        ref_name: Some("test".into()),
+                        title: "Test".into(),
+                        description: None,
+                        agent_id: None,
+                        priority: None,
+                        depends_on: Some(vec!["build".into()]),
+                    },
+                    BatchTaskInput {
+                        ref_name: Some("deploy".into()),
+                        title: "Deploy".into(),
+                        description: None,
+                        agent_id: None,
+                        priority: None,
+                        depends_on: Some(vec!["test".into()]),
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(tasks.len(), 3);
+        assert!(!board.is_ready(&tasks[2].id).unwrap()); // deploy blocked
+        assert!(!board.is_ready(&tasks[1].id).unwrap()); // test blocked
+        assert!(board.is_ready(&tasks[0].id).unwrap()); // build ready
+
+        // Complete build → test ready
+        board
+            .update_status(&tasks[0].id, "completed", None)
+            .unwrap();
+        assert!(board.is_ready(&tasks[1].id).unwrap());
+        assert!(!board.is_ready(&tasks[2].id).unwrap()); // deploy still blocked
+
+        // Complete test → deploy ready
+        board
+            .update_status(&tasks[1].id, "completed", None)
+            .unwrap();
+        assert!(board.is_ready(&tasks[2].id).unwrap());
     }
 }

@@ -137,6 +137,7 @@ impl Database {
             (14, MIGRATION_V14),
             (15, MIGRATION_V15),
             (16, MIGRATION_V16),
+            (17, MIGRATION_V17),
         ];
 
         for &(target, sql) in migrations {
@@ -535,6 +536,21 @@ ALTER TABLE conversation_messages ADD COLUMN processed INTEGER NOT NULL DEFAULT 
 ALTER TABLE conversations ADD COLUMN processing_status TEXT NOT NULL DEFAULT 'idle';
 ";
 
+const MIGRATION_V17: &str = "
+-- ADR-020: Task dependencies.
+-- Directed edges: task_id depends on depends_on_id.
+-- A task cannot start until all its dependencies are completed.
+CREATE TABLE task_dependencies (
+    task_id TEXT NOT NULL,
+    depends_on_id TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_task_deps_task ON task_dependencies(task_id);
+CREATE INDEX idx_task_deps_dep ON task_dependencies(depends_on_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,7 +568,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "16");
+        assert_eq!(version, "17");
     }
 
     #[test]

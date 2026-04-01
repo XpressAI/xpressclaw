@@ -158,7 +158,10 @@ export const conversations = {
 		const eventSource = new EventSource(url);
 
 		eventSource.addEventListener('thinking', (e) => {
-			try { callbacks.onThinking?.(JSON.parse(e.data).agent_id); } catch {}
+			try {
+				const d = JSON.parse(e.data);
+				callbacks.onThinking?.(d.agent_id);
+			} catch {}
 		});
 		eventSource.addEventListener('chunk', (e) => {
 			try {
@@ -166,8 +169,14 @@ export const conversations = {
 				callbacks.onChunk?.(d.agent_id, d.content);
 			} catch {}
 		});
-		eventSource.addEventListener('message', (e) => {
-			try { callbacks.onAgentMessage?.(JSON.parse(e.data)); } catch {}
+		eventSource.addEventListener('agent_message', (e) => {
+			try {
+				const data = JSON.parse(e.data);
+				// Live events are wrapped: {type, message: {...}}
+				// Replayed events are raw: {id, content, ...}
+				const msg = data.message ?? data;
+				callbacks.onAgentMessage?.(msg);
+			} catch {}
 		});
 		eventSource.addEventListener('error', (e) => {
 			if (e instanceof MessageEvent) {
@@ -255,6 +264,10 @@ export interface Task {
 	updated_at: string;
 	completed_at: string | null;
 	context: unknown;
+	depends_on?: string[];
+	dependents?: string[];
+	blocked_by?: string[];
+	ready?: boolean;
 }
 
 export interface TaskCounts {
@@ -290,6 +303,13 @@ export const tasks = {
 			body: JSON.stringify({ role, content })
 		}),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
+	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; depends_on?: string[] }[]; parent_task_id?: string }) =>
+		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
+	addDependency: (taskId: string, dependsOn: string) =>
+		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {
+			method: 'POST',
+			body: JSON.stringify({ depends_on: dependsOn })
+		}),
 };
 
 export interface TaskMessage {

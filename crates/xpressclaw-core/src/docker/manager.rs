@@ -72,7 +72,10 @@ pub struct DockerManager {
 impl DockerManager {
     /// Connect to the Docker/Podman daemon.
     pub async fn connect() -> Result<Self> {
-        let docker = Docker::connect_with_local_defaults()
+        // Use connect_with_defaults so DOCKER_HOST is honored for all
+        // schemes (unix, tcp, http, npipe). This is needed for rootless
+        // Podman which sets DOCKER_HOST to a user-level socket.
+        let docker = Docker::connect_with_defaults()
             .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
 
         // Verify connection

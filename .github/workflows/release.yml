@@ -49,7 +49,7 @@ jobs:
       # System dependencies
       - name: Install macOS build deps
         if: runner.os == 'macOS'
-        run: brew install cmake bazelisk
+        run: brew install cmake
 
       - name: Install Windows build deps
         if: runner.os == 'Windows'
@@ -78,14 +78,9 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
-      # cargo fetch: pre-warm git cache — llama-cpp-rs submodule download
-      # can exceed crate_universe's default 600s timeout on cold runners.
+      # Pre-warm cargo git cache for llama-cpp-rs submodule.
       - name: Fetch Cargo dependencies
         run: cargo fetch
-
-      # npm ci: install frontend deps so the Bazel genrule can skip it.
-      - name: Install frontend dependencies
-        run: cd frontend && npm ci
 
       # Write notarization API key before build (macOS signing requires it).
       - name: Write API key
@@ -96,20 +91,19 @@ jobs:
           mkdir -p ~/.appstoreconnect/private_keys
           echo -n "$APPLE_API_KEY_CONTENT" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPLE_API_KEY_ID }}.p8
 
-      # macOS: build with build.sh (Bazel + Tauri)
+      # macOS: build with build.sh (Cargo + Tauri)
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
-          CARGO_BAZEL_TIMEOUT: "1800"
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
         run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
-      # Windows: build with build-cargo.ps1 (Cargo, bypasses Bazel path issues)
+      # Windows
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: powershell -File build-cargo.ps1 --skip-docker --target=${{ matrix.target }}
+        run: powershell -File build.ps1 --skip-docker --skip-check --target=${{ matrix.target }}
 
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
@@ -139,6 +133,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need full history for release number
 
       - uses: actions/download-artifact@v4
         with:
@@ -151,17 +147,25 @@ jobs:
           find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Get short SHA
-        id: sha
-        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Compute release number
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          # Count releases so far (tags matching beta-* or v*) + 1
+          RELEASE_COUNT=$(git tag -l 'beta-*' 'v*' | wc -l | tr -d ' ')
+          NEXT_NUM=$((RELEASE_COUNT + 1))
+          TAG="beta-${NEXT_NUM}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG (commit $SHORT_SHA)"
 
-      - name: Create or update pre-release
+      - name: Create pre-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly
-          name: "Nightly (${{ steps.sha.outputs.short }})"
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "Beta ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.sha }})"
           body: |
-            Automated pre-release build from `main` at ${{ github.sha }}.
+            Pre-release build from `main` at ${{ github.sha }}.
 
             **Downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized

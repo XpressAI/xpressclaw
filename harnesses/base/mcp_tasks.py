@@ -57,6 +57,71 @@ TOOLS = [
         },
     },
     {
+        "name": "create_tasks",
+        "description": (
+            "Create multiple tasks with dependencies in a single call. "
+            "Give each task a short 'ref' name to reference it within this batch. "
+            "Use 'depends_on' to list ref names of tasks that must complete first. "
+            "Example: [{\"ref\": \"build\", \"title\": \"Build\"}, "
+            "{\"ref\": \"test\", \"title\": \"Test\", \"depends_on\": [\"build\"]}]"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref": {
+                                "type": "string",
+                                "description": "Short reference name for this task (e.g. 'build', 'test')",
+                            },
+                            "title": {"type": "string", "description": "Task title"},
+                            "description": {
+                                "type": "string",
+                                "description": "Task description",
+                            },
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Agent to assign",
+                            },
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Ref names of tasks that must complete first",
+                            },
+                        },
+                        "required": ["ref", "title"],
+                    },
+                },
+                "parent_task_id": {
+                    "type": "string",
+                    "description": "If set, all tasks become subtasks of this parent",
+                },
+            },
+            "required": ["tasks"],
+        },
+    },
+    {
+        "name": "add_dependency",
+        "description": "Add a dependency: task cannot start until the dependency completes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task that will be blocked",
+                },
+                "depends_on": {
+                    "type": "string",
+                    "description": "Task ID that must complete first",
+                },
+            },
+            "required": ["task_id", "depends_on"],
+        },
+    },
+    {
         "name": "list_tasks",
         "description": "List tasks from the task board. Filter by status and/or agent.",
         "inputSchema": {
@@ -284,6 +349,31 @@ def handle_tool(name: str, arguments: dict) -> str:
             f"Created task '{task['title']}' "
             f"(id: {task['id']}, assigned to: {task.get('agent_id') or 'unassigned'})"
         )
+
+    elif name == "create_tasks":
+        body = {"tasks": arguments["tasks"]}
+        # Default agent_id for tasks without explicit assignment
+        for t in body["tasks"]:
+            if "agent_id" not in t or not t["agent_id"]:
+                t["agent_id"] = AGENT_ID or None
+        if "parent_task_id" in arguments:
+            body["parent_task_id"] = arguments["parent_task_id"]
+
+        tasks = _api("POST", "/tasks/batch", body)
+        lines = []
+        for t in tasks:
+            deps = t.get("depends_on", [])
+            dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
+            lines.append(
+                f"- {t['title']} (id: {t['id']}, ref: {t.get('ref', '?')}){dep_str}"
+            )
+        return f"Created {len(tasks)} task(s):\n" + "\n".join(lines)
+
+    elif name == "add_dependency":
+        _api("POST", f"/tasks/{arguments['task_id']}/dependencies", {
+            "depends_on": arguments["depends_on"],
+        })
+        return f"Added dependency: {arguments['task_id']} now depends on {arguments['depends_on']}"
 
     elif name == "list_tasks":
         params = {}
