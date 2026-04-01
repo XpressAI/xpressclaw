@@ -207,31 +207,38 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error building xpressclaw desktop app")
         .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
-                let mut child = { app.state::<SidecarState>().0.lock().unwrap().take() };
-                if let Some(ref mut child) = child {
-                    info!("stopping sidecar (graceful shutdown)");
-                    // Send SIGTERM so the sidecar can stop containers gracefully.
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id().to_string();
-                        let _ = std::process::Command::new("kill")
-                            .args(["-TERM", &pid])
-                            .status();
-                        // Give it a few seconds to clean up containers
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-                        // Kill if still running
-                        if child.try_wait().ok().flatten().is_none() {
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    // Show shutdown overlay in the webview before freezing
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.eval(
+                            "document.body.innerHTML = '<div style=\"display:flex;align-items:center;justify-content:center;height:100vh;background:#0f172a;color:#94a3b8;font-family:system-ui\"><div style=\"text-align:center\"><div style=\"font-size:1.5rem;margin-bottom:0.5rem\">Shutting down...</div><div style=\"font-size:0.875rem\">Stopping agents and containers</div></div></div>';"
+                        );
+                    }
+                    // Don't prevent exit — let it proceed to RunEvent::Exit
+                }
+                tauri::RunEvent::Exit => {
+                    let mut child = { app.state::<SidecarState>().0.lock().unwrap().take() };
+                    if let Some(ref mut child) = child {
+                        info!("stopping sidecar (graceful shutdown)");
+                        #[cfg(unix)]
+                        {
+                            let pid = child.id().to_string();
+                            let _ = std::process::Command::new("kill")
+                                .args(["-TERM", &pid])
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            if child.try_wait().ok().flatten().is_none() {
+                                let _ = child.kill();
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
                             let _ = child.kill();
                         }
                     }
-                    #[cfg(not(unix))]
-                    {
-                        // On Windows, there's no SIGTERM — just kill.
-                        // The reconciler will clean up on next start.
-                        let _ = child.kill();
-                    }
                 }
+                _ => {}
             }
         });
 }
