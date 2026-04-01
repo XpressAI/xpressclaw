@@ -57,9 +57,25 @@
 	let newBeforeHook = $state('');
 	let newAfterHook = $state('');
 
-	onMount(async () => {
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+	// Re-load when route param changes (Svelte reuses the component)
+	$effect(() => {
+		const id = $page.params.id;
+		if (id) loadAgent(id);
+	});
+
+	onDestroy(() => {
+		if (pollTimer) clearInterval(pollTimer);
+	});
+
+	async function loadAgent(id: string) {
+		// Clear previous poll
+		if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+		error = null;
+
 		try {
-			agent = await agents.get($page.params.id!);
+			agent = await agents.get(id);
 			const config = await setup.getConfig();
 			agentConfig = config.agents.find(a => a.name === agent!.name) ?? null;
 			if (agentConfig) {
@@ -114,15 +130,10 @@
 		// Poll agent status every 5s so reconciler progress is visible
 		pollTimer = setInterval(async () => {
 			try {
-				agent = await agents.get($page.params.id!);
+				agent = await agents.get(id);
 			} catch {}
 		}, 5000);
-	});
-
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
-	onDestroy(() => {
-		if (pollTimer) clearInterval(pollTimer);
-	});
+	}
 
 	async function handleStart() {
 		if (!agent) return;
