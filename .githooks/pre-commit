@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run cargo fmt --check before committing.
+# Install: git config core.hooksPath .githooks
+
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "ERROR: cargo fmt check failed. Run 'cargo fmt' and re-commit."
+    echo ""
+    exit 1
+fi
