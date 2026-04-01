@@ -181,6 +181,11 @@
 									title="Delete"
 								>&times;</button>
 							</div>
+							{#if task.blocked_by && task.blocked_by.length > 0}
+								<div class="text-xs text-amber-500">
+									⏳ Waiting on {task.blocked_by.length} task{task.blocked_by.length > 1 ? 's' : ''}
+								</div>
+							{/if}
 							{#if task.description}
 								<p class="text-xs text-muted-foreground line-clamp-2">{task.description}</p>
 							{/if}

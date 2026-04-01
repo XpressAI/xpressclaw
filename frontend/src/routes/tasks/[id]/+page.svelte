@@ -159,6 +159,32 @@
 						</div>
 					{/if}
 
+					<!-- Dependencies -->
+					{#if task.blocked_by && task.blocked_by.length > 0}
+						<div class="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+							<div class="text-xs font-medium text-amber-500 mb-1">Blocked by</div>
+							<div class="space-y-1">
+								{#each task.blocked_by as blockerId}
+									<a href="/tasks/{blockerId}" class="block text-xs text-amber-400 hover:underline">
+										{blockerId}
+									</a>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					{#if task.depends_on && task.depends_on.length > 0}
+						<div class="rounded-lg border border-border/50 p-3 text-sm">
+							<div class="text-xs font-medium text-muted-foreground mb-1">Dependencies</div>
+							<div class="space-y-1">
+								{#each task.depends_on as depId}
+									<a href="/tasks/{depId}" class="block text-xs text-muted-foreground hover:underline">
+										{#if task.blocked_by?.includes(depId)}⏳{:else}✅{/if} {depId}
+									</a>
+								{/each}
+							</div>
+						</div>
+					{/if}
+
 					<!-- Messages -->
 					{#each messages as msg (msg.id)}
 						{@const isSystem = msg.role === 'system'}

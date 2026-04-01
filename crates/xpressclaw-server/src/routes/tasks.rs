@@ -61,7 +61,19 @@ async fn list_tasks(
 
     let counts = board.counts().map_err(internal_error)?;
 
-    Ok(Json(json!({ "tasks": tasks, "counts": counts })))
+    // Enrich tasks with dependency info
+    let enriched: Vec<Value> = tasks
+        .iter()
+        .map(|t| {
+            let mut v = json!(t);
+            v["depends_on"] = json!(board.get_dependencies(&t.id).unwrap_or_default());
+            v["blocked_by"] = json!(board.get_blockers(&t.id).unwrap_or_default());
+            v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
+            v
+        })
+        .collect();
+
+    Ok(Json(json!({ "tasks": enriched, "counts": counts })))
 }
 
 async fn create_task(
