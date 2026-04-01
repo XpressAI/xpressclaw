@@ -276,8 +276,10 @@
 		</aside>
 
 		<!-- Main content -->
-		<main class="flex-1 overflow-auto">
-			{@render children()}
+		<main class="flex-1 overflow-hidden">
+			<div class="h-full overflow-y-auto flex flex-col">
+				{@render children()}
+			</div>
 		</main>
 	</div>
 {/if}
