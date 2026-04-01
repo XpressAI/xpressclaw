@@ -208,7 +208,7 @@ fn main() {
         .expect("error building xpressclaw desktop app")
         .run(|app, event| {
             match event {
-                tauri::RunEvent::ExitRequested { api, .. } => {
+                tauri::RunEvent::ExitRequested { .. } => {
                     // Show shutdown overlay in the webview before freezing
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.eval(
