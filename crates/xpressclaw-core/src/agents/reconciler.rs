@@ -51,12 +51,60 @@ async fn reconcile_once(
         }
     };
 
+    reconcile_models(config).await;
     reconcile_images(config, &docker).await;
     reconcile_agents(db, config, &docker, server_port).await;
     reconcile_apps(db, &docker).await;
     reconcile_tasks(db, &docker).await;
 
     Ok(())
+}
+
+/// Ensure Ollama models are pulled for agents using the local provider.
+async fn reconcile_models(config: &Config) {
+    // Only relevant when using Ollama (local provider without a GGUF path)
+    if config.llm.local_model_path.is_some() {
+        return;
+    }
+    if config.llm.default_provider != "local" {
+        return;
+    }
+
+    let base_url = config
+        .llm
+        .local_base_url
+        .as_deref()
+        .unwrap_or("http://localhost:11434");
+
+    // Collect unique model names across agents + global config
+    let mut models = std::collections::HashSet::new();
+    if let Some(ref m) = config.llm.local_model {
+        models.insert(m.clone());
+    }
+    for agent in &config.agents {
+        let uses_local = agent
+            .llm
+            .as_ref()
+            .and_then(|l| l.provider.as_deref())
+            .unwrap_or(&config.llm.default_provider)
+            == "local";
+        if uses_local {
+            if let Some(ref m) = agent.model {
+                models.insert(m.clone());
+            }
+        }
+    }
+
+    for model in &models {
+        if !crate::llm::local::ollama_has_model(base_url, model).await {
+            info!(model, "pulling Ollama model");
+            if let Err(e) = crate::llm::local::ollama_pull(base_url, model).await {
+                warn!(model, error = %e, "failed to pull Ollama model");
+            } else {
+                info!(model, "Ollama model pull complete");
+            }
+        }
+    }
 }
 
 /// Pull images for all configured backends.

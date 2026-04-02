@@ -262,8 +262,9 @@
 			if (ds?.available) containerless = false;
 		} catch {}
 		try {
-			const isLocal = llmProvider === 'local' || llmProvider === 'ollama';
-			const useEmbedded = isLocal && (!ollamaInfo?.available || !llmLocalBaseUrl);
+			const isOllama = llmProvider === 'ollama';
+			const isLocal = llmProvider === 'local' || isOllama;
+			const useEmbedded = llmProvider === 'local';
 
 			// Build MCP servers from tool toggles + any custom servers
 			const allMcpServers = { ...mcpServers };
@@ -333,7 +334,7 @@
 						name: agentName,
 						preset: selectedPreset?.id,
 						role: customRole || undefined,
-						model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
+						model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (isLocal ? llmLocalModel : undefined),
 						tools,
 						volumes: volumes.length > 0 ? volumes : undefined,
 					}],
@@ -476,14 +477,40 @@
 
 			<div class="space-y-2 mb-4">
 				<button
+					onclick={() => { llmProvider = 'ollama'; isOpenRouter = false; keyValid = null; }}
+					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'ollama' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
+					disabled={ollamaInfo !== null && !ollamaInfo.available}
+				>
+					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F999;</div>
+					<div class="flex-1">
+						<div class="text-sm font-medium text-foreground flex items-center gap-2">
+							Ollama
+							{#if ollamaInfo?.available}
+								<span class="inline-block h-2 w-2 rounded-full bg-emerald-500"></span>
+							{:else if ollamaInfo !== null}
+								<span class="inline-block h-2 w-2 rounded-full bg-red-500"></span>
+							{/if}
+						</div>
+						<div class="text-xs text-muted-foreground">
+							{#if ollamaInfo?.available}
+								{ollamaInfo.models.length} model{ollamaInfo.models.length !== 1 ? 's' : ''} installed. Free and private.
+							{:else if ollamaInfo !== null}
+								Not running. Install from ollama.com and run <code class="bg-muted px-1 rounded">ollama serve</code>.
+							{:else}
+								Use Ollama for local inference. Free and private.
+							{/if}
+						</div>
+					</div>
+				</button>
+				<button
 					onclick={() => { llmProvider = 'local'; isOpenRouter = false; keyValid = null; }}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'local' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F4BB;</div>
 					<div class="flex-1">
-						<div class="text-sm font-medium text-foreground">Local</div>
+						<div class="text-sm font-medium text-foreground">Built-in</div>
 						<div class="text-xs text-muted-foreground">
-							Runs a model directly inside xpressclaw. Free and private.
+							Downloads and runs a model inside xpressclaw. No external dependencies.
 							{#if modelRec}Recommended: {modelRec.model}{/if}
 						</div>
 					</div>
@@ -520,7 +547,33 @@
 				</button>
 			</div>
 
-			{#if llmProvider === 'local'}
+			{#if llmProvider === 'ollama'}
+				<div class="space-y-3 rounded-lg border border-border p-4">
+					<div>
+						<label for="ollama-model" class="block text-xs font-medium text-foreground mb-1">Model</label>
+						<input id="ollama-model" type="text" bind:value={llmLocalModel} placeholder="qwen3:8b"
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+						<p class="mt-1 text-xs text-muted-foreground">
+							Enter any Ollama model name. It will be pulled automatically if not already installed.
+						</p>
+					</div>
+					{#if ollamaInfo?.models && ollamaInfo.models.length > 0}
+						<div class="space-y-1">
+							<div class="text-xs font-medium text-muted-foreground">Installed models:</div>
+							<div class="flex flex-wrap gap-1">
+								{#each ollamaInfo.models as m}
+									<button onclick={() => llmLocalModel = m.name}
+										class="rounded px-2 py-1 text-xs transition-colors {llmLocalModel === m.name
+											? 'bg-primary/10 border border-primary text-foreground'
+											: 'border border-border hover:border-primary/40 text-foreground'}">
+										{m.name}{#if m.size} <span class="text-muted-foreground">({formatBytes(m.size)})</span>{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/if}
+				</div>
+			{:else if llmProvider === 'local'}
 				<div class="space-y-3 rounded-lg border border-border p-4">
 					<div>
 						<label for="local-model" class="block text-xs font-medium text-foreground mb-1">Model</label>
@@ -544,14 +597,6 @@
 							</div>
 						</div>
 					{/if}
-					<div>
-						<label for="local-url" class="block text-xs font-medium text-foreground mb-1">
-							Remote server <span class="text-muted-foreground font-normal">(optional)</span>
-						</label>
-						<input id="local-url" type="text" bind:value={llmLocalBaseUrl} placeholder="http://localhost:11434"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-						<p class="mt-1 text-xs text-muted-foreground">Leave empty to run the model inside xpressclaw.</p>
-					</div>
 				</div>
 			{:else if llmProvider === 'openai' || llmProvider === 'anthropic'}
 				<div class="space-y-3 rounded-lg border border-border p-4">

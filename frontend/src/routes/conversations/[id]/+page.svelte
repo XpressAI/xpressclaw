@@ -100,7 +100,7 @@
 			scrollToBottom();
 
 			// Subscribe to live events (ADR-019)
-			subscribeToEvents();
+			const sseReady = subscribeToEvents();
 
 			// Handle ?msg= query param exactly once (e.g. from "new conversation" flow).
 			// Read from window.location (not $page) and guard with a flag to
@@ -111,6 +111,8 @@
 				if (pendingMsg) {
 					pendingMsgHandled = true;
 					window.history.replaceState(window.history.state, '', window.location.pathname);
+					// Wait for SSE connection before sending so events aren't missed
+					await sseReady;
 					input = pendingMsg;
 					await tick();
 					sendMessage();
@@ -129,8 +131,8 @@
 	// Subscribe to SSE events for this conversation (ADR-019).
 	// Handles thinking, chunks, messages, and errors from the background processor.
 	// Always closes any existing subscription first to prevent duplicate streams.
-	function subscribeToEvents() {
-		if (!conv) return;
+	function subscribeToEvents(): Promise<void> {
+		if (!conv) return Promise.resolve();
 
 		// Close any existing subscription — prevents duplicate streams
 		// when navigating away and back.
@@ -145,7 +147,7 @@
 		sending = false;
 
 		const lastId = messages.length > 0 ? messages[messages.length - 1].id : 0;
-		cancelStream = conversations.subscribeEvents(conv.id, lastId, {
+		const sub = conversations.subscribeEvents(conv.id, lastId, {
 			onThinking: async (agentId) => {
 				thinkingAgent = agentId;
 				streamingContent = '';
@@ -177,6 +179,8 @@
 				streamingContent = '';
 			}
 		});
+		cancelStream = sub.cancel;
+		return sub.ready;
 	}
 
 	async function sendMessage() {
