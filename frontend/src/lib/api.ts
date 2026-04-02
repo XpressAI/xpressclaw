@@ -249,6 +249,7 @@ export const agents = {
 		} | null;
 		wake_on?: { schedule: string | null; event: string | null; condition: string | null }[];
 		hooks?: { before_message: string[]; after_message: string[] };
+		idle_prompt?: string | null;
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
 	)
@@ -569,6 +570,7 @@ export interface LiveConfig {
 		rate_limit?: { requests_per_minute: number; tokens_per_minute: number; concurrent_requests: number };
 		wake_on?: { schedule: string | null; event: string | null; condition: string | null }[];
 		hooks?: { before_message: string[]; after_message: string[] };
+		idle_prompt?: string | null;
 	}[];
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
 	mcp_servers: string[];

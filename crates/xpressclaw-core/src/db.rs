@@ -138,6 +138,7 @@ impl Database {
             (15, MIGRATION_V15),
             (16, MIGRATION_V16),
             (17, MIGRATION_V17),
+            (18, MIGRATION_V18),
         ];
 
         for &(target, sql) in migrations {
@@ -551,6 +552,16 @@ CREATE INDEX idx_task_deps_task ON task_dependencies(task_id);
 CREATE INDEX idx_task_deps_dep ON task_dependencies(depends_on_id);
 ";
 
+const MIGRATION_V18: &str = "
+-- Idle-task tracking columns on agents (XCLAW-47).
+ALTER TABLE agents ADD COLUMN idle_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN last_idle_check TIMESTAMP;
+
+-- Task type and hidden flag for idle tasks.
+ALTER TABLE tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'normal';
+ALTER TABLE tasks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,7 +579,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "17");
+        assert_eq!(version, "18");
     }
 
     #[test]

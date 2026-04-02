@@ -51,6 +51,9 @@
 	// Wake-on triggers
 	let editWakeOn = $state<{ schedule: string; event: string; condition: string }[]>([]);
 
+	// Idle prompt
+	let editIdlePrompt = $state('');
+
 	// Hooks
 	let editBeforeHooks = $state<string[]>([]);
 	let editAfterHooks = $state<string[]>([]);
@@ -59,14 +62,27 @@
 
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-	// Re-load when route param changes (Svelte reuses the component)
-	$effect(() => {
-		const id = $page.params.id;
-		if (id) loadAgent(id);
+	// Track which agent ID we've loaded. Plain variable (not $state) so
+	// reading it inside the subscription doesn't create reactive deps.
+	let loadedAgentId = '';
+
+	// Subscribe to the page store manually instead of using $effect,
+	// which aggressively re-fires on any $page update (XCLAW-48).
+	// This only calls loadAgent when the route param actually changes.
+	let unsubPage: (() => void) | null = null;
+	onMount(() => {
+		unsubPage = page.subscribe(($p) => {
+			const id = $p.params.id;
+			if (id && id !== loadedAgentId) {
+				loadedAgentId = id;
+				loadAgent(id);
+			}
+		});
 	});
 
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
+		if (unsubPage) unsubPage();
 	});
 
 	async function loadAgent(id: string) {
@@ -114,6 +130,7 @@
 					condition: w.condition ?? '',
 				}));
 
+				editIdlePrompt = agentConfig.idle_prompt ?? '';
 				editBeforeHooks = [...(agentConfig.hooks?.before_message ?? [])];
 				editAfterHooks = [...(agentConfig.hooks?.after_message ?? [])];
 			}
@@ -223,6 +240,8 @@
 				before_message: editBeforeHooks.filter(h => h.trim()),
 				after_message: editAfterHooks.filter(h => h.trim()),
 			};
+
+			payload.idle_prompt = editIdlePrompt.trim() || null;
 
 			const result = await agents.updateConfig(agent.id, payload);
 			if (result.needs_restart) {
@@ -663,6 +682,26 @@
 					</div>
 				</details>
 
+				<!-- Idle Prompt -->
+				<details class="rounded-lg border border-border bg-card" open={!!editIdlePrompt}>
+					<summary class="cursor-pointer p-4 text-sm font-semibold select-none hover:bg-accent/30">
+						Idle Prompt
+						{#if editIdlePrompt}<span class="ml-2 text-xs font-normal text-muted-foreground">active</span>{/if}
+					</summary>
+					<div class="px-4 pb-4 space-y-3 border-t border-border pt-3">
+						<p class="text-xs text-muted-foreground">
+							When set, the agent self-activates during idle periods with exponential backoff.
+							The agent maintains a scratch pad between cycles for notes and context.
+						</p>
+						<textarea bind:value={editIdlePrompt} rows="4"
+							placeholder="e.g., Check for pending tasks, review your memory, and scan your workspace for anything that needs attention. If nothing needs action, rest."
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"></textarea>
+						<p class="text-xs text-muted-foreground">
+							Leave empty to disable idle tasks. Backoff: immediate &rarr; 30m &rarr; 2h &rarr; 6h &rarr; 12h. Resets when the agent completes real work.
+						</p>
+					</div>
+				</details>
+
 				<!-- Hooks -->
 				<details class="rounded-lg border border-border bg-card" open={editBeforeHooks.length > 0 || editAfterHooks.length > 0}>
 					<summary class="cursor-pointer p-4 text-sm font-semibold select-none hover:bg-accent/30">
@@ -720,7 +759,7 @@
 
 	<!-- Save bar (always at bottom) -->
 	{#if agent}
-		<div class="shrink-0 border-t border-border bg-background px-6 py-3 flex items-center gap-3">
+		<div class="shrink-0 border-t border-border bg-background px-6 py-3 flex items-center justify-end gap-3">
 			<button onclick={saveConfig} disabled={saving}
 				class="rounded-md bg-primary px-6 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
 				{saving ? 'Saving...' : 'Save Changes'}

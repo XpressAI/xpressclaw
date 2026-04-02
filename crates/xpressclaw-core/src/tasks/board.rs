@@ -58,6 +58,16 @@ pub struct Task {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub context: Option<serde_json::Value>,
+    /// Task type: "normal" or "IDLE" (hidden single-turn idle tasks).
+    #[serde(default = "default_task_type")]
+    pub task_type: String,
+    /// Hidden tasks (e.g. idle tasks) are excluded from default list views.
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+fn default_task_type() -> String {
+    "normal".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -132,6 +142,27 @@ impl TaskBoard {
         self.get(&id)
     }
 
+    /// Create a hidden single-turn idle task for an agent (XCLAW-47).
+    pub fn create_idle_task(&self, agent_id: &str, description: &str) -> Result<Task> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let title = format!("[Idle] {agent_id}");
+
+        {
+            let conn = self.db.conn();
+            conn.execute(
+                "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6)",
+                rusqlite::params![id, title, description, agent_id, now, now],
+            )?;
+        }
+
+        self.get(&id)
+    }
+
     pub fn get(&self, task_id: &str) -> Result<Task> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare("SELECT * FROM tasks WHERE id = ?1")?;
@@ -149,9 +180,33 @@ impl TaskBoard {
         agent_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Task>> {
+        self.list_inner(status, agent_id, limit, false)
+    }
+
+    /// List tasks including hidden ones (e.g. IDLE tasks).
+    pub fn list_all(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Task>> {
+        self.list_inner(status, agent_id, limit, true)
+    }
+
+    fn list_inner(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        limit: i64,
+        include_hidden: bool,
+    ) -> Result<Vec<Task>> {
         let conn = self.db.conn();
         let mut sql = "SELECT * FROM tasks WHERE 1=1".to_string();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if !include_hidden {
+            sql.push_str(" AND hidden = 0");
+        }
 
         if let Some(s) = status {
             sql.push_str(" AND status = ?");
@@ -518,6 +573,10 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
         context,
+        task_type: row
+            .get::<_, String>("task_type")
+            .unwrap_or_else(|_| "normal".to_string()),
+        hidden: row.get::<_, i32>("hidden").unwrap_or(0) != 0,
     })
 }
 

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use std::time::SystemTime;
 
 /// Returns the npm command name for the current platform.
 /// Windows needs "npm.cmd" because npm is a batch script.
@@ -11,37 +12,68 @@ fn npm() -> &'static str {
     }
 }
 
+/// Recursively emit `cargo:rerun-if-changed` for every file in a directory
+/// and return the most recent mtime found.
+fn walk_dir(dir: &Path, newest: &mut SystemTime) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_dir(&path, newest);
+            } else {
+                println!("cargo:rerun-if-changed={}", path.display());
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime > *newest {
+                            *newest = mtime;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_root = Path::new(&manifest_dir).parent().unwrap().parent().unwrap();
     let frontend_dir = workspace_root.join("frontend");
-    let build_dir = frontend_dir.join("build");
+    let build_marker = frontend_dir.join("build").join("index.html");
 
-    // Tell Cargo to rerun this script if any frontend source changes
-    println!(
-        "cargo:rerun-if-changed={}",
-        frontend_dir.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        frontend_dir.join("static").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        frontend_dir.join("svelte.config.js").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        frontend_dir.join("vite.config.ts").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        frontend_dir.join("package.json").display()
-    );
+    // Tell Cargo to rerun this script if any frontend source file changes.
+    // We must walk the directory tree and emit each file individually because
+    // rerun-if-changed on a directory only fires when direct children are
+    // added/removed — not when nested files are modified.
+    let mut newest_source = SystemTime::UNIX_EPOCH;
+    for dir in &["src", "static"] {
+        let target = frontend_dir.join(dir);
+        if target.is_dir() {
+            walk_dir(&target, &mut newest_source);
+        }
+    }
+    for file in &[
+        "svelte.config.js",
+        "vite.config.ts",
+        "package.json",
+        "tsconfig.json",
+        "tailwind.config.ts",
+    ] {
+        let p = frontend_dir.join(file);
+        if p.exists() {
+            println!("cargo:rerun-if-changed={}", p.display());
+            if let Ok(mtime) = p.metadata().and_then(|m| m.modified()) {
+                if mtime > newest_source {
+                    newest_source = mtime;
+                }
+            }
+        }
+    }
 
-    // Skip frontend build if already built (e.g. CI pre-builds it)
-    if build_dir.join("index.html").exists() {
-        return;
+    // Skip rebuild if the build output is newer than all source files.
+    if let Ok(build_mtime) = build_marker.metadata().and_then(|m| m.modified()) {
+        if build_mtime >= newest_source {
+            return;
+        }
     }
 
     // Install deps if needed

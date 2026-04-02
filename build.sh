@@ -77,8 +77,8 @@ elif [[ "$(uname)" == "Darwin" ]]; then
 fi
 
 # Build CLI (release mode — disables debug_assertions so rust-embed
-# embeds statically. The server's build.rs auto-builds the frontend
-# if frontend/build/ doesn't exist.)
+# embeds statically. The server's build.rs auto-rebuilds the frontend
+# whenever frontend source files change.)
 echo "==> Building CLI..."
 cargo build --release -p xpressclaw-cli $CARGO_FEATURES
 

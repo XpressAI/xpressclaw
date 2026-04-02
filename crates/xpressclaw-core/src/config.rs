@@ -222,6 +222,10 @@ pub struct AgentConfig {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub volumes: Vec<String>,
+    /// Idle-task prompt. When set, the agent self-activates during idle
+    /// periods with exponential backoff. The agent reads/writes a scratch
+    /// pad at {data_dir}/{agent_id}/idle.md between cycles.
+    pub idle_prompt: Option<String>,
 }
 
 impl Default for AgentConfig {
@@ -240,6 +244,7 @@ impl Default for AgentConfig {
             container: HashMap::new(),
             hooks: HooksConfig::default(),
             volumes: Vec::new(),
+            idle_prompt: None,
         }
     }
 }

@@ -234,6 +234,7 @@ struct UpdateAgentConfigRequest {
     rate_limit: Option<RateLimitConfig>,
     wake_on: Option<Vec<WakeOnConfig>>,
     hooks: Option<HooksConfig>,
+    idle_prompt: Option<String>,
 }
 
 /// Update an agent's configuration in the YAML config file and reload.
@@ -306,6 +307,13 @@ async fn update_agent_config(
     if let Some(hooks) = req.hooks {
         agent.hooks = hooks;
     }
+    if let Some(idle_prompt) = req.idle_prompt {
+        agent.idle_prompt = if idle_prompt.is_empty() {
+            None
+        } else {
+            Some(idle_prompt)
+        };
+    }
 
     let needs_restart = record.desired_status == "running";
 
@@ -366,6 +374,7 @@ async fn update_agent_config(
                 "before_message": updated.hooks.before_message,
                 "after_message": updated.hooks.after_message,
             },
+            "idle_prompt": updated.idle_prompt,
         },
         "needs_restart": needs_restart,
     })))
