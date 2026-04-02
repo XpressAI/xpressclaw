@@ -346,16 +346,13 @@ async fn complete_setup(
         // Model path will be set after download completes
         local_model_path: None,
         local_base_url: if is_local {
-            req.llm
-                .local_base_url
-                .clone()
-                .or_else(|| {
-                    if req.llm.provider == "ollama" {
-                        Some("http://localhost:11434".to_string())
-                    } else {
-                        None
-                    }
-                })
+            req.llm.local_base_url.clone().or_else(|| {
+                if req.llm.provider == "ollama" {
+                    Some("http://localhost:11434".to_string())
+                } else {
+                    None
+                }
+            })
         } else {
             None
         },

@@ -10,7 +10,6 @@
     clippy::cast_sign_loss
 )]
 
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -235,11 +234,7 @@ impl LlamaCppProvider {
         } else {
             DEFAULT_CONTEXT_LENGTH
         };
-        tracing::info!(
-            model = model_name,
-            n_ctx_train,
-            "GGUF model loaded"
-        );
+        tracing::info!(model = model_name, n_ctx_train, "GGUF model loaded");
 
         Ok(Self {
             backend,
@@ -905,7 +900,10 @@ fn parse_xml_tool_calls(raw: &str) -> Option<Vec<super::router::ToolCall>> {
 
             let param_value_end = after_param_name.find("</parameter>")?;
             let param_value = after_param_name[..param_value_end].trim();
-            args.insert(param_name, serde_json::Value::String(param_value.to_string()));
+            args.insert(
+                param_name,
+                serde_json::Value::String(param_value.to_string()),
+            );
 
             param_remaining = &after_param_name[param_value_end + "</parameter>".len()..];
         }

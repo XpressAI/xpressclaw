@@ -83,11 +83,7 @@ pub async fn ollama_has_model(base_url: &str, model: &str) -> bool {
         .build()
         .unwrap_or_default();
 
-    let Ok(resp) = client
-        .get(format!("{base_url}/api/tags"))
-        .send()
-        .await
-    else {
+    let Ok(resp) = client.get(format!("{base_url}/api/tags")).send().await else {
         return false;
     };
 
