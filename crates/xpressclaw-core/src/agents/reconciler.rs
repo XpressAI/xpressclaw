@@ -56,6 +56,7 @@ async fn reconcile_once(
     reconcile_agents(db, config, &docker, server_port).await;
     reconcile_apps(db, &docker).await;
     reconcile_tasks(db, &docker).await;
+    reconcile_idle_tasks(db, config);
 
     Ok(())
 }
@@ -363,7 +364,7 @@ async fn reconcile_tasks(db: &Arc<Database>, docker: &DockerManager) {
     let board = TaskBoard::new(db.clone());
     let queue = TaskQueue::new(db.clone());
 
-    let tasks = match board.list(Some("in_progress"), None, 100) {
+    let tasks = match board.list_all(Some("in_progress"), None, 100) {
         Ok(t) => t,
         Err(_) => return,
     };
@@ -395,6 +396,245 @@ async fn reconcile_tasks(db: &Arc<Database>, docker: &DockerManager) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Idle tasks (XCLAW-47)
+// ---------------------------------------------------------------------------
+
+/// Create idle tasks for agents that have an `idle_prompt` configured and
+/// currently have no work. Follows the desired-state pattern: if an agent
+/// should have an idle task but doesn't, create one.
+fn reconcile_idle_tasks(db: &Arc<Database>, config: &Config) {
+    let registry = AgentRegistry::new(db.clone());
+    let board = TaskBoard::new(db.clone());
+    let queue = TaskQueue::new(db.clone());
+
+    for agent_cfg in &config.agents {
+        let idle_prompt = match agent_cfg.idle_prompt.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+
+        // Agent must be running
+        let agent = match registry.get(&agent_cfg.name) {
+            Ok(a) if a.desired_status == "running" && a.status == "running" => a,
+            _ => continue,
+        };
+
+        // Skip if the agent already has an IDLE task queued or in progress
+        let has_idle_task = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE agent_id = ?1 AND task_type = 'IDLE'
+                       AND status IN ('pending', 'in_progress')",
+                    [&agent_cfg.name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| crate::error::Error::Database(e.to_string()))
+            })
+            .unwrap_or(0)
+            > 0;
+        if has_idle_task {
+            continue;
+        }
+
+        // Skip if agent has real (non-IDLE) work pending or in progress
+        let has_real_work = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks
+                     WHERE agent_id = ?1 AND task_type != 'IDLE'
+                       AND status IN ('pending', 'in_progress')",
+                    [&agent_cfg.name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| crate::error::Error::Database(e.to_string()))
+            })
+            .unwrap_or(0)
+            > 0;
+        if has_real_work {
+            continue;
+        }
+
+        // Skip if a conversation involving this agent is currently processing
+        let conv_busy = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversations c
+                     JOIN conversation_participants cp ON cp.conversation_id = c.id
+                     WHERE cp.participant_id = ?1
+                       AND cp.participant_type = 'agent'
+                       AND c.processing_status = 'processing'",
+                    [&agent_cfg.name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| crate::error::Error::Database(e.to_string()))
+            })
+            .unwrap_or(0)
+            > 0;
+        if conv_busy {
+            continue;
+        }
+
+        // Check backoff
+        if !idle_backoff_elapsed(agent.idle_count, agent.last_idle_check.as_deref()) {
+            continue;
+        }
+
+        // Build the idle prompt with scratch pad contents
+        let description = build_idle_prompt(idle_prompt, &agent_cfg.name, &config.system.data_dir);
+
+        // Seed scratch pad on first use
+        seed_scratch_pad(&agent_cfg.name, &config.system.data_dir);
+
+        // Create the hidden idle task
+        match board.create_idle_task(&agent_cfg.name, &description) {
+            Ok(task) => {
+                if let Err(e) = queue.enqueue(&task.id, &agent_cfg.name) {
+                    warn!(
+                        agent = agent_cfg.name,
+                        error = %e,
+                        "failed to enqueue idle task"
+                    );
+                }
+                // Update idle tracking columns
+                let now = chrono::Utc::now()
+                    .naive_utc()
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string();
+                let _ = db.with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE agents SET idle_count = idle_count + 1, last_idle_check = ?1 WHERE id = ?2",
+                        rusqlite::params![now, agent_cfg.name],
+                    )
+                    .map_err(|e| crate::error::Error::Database(e.to_string()))
+                });
+                info!(
+                    agent = agent_cfg.name,
+                    idle_count = agent.idle_count + 1,
+                    task_id = task.id,
+                    "created idle task"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    agent = agent_cfg.name,
+                    error = %e,
+                    "failed to create idle task"
+                );
+            }
+        }
+    }
+
+    // Safety net: clean up stuck IDLE tasks (>30 min in in_progress)
+    cleanup_stuck_idle_tasks(db);
+}
+
+/// Build the idle prompt with current time and scratch pad contents.
+fn build_idle_prompt(idle_prompt: &str, agent_id: &str, data_dir: &std::path::Path) -> String {
+    let now = chrono::Local::now();
+    let mut prompt = format!(
+        "Current time: {} ({})\n\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
+    );
+
+    prompt.push_str(idle_prompt);
+    prompt.push_str("\n\n");
+
+    // Embed scratch pad contents to save a tool-call round-trip
+    let scratch_path = data_dir.join(agent_id).join("idle.md");
+    prompt.push_str(&format!(
+        "Your persistent scratch pad is at {} — update it as needed.\n",
+        scratch_path.display()
+    ));
+    if let Ok(contents) = std::fs::read_to_string(&scratch_path) {
+        if !contents.trim().is_empty() {
+            prompt.push_str("\n--- scratch pad contents ---\n");
+            prompt.push_str(&contents);
+            prompt.push_str("\n--- end scratch pad ---\n");
+        }
+    }
+
+    prompt
+}
+
+/// Write a default scratch pad if one doesn't exist yet.
+fn seed_scratch_pad(agent_id: &str, data_dir: &std::path::Path) {
+    let dir = data_dir.join(agent_id);
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("idle.md");
+    if !path.exists() {
+        let template = "# Idle Scratch Pad\n\n\
+            Notes and observations maintained across idle cycles.\n\n\
+            ## Reminders\n\
+            - (Add items here)\n\n\
+            ## Agent Notes\n\
+            (Update this section with observations, pending items, and context between sessions.)\n";
+        let _ = std::fs::write(&path, template);
+    }
+}
+
+/// Delete IDLE tasks stuck in in_progress for >30 minutes.
+fn cleanup_stuck_idle_tasks(db: &Arc<Database>) {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(30))
+        .naive_utc()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let deleted = db
+        .with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM tasks
+                 WHERE task_type = 'IDLE' AND status = 'in_progress'
+                   AND updated_at < ?1",
+                [&cutoff],
+            )
+            .map_err(|e| crate::error::Error::Database(e.to_string()))
+        })
+        .unwrap_or(0);
+    if deleted > 0 {
+        warn!(count = deleted, "cleaned up stuck idle tasks");
+    }
+}
+
+/// Idle-task exponential backoff. Returns true if enough time has elapsed
+/// since the last idle check for the given idle_count.
+///
+/// Schedule (matching XpressAI platform):
+/// - idle_count=0 → immediate
+/// - idle_count=1 → 30 min
+/// - idle_count=2 → 2 hours
+/// - idle_count=3 → 6 hours
+/// - idle_count>=4 → 12 hours
+fn idle_backoff_elapsed(idle_count: i32, last_idle_check: Option<&str>) -> bool {
+    if idle_count == 0 {
+        return true;
+    }
+
+    let required_secs: u64 = match idle_count {
+        1 => 30 * 60,      // 30 min
+        2 => 2 * 60 * 60,  // 2 hours
+        3 => 6 * 60 * 60,  // 6 hours
+        _ => 12 * 60 * 60, // 12 hours
+    };
+
+    let Some(last) = last_idle_check else {
+        return true;
+    };
+
+    let Ok(last_time) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") else {
+        return true;
+    };
+
+    let elapsed = chrono::Utc::now()
+        .naive_utc()
+        .signed_duration_since(last_time)
+        .num_seconds()
+        .max(0) as u64;
+
+    elapsed >= required_secs
+}
+
 /// Exponential backoff: should we attempt to start this agent now?
 fn should_attempt(restart_count: i32, last_attempt_at: Option<&str>) -> bool {
     if restart_count == 0 {
@@ -422,4 +662,151 @@ fn should_attempt(restart_count: i32, last_attempt_at: Option<&str>) -> bool {
         .max(0) as u64;
 
     elapsed >= backoff_secs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_idle_backoff_immediate_at_zero() {
+        assert!(idle_backoff_elapsed(0, None));
+        assert!(idle_backoff_elapsed(0, Some("2020-01-01 00:00:00")));
+    }
+
+    #[test]
+    fn test_idle_backoff_no_last_check() {
+        // No last_idle_check means we should fire regardless of count
+        assert!(idle_backoff_elapsed(1, None));
+        assert!(idle_backoff_elapsed(4, None));
+    }
+
+    #[test]
+    fn test_idle_backoff_not_elapsed() {
+        // Just now — backoff should prevent firing for idle_count >= 1
+        let now = chrono::Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(!idle_backoff_elapsed(1, Some(&now))); // needs 30min
+        assert!(!idle_backoff_elapsed(2, Some(&now))); // needs 2h
+        assert!(!idle_backoff_elapsed(3, Some(&now))); // needs 6h
+        assert!(!idle_backoff_elapsed(4, Some(&now))); // needs 12h
+    }
+
+    #[test]
+    fn test_idle_backoff_elapsed() {
+        // 2 hours ago — sufficient for idle_count 1 (30min) and 2 (2h)
+        let two_hours_ago =
+            (chrono::Utc::now() - chrono::Duration::hours(2) - chrono::Duration::seconds(1))
+                .naive_utc()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+        assert!(idle_backoff_elapsed(1, Some(&two_hours_ago)));
+        assert!(idle_backoff_elapsed(2, Some(&two_hours_ago)));
+        assert!(!idle_backoff_elapsed(3, Some(&two_hours_ago))); // needs 6h
+    }
+
+    #[test]
+    fn test_idle_backoff_bad_timestamp() {
+        // Unparseable timestamp → allow
+        assert!(idle_backoff_elapsed(3, Some("not-a-timestamp")));
+    }
+
+    #[test]
+    fn test_build_idle_prompt_basic() {
+        let prompt = build_idle_prompt(
+            "Check your tasks.",
+            "atlas",
+            std::path::Path::new("/tmp/test-data"),
+        );
+        assert!(prompt.contains("Check your tasks."));
+        assert!(prompt.contains("Current time:"));
+        assert!(prompt.contains("scratch pad"));
+    }
+
+    #[test]
+    fn test_build_idle_prompt_with_scratch_pad() {
+        let dir = std::env::temp_dir().join("xpressclaw-test-idle");
+        let agent_dir = dir.join("test-agent");
+        let _ = std::fs::create_dir_all(&agent_dir);
+        std::fs::write(agent_dir.join("idle.md"), "# My Notes\nImportant stuff").unwrap();
+
+        let prompt = build_idle_prompt("Check tasks.", "test-agent", &dir);
+        assert!(prompt.contains("Important stuff"));
+        assert!(prompt.contains("scratch pad contents"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seed_scratch_pad_creates_file() {
+        let dir = std::env::temp_dir().join("xpressclaw-test-seed");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        seed_scratch_pad("test-agent", &dir);
+
+        let path = dir.join("test-agent").join("idle.md");
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("Idle Scratch Pad"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_seed_scratch_pad_does_not_overwrite() {
+        let dir = std::env::temp_dir().join("xpressclaw-test-seed-no-overwrite");
+        let agent_dir = dir.join("test-agent");
+        let _ = std::fs::create_dir_all(&agent_dir);
+        std::fs::write(agent_dir.join("idle.md"), "custom content").unwrap();
+
+        seed_scratch_pad("test-agent", &dir);
+
+        let contents = std::fs::read_to_string(agent_dir.join("idle.md")).unwrap();
+        assert_eq!(contents, "custom content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_idle_task() {
+        let db = Arc::new(crate::db::Database::open_memory().unwrap());
+        let board = TaskBoard::new(db.clone());
+
+        let task = board
+            .create_idle_task("atlas", "Check your workspace")
+            .unwrap();
+
+        assert_eq!(task.task_type, "IDLE");
+        assert!(task.hidden);
+        assert_eq!(task.title, "[Idle] atlas");
+        assert_eq!(task.agent_id.as_deref(), Some("atlas"));
+        assert_eq!(task.status, crate::tasks::board::TaskStatus::Pending);
+    }
+
+    #[test]
+    fn test_idle_tasks_hidden_from_default_list() {
+        let db = Arc::new(crate::db::Database::open_memory().unwrap());
+        let board = TaskBoard::new(db.clone());
+
+        // Create a normal task and an idle task
+        board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Normal task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        board.create_idle_task("atlas", "idle check").unwrap();
+
+        // Default list should only show the normal task
+        let visible = board.list(None, None, 100).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].title, "Normal task");
+
+        // list_all should show both
+        let all = board.list_all(None, None, 100).unwrap();
+        assert_eq!(all.len(), 2);
+    }
 }

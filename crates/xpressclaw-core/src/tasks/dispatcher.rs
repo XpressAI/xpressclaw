@@ -402,6 +402,18 @@ fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
         return State::Done(DriverResult::Skipped);
     }
 
+    // IDLE tasks auto-complete after a single agent response and get deleted.
+    // They are single-turn check-ins, not multi-turn conversations.
+    if ctx.task.task_type == "IDLE" {
+        info!(
+            task_id = ctx.task.id,
+            agent_id = ctx.agent_id,
+            "idle task auto-completing after agent response"
+        );
+        let _ = board.delete(&ctx.task.id);
+        return State::Done(DriverResult::Completed);
+    }
+
     // Auto-advance subtasks
     if !ctx.subtasks.is_empty() {
         // Refresh subtask status
@@ -497,6 +509,24 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+/// Reset an agent's idle_count to 0 after completing real work.
+/// This ensures the next idle check fires promptly.
+fn reset_idle_count(db: &Arc<Database>, agent_id: &str) {
+    let now = chrono::Utc::now()
+        .naive_utc()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if let Err(e) = db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE agents SET idle_count = 0, last_idle_check = ?1 WHERE id = ?2",
+            rusqlite::params![now, agent_id],
+        )
+        .map_err(|e| crate::error::Error::Database(e.to_string()))
+    }) {
+        debug!(agent_id, error = %e, "failed to reset idle_count");
+    }
+}
+
 /// Send a task status notification back to the originating conversation.
 /// This lets the user (and the agent) know the background task finished.
 fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status: &str) {
@@ -580,7 +610,7 @@ fn recover_on_startup(db: &Arc<Database>) -> crate::error::Result<()> {
     }
 
     // 2. Re-enqueue in_progress tasks that have no active queue entry
-    let in_progress = board.list(Some("in_progress"), None, 100)?;
+    let in_progress = board.list_all(Some("in_progress"), None, 100)?;
     for task in &in_progress {
         let agent_id = match &task.agent_id {
             Some(id) => id.clone(),
@@ -667,9 +697,19 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
         match &result {
             DriverResult::Completed => {
                 let _ = queue.complete(claimed.id, "completed");
-                let _ = board.update_status(&claimed.task_id, "completed", None);
+                // IDLE tasks delete themselves in evaluate(); for normal tasks
+                // mark completed and reset the agent's idle_count so the next
+                // idle check fires promptly.
+                let is_idle = board
+                    .get(&claimed.task_id)
+                    .map(|t| t.task_type == "IDLE")
+                    .unwrap_or(false);
+                if !is_idle {
+                    let _ = board.update_status(&claimed.task_id, "completed", None);
+                    reset_idle_count(db, &claimed.agent_id);
+                    notify_conversation(db, &claimed.task_id, &claimed.agent_id, "completed");
+                }
                 info!(task_id = claimed.task_id, "task completed");
-                notify_conversation(db, &claimed.task_id, &claimed.agent_id, "completed");
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
@@ -721,6 +761,8 @@ mod tests {
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                task_type: "normal".into(),
+                hidden: false,
             },
             Task {
                 id: "2".into(),
@@ -736,6 +778,8 @@ mod tests {
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                task_type: "normal".into(),
+                hidden: false,
             },
             Task {
                 id: "3".into(),
@@ -751,6 +795,8 @@ mod tests {
                 updated_at: String::new(),
                 completed_at: None,
                 context: None,
+                task_type: "normal".into(),
+                hidden: false,
             },
         ];
 
@@ -774,6 +820,8 @@ mod tests {
             updated_at: String::new(),
             completed_at: None,
             context: None,
+            task_type: "normal".into(),
+            hidden: false,
         }];
 
         let current = current_subtask(&subtasks).unwrap();
@@ -796,6 +844,8 @@ mod tests {
             updated_at: String::new(),
             completed_at: None,
             context: None,
+            task_type: "normal".into(),
+            hidden: false,
         }];
 
         assert!(current_subtask(&subtasks).is_none());

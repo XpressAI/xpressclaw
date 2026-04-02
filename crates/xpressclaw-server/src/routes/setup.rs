@@ -91,6 +91,9 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "before_message": a.hooks.before_message,
                 "after_message": a.hooks.after_message,
             });
+            if let Some(ref ip) = a.idle_prompt {
+                agent["idle_prompt"] = json!(ip);
+            }
             agent
         }).collect::<Vec<_>>(),
         "system": {

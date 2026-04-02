@@ -27,6 +27,10 @@ pub struct AgentRecord {
     pub restart_count: i32,
     /// When the reconciler last attempted to start this agent.
     pub last_attempt_at: Option<String>,
+    /// How many consecutive idle-task cycles have run (XCLAW-47).
+    pub idle_count: i32,
+    /// When the last idle check occurred.
+    pub last_idle_check: Option<String>,
 }
 
 /// Manages agent runtime state in the database.
@@ -63,7 +67,8 @@ impl AgentRegistry {
             let mut stmt = conn.prepare(
                 "SELECT id, name, backend, status, container_id, created_at,
                         started_at, stopped_at, error_message,
-                        desired_status, restart_count, last_attempt_at
+                        desired_status, restart_count, last_attempt_at,
+                        idle_count, last_idle_check
                  FROM agents WHERE id = ?1",
             )?;
             let record = stmt.query_row([agent_id], |row| {
@@ -80,6 +85,8 @@ impl AgentRegistry {
                     desired_status: row.get(9)?,
                     restart_count: row.get(10)?,
                     last_attempt_at: row.get(11)?,
+                    idle_count: row.get(12)?,
+                    last_idle_check: row.get(13)?,
                 })
             });
             match record {
@@ -96,7 +103,8 @@ impl AgentRegistry {
             let mut stmt = conn.prepare(
                 "SELECT id, name, backend, status, container_id, created_at,
                         started_at, stopped_at, error_message,
-                        desired_status, restart_count, last_attempt_at
+                        desired_status, restart_count, last_attempt_at,
+                        idle_count, last_idle_check
                  FROM agents ORDER BY name",
             )?;
             let records = stmt
@@ -114,6 +122,8 @@ impl AgentRegistry {
                         desired_status: row.get(9)?,
                         restart_count: row.get(10)?,
                         last_attempt_at: row.get(11)?,
+                        idle_count: row.get(12)?,
+                        last_idle_check: row.get(13)?,
                     })
                 })
                 .map_err(|e| Error::Database(e.to_string()))?
