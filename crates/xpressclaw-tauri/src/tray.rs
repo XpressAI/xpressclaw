@@ -32,7 +32,7 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
                 }
                 "quit" => {
                     info!("quit requested from tray");
-                    handle.exit(0);
+                    crate::confirm_quit(&handle);
                 }
                 _ => {}
             }
