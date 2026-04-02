@@ -74,6 +74,55 @@ pub async fn detect_ollama() -> OllamaInfo {
     }
 }
 
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+
+/// Check if Ollama has a specific model installed.
+pub async fn ollama_has_model(base_url: &str, model: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    let Ok(resp) = client
+        .get(format!("{base_url}/api/tags"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+
+    let Ok(tags) = resp.json::<OllamaTagsResponse>().await else {
+        return false;
+    };
+
+    tags.models
+        .unwrap_or_default()
+        .iter()
+        .any(|m| m.name == model || m.name == format!("{model}:latest"))
+}
+
+/// Pull a model from Ollama. Blocks until the pull completes.
+pub async fn ollama_pull(base_url: &str, model: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .unwrap_or_default();
+
+    let resp = client
+        .post(format!("{base_url}/api/pull"))
+        .json(&serde_json::json!({ "name": model, "stream": false }))
+        .send()
+        .await
+        .map_err(|e| Error::Llm(format!("Ollama pull request failed: {e}")))?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::Llm(format!("Ollama pull failed: {body}")));
+    }
+
+    Ok(())
+}
+
 /// Local LLM provider that proxies to an OpenAI-compatible server.
 ///
 /// Works with Ollama, vLLM, llama.cpp server, or any other local server
@@ -100,12 +149,12 @@ impl LocalProvider {
 
     /// Connect to Ollama's OpenAI-compatible endpoint.
     pub fn ollama(model_name: String) -> Self {
-        Self::new("http://localhost:11434".to_string(), model_name)
+        Self::new(DEFAULT_OLLAMA_URL.to_string(), model_name)
     }
 
     /// Create a provider using the config's local_base_url, falling back to Ollama's default.
     pub fn from_config(model_name: String, base_url: Option<String>) -> Self {
-        let url = base_url.unwrap_or_else(|| "http://localhost:11434".to_string());
+        let url = base_url.unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
         Self::new(url, model_name)
     }
 }

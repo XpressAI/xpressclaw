@@ -136,8 +136,8 @@ pub fn download_gguf_with_progress(
 }
 
 /// Default context length for inference.
-/// Default context length. 128k supports tool-calling (Claude SDK sends ~18k tokens
-/// of tool definitions) with ample room for conversation. KV cache at 128k is ~4GB.
+/// 128k supports tool-calling (Claude SDK sends ~18k tokens
+/// of tool definitions) with ample room for conversation.
 const DEFAULT_CONTEXT_LENGTH: u32 = 131_072;
 
 /// Global LlamaBackend singleton — llama.cpp only allows one backend per process.
@@ -154,6 +154,11 @@ fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
     // Re-check after acquiring lock (another thread may have initialized)
     if let Some(b) = LLAMA_BACKEND.get() {
         return Ok(b.clone());
+    }
+    // Enable CUDA unified memory so the KV cache can spill to system RAM
+    // when VRAM is insufficient (instead of failing with cudaMalloc OOM).
+    if std::env::var("GGML_CUDA_ENABLE_UNIFIED_MEMORY").is_err() {
+        std::env::set_var("GGML_CUDA_ENABLE_UNIFIED_MEMORY", "1");
     }
     let backend =
         LlamaBackend::init().map_err(|e| Error::Llm(format!("llama backend init failed: {e}")))?;
@@ -209,6 +214,10 @@ impl LlamaCppProvider {
 
         let params = {
             let p = LlamaModelParams::default();
+            // Offload all layers to GPU (CUDA/Metal)
+            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+            let p = p.with_n_gpu_layers(u32::MAX);
+            // Intel Macs have no Metal support
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             let p = p.with_n_gpu_layers(0);
             p
@@ -218,16 +227,16 @@ impl LlamaCppProvider {
                 .map_err(|e| Error::Llm(format!("failed to load model: {e}")))?,
         );
 
-        // Use the model's trained context length, capped at our default
         let n_ctx_train = model.n_ctx_train();
+        // Context length stored for prompt-fits-in-context checks.
+        // Actual context allocation uses auto-fit (n_ctx=0) at inference time.
         let context_length = if n_ctx_train > 0 {
-            (n_ctx_train as u32).min(DEFAULT_CONTEXT_LENGTH)
+            n_ctx_train as u32
         } else {
             DEFAULT_CONTEXT_LENGTH
         };
         tracing::info!(
             model = model_name,
-            n_ctx = context_length,
             n_ctx_train,
             "GGUF model loaded"
         );
@@ -377,8 +386,10 @@ impl LlamaCppProvider {
         grammar_lazy: bool,
     ) -> Result<(String, Usage)> {
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(self.context_length))
-            .with_n_batch(self.context_length);
+            .with_n_ctx(None)
+            .with_n_batch(self.context_length)
+            .with_type_k(llama_cpp_2::context::params::KvCacheType::Q8_0)
+            .with_type_v(llama_cpp_2::context::params::KvCacheType::Q8_0);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
@@ -558,6 +569,7 @@ impl LlmProvider for LlamaCppProvider {
         let max_tokens = request.max_tokens.unwrap_or(256) as i32;
         let temperature = request.temperature.unwrap_or(0.8) as f32;
 
+        let has_tools = request.tools.is_some();
         let model = self.model.clone();
         let backend = self.backend.clone();
         let model_name = self.model_name.clone();
@@ -595,8 +607,10 @@ impl LlmProvider for LlamaCppProvider {
 
             // Create context
             let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(context_length))
-                .with_n_batch(context_length);
+                .with_n_ctx(None)
+                .with_n_batch(context_length)
+                .with_type_k(llama_cpp_2::context::params::KvCacheType::Q8_0)
+                .with_type_v(llama_cpp_2::context::params::KvCacheType::Q8_0);
             let mut ctx = match model.new_context(&backend, ctx_params) {
                 Ok(c) => c,
                 Err(e) => {
@@ -665,8 +679,11 @@ impl LlmProvider for LlamaCppProvider {
                 };
                 full_output.push_str(&piece);
 
-                // Send token immediately
-                send_chunk(piece, None);
+                // When tools are defined, buffer output so we can parse
+                // <tool_call> tags at the end. Otherwise stream immediately.
+                if !has_tools {
+                    send_chunk(piece, None);
+                }
 
                 if full_output.ends_with("<|im_end|>") {
                     break;
@@ -680,8 +697,53 @@ impl LlmProvider for LlamaCppProvider {
                 }
             }
 
-            // Send final chunk with finish_reason
-            send_chunk(String::new(), Some("stop".into()));
+            if has_tools {
+                // Parse tool calls from buffered output
+                let (parsed_content, tool_calls, finish_reason) = parse_tool_calls(&full_output);
+                if let Some(ref tcs) = tool_calls {
+                    // Emit text content first if any
+                    if !parsed_content.is_empty() {
+                        send_chunk(parsed_content, None);
+                    }
+                    // Emit structured tool call chunk
+                    let chunk = super::router::ChatCompletionChunk {
+                        id: id_clone.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model_name_clone.clone(),
+                        choices: vec![super::router::ChunkChoice {
+                            index: 0,
+                            delta: super::router::ChunkDelta {
+                                role: None,
+                                content: None,
+                                tool_calls: Some(
+                                    tcs.iter()
+                                        .enumerate()
+                                        .map(|(i, tc)| super::router::ChunkToolCall {
+                                            index: i as i64,
+                                            id: Some(tc.id.clone()),
+                                            call_type: Some("function".into()),
+                                            function: Some(super::router::ChunkToolCallFunction {
+                                                name: Some(tc.function.name.clone()),
+                                                arguments: Some(tc.function.arguments.clone()),
+                                            }),
+                                        })
+                                        .collect(),
+                                ),
+                                ..Default::default()
+                            },
+                            finish_reason: Some(finish_reason),
+                        }],
+                    };
+                    let _ = tx.blocking_send(Ok(chunk));
+                } else {
+                    // No tool calls found — send buffered text as one chunk
+                    send_chunk(full_output, Some("stop".into()));
+                }
+            } else {
+                // No tools — final chunk with stop
+                send_chunk(String::new(), Some("stop".into()));
+            }
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -785,6 +847,13 @@ fn parse_tool_calls(raw: &str) -> (String, Option<Vec<super::router::ToolCall>>,
     } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
         trimmed
     } else {
+        // No JSON-style tool call detected — try XML format:
+        // <tool_call>\n<function=name>\n<parameter=key>\nvalue\n</parameter>\n</function>\n</tool_call>
+        if let Some(calls) = parse_xml_tool_calls(trimmed) {
+            if !calls.is_empty() {
+                return (String::new(), Some(calls), "tool_calls".into());
+            }
+        }
         // No tool call detected — return as plain text
         return (raw.to_string(), None, "stop".into());
     };
@@ -798,8 +867,70 @@ fn parse_tool_calls(raw: &str) -> (String, Option<Vec<super::router::ToolCall>>,
         }
     }
 
-    // Not valid tool call JSON — return as text
+    // JSON didn't parse — try XML format inside the <tool_call> tags
+    if let Some(inner) = extract_between(trimmed, "<tool_call>", "</tool_call>") {
+        if let Some(calls) = parse_xml_tool_calls(inner) {
+            if !calls.is_empty() {
+                return (String::new(), Some(calls), "tool_calls".into());
+            }
+        }
+    }
+
+    // Not valid tool call — return as text
     (raw.to_string(), None, "stop".into())
+}
+
+/// Parse XML-style tool calls: `<function=name><parameter=key>value</parameter></function>`
+/// This format is used by some model templates (e.g. Qwen3.5) during streaming.
+fn parse_xml_tool_calls(raw: &str) -> Option<Vec<super::router::ToolCall>> {
+    use super::router::{ToolCall, ToolCallFunction};
+
+    let mut calls = Vec::new();
+    let mut remaining = raw;
+
+    while let Some(func_start) = remaining.find("<function=") {
+        let after_prefix = &remaining[func_start + "<function=".len()..];
+        let name_end = after_prefix.find('>')?;
+        let name = after_prefix[..name_end].trim().to_string();
+        let after_name = &after_prefix[name_end + 1..];
+
+        // Parse parameters
+        let mut args = serde_json::Map::new();
+        let mut param_remaining = after_name;
+        while let Some(param_start) = param_remaining.find("<parameter=") {
+            let after_param = &param_remaining[param_start + "<parameter=".len()..];
+            let param_name_end = after_param.find('>')?;
+            let param_name = after_param[..param_name_end].trim().to_string();
+            let after_param_name = &after_param[param_name_end + 1..];
+
+            let param_value_end = after_param_name.find("</parameter>")?;
+            let param_value = after_param_name[..param_value_end].trim();
+            args.insert(param_name, serde_json::Value::String(param_value.to_string()));
+
+            param_remaining = &after_param_name[param_value_end + "</parameter>".len()..];
+        }
+
+        calls.push(ToolCall {
+            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+            call_type: "function".into(),
+            function: ToolCallFunction {
+                name,
+                arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".into()),
+            },
+        });
+
+        // Advance past </function>
+        remaining = match remaining[func_start..].find("</function>") {
+            Some(end) => &remaining[func_start + end + "</function>".len()..],
+            None => break,
+        };
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
 }
 
 fn parse_tool_call_value(val: &serde_json::Value) -> Option<Vec<super::router::ToolCall>> {

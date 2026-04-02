@@ -314,7 +314,12 @@ async fn complete_setup(
     };
 
     let llm = LlmConfig {
-        default_provider: req.llm.provider.clone(),
+        // Normalize "ollama" → "local" for the router (both use LocalProvider)
+        default_provider: if req.llm.provider == "ollama" {
+            "local".to_string()
+        } else {
+            req.llm.provider.clone()
+        },
         openai_api_key: if req.llm.provider == "openai" {
             req.llm.api_key.clone()
         } else {
@@ -341,7 +346,16 @@ async fn complete_setup(
         // Model path will be set after download completes
         local_model_path: None,
         local_base_url: if is_local {
-            req.llm.local_base_url.clone()
+            req.llm
+                .local_base_url
+                .clone()
+                .or_else(|| {
+                    if req.llm.provider == "ollama" {
+                        Some("http://localhost:11434".to_string())
+                    } else {
+                        None
+                    }
+                })
         } else {
             None
         },
@@ -380,7 +394,11 @@ async fn complete_setup(
 
                 // Populate per-agent LLM config from wizard settings
                 let agent_llm = {
-                    let provider = req.llm.provider.clone();
+                    let provider = if req.llm.provider == "ollama" {
+                        "local".to_string()
+                    } else {
+                        req.llm.provider.clone()
+                    };
                     let api_key = req.llm.api_key.clone();
                     let base_url = req.llm.base_url.clone().or(req.llm.local_base_url.clone());
                     if !provider.is_empty() {

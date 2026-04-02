@@ -153,9 +153,14 @@ export const conversations = {
 	/** Subscribe to conversation events via SSE (ADR-019).
 	 * Replays missed messages from DB, then streams live events.
 	 * Returns a cleanup function to close the connection. */
-	subscribeEvents: (id: string, afterMessageId: number, callbacks: StreamCallbacks): (() => void) => {
+	subscribeEvents: (id: string, afterMessageId: number, callbacks: StreamCallbacks): { cancel: () => void; ready: Promise<void> } => {
 		const url = `${BASE}/api/conversations/${id}/events?after=${afterMessageId}`;
 		const eventSource = new EventSource(url);
+
+		// Resolves when the SSE connection is established
+		let resolveReady: () => void;
+		const ready = new Promise<void>(r => { resolveReady = r; });
+		eventSource.addEventListener('open', () => resolveReady());
 
 		eventSource.addEventListener('thinking', (e) => {
 			try {
@@ -187,7 +192,7 @@ export const conversations = {
 			callbacks.onDone?.();
 		});
 
-		return () => eventSource.close();
+		return { cancel: () => eventSource.close(), ready };
 	},
 	addParticipant: (id: string, participantType: string, participantId: string) =>
 		request<void>(`/api/conversations/${id}/participants`, {

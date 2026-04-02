@@ -172,13 +172,15 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 ..Default::default()
             };
 
-            // Broadcast thinking
+            // Broadcast thinking and yield so the SSE event reaches clients
+            // before the LLM call (which may block for seconds during context init)
             ctx.event_bus.send(
                 conv_id,
                 ConversationEvent::Thinking {
                     agent_id: agent_id.clone(),
                 },
             );
+            tokio::task::yield_now().await;
 
             // Route through harness or LLM router
             let stream_result = if let Some(ref cid) = agent.container_id {
