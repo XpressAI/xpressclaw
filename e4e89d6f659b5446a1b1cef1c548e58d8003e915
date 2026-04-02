@@ -1,0 +1,1 @@
+fix: XCLAW-45/46 Linux tray + desktop. Tray icon was black-on-transparent (macOS template style) — invisible on dark panels. Added tray-icon-light.png (ImageMagick -negate) and set_icon() override on Linux via cfg(target_os). Needed image-png Tauri feature for Image::from_bytes. Custom .desktop template replaces Tauri's auto-generated one (empty Categories, generic comment).
