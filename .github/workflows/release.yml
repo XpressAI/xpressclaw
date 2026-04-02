@@ -27,6 +27,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             label: Windows-x64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            label: Linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +57,13 @@ jobs:
       - name: Install Windows build deps
         if: runner.os == 'Windows'
         run: choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf cmake
 
       # macOS: install certificate for signing
       - name: Install Apple certificate
@@ -105,6 +115,13 @@ jobs:
         if: runner.os == 'Windows'
         run: powershell -File build.ps1 --skip-docker --skip-check --target=${{ matrix.target }}
 
+      # Linux
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TAURI_BUNDLES: "deb,rpm"
+        run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
+
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
@@ -126,6 +143,20 @@ jobs:
           name: xpressclaw-${{ matrix.label }}.exe
           path: target/${{ matrix.target }}/release/bundle/nsis/*.exe
 
+      - name: Upload Linux deb
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpressclaw-${{ matrix.label }}.deb
+          path: target/${{ matrix.target }}/release/bundle/deb/*.deb
+
+      - name: Upload Linux rpm
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpressclaw-${{ matrix.label }}.rpm
+          path: target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+
   pre-release:
     needs: build-tauri
     runs-on: ubuntu-latest
@@ -144,7 +175,7 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec cp {} release-assets/ \;
+          find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
       - name: Compute release number
@@ -171,6 +202,7 @@ jobs:
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
             - macOS (Intel): `.dmg` x64 — signed and notarized
             - Windows: `.exe` NSIS installer, `.msi` MSI installer
+            - Linux: `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL)
           prerelease: true
           make_latest: false
           files: release-assets/*
