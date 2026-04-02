@@ -7,6 +7,7 @@ mod tray;
 use std::sync::Mutex;
 
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -51,9 +52,70 @@ fn main() {
         ));
     }
 
+    // On macOS, disable the default menu so we can replace the Quit item
+    // with a custom one that shows a confirmation dialog. The default Quit
+    // menu item calls std::process::exit(0) directly, bypassing all event
+    // handlers (ExitRequested never fires on macOS Cmd-Q).
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.enable_macos_default_menu(false);
+    }
+
     builder
         .manage(SidecarState(Mutex::new(None)))
+        // Window close (Cmd-W / red X) → hide to tray instead of quitting.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                info!("window hidden to tray");
+            }
+        })
+        // Handle our custom "quit" menu item (Cmd-Q on macOS)
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "custom-quit" {
+                confirm_quit(app);
+            }
+        })
         .setup(move |app| {
+            // Build the custom macOS app menu with our own Quit item
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::menu::{
+                    MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+                };
+
+                let quit_item = MenuItemBuilder::with_id("custom-quit", "Quit xpressclaw")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+
+                let app_submenu = SubmenuBuilder::new(app, "xpressclaw")
+                    .about(None)
+                    .separator()
+                    .items(&[&PredefinedMenuItem::hide(app, None)?])
+                    .items(&[&PredefinedMenuItem::hide_others(app, None)?])
+                    .items(&[&PredefinedMenuItem::show_all(app, None)?])
+                    .separator()
+                    .item(&quit_item)
+                    .build()?;
+
+                let edit_submenu = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
+
+                let menu = MenuBuilder::new(app)
+                    .items(&[&app_submenu, &edit_submenu])
+                    .build()?;
+
+                app.set_menu(menu)?;
+            }
+
             // Resolve working directory for the CLI sidecar
             let data_dir = dirs::home_dir()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
@@ -62,20 +124,28 @@ fn main() {
             let workdir = data_dir.to_string_lossy().to_string();
 
             // Resolve the sidecar binary path.
-            // Tauri bundles externalBin sidecars next to the main executable,
-            // while dev builds place them in a binaries/ subdirectory.
             let cli_name = if cfg!(target_os = "windows") {
                 "xpressclaw.exe"
             } else {
                 "xpressclaw"
             };
             let sidecar_name = sidecar_binary_name();
-            let sidecar_path =
-                // Check next to the executable (Contents/MacOS/) first
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
-                    .and_then(|d| {
+            let sidecar_path = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+                .and_then(|d| {
+                    let flat = d.join(cli_name);
+                    if flat.exists() {
+                        return Some(flat);
+                    }
+                    let with_triple = d.join(&sidecar_name);
+                    if with_triple.exists() {
+                        return Some(with_triple);
+                    }
+                    None
+                })
+                .or_else(|| {
+                    app.path().resource_dir().ok().and_then(|d| {
                         let flat = d.join(cli_name);
                         if flat.exists() {
                             return Some(flat);
@@ -84,28 +154,14 @@ fn main() {
                         if with_triple.exists() {
                             return Some(with_triple);
                         }
+                        let in_subdir = d.join("binaries").join(&sidecar_name);
+                        if in_subdir.exists() {
+                            return Some(in_subdir);
+                        }
                         None
                     })
-                    // Also check resource_dir (Contents/Resources/)
-                    .or_else(|| {
-                        app.path().resource_dir().ok().and_then(|d| {
-                            let flat = d.join(cli_name);
-                            if flat.exists() {
-                                return Some(flat);
-                            }
-                            let with_triple = d.join(&sidecar_name);
-                            if with_triple.exists() {
-                                return Some(with_triple);
-                            }
-                            let in_subdir = d.join("binaries").join(&sidecar_name);
-                            if in_subdir.exists() {
-                                return Some(in_subdir);
-                            }
-                            None
-                        })
-                    })
+                })
                 .or_else(|| {
-                    // Dev mode: look in the binaries/ directory next to the Tauri manifest
                     let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("binaries")
                         .join(&sidecar_name);
@@ -131,15 +187,12 @@ fn main() {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
 
-            // On Windows, prevent the sidecar from opening a visible console window.
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
                 cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
             }
 
-            // On macOS, clear environment to avoid inheriting state that can
-            // cause issues in the child process, then re-add essentials.
             #[cfg(target_os = "macos")]
             {
                 cmd.env_clear()
@@ -152,7 +205,6 @@ fn main() {
                     );
             }
 
-            // On Windows/Linux, inherit environment normally
             #[cfg(not(target_os = "macos"))]
             {
                 cmd.env(
@@ -176,7 +228,6 @@ fn main() {
 
             info!(pid = child.id(), "sidecar spawned");
 
-            // Store child handle for cleanup on exit
             let state = app.state::<SidecarState>();
             *state.0.lock().unwrap() = Some(child);
 
@@ -186,7 +237,6 @@ fn main() {
                 wait_for_server(port).await;
                 info!("server is ready");
                 if let Some(window) = handle.get_webview_window("main") {
-                    // Reload — the webview tried loading before the server was ready
                     let url = format!("http://localhost:{port}");
                     let _ = window.navigate(url.parse().unwrap());
                     let _ = window.show();
@@ -207,37 +257,73 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error building xpressclaw desktop app")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let mut child = app.state::<SidecarState>().0.lock().unwrap().take();
-                if let Some(ref mut child) = child {
-                    info!("stopping sidecar (graceful shutdown)");
-                    #[cfg(unix)]
-                    {
-                        // SIGTERM, then poll briefly before falling back to SIGKILL
-                        let pid = child.id().to_string();
-                        let _ = std::process::Command::new("kill")
-                            .args(["-TERM", &pid])
-                            .status();
-                        for _ in 0..20 {
-                            if child.try_wait().ok().flatten().is_some() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(250));
-                        }
-                        if child.try_wait().ok().flatten().is_none() {
-                            let _ = child.kill();
-                        }
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
-                }
+            // Safety net: if the process is killed through means we can't
+            // intercept (dock quit, SIGTERM), at least clean up the sidecar.
+            if let tauri::RunEvent::Exit = event {
+                shutdown_sidecar(app);
             }
         });
 }
 
-/// Return the platform-specific sidecar binary name.
+/// Show a confirmation dialog, then shut down if confirmed.
+/// Used by both the custom Cmd-Q menu item and the tray Quit button.
+pub fn confirm_quit(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    app.dialog()
+        .message("Your agents will stop running and won't be available until you restart.")
+        .title("Quit xpressclaw?")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit".into(),
+            "Cancel".into(),
+        ))
+        .show(move |confirmed| {
+            if confirmed {
+                info!("quit confirmed — shutting down");
+                shutdown_sidecar(&handle);
+                std::process::exit(0);
+            }
+        });
+}
+
+/// Gracefully stop agents and kill the sidecar.
+/// Runs `xpressclaw down` (which stops Docker containers via the API),
+/// then kills the sidecar child process.
+pub fn shutdown_sidecar(app: &tauri::AppHandle) {
+    let port = std::env::var("XPRESSCLAW_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_PORT);
+
+    // Resolve the sidecar binary path from the stored child's info,
+    // or fall back to the CLI name on PATH.
+    let cli_name = if cfg!(target_os = "windows") {
+        "xpressclaw.exe"
+    } else {
+        "xpressclaw"
+    };
+    let sidecar_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(cli_name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from(cli_name));
+
+    // Run `xpressclaw down --port <port>` to stop all agents/containers
+    info!("running xpressclaw down");
+    let _ = std::process::Command::new(&sidecar_path)
+        .args(["down", "--port", &port.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Kill the sidecar server process
+    let mut child = app.state::<SidecarState>().0.lock().unwrap().take();
+    if let Some(ref mut child) = child {
+        info!("killing sidecar process");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn sidecar_binary_name() -> String {
     let triple = env!("TAURI_ENV_TARGET_TRIPLE");
     if cfg!(target_os = "windows") {
@@ -247,7 +333,6 @@ fn sidecar_binary_name() -> String {
     }
 }
 
-/// Poll the health endpoint until the server is ready.
 async fn wait_for_server(port: u16) {
     let url = format!("http://localhost:{port}/api/health");
     let client = reqwest::Client::new();
