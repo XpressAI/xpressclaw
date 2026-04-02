@@ -1,7 +1,7 @@
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconEvent;
 use tauri::{App, Manager};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Set up the system tray with menu items.
 pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -15,6 +15,21 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
     if let Some(tray) = app.tray_by_id("main-tray") {
         tray.set_menu(Some(menu))?;
         tray.set_tooltip(Some(&format!("xpressclaw - localhost:{port}")))?;
+
+        // On Linux, the default tray icon is a black monochrome template
+        // designed for macOS (which auto-inverts it). On dark panels (GNOME,
+        // KDE, etc.) it's invisible. Use the inverted (white) version instead.
+        #[cfg(target_os = "linux")]
+        {
+            let icon_bytes = include_bytes!("../icons/tray-icon-light.png");
+            match tauri::image::Image::from_bytes(icon_bytes) {
+                Ok(img) => {
+                    let _ = tray.set_icon(Some(img));
+                    info!("tray icon set to light variant for Linux");
+                }
+                Err(e) => warn!(error = %e, "failed to set Linux tray icon"),
+            }
+        }
 
         let handle = app.handle().clone();
         tray.on_menu_event(move |_app, event| {
@@ -47,6 +62,10 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
                 }
             }
         });
+
+        info!("tray icon registered (id=main-tray)");
+    } else {
+        warn!("tray icon 'main-tray' not found — system tray will be unavailable");
     }
 
     Ok(())
