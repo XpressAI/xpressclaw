@@ -91,7 +91,15 @@
 			const participantIds = c.participants
 				.filter(p => p.participant_type === 'agent')
 				.map(p => p.participant_id);
-			stoppedAgents = a.filter(ag => participantIds.includes(ag.id) && ag.status !== 'running');
+			// Only prompt for agents the user hasn't already requested to run.
+			// When Docker is slow/unavailable, status may show "starting" even
+			// though the agent is running fine. Check desired_status to avoid
+			// repeatedly prompting on every page navigation. (XCLAW-55)
+			stoppedAgents = a.filter(ag =>
+				participantIds.includes(ag.id) &&
+				ag.status !== 'running' &&
+				ag.desired_status !== 'running'
+			);
 			if (stoppedAgents.length > 0) {
 				showStartDialog = true;
 			}
