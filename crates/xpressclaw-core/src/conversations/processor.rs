@@ -31,6 +31,8 @@ pub struct ProcessorContext {
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
     /// If not provided, uses the raw role from config.
     pub agent_roles: std::collections::HashMap<String, String>,
+    /// Shared Docker connection to avoid socket exhaustion.
+    pub docker: Option<Arc<crate::docker::manager::DockerManager>>,
 }
 
 /// Spawn a background task to process agent responses for a conversation.
@@ -182,17 +184,19 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             );
             tokio::task::yield_now().await;
 
-            // Route through harness or LLM router
+            // Route through harness or LLM router.
+            // Uses the shared Docker connection to avoid socket exhaustion.
             let stream_result = if let Some(ref cid) = agent.container_id {
-                match crate::docker::manager::DockerManager::connect().await {
-                    Ok(docker) => match docker.get_container_port(cid).await {
-                        Some(port) => {
-                            let harness = crate::agents::harness::HarnessClient::new(port);
-                            harness.chat_stream(&llm_req).await
-                        }
-                        None => ctx.llm_router.chat_stream(&llm_req).await,
-                    },
-                    Err(_) => ctx.llm_router.chat_stream(&llm_req).await,
+                let port = if let Some(ref docker) = ctx.docker {
+                    docker.get_container_port(cid).await
+                } else {
+                    None
+                };
+                if let Some(port) = port {
+                    let harness = crate::agents::harness::HarnessClient::new(port);
+                    harness.chat_stream(&llm_req).await
+                } else {
+                    ctx.llm_router.chat_stream(&llm_req).await
                 }
             } else {
                 ctx.llm_router.chat_stream(&llm_req).await

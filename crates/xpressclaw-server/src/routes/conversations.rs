@@ -262,6 +262,7 @@ async fn send_message(
                     event_bus: state.event_bus.clone(),
                     rate_limiter: state.rate_limiter(),
                     agent_roles: agent_skills_map,
+                    docker: state.docker().await.map(|d| d.clone()),
                 },
             );
         }
