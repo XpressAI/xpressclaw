@@ -48,7 +48,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        harness: [generic, claude-sdk, xaibo, langchain]
+        harness: [claude-sdk, xaibo, langchain]
     steps:
       - uses: actions/checkout@v4
 
