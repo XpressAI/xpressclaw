@@ -1,0 +1,10 @@
+[Desktop Entry]
+Categories=Development;Utility;
+Comment=AI Agent Runtime — run, manage, and observe AI agents
+Exec=xpressclaw-desktop
+Icon=xpressclaw-desktop
+Name=XpressCLAW
+Terminal=false
+Type=Application
+StartupWMClass=xpressclaw
+Keywords=ai;agent;llm;
