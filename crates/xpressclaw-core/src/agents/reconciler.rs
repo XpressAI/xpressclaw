@@ -282,7 +282,7 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
         let conn = db.conn();
         let mut stmt = match conn.prepare(
             "SELECT id, agent_id, start_command, image, port FROM apps
-             WHERE status IN ('running', 'starting', 'error') AND start_command IS NOT NULL",
+             WHERE status IN ('running', 'starting') AND start_command IS NOT NULL",
         ) {
             Ok(s) => s,
             Err(_) => return,

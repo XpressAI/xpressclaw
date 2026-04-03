@@ -443,28 +443,11 @@ def handle_tool(name: str, arguments: dict) -> str:
             "source_dir": source_dir,
             "start_command": arguments.get("start_command"),
         }
-        _api("POST", "/apps/publish", body)
+        result = _api("POST", "/apps/publish", body)
 
-        # Poll the app status to catch startup errors.
-        import time
-        status = "starting"
-        error_msg = None
-        for _ in range(10):
-            time.sleep(2)
-            try:
-                apps = _api("GET", "/apps")
-                app = next((a for a in apps if a["id"] == app_name), None)
-                if app:
-                    status = app.get("status", "unknown")
-                    if status == "running":
-                        break
-                    if status == "error":
-                        error_msg = app.get("error_message", "unknown error")
-                        break
-            except Exception:
-                pass
-
+        status = result.get("status", "unknown")
         if status == "error":
+            error_msg = result.get("error", "unknown error")
             return (
                 f"App '{arguments['title']}' was published but FAILED to start.\n"
                 f"Error: {error_msg}\n"
@@ -478,8 +461,8 @@ def handle_tool(name: str, arguments: dict) -> str:
             )
         else:
             return (
-                f"Published app '{arguments['title']}' (id: {app_name}) — status: {status}.\n"
-                f"It may still be starting. Check the Apps section of the sidebar."
+                f"Published app '{arguments['title']}' (id: {app_name}) — published.\n"
+                f"It should appear in the Apps section of the sidebar shortly."
             )
 
     elif name == "list_apps":
