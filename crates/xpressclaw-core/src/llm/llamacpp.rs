@@ -543,10 +543,7 @@ impl LlmProvider for LlamaCppProvider {
             (request.temperature.unwrap_or(0.8) as f32, 20, 0.95f32)
         };
         // Per-request reasoning budget (default 4096 tokens for thinking)
-        let reasoning_budget = request
-            .reasoning_budget
-            .map(|b| b as i32)
-            .or(Some(4096));
+        let reasoning_budget = request.reasoning_budget.map(|b| b as i32).or(Some(4096));
 
         // Grammar-constrained decoding can crash with some model/grammar combinations.
         // Use it when available but fall back gracefully.
