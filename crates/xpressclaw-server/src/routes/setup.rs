@@ -36,7 +36,10 @@ pub fn routes() -> Router<AppState> {
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
-        .route("/mcp-servers/{name}", axum::routing::delete(delete_mcp_server))
+        .route(
+            "/mcp-servers/{name}",
+            axum::routing::delete(delete_mcp_server),
+        )
 }
 
 /// Return the current live configuration (sanitized — no API keys).
@@ -859,7 +862,9 @@ async fn upsert_mcp_server(
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
     };
-    new_config.save(&state.config_path).map_err(internal_error)?;
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
 
     let new_config = std::sync::Arc::new(new_config);
     state.apply_config(new_config, state.llm_router());
@@ -891,7 +896,9 @@ async fn delete_mcp_server(
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
     };
-    new_config.save(&state.config_path).map_err(internal_error)?;
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
 
     let new_config = std::sync::Arc::new(new_config);
     state.apply_config(new_config, state.llm_router());
