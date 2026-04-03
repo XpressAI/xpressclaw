@@ -297,22 +297,32 @@ async fn publish_app(
             working_dir: None, // Set by launch_app_container
         };
 
-        // Launch in background
-        tokio::spawn(async move {
-            match launch_app_container(&app_id, &spec, &cmd, &db_clone).await {
-                Ok(container_id) => {
-                    info!(app_id = %app_id, container_id = &container_id[..12], "app container started");
-                }
-                Err(e) => {
-                    warn!(app_id = %app_id, error = %e, "failed to launch app container");
-                    let conn = db_clone.conn();
-                    let _ = conn.execute(
-                        "UPDATE apps SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                        [&app_id],
-                    );
-                }
+        // Launch synchronously so the caller gets the real result.
+        match launch_app_container(&app_id, &spec, &cmd, &state.db).await {
+            Ok(container_id) => {
+                info!(app_id = %app_id, container_id = &container_id[..12], "app container started");
+                return Ok(Json(json!({
+                    "id": req.id,
+                    "published": true,
+                    "status": "running",
+                    "container_id": container_id,
+                })));
             }
-        });
+            Err(e) => {
+                warn!(app_id = %app_id, error = %e, "failed to launch app container");
+                let conn = state.db.conn();
+                let _ = conn.execute(
+                    "UPDATE apps SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [&app_id],
+                );
+                return Ok(Json(json!({
+                    "id": req.id,
+                    "published": true,
+                    "status": "error",
+                    "error": e.to_string(),
+                })));
+            }
+        }
     }
 
     Ok(Json(json!({ "id": req.id, "published": true })))
