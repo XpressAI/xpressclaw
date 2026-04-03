@@ -119,7 +119,6 @@ fi
 if [ "$SKIP_DOCKER" = false ] && command -v docker &>/dev/null; then
     echo "==> Building agent harness Docker images..."
     docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest harnesses/base
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-generic:latest harnesses/generic
     docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest harnesses/claude-sdk
     docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest harnesses/langchain
     docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest harnesses/xaibo

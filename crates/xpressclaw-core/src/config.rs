@@ -242,7 +242,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             name: "default".to_string(),
-            backend: "generic".to_string(),
+            backend: "claude-sdk".to_string(),
             model: None,
             llm: None,
             display_name: None,
@@ -483,7 +483,7 @@ system:
 # Agent definitions
 agents:
   - name: atlas
-    backend: generic
+    backend: claude-sdk
     role: |
       You are a helpful AI assistant.
 
@@ -568,7 +568,7 @@ system:
     daily: "$10.00"
 agents:
   - name: test-agent
-    backend: generic
+    backend: claude-sdk
     role: "Test role"
 memory:
   near_term_slots: 4

@@ -42,7 +42,7 @@ pub struct VolumeMount {
 impl Default for ContainerSpec {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/xpressai/xpressclaw-harness-generic:latest".to_string(),
+            image: "ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest".to_string(),
             memory_limit: Some(2 * 1024 * 1024 * 1024), // 2GB
             cpu_limit: None,
             environment: Vec::new(),
@@ -484,6 +484,6 @@ mod tests {
     fn test_container_spec_default() {
         let spec = ContainerSpec::default();
         assert_eq!(spec.expose_port, Some(8080));
-        assert!(spec.image.contains("generic"));
+        assert!(spec.image.contains("claude-sdk"));
     }
 }

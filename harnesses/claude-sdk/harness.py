@@ -261,6 +261,9 @@ async def _query_to_queue(
                         _send("<think>")
                     elif block_type == "tool_use":
                         tool_name = block.get("name", "tool")
+                        # Strip MCP server prefix (e.g. mcp__xpressclaw__publish_app → publish_app)
+                        if "__" in tool_name:
+                            tool_name = tool_name.rsplit("__", 1)[-1]
                         _send(f'<tool_call name="{tool_name}">')
                         in_tool_call = True
 
