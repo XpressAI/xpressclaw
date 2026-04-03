@@ -628,6 +628,7 @@ fn anthropic_to_openai_request(req: AnthropicMessagesRequest) -> ChatCompletionR
         stop: req.stop_sequences,
         tools,
         tool_choice,
+        reasoning_budget: None,
     }
 }
 

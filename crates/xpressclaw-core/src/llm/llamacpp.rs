@@ -377,6 +377,9 @@ impl LlamaCppProvider {
         prompt: &str,
         max_tokens: i32,
         temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        reasoning_budget: Option<i32>,
         grammar: Option<&str>,
         grammar_lazy: bool,
     ) -> Result<(String, Usage)> {
@@ -430,13 +433,11 @@ impl LlamaCppProvider {
         let grammar_sampler: Option<LlamaSampler> = None;
         let _ = (grammar, grammar_lazy); // suppress unused warnings
 
-        // Sampling parameters follow Unsloth's Qwen3.5 recommendations:
-        // temp=1.0, top_p=0.95, top_k=20, min_p=0.0
         let mut sampler = if temperature > 0.0 {
             LlamaSampler::chain_simple([
                 LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
-                LlamaSampler::top_k(20),
-                LlamaSampler::top_p(0.95, 1),
+                LlamaSampler::top_k(top_k),
+                LlamaSampler::top_p(top_p, 1),
                 LlamaSampler::temp(temperature),
                 LlamaSampler::dist(1234),
             ])
@@ -456,6 +457,9 @@ impl LlamaCppProvider {
         let mut output = String::new();
         let mut completion_tokens = 0i64;
         let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let mut thinking_tokens = 0i32;
+        let mut in_thinking = false;
+        let budget = reasoning_budget.unwrap_or(i32::MAX);
 
         while n_cur <= n_len {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -472,6 +476,26 @@ impl LlamaCppProvider {
                 .map_err(|e| Error::Llm(format!("token decode failed: {e}")))?;
             output.push_str(&piece);
             completion_tokens += 1;
+
+            // Track thinking block tokens and enforce reasoning budget.
+            if output.contains("<think>") && !output.contains("</think>") {
+                if !in_thinking {
+                    in_thinking = true;
+                    thinking_tokens = 0;
+                }
+                thinking_tokens += 1;
+                if thinking_tokens >= budget {
+                    output.push_str("</think>\n");
+                    in_thinking = false;
+                    tracing::debug!(
+                        thinking_tokens,
+                        budget,
+                        "reasoning budget reached, closing thinking block"
+                    );
+                }
+            } else if in_thinking && output.contains("</think>") {
+                in_thinking = false;
+            }
 
             // Stop on ChatML end token in output
             if output.ends_with("<|im_end|>") {
@@ -507,7 +531,22 @@ impl LlmProvider for LlamaCppProvider {
         let tools = request.tools.as_deref();
         let pg = self.format_prompt_with_tools(&request.messages, tools)?;
         let max_tokens = request.max_tokens.unwrap_or(4096) as i32;
-        let temperature = request.temperature.unwrap_or(0.8) as f32;
+
+        // Per-model sampling defaults.
+        let name_lower = self.model_name.to_lowercase();
+        let is_gemma = name_lower.contains("gemma");
+        let (temperature, top_k, top_p) = if is_gemma {
+            // Google's Gemma 4 recommendations
+            (request.temperature.unwrap_or(1.0) as f32, 64, 0.95f32)
+        } else {
+            // Qwen 3.5 / default
+            (request.temperature.unwrap_or(0.8) as f32, 20, 0.95f32)
+        };
+        // Per-request reasoning budget (default 4096 tokens for thinking)
+        let reasoning_budget = request
+            .reasoning_budget
+            .map(|b| b as i32)
+            .or(Some(4096));
 
         // Grammar-constrained decoding can crash with some model/grammar combinations.
         // Use it when available but fall back gracefully.
@@ -515,6 +554,9 @@ impl LlmProvider for LlamaCppProvider {
             &pg.prompt,
             max_tokens,
             temperature,
+            top_k,
+            top_p,
+            reasoning_budget,
             pg.grammar.as_deref(),
             pg.grammar_lazy,
         )?;
@@ -562,7 +604,14 @@ impl LlmProvider for LlamaCppProvider {
         let prompt = pg.prompt;
         // Note: grammar-constrained streaming not yet supported — would need per-token grammar sampling
         let max_tokens = request.max_tokens.unwrap_or(256) as i32;
-        let temperature = request.temperature.unwrap_or(0.8) as f32;
+
+        let name_lower = self.model_name.to_lowercase();
+        let is_gemma = name_lower.contains("gemma");
+        let temperature = if is_gemma {
+            request.temperature.unwrap_or(1.0) as f32
+        } else {
+            request.temperature.unwrap_or(0.8) as f32
+        };
 
         let has_tools = request.tools.is_some();
         let model = self.model.clone();
@@ -641,11 +690,12 @@ impl LlmProvider for LlamaCppProvider {
                 return;
             }
 
+            let stream_top_k = if is_gemma { 64 } else { 20 };
             let mut sampler = if temperature > 0.0 {
                 LlamaSampler::chain_simple([
                     LlamaSampler::penalties(64, 1.0, 0.0, 0.0),
-                    LlamaSampler::top_k(40),
-                    LlamaSampler::min_p(0.05, 1),
+                    LlamaSampler::top_k(stream_top_k),
+                    LlamaSampler::top_p(0.95, 1),
                     LlamaSampler::temp(temperature),
                     LlamaSampler::dist(1234),
                 ])
@@ -1088,7 +1138,7 @@ mod tests {
         eprintln!("Prompt: {:?}", pg.prompt);
 
         let (output, usage) = provider
-            .generate(&pg.prompt, 128, 0.8, None, false)
+            .generate(&pg.prompt, 128, 0.8, 20, 0.95, Some(4096), None, false)
             .expect("inference failed");
 
         eprintln!("Output: {output:?}");

@@ -98,6 +98,16 @@ pub struct ChatCompletionRequest {
     /// How the model should choose tools: "auto", "none", or "required".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    /// Maximum tokens for reasoning/thinking. Caps the `<think>` block.
+    /// Higher for tasks (e.g. 8192), lower for chat (e.g. 1024).
+    /// Serialized as `reasoning_budget_tokens` for llama-server compat.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "reasoning_budget",
+        rename = "reasoning_budget_tokens"
+    )]
+    pub reasoning_budget: Option<i64>,
 }
 
 /// Token usage stats.

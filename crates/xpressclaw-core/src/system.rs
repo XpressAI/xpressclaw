@@ -85,11 +85,10 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
         info.total_memory_gb * 0.6
     };
 
-    // Only models that exist on HuggingFace (unsloth/Qwen3.5-*-GGUF).
     // Dense models are recommended automatically; MoE models are listed
     // but only used when the user explicitly selects them.
     let options = vec![
-        // Dense models (auto-recommended)
+        // --- Qwen 3.5 (unsloth/Qwen3.5-*-GGUF) ---
         ModelOption {
             model: "qwen3.5:0.8b".into(),
             display_name: "Qwen 3.5 0.8B".into(),
@@ -114,12 +113,12 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
             ram_required_gb: 20.0,
             suitable: budget_gb >= 20.0,
         },
-        // MoE models (only used when user explicitly selects)
+        // Qwen 3.5 MoE (only used when user explicitly selects)
         ModelOption {
             model: "qwen3.5:35b-a3b".into(),
             display_name: "Qwen 3.5 35B-A3B (MoE)".into(),
             ram_required_gb: 24.0,
-            suitable: false, // never auto-recommended
+            suitable: false,
         },
         ModelOption {
             model: "qwen3.5:122b-a10b".into(),
@@ -131,6 +130,31 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
             model: "qwen3.5:397b-a17b".into(),
             display_name: "Qwen 3.5 397B-A17B (MoE)".into(),
             ram_required_gb: 240.0,
+            suitable: false,
+        },
+        // --- Gemma 4 (unsloth/gemma-4-*-GGUF) ---
+        ModelOption {
+            model: "gemma4:e2b".into(),
+            display_name: "Gemma 4 E2B".into(),
+            ram_required_gb: 2.0,
+            suitable: false, // not auto-recommended (Qwen is default)
+        },
+        ModelOption {
+            model: "gemma4:e4b".into(),
+            display_name: "Gemma 4 E4B".into(),
+            ram_required_gb: 4.0,
+            suitable: false,
+        },
+        ModelOption {
+            model: "gemma4:26b-a4b".into(),
+            display_name: "Gemma 4 26B-A4B (MoE)".into(),
+            ram_required_gb: 18.0,
+            suitable: false,
+        },
+        ModelOption {
+            model: "gemma4:31b".into(),
+            display_name: "Gemma 4 31B".into(),
+            ram_required_gb: 22.0,
             suitable: false,
         },
     ];
