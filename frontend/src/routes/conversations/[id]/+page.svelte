@@ -91,15 +91,7 @@
 			const participantIds = c.participants
 				.filter(p => p.participant_type === 'agent')
 				.map(p => p.participant_id);
-			// Only show "start agent" dialog for agents that are actually stopped
-			// (desired_status === 'stopped'), not agents that are still starting
-			// or temporarily unavailable. This prevents the dialog from flashing
-			// on every page navigation when Docker is slow to report status.
-			stoppedAgents = a.filter(ag =>
-				participantIds.includes(ag.id) &&
-				ag.status !== 'running' &&
-				ag.desired_status !== 'running'
-			);
+			stoppedAgents = a.filter(ag => participantIds.includes(ag.id) && ag.status !== 'running');
 			if (stoppedAgents.length > 0) {
 				showStartDialog = true;
 			}
