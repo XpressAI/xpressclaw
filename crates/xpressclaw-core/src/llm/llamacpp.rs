@@ -372,6 +372,7 @@ impl LlamaCppProvider {
     /// Creates a fresh context on the calling thread to satisfy Metal's
     /// thread affinity requirements. When a grammar is provided, it constrains
     /// the model output to valid tool-call JSON.
+    #[allow(clippy::too_many_arguments)]
     fn generate(
         &self,
         prompt: &str,
