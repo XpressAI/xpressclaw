@@ -183,12 +183,56 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             tokio::task::yield_now().await;
 
             // Route through harness or LLM router
+            // Route through harness or LLM router.
+            // When the agent has a running container, use non-streaming chat
+            // so the harness's multi-turn tool execution loop runs properly.
+            // Streaming bypasses tool calls in the harness.
             let stream_result = if let Some(ref cid) = agent.container_id {
                 match crate::docker::manager::DockerManager::connect().await {
                     Ok(docker) => match docker.get_container_port(cid).await {
                         Some(port) => {
                             let harness = crate::agents::harness::HarnessClient::new(port);
-                            harness.chat_stream(&llm_req).await
+                            let mut non_stream_req = llm_req.clone();
+                            non_stream_req.stream = Some(false);
+                            match harness.chat(&non_stream_req).await {
+                                Ok(resp) => {
+                                    // Convert the complete response into a
+                                    // single-chunk stream so the rest of the
+                                    // processor handles it uniformly.
+                                    let text = resp
+                                        .choices
+                                        .first()
+                                        .map(|c| c.message.content.clone())
+                                        .unwrap_or_default();
+                                    let chunk = crate::llm::router::ChatCompletionChunk {
+                                        id: resp.id,
+                                        object: "chat.completion.chunk".into(),
+                                        created: resp.created,
+                                        model: resp.model,
+                                        choices: vec![crate::llm::router::ChunkChoice {
+                                            index: 0,
+                                            delta: crate::llm::router::ChunkDelta {
+                                                role: Some("assistant".into()),
+                                                content: Some(text),
+                                                ..Default::default()
+                                            },
+                                            finish_reason: Some("stop".into()),
+                                        }],
+                                    };
+                                    Ok(Box::pin(futures_util::stream::once(
+                                        async move { Ok(chunk) },
+                                    ))
+                                        as crate::llm::router::ChatStream)
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        agent_id,
+                                        error = %e,
+                                        "harness call failed, falling back to LLM router"
+                                    );
+                                    ctx.llm_router.chat_stream(&llm_req).await
+                                }
+                            }
                         }
                         None => ctx.llm_router.chat_stream(&llm_req).await,
                     },
