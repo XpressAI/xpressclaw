@@ -6,18 +6,12 @@ use crate::error::Result;
 
 /// Known harness images.
 pub const HARNESS_BASE: &str = "ghcr.io/xpressai/xpressclaw-harness-base:latest";
-pub const HARNESS_GENERIC: &str = "ghcr.io/xpressai/xpressclaw-harness-generic:latest";
 pub const HARNESS_CLAUDE_SDK: &str = "ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest";
 pub const HARNESS_XAIBO: &str = "ghcr.io/xpressai/xpressclaw-harness-xaibo:latest";
 pub const HARNESS_LANGCHAIN: &str = "ghcr.io/xpressai/xpressclaw-harness-langchain:latest";
 
 /// All harness images for pulling.
-pub const ALL_HARNESS_IMAGES: &[&str] = &[
-    HARNESS_GENERIC,
-    HARNESS_CLAUDE_SDK,
-    HARNESS_XAIBO,
-    HARNESS_LANGCHAIN,
-];
+pub const ALL_HARNESS_IMAGES: &[&str] = &[HARNESS_CLAUDE_SDK, HARNESS_XAIBO, HARNESS_LANGCHAIN];
 
 /// Resolve a backend name to its harness image.
 pub fn image_for_backend(backend: &str) -> &'static str {
@@ -25,7 +19,7 @@ pub fn image_for_backend(backend: &str) -> &'static str {
         "claude-code" | "claude-sdk" | "claude" => HARNESS_CLAUDE_SDK,
         "xaibo" => HARNESS_XAIBO,
         "langchain" | "crewai" => HARNESS_LANGCHAIN,
-        _ => HARNESS_GENERIC,
+        _ => HARNESS_CLAUDE_SDK,
     }
 }
 
@@ -219,7 +213,7 @@ fn expand_tilde(path: &str) -> String {
 
 /// Pull all default harness images.
 pub async fn pull_defaults(docker: &DockerManager) -> Result<()> {
-    let images = [HARNESS_GENERIC];
+    let images = [HARNESS_CLAUDE_SDK];
 
     for image in images {
         info!(image, "pulling default harness image");
@@ -260,15 +254,15 @@ mod tests {
 
     #[test]
     fn test_image_for_backend_fallback() {
-        assert_eq!(image_for_backend("anything-else"), HARNESS_GENERIC);
-        assert_eq!(image_for_backend(""), HARNESS_GENERIC);
+        assert_eq!(image_for_backend("anything-else"), HARNESS_CLAUDE_SDK);
+        assert_eq!(image_for_backend(""), HARNESS_CLAUDE_SDK);
     }
 
     #[test]
     fn test_build_container_spec_basic() {
         let agent = AgentConfig {
             name: "test-agent".to_string(),
-            backend: "generic".to_string(),
+            backend: "claude-sdk".to_string(),
             role: "Test role".to_string(),
             model: Some("gpt-4o".to_string()),
             ..Default::default()
@@ -276,7 +270,7 @@ mod tests {
 
         let spec = build_container_spec(&agent, 6969, None, None, None);
 
-        assert_eq!(spec.image, HARNESS_GENERIC);
+        assert_eq!(spec.image, HARNESS_CLAUDE_SDK);
         assert_eq!(spec.expose_port, Some(8080));
         assert!(spec
             .environment

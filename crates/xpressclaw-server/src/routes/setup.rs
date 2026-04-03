@@ -388,7 +388,7 @@ async fn complete_setup(
     let agents = if req.agents.is_empty() {
         vec![AgentConfig {
             name: "atlas".to_string(),
-            backend: "generic".to_string(),
+            backend: "claude-sdk".to_string(),
             role: "You are a helpful AI assistant.".to_string(),
             ..Default::default()
         }]
@@ -442,7 +442,7 @@ async fn complete_setup(
                         .backend
                         .clone()
                         .or(preset.map(|p| p.backend.to_string()))
-                        .unwrap_or("generic".to_string()),
+                        .unwrap_or("claude-sdk".to_string()),
                     role: a
                         .role
                         .clone()
@@ -664,7 +664,7 @@ async fn add_agent(
             .backend
             .clone()
             .or(preset.map(|p| p.backend.to_string()))
-            .unwrap_or("generic".to_string()),
+            .unwrap_or("claude-sdk".to_string()),
         role: req
             .role
             .clone()
