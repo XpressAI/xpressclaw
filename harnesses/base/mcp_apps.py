@@ -444,11 +444,43 @@ def handle_tool(name: str, arguments: dict) -> str:
             "start_command": arguments.get("start_command"),
         }
         _api("POST", "/apps/publish", body)
-        return (
-            f"Published app '{arguments['title']}' (id: {app_name}).\n"
-            f"It will appear in the Apps section of the sidebar.\n"
-            f"The user can click on it to view it in the UI."
-        )
+
+        # Poll the app status to catch startup errors.
+        import time
+        status = "starting"
+        error_msg = None
+        for _ in range(10):
+            time.sleep(2)
+            try:
+                apps = _api("GET", "/apps")
+                app = next((a for a in apps if a["id"] == app_name), None)
+                if app:
+                    status = app.get("status", "unknown")
+                    if status == "running":
+                        break
+                    if status == "error":
+                        error_msg = app.get("error_message", "unknown error")
+                        break
+            except Exception:
+                pass
+
+        if status == "error":
+            return (
+                f"App '{arguments['title']}' was published but FAILED to start.\n"
+                f"Error: {error_msg}\n"
+                f"Check the start_command and ensure all dependencies are installed.\n"
+                f"The app files are at {source_dir}/"
+            )
+        elif status == "running":
+            return (
+                f"Published app '{arguments['title']}' (id: {app_name}) — running.\n"
+                f"It is now visible in the Apps section of the sidebar."
+            )
+        else:
+            return (
+                f"Published app '{arguments['title']}' (id: {app_name}) — status: {status}.\n"
+                f"It may still be starting. Check the Apps section of the sidebar."
+            )
 
     elif name == "list_apps":
         apps = _api("GET", "/apps")
