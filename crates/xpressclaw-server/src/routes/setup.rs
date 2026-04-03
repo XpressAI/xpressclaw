@@ -714,21 +714,35 @@ async fn add_agent(
 
 /// Map a model name from the setup UI to a HuggingFace GGUF repo and filename.
 ///
-/// The setup wizard shows model names like "qwen3.5:4b" (Ollama-style).
-/// This maps them to the corresponding HuggingFace GGUF repo/file.
-///
-/// Available Qwen3.5 models:
-/// - Dense: 0.8B, 4B, 9B, 27B
-/// - MoE: 35B-A3B, 122B-A10B, 397B-A17B
+/// The setup wizard shows model names like "qwen3.5:4b" or "gemma4:e4b"
+/// (Ollama-style). This maps them to the corresponding HuggingFace GGUF repo/file.
 #[cfg(feature = "local-llm")]
 fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
-    match model_name {
-        // Dense models
+    let name = model_name.to_lowercase();
+    match name.as_str() {
+        // --- Gemma 4 ---
+        s if s.contains("gemma") && s.contains("e2b") => (
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+        ),
+        s if s.contains("gemma") && s.contains("e4b") => (
+            "unsloth/gemma-4-E4B-it-GGUF",
+            "gemma-4-E4B-it-UD-Q4_K_XL.gguf",
+        ),
+        s if s.contains("gemma") && (s.contains("26b") || s.contains("a4b")) => (
+            "unsloth/gemma-4-26B-A4B-it-GGUF",
+            "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+        ),
+        s if s.contains("gemma") && s.contains("31b") => (
+            "unsloth/gemma-4-31B-it-GGUF",
+            "gemma-4-31B-it-UD-Q4_K_XL.gguf",
+        ),
+        // --- Qwen 3.5 Dense ---
         s if s.contains("0.8") => ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"),
         s if s.contains("4b") => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
         s if s.contains("9b") => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-UD-Q4_K_XL.gguf"),
         s if s.contains("27b") => ("unsloth/Qwen3.5-27B-GGUF", "Qwen3.5-27B-UD-Q4_K_XL.gguf"),
-        // MoE models (user must explicitly select)
+        // Qwen 3.5 MoE
         s if s.contains("35b") || s.contains("a3b") => (
             "unsloth/Qwen3.5-35B-A3B-GGUF",
             "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
@@ -746,7 +760,7 @@ fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
             xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_REPO,
             model_name,
         ),
-        // Default: 4B is the safe default for most systems
+        // Default: Qwen 3.5 4B
         _ => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
     }
 }

@@ -586,12 +586,12 @@
 							<div class="text-xs font-medium text-muted-foreground">Available sizes:</div>
 							<div class="grid grid-cols-2 gap-1">
 								{#each modelRec.all_options as opt}
-									<button onclick={() => llmLocalModel = opt.model} disabled={!opt.suitable}
+									<button onclick={() => llmLocalModel = opt.model}
 										class="rounded px-2 py-1 text-xs text-left transition-colors {llmLocalModel === opt.model
 											? 'bg-primary/10 border border-primary text-foreground'
-											: opt.suitable ? 'border border-border hover:border-primary/40 text-foreground'
-											: 'border border-border text-muted-foreground/40 cursor-not-allowed'}">
+											: 'border border-border hover:border-primary/40 text-foreground'}">
 										{opt.display_name} <span class="text-muted-foreground">({opt.ram_required_gb}GB)</span>
+										{#if !opt.suitable}<span class="text-amber-500/60">*</span>{/if}
 									</button>
 								{/each}
 							</div>
