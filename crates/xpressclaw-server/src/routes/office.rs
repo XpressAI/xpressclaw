@@ -338,25 +338,21 @@ async fn upload_document(
     let mut agent_id = "default".to_string();
     let mut files_saved = Vec::new();
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| internal_error(e))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(internal_error)? {
         let field_name = field.name().unwrap_or("").to_string();
 
         if field_name == "agent_id" {
-            agent_id = field.text().await.map_err(|e| internal_error(e))?;
+            agent_id = field.text().await.map_err(internal_error)?;
             continue;
         }
 
         if field_name == "file" {
             let file_name = field.file_name().unwrap_or("upload").to_string();
-            let data = field.bytes().await.map_err(|e| internal_error(e))?;
+            let data = field.bytes().await.map_err(internal_error)?;
 
             let docs_dir = documents_dir(&state, &agent_id);
             let dest = docs_dir.join(&file_name);
-            std::fs::write(&dest, &data).map_err(|e| internal_error(e))?;
+            std::fs::write(&dest, &data).map_err(internal_error)?;
 
             info!(agent_id, file_name, size = data.len(), "file uploaded");
             files_saved.push(json!({
@@ -386,7 +382,7 @@ async fn delete_document(
         ));
     }
 
-    std::fs::remove_file(&file_path).map_err(|e| internal_error(e))?;
+    std::fs::remove_file(&file_path).map_err(internal_error)?;
     info!(agent_id, name, "document deleted");
 
     Ok(Json(json!({ "deleted": name })))
