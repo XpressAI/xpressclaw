@@ -49,7 +49,10 @@
       "Bash(1 echo:*)",
       "Bash(docker exec:*)",
       "Bash(./build.sh)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(bash build.sh --skip-tauri --skip-docker --skip-test)",
+      "WebFetch(domain:registry.modelcontextprotocol.io)",
+      "Bash(gh pr:*)"
     ]
   }
 }

@@ -15,10 +15,7 @@ pub fn routes() -> Router<AppState> {
         .route("/export", post(export_document))
         .route("/documents", get(list_documents))
         .route("/documents/{name}", get(download_document))
-        .route(
-            "/documents/{name}/content",
-            get(read_document_content),
-        )
+        .route("/documents/{name}/content", get(read_document_content))
         .route("/upload", post(upload_document))
         .route("/documents/{name}/delete", post(delete_document))
 }
@@ -354,10 +351,7 @@ async fn upload_document(
         }
 
         if field_name == "file" {
-            let file_name = field
-                .file_name()
-                .unwrap_or("upload")
-                .to_string();
+            let file_name = field.file_name().unwrap_or("upload").to_string();
             let data = field.bytes().await.map_err(|e| internal_error(e))?;
 
             let docs_dir = documents_dir(&state, &agent_id);

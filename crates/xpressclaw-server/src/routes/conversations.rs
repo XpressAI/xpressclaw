@@ -247,7 +247,8 @@ async fn send_message(
                 .agents
                 .iter()
                 .map(|a| {
-                    let role = append_skills(&a.full_system_prompt(), &a.skills, &state.config_path);
+                    let role =
+                        append_skills(&a.full_system_prompt(), &a.skills, &state.config_path);
                     (a.name.clone(), role)
                 })
                 .collect();
