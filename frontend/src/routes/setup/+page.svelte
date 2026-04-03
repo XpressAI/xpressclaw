@@ -25,6 +25,8 @@
 	let agentName = $state('');
 	let selectedPreset = $state<AgentPreset | null>(null);
 	let customRole = $state('');
+	let agentRoleTitle = $state('');
+	let agentResponsibilities = $state('');
 
 	// -- Step 1: LLM --
 	let systemInfo = $state<SystemInfo | null>(null);
@@ -334,6 +336,8 @@
 						name: agentName,
 						preset: selectedPreset?.id,
 						role: customRole || undefined,
+						role_title: agentRoleTitle || undefined,
+						responsibilities: agentResponsibilities || undefined,
 						model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (isLocal ? llmLocalModel : undefined),
 						tools,
 						volumes: volumes.length > 0 ? volumes : undefined,
@@ -433,8 +437,32 @@
 					/>
 				</div>
 				<div>
+					<label for="agent-role-title" class="block text-xs font-medium text-foreground mb-1">
+						Role Title <span class="text-muted-foreground font-normal">(e.g. Personal Assistant, Code Reviewer)</span>
+					</label>
+					<input
+						id="agent-role-title"
+						type="text"
+						bind:value={agentRoleTitle}
+						placeholder="e.g. Developer, Personal Assistant"
+						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+					/>
+				</div>
+				<div>
+					<label for="agent-responsibilities" class="block text-xs font-medium text-foreground mb-1">
+						Responsibilities <span class="text-muted-foreground font-normal">(what should this agent do?)</span>
+					</label>
+					<textarea
+						id="agent-responsibilities"
+						bind:value={agentResponsibilities}
+						rows="2"
+						placeholder="e.g. Manages code reviews, writes tests, fixes bugs"
+						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+					></textarea>
+				</div>
+				<div>
 					<label for="agent-role" class="block text-xs font-medium text-foreground mb-1">
-						System Prompt <span class="text-muted-foreground font-normal">(customizable)</span>
+						System Prompt <span class="text-muted-foreground font-normal">(advanced)</span>
 					</label>
 					<textarea
 						id="agent-role"

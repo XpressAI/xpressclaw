@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -34,6 +34,12 @@ pub fn routes() -> Router<AppState> {
         .route("/add-agent", post(add_agent))
         .route("/download-status", get(download_status))
         .route("/config", get(get_config))
+        .route("/mcp-servers", get(list_mcp_servers))
+        .route("/mcp-servers", post(upsert_mcp_server))
+        .route(
+            "/mcp-servers/{name}",
+            axum::routing::delete(delete_mcp_server),
+        )
 }
 
 /// Return the current live configuration (sanitized — no API keys).
@@ -52,6 +58,10 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
             let mut agent = json!({
                 "name": a.name,
                 "backend": a.backend,
+                "display_name": a.display_name,
+                "role_title": a.role_title,
+                "responsibilities": a.responsibilities,
+                "avatar": a.avatar,
                 "role": a.role,
                 "model": a.model,
                 "llm": a.llm.as_ref().map(|l| json!({
@@ -103,7 +113,16 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "on_exceeded": config.system.budget.on_exceeded,
             },
         },
-        "mcp_servers": config.mcp_servers.keys().collect::<Vec<_>>(),
+        "mcp_servers": config.mcp_servers.iter().map(|(name, cfg)| {
+            json!({
+                "name": name,
+                "type": cfg.server_type,
+                "command": cfg.command,
+                "args": cfg.args,
+                "url": cfg.url,
+                "env": cfg.env.keys().collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
     }))
 }
 
@@ -270,6 +289,8 @@ struct AgentSetup {
     name: String,
     preset: Option<String>,
     role: Option<String>,
+    role_title: Option<String>,
+    responsibilities: Option<String>,
     backend: Option<String>,
     model: Option<String>,
     tools: Option<Vec<String>>,
@@ -414,6 +435,9 @@ async fn complete_setup(
 
                 AgentConfig {
                     name: a.name.clone(),
+                    display_name: Some(capitalize(&a.name)),
+                    role_title: a.role_title.clone(),
+                    responsibilities: a.responsibilities.clone(),
                     backend: a
                         .backend
                         .clone()
@@ -762,6 +786,131 @@ fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
         ),
         // Default: Qwen 3.5 4B
         _ => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP server management
+// ---------------------------------------------------------------------------
+
+/// List all configured MCP servers with full details.
+async fn list_mcp_servers(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config();
+    let servers: Vec<Value> = config
+        .mcp_servers
+        .iter()
+        .map(|(name, cfg)| {
+            json!({
+                "name": name,
+                "type": cfg.server_type,
+                "command": cfg.command,
+                "args": cfg.args,
+                "url": cfg.url,
+                "env": cfg.env,
+                "headers": cfg.headers,
+            })
+        })
+        .collect();
+    Json(json!({ "servers": servers }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertMcpServerRequest {
+    name: String,
+    #[serde(rename = "type", default = "default_stdio")]
+    server_type: String,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: std::collections::HashMap<String, String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: std::collections::HashMap<String, String>,
+}
+
+fn default_stdio() -> String {
+    "stdio".to_string()
+}
+
+/// Add or update an MCP server in the global config.
+async fn upsert_mcp_server(
+    State(state): State<AppState>,
+    Json(req): Json<UpsertMcpServerRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let old_config = state.config();
+
+    let mut new_mcp = old_config.mcp_servers.clone();
+    new_mcp.insert(
+        req.name.clone(),
+        McpServerConfig {
+            server_type: req.server_type,
+            command: req.command,
+            args: req.args,
+            env: req.env,
+            url: req.url,
+            headers: req.headers,
+        },
+    );
+
+    let new_config = Config {
+        mcp_servers: new_mcp,
+        agents: old_config.agents.clone(),
+        llm: old_config.llm.clone(),
+        system: old_config.system.clone(),
+        tools: old_config.tools.clone(),
+        tool_policies: old_config.tool_policies.clone(),
+        memory: old_config.memory.clone(),
+    };
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
+
+    Ok(Json(json!({ "success": true, "name": req.name })))
+}
+
+/// Delete an MCP server from the global config.
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let old_config = state.config();
+
+    let mut new_mcp = old_config.mcp_servers.clone();
+    if new_mcp.remove(&name).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("MCP server '{name}' not found") })),
+        ));
+    }
+
+    let new_config = Config {
+        mcp_servers: new_mcp,
+        agents: old_config.agents.clone(),
+        llm: old_config.llm.clone(),
+        system: old_config.system.clone(),
+        tools: old_config.tools.clone(),
+        tool_policies: old_config.tool_policies.clone(),
+        memory: old_config.memory.clone(),
+    };
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
+
+    Ok(Json(json!({ "success": true, "deleted": name })))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
 }
 

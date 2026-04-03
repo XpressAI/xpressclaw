@@ -228,6 +228,10 @@ export const agents = {
 	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST', body: '{}' }),
 	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' }),
 	updateConfig: (id: string, data: {
+		display_name?: string | null;
+		role_title?: string | null;
+		responsibilities?: string | null;
+		avatar?: string | null;
 		role?: string;
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
@@ -353,7 +357,11 @@ export interface MemoryStats {
 }
 
 export const memory = {
-	list: (limit = 50) => request<MemorySearchResult[]>(`/api/memory?limit=${limit}`),
+	list: (limit = 50, agentId?: string) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (agentId) params.set('agent_id', agentId);
+		return request<MemorySearchResult[]>(`/api/memory?${params}`);
+	},
 	get: (id: string) => request<Memory>(`/api/memory/${id}`),
 	search: (q: string, limit = 10) =>
 		request<MemorySearchResult[]>(`/api/memory/search?q=${encodeURIComponent(q)}&limit=${limit}`),
@@ -380,7 +388,10 @@ export interface Schedule {
 }
 
 export const schedules = {
-	list: () => request<Schedule[]>('/api/schedules'),
+	list: (agentId?: string) => {
+		const params = agentId ? `?agent_id=${agentId}` : '';
+		return request<Schedule[]>(`/api/schedules${params}`);
+	},
 	get: (id: string) => request<Schedule>(`/api/schedules/${id}`),
 	create: (data: {
 		name: string;
@@ -560,6 +571,10 @@ export interface LiveConfig {
 	agents: {
 		name: string;
 		backend: string;
+		display_name?: string | null;
+		role_title?: string | null;
+		responsibilities?: string | null;
+		avatar?: string | null;
 		role: string;
 		model: string | null;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
@@ -599,7 +614,7 @@ export const setup = {
 	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
 		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
-		agents: { name: string; preset?: string; role?: string; model?: string; tools?: string[]; volumes?: string[] }[];
+		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; tools?: string[]; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
