@@ -56,6 +56,10 @@ fn agent_json(
         "error_message": record.error_message,
         "restart_count": record.restart_count,
         "config": agent_cfg.map(|c| json!({
+            "display_name": c.display_name,
+            "role_title": c.role_title,
+            "responsibilities": c.responsibilities,
+            "avatar": c.avatar,
             "role": c.role,
             "model": c.model,
             "llm": c.llm,
@@ -224,6 +228,10 @@ async fn stop_agent(
 
 #[derive(Debug, Deserialize)]
 struct UpdateAgentConfigRequest {
+    display_name: Option<String>,
+    role_title: Option<String>,
+    responsibilities: Option<String>,
+    avatar: Option<String>,
     role: Option<String>,
     model: Option<String>,
     llm: Option<AgentLlmConfig>,
@@ -265,7 +273,19 @@ async fn update_agent_config(
         new_agents.last_mut().unwrap()
     };
 
-    // Apply partial updates
+    // Apply partial updates — profile fields
+    if let Some(dn) = req.display_name {
+        agent.display_name = if dn.is_empty() { None } else { Some(dn) };
+    }
+    if let Some(rt) = req.role_title {
+        agent.role_title = if rt.is_empty() { None } else { Some(rt) };
+    }
+    if let Some(resp) = req.responsibilities {
+        agent.responsibilities = if resp.is_empty() { None } else { Some(resp) };
+    }
+    if let Some(av) = req.avatar {
+        agent.avatar = if av.is_empty() { None } else { Some(av) };
+    }
     if let Some(role) = req.role {
         agent.role = role;
     }
@@ -347,6 +367,10 @@ async fn update_agent_config(
         "agent": {
             "name": updated.name,
             "backend": updated.backend,
+            "display_name": updated.display_name,
+            "role_title": updated.role_title,
+            "responsibilities": updated.responsibilities,
+            "avatar": updated.avatar,
             "role": updated.role,
             "model": updated.model,
             "llm": updated.llm.as_ref().map(|l| json!({

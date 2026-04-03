@@ -138,7 +138,7 @@ async fn load_task(
         .and_then(|a| a.model.clone())
         .unwrap_or_else(|| "local".to_string());
     let system_prompt = agent_cfg
-        .map(|a| a.role.clone())
+        .map(|a| a.full_system_prompt())
         .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
 
     // Verify agent is running and get harness port

@@ -206,6 +206,16 @@ pub struct AgentConfig {
     /// Per-agent LLM provider/key/url override.
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
+    /// Human-friendly display name (e.g. "Avery (PA)").
+    pub display_name: Option<String>,
+    /// Short role title (e.g. "Personal Assistant").
+    pub role_title: Option<String>,
+    /// Longer description of what this agent does.
+    pub responsibilities: Option<String>,
+    /// Path or URL to avatar image.
+    pub avatar: Option<String>,
+    /// Raw system prompt. display_name, role_title, and responsibilities
+    /// are prepended automatically when building the LLM messages.
     pub role: String,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -235,6 +245,10 @@ impl Default for AgentConfig {
             backend: "generic".to_string(),
             model: None,
             llm: None,
+            display_name: None,
+            role_title: None,
+            responsibilities: None,
+            avatar: None,
             role: String::new(),
             tools: Vec::new(),
             skills: Vec::new(),
@@ -245,6 +259,30 @@ impl Default for AgentConfig {
             hooks: HooksConfig::default(),
             volumes: Vec::new(),
             idle_prompt: None,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Build the full system prompt by prepending profile fields
+    /// (display_name, role_title, responsibilities) to the raw role.
+    pub fn full_system_prompt(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(ref name) = self.display_name {
+            parts.push(format!("Your name is {name}."));
+        }
+        if let Some(ref title) = self.role_title {
+            parts.push(format!("Your role is: {title}."));
+        }
+        if let Some(ref resp) = self.responsibilities {
+            parts.push(format!("Your responsibilities: {resp}"));
+        }
+        if parts.is_empty() {
+            self.role.clone()
+        } else {
+            parts.push(String::new()); // blank line separator
+            parts.push(self.role.clone());
+            parts.join("\n")
         }
     }
 }

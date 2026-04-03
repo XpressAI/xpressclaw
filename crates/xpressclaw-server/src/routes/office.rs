@@ -15,6 +15,12 @@ pub fn routes() -> Router<AppState> {
         .route("/export", post(export_document))
         .route("/documents", get(list_documents))
         .route("/documents/{name}", get(download_document))
+        .route(
+            "/documents/{name}/content",
+            get(read_document_content),
+        )
+        .route("/upload", post(upload_document))
+        .route("/documents/{name}/delete", post(delete_document))
 }
 
 /// Get the documents directory for an agent (~/.xpressclaw/{agent_id}/documents/).
@@ -298,6 +304,105 @@ async fn download_document(
         )
         .body(axum::body::Body::from(bytes))
         .unwrap())
+}
+
+/// Read a text document's content inline (for the workspace file viewer).
+async fn read_document_content(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let agent_id = query.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let file_path = docs_dir.join(&name);
+
+    if !file_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "File not found" })),
+        ));
+    }
+
+    let content = std::fs::read_to_string(&file_path).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": format!("Cannot read as text: {e}") })),
+        )
+    })?;
+
+    Ok(Json(json!({ "name": name, "content": content })))
+}
+
+/// Upload a file to the agent's documents directory.
+async fn upload_document(
+    State(state): State<AppState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut agent_id = "default".to_string();
+    let mut files_saved = Vec::new();
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| internal_error(e))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+
+        if field_name == "agent_id" {
+            agent_id = field.text().await.map_err(|e| internal_error(e))?;
+            continue;
+        }
+
+        if field_name == "file" {
+            let file_name = field
+                .file_name()
+                .unwrap_or("upload")
+                .to_string();
+            let data = field.bytes().await.map_err(|e| internal_error(e))?;
+
+            let docs_dir = documents_dir(&state, &agent_id);
+            let dest = docs_dir.join(&file_name);
+            std::fs::write(&dest, &data).map_err(|e| internal_error(e))?;
+
+            info!(agent_id, file_name, size = data.len(), "file uploaded");
+            files_saved.push(json!({
+                "name": file_name,
+                "size": data.len(),
+            }));
+        }
+    }
+
+    Ok(Json(json!({ "files": files_saved })))
+}
+
+/// Delete a document from the agent's documents directory.
+async fn delete_document(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let agent_id = query.agent_id.as_deref().unwrap_or("default");
+    let docs_dir = documents_dir(&state, agent_id);
+    let file_path = docs_dir.join(&name);
+
+    if !file_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "File not found" })),
+        ));
+    }
+
+    std::fs::remove_file(&file_path).map_err(|e| internal_error(e))?;
+    info!(agent_id, name, "document deleted");
+
+    Ok(Json(json!({ "deleted": name })))
+}
+
+fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
 }
 
 // ---------------------------------------------------------------------------
