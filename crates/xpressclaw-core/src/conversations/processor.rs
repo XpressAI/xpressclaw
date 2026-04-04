@@ -31,7 +31,7 @@ pub struct ProcessorContext {
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
     /// If not provided, uses the raw role from config.
     pub agent_roles: std::collections::HashMap<String, String>,
-    /// Shared Docker connection to avoid socket exhaustion.
+    /// Shared Docker connection for harness tool execution.
     pub docker: Option<Arc<crate::docker::manager::DockerManager>>,
 }
 
@@ -130,10 +130,10 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 RateLimitResult::Allowed => {}
             }
 
-            let agent = match registry.get(agent_id) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
+            // Verify agent exists in the registry
+            if registry.get(agent_id).is_err() {
+                continue;
+            }
             let agent_cfg = ctx.config.agents.iter().find(|a| a.name == *agent_id);
 
             let model = agent_cfg
@@ -184,23 +184,10 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             );
             tokio::task::yield_now().await;
 
-            // Route through harness or LLM router.
-            // Uses the shared Docker connection to avoid socket exhaustion.
-            let stream_result = if let Some(ref cid) = agent.container_id {
-                let port = if let Some(ref docker) = ctx.docker {
-                    docker.get_container_port(cid).await
-                } else {
-                    None
-                };
-                if let Some(port) = port {
-                    let harness = crate::agents::harness::HarnessClient::new(port);
-                    harness.chat_stream(&llm_req).await
-                } else {
-                    ctx.llm_router.chat_stream(&llm_req).await
-                }
-            } else {
-                ctx.llm_router.chat_stream(&llm_req).await
-            };
+            // Stream from LLM router for instant token-by-token display.
+            // If the response contains tool calls (<tool_call> tags), we
+            // then execute them via the harness and send a follow-up message.
+            let stream_result = ctx.llm_router.chat_stream(&llm_req).await;
 
             match stream_result {
                 Ok(mut chunk_stream) => {
@@ -265,13 +252,15 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                         ctx.rate_limiter
                             .record_request(agent_id, (input_tokens + output_tokens) as u32);
 
+                        let has_tool_calls = full_content.contains("<tool_call");
+
                         if let Ok(agent_msg) = mgr.send_message(
                             conv_id,
                             &SendMessage {
                                 sender_type: "agent".into(),
                                 sender_id: agent_id.clone(),
                                 sender_name: Some(agent_id.clone()),
-                                content: full_content,
+                                content: full_content.clone(),
                                 message_type: None,
                             },
                         ) {
@@ -281,6 +270,64 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                     message: json!(agent_msg),
                                 },
                             );
+                        }
+
+                        // If the LLM output contains tool calls, send the
+                        // full conversation through the harness for execution.
+                        // The harness runs the tool loop and returns the final
+                        // result, which we send as a follow-up message.
+                        if has_tool_calls {
+                            if let Some(ref docker) = ctx.docker {
+                                if let Some(ref cid) =
+                                    registry.get(agent_id).ok().and_then(|a| a.container_id)
+                                {
+                                    if let Some(port) = docker.get_container_port(cid).await {
+                                        let harness =
+                                            crate::agents::harness::HarnessClient::new(port);
+                                        // Build full conversation including the
+                                        // tool-containing response
+                                        let mut harness_msgs = llm_req.messages.clone();
+                                        harness_msgs.push(crate::llm::router::ChatMessage::text(
+                                            "assistant",
+                                            &full_content,
+                                        ));
+                                        harness_msgs.push(crate::llm::router::ChatMessage::text(
+                                            "user",
+                                            "Execute the tool calls above and report the results.",
+                                        ));
+                                        let mut harness_req = llm_req.clone();
+                                        harness_req.messages = harness_msgs;
+                                        harness_req.stream = Some(false);
+
+                                        if let Ok(resp) = harness.chat(&harness_req).await {
+                                            let tool_result = resp
+                                                .choices
+                                                .first()
+                                                .map(|c| c.message.content.clone())
+                                                .unwrap_or_default();
+                                            if !tool_result.is_empty() {
+                                                if let Ok(tool_msg) = mgr.send_message(
+                                                    conv_id,
+                                                    &SendMessage {
+                                                        sender_type: "agent".into(),
+                                                        sender_id: agent_id.clone(),
+                                                        sender_name: Some(agent_id.clone()),
+                                                        content: tool_result,
+                                                        message_type: None,
+                                                    },
+                                                ) {
+                                                    ctx.event_bus.send(
+                                                        conv_id,
+                                                        ConversationEvent::Message {
+                                                            message: json!(tool_msg),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
