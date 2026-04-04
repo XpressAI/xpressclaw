@@ -7691,6 +7691,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -7703,6 +7704,7 @@ name = "xpressclaw-tauri"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "open",
  "reqwest 0.12.28",
  "serde_json",
