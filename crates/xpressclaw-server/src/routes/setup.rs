@@ -404,6 +404,7 @@ async fn complete_setup(
             ..Default::default()
         }]
     } else {
+        let mut used_ids: Vec<String> = Vec::new();
         req.agents
             .iter()
             .map(|a| {
@@ -444,9 +445,14 @@ async fn complete_setup(
                     }
                 };
 
+                // Slugify the name for use as an ID, keep original as display_name
+                let id_refs: Vec<&str> = used_ids.iter().map(|s| s.as_str()).collect();
+                let agent_id = xpressclaw_core::config::unique_agent_id(&a.name, &id_refs);
+                used_ids.push(agent_id.clone());
+
                 AgentConfig {
-                    name: a.name.clone(),
-                    display_name: Some(capitalize(&a.name)),
+                    name: agent_id,
+                    display_name: Some(a.name.clone()),
                     role_title: a.role_title.clone(),
                     responsibilities: a.responsibilities.clone(),
                     backend: a
@@ -676,8 +682,13 @@ async fn add_agent(
         "build-app".to_string(),
     ];
 
+    // Slugify the name and ensure uniqueness
+    let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
+    let agent_id = xpressclaw_core::config::unique_agent_id(&req.name, &existing_ids);
+
     let agent_config = AgentConfig {
-        name: req.name.clone(),
+        name: agent_id.clone(),
+        display_name: Some(req.name.clone()),
         backend: req
             .backend
             .clone()
@@ -929,14 +940,6 @@ async fn delete_mcp_server(
     state.apply_config(new_config, state.llm_router());
 
     Ok(Json(json!({ "success": true, "deleted": name })))
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

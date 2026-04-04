@@ -287,6 +287,65 @@ impl AgentConfig {
     }
 }
 
+/// Generate a URL-safe slug from a display name.
+///
+/// Handles Unicode (including Japanese) by:
+/// 1. Lowercasing ASCII characters
+/// 2. Replacing spaces/punctuation with hyphens
+/// 3. Keeping alphanumeric ASCII and Unicode letters/numbers
+/// 4. Collapsing multiple hyphens
+/// 5. Trimming leading/trailing hyphens
+///
+/// If the result is empty (e.g. all emoji), falls back to "agent".
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut last_was_hyphen = true; // prevent leading hyphen
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if ch.is_alphanumeric() {
+            // Keep non-ASCII letters/numbers (Japanese, etc.)
+            slug.push(ch);
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            slug.push('-');
+            last_was_hyphen = true;
+        }
+    }
+
+    // Trim trailing hyphen
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "agent".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Generate a unique agent ID from a display name, given existing IDs.
+/// Appends a numeric suffix if the slug already exists.
+pub fn unique_agent_id(display_name: &str, existing_ids: &[&str]) -> String {
+    let base = slugify(display_name);
+
+    if !existing_ids.contains(&base.as_str()) {
+        return base;
+    }
+
+    // Append numeric suffix
+    for i in 2.. {
+        let candidate = format!("{base}-{i}");
+        if !existing_ids.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SystemConfig {
@@ -729,5 +788,40 @@ memory:
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("yaml.bak"));
+    }
+
+    #[test]
+    fn test_slugify_ascii() {
+        assert_eq!(slugify("My Agent"), "my-agent");
+        assert_eq!(slugify("Code Reviewer"), "code-reviewer");
+        assert_eq!(slugify("  hello  world  "), "hello-world");
+        assert_eq!(slugify("agent!@#$%name"), "agent-name");
+    }
+
+    #[test]
+    fn test_slugify_japanese() {
+        assert_eq!(slugify("エリ"), "エリ");
+        assert_eq!(slugify("パーソナルアシスタント"), "パーソナルアシスタント");
+        assert_eq!(slugify("My エージェント"), "my-エージェント");
+    }
+
+    #[test]
+    fn test_slugify_empty() {
+        assert_eq!(slugify(""), "agent");
+        assert_eq!(slugify("!!!"), "agent");
+        assert_eq!(slugify("   "), "agent");
+    }
+
+    #[test]
+    fn test_unique_agent_id() {
+        assert_eq!(unique_agent_id("Atlas", &[]), "atlas");
+        assert_eq!(unique_agent_id("Atlas", &["atlas"]), "atlas-2");
+        assert_eq!(unique_agent_id("Atlas", &["atlas", "atlas-2"]), "atlas-3");
+    }
+
+    #[test]
+    fn test_unique_agent_id_japanese() {
+        assert_eq!(unique_agent_id("エリ", &[]), "エリ");
+        assert_eq!(unique_agent_id("エリ", &["エリ"]), "エリ-2");
     }
 }
