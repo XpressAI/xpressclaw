@@ -19,6 +19,8 @@
 	let editAgentId = $state('');
 	let editPriority = $state(0);
 	let editDeps = $state<string[]>([]);
+	let messageInput = $state('');
+	let messageSending = $state(false);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl: HTMLDivElement;
 	let prevMessageCount = 0;
@@ -33,7 +35,7 @@
 		loading = false;
 		// Auto-poll while task is in progress
 		pollTimer = setInterval(async () => {
-			if (task && (task.status === 'in_progress' || task.status === 'pending')) {
+			if (task && (task.status === 'in_progress' || task.status === 'pending' || task.status === 'waiting_for_input')) {
 				await poll();
 			}
 		}, 3000);
@@ -96,6 +98,29 @@
 		setTimeout(() => {
 			if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
 		}, 50);
+	}
+
+	async function sendTaskMessage() {
+		if (!messageInput.trim() || !task) return;
+		const content = messageInput.trim();
+		messageInput = '';
+		messageSending = true;
+		try {
+			await tasks.addMessage(task.id, 'user', content);
+			await poll();
+			scrollToBottom();
+		} catch (e) {
+			alert(String(e));
+		} finally {
+			messageSending = false;
+		}
+	}
+
+	function handleMessageKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter' && !e.shiftKey) {
+			e.preventDefault();
+			sendTaskMessage();
+		}
 	}
 
 	async function updateStatus(status: string) {
@@ -378,8 +403,41 @@
 							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
 							Agent is working on this task...
 						</div>
+					{:else if task.status === 'waiting_for_input'}
+						<div class="flex items-center gap-2 text-xs text-orange-400">
+							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
+							Waiting for your response...
+						</div>
 					{/if}
 				</div>
+
+				<!-- Message input -->
+				{#if task.status === 'in_progress' || task.status === 'waiting_for_input'}
+					<div class="border-t border-border p-4">
+						{#if task.status === 'waiting_for_input'}
+							<div class="text-xs text-orange-400 mb-2">The agent needs your input to continue</div>
+						{/if}
+						<div class="flex items-end gap-3">
+							<div class="flex-1 rounded-xl border border-border bg-secondary/50 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/30 transition-all">
+								<textarea
+									bind:value={messageInput}
+									onkeydown={handleMessageKeydown}
+									placeholder="Send a message to the agent..."
+									rows={1}
+									class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"
+									disabled={messageSending}
+								></textarea>
+							</div>
+							<button
+								onclick={sendTaskMessage}
+								disabled={!messageInput.trim() || messageSending}
+								class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
+							>
+								<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+							</button>
+						</div>
+					</div>
+				{/if}
 			</div>
 
 			<!-- Right: details sidebar -->
@@ -425,15 +483,30 @@
 						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
 							Steps ({subtaskList.filter(s => s.status === 'completed').length}/{subtaskList.length})
 						</h3>
-						<div class="space-y-1">
+						<div class="space-y-1.5">
 							{#each subtaskList as sub}
-								<a href="/tasks/{sub.id}" class="flex items-center gap-2 rounded p-1.5 hover:bg-accent text-sm">
-									<span class="h-1.5 w-1.5 rounded-full
-										{sub.status === 'completed' ? 'bg-emerald-400' :
-										 sub.status === 'in_progress' ? 'bg-blue-400 animate-pulse' :
-										 'bg-muted-foreground/30'}"></span>
-									<span class="truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : ''}">{sub.title}</span>
-								</a>
+								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
+									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
+										{sub.status === 'completed'
+											? 'bg-emerald-500/20 border-emerald-500 text-emerald-400'
+											: sub.status === 'in_progress'
+											? 'border-blue-400 text-blue-400'
+											: 'border-muted-foreground/30'}">
+										{#if sub.status === 'completed'}
+											<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+												<path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+											</svg>
+										{:else if sub.status === 'in_progress'}
+											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
+										{/if}
+									</span>
+									<div class="flex-1 min-w-0">
+										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : ''}">{sub.title}</span>
+										{#if sub.description}
+											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
+										{/if}
+									</div>
+								</div>
 							{/each}
 						</div>
 					</div>

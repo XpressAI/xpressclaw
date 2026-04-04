@@ -56,6 +56,8 @@ pub enum DriverResult {
     Skipped,
     /// Agent not ready — put back in queue for later.
     Requeue,
+    /// Task paused — agent requested user input.
+    Paused,
 }
 
 /// Mutable context carried between state machine transitions.
@@ -117,15 +119,15 @@ async fn load_task(
 
     // Verify task is actionable
     match task.status {
-        TaskStatus::Pending | TaskStatus::InProgress => {}
+        TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::WaitingForInput => {}
         _ => {
             debug!(task_id, status = ?task.status, "task not actionable, skipping");
             return State::Done(DriverResult::Skipped);
         }
     }
 
-    // Mark as in_progress if pending
-    if task.status == TaskStatus::Pending {
+    // Mark as in_progress if pending or resuming from waiting_for_input
+    if task.status == TaskStatus::Pending || task.status == TaskStatus::WaitingForInput {
         if let Err(e) = board.update_status(task_id, "in_progress", Some(agent_id)) {
             warn!(task_id, error = %e, "failed to set task in_progress");
             return State::Done(DriverResult::Failed(e.to_string()));
@@ -449,6 +451,15 @@ fn evaluate(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     if ctx.task.status == TaskStatus::Cancelled {
         info!(task_id = ctx.task.id, "task was cancelled");
         return State::Done(DriverResult::Skipped);
+    }
+
+    if ctx.task.status == TaskStatus::WaitingForInput {
+        info!(
+            task_id = ctx.task.id,
+            turns = ctx.turn,
+            "task paused, waiting for user input"
+        );
+        return State::Done(DriverResult::Paused);
     }
 
     // IDLE tasks auto-complete after a single agent response and get deleted.
@@ -832,6 +843,10 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                     task_id = claimed.task_id,
                     "task requeued (agent became unavailable mid-execution)"
                 );
+            }
+            DriverResult::Paused => {
+                let _ = queue.complete(claimed.id, "waiting_for_input");
+                info!(task_id = claimed.task_id, "task paused for user input");
             }
         }
     }

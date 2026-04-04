@@ -197,6 +197,22 @@ async fn add_message(
     let msg = conv
         .add_message(&id, &req.role, &req.content)
         .map_err(internal_error)?;
+
+    // When a user sends a message to a waiting_for_input task, resume it.
+    if req.role == "user" {
+        let board = TaskBoard::new(state.db.clone());
+        if let Ok(task) = board.get(&id) {
+            if task.status == xpressclaw_core::tasks::board::TaskStatus::WaitingForInput {
+                if let Some(ref agent_id) = task.agent_id {
+                    let _ = board.update_status(&id, "in_progress", Some(agent_id));
+                    let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
+                    let _ = queue.enqueue(&id, agent_id);
+                    tracing::info!(task_id = id, agent_id, "resumed task after user input");
+                }
+            }
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(json!(msg))))
 }
 

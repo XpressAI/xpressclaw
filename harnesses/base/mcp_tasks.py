@@ -202,6 +202,28 @@ TOOLS = [
         },
     },
     {
+        "name": "request_input",
+        "description": (
+            "Ask the user a question and pause the task until they respond. "
+            "The task status will change to waiting_for_input. "
+            "Use this when you need clarification, approval, or any input from the user."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID to pause for input",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The question or prompt to show the user",
+                },
+            },
+            "required": ["task_id", "question"],
+        },
+    },
+    {
         "name": "list_subtasks",
         "description": "List subtasks of a parent task.",
         "inputSchema": {
@@ -427,6 +449,23 @@ def handle_tool(name: str, arguments: dict) -> str:
         _api("PATCH", f"/tasks/{arguments['task_id']}/status", {"status": "completed"})
         task = _api("GET", f"/tasks/{arguments['task_id']}")
         return f"Completed task: {task['title']}"
+
+    elif name == "request_input":
+        task_id = arguments["task_id"]
+        question = arguments["question"]
+        # Save the question as an assistant message so the user sees it
+        _api("POST", f"/tasks/{task_id}/messages", {
+            "role": "assistant",
+            "content": question,
+        })
+        # Pause the task until the user responds
+        _api("PATCH", f"/tasks/{task_id}/status", {
+            "status": "waiting_for_input",
+        })
+        return (
+            f"Task paused. Your question has been sent to the user. "
+            f"The task will resume when they respond."
+        )
 
     elif name == "list_subtasks":
         parent_id = arguments["parent_task_id"]
