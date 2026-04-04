@@ -217,6 +217,9 @@ impl TaskBoard {
             sql.push_str(" AND hidden = 0");
         }
 
+        // Subtasks belong inside their parent, not the top-level list.
+        sql.push_str(" AND parent_task_id IS NULL");
+
         if let Some(s) = status {
             sql.push_str(" AND status = ?");
             params.push(Box::new(s.to_string()));

@@ -22,7 +22,7 @@ use serde_json::json;
 use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
-use crate::conversations::{ConversationManager, CreateConversation, SendMessage};
+use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::DockerManager;
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
@@ -129,35 +129,6 @@ async fn load_task(
         if let Err(e) = board.update_status(task_id, "in_progress", Some(agent_id)) {
             warn!(task_id, error = %e, "failed to set task in_progress");
             return State::Done(DriverResult::Failed(e.to_string()));
-        }
-    }
-
-    // Auto-create a conversation for the task if one doesn't exist.
-    // Without this, the agent has nowhere to send results and
-    // notify_conversation silently drops status updates.
-    let mut task = task;
-    if task.conversation_id.is_none() {
-        let mgr = ConversationManager::new(db.clone());
-        match mgr.create(&CreateConversation {
-            title: Some(format!("Task: {}", task.title)),
-            icon: None,
-            participant_ids: vec![agent_id.to_string()],
-        }) {
-            Ok(conv) => {
-                if let Err(e) = board.set_conversation_id(task_id, &conv.id) {
-                    warn!(task_id, error = %e, "failed to link conversation to task");
-                } else {
-                    info!(
-                        task_id,
-                        conv_id = conv.id,
-                        "auto-created conversation for task"
-                    );
-                    task.conversation_id = Some(conv.id);
-                }
-            }
-            Err(e) => {
-                warn!(task_id, error = %e, "failed to create conversation for task");
-            }
         }
     }
 
