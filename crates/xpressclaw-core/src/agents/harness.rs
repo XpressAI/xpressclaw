@@ -130,6 +130,95 @@ impl HarnessClient {
         Ok(Box::pin(stream))
     }
 
+    /// Send a message to the agent's persistent session.
+    /// Returns a stream of SSE chunks (may be buffered by the SDK).
+    pub async fn send_session_message(
+        &self,
+        message: &str,
+        conversation_id: &str,
+        sender_name: &str,
+        sender_type: &str,
+        system_prompt: &str,
+    ) -> Result<ChatStream> {
+        let url = format!("{}/v1/session/send", self.base_url);
+
+        let body = serde_json::json!({
+            "message": message,
+            "conversation_id": conversation_id,
+            "sender_name": sender_name,
+            "sender_type": sender_type,
+            "system_prompt": system_prompt,
+            "stream": true,
+        });
+
+        debug!(url, conversation_id, "sending session message to harness");
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Agent(format!("harness session request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Agent(format!(
+                "harness session error {status}: {body}"
+            )));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = parse_sse_stream(byte_stream);
+        Ok(Box::pin(stream))
+    }
+
+    /// Send a message to the agent's session (non-streaming).
+    pub async fn send_session_message_sync(
+        &self,
+        message: &str,
+        conversation_id: &str,
+        sender_name: &str,
+        sender_type: &str,
+        system_prompt: &str,
+    ) -> Result<String> {
+        let url = format!("{}/v1/session/send", self.base_url);
+
+        let body = serde_json::json!({
+            "message": message,
+            "conversation_id": conversation_id,
+            "sender_name": sender_name,
+            "sender_type": sender_type,
+            "system_prompt": system_prompt,
+            "stream": false,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|e| Error::Agent(format!("harness session request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Agent(format!(
+                "harness session error {status}: {body}"
+            )));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Agent(format!("failed to parse session response: {e}")))?;
+
+        Ok(data["content"].as_str().unwrap_or("").to_string())
+    }
+
     /// Check if the harness is healthy.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/health", self.base_url);

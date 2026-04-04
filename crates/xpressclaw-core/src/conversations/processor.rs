@@ -1,8 +1,10 @@
-//! Background conversation processor (ADR-019).
+//! Background conversation processor (ADR-019, ADR-021).
 //!
-//! Processes agent responses in a background task. The conversation
-//! continues regardless of whether a client is connected. Events are
-//! broadcast to any subscribers via the event bus.
+//! Routes conversation messages through agent harness sessions.
+//! The harness has the real MCP tools, correct personality, and
+//! maintains context across messages via persistent sessions.
+//!
+//! Falls back to LLM router streaming when no harness is available.
 
 use std::sync::Arc;
 
@@ -29,14 +31,12 @@ pub struct ProcessorContext {
     pub event_bus: Arc<ConversationEventBus>,
     pub rate_limiter: Arc<RateLimiter>,
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
-    /// If not provided, uses the raw role from config.
     pub agent_roles: std::collections::HashMap<String, String>,
-    /// Shared Docker connection for harness tool execution.
+    /// Shared Docker connection for harness access.
     pub docker: Option<Arc<crate::docker::manager::DockerManager>>,
 }
 
 /// Spawn a background task to process agent responses for a conversation.
-/// Returns immediately — the processing happens asynchronously.
 pub fn spawn(conv_id: String, ctx: ProcessorContext) {
     tokio::spawn(async move {
         process_loop(&conv_id, &ctx).await;
@@ -44,11 +44,9 @@ pub fn spawn(conv_id: String, ctx: ProcessorContext) {
 }
 
 /// Process all pending user messages in a conversation.
-/// Loops until there are no more unprocessed messages.
 async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
     let mgr = ConversationManager::new(ctx.db.clone());
 
-    // Mark conversation as processing
     let _ = mgr.set_processing_status(conv_id, "processing");
 
     loop {
@@ -56,7 +54,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             break;
         }
 
-        // Resolve target agents
         let target_agents = match mgr.resolve_target_agents(conv_id, "") {
             Ok(agents) => agents,
             Err(e) => {
@@ -70,8 +67,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             break;
         }
 
-        // Mark messages as processed BEFORE generating response
-        // so new messages arriving during generation start a new cycle
         let _ = mgr.mark_processed(conv_id);
 
         let registry = AgentRegistry::new(ctx.db.clone());
@@ -130,7 +125,7 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 RateLimitResult::Allowed => {}
             }
 
-            // Verify agent exists in the registry
+            // Verify agent exists
             if registry.get(agent_id).is_err() {
                 continue;
             }
@@ -147,55 +142,32 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                         .unwrap_or_else(|| "local".to_string())
                 });
 
-            // Use pre-computed role (with skills) if available, else raw config role
-            let mut role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
+            let role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
                 agent_cfg
-                    .map(|c| c.role.clone())
+                    .map(|c| c.full_system_prompt())
                     .unwrap_or_else(|| "You are a helpful AI assistant.".to_string())
             });
 
-            // Inject tool descriptions so the model knows what's available.
-            // Conversations stream directly from the LLM router (bypassing
-            // the harness for streaming), so the model needs tool info in the
-            // prompt. When it outputs <tool_call> tags, the harness executes them.
-            let agent_tools = agent_cfg.map(|c| &c.tools).cloned().unwrap_or_default();
-            if !agent_tools.is_empty() {
-                let tool_desc = build_tool_descriptions(&agent_tools);
-                role.push_str(&tool_desc);
+            // Get the last user message to send to the session
+            let history = mgr.get_messages(conv_id, 5, None).unwrap_or_default();
+            let last_user_msg = history
+                .iter()
+                .rev()
+                .find(|m| m.sender_type == "user")
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+            let sender_name = history
+                .iter()
+                .rev()
+                .find(|m| m.sender_type == "user")
+                .and_then(|m| m.sender_name.clone())
+                .unwrap_or_else(|| "User".to_string());
+
+            if last_user_msg.is_empty() {
+                continue;
             }
 
-            let history = mgr.get_messages(conv_id, 20, None).unwrap_or_default();
-
-            let mut llm_messages = vec![ChatMessage::text("system", &role)];
-            for m in &history {
-                match m.sender_type.as_str() {
-                    "agent" => {
-                        llm_messages.push(ChatMessage::text("assistant", &m.content));
-                    }
-                    "system" => {
-                        // System messages are presented as user messages with
-                        // a SYSTEM prefix so the model can see and react to them
-                        // (e.g. task completion notifications).
-                        let sys_content = format!("SYSTEM: {}", m.content);
-                        llm_messages.push(ChatMessage::text("user", &sys_content));
-                    }
-                    _ => {
-                        llm_messages.push(ChatMessage::text("user", &m.content));
-                    }
-                }
-            }
-
-            let llm_req = ChatCompletionRequest {
-                model: model.clone(),
-                messages: llm_messages,
-                temperature: Some(0.7),
-                max_tokens: Some(4096),
-                stream: Some(true),
-                ..Default::default()
-            };
-
-            // Broadcast thinking and yield so the SSE event reaches clients
-            // before the LLM call (which may block for seconds during context init)
+            // Broadcast "thinking" event
             ctx.event_bus.send(
                 conv_id,
                 ConversationEvent::Thinking {
@@ -204,198 +176,94 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             );
             tokio::task::yield_now().await;
 
-            // Stream from LLM router for instant token-by-token display.
-            // If the response contains tool calls (<tool_call> tags), we
-            // then execute them via the harness and send a follow-up message.
-            let stream_result = ctx.llm_router.chat_stream(&llm_req).await;
+            // Try routing through harness session (has tools, persistent context)
+            let harness_port = get_harness_port(ctx, &registry, agent_id).await;
 
-            match stream_result {
-                Ok(mut chunk_stream) => {
-                    let mut full_content = String::new();
-                    let mut total_tokens: i64 = 0;
+            if let Some(port) = harness_port {
+                let harness = crate::agents::harness::HarnessClient::new(port);
 
-                    while let Some(result) = chunk_stream.next().await {
-                        match result {
-                            Ok(chunk) => {
-                                if let Some(choice) = chunk.choices.first() {
-                                    if let Some(ref text) = choice.delta.content {
-                                        full_content.push_str(text);
-                                        total_tokens += text.len() as i64;
-                                        ctx.event_bus.send(
-                                            conv_id,
-                                            ConversationEvent::Chunk {
-                                                agent_id: agent_id.clone(),
-                                                content: text.clone(),
-                                            },
-                                        );
+                // Send to the agent's persistent session
+                match harness
+                    .send_session_message(&last_user_msg, conv_id, &sender_name, "user", &role)
+                    .await
+                {
+                    Ok(mut stream) => {
+                        let mut full_content = String::new();
+                        let mut total_tokens: i64 = 0;
+
+                        while let Some(result) = stream.next().await {
+                            match result {
+                                Ok(chunk) => {
+                                    if let Some(choice) = chunk.choices.first() {
+                                        if let Some(ref text) = choice.delta.content {
+                                            full_content.push_str(text);
+                                            total_tokens += text.len() as i64;
+                                            ctx.event_bus.send(
+                                                conv_id,
+                                                ConversationEvent::Chunk {
+                                                    agent_id: agent_id.clone(),
+                                                    content: text.clone(),
+                                                },
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                ctx.event_bus.send(
-                                    conv_id,
-                                    ConversationEvent::Error {
-                                        agent_id: Some(agent_id.clone()),
-                                        error: e.to_string(),
-                                    },
-                                );
-                                break;
+                                Err(e) => {
+                                    warn!(agent_id, error = %e, "session stream error");
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    // Store the complete agent message
-                    if !full_content.is_empty() {
-                        let input_tokens = (llm_req
-                            .messages
-                            .iter()
-                            .map(|m| m.content.len())
-                            .sum::<usize>()
-                            / 4) as i64;
-                        let output_tokens = total_tokens / 4;
-                        let _ = cost_tracker.record(
+                        if !full_content.is_empty() {
+                            record_and_store(
+                                &mgr,
+                                &cost_tracker,
+                                &budget_mgr,
+                                &ctx.rate_limiter,
+                                ctx,
+                                conv_id,
+                                agent_id,
+                                &model,
+                                &full_content,
+                                total_tokens,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent_id, error = %e, "harness session failed, falling back to LLM router");
+                        // Fall back to LLM router streaming
+                        stream_from_llm_router(
+                            ctx,
+                            &mgr,
+                            &cost_tracker,
+                            &budget_mgr,
+                            conv_id,
                             agent_id,
                             &model,
-                            input_tokens,
-                            output_tokens,
-                            "chat",
-                            Some(conv_id),
-                        );
-                        let cost = cost_tracker.pricing().calculate(
-                            &model,
-                            input_tokens,
-                            output_tokens,
-                            0,
-                            0,
-                        );
-                        let _ = budget_mgr.update_spending(agent_id, cost);
-                        ctx.rate_limiter
-                            .record_request(agent_id, (input_tokens + output_tokens) as u32);
-
-                        // Check for actual tool call invocations (not just mentions).
-                        // The model may quote the tool_call syntax in explanations.
-                        // A real invocation has <tool_call name="..."> with content.
-                        let has_tool_calls = full_content.contains("<tool_call name=\"")
-                            && full_content.contains("</tool_call>");
-
-                        // Always store the message. If it has tool calls, the harness
-                        // follow-up will add a second message with the tool results.
-                        {
-                            if let Ok(agent_msg) = mgr.send_message(
-                                conv_id,
-                                &SendMessage {
-                                    sender_type: "agent".into(),
-                                    sender_id: agent_id.clone(),
-                                    sender_name: Some(agent_id.clone()),
-                                    content: full_content.clone(),
-                                    message_type: None,
-                                },
-                            ) {
-                                ctx.event_bus.send(
-                                    conv_id,
-                                    ConversationEvent::Message {
-                                        message: json!(agent_msg),
-                                    },
-                                );
-                            }
-                        }
-
-                        // If the LLM output contains tool calls, hand off to
-                        // the harness for execution. Stream the harness response
-                        // so tool calls, intermediate steps, and the final text
-                        // are all visible in the conversation in real-time.
-                        if has_tool_calls {
-                            let harness_port = match (&ctx.docker, registry.get(agent_id).ok()) {
-                                (Some(docker), Some(record)) if record.container_id.is_some() => {
-                                    docker
-                                        .get_container_port(record.container_id.as_ref().unwrap())
-                                        .await
-                                }
-                                _ => None,
-                            };
-
-                            if let Some(port) = harness_port {
-                                let harness = crate::agents::harness::HarnessClient::new(port);
-                                let mut harness_msgs = llm_req.messages.clone();
-                                harness_msgs.push(crate::llm::router::ChatMessage::text(
-                                    "assistant",
-                                    &full_content,
-                                ));
-                                harness_msgs.push(crate::llm::router::ChatMessage::text(
-                                    "user",
-                                    "Execute the tool calls above and report the results.",
-                                ));
-                                let mut harness_req = llm_req.clone();
-                                harness_req.messages = harness_msgs;
-
-                                // Stream from harness so tool calls and
-                                // intermediate text are visible in real-time
-                                match harness.chat_stream(&harness_req).await {
-                                    Ok(mut harness_stream) => {
-                                        let mut harness_content = String::new();
-                                        while let Some(result) = harness_stream.next().await {
-                                            if let Ok(chunk) = result {
-                                                if let Some(choice) = chunk.choices.first() {
-                                                    if let Some(ref text) = choice.delta.content {
-                                                        harness_content.push_str(text);
-                                                        ctx.event_bus.send(
-                                                            conv_id,
-                                                            ConversationEvent::Chunk {
-                                                                agent_id: agent_id.clone(),
-                                                                content: text.clone(),
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if !harness_content.is_empty() {
-                                            if let Ok(tool_msg) = mgr.send_message(
-                                                conv_id,
-                                                &SendMessage {
-                                                    sender_type: "agent".into(),
-                                                    sender_id: agent_id.clone(),
-                                                    sender_name: Some(agent_id.clone()),
-                                                    content: harness_content,
-                                                    message_type: None,
-                                                },
-                                            ) {
-                                                ctx.event_bus.send(
-                                                    conv_id,
-                                                    ConversationEvent::Message {
-                                                        message: json!(tool_msg),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(agent_id, error = %e, "harness tool execution failed");
-                                    }
-                                }
-                            } else {
-                                warn!(
-                                    agent_id,
-                                    "tool calls detected but agent container not available"
-                                );
-                            }
-                        }
+                            &role,
+                            &history,
+                        )
+                        .await;
                     }
                 }
-                Err(e) => {
-                    warn!(conv_id, agent_id, error = %e, "LLM stream failed");
-                    ctx.event_bus.send(
-                        conv_id,
-                        ConversationEvent::Error {
-                            agent_id: Some(agent_id.clone()),
-                            error: e.to_string(),
-                        },
-                    );
-                }
+            } else {
+                // No harness container — stream from LLM router (no tools)
+                stream_from_llm_router(
+                    ctx,
+                    &mgr,
+                    &cost_tracker,
+                    &budget_mgr,
+                    conv_id,
+                    agent_id,
+                    &model,
+                    &role,
+                    &history,
+                )
+                .await;
             }
         }
 
-        // Check if more messages arrived during processing
         if !mgr.has_unprocessed(conv_id) {
             break;
         }
@@ -405,37 +273,165 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
         );
     }
 
-    // Mark conversation as idle
     let _ = mgr.set_processing_status(conv_id, "idle");
-
     ctx.event_bus.send(conv_id, ConversationEvent::Done);
-
     info!(conv_id, "background processing complete");
 }
 
-/// Build a tool description block to append to the system prompt.
-/// This tells the model what tools it has so it can decide to use them.
-/// When the model outputs <tool_call> tags, the harness executes them.
-fn build_tool_descriptions(tools: &[String]) -> String {
-    let mut desc = String::from("\n\n## Available Tools\nYou have the following tools available. To use a tool, output a <tool_call> tag.\n\n");
-    for tool in tools {
-        match tool.as_str() {
-            "filesystem" => desc
-                .push_str("- **filesystem**: Read, write, edit, search files in the workspace\n"),
-            "shell" => desc.push_str("- **shell**: Run shell commands\n"),
-            "memory" => desc.push_str(
-                "- **memory**: Save and search memories (search_memory, create_memory)\n",
-            ),
-            "fetch" => desc.push_str("- **fetch**: Fetch web pages and APIs (WebFetch)\n"),
-            "websearch" => desc
-                .push_str("- **web_search**: Search the web for current information (WebSearch)\n"),
-            "git" => desc.push_str("- **git**: Interact with git repositories\n"),
-            "github" => desc.push_str("- **github**: Manage GitHub issues, PRs, repos\n"),
-            other => desc.push_str(&format!("- **{other}**\n")),
+/// Get the harness port for an agent's container.
+async fn get_harness_port(
+    ctx: &ProcessorContext,
+    registry: &AgentRegistry,
+    agent_id: &str,
+) -> Option<u16> {
+    let docker = ctx.docker.as_ref()?;
+    let record = registry.get(agent_id).ok()?;
+    let cid = record.container_id.as_ref()?;
+    docker.get_container_port(cid).await
+}
+
+/// Fall back to streaming from the LLM router (no tools, but responsive).
+#[allow(clippy::too_many_arguments)]
+async fn stream_from_llm_router(
+    ctx: &ProcessorContext,
+    mgr: &ConversationManager,
+    cost_tracker: &CostTracker,
+    budget_mgr: &BudgetManager,
+    conv_id: &str,
+    agent_id: &str,
+    model: &str,
+    role: &str,
+    history: &[crate::conversations::ConversationMessage],
+) {
+    let mut llm_messages = vec![ChatMessage::text("system", role)];
+    for m in history {
+        match m.sender_type.as_str() {
+            "agent" => llm_messages.push(ChatMessage::text("assistant", &m.content)),
+            "system" => {
+                let sys_content = format!("SYSTEM: {}", m.content);
+                llm_messages.push(ChatMessage::text("user", &sys_content));
+            }
+            _ => llm_messages.push(ChatMessage::text("user", &m.content)),
         }
     }
-    desc.push_str(
-        "\nUse <tool_call name=\"tool_name\">{\"arg\": \"value\"}</tool_call> to invoke a tool.\n",
+
+    let llm_req = ChatCompletionRequest {
+        model: model.to_string(),
+        messages: llm_messages,
+        temperature: Some(0.7),
+        max_tokens: Some(4096),
+        stream: Some(true),
+        ..Default::default()
+    };
+
+    match ctx.llm_router.chat_stream(&llm_req).await {
+        Ok(mut chunk_stream) => {
+            let mut full_content = String::new();
+            let mut total_tokens: i64 = 0;
+
+            while let Some(result) = chunk_stream.next().await {
+                match result {
+                    Ok(chunk) => {
+                        if let Some(choice) = chunk.choices.first() {
+                            if let Some(ref text) = choice.delta.content {
+                                full_content.push_str(text);
+                                total_tokens += text.len() as i64;
+                                ctx.event_bus.send(
+                                    conv_id,
+                                    ConversationEvent::Chunk {
+                                        agent_id: agent_id.to_string(),
+                                        content: text.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ctx.event_bus.send(
+                            conv_id,
+                            ConversationEvent::Error {
+                                agent_id: Some(agent_id.to_string()),
+                                error: e.to_string(),
+                            },
+                        );
+                        break;
+                    }
+                }
+            }
+
+            if !full_content.is_empty() {
+                record_and_store(
+                    mgr,
+                    cost_tracker,
+                    budget_mgr,
+                    &ctx.rate_limiter,
+                    ctx,
+                    conv_id,
+                    agent_id,
+                    model,
+                    &full_content,
+                    total_tokens,
+                );
+            }
+        }
+        Err(e) => {
+            warn!(conv_id, agent_id, error = %e, "LLM stream failed");
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Error {
+                    agent_id: Some(agent_id.to_string()),
+                    error: e.to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// Record costs, update budget, and store the agent message.
+#[allow(clippy::too_many_arguments)]
+fn record_and_store(
+    mgr: &ConversationManager,
+    cost_tracker: &CostTracker,
+    budget_mgr: &BudgetManager,
+    rate_limiter: &RateLimiter,
+    ctx: &ProcessorContext,
+    conv_id: &str,
+    agent_id: &str,
+    model: &str,
+    content: &str,
+    total_tokens: i64,
+) {
+    let input_tokens = total_tokens / 4;
+    let output_tokens = total_tokens / 4;
+    let _ = cost_tracker.record(
+        agent_id,
+        model,
+        input_tokens,
+        output_tokens,
+        "chat",
+        Some(conv_id),
     );
-    desc
+    let cost = cost_tracker
+        .pricing()
+        .calculate(model, input_tokens, output_tokens, 0, 0);
+    let _ = budget_mgr.update_spending(agent_id, cost);
+    rate_limiter.record_request(agent_id, (input_tokens + output_tokens) as u32);
+
+    if let Ok(agent_msg) = mgr.send_message(
+        conv_id,
+        &SendMessage {
+            sender_type: "agent".into(),
+            sender_id: agent_id.to_string(),
+            sender_name: Some(agent_id.to_string()),
+            content: content.to_string(),
+            message_type: None,
+        },
+    ) {
+        ctx.event_bus.send(
+            conv_id,
+            ConversationEvent::Message {
+                message: json!(agent_msg),
+            },
+        );
+    }
 }

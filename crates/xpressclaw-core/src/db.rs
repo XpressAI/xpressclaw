@@ -139,6 +139,7 @@ impl Database {
             (16, MIGRATION_V16),
             (17, MIGRATION_V17),
             (18, MIGRATION_V18),
+            (19, MIGRATION_V19),
         ];
 
         for &(target, sql) in migrations {
@@ -562,6 +563,11 @@ ALTER TABLE tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'normal';
 ALTER TABLE tasks ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;
 ";
 
+const MIGRATION_V19: &str = "
+-- Agent session ID for persistent harness sessions (ADR-021).
+ALTER TABLE agents ADD COLUMN session_id TEXT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,7 +585,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "18");
+        assert_eq!(version, "19");
     }
 
     #[test]
