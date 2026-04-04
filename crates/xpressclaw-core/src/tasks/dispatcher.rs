@@ -338,6 +338,8 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
 }
 
 async fn call_agent(ctx: &mut Context) -> State {
+    use futures_util::StreamExt;
+
     let harness = HarnessClient::new(ctx.harness_port);
 
     debug!(
@@ -347,12 +349,12 @@ async fn call_agent(ctx: &mut Context) -> State {
         "calling agent harness"
     );
 
-    // Use the session endpoint so tasks share the agent's session context.
-    // The task prompt is sent as a system message with the task details.
     let conv_id = ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id);
 
+    // Use streaming session endpoint so tool calls and intermediate
+    // text appear in task_messages as they happen.
     match harness
-        .send_session_message_sync(
+        .send_session_message(
             &ctx.current_prompt,
             conv_id,
             "system",
@@ -361,16 +363,26 @@ async fn call_agent(ctx: &mut Context) -> State {
         )
         .await
     {
-        Ok(text) => {
-            ctx.last_response = text;
+        Ok(mut stream) => {
+            let mut full_content = String::new();
+            while let Some(result) = stream.next().await {
+                if let Ok(chunk) = result {
+                    if let Some(choice) = chunk.choices.first() {
+                        if let Some(ref text) = choice.delta.content {
+                            full_content.push_str(text);
+                        }
+                    }
+                }
+            }
+            ctx.last_response = full_content;
             State::ProcessResponse
         }
         Err(e) => {
-            // Fall back to legacy send_task if session endpoint isn't available
+            // Fall back to legacy send_task
             warn!(
                 task_id = ctx.task.id,
                 error = %e,
-                "session endpoint failed, trying legacy send_task"
+                "session stream failed, trying legacy send_task"
             );
             match harness
                 .send_task(&ctx.system_prompt, &ctx.current_prompt, &ctx.model)
