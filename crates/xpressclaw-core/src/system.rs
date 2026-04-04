@@ -167,9 +167,10 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
     ];
 
     // Apply hardware caps:
-    // Intel Macs: Metal works but GPU layers are disabled (ngl=0) for
-    // stability. CPU-only inference is slower, so cap at a reasonable size.
-    let max_ram_gb = if is_intel_mac { 16.0 } else { f64::MAX };
+    // Intel Macs: Metal works but GPU layers are disabled (ngl=0) so
+    // inference is CPU-only and slow. Cap at 4B — 9B is ~4 tok/s even
+    // on the fastest Intel Mac.
+    let max_ram_gb = if is_intel_mac { 12.0 } else { f64::MAX };
 
     // Pick the largest suitable dense model that doesn't exceed the cap
     let recommended = options
@@ -372,8 +373,8 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 9B (ngl=0, CPU only)
-        assert_eq!(rec.model, "qwen3.5:9b");
+        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 4B (ngl=0, CPU only)
+        assert_eq!(rec.model, "qwen3.5:4b");
     }
 
     #[test]
