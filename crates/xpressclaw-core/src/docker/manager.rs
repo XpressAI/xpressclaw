@@ -304,7 +304,9 @@ impl DockerManager {
     pub async fn stop(&self, agent_id: &str) -> Result<()> {
         let container_name = format!("xpressclaw-{agent_id}");
 
-        let stop_opts = StopContainerOptions { t: 10 };
+        // Short timeout — containers will be restarted on next boot.
+        // Node.js/Python processes that don't handle SIGTERM get SIGKILL after this.
+        let stop_opts = StopContainerOptions { t: 2 };
         if let Err(e) = self
             .docker
             .stop_container(&container_name, Some(stop_opts))
