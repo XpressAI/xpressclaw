@@ -579,6 +579,28 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
             "failed to notify conversation of task status"
         );
     }
+
+    // On completion or failure, send an unprocessed "user" message so the
+    // conversation processor wakes the agent to respond about the result.
+    // Uses sender_type "user" because the processor only checks for
+    // unprocessed user messages (system messages are user messages with
+    // a SYSTEM prefix in this architecture).
+    if status == "completed" || status == "failed" {
+        let wake_content = format!(
+            "SYSTEM: Background task \"{}\" has {}. Please acknowledge this to the user.",
+            task.title, status
+        );
+        let _ = mgr.send_user_message(
+            &conv_id,
+            &SendMessage {
+                sender_type: "user".into(),
+                sender_id: "system".to_string(),
+                sender_name: Some("System".to_string()),
+                content: wake_content,
+                message_type: Some("task_wake".into()),
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
