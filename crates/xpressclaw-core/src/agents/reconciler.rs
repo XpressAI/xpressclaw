@@ -52,8 +52,8 @@ async fn reconcile_once(
     };
 
     reconcile_models(config).await;
-    reconcile_images(config, &docker).await;
-    reconcile_agents(db, config, &docker, server_port).await;
+    let available_images = reconcile_images(config, &docker).await;
+    reconcile_agents(db, config, &docker, server_port, &available_images).await;
     reconcile_apps(db, &docker).await;
     reconcile_tasks(db, &docker).await;
     reconcile_idle_tasks(db, config);
@@ -109,22 +109,41 @@ async fn reconcile_models(config: &Config) {
 }
 
 /// Pull images for all configured backends.
-async fn reconcile_images(config: &Config, docker: &DockerManager) {
+/// Pull images for all configured backends. Returns the set of images
+/// that are available (either pulled successfully or already local).
+async fn reconcile_images(
+    config: &Config,
+    docker: &DockerManager,
+) -> std::collections::HashSet<String> {
     let mut seen = std::collections::HashSet::new();
+    let mut available = std::collections::HashSet::new();
     for agent in &config.agents {
         let image = crate::docker::images::image_for_backend(&agent.backend);
         if !seen.insert(image.to_string()) {
-            continue; // Already handled this image
+            if available.contains(image) {
+                // Already confirmed available
+            }
+            continue;
         }
-        if let Err(e) = docker.pull_image(image).await {
-            // Non-fatal: use local image if available
-            if docker.has_image(image).await {
-                debug!(image, error = %e, "pull failed, local image available");
-            } else {
-                warn!(image, error = %e, "pull failed and no local image");
+        if docker.has_image(image).await {
+            available.insert(image.to_string());
+            // Still try to pull for updates, but don't block
+            let _ = docker.pull_image(image).await;
+        } else {
+            // Image not local — must pull before agents can start
+            info!(image, "pulling required harness image");
+            match docker.pull_image(image).await {
+                Ok(_) => {
+                    info!(image, "harness image pulled successfully");
+                    available.insert(image.to_string());
+                }
+                Err(e) => {
+                    error!(image, error = %e, "failed to pull harness image — agents using this image cannot start");
+                }
             }
         }
     }
+    available
 }
 
 /// Reconcile agent containers against desired state.
@@ -133,6 +152,7 @@ async fn reconcile_agents(
     config: &Config,
     docker: &DockerManager,
     server_port: u16,
+    available_images: &std::collections::HashSet<String>,
 ) {
     let registry = AgentRegistry::new(db.clone());
 
@@ -169,6 +189,20 @@ async fn reconcile_agents(
 
             // Desired running, not running → start (with backoff)
             ("running", false) => {
+                // Skip if harness image isn't available yet
+                let image = crate::docker::images::image_for_backend(&agent_config.backend);
+                if !available_images.contains(image) {
+                    debug!(
+                        agent = agent.id,
+                        image, "skipping agent start — harness image not available"
+                    );
+                    let _ = registry.record_attempt(
+                        &agent.id,
+                        Some(&format!("harness image not available: {image}")),
+                    );
+                    continue;
+                }
+
                 if !should_attempt(agent.restart_count, agent.last_attempt_at.as_deref()) {
                     continue; // Backoff not elapsed, check next agent
                 }
