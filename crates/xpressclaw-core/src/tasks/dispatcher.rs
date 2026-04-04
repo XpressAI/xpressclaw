@@ -337,27 +337,54 @@ async fn call_agent(ctx: &mut Context) -> State {
         "calling agent harness"
     );
 
+    // Use the session endpoint so tasks share the agent's session context.
+    // The task prompt is sent as a system message with the task details.
+    let conv_id = ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id);
+
     match harness
-        .send_task(&ctx.system_prompt, &ctx.current_prompt, &ctx.model)
+        .send_session_message_sync(
+            &ctx.current_prompt,
+            conv_id,
+            "system",
+            "system",
+            &ctx.system_prompt,
+        )
         .await
     {
-        Ok(response) => {
-            let text = response
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
+        Ok(text) => {
             ctx.last_response = text;
             State::ProcessResponse
         }
         Err(e) => {
-            error!(
+            // Fall back to legacy send_task if session endpoint isn't available
+            warn!(
                 task_id = ctx.task.id,
-                turn = ctx.turn,
                 error = %e,
-                "harness call failed"
+                "session endpoint failed, trying legacy send_task"
             );
-            State::Done(DriverResult::Failed(format!("harness error: {e}")))
+            match harness
+                .send_task(&ctx.system_prompt, &ctx.current_prompt, &ctx.model)
+                .await
+            {
+                Ok(response) => {
+                    let text = response
+                        .choices
+                        .first()
+                        .map(|c| c.message.content.clone())
+                        .unwrap_or_default();
+                    ctx.last_response = text;
+                    State::ProcessResponse
+                }
+                Err(e2) => {
+                    error!(
+                        task_id = ctx.task.id,
+                        turn = ctx.turn,
+                        error = %e2,
+                        "harness call failed"
+                    );
+                    State::Done(DriverResult::Failed(format!("harness error: {e2}")))
+                }
+            }
         }
     }
 }
