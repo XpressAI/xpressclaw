@@ -91,7 +91,7 @@ async fn run_task(
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
             State::CallAgent => call_agent(ctx.as_mut().unwrap()).await,
             State::ProcessResponse => process_response(db, ctx.as_mut().unwrap()),
-            State::Evaluate => evaluate(db, ctx.as_mut().unwrap()),
+            State::Evaluate => evaluate(db, config, ctx.as_mut().unwrap()),
             State::Done(result) => return result,
         };
     }
@@ -379,7 +379,7 @@ fn process_response(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::Evaluate
 }
 
-fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
+fn evaluate(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     let board = TaskBoard::new(db.clone());
 
     // Reload task status (agent may have completed it via MCP tools)
@@ -453,7 +453,7 @@ fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
         ctx.subtasks = board.list_subtasks(&ctx.task.id).unwrap_or_default();
 
         // Send progress update to conversation if subtasks advanced
-        notify_conversation(db, &ctx.task.id, &ctx.agent_id, "in_progress");
+        notify_conversation(db, config, &ctx.task.id, &ctx.agent_id, "in_progress");
 
         // Check if all subtasks are done
         let all_done = ctx
@@ -532,7 +532,13 @@ fn reset_idle_count(db: &Arc<Database>, agent_id: &str) {
 
 /// Send a task status notification back to the originating conversation.
 /// Includes subtask progress (completed/total) for inline progress bars.
-fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status: &str) {
+fn notify_conversation(
+    db: &Arc<Database>,
+    config: &Config,
+    task_id: &str,
+    agent_id: &str,
+    status: &str,
+) {
     let board = TaskBoard::new(db.clone());
     let task = match board.get(task_id) {
         Ok(t) => t,
@@ -562,12 +568,20 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
     })
     .to_string();
 
+    // Use display_name if available, fall back to agent_id
+    let display_name = config
+        .agents
+        .iter()
+        .find(|a| a.name == agent_id)
+        .and_then(|a| a.display_name.clone())
+        .unwrap_or_else(|| agent_id.to_string());
+
     if let Err(e) = mgr.send_message(
         &conv_id,
         &SendMessage {
             sender_type: "system".into(),
             sender_id: agent_id.to_string(),
-            sender_name: Some(agent_id.to_string()),
+            sender_name: Some(display_name.clone()),
             content,
             message_type: Some("task_status".into()),
         },
@@ -742,14 +756,20 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                 if !is_idle {
                     let _ = board.update_status(&claimed.task_id, "completed", None);
                     reset_idle_count(db, &claimed.agent_id);
-                    notify_conversation(db, &claimed.task_id, &claimed.agent_id, "completed");
+                    notify_conversation(
+                        db,
+                        config,
+                        &claimed.task_id,
+                        &claimed.agent_id,
+                        "completed",
+                    );
                 }
                 info!(task_id = claimed.task_id, "task completed");
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
-                notify_conversation(db, &claimed.task_id, &claimed.agent_id, "failed");
+                notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
             }
             DriverResult::Skipped => {
                 let _ = queue.complete(claimed.id, "skipped");

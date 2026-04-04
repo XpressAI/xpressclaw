@@ -69,6 +69,7 @@ fn agent_json(
             "budget": c.budget,
             "rate_limit": c.rate_limit,
             "wake_on": c.wake_on,
+            "idle_prompt": c.idle_prompt,
         })),
     })
 }

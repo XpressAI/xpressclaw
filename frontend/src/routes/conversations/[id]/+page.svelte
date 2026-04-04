@@ -626,7 +626,7 @@
 							{@const askQuestions = parseAskUserQuestion(msg.content)}
 							{@const msgKey = msg.id.toString()}
 							<div class="flex items-center gap-2">
-								<span class="text-xs font-semibold text-foreground">{msg.sender_name ?? msg.sender_id}</span>
+								<span class="text-xs font-semibold text-foreground">{agent?.config?.display_name || msg.sender_name || msg.sender_id}</span>
 								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
 							</div>
 

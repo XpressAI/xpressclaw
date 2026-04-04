@@ -193,7 +193,7 @@
 							{@const active = isAgentActive(agent.id, $page.url.pathname)}
 							<a href="/agents/{agent.id}" class={linkClass(active)}>
 								<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover ring-2 {agent.status === 'running' ? 'ring-emerald-400' : agent.status === 'starting' ? 'ring-amber-400' : 'ring-red-400'}" />
-								<span class="truncate">{agent.name}</span>
+								<span class="truncate">{agent.config?.display_name || agent.name}</span>
 							</a>
 						{/each}
 					</div>
