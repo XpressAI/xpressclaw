@@ -287,49 +287,44 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             }
         }
 
-        if ctx.subtasks.is_empty() {
+        if !ctx.subtasks.is_empty() {
             prompt.push_str(
-                "Before starting, break this task into subtasks using the `create_task` tool \
-                 with parent_task_id set to this task's ID. This shows progress to the user. \
-                 Then work through each subtask in order, marking each complete as you go. \
-                 When all subtasks are done, use `complete_task` to mark the parent complete.",
+                "Work on the current step. Mark each step complete as you finish it. \
+                 When all steps are done, use `complete_task` to mark the parent complete.",
             );
         } else {
             prompt.push_str(
-                "Work on the current step using the tools available to you. \
-                 Mark each subtask complete as you finish it. \
-                 When all steps are done, use `complete_task` to mark the parent complete.",
+                "Work on this task using the tools available to you. \
+                 For complex tasks, consider creating subtasks with `create_task` \
+                 (set parent_task_id to this task's ID) to show progress. \
+                 When done, use `complete_task` to mark it complete. \
+                 If you need clarification from the user, use `request_input`.",
             );
         }
     } else {
-        // Continuation prompt
-        prompt.push_str("Continue working on the current task.\n\n");
+        // Continuation prompt — the agent session preserves context,
+        // so we don't replay history (that causes it to render inside
+        // the system message in the UI). Just nudge the agent forward.
+        prompt.push_str("Continue working on the current task.");
 
         if let Some(subtask) = current_subtask(&ctx.subtasks) {
-            prompt.push_str(&format!("Current step: {}\n", subtask.title));
+            prompt.push_str(&format!("\n\nCurrent step: {}", subtask.title));
             if let Some(ref desc) = subtask.description {
-                prompt.push_str(desc);
-                prompt.push('\n');
+                prompt.push_str(&format!("\n{}", desc));
             }
         }
 
-        // Include recent history for context
-        let recent: Vec<_> = history.iter().rev().take(4).rev().collect();
-        if !recent.is_empty() {
-            prompt.push_str("\nRecent conversation:\n");
-            for msg in recent {
+        // If the user sent a message, highlight it
+        if let Some(last) = history.last() {
+            if last.role == "user" {
                 prompt.push_str(&format!(
-                    "[{}]: {}\n",
-                    msg.role,
-                    truncate(&msg.content, 500)
+                    "\n\nThe user responded:\n> {}",
+                    truncate(&last.content, 500)
                 ));
             }
         }
 
-        prompt.push_str(
-            "\nContinue from where you left off. \
-             Use `complete_task` when this task is fully done.",
-        );
+        prompt.push_str("\n\nUse `complete_task` when this task is fully done.");
     }
 
     // Save the user-side prompt as a task message

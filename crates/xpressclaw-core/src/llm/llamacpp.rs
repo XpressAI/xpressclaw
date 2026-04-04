@@ -213,14 +213,12 @@ impl LlamaCppProvider {
 
         let params = {
             let p = LlamaModelParams::default();
-            // Offload all layers to GPU (CUDA/Metal)
-            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-            let p = p.with_n_gpu_layers(u32::MAX);
-            // Intel Macs: Metal works but GPU layer offloading has bugs.
-            // Use CPU-only (ngl=0) for stability.
-            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-            let p = p.with_n_gpu_layers(0);
-            p
+            // Intel Macs: GPU layer offloading produces garbage output.
+            // Use ngl=0 (CPU-only). All other platforms: offload everything.
+            let is_intel_mac = cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64";
+            let ngl = if is_intel_mac { 0 } else { u32::MAX };
+            tracing::info!(ngl, is_intel_mac, "setting GPU layer count");
+            p.with_n_gpu_layers(ngl)
         };
         let model = Arc::new(
             LlamaModel::load_from_file(&backend, path, &params)
