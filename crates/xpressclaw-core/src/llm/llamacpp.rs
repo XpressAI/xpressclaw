@@ -455,6 +455,7 @@ impl LlamaCppProvider {
         }
 
         // Generation loop
+        let gen_start = std::time::Instant::now();
         let mut n_cur = batch.n_tokens();
         let mut output = String::new();
         let mut completion_tokens = 0i64;
@@ -514,6 +515,20 @@ impl LlamaCppProvider {
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Llm(format!("decode failed: {e}")))?;
         }
+
+        let gen_elapsed = gen_start.elapsed();
+        let tok_per_sec = if gen_elapsed.as_secs_f64() > 0.0 {
+            completion_tokens as f64 / gen_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        tracing::info!(
+            prompt_tokens,
+            completion_tokens,
+            elapsed_ms = gen_elapsed.as_millis() as u64,
+            tok_per_sec = format!("{tok_per_sec:.1}"),
+            "generation complete"
+        );
 
         Ok((
             output.trim().to_string(),
