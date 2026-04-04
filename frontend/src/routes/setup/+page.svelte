@@ -57,9 +57,6 @@
 	let newFolderPath = $state('');
 
 	// Optional tool toggles + config
-	let fetchEnabled = $state(false);
-	let fetchMode = $state<'allow' | 'block'>('block');
-	let fetchPatterns = $state('');
 	let gitEnabled = $state(false);
 	let gitSshKeyPath = $state('');
 	let githubEnabled = $state(false);
@@ -110,12 +107,11 @@
 		// Pre-fill optional tools from preset
 		const tools = preset.default_tools || [];
 		const servers = preset.default_mcp_servers || {};
-		fetchEnabled = tools.includes('fetch') || 'fetch' in servers;
 		gitEnabled = tools.includes('git') || 'git' in servers;
 		githubEnabled = tools.includes('github') || 'github' in servers;
 
 		// Keep non-default MCP servers (custom ones)
-		const defaultKeys = new Set(['shell', 'filesystem', 'fetch', 'git', 'github']);
+		const defaultKeys = new Set(['shell', 'filesystem', 'git', 'github']);
 		const custom: typeof mcpServers = {};
 		for (const [k, v] of Object.entries(servers)) {
 			if (!defaultKeys.has(k)) custom[k] = v;
@@ -270,15 +266,6 @@
 
 			// Build MCP servers from tool toggles + any custom servers
 			const allMcpServers = { ...mcpServers };
-			if (fetchEnabled) {
-				allMcpServers['fetch'] = {
-					type: 'stdio', command: 'npx',
-					args: ['-y', '@modelcontextprotocol/server-fetch'],
-					env: fetchPatterns.trim() ? {
-						[fetchMode === 'allow' ? 'FETCH_ALLOWED_URLS' : 'FETCH_BLOCKED_URLS']: fetchPatterns.trim()
-					} : {}
-				};
-			}
 			if (gitEnabled) {
 				allMcpServers['git'] = {
 					type: 'stdio', command: 'npx',
@@ -304,7 +291,6 @@
 
 			// Build tools list from enabled toggles
 			const tools = ['filesystem', 'shell', 'memory'];
-			if (fetchEnabled) tools.push('fetch');
 			if (gitEnabled) tools.push('git');
 			if (githubEnabled) tools.push('github');
 
@@ -736,34 +722,6 @@
 		<div class="mb-4">
 			<h3 class="text-sm font-medium text-foreground mb-3">Optional Tools</h3>
 			<div class="space-y-2">
-				<!-- Fetch -->
-				<div class="rounded-lg border {fetchEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" bind:checked={fetchEnabled} class="rounded border-border" />
-						<div>
-							<div class="text-sm font-medium text-foreground">Internet Access (Fetch)</div>
-							<div class="text-xs text-muted-foreground">Fetch web pages and APIs</div>
-						</div>
-					</label>
-					{#if fetchEnabled}
-						<div class="mt-3 ml-7 space-y-2">
-							<div class="flex gap-2">
-								<button onclick={() => fetchMode = 'block'}
-									class="rounded-md border px-2 py-1 text-xs {fetchMode === 'block' ? 'border-primary bg-primary/10' : 'border-border'}">
-									Block list
-								</button>
-								<button onclick={() => fetchMode = 'allow'}
-									class="rounded-md border px-2 py-1 text-xs {fetchMode === 'allow' ? 'border-primary bg-primary/10' : 'border-border'}">
-									Allow list
-								</button>
-							</div>
-							<textarea bind:value={fetchPatterns} rows="2"
-								placeholder={fetchMode === 'allow' ? 'Allowed URL patterns (one per line, e.g. *.github.com/*)' : 'Blocked URL patterns (one per line, leave empty to allow all)'}
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"></textarea>
-						</div>
-					{/if}
-				</div>
-
 				<!-- Git -->
 				<div class="rounded-lg border {gitEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
 					<label class="flex items-center gap-3 cursor-pointer">

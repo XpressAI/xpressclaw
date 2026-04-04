@@ -1163,7 +1163,7 @@ mod tests {
                                 {
                                     "name": "researcher",
                                     "preset": "researcher",
-                                    "tools": ["filesystem", "shell", "memory", "fetch"]
+                                    "tools": ["filesystem", "shell", "memory", "websearch"]
                                 }
                             ]
                         })
@@ -1181,24 +1181,24 @@ mod tests {
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "researcher");
         assert!(
-            config.agents[0].tools.contains(&"fetch".to_string()),
-            "agent should have fetch tool"
+            config.agents[0].tools.contains(&"websearch".to_string()),
+            "agent should have websearch tool"
         );
         // Preset default_mcp_servers should have been merged
         assert!(
-            config.mcp_servers.contains_key("fetch"),
-            "fetch MCP server should be configured from preset"
+            config.mcp_servers.contains_key("websearch"),
+            "websearch MCP server should be configured from preset"
         );
-        let fetch_cfg = &config.mcp_servers["fetch"];
-        assert_eq!(fetch_cfg.server_type, "stdio");
-        assert_eq!(fetch_cfg.command.as_deref(), Some("npx"));
+        let ws_cfg = &config.mcp_servers["websearch"];
+        assert_eq!(ws_cfg.server_type, "stdio");
+        assert_eq!(ws_cfg.command.as_deref(), Some("npx"));
 
         // Verify the YAML round-trips: save it again, reload, still valid
         let roundtrip_path = std::env::temp_dir().join("test-xpressclaw-wizard-roundtrip.yaml");
         config.save(&roundtrip_path).unwrap();
         let reloaded = Config::load(&roundtrip_path).unwrap();
         assert_eq!(reloaded.agents[0].name, "researcher");
-        assert!(reloaded.mcp_servers.contains_key("fetch"));
+        assert!(reloaded.mcp_servers.contains_key("websearch"));
         let _ = std::fs::remove_file(&roundtrip_path);
 
         // ── Step 2: add developer agent via add-agent ──
@@ -1231,10 +1231,10 @@ mod tests {
         assert!(agent_names.contains(&"researcher"));
         assert!(agent_names.contains(&"developer"));
 
-        // Researcher's fetch should still be there
+        // Researcher's websearch should still be there
         assert!(
-            config.mcp_servers.contains_key("fetch"),
-            "fetch MCP server should be preserved"
+            config.mcp_servers.contains_key("websearch"),
+            "websearch MCP server should be preserved"
         );
 
         // Cleanup
@@ -1253,7 +1253,7 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
-        // Frontend sends explicit fetch config with custom env (URL filter)
+        // Frontend sends custom websearch config that should override preset default
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1266,14 +1266,14 @@ mod tests {
                             "agents": [{
                                 "name": "researcher",
                                 "preset": "researcher",
-                                "tools": ["filesystem", "shell", "memory", "fetch"]
+                                "tools": ["filesystem", "shell", "memory", "websearch"]
                             }],
                             "mcp_servers": {
-                                "fetch": {
+                                "websearch": {
                                     "type": "stdio",
                                     "command": "npx",
-                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
-                                    "env": { "FETCH_BLOCKED_URLS": "*.evil.com" }
+                                    "args": ["-y", "duckduckgo-mcp-server"],
+                                    "env": { "SEARCH_LANG": "en" }
                                 }
                             }
                         })
@@ -1287,21 +1287,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let config = Config::load(&config_path).unwrap();
-        let fetch_cfg = config
+        let ws_cfg = config
             .mcp_servers
-            .get("fetch")
-            .expect("fetch MCP server missing");
+            .get("websearch")
+            .expect("websearch MCP server missing");
         // Frontend's explicit config should win over preset default
         assert_eq!(
-            fetch_cfg.env.get("FETCH_BLOCKED_URLS").map(|s| s.as_str()),
-            Some("*.evil.com"),
+            ws_cfg.env.get("SEARCH_LANG").map(|s| s.as_str()),
+            Some("en"),
             "frontend env overrides should be preserved"
         );
 
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// add-agent with frontend MCP servers should override preset defaults.
+    /// add-agent with researcher preset should merge its MCP servers.
     #[tokio::test]
     async fn test_add_agent_frontend_mcp_overrides() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");
@@ -1333,7 +1333,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Add researcher with custom fetch config from frontend
+        // Add researcher — preset's websearch MCP server should be merged
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1344,15 +1344,8 @@ mod tests {
                         json!({
                             "name": "researcher",
                             "preset": "researcher",
-                            "tools": ["filesystem", "shell", "memory", "fetch"],
-                            "mcp_servers": {
-                                "fetch": {
-                                    "type": "stdio",
-                                    "command": "npx",
-                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
-                                    "env": { "FETCH_ALLOWED_URLS": "*.wikipedia.org,*.arxiv.org" }
-                                }
-                            }
+                            "tools": ["filesystem", "shell", "memory", "websearch"],
+                            "mcp_servers": {}
                         })
                         .to_string(),
                     ))
@@ -1365,14 +1358,14 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
 
-        // Frontend-provided fetch config should be used (not bare preset default)
-        let fetch_cfg = config
+        // Researcher preset's websearch MCP server should be present
+        let ws_cfg = config
             .mcp_servers
-            .get("fetch")
-            .expect("fetch MCP server missing");
+            .get("websearch")
+            .expect("websearch MCP server missing from researcher preset");
         assert_eq!(
-            fetch_cfg.env.get("FETCH_ALLOWED_URLS").map(|s| s.as_str()),
-            Some("*.wikipedia.org,*.arxiv.org"),
+            ws_cfg.command.as_deref(),
+            Some("npx"),
         );
 
         let _ = std::fs::remove_file(&config_path);
