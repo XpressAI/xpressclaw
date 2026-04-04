@@ -37,7 +37,7 @@ jobs:
         with:
           context: harnesses/base
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name == 'push' }}
+          push: true
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -64,15 +64,7 @@ jobs:
 
       - uses: docker/setup-qemu-action@v3
 
-      # Build the base image locally so child images can resolve FROM
-      - uses: docker/build-push-action@v6
-        with:
-          context: harnesses/base
-          platforms: linux/amd64,linux/arm64
-          push: false
-          tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
-          cache-from: type=gha
-
+      # Base image is already pushed by build-base job
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/${{ matrix.harness }}
