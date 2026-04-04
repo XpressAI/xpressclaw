@@ -375,6 +375,8 @@ struct AppRow {
     start_command: Option<String>,
     image: Option<String>,
     port: i64,
+    restart_count: i32,
+    last_attempt_at: Option<String>,
 }
 
 /// Reconcile published app containers — restart any that should be running but aren't.
@@ -382,7 +384,8 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
     let apps: Vec<AppRow> = {
         let conn = db.conn();
         let mut stmt = match conn.prepare(
-            "SELECT id, agent_id, start_command, image, port FROM apps
+            "SELECT id, agent_id, start_command, image, port, restart_count, last_attempt_at
+             FROM apps
              WHERE status IN ('running', 'starting') AND start_command IS NOT NULL",
         ) {
             Ok(s) => s,
@@ -395,6 +398,8 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
                 start_command: row.get(2)?,
                 image: row.get(3)?,
                 port: row.get(4)?,
+                restart_count: row.get(5)?,
+                last_attempt_at: row.get(6)?,
             })
         })
         .unwrap_or_else(|_| panic!("query apps"))
@@ -407,16 +412,31 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
         let agent_id = &app.agent_id;
         let container_name = format!("app-{app_id}");
         if docker.is_container_running(&container_name).await {
-            continue; // Already running
+            // Running — reset restart count if it was elevated
+            if app.restart_count > 0 {
+                let conn = db.conn();
+                let _ = conn.execute(
+                    "UPDATE apps SET restart_count = 0 WHERE id = ?1",
+                    [app_id],
+                );
+            }
+            continue;
         }
 
         let Some(cmd) = app.start_command else {
             continue;
         };
+
+        // Backoff: don't restart every 10s if it keeps failing
+        if !should_attempt(app.restart_count, app.last_attempt_at.as_deref()) {
+            debug!(app_id, restart_count = app.restart_count, "app restart backoff");
+            continue;
+        }
+
         let image = app.image.unwrap_or_else(|| "node:20-alpine".to_string());
         let app_port = app.port as u16;
 
-        info!(app_id, "restarting app container");
+        info!(app_id, restart_count = app.restart_count, "restarting app container");
 
         let volume_name = format!("xpressclaw-workspace-{agent_id}");
         let spec = crate::docker::manager::ContainerSpec {
@@ -434,6 +454,15 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), cmd]),
             working_dir: Some(format!("/workspace/apps/{app_id}")),
         };
+
+        // Record attempt time + bump restart count
+        {
+            let conn = db.conn();
+            let _ = conn.execute(
+                "UPDATE apps SET restart_count = restart_count + 1, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [app_id],
+            );
+        }
 
         match docker.launch(&container_name, &spec).await {
             Ok(info) => {

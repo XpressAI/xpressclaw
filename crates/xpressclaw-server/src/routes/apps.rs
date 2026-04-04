@@ -451,10 +451,17 @@ async fn proxy_handler(
     let host_port = match docker.inspect(&container_id).await {
         Ok(Some(p)) => p,
         _ => {
-            return err_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Container port not available",
-            )
+            // Container may be starting up — retry once after a brief delay
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            match docker.inspect(&container_id).await {
+                Ok(Some(p)) => p,
+                _ => {
+                    return err_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Container port not available",
+                    )
+                }
+            }
         }
     };
 
