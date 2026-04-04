@@ -44,6 +44,12 @@
 	let agentList = $state<Agent[]>([]);
 	let appList = $state<App[]>([]);
 
+	// Docker status — checked periodically
+	let dockerAvailable = $state(true);
+	let dockerInstalled = $state(true);
+	let dockerCanStart = $state(false);
+	let dockerStarting = $state(false);
+
 	let { children } = $props();
 
 	async function loadSidebar() {
@@ -57,10 +63,40 @@
 		appList = ap;
 	}
 
+	async function checkDocker() {
+		try {
+			const resp = await fetch('/api/setup/check-docker');
+			const data = await resp.json();
+			dockerAvailable = data.available;
+			dockerInstalled = data.installed;
+			dockerCanStart = data.can_start;
+		} catch {
+			// Server itself is down — don't show Docker modal
+		}
+	}
+
+	async function startDocker() {
+		dockerStarting = true;
+		try {
+			await fetch('/api/setup/start-docker', { method: 'POST' });
+			// Poll until Docker is available (up to 60s)
+			for (let i = 0; i < 30; i++) {
+				await new Promise(r => setTimeout(r, 2000));
+				await checkDocker();
+				if (dockerAvailable) break;
+			}
+		} catch {}
+		dockerStarting = false;
+	}
+
 	onMount(() => {
 		if (isSetupRoute) return;
 		loadSidebar();
-		const interval = setInterval(loadSidebar, 10000);
+		checkDocker();
+		const interval = setInterval(() => {
+			loadSidebar();
+			if (!dockerAvailable) checkDocker();
+		}, 10000);
 		return () => clearInterval(interval);
 	});
 
@@ -282,4 +318,41 @@
 			</div>
 		</main>
 	</div>
+
+	<!-- Docker unavailable modal -->
+	{#if !dockerAvailable && !isSetupRoute}
+		<div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+			<div class="mx-4 w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
+				<div class="flex items-center gap-3">
+					<div class="w-10 h-10 rounded-full bg-amber-500/10 flex items-center justify-center">
+						<svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+							<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+						</svg>
+					</div>
+					<div>
+						<h3 class="text-sm font-semibold">Docker is not running</h3>
+						<p class="text-xs text-muted-foreground">
+							{#if !dockerInstalled}
+								Docker Desktop is not installed. Agents need Docker to run.
+							{:else}
+								Docker Desktop is installed but not running. Start it to use agents.
+							{/if}
+						</p>
+					</div>
+				</div>
+				<div class="flex justify-end gap-2">
+					<button onclick={() => { dockerAvailable = true; }}
+						class="rounded-lg border border-border px-3 py-1.5 text-xs hover:bg-secondary transition-colors">
+						Dismiss
+					</button>
+					{#if dockerCanStart}
+						<button onclick={startDocker} disabled={dockerStarting}
+							class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors">
+							{#if dockerStarting}Starting Docker...{:else}Start Docker{/if}
+						</button>
+					{/if}
+				</div>
+			</div>
+		</div>
+	{/if}
 {/if}
