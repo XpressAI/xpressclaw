@@ -272,12 +272,15 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                         ctx.rate_limiter
                             .record_request(agent_id, (input_tokens + output_tokens) as u32);
 
-                        let has_tool_calls = full_content.contains("<tool_call");
+                        // Check for actual tool call invocations (not just mentions).
+                        // The model may quote the tool_call syntax in explanations.
+                        // A real invocation has <tool_call name="..."> with content.
+                        let has_tool_calls = full_content.contains("<tool_call name=\"")
+                            && full_content.contains("</tool_call>");
 
-                        // Don't store the raw tool call XML as a message —
-                        // the harness follow-up will produce the real response.
-                        // Only store if there are no tool calls (plain text).
-                        if !has_tool_calls {
+                        // Always store the message. If it has tool calls, the harness
+                        // follow-up will add a second message with the tool results.
+                        {
                             if let Ok(agent_msg) = mgr.send_message(
                                 conv_id,
                                 &SendMessage {
