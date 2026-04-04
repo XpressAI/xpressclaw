@@ -148,21 +148,41 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 });
 
             // Use pre-computed role (with skills) if available, else raw config role
-            let role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
+            let mut role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
                 agent_cfg
                     .map(|c| c.role.clone())
                     .unwrap_or_else(|| "You are a helpful AI assistant.".to_string())
             });
 
+            // Inject tool descriptions so the model knows what's available.
+            // Conversations stream directly from the LLM router (bypassing
+            // the harness for streaming), so the model needs tool info in the
+            // prompt. When it outputs <tool_call> tags, the harness executes them.
+            let agent_tools = agent_cfg.map(|c| &c.tools).cloned().unwrap_or_default();
+            if !agent_tools.is_empty() {
+                let tool_desc = build_tool_descriptions(&agent_tools);
+                role.push_str(&tool_desc);
+            }
+
             let history = mgr.get_messages(conv_id, 20, None).unwrap_or_default();
 
             let mut llm_messages = vec![ChatMessage::text("system", &role)];
             for m in &history {
-                let r = match m.sender_type.as_str() {
-                    "agent" => "assistant",
-                    _ => "user",
-                };
-                llm_messages.push(ChatMessage::text(r, &m.content));
+                match m.sender_type.as_str() {
+                    "agent" => {
+                        llm_messages.push(ChatMessage::text("assistant", &m.content));
+                    }
+                    "system" => {
+                        // System messages are presented as user messages with
+                        // a SYSTEM prefix so the model can see and react to them
+                        // (e.g. task completion notifications).
+                        let sys_content = format!("SYSTEM: {}", m.content);
+                        llm_messages.push(ChatMessage::text("user", &sys_content));
+                    }
+                    _ => {
+                        llm_messages.push(ChatMessage::text("user", &m.content));
+                    }
+                }
             }
 
             let llm_req = ChatCompletionRequest {
@@ -360,4 +380,31 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
     ctx.event_bus.send(conv_id, ConversationEvent::Done);
 
     info!(conv_id, "background processing complete");
+}
+
+/// Build a tool description block to append to the system prompt.
+/// This tells the model what tools it has so it can decide to use them.
+/// When the model outputs <tool_call> tags, the harness executes them.
+fn build_tool_descriptions(tools: &[String]) -> String {
+    let mut desc = String::from("\n\n## Available Tools\nYou have the following tools available. To use a tool, output a <tool_call> tag.\n\n");
+    for tool in tools {
+        match tool.as_str() {
+            "filesystem" => desc
+                .push_str("- **filesystem**: Read, write, edit, search files in the workspace\n"),
+            "shell" => desc.push_str("- **shell**: Run shell commands\n"),
+            "memory" => desc.push_str(
+                "- **memory**: Save and search memories (search_memory, create_memory)\n",
+            ),
+            "fetch" => desc.push_str("- **fetch**: Fetch web pages and APIs (WebFetch)\n"),
+            "websearch" => desc
+                .push_str("- **web_search**: Search the web for current information (WebSearch)\n"),
+            "git" => desc.push_str("- **git**: Interact with git repositories\n"),
+            "github" => desc.push_str("- **github**: Manage GitHub issues, PRs, repos\n"),
+            other => desc.push_str(&format!("- **{other}**\n")),
+        }
+    }
+    desc.push_str(
+        "\nUse <tool_call name=\"tool_name\">{\"arg\": \"value\"}</tool_call> to invoke a tool.\n",
+    );
+    desc
 }
