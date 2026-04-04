@@ -494,6 +494,13 @@ impl DockerManager {
         self.get_host_port(container_id, Some(8080)).await
     }
 
+    /// Get the container ID by name.
+    pub async fn get_container_id(&self, container_name: &str) -> Option<String> {
+        self.inspect_by_name(container_name)
+            .await
+            .and_then(|info| info.id)
+    }
+
     /// Get the host port for a container with a specific internal port.
     pub async fn get_container_port_for(
         &self,
