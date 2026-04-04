@@ -389,6 +389,8 @@ pub struct Config {
 
 impl Config {
     /// Load config from a YAML file.
+    ///
+    /// If the YAML is corrupt, attempts to load from the `.yaml.bak` backup.
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Err(Error::ConfigNotFound {
@@ -399,9 +401,34 @@ impl Config {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("failed to read config: {e}")))?;
 
-        let config: Config = serde_yaml::from_str(&contents)?;
-        config.validate()?;
-        Ok(config)
+        match serde_yaml::from_str::<Config>(&contents) {
+            Ok(config) => {
+                config.validate()?;
+                // Save a backup of the known-good config
+                let backup = path.with_extension("yaml.bak");
+                let _ = std::fs::copy(path, backup);
+                Ok(config)
+            }
+            Err(e) => {
+                // Try backup
+                let backup = path.with_extension("yaml.bak");
+                if backup.exists() {
+                    tracing::warn!(
+                        error = %e,
+                        "config file is corrupt, loading from backup"
+                    );
+                    let backup_contents = std::fs::read_to_string(&backup)
+                        .map_err(|e2| Error::Config(format!("failed to read backup: {e2}")))?;
+                    let config: Config = serde_yaml::from_str(&backup_contents)?;
+                    config.validate()?;
+                    // Restore the good config
+                    let _ = std::fs::copy(&backup, path);
+                    Ok(config)
+                } else {
+                    Err(Error::Config(format!("failed to parse config: {e}")))
+                }
+            }
+        }
     }
 
     /// Load config from the default location (./xpressclaw.yaml).
@@ -418,10 +445,27 @@ impl Config {
     }
 
     /// Save config to a YAML file.
+    ///
+    /// Validates the round-trip: serializes to YAML, parses it back, and only
+    /// writes to disk if the parse succeeds. This prevents corrupted YAML from
+    /// being written (e.g. if a prompt contains unescaped YAML symbols).
+    /// Writes to a temp file first and renames atomically to avoid partial writes.
     pub fn save(&self, path: &Path) -> Result<()> {
         let yaml = serde_yaml::to_string(self)?;
-        std::fs::write(path, yaml)
+
+        // Verify round-trip before writing to disk
+        serde_yaml::from_str::<Config>(&yaml).map_err(|e| {
+            Error::Config(format!(
+                "config would produce invalid YAML (not saving): {e}"
+            ))
+        })?;
+
+        // Atomic write: temp file + rename
+        let tmp = path.with_extension("yaml.tmp");
+        std::fs::write(&tmp, &yaml)
             .map_err(|e| Error::Config(format!("failed to write config: {e}")))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| Error::Config(format!("failed to rename config: {e}")))?;
         Ok(())
     }
 
@@ -591,5 +635,99 @@ memory:
         let mut config = Config::default();
         config.system.isolation = "podman".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_japanese_prompt_round_trip() {
+        let role = "あなたは日本語のアシスタントです。\n\n## 責任\n- タスクの管理\n- メールの返信\n- スケジュールの確認";
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "eri".to_string(),
+            role: role.to_string(),
+            ..Default::default()
+        });
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        eprintln!("=== YAML ===\n{yaml}");
+
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            parsed.agents[0].role, role,
+            "Japanese role round-trip failed"
+        );
+    }
+
+    #[test]
+    fn test_markdown_list_prompt_round_trip() {
+        let role = "You are a helpful assistant.\n\n## Guidelines\n- Write clean code\n- Ask clarifying questions\n* Use bullet points\n  - Nested items too";
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "test".to_string(),
+            role: role.to_string(),
+            ..Default::default()
+        });
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            parsed.agents[0].role, role,
+            "Markdown list round-trip failed"
+        );
+    }
+
+    #[test]
+    fn test_prompt_save_load_file() {
+        let role = "パーソナルファイナンスアシスタント\n\n## 責任\n- 予算管理\n- 投資アドバイス";
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "eri".to_string(),
+            role: role.to_string(),
+            ..Default::default()
+        });
+
+        let path = std::env::temp_dir().join("xpressclaw-test-jp.yaml");
+        config.save(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        eprintln!("=== FILE ===\n{contents}");
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agents[0].role, role, "File round-trip failed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_xclaw59_exact_prompt() {
+        // Exact prompt from XCLAW-59 bug report
+        let role = "あなたは徹底的に調査を行うリサーチアシスタントです。\n\n\
+            あなたの仕事は、ユーザーが求めるトピックに関する情報を見つけ、統合し、整理することです。\n\
+            また、調査結果が会話をまたいでも保持されるよう、メモリシステムを使って詳細なメモを記録します。\n\
+            ガイドライン\n\n\
+            - まず広く調査し、その後有望な情報について深掘りする\n\
+            - 常に情報源を明示する\n\
+            - 重要な発見はすぐにメモリに保存する\n\
+            - 情報は構造化され、読みやすい形式で提示する\n\
+            - 情報が古い、または信頼性に疑問がある場合はその旨を明示する";
+
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "eri".to_string(),
+            role: role.to_string(),
+            ..Default::default()
+        });
+
+        let path = std::env::temp_dir().join("xpressclaw-test-xclaw59.yaml");
+        config.save(&path).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        eprintln!("=== XCLAW-59 YAML ===\n{contents}");
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(
+            loaded.agents[0].role, role,
+            "XCLAW-59 prompt round-trip failed"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("yaml.bak"));
     }
 }
