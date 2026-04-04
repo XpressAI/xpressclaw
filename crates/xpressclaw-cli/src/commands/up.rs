@@ -175,12 +175,19 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     registry.remove_stale(&valid_names).unwrap_or_default();
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
-            Ok(record) => info!(
-                name = record.name,
-                backend = record.backend,
-                status = record.status,
-                "synced agent"
-            ),
+            Ok(record) => {
+                // Agents in the config should be running — set desired state.
+                // This ensures agents auto-start on boot without manual intervention.
+                let _ = registry.set_desired_status(
+                    &record.id,
+                    &xpressclaw_core::agents::state::DesiredStatus::Running,
+                );
+                info!(
+                    name = record.name,
+                    backend = record.backend,
+                    "synced agent (desired=running)"
+                );
+            }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }

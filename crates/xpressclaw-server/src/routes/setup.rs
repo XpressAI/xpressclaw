@@ -524,7 +524,14 @@ async fn complete_setup(
     }
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
-            Ok(record) => info!(name = record.name, backend = record.backend, "synced agent"),
+            Ok(record) => {
+                info!(name = record.name, backend = record.backend, "synced agent");
+                // Auto-start all agents after setup
+                let _ = registry.set_desired_status(
+                    &record.id,
+                    &xpressclaw_core::agents::state::DesiredStatus::Running,
+                );
+            }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
     }
@@ -731,11 +738,15 @@ async fn add_agent(
         .map_err(internal_error)?;
     info!(name = agent_config.name, "added agent to configuration");
 
-    // Register in DB
+    // Register in DB and auto-start
     let registry = AgentRegistry::new(state.db.clone());
-    registry
+    let record = registry
         .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
+    let _ = registry.set_desired_status(
+        &record.id,
+        &xpressclaw_core::agents::state::DesiredStatus::Running,
+    );
 
     // Reload config
     let new_config = std::sync::Arc::new(new_config);
