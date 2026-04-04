@@ -169,6 +169,10 @@ class ClaudeSdkHarness(BaseHarness):
 
             model = LLM_MODEL
 
+            # Set current conversation so MCP tools (create_task, etc.)
+            # can auto-link to it without the agent passing it explicitly.
+            os.environ["CURRENT_CONVERSATION_ID"] = conversation_id
+
             if stream:
                 return StreamingResponse(
                     self._session_stream(prompt, model, system_prompt),

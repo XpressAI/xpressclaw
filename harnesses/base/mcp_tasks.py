@@ -339,8 +339,10 @@ def handle_tool(name: str, arguments: dict) -> str:
         body["agent_id"] = arguments.get("agent_id", AGENT_ID or None)
         if "parent_task_id" in arguments:
             body["parent_task_id"] = arguments["parent_task_id"]
-        if "conversation_id" in arguments:
-            body["conversation_id"] = arguments["conversation_id"]
+        # Use explicit conversation_id or fall back to the current session's conversation
+        conv_id = arguments.get("conversation_id") or os.environ.get("CURRENT_CONVERSATION_ID")
+        if conv_id:
+            body["conversation_id"] = conv_id
         if "priority" in arguments:
             body["priority"] = arguments["priority"]
 
