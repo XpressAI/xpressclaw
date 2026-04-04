@@ -527,6 +527,79 @@ impl LlamaCppProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lazy loading wrapper
+// ---------------------------------------------------------------------------
+
+/// Wraps `LlamaCppProvider` with lazy initialization. The GGUF model is only
+/// loaded into memory on the first chat request, not at startup. This avoids
+/// allocating several GB of RAM before the user actually needs the model.
+pub struct LazyLlamaCppProvider {
+    path: PathBuf,
+    model_name: String,
+    inner: std::sync::OnceLock<std::result::Result<LlamaCppProvider, String>>,
+}
+
+// SAFETY: same reasoning as LlamaCppProvider — OnceLock contents are thread-safe
+unsafe impl Send for LazyLlamaCppProvider {}
+unsafe impl Sync for LazyLlamaCppProvider {}
+
+impl LazyLlamaCppProvider {
+    /// Create a lazy provider that will load the model on first use.
+    pub fn new(path: PathBuf, model_name: String) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::Llm(format!(
+                "model file not found: {}",
+                path.display()
+            )));
+        }
+        tracing::info!(
+            path = %path.display(),
+            model = model_name,
+            "registered lazy llama.cpp provider (model will load on first use)"
+        );
+        Ok(Self {
+            path,
+            model_name,
+            inner: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn get_or_load(&self) -> Result<&LlamaCppProvider> {
+        self.inner
+            .get_or_init(|| {
+                tracing::info!(path = %self.path.display(), "lazy-loading GGUF model");
+                LlamaCppProvider::from_path(&self.path, self.model_name.clone())
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| Error::Llm(format!("failed to load model: {e}")))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for LazyLlamaCppProvider {
+    async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
+        self.get_or_load()?.chat(request).await
+    }
+
+    async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
+        self.get_or_load()?.chat_stream(request).await
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: self.model_name.clone(),
+            object: "model".into(),
+            owned_by: "local".into(),
+        }]
+    }
+
+    fn name(&self) -> &str {
+        "llamacpp-lazy"
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for LlamaCppProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
