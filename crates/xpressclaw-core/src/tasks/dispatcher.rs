@@ -452,6 +452,9 @@ fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
         // Refresh again
         ctx.subtasks = board.list_subtasks(&ctx.task.id).unwrap_or_default();
 
+        // Send progress update to conversation if subtasks advanced
+        notify_conversation(db, &ctx.task.id, &ctx.agent_id, "in_progress");
+
         // Check if all subtasks are done
         let all_done = ctx
             .subtasks
@@ -528,7 +531,7 @@ fn reset_idle_count(db: &Arc<Database>, agent_id: &str) {
 }
 
 /// Send a task status notification back to the originating conversation.
-/// This lets the user (and the agent) know the background task finished.
+/// Includes subtask progress (completed/total) for inline progress bars.
 fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status: &str) {
     let board = TaskBoard::new(db.clone());
     let task = match board.get(task_id) {
@@ -541,11 +544,21 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
         None => return,
     };
 
+    // Count subtask progress
+    let subtasks = board.list_subtasks(task_id).unwrap_or_default();
+    let total = subtasks.len();
+    let completed = subtasks
+        .iter()
+        .filter(|s| s.status == TaskStatus::Completed)
+        .count();
+
     let mgr = ConversationManager::new(db.clone());
     let content = json!({
         "task_id": task.id,
         "title": task.title,
         "status": status,
+        "subtasks_total": total,
+        "subtasks_completed": completed,
     })
     .to_string();
 
@@ -563,7 +576,29 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
             task_id,
             conv_id,
             error = %e,
-            "failed to notify conversation of task completion"
+            "failed to notify conversation of task status"
+        );
+    }
+
+    // On completion or failure, send an unprocessed "user" message so the
+    // conversation processor wakes the agent to respond about the result.
+    // Uses sender_type "user" because the processor only checks for
+    // unprocessed user messages (system messages are user messages with
+    // a SYSTEM prefix in this architecture).
+    if status == "completed" || status == "failed" {
+        let wake_content = format!(
+            "SYSTEM: Background task \"{}\" has {}. Please acknowledge this to the user.",
+            task.title, status
+        );
+        let _ = mgr.send_user_message(
+            &conv_id,
+            &SendMessage {
+                sender_type: "user".into(),
+                sender_id: "system".to_string(),
+                sender_name: Some("System".to_string()),
+                content: wake_content,
+                message_type: Some("task_wake".into()),
+            },
         );
     }
 }

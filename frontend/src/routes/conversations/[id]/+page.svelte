@@ -577,6 +577,18 @@
 											 'bg-amber-400'}"></span>
 										<span class="font-medium">{taskData.title}</span>
 									</div>
+									{#if taskData.subtasks_total > 0}
+										<div class="mt-2">
+											<div class="flex items-center justify-between text-xs text-muted-foreground mb-1">
+												<span>{taskData.subtasks_completed}/{taskData.subtasks_total} subtasks</span>
+												<span>{Math.round((taskData.subtasks_completed / taskData.subtasks_total) * 100)}%</span>
+											</div>
+											<div class="h-1.5 rounded-full bg-muted overflow-hidden">
+												<div class="h-full rounded-full transition-all duration-500 {taskData.status === 'completed' ? 'bg-emerald-500' : taskData.status === 'failed' ? 'bg-red-500' : 'bg-blue-500'}"
+													style="width: {(taskData.subtasks_completed / taskData.subtasks_total) * 100}%"></div>
+											</div>
+										</div>
+									{/if}
 									<div class="text-xs text-muted-foreground mt-1.5 flex items-center gap-2">
 										<span>Task {taskData.status === 'in_progress' ? 'in progress' : taskData.status}</span>
 										<span>&middot;</span>
