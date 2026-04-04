@@ -289,13 +289,19 @@ impl LlmRouter {
                     .local_model
                     .clone()
                     .unwrap_or_else(|| "local".to_string());
-                match super::llamacpp::LlamaCppProvider::from_path(path, model_name) {
+                // Use lazy loading — model is only loaded into memory on
+                // first use, not at startup. This avoids allocating several
+                // GB of RAM before the user actually sends a message.
+                match super::llamacpp::LazyLlamaCppProvider::new(
+                    std::path::PathBuf::from(path),
+                    model_name,
+                ) {
                     Ok(provider) => {
-                        tracing::info!(path = %path, "using embedded llama.cpp provider");
+                        tracing::info!(path = %path, "registered lazy llama.cpp provider");
                         router.register_provider("local", Arc::new(provider));
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to load GGUF model, falling back to HTTP proxy");
+                        tracing::warn!(error = %e, "GGUF model not found, falling back to HTTP proxy");
                         if let Some(ref model) = config.local_model {
                             let provider = super::local::LocalProvider::from_config(
                                 model.clone(),
