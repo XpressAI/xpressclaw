@@ -63,7 +63,7 @@ pub fn detect() -> SystemInfo {
 /// Selection logic:
 /// - On Windows/Linux with a discrete GPU: choose based on GPU VRAM
 /// - On macOS with Apple Silicon: choose based on system RAM (unified memory)
-/// - On Intel Macs: max at 9B (Metal on Intel is unreliable)
+/// - On Intel Macs: max at 9B (GPU offload disabled, CPU-only)
 /// - Otherwise: choose based on system RAM
 ///
 /// Tier targets:
@@ -167,9 +167,9 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
     ];
 
     // Apply hardware caps:
-    // Intel Macs: max at 9B (Metal is unreliable on x86_64)
-    // The cap is expressed as max RAM budget in GB.
-    let max_ram_gb = if is_intel_mac { 8.0 } else { f64::MAX }; // Intel Mac: max 2B
+    // Intel Macs: Metal works but GPU layers are disabled (ngl=0) for
+    // stability. CPU-only inference is slower, so cap at a reasonable size.
+    let max_ram_gb = if is_intel_mac { 16.0 } else { f64::MAX };
 
     // Pick the largest suitable dense model that doesn't exceed the cap
     let recommended = options
@@ -190,7 +190,7 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
 
     let mut reason = format!("{memory_source} → {}", recommended.display_name);
     if is_intel_mac && budget_gb > max_ram_gb {
-        reason.push_str(" (Intel Mac capped at 9B)");
+        reason.push_str(" (Intel Mac: CPU-only, capped)");
     }
 
     ModelRecommendation {
@@ -372,8 +372,8 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 2B
-        assert_eq!(rec.model, "qwen3.5:2b");
+        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 9B (ngl=0, CPU only)
+        assert_eq!(rec.model, "qwen3.5:9b");
     }
 
     #[test]

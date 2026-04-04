@@ -216,7 +216,8 @@ impl LlamaCppProvider {
             // Offload all layers to GPU (CUDA/Metal)
             #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
             let p = p.with_n_gpu_layers(u32::MAX);
-            // Intel Macs have no Metal support
+            // Intel Macs: Metal works but GPU layer offloading has bugs.
+            // Use CPU-only (ngl=0) for stability.
             #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
             let p = p.with_n_gpu_layers(0);
             p
