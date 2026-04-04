@@ -285,10 +285,20 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             }
         }
 
-        prompt.push_str(
-            "Work on this task using the tools available to you. \
-             When you are done, use the `complete_task` tool to mark it complete.",
-        );
+        if ctx.subtasks.is_empty() {
+            prompt.push_str(
+                "Before starting, break this task into subtasks using the `create_task` tool \
+                 with parent_task_id set to this task's ID. This shows progress to the user. \
+                 Then work through each subtask in order, marking each complete as you go. \
+                 When all subtasks are done, use `complete_task` to mark the parent complete.",
+            );
+        } else {
+            prompt.push_str(
+                "Work on the current step using the tools available to you. \
+                 Mark each subtask complete as you finish it. \
+                 When all steps are done, use `complete_task` to mark the parent complete.",
+            );
+        }
     } else {
         // Continuation prompt
         prompt.push_str("Continue working on the current task.\n\n");
