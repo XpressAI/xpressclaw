@@ -97,7 +97,8 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict,
         options.mcp_servers = mcp_servers
     if session_id:
         options.session_id = session_id
-        options.continue_conversation = True
+    # Always continue conversation to maintain context across messages
+    options.continue_conversation = True
     return options
 
 
@@ -227,23 +228,9 @@ class ClaudeSdkHarness(BaseHarness):
         """Ensure we have an active session, creating one if needed."""
         if self.session_id:
             return
-
-        # Check for existing sessions
-        try:
-            sessions = list_sessions(directory=WORKSPACE_DIR, limit=1)
-            if sessions:
-                self.session_id = sessions[0].created_at  # Use most recent
-                # Actually, we need the session ID not created_at
-                # The SDK uses the session's directory name as ID
-                # Let's create a new one and let the SDK manage it
-                self.session_id = None
-        except Exception as e:
-            logger.warning("failed to list sessions: %s", e)
-
-        if not self.session_id:
-            # Create a new session by running an initial query
-            # The SDK will assign a session_id automatically
-            logger.info("creating new agent session")
+        # No session_id yet — the first query() call will create one.
+        # With continue_conversation=True, subsequent calls continue it.
+        logger.info("no active session — next query will create one")
 
     async def _session_complete(self, prompt: str, model: str,
                                 system_prompt: str) -> str:
@@ -440,16 +427,14 @@ async def _session_query_to_queue(
 
 
 def _extract_session_id(message: ResultMessage) -> str | None:
-    """Try to extract session_id from a ResultMessage."""
-    # The SDK stores session info internally — we can get it from session listing
-    try:
-        sessions = list_sessions(directory=WORKSPACE_DIR, limit=1)
-        if sessions:
-            # Return the most recent session's identifier
-            # SDK session IDs are typically timestamps or UUIDs
-            return sessions[0].created_at
-    except Exception:
-        pass
+    """Try to extract session_id from a ResultMessage.
+
+    The SDK doesn't directly expose the session_id in ResultMessage.
+    We rely on continue_conversation=True to maintain the session
+    without needing an explicit session_id.
+    """
+    # The session is maintained by the SDK internally when
+    # continue_conversation=True. We don't need to extract an ID.
     return None
 
 
