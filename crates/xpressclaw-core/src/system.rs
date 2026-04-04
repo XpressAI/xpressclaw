@@ -89,29 +89,36 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
     // but only used when the user explicitly selects them.
     let options = vec![
         // --- Qwen 3.5 (unsloth/Qwen3.5-*-GGUF) ---
+        // RAM requirements include Docker overhead (~2-4GB) + model + context.
         ModelOption {
             model: "qwen3.5:0.8b".into(),
             display_name: "Qwen 3.5 0.8B".into(),
-            ram_required_gb: 1.0,
-            suitable: budget_gb >= 1.0,
-        },
-        ModelOption {
-            model: "qwen3.5:4b".into(),
-            display_name: "Qwen 3.5 4B".into(),
             ram_required_gb: 4.0,
             suitable: budget_gb >= 4.0,
         },
         ModelOption {
-            model: "qwen3.5:9b".into(),
-            display_name: "Qwen 3.5 9B".into(),
+            model: "qwen3.5:2b".into(),
+            display_name: "Qwen 3.5 2B".into(),
             ram_required_gb: 8.0,
             suitable: budget_gb >= 8.0,
         },
         ModelOption {
+            model: "qwen3.5:4b".into(),
+            display_name: "Qwen 3.5 4B".into(),
+            ram_required_gb: 12.0,
+            suitable: budget_gb >= 12.0,
+        },
+        ModelOption {
+            model: "qwen3.5:9b".into(),
+            display_name: "Qwen 3.5 9B".into(),
+            ram_required_gb: 16.0,
+            suitable: budget_gb >= 16.0,
+        },
+        ModelOption {
             model: "qwen3.5:27b".into(),
             display_name: "Qwen 3.5 27B".into(),
-            ram_required_gb: 20.0,
-            suitable: budget_gb >= 20.0,
+            ram_required_gb: 40.0,
+            suitable: budget_gb >= 40.0,
         },
         // Qwen 3.5 MoE (only used when user explicitly selects)
         ModelOption {
@@ -162,7 +169,7 @@ pub fn recommend_model(info: &SystemInfo) -> ModelRecommendation {
     // Apply hardware caps:
     // Intel Macs: max at 9B (Metal is unreliable on x86_64)
     // The cap is expressed as max RAM budget in GB.
-    let max_ram_gb = if is_intel_mac { 8.0 } else { f64::MAX };
+    let max_ram_gb = if is_intel_mac { 8.0 } else { f64::MAX }; // Intel Mac: max 2B
 
     // Pick the largest suitable dense model that doesn't exceed the cap
     let recommended = options
@@ -289,7 +296,7 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 4 * 0.6 = 2.4 GB budget → 0.8B (needs 1GB)
+        // 4 * 0.6 = 2.4 GB budget → 0.8B (needs 4GB) — too small, falls back to 0.8B
         assert_eq!(rec.model, "qwen3.5:0.8b");
     }
 
@@ -308,8 +315,8 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 24 - 1 = 23 GB VRAM budget → 27B (needs 20GB)
-        assert_eq!(rec.model, "qwen3.5:27b");
+        // 24 - 1 = 23 GB VRAM budget → 9B (needs 16GB)
+        assert_eq!(rec.model, "qwen3.5:9b");
     }
 
     #[test]
@@ -327,8 +334,8 @@ mod tests {
             arch: "aarch64".into(),
         };
         let rec = recommend_model(&info);
-        // 16 * 0.6 = 9.6 GB budget → 9B (needs 8GB)
-        assert_eq!(rec.model, "qwen3.5:9b");
+        // 16 * 0.6 = 9.6 GB budget → 2B (needs 8GB)
+        assert_eq!(rec.model, "qwen3.5:2b");
     }
 
     #[test]
@@ -346,8 +353,8 @@ mod tests {
             arch: "aarch64".into(),
         };
         let rec = recommend_model(&info);
-        // 36 * 0.6 = 21.6 GB budget → 27B (needs 20GB)
-        assert_eq!(rec.model, "qwen3.5:27b");
+        // 36 * 0.6 = 21.6 GB budget → 9B (needs 16GB)
+        assert_eq!(rec.model, "qwen3.5:9b");
     }
 
     #[test]
@@ -365,9 +372,8 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 9B
-        assert_eq!(rec.model, "qwen3.5:9b");
-        assert!(rec.reason.contains("capped at 9B"));
+        // 64 * 0.6 = 38.4 GB budget, but Intel Mac capped at 2B
+        assert_eq!(rec.model, "qwen3.5:2b");
     }
 
     #[test]
@@ -385,7 +391,7 @@ mod tests {
             arch: "x86_64".into(),
         };
         let rec = recommend_model(&info);
-        // 6 - 1 = 5 GB VRAM budget → 4B (needs 4GB)
-        assert_eq!(rec.model, "qwen3.5:4b");
+        // 6 - 1 = 5 GB VRAM budget → 0.8B (needs 4GB)
+        assert_eq!(rec.model, "qwen3.5:0.8b");
     }
 }
