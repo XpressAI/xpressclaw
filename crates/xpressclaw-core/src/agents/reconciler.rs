@@ -74,21 +74,10 @@ async fn reconcile_models(config: &Config) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
 
-    // If embedded llama.cpp is configured, skip Ollama entirely
-    if config.llm.local_model_path.is_some() {
-        return;
-    }
-
-    // Only pull from Ollama if the default provider is "local" and
-    // no custom base_url is set (custom URL = not Ollama)
-    let is_ollama = config.llm.default_provider == "local"
-        && config
-            .llm
-            .local_base_url
-            .as_deref()
-            .map_or(true, |u| u.contains("11434"));
-
-    if !is_ollama {
+    // Only pull from Ollama when explicitly configured as the provider.
+    // "local" = embedded llama.cpp (no Ollama needed).
+    // "ollama" = Ollama HTTP API.
+    if config.llm.default_provider != "ollama" {
         return;
     }
 
@@ -121,13 +110,13 @@ async fn reconcile_models(config: &Config) {
         models.insert(m.clone());
     }
     for agent in &config.agents {
-        let uses_local = agent
+        let uses_ollama = agent
             .llm
             .as_ref()
             .and_then(|l| l.provider.as_deref())
             .unwrap_or(&config.llm.default_provider)
-            == "local";
-        if uses_local {
+            == "ollama";
+        if uses_ollama {
             if let Some(ref m) = agent.model {
                 models.insert(m.clone());
             }
