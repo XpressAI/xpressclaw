@@ -174,6 +174,15 @@ impl TaskBoard {
         Ok(task)
     }
 
+    pub fn set_conversation_id(&self, task_id: &str, conversation_id: &str) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute(
+            "UPDATE tasks SET conversation_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![conversation_id, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list(
         &self,
         status: Option<&str>,

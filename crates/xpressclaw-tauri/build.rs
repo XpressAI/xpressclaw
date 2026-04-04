@@ -28,35 +28,47 @@ fn main() {
     };
     let dest = binaries_dir.join(format!("xpressclaw-{target_triple}{exe_suffix}"));
 
-    // If the sidecar already exists (placed by build.sh from Bazel), don't overwrite it.
-    // Only copy from Cargo's target/ during `cargo tauri dev` when no sidecar is present.
-    if !dest.exists() {
-        if let Some(workspace_root) = std::path::Path::new(&manifest_dir)
-            .parent()
-            .and_then(|p| p.parent())
-        {
-            let candidates = [
-                workspace_root
-                    .join("target")
-                    .join(&profile)
-                    .join(format!("xpressclaw{exe_suffix}")),
-                workspace_root
-                    .join("target")
-                    .join(&target_triple)
-                    .join(&profile)
-                    .join(format!("xpressclaw{exe_suffix}")),
-            ];
+    // Copy the newest CLI binary as sidecar. Always overwrite if the
+    // source is newer so we never serve a stale frontend.
+    if let Some(workspace_root) = std::path::Path::new(&manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+    {
+        let candidates = [
+            workspace_root
+                .join("target")
+                .join(&profile)
+                .join(format!("xpressclaw{exe_suffix}")),
+            workspace_root
+                .join("target")
+                .join(&target_triple)
+                .join(&profile)
+                .join(format!("xpressclaw{exe_suffix}")),
+        ];
 
-            let copied = candidates
-                .iter()
-                .any(|src| src.exists() && std::fs::copy(src, &dest).is_ok());
+        let dest_mtime = dest
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-            if !copied {
-                let _ = std::fs::write(&dest, "placeholder");
+        let copied = candidates.iter().any(|src| {
+            let src_newer = src
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t > dest_mtime)
+                .unwrap_or(false);
+            if src_newer {
+                std::fs::copy(src, &dest).is_ok()
+            } else {
+                false
             }
-        } else {
+        });
+
+        if !copied && !dest.exists() {
             let _ = std::fs::write(&dest, "placeholder");
         }
+    } else if !dest.exists() {
+        let _ = std::fs::write(&dest, "placeholder");
     }
 
     tauri_build::build()

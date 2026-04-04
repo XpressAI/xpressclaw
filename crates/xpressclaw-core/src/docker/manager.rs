@@ -138,12 +138,11 @@ impl DockerManager {
     pub fn is_docker_desktop_installed() -> bool {
         #[cfg(target_os = "macos")]
         {
-            return std::path::Path::new("/Applications/Docker.app").exists();
+            std::path::Path::new("/Applications/Docker.app").exists()
         }
         #[cfg(target_os = "windows")]
         {
-            return std::path::Path::new("C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe")
-                .exists();
+            std::path::Path::new("C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe").exists()
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
@@ -158,11 +157,12 @@ impl DockerManager {
                 .status()
                 .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
             if status.success() {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(Error::DockerNotAvailable(
+                    "Failed to start Docker Desktop".to_string(),
+                ))
             }
-            return Err(Error::DockerNotAvailable(
-                "Failed to start Docker Desktop".to_string(),
-            ));
         }
         #[cfg(target_os = "windows")]
         {
@@ -176,11 +176,12 @@ impl DockerManager {
                 .status()
                 .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
             if status.success() {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(Error::DockerNotAvailable(
+                    "Failed to start Docker Desktop".to_string(),
+                ))
             }
-            return Err(Error::DockerNotAvailable(
-                "Failed to start Docker Desktop".to_string(),
-            ));
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Err(Error::DockerNotAvailable(
