@@ -223,8 +223,19 @@ async fn reconcile_agents(
         let is_running = docker.is_container_running(&container_name).await;
 
         match (agent.desired_status.as_str(), is_running) {
-            // Desired running, is running → check stability
+            // Desired running, is running → check stability + ensure DB has container_id
             ("running", true) => {
+                // Ensure container_id is stored (may be missing after restart)
+                if agent.container_id.is_none() {
+                    if let Some(cid) = docker.get_container_id(&container_name).await {
+                        let _ = registry.update_status(
+                            &agent.id,
+                            &crate::agents::state::AgentStatus::Running,
+                            Some(&cid),
+                        );
+                    }
+                }
+
                 if agent.restart_count > 0 {
                     let uptime = docker.container_uptime_secs(&container_name).await;
                     if uptime >= STABLE_THRESHOLD_SECS {

@@ -305,70 +305,79 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                         // so tool calls, intermediate steps, and the final text
                         // are all visible in the conversation in real-time.
                         if has_tool_calls {
-                            if let Some(ref docker) = ctx.docker {
-                                if let Some(ref cid) =
-                                    registry.get(agent_id).ok().and_then(|a| a.container_id)
-                                {
-                                    if let Some(port) = docker.get_container_port(cid).await {
-                                        let harness =
-                                            crate::agents::harness::HarnessClient::new(port);
-                                        let mut harness_msgs = llm_req.messages.clone();
-                                        harness_msgs.push(crate::llm::router::ChatMessage::text(
-                                            "assistant",
-                                            &full_content,
-                                        ));
-                                        harness_msgs.push(crate::llm::router::ChatMessage::text(
-                                            "user",
-                                            "Execute the tool calls above and report the results.",
-                                        ));
-                                        let mut harness_req = llm_req.clone();
-                                        harness_req.messages = harness_msgs;
+                            let harness_port = match (&ctx.docker, registry.get(agent_id).ok()) {
+                                (Some(docker), Some(record)) if record.container_id.is_some() => {
+                                    docker
+                                        .get_container_port(record.container_id.as_ref().unwrap())
+                                        .await
+                                }
+                                _ => None,
+                            };
 
-                                        // Stream from harness so tool calls and
-                                        // intermediate text are visible in real-time
-                                        if let Ok(mut harness_stream) =
-                                            harness.chat_stream(&harness_req).await
-                                        {
-                                            let mut harness_content = String::new();
-                                            while let Some(result) = harness_stream.next().await {
-                                                if let Ok(chunk) = result {
-                                                    if let Some(choice) = chunk.choices.first() {
-                                                        if let Some(ref text) = choice.delta.content
-                                                        {
-                                                            harness_content.push_str(text);
-                                                            ctx.event_bus.send(
-                                                                conv_id,
-                                                                ConversationEvent::Chunk {
-                                                                    agent_id: agent_id.clone(),
-                                                                    content: text.clone(),
-                                                                },
-                                                            );
-                                                        }
+                            if let Some(port) = harness_port {
+                                let harness = crate::agents::harness::HarnessClient::new(port);
+                                let mut harness_msgs = llm_req.messages.clone();
+                                harness_msgs.push(crate::llm::router::ChatMessage::text(
+                                    "assistant",
+                                    &full_content,
+                                ));
+                                harness_msgs.push(crate::llm::router::ChatMessage::text(
+                                    "user",
+                                    "Execute the tool calls above and report the results.",
+                                ));
+                                let mut harness_req = llm_req.clone();
+                                harness_req.messages = harness_msgs;
+
+                                // Stream from harness so tool calls and
+                                // intermediate text are visible in real-time
+                                match harness.chat_stream(&harness_req).await {
+                                    Ok(mut harness_stream) => {
+                                        let mut harness_content = String::new();
+                                        while let Some(result) = harness_stream.next().await {
+                                            if let Ok(chunk) = result {
+                                                if let Some(choice) = chunk.choices.first() {
+                                                    if let Some(ref text) = choice.delta.content {
+                                                        harness_content.push_str(text);
+                                                        ctx.event_bus.send(
+                                                            conv_id,
+                                                            ConversationEvent::Chunk {
+                                                                agent_id: agent_id.clone(),
+                                                                content: text.clone(),
+                                                            },
+                                                        );
                                                     }
                                                 }
                                             }
-                                            if !harness_content.is_empty() {
-                                                if let Ok(tool_msg) = mgr.send_message(
+                                        }
+                                        if !harness_content.is_empty() {
+                                            if let Ok(tool_msg) = mgr.send_message(
+                                                conv_id,
+                                                &SendMessage {
+                                                    sender_type: "agent".into(),
+                                                    sender_id: agent_id.clone(),
+                                                    sender_name: Some(agent_id.clone()),
+                                                    content: harness_content,
+                                                    message_type: None,
+                                                },
+                                            ) {
+                                                ctx.event_bus.send(
                                                     conv_id,
-                                                    &SendMessage {
-                                                        sender_type: "agent".into(),
-                                                        sender_id: agent_id.clone(),
-                                                        sender_name: Some(agent_id.clone()),
-                                                        content: harness_content,
-                                                        message_type: None,
+                                                    ConversationEvent::Message {
+                                                        message: json!(tool_msg),
                                                     },
-                                                ) {
-                                                    ctx.event_bus.send(
-                                                        conv_id,
-                                                        ConversationEvent::Message {
-                                                            message: json!(tool_msg),
-                                                        },
-                                                    );
-                                                }
+                                                );
                                             }
                                         }
                                     }
+                                    Err(e) => {
+                                        warn!(agent_id, error = %e, "harness tool execution failed");
+                                    }
                                 }
+                            } else {
+                                warn!(
+                                    agent_id,
+                                    "tool calls detected but agent container not available"
+                                );
                             }
                         }
                     }
