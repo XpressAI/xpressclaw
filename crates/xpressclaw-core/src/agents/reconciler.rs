@@ -62,7 +62,11 @@ async fn reconcile_once(
 }
 
 /// Ensure Ollama models are pulled for agents using the local provider.
+/// Only runs when using Ollama (no GGUF path set) and Ollama is reachable.
 async fn reconcile_models(config: &Config) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
+
     // Only relevant when using Ollama (local provider without a GGUF path)
     if config.llm.local_model_path.is_some() {
         return;
@@ -76,6 +80,23 @@ async fn reconcile_models(config: &Config) {
         .local_base_url
         .as_deref()
         .unwrap_or("http://localhost:11434");
+
+    // Backoff: if Ollama failed recently, don't retry for 60 seconds
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_fail = LAST_OLLAMA_FAIL.load(Ordering::Relaxed);
+    if last_fail > 0 && now - last_fail < 60 {
+        return;
+    }
+
+    // Check if Ollama is reachable before trying to pull
+    if !crate::llm::local::ollama_is_reachable(base_url).await {
+        LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
+        debug!("Ollama not reachable at {base_url}, skipping model pull");
+        return;
+    }
 
     // Collect unique model names across agents + global config
     let mut models = std::collections::HashSet::new();
@@ -101,6 +122,7 @@ async fn reconcile_models(config: &Config) {
             info!(model, "pulling Ollama model");
             if let Err(e) = crate::llm::local::ollama_pull(base_url, model).await {
                 warn!(model, error = %e, "failed to pull Ollama model");
+                LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
             } else {
                 info!(model, "Ollama model pull complete");
             }
@@ -108,13 +130,21 @@ async fn reconcile_models(config: &Config) {
     }
 }
 
-/// Pull images for all configured backends.
 /// Pull images for all configured backends. Returns the set of images
 /// that are available (either pulled successfully or already local).
+/// Uses backoff to avoid hammering the registry on repeated failures.
 async fn reconcile_images(
     config: &Config,
     docker: &DockerManager,
 ) -> std::collections::HashSet<String> {
+    use std::sync::Mutex;
+    static PULL_FAILURES: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let mut seen = std::collections::HashSet::new();
     let mut available = std::collections::HashSet::new();
     for agent in &config.agents {
@@ -127,19 +157,39 @@ async fn reconcile_images(
         }
         if docker.has_image(image).await {
             available.insert(image.to_string());
-            // Still try to pull for updates, but don't block
-            let _ = docker.pull_image(image).await;
-        } else {
-            // Image not local — must pull before agents can start
-            info!(image, "pulling required harness image");
-            match docker.pull_image(image).await {
-                Ok(_) => {
-                    info!(image, "harness image pulled successfully");
-                    available.insert(image.to_string());
+            continue; // Already local — no need to pull every cycle
+        }
+
+        // Backoff: don't retry failed pulls for 5 minutes
+        {
+            let failures = PULL_FAILURES.lock().unwrap();
+            if let Some(ref map) = *failures {
+                if let Some(&last_fail) = map.get(image) {
+                    if now - last_fail < 300 {
+                        debug!(image, "skipping image pull (backoff)");
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    error!(image, error = %e, "failed to pull harness image — agents using this image cannot start");
+            }
+        }
+
+        // Image not local — must pull before agents can start
+        info!(image, "pulling required harness image");
+        match docker.pull_image(image).await {
+            Ok(_) => {
+                info!(image, "harness image pulled successfully");
+                available.insert(image.to_string());
+                // Clear failure record
+                let mut failures = PULL_FAILURES.lock().unwrap();
+                if let Some(ref mut map) = *failures {
+                    map.remove(image);
                 }
+            }
+            Err(e) => {
+                error!(image, error = %e, "failed to pull harness image");
+                let mut failures = PULL_FAILURES.lock().unwrap();
+                let map = failures.get_or_insert_with(std::collections::HashMap::new);
+                map.insert(image.to_string(), now);
             }
         }
     }

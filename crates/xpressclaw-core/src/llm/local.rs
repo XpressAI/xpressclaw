@@ -76,6 +76,19 @@ pub async fn detect_ollama() -> OllamaInfo {
 
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
+/// Check if Ollama is reachable at the given base URL.
+pub async fn ollama_is_reachable(base_url: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+    client
+        .get(format!("{base_url}/api/tags"))
+        .send()
+        .await
+        .is_ok()
+}
+
 /// Check if Ollama has a specific model installed.
 pub async fn ollama_has_model(base_url: &str, model: &str) -> bool {
     let client = reqwest::Client::builder()
