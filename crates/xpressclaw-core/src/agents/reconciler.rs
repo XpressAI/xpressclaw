@@ -61,17 +61,34 @@ async fn reconcile_once(
     Ok(())
 }
 
-/// Ensure Ollama models are pulled for agents using the local provider.
-/// Only runs when using Ollama (no GGUF path set) and Ollama is reachable.
+/// Ensure Ollama models are pulled for agents that explicitly use Ollama.
+///
+/// Only runs when:
+/// 1. No embedded GGUF path is set (local_model_path is None)
+/// 2. The default provider is "local" AND local_base_url points to Ollama
+///    (or an agent explicitly overrides to use Ollama)
+/// 3. Ollama is actually reachable
+///
+/// Skipped entirely when using the embedded llama.cpp provider.
 async fn reconcile_models(config: &Config) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
 
-    // Only relevant when using Ollama (local provider without a GGUF path)
+    // If embedded llama.cpp is configured, skip Ollama entirely
     if config.llm.local_model_path.is_some() {
         return;
     }
-    if config.llm.default_provider != "local" {
+
+    // Only pull from Ollama if the default provider is "local" and
+    // no custom base_url is set (custom URL = not Ollama)
+    let is_ollama = config.llm.default_provider == "local"
+        && config
+            .llm
+            .local_base_url
+            .as_deref()
+            .map_or(true, |u| u.contains("11434"));
+
+    if !is_ollama {
         return;
     }
 
@@ -98,7 +115,7 @@ async fn reconcile_models(config: &Config) {
         return;
     }
 
-    // Collect unique model names across agents + global config
+    // Collect models only from agents that actually use local/Ollama
     let mut models = std::collections::HashSet::new();
     if let Some(ref m) = config.llm.local_model {
         models.insert(m.clone());
