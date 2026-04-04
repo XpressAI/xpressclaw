@@ -4,6 +4,7 @@
 	import { tasks, agents } from '$lib/api';
 	import type { Task, TaskMessage, Agent } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import { renderContent } from '$lib/formatMessage';
 
 	let task = $state<Task | null>(null);
 	let messages = $state<TaskMessage[]>([]);
@@ -20,6 +21,8 @@
 	let editDeps = $state<string[]>([]);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl: HTMLDivElement;
+	let prevMessageCount = 0;
+	let initialLoad = true;
 
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
@@ -31,7 +34,7 @@
 		// Auto-poll while task is in progress
 		pollTimer = setInterval(async () => {
 			if (task && (task.status === 'in_progress' || task.status === 'pending')) {
-				await load();
+				await poll();
 			}
 		}, 3000);
 	});
@@ -48,6 +51,7 @@
 				agents.list().catch(() => []),
 			]);
 			messages = await tasks.messages(id);
+			prevMessageCount = messages.length;
 			try {
 				const sub = await tasks.subtasks(id);
 				subtaskList = sub.tasks;
@@ -56,10 +60,36 @@
 				const all = await tasks.list();
 				allTasks = all.tasks;
 			} catch { allTasks = []; }
-			scrollToBottom();
+			if (initialLoad) {
+				initialLoad = false;
+				scrollToBottom();
+			}
 		} catch (e) {
 			error = String(e);
 		}
+	}
+
+	/** Poll for updates without resetting scroll. Only scroll if new messages arrived. */
+	async function poll() {
+		try {
+			const id = $page.params.id!;
+			const [newTask, newMessages] = await Promise.all([
+				tasks.get(id),
+				tasks.messages(id),
+			]);
+			// Update task status/details in-place
+			task = newTask;
+			// Only update messages and scroll if count changed
+			if (newMessages.length !== prevMessageCount) {
+				messages = newMessages;
+				prevMessageCount = newMessages.length;
+				scrollToBottom();
+			}
+			try {
+				const sub = await tasks.subtasks(id);
+				subtaskList = sub.tasks;
+			} catch { subtaskList = []; }
+		} catch { /* ignore poll errors */ }
 	}
 
 	function scrollToBottom() {
@@ -323,11 +353,11 @@
 									<span class="text-xs font-medium {isSystem ? 'text-muted-foreground' : ''}">{msg.role}</span>
 									<span class="text-xs text-muted-foreground">{timeAgo(msg.timestamp)}</span>
 								</div>
-								<div class="rounded-lg px-3 py-2 text-sm whitespace-pre-wrap
+								<div class="rounded-lg px-3 py-2 text-sm prose prose-invert prose-sm max-w-none
 									{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
 									 isAssistant ? 'bg-accent text-accent-foreground' :
 									 'bg-primary text-primary-foreground'}">
-									{msg.content}
+									{@html renderContent(msg.content)}
 								</div>
 							</div>
 						</div>
