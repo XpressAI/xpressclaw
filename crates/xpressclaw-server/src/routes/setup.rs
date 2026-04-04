@@ -1363,10 +1363,7 @@ mod tests {
             .mcp_servers
             .get("websearch")
             .expect("websearch MCP server missing from researcher preset");
-        assert_eq!(
-            ws_cfg.command.as_deref(),
-            Some("npx"),
-        );
+        assert_eq!(ws_cfg.command.as_deref(), Some("npx"),);
 
         let _ = std::fs::remove_file(&config_path);
     }

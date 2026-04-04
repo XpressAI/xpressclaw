@@ -415,10 +415,7 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             // Running — reset restart count if it was elevated
             if app.restart_count > 0 {
                 let conn = db.conn();
-                let _ = conn.execute(
-                    "UPDATE apps SET restart_count = 0 WHERE id = ?1",
-                    [app_id],
-                );
+                let _ = conn.execute("UPDATE apps SET restart_count = 0 WHERE id = ?1", [app_id]);
             }
             continue;
         }
@@ -429,14 +426,22 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
 
         // Backoff: don't restart every 10s if it keeps failing
         if !should_attempt(app.restart_count, app.last_attempt_at.as_deref()) {
-            debug!(app_id, restart_count = app.restart_count, "app restart backoff");
+            debug!(
+                app_id,
+                restart_count = app.restart_count,
+                "app restart backoff"
+            );
             continue;
         }
 
         let image = app.image.unwrap_or_else(|| "node:20-alpine".to_string());
         let app_port = app.port as u16;
 
-        info!(app_id, restart_count = app.restart_count, "restarting app container");
+        info!(
+            app_id,
+            restart_count = app.restart_count,
+            "restarting app container"
+        );
 
         let volume_name = format!("xpressclaw-workspace-{agent_id}");
         let spec = crate::docker::manager::ContainerSpec {
