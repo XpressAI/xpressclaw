@@ -274,22 +274,27 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
 
                         let has_tool_calls = full_content.contains("<tool_call");
 
-                        if let Ok(agent_msg) = mgr.send_message(
-                            conv_id,
-                            &SendMessage {
-                                sender_type: "agent".into(),
-                                sender_id: agent_id.clone(),
-                                sender_name: Some(agent_id.clone()),
-                                content: full_content.clone(),
-                                message_type: None,
-                            },
-                        ) {
-                            ctx.event_bus.send(
+                        // Don't store the raw tool call XML as a message —
+                        // the harness follow-up will produce the real response.
+                        // Only store if there are no tool calls (plain text).
+                        if !has_tool_calls {
+                            if let Ok(agent_msg) = mgr.send_message(
                                 conv_id,
-                                ConversationEvent::Message {
-                                    message: json!(agent_msg),
+                                &SendMessage {
+                                    sender_type: "agent".into(),
+                                    sender_id: agent_id.clone(),
+                                    sender_name: Some(agent_id.clone()),
+                                    content: full_content.clone(),
+                                    message_type: None,
                                 },
-                            );
+                            ) {
+                                ctx.event_bus.send(
+                                    conv_id,
+                                    ConversationEvent::Message {
+                                        message: json!(agent_msg),
+                                    },
+                                );
+                            }
                         }
 
                         // If the LLM output contains tool calls, hand off to
