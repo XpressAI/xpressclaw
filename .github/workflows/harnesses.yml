@@ -31,11 +31,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/setup-qemu-action@v3
+
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/base
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
-          load: ${{ github.event_name != 'push' }}
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -60,17 +62,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/setup-qemu-action@v3
+
       # Build the base image locally so child images can resolve FROM
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/base
-          load: true
+          platforms: linux/amd64,linux/arm64
+          push: false
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
           cache-from: type=gha
 
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/${{ matrix.harness }}
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ env.REGISTRY }}/xpressclaw-harness-${{ matrix.harness }}:latest
           cache-from: type=gha
