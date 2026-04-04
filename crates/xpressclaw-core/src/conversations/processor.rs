@@ -292,10 +292,10 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                             );
                         }
 
-                        // If the LLM output contains tool calls, send the
-                        // full conversation through the harness for execution.
-                        // The harness runs the tool loop and returns the final
-                        // result, which we send as a follow-up message.
+                        // If the LLM output contains tool calls, hand off to
+                        // the harness for execution. Stream the harness response
+                        // so tool calls, intermediate steps, and the final text
+                        // are all visible in the conversation in real-time.
                         if has_tool_calls {
                             if let Some(ref docker) = ctx.docker {
                                 if let Some(ref cid) =
@@ -304,8 +304,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                     if let Some(port) = docker.get_container_port(cid).await {
                                         let harness =
                                             crate::agents::harness::HarnessClient::new(port);
-                                        // Build full conversation including the
-                                        // tool-containing response
                                         let mut harness_msgs = llm_req.messages.clone();
                                         harness_msgs.push(crate::llm::router::ChatMessage::text(
                                             "assistant",
@@ -317,22 +315,38 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                         ));
                                         let mut harness_req = llm_req.clone();
                                         harness_req.messages = harness_msgs;
-                                        harness_req.stream = Some(false);
 
-                                        if let Ok(resp) = harness.chat(&harness_req).await {
-                                            let tool_result = resp
-                                                .choices
-                                                .first()
-                                                .map(|c| c.message.content.clone())
-                                                .unwrap_or_default();
-                                            if !tool_result.is_empty() {
+                                        // Stream from harness so tool calls and
+                                        // intermediate text are visible in real-time
+                                        if let Ok(mut harness_stream) =
+                                            harness.chat_stream(&harness_req).await
+                                        {
+                                            let mut harness_content = String::new();
+                                            while let Some(result) = harness_stream.next().await {
+                                                if let Ok(chunk) = result {
+                                                    if let Some(choice) = chunk.choices.first() {
+                                                        if let Some(ref text) = choice.delta.content
+                                                        {
+                                                            harness_content.push_str(text);
+                                                            ctx.event_bus.send(
+                                                                conv_id,
+                                                                ConversationEvent::Chunk {
+                                                                    agent_id: agent_id.clone(),
+                                                                    content: text.clone(),
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if !harness_content.is_empty() {
                                                 if let Ok(tool_msg) = mgr.send_message(
                                                     conv_id,
                                                     &SendMessage {
                                                         sender_type: "agent".into(),
                                                         sender_id: agent_id.clone(),
                                                         sender_name: Some(agent_id.clone()),
-                                                        content: tool_result,
+                                                        content: harness_content,
                                                         message_type: None,
                                                     },
                                                 ) {
