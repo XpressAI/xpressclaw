@@ -213,7 +213,18 @@ export interface Agent {
 	desired_status: string;
 	observed_status: string;
 	container_id: string | null;
-	config: string;
+	config?: {
+		display_name?: string | null;
+		role_title?: string | null;
+		responsibilities?: string | null;
+		avatar?: string | null;
+		role?: string;
+		model?: string | null;
+		tools?: string[];
+		skills?: string[];
+		volumes?: string[];
+		idle_prompt?: string | null;
+	};
 	created_at: string;
 	started_at: string | null;
 	stopped_at: string | null;
