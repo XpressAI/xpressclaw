@@ -71,23 +71,121 @@ pub struct DockerManager {
 
 impl DockerManager {
     /// Connect to the Docker/Podman daemon.
+    ///
+    /// Tries multiple socket paths to handle Docker Desktop on macOS/Windows
+    /// where the default socket may be disabled. Order:
+    /// 1. DOCKER_HOST env var (if set)
+    /// 2. bollard defaults (/var/run/docker.sock, npipe, etc.)
+    /// 3. ~/.docker/run/docker.sock (Docker Desktop macOS without default socket)
+    /// 4. Podman rootless socket
     pub async fn connect() -> Result<Self> {
-        // Use connect_with_defaults so DOCKER_HOST is honored for all
-        // schemes (unix, tcp, http, npipe). This is needed for rootless
-        // Podman which sets DOCKER_HOST to a user-level socket.
+        // If DOCKER_HOST is set, trust it
+        if std::env::var("DOCKER_HOST").is_ok() {
+            return Self::connect_default().await;
+        }
+
+        // Try bollard defaults first
+        if let Ok(mgr) = Self::connect_default().await {
+            return Ok(mgr);
+        }
+
+        // Try Docker Desktop's user-level socket (macOS with default socket disabled)
+        #[cfg(target_os = "macos")]
+        {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let user_socket = format!("{home}/.docker/run/docker.sock");
+            if std::path::Path::new(&user_socket).exists() {
+                if let Ok(mgr) = Self::connect_to_socket(&user_socket).await {
+                    return Ok(mgr);
+                }
+            }
+        }
+
+        Err(Error::DockerNotAvailable(
+            "Cannot reach Docker/Podman daemon. \
+             Ensure Docker Desktop or Podman is running."
+                .to_string(),
+        ))
+    }
+
+    async fn connect_default() -> Result<Self> {
         let docker = Docker::connect_with_defaults()
             .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
-
-        // Verify connection
-        docker.ping().await.map_err(|e| {
-            Error::DockerNotAvailable(format!(
-                "Cannot reach Docker/Podman daemon: {e}\n\
-                 Ensure Docker or Podman is running."
-            ))
-        })?;
-
+        docker
+            .ping()
+            .await
+            .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed: {e}")))?;
         info!("connected to container runtime");
         Ok(Self { docker })
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn connect_to_socket(path: &str) -> Result<Self> {
+        let docker = Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
+            .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
+        docker
+            .ping()
+            .await
+            .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed on {path}: {e}")))?;
+        info!(
+            socket = path,
+            "connected to container runtime via custom socket"
+        );
+        Ok(Self { docker })
+    }
+
+    /// Check if Docker Desktop is installed (macOS/Windows).
+    pub fn is_docker_desktop_installed() -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            return std::path::Path::new("/Applications/Docker.app").exists();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return std::path::Path::new("C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe")
+                .exists();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        false
+    }
+
+    /// Try to start Docker Desktop (macOS/Windows). Returns Ok if launched.
+    pub fn start_docker_desktop() -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let status = std::process::Command::new("open")
+                .args(["-a", "Docker"])
+                .status()
+                .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(Error::DockerNotAvailable(
+                "Failed to start Docker Desktop".to_string(),
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "start",
+                    "",
+                    "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe",
+                ])
+                .status()
+                .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
+            if status.success() {
+                return Ok(());
+            }
+            return Err(Error::DockerNotAvailable(
+                "Failed to start Docker Desktop".to_string(),
+            ));
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        Err(Error::DockerNotAvailable(
+            "Auto-start not supported on this platform".to_string(),
+        ))
     }
 
     /// Launch an agent container.
