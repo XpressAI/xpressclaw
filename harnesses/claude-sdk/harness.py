@@ -97,8 +97,7 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict,
         options.mcp_servers = mcp_servers
     if session_id:
         options.session_id = session_id
-    # Always continue conversation to maintain context across messages
-    options.continue_conversation = True
+        options.continue_conversation = True
     return options
 
 
