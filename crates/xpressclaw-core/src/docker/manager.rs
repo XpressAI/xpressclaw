@@ -453,6 +453,27 @@ impl DockerManager {
         self.docker.inspect_image(image).await.is_ok()
     }
 
+    /// Check if a container's image matches the latest local image.
+    /// Returns false if the container is running an outdated image.
+    pub async fn container_image_matches(
+        &self,
+        container_name: &str,
+        expected_image: &str,
+    ) -> bool {
+        let container_image = match self.docker.inspect_container(container_name, None).await {
+            Ok(info) => info.image,
+            Err(_) => return true, // Can't check, assume ok
+        };
+        let latest_image = match self.docker.inspect_image(expected_image).await {
+            Ok(info) => info.id,
+            Err(_) => return true, // Image not found locally, assume ok
+        };
+        match (container_image, latest_image) {
+            (Some(container_sha), Some(latest_sha)) => container_sha == latest_sha,
+            _ => true, // Can't compare, assume ok
+        }
+    }
+
     /// Check if a named container is running.
     pub async fn is_container_running(&self, container_name: &str) -> bool {
         match self.docker.inspect_container(container_name, None).await {

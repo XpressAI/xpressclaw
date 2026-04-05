@@ -229,7 +229,8 @@ async fn reconcile_agents(
         let is_running = docker.is_container_running(&container_name).await;
 
         match (agent.desired_status.as_str(), is_running) {
-            // Desired running, is running → check stability + ensure DB has container_id
+            // Desired running, is running → check stability, image freshness,
+            // and ensure DB has container_id.
             ("running", true) => {
                 // Ensure container_id is stored (may be missing after restart)
                 if agent.container_id.is_none() {
@@ -240,6 +241,26 @@ async fn reconcile_agents(
                             Some(&cid),
                         );
                     }
+                }
+
+                // Check if the container's image matches the latest.
+                // If the image was rebuilt (e.g. by build.sh), recreate
+                // the container so the agent gets the new harness code.
+                let image = crate::docker::images::image_for_backend(&agent_config.backend);
+                if !docker.container_image_matches(&container_name, image).await {
+                    info!(
+                        agent = agent.id,
+                        image, "harness image updated, recreating container"
+                    );
+                    let _ = docker.stop(&agent.id).await;
+                    // The next reconcile cycle will see ("running", false) and
+                    // start a new container from the updated image.
+                    let _ = registry.update_status(
+                        &agent.id,
+                        &crate::agents::state::AgentStatus::Stopped,
+                        None,
+                    );
+                    continue;
                 }
 
                 if agent.restart_count > 0 {
