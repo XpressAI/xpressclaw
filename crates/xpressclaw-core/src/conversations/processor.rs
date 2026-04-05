@@ -50,6 +50,11 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
     let _ = mgr.set_processing_status(conv_id, "processing");
 
     loop {
+        // Check if processing was cancelled (user hit stop)
+        if !mgr.is_processing(conv_id) {
+            info!(conv_id, "processing cancelled by user");
+            break;
+        }
         if !mgr.has_unprocessed(conv_id) {
             break;
         }

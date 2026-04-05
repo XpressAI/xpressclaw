@@ -59,6 +59,7 @@ export const conversations = {
 	update: (id: string, data: { title?: string; icon?: string }) =>
 		request<Conversation>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
+	stop: (id: string) => request<void>(`/api/conversations/${id}/stop`, { method: 'POST' }),
 	messages: (id: string, limit = 50, beforeId?: number) => {
 		const params = new URLSearchParams({ limit: String(limit) });
 		if (beforeId) params.set('before_id', String(beforeId));

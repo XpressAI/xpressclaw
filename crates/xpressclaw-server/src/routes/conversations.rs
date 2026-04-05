@@ -116,6 +116,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/messages", get(get_messages).post(send_message))
         .route("/{id}/messages/stream", axum::routing::post(stream_message))
+        .route("/{id}/stop", axum::routing::post(stop_processing))
         .route("/{id}/events", get(subscribe_events))
         .route(
             "/{id}/participants",
@@ -276,6 +277,14 @@ async fn send_message(
 /// Streaming version of send_message. Returns SSE events:
 /// SSE event subscription for a conversation (ADR-019).
 /// Replays messages after `after` ID, then streams live events.
+async fn stop_processing(State(state): State<AppState>, Path(conv_id): Path<String>) -> StatusCode {
+    let mgr = ConversationManager::new(state.db.clone());
+    let _ = mgr.set_processing_status(&conv_id, "idle");
+    let _ = mgr.mark_processed(&conv_id);
+    tracing::info!(conv_id, "processing stopped by user");
+    StatusCode::OK
+}
+
 /// The client can disconnect and reconnect — missed messages are
 /// replayed from the DB on reconnect.
 #[derive(Deserialize)]

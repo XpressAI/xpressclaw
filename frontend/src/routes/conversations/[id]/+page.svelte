@@ -217,6 +217,22 @@
 		}
 	}
 
+	async function stopAgent() {
+		if (!conv) return;
+		try {
+			await conversations.stop(conv.id);
+			if (cancelStream) {
+				cancelStream();
+				cancelStream = null;
+			}
+			sending = false;
+			thinkingAgent = null;
+			streamingContent = '';
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	function scrollToBottom() {
 		if (messagesEl) {
 			messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -741,13 +757,23 @@
 							disabled={sending}
 						></textarea>
 					</div>
-					<button
-						onclick={sendMessage}
-						disabled={!input.trim() || sending}
-						class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
-					>
-						<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-					</button>
+					{#if sending}
+						<button
+							onclick={stopAgent}
+							class="flex h-11 w-11 items-center justify-center rounded-xl bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors flex-shrink-0 shadow-lg shadow-destructive/20"
+							title="Stop agent"
+						>
+							<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+						</button>
+					{:else}
+						<button
+							onclick={sendMessage}
+							disabled={!input.trim()}
+							class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
+						>
+							<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+						</button>
+					{/if}
 				</div>
 			</div>
 		</div>
