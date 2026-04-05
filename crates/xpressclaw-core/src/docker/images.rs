@@ -58,6 +58,7 @@ pub fn build_container_spec_with_mcp(
         format!("AGENT_ID={}", agent.name),
         format!("AGENT_NAME={}", agent.name),
         format!("AGENT_BACKEND={}", agent.backend),
+        format!("XPRESSCLAW_PORT={server_port}"),
         "HOME=/workspace".to_string(),
         "WORKSPACE_DIR=/workspace".to_string(),
     ];

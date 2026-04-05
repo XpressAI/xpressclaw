@@ -59,6 +59,8 @@ impl MemoryHooks {
         conversation_context: &str,
         harness_port: u16,
     ) -> Option<String> {
+        // Use agent_id as model name — the harness maps it to LLM_MODEL.
+        let model = agent_id;
         if !self.has_memories(agent_id) {
             debug!(agent_id, "no memories found, skipping recall");
             return None;
@@ -88,8 +90,7 @@ impl MemoryHooks {
         match harness
             .send_task(
                 "", // no separate system prompt needed
-                &prompt,
-                "memory-recall",
+                &prompt, model,
             )
             .await
         {
@@ -158,7 +159,7 @@ impl MemoryHooks {
             agent_resp = truncate(agent_response, 1000),
         );
 
-        match harness.send_task("", &prompt, "memory-remember").await {
+        match harness.send_task("", &prompt, agent_id).await {
             Ok(_) => {
                 info!(agent_id, "async remember complete");
             }
@@ -192,7 +193,7 @@ impl MemoryHooks {
             agent_id = agent_id,
         );
 
-        match harness.send_task("", &prompt, "memory-consolidate").await {
+        match harness.send_task("", &prompt, agent_id).await {
             Ok(_) => {
                 info!(agent_id, "memory consolidation complete");
             }
