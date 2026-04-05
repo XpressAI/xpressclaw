@@ -9,8 +9,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(body.error || res.statusText);
 	}
-	if (res.status === 204) return undefined as T;
-	return res.json();
+	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
+	const text = await res.text();
+	if (!text) return undefined as T;
+	return JSON.parse(text);
 }
 
 // -- Conversations --
