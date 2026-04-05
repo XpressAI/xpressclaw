@@ -68,7 +68,6 @@ struct Context {
     task: Task,
     agent_id: String,
     harness_port: u16,
-    model: String,
     system_prompt: String,
     turn: usize,
     max_turns: usize,
@@ -140,9 +139,6 @@ async fn load_task(
 
     // Get agent config
     let agent_cfg = config.agents.iter().find(|a| a.name == agent_id);
-    let model = agent_cfg
-        .and_then(|a| a.model.clone())
-        .unwrap_or_else(|| "local".to_string());
     let system_prompt = agent_cfg
         .map(|a| a.full_system_prompt())
         .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
@@ -210,7 +206,6 @@ async fn load_task(
         task: board.get(task_id).unwrap_or(task),
         agent_id: agent_id.to_string(),
         harness_port,
-        model,
         system_prompt,
         turn: 0,
         max_turns,
@@ -430,38 +425,13 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
             State::ProcessResponse
         }
         Err(e) => {
-            // Fall back to legacy send_task
-            warn!(
+            error!(
                 task_id = ctx.task.id,
+                turn = ctx.turn,
                 error = %e,
-                "session stream failed, trying legacy send_task"
+                "harness session call failed"
             );
-            match harness
-                .send_task(&ctx.system_prompt, &ctx.current_prompt, &ctx.model)
-                .await
-            {
-                Ok(response) => {
-                    let text = response
-                        .choices
-                        .first()
-                        .map(|c| c.message.content.clone())
-                        .unwrap_or_default();
-                    // Legacy path doesn't stream, so save the full message here.
-                    let conv = TaskConversation::new(db.clone());
-                    let _ = conv.add_message(&ctx.task.id, "assistant", &text);
-                    ctx.last_response = text;
-                    State::ProcessResponse
-                }
-                Err(e2) => {
-                    error!(
-                        task_id = ctx.task.id,
-                        turn = ctx.turn,
-                        error = %e2,
-                        "harness call failed"
-                    );
-                    State::Done(DriverResult::Failed(format!("harness error: {e2}")))
-                }
-            }
+            State::Done(DriverResult::Failed(format!("harness error: {e}")))
         }
     }
 }
@@ -909,6 +879,7 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
+                let _ = board.update_status(&claimed.task_id, "cancelled", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
                 notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
             }
