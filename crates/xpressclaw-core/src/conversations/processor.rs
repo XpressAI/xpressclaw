@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
+use crate::activity::ActivityManager;
 use crate::agents::registry::AgentRegistry;
 use crate::budget::manager::BudgetManager;
 use crate::budget::rate_limiter::{RateLimitResult, RateLimiter};
@@ -514,4 +515,18 @@ fn record_and_store(
             },
         );
     }
+
+    // Log activity for dashboard
+    let activity = ActivityManager::new(ctx.db.clone());
+    let _ = activity.log(
+        "agent_response",
+        Some(agent_id),
+        Some(&json!({
+            "conversation_id": conv_id,
+            "model": model,
+            "tokens": total_tokens,
+            "response_len": content.len(),
+        })),
+        None,
+    );
 }

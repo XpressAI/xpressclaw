@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use serde_json::json;
 
+use crate::activity::ActivityManager;
 use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
@@ -885,6 +886,23 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                         &claimed.task_id,
                         &claimed.agent_id,
                         "completed",
+                    );
+                }
+                // Log activity
+                if !is_idle {
+                    let activity = ActivityManager::new(db.clone());
+                    let title = board
+                        .get(&claimed.task_id)
+                        .map(|t| t.title)
+                        .unwrap_or_default();
+                    let _ = activity.log(
+                        "task_completed",
+                        Some(&claimed.agent_id),
+                        Some(&json!({
+                            "task_id": claimed.task_id,
+                            "title": title,
+                        })),
+                        None,
                     );
                 }
                 info!(task_id = claimed.task_id, "task completed");

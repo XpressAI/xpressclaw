@@ -266,9 +266,10 @@ class ClaudeSdkHarness(BaseHarness):
         result_text = ""
         async for message in query(prompt=prompt, options=options):
             if isinstance(message, ResultMessage):
-                if not self.session_id:
-                    # Capture session_id from first query
-                    self.session_id = _extract_session_id(message)
+                # Always capture session_id — it may change after compaction
+                new_sid = _extract_session_id(message)
+                if new_sid:
+                    self.session_id = new_sid
                 if message.is_error:
                     return f"Agent error: {message.result or 'unknown error'}"
                 result_text = message.result or ""
@@ -423,9 +424,10 @@ async def _session_query_to_queue(
             elif isinstance(message, ResultMessage):
                 logger.info("ResultMessage: is_error=%s result_len=%d",
                             message.is_error, len(message.result or ""))
-                # Capture session_id from result
-                if not harness.session_id:
-                    harness.session_id = _extract_session_id(message)
+                # Always capture session_id — may change after compaction
+                new_sid = _extract_session_id(message)
+                if new_sid:
+                    harness.session_id = new_sid
                 if message.is_error:
                     _send(f"Agent error: {message.result or 'unknown error'}")
                 elif not sent_role and message.result:
@@ -446,15 +448,17 @@ async def _session_query_to_queue(
 
 
 def _extract_session_id(message: ResultMessage) -> str | None:
-    """Try to extract session_id from a ResultMessage.
+    """Extract session_id from a ResultMessage.
 
-    The SDK doesn't directly expose the session_id in ResultMessage.
-    We rely on continue_conversation=True to maintain the session
-    without needing an explicit session_id.
+    The SDK exposes session_id directly on ResultMessage. We capture
+    it on the first query and pass it back via ClaudeAgentOptions.session_id
+    + continue_conversation=True on subsequent calls to maintain the
+    persistent session.
     """
-    # The session is maintained by the SDK internally when
-    # continue_conversation=True. We don't need to extract an ID.
-    return None
+    session_id = getattr(message, "session_id", None)
+    if session_id:
+        logger.info("captured session_id: %s", session_id)
+    return session_id
 
 
 def _sse_chunk_raw(conv_id: str, model: str, delta: dict,

@@ -273,7 +273,9 @@ export const agents = {
 		idle_prompt?: string | null;
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
-	)
+	),
+	logs: (id: string, tail = 100) =>
+		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
 };
 
 // -- Tasks --
