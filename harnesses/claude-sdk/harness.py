@@ -96,8 +96,7 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict,
     if mcp_servers:
         options.mcp_servers = mcp_servers
     if session_id:
-        options.session_id = session_id
-        options.continue_conversation = True
+        options.resume = session_id
     return options
 
 
