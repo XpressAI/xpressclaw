@@ -246,6 +246,20 @@ impl HarnessClient {
         Ok(())
     }
 
+    /// Trigger session compaction in the harness.
+    /// Called after memory consolidation so the agent continues with a
+    /// clean context window.
+    pub async fn compact(&self) -> Result<()> {
+        let url = format!("{}/v1/session/compact", self.base_url);
+        self.client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| Error::Llm(format!("compact failed: {e}")))?;
+        Ok(())
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

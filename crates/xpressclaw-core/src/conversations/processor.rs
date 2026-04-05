@@ -263,7 +263,9 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                 total_tokens,
                             );
 
-                            // Async memory remember hook — runs in background
+                            // Async memory remember hook — runs in background.
+                            // Also checks if we're approaching the context limit
+                            // and triggers consolidation + compaction if needed.
                             if let Some(hooks_cfg) = agent_hooks {
                                 if hooks::has_remember_hook(hooks_cfg) {
                                     let db = ctx.db.clone();
@@ -272,9 +274,37 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                     let user_msg = last_user_msg.clone();
                                     let resp = full_content.clone();
                                     let hp = port;
+                                    let conv_id_owned = conv_id.to_string();
+                                    let db_for_tokens = ctx.db.clone();
+                                    // Rough context limit: 80% of 128k tokens (~100k chars)
+                                    let context_limit: usize = 100_000;
                                     tokio::spawn(async move {
-                                        let mem_hooks = MemoryHooks::new(db, &eviction);
+                                        let mem_hooks = MemoryHooks::new(db.clone(), &eviction);
                                         mem_hooks.remember(&aid, &user_msg, &resp, hp).await;
+
+                                        // Check conversation size and trigger
+                                        // consolidation + compaction if approaching limit.
+                                        let conv_mgr = ConversationManager::new(db_for_tokens);
+                                        let total_chars: usize = conv_mgr
+                                            .get_messages(&conv_id_owned, 1000, None)
+                                            .unwrap_or_default()
+                                            .iter()
+                                            .map(|m| m.content.len())
+                                            .sum();
+
+                                        if total_chars > context_limit {
+                                            info!(
+                                                conv_id = conv_id_owned,
+                                                total_chars,
+                                                "approaching context limit, consolidating memory"
+                                            );
+                                            mem_hooks.consolidate(&aid, hp).await;
+                                            // Trigger compaction in the harness
+                                            let harness =
+                                                crate::agents::harness::HarnessClient::new(hp);
+                                            let _ = harness.compact().await;
+                                            info!(conv_id = conv_id_owned, "compaction triggered");
+                                        }
                                     });
                                 }
                             }

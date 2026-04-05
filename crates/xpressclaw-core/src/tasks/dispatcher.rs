@@ -94,8 +94,8 @@ async fn run_task(
         state = match state {
             State::LoadTask => load_task(db, config, task_id, agent_id, &mut ctx).await,
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
-            State::CallAgent => call_agent(db, ctx.as_mut().unwrap()).await,
-            State::ProcessResponse => process_response(db, ctx.as_mut().unwrap()),
+            State::CallAgent => call_agent(db, config, ctx.as_mut().unwrap()).await,
+            State::ProcessResponse => process_response(db, config, ctx.as_mut().unwrap()),
             State::Evaluate => evaluate(db, config, ctx.as_mut().unwrap()),
             State::Done(result) => return result,
         };
@@ -340,7 +340,7 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::CallAgent
 }
 
-async fn call_agent(db: &Arc<Database>, ctx: &mut Context) -> State {
+async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     use futures_util::StreamExt;
 
     let harness = HarnessClient::new(ctx.harness_port);
@@ -354,8 +354,7 @@ async fn call_agent(db: &Arc<Database>, ctx: &mut Context) -> State {
 
     // Memory recall hook: first turn only, if agent has memories.
     if ctx.turn == 0 && hooks::has_recall_hook(&ctx.hooks) {
-        let eviction = "least-recently-relevant"; // default
-        let mem_hooks = MemoryHooks::new(db.clone(), eviction);
+        let mem_hooks = MemoryHooks::new(db.clone(), &config.memory.eviction);
         if let Some(recollection) = mem_hooks
             .recall(&ctx.agent_id, &ctx.current_prompt, ctx.harness_port)
             .await
@@ -466,19 +465,20 @@ async fn call_agent(db: &Arc<Database>, ctx: &mut Context) -> State {
     }
 }
 
-fn process_response(db: &Arc<Database>, ctx: &mut Context) -> State {
+fn process_response(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
 
     // Async memory remember hook — runs in background, doesn't block
     if hooks::has_remember_hook(&ctx.hooks) {
         let db2 = db.clone();
+        let eviction = config.memory.eviction.clone();
         let aid = ctx.agent_id.clone();
         let prompt = ctx.current_prompt.clone();
         let resp = ctx.last_response.clone();
         let hp = ctx.harness_port;
         tokio::spawn(async move {
-            let mem_hooks = MemoryHooks::new(db2, "least-recently-relevant");
+            let mem_hooks = MemoryHooks::new(db2, &eviction);
             mem_hooks.remember(&aid, &prompt, &resp, hp).await;
         });
     }

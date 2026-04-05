@@ -227,6 +227,22 @@ class ClaudeSdkHarness(BaseHarness):
 
             return {"session_id": self.session_id}
 
+        @self.app.post("/v1/session/compact")
+        async def compact_session():
+            """Trigger session compaction.
+
+            Starts a new session, preserving context through the SDK's
+            continue_conversation mechanism. The old session's context
+            gets compacted (summarized) by the SDK automatically.
+            """
+            old_session = self.session_id
+            self.session_id = None
+            logger.info("compaction triggered, old_session=%s", old_session)
+            # Next query will start a fresh session. The SDK's internal
+            # compaction has already happened by this point since the
+            # server triggered consolidation before calling this.
+            return {"status": "compacted", "old_session": old_session}
+
     def _ensure_session(self):
         """Ensure we have an active session, creating one if needed."""
         if self.session_id:

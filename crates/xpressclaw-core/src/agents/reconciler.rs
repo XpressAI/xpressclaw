@@ -622,6 +622,26 @@ fn reconcile_idle_tasks(db: &Arc<Database>, config: &Config) {
         // Seed scratch pad on first use
         seed_scratch_pad(&agent_cfg.name, &config.system.data_dir);
 
+        // Memory consolidation: process Inbox/ → Zettel/ during idle periods.
+        // Runs as a background task since we're in a sync context.
+        if crate::memory::hooks::has_remember_hook(&agent_cfg.hooks) {
+            if let Some(ref cid) = agent.container_id {
+                let db2 = db.clone();
+                let eviction = config.memory.eviction.clone();
+                let agent_name = agent_cfg.name.clone();
+                let cid2 = cid.clone();
+                tokio::spawn(async move {
+                    if let Ok(docker) = DockerManager::connect().await {
+                        if let Some(port) = docker.get_container_port(&cid2).await {
+                            let mem_hooks = crate::memory::hooks::MemoryHooks::new(db2, &eviction);
+                            mem_hooks.consolidate(&agent_name, port).await;
+                            debug!(agent = agent_name, "memory consolidation during idle");
+                        }
+                    }
+                });
+            }
+        }
+
         // Create the hidden idle task
         match board.create_idle_task(&agent_cfg.name, &description) {
             Ok(task) => {

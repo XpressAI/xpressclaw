@@ -57,6 +57,12 @@ class BaseHarness(ABC):
             logger.info("cancel requested — will stop at next tool call")
             return {"status": "cancelled"}
 
+        @self.app.post("/v1/session/compact")
+        async def compact():
+            """Trigger session compaction. Override in subclasses."""
+            logger.info("compact requested (no-op in base harness)")
+            return {"status": "compacted"}
+
         @self.app.get("/v1/models")
         async def models():
             return {
