@@ -225,8 +225,11 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     let mut prompt = String::new();
 
     if ctx.turn == 0 {
-        // Initial prompt
-        prompt.push_str(&format!("# Task: {}\n\n", ctx.task.title));
+        // Initial prompt — include the task ID so the agent can call complete_task
+        prompt.push_str(&format!(
+            "# Task: {}\nTask ID: {}\n\n",
+            ctx.task.title, ctx.task.id
+        ));
         if let Some(ref desc) = ctx.task.description {
             prompt.push_str(desc);
             prompt.push_str("\n\n");
@@ -295,13 +298,14 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
                  When all steps are done, use `complete_task` to mark the parent complete.",
             );
         } else {
-            prompt.push_str(
+            prompt.push_str(&format!(
                 "Work on this task using the tools available to you. \
                  For complex tasks, consider creating subtasks with `create_task` \
-                 (set parent_task_id to this task's ID) to show progress. \
-                 When done, use `complete_task` to mark it complete. \
+                 (set parent_task_id to \"{task_id}\") to show progress. \
+                 When done, call `complete_task` with task_id \"{task_id}\". \
                  If you need clarification from the user, use `request_input`.",
-            );
+                task_id = ctx.task.id,
+            ));
         }
     } else {
         // Continuation prompt — the agent session preserves context,
@@ -326,7 +330,11 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             }
         }
 
-        prompt.push_str("\n\nUse `complete_task` when this task is fully done.");
+        prompt.push_str(&format!(
+            "\n\nIMPORTANT: Call `complete_task` with task_id \"{}\" when done. \
+             The task stays open until you call the tool.",
+            ctx.task.id,
+        ));
     }
 
     // Save the user-side prompt as a task message
