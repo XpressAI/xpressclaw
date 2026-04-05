@@ -220,8 +220,8 @@ async fn fetch_provider_models(
     let client = reqwest::Client::new();
     let url = match provider {
         "openai" => {
-            let base = base_url.unwrap_or("https://api.openai.com");
-            format!("{}/v1/models", base.trim_end_matches('/'))
+            let base = base_url.unwrap_or("https://api.openai.com/v1").trim_end_matches('/');
+            format!("{base}/models")
         }
         "anthropic" => {
             let base = base_url.unwrap_or("https://api.anthropic.com");

@@ -20,7 +20,8 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
-        let base_url = base_url.unwrap_or_else(|| "https://api.openai.com".to_string());
+        let base_url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let base_url = base_url.trim_end_matches('/').to_string();
         let is_openrouter = base_url.contains("openrouter.ai");
 
         // Add OpenRouter-specific headers for rankings
@@ -54,30 +55,50 @@ impl OpenAiProvider {
         self
     }
 
-    /// Validate an OpenAI API key by listing models.
+    /// Validate an OpenAI-compatible API key by sending a minimal chat request.
+    ///
+    /// We use `/chat/completions` with `max_tokens: 1` instead of `/models`
+    /// because some providers (e.g. OpenRouter) serve `/models` publicly
+    /// without requiring authentication.
     pub async fn validate_key(
         api_key: &str,
         base_url: Option<&str>,
     ) -> std::result::Result<bool, String> {
-        let base = base_url.unwrap_or("https://api.openai.com");
-        let url = format!("{base}/v1/models");
+        let base = base_url.unwrap_or("https://api.openai.com/v1").trim_end_matches('/');
+        let url = format!("{base}/chat/completions");
 
         let client = Client::new();
         let resp = client
-            .get(&url)
+            .post(&url)
             .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "model": "openai/gpt-4o-mini",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
             .send()
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
 
-        Ok(resp.status().is_success())
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(false);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(format!(
+                "Could not reach API at {url} — check your base URL"
+            ));
+        }
+        // 200 = valid, 400/model-not-found = key is valid but model issue, etc.
+        Ok(true)
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiProvider {
     async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.base_url);
 
         let mut req = self.client.post(&url).json(request);
 
@@ -110,7 +131,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.base_url);
 
         // Force stream=true
         let mut stream_req = request.clone();

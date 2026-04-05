@@ -152,7 +152,14 @@
 				llmBaseUrl || undefined);
 			keyValid = result.valid;
 			if (!result.valid) {
-				keyError = result.error || 'Invalid API key';
+				if (result.error?.includes('not reach')) {
+					const expectedBase = isOpenRouter ? 'https://openrouter.ai/api/v1'
+						: llmProvider === 'anthropic' ? 'https://api.anthropic.com/v1'
+						: 'https://api.openai.com/v1';
+					keyError = `Could not reach API. Expected base URL: ${expectedBase}`;
+				} else {
+					keyError = result.error || 'Invalid API key';
+				}
 			} else if (result.models?.length) {
 				availableModels = result.models;
 				if (!llmModel && availableModels.length > 0) {
