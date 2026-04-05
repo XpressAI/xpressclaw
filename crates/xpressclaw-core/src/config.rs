@@ -176,12 +176,24 @@ pub struct WakeOnConfig {
     pub condition: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Internal hook configuration. Not user-facing — always includes
+/// memory hooks. Deserialized hooks from YAML are ignored; the
+/// defaults always apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
-    #[serde(default)]
+    #[serde(skip)]
     pub before_message: Vec<String>,
-    #[serde(default)]
+    #[serde(skip)]
     pub after_message: Vec<String>,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            before_message: vec!["memory_recall".to_string()],
+            after_message: vec!["memory_remember".to_string()],
+        }
+    }
 }
 
 /// Per-agent LLM override. When set, the agent uses this provider/key/url
@@ -597,12 +609,6 @@ agents:
       - **Before starting work:** Use `search_memory` to recall relevant context
       - **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts
       - **Be proactive:** If someone tells you about themselves or their work, SAVE IT
-
-    hooks:
-      before_message:
-        - memory_recall
-      after_message:
-        - memory_remember
 
     # Volumes mounted into the agent container
     volumes:
