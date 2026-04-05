@@ -220,7 +220,7 @@
 	async function stopAgent() {
 		if (!conv) return;
 		try {
-			await conversations.stop(conv.id);
+			await conversations.stop(conv.id, thinkingAgent ?? undefined);
 			if (cancelStream) {
 				cancelStream();
 				cancelStream = null;

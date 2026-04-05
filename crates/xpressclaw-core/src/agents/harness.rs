@@ -234,6 +234,18 @@ impl HarnessClient {
         }
     }
 
+    /// Signal the harness to cancel at its next tool call.
+    pub async fn cancel(&self) -> Result<()> {
+        let url = format!("{}/v1/cancel", self.base_url);
+        self.client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| Error::Llm(format!("cancel failed: {e}")))?;
+        Ok(())
+    }
+
     pub fn base_url(&self) -> &str {
         &self.base_url
     }

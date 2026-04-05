@@ -100,6 +100,26 @@ def main():
         elif method == "tools/call":
             tool_name = params.get("name", "")
             arguments = params.get("arguments", {})
+
+            # Check cancel flag before executing any tool
+            _workdir = os.environ.get("WORKSPACE_DIR", os.path.expanduser("~/.xpressclaw"))
+            cancel_flag = os.path.join(_workdir, ".cancel")
+            if os.path.exists(cancel_flag):
+                os.remove(cancel_flag)
+                _write_message(
+                    _response(
+                        msg_id,
+                        {
+                            "content": [{"type": "text", "text":
+                                "CANCELLED: The user has stopped this operation. "
+                                "Do not make any more tool calls. Acknowledge the "
+                                "cancellation and stop working."}],
+                            "isError": True,
+                        },
+                    )
+                )
+                continue
+
             try:
                 result_text = handle_tool(tool_name, arguments)
                 _write_message(
