@@ -20,6 +20,7 @@ use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::llm::router::{ChatCompletionRequest, ChatMessage, LlmRouter};
+use crate::memory::hooks::{self, MemoryHooks};
 
 use futures_util::StreamExt;
 
@@ -172,6 +173,37 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 continue;
             }
 
+            // Memory recall hook: on first turn, if agent has memories,
+            // spawn a sub-agent to synthesize a recollection.
+            let harness_port = get_harness_port(ctx, &registry, agent_id).await;
+            let agent_hooks = agent_cfg.map(|c| &c.hooks);
+            let mut recollection: Option<String> = None;
+
+            if let Some(port) = harness_port {
+                if let Some(hooks_cfg) = agent_hooks {
+                    if hooks::has_recall_hook(hooks_cfg) {
+                        let eviction = &ctx.config.memory.eviction;
+                        let mem_hooks = MemoryHooks::new(ctx.db.clone(), eviction);
+                        recollection = mem_hooks.recall(agent_id, &last_user_msg, port).await;
+                    }
+                }
+            }
+
+            // If we got a recollection, inject it as a system message
+            // (visible to the agent but doesn't change the system prompt).
+            if let Some(ref recall_text) = recollection {
+                let _ = mgr.send_message(
+                    conv_id,
+                    &SendMessage {
+                        sender_type: "system".into(),
+                        sender_id: "memory".to_string(),
+                        sender_name: Some("Memory".to_string()),
+                        content: format!("*Recollection:* {recall_text}"),
+                        message_type: Some("memory_recall".into()),
+                    },
+                );
+            }
+
             // Broadcast "thinking" event
             ctx.event_bus.send(
                 conv_id,
@@ -180,9 +212,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 },
             );
             tokio::task::yield_now().await;
-
-            // Try routing through harness session (has tools, persistent context)
-            let harness_port = get_harness_port(ctx, &registry, agent_id).await;
 
             if let Some(port) = harness_port {
                 let harness = crate::agents::harness::HarnessClient::new(port);
@@ -233,6 +262,22 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                                 &full_content,
                                 total_tokens,
                             );
+
+                            // Async memory remember hook — runs in background
+                            if let Some(hooks_cfg) = agent_hooks {
+                                if hooks::has_remember_hook(hooks_cfg) {
+                                    let db = ctx.db.clone();
+                                    let eviction = ctx.config.memory.eviction.clone();
+                                    let aid = agent_id.to_string();
+                                    let user_msg = last_user_msg.clone();
+                                    let resp = full_content.clone();
+                                    let hp = port;
+                                    tokio::spawn(async move {
+                                        let mem_hooks = MemoryHooks::new(db, &eviction);
+                                        mem_hooks.remember(&aid, &user_msg, &resp, hp).await;
+                                    });
+                                }
+                            }
                         }
                     }
                     Err(e) => {
