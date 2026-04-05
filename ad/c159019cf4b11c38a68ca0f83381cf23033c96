@@ -1,0 +1,1 @@
+fix: memory MCP tools (list_memories, search_memory) crashed with KeyError 'id' because the API returns MemorySearchResult objects { memory: {...}, relevance_score, source } but the handlers accessed fields directly as if they were flat Memory objects. This was a careless mistake — should have tested the actual API response shape before writing the handler code.
