@@ -263,20 +263,35 @@ class ClaudeSdkHarness(BaseHarness):
         )
 
         result_text = ""
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, ResultMessage):
-                # Always capture session_id — it may change after compaction
-                new_sid = _extract_session_id(message)
-                if new_sid:
-                    self.session_id = new_sid
-                if message.is_error:
-                    return f"Agent error: {message.result or 'unknown error'}"
-                result_text = message.result or ""
-            elif isinstance(message, AssistantMessage):
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            result_text = block.text
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    # Always capture session_id — it may change after compaction
+                    new_sid = _extract_session_id(message)
+                    if new_sid:
+                        self.session_id = new_sid
+                    if message.is_error:
+                        return f"Agent error: {message.result or 'unknown error'}"
+                    result_text = message.result or ""
+                elif isinstance(message, AssistantMessage):
+                    if hasattr(message, "content"):
+                        for block in message.content:
+                            if hasattr(block, "text"):
+                                result_text = block.text
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("session query failed: %s", error_msg)
+            if "maximum buffer size" in error_msg or "exit code 1" in error_msg:
+                # Session is dead after a buffer overflow or CLI crash.
+                # Reset so next call starts fresh.
+                logger.warning("session crashed, resetting session_id")
+                self.session_id = None
+                return (
+                    f"Error: {error_msg}\n\n"
+                    "The previous operation produced output that was too large. "
+                    "Try using more specific queries or smaller operations."
+                )
+            raise
 
         logger.info("session query complete: session=%s result_len=%d",
                      self.session_id, len(result_text))
@@ -436,9 +451,20 @@ async def _session_query_to_queue(
                 return
 
     except Exception as e:
+        error_msg = str(e)
         logger.exception("session query error")
-        error_payload = {"error": {"message": str(e), "type": "server_error"}}
-        q.put(f"data: {json.dumps(error_payload)}\n\n")
+        if "maximum buffer size" in error_msg or "exit code 1" in error_msg:
+            # Session crashed — reset so next call starts fresh
+            logger.warning("session crashed, resetting session_id")
+            harness.session_id = None
+            _send(
+                "\n\nError: A tool produced output that was too large "
+                "(>1MB). The session has been reset. "
+                "Try using more specific queries or smaller operations."
+            )
+        else:
+            error_payload = {"error": {"message": error_msg, "type": "server_error"}}
+            q.put(f"data: {json.dumps(error_payload)}\n\n")
 
     if not sent_role:
         _send("No response from agent.")
