@@ -174,6 +174,15 @@ impl TaskBoard {
         Ok(task)
     }
 
+    pub fn set_conversation_id(&self, task_id: &str, conversation_id: &str) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute(
+            "UPDATE tasks SET conversation_id = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![conversation_id, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn list(
         &self,
         status: Option<&str>,
@@ -207,6 +216,9 @@ impl TaskBoard {
         if !include_hidden {
             sql.push_str(" AND hidden = 0");
         }
+
+        // Subtasks belong inside their parent, not the top-level list.
+        sql.push_str(" AND parent_task_id IS NULL");
 
         if let Some(s) = status {
             sql.push_str(" AND status = ?");

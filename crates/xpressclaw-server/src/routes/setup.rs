@@ -349,12 +349,7 @@ async fn complete_setup(
     };
 
     let llm = LlmConfig {
-        // Normalize "ollama" → "local" for the router (both use LocalProvider)
-        default_provider: if req.llm.provider == "ollama" {
-            "local".to_string()
-        } else {
-            req.llm.provider.clone()
-        },
+        default_provider: req.llm.provider.clone(),
         openai_api_key: if req.llm.provider == "openai" {
             req.llm.api_key.clone()
         } else {
@@ -404,6 +399,7 @@ async fn complete_setup(
             ..Default::default()
         }]
     } else {
+        let mut used_ids: Vec<String> = Vec::new();
         req.agents
             .iter()
             .map(|a| {
@@ -426,11 +422,7 @@ async fn complete_setup(
 
                 // Populate per-agent LLM config from wizard settings
                 let agent_llm = {
-                    let provider = if req.llm.provider == "ollama" {
-                        "local".to_string()
-                    } else {
-                        req.llm.provider.clone()
-                    };
+                    let provider = req.llm.provider.clone();
                     let api_key = req.llm.api_key.clone();
                     let base_url = req.llm.base_url.clone().or(req.llm.local_base_url.clone());
                     if !provider.is_empty() {
@@ -444,9 +436,14 @@ async fn complete_setup(
                     }
                 };
 
+                // Slugify the name for use as an ID, keep original as display_name
+                let id_refs: Vec<&str> = used_ids.iter().map(|s| s.as_str()).collect();
+                let agent_id = xpressclaw_core::config::unique_agent_id(&a.name, &id_refs);
+                used_ids.push(agent_id.clone());
+
                 AgentConfig {
-                    name: a.name.clone(),
-                    display_name: Some(capitalize(&a.name)),
+                    name: agent_id,
+                    display_name: Some(a.name.clone()),
                     role_title: a.role_title.clone(),
                     responsibilities: a.responsibilities.clone(),
                     backend: a
@@ -676,8 +673,13 @@ async fn add_agent(
         "build-app".to_string(),
     ];
 
+    // Slugify the name and ensure uniqueness
+    let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
+    let agent_id = xpressclaw_core::config::unique_agent_id(&req.name, &existing_ids);
+
     let agent_config = AgentConfig {
-        name: req.name.clone(),
+        name: agent_id.clone(),
+        display_name: Some(req.name.clone()),
         backend: req
             .backend
             .clone()
@@ -931,14 +933,6 @@ async fn delete_mcp_server(
     Ok(Json(json!({ "success": true, "deleted": name })))
 }
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
-}
-
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1169,7 +1163,7 @@ mod tests {
                                 {
                                     "name": "researcher",
                                     "preset": "researcher",
-                                    "tools": ["filesystem", "shell", "memory", "fetch"]
+                                    "tools": ["filesystem", "shell", "memory", "websearch"]
                                 }
                             ]
                         })
@@ -1187,24 +1181,24 @@ mod tests {
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "researcher");
         assert!(
-            config.agents[0].tools.contains(&"fetch".to_string()),
-            "agent should have fetch tool"
+            config.agents[0].tools.contains(&"websearch".to_string()),
+            "agent should have websearch tool"
         );
         // Preset default_mcp_servers should have been merged
         assert!(
-            config.mcp_servers.contains_key("fetch"),
-            "fetch MCP server should be configured from preset"
+            config.mcp_servers.contains_key("websearch"),
+            "websearch MCP server should be configured from preset"
         );
-        let fetch_cfg = &config.mcp_servers["fetch"];
-        assert_eq!(fetch_cfg.server_type, "stdio");
-        assert_eq!(fetch_cfg.command.as_deref(), Some("npx"));
+        let ws_cfg = &config.mcp_servers["websearch"];
+        assert_eq!(ws_cfg.server_type, "stdio");
+        assert_eq!(ws_cfg.command.as_deref(), Some("npx"));
 
         // Verify the YAML round-trips: save it again, reload, still valid
         let roundtrip_path = std::env::temp_dir().join("test-xpressclaw-wizard-roundtrip.yaml");
         config.save(&roundtrip_path).unwrap();
         let reloaded = Config::load(&roundtrip_path).unwrap();
         assert_eq!(reloaded.agents[0].name, "researcher");
-        assert!(reloaded.mcp_servers.contains_key("fetch"));
+        assert!(reloaded.mcp_servers.contains_key("websearch"));
         let _ = std::fs::remove_file(&roundtrip_path);
 
         // ── Step 2: add developer agent via add-agent ──
@@ -1237,10 +1231,10 @@ mod tests {
         assert!(agent_names.contains(&"researcher"));
         assert!(agent_names.contains(&"developer"));
 
-        // Researcher's fetch should still be there
+        // Researcher's websearch should still be there
         assert!(
-            config.mcp_servers.contains_key("fetch"),
-            "fetch MCP server should be preserved"
+            config.mcp_servers.contains_key("websearch"),
+            "websearch MCP server should be preserved"
         );
 
         // Cleanup
@@ -1259,7 +1253,7 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
-        // Frontend sends explicit fetch config with custom env (URL filter)
+        // Frontend sends custom websearch config that should override preset default
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1272,14 +1266,14 @@ mod tests {
                             "agents": [{
                                 "name": "researcher",
                                 "preset": "researcher",
-                                "tools": ["filesystem", "shell", "memory", "fetch"]
+                                "tools": ["filesystem", "shell", "memory", "websearch"]
                             }],
                             "mcp_servers": {
-                                "fetch": {
+                                "websearch": {
                                     "type": "stdio",
                                     "command": "npx",
-                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
-                                    "env": { "FETCH_BLOCKED_URLS": "*.evil.com" }
+                                    "args": ["-y", "duckduckgo-mcp-server"],
+                                    "env": { "SEARCH_LANG": "en" }
                                 }
                             }
                         })
@@ -1293,21 +1287,21 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let config = Config::load(&config_path).unwrap();
-        let fetch_cfg = config
+        let ws_cfg = config
             .mcp_servers
-            .get("fetch")
-            .expect("fetch MCP server missing");
+            .get("websearch")
+            .expect("websearch MCP server missing");
         // Frontend's explicit config should win over preset default
         assert_eq!(
-            fetch_cfg.env.get("FETCH_BLOCKED_URLS").map(|s| s.as_str()),
-            Some("*.evil.com"),
+            ws_cfg.env.get("SEARCH_LANG").map(|s| s.as_str()),
+            Some("en"),
             "frontend env overrides should be preserved"
         );
 
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// add-agent with frontend MCP servers should override preset defaults.
+    /// add-agent with researcher preset should merge its MCP servers.
     #[tokio::test]
     async fn test_add_agent_frontend_mcp_overrides() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");
@@ -1339,7 +1333,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Add researcher with custom fetch config from frontend
+        // Add researcher — preset's websearch MCP server should be merged
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1350,15 +1344,8 @@ mod tests {
                         json!({
                             "name": "researcher",
                             "preset": "researcher",
-                            "tools": ["filesystem", "shell", "memory", "fetch"],
-                            "mcp_servers": {
-                                "fetch": {
-                                    "type": "stdio",
-                                    "command": "npx",
-                                    "args": ["-y", "@modelcontextprotocol/server-fetch"],
-                                    "env": { "FETCH_ALLOWED_URLS": "*.wikipedia.org,*.arxiv.org" }
-                                }
-                            }
+                            "tools": ["filesystem", "shell", "memory", "websearch"],
+                            "mcp_servers": {}
                         })
                         .to_string(),
                     ))
@@ -1371,15 +1358,12 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
 
-        // Frontend-provided fetch config should be used (not bare preset default)
-        let fetch_cfg = config
+        // Researcher preset's websearch MCP server should be present
+        let ws_cfg = config
             .mcp_servers
-            .get("fetch")
-            .expect("fetch MCP server missing");
-        assert_eq!(
-            fetch_cfg.env.get("FETCH_ALLOWED_URLS").map(|s| s.as_str()),
-            Some("*.wikipedia.org,*.arxiv.org"),
-        );
+            .get("websearch")
+            .expect("websearch MCP server missing from researcher preset");
+        assert_eq!(ws_cfg.command.as_deref(), Some("npx"),);
 
         let _ = std::fs::remove_file(&config_path);
     }

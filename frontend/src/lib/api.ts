@@ -9,8 +9,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
 		throw new Error(body.error || res.statusText);
 	}
-	if (res.status === 204) return undefined as T;
-	return res.json();
+	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
+	const text = await res.text();
+	if (!text) return undefined as T;
+	return JSON.parse(text);
 }
 
 // -- Conversations --
@@ -59,6 +61,10 @@ export const conversations = {
 	update: (id: string, data: { title?: string; icon?: string }) =>
 		request<Conversation>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
+	stop: (id: string, agentId?: string) => {
+		const params = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
+		return request<void>(`/api/conversations/${id}/stop${params}`, { method: 'POST' });
+	},
 	messages: (id: string, limit = 50, beforeId?: number) => {
 		const params = new URLSearchParams({ limit: String(limit) });
 		if (beforeId) params.set('before_id', String(beforeId));
@@ -213,7 +219,18 @@ export interface Agent {
 	desired_status: string;
 	observed_status: string;
 	container_id: string | null;
-	config: string;
+	config?: {
+		display_name?: string | null;
+		role_title?: string | null;
+		responsibilities?: string | null;
+		avatar?: string | null;
+		role?: string;
+		model?: string | null;
+		tools?: string[];
+		skills?: string[];
+		volumes?: string[];
+		idle_prompt?: string | null;
+	};
 	created_at: string;
 	started_at: string | null;
 	stopped_at: string | null;
@@ -256,7 +273,9 @@ export const agents = {
 		idle_prompt?: string | null;
 	}) => request<{ agent: LiveConfig['agents'][0]; needs_restart: boolean }>(
 		`/api/agents/${id}/config`, { method: 'PATCH', body: JSON.stringify(data) }
-	)
+	),
+	logs: (id: string, tail = 100) =>
+		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
 };
 
 // -- Tasks --

@@ -89,14 +89,43 @@
 		dockerStarting = false;
 	}
 
+	// Connection health monitor — detect when server goes away and
+	// auto-reload when it comes back. Prevents the app from being
+	// stuck in a "loading" state forever after a server restart.
+	let serverConnected = $state(true);
+	let wasDisconnected = false;
+
+	async function checkConnection() {
+		try {
+			const resp = await fetch('/api/agents', { signal: AbortSignal.timeout(3000) });
+			if (resp.ok) {
+				if (wasDisconnected) {
+					// Server is back — reload the page to reset all state
+					wasDisconnected = false;
+					serverConnected = true;
+					window.location.reload();
+					return;
+				}
+				serverConnected = true;
+			} else {
+				serverConnected = false;
+				wasDisconnected = true;
+			}
+		} catch {
+			serverConnected = false;
+			wasDisconnected = true;
+		}
+	}
+
 	onMount(() => {
 		if (isSetupRoute) return;
 		loadSidebar();
 		checkDocker();
 		const interval = setInterval(() => {
 			loadSidebar();
+			checkConnection();
 			if (!dockerAvailable) checkDocker();
-		}, 10000);
+		}, 5000);
 		return () => clearInterval(interval);
 	});
 
@@ -193,7 +222,7 @@
 							{@const active = isAgentActive(agent.id, $page.url.pathname)}
 							<a href="/agents/{agent.id}" class={linkClass(active)}>
 								<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover ring-2 {agent.status === 'running' ? 'ring-emerald-400' : agent.status === 'starting' ? 'ring-amber-400' : 'ring-red-400'}" />
-								<span class="truncate">{agent.name}</span>
+								<span class="truncate">{agent.config?.display_name || agent.name}</span>
 							</a>
 						{/each}
 					</div>
@@ -318,6 +347,21 @@
 			</div>
 		</main>
 	</div>
+
+	<!-- Server disconnected overlay -->
+	{#if !serverConnected}
+		<div class="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm">
+			<div class="mx-4 w-full max-w-xs rounded-xl border border-border bg-card p-6 shadow-2xl text-center space-y-3">
+				<div class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-amber-500/10">
+					<svg class="h-5 w-5 text-amber-500 animate-pulse" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" />
+					</svg>
+				</div>
+				<h3 class="text-sm font-semibold">Reconnecting...</h3>
+				<p class="text-xs text-muted-foreground">Lost connection to the server. Will reconnect automatically.</p>
+			</div>
+		</div>
+	{/if}
 
 	<!-- Docker unavailable modal -->
 	{#if !dockerAvailable && !isSetupRoute}

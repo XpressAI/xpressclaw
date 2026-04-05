@@ -61,17 +61,23 @@ async fn reconcile_once(
     Ok(())
 }
 
-/// Ensure Ollama models are pulled for agents using the local provider.
-/// Only runs when using Ollama (no GGUF path set) and Ollama is reachable.
+/// Ensure Ollama models are pulled for agents that explicitly use Ollama.
+///
+/// Only runs when:
+/// 1. No embedded GGUF path is set (local_model_path is None)
+/// 2. The default provider is "local" AND local_base_url points to Ollama
+///    (or an agent explicitly overrides to use Ollama)
+/// 3. Ollama is actually reachable
+///
+/// Skipped entirely when using the embedded llama.cpp provider.
 async fn reconcile_models(config: &Config) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
 
-    // Only relevant when using Ollama (local provider without a GGUF path)
-    if config.llm.local_model_path.is_some() {
-        return;
-    }
-    if config.llm.default_provider != "local" {
+    // Only pull from Ollama when explicitly configured as the provider.
+    // "local" = embedded llama.cpp (no Ollama needed).
+    // "ollama" = Ollama HTTP API.
+    if config.llm.default_provider != "ollama" {
         return;
     }
 
@@ -98,19 +104,19 @@ async fn reconcile_models(config: &Config) {
         return;
     }
 
-    // Collect unique model names across agents + global config
+    // Collect models only from agents that actually use local/Ollama
     let mut models = std::collections::HashSet::new();
     if let Some(ref m) = config.llm.local_model {
         models.insert(m.clone());
     }
     for agent in &config.agents {
-        let uses_local = agent
+        let uses_ollama = agent
             .llm
             .as_ref()
             .and_then(|l| l.provider.as_deref())
             .unwrap_or(&config.llm.default_provider)
-            == "local";
-        if uses_local {
+            == "ollama";
+        if uses_ollama {
             if let Some(ref m) = agent.model {
                 models.insert(m.clone());
             }
@@ -223,7 +229,8 @@ async fn reconcile_agents(
         let is_running = docker.is_container_running(&container_name).await;
 
         match (agent.desired_status.as_str(), is_running) {
-            // Desired running, is running → check stability + ensure DB has container_id
+            // Desired running, is running → check stability, image freshness,
+            // and ensure DB has container_id.
             ("running", true) => {
                 // Ensure container_id is stored (may be missing after restart)
                 if agent.container_id.is_none() {
@@ -234,6 +241,26 @@ async fn reconcile_agents(
                             Some(&cid),
                         );
                     }
+                }
+
+                // Check if the container's image matches the latest.
+                // If the image was rebuilt (e.g. by build.sh), recreate
+                // the container so the agent gets the new harness code.
+                let image = crate::docker::images::image_for_backend(&agent_config.backend);
+                if !docker.container_image_matches(&container_name, image).await {
+                    info!(
+                        agent = agent.id,
+                        image, "harness image updated, recreating container"
+                    );
+                    let _ = docker.stop(&agent.id).await;
+                    // The next reconcile cycle will see ("running", false) and
+                    // start a new container from the updated image.
+                    let _ = registry.update_status(
+                        &agent.id,
+                        &crate::agents::state::AgentStatus::Stopped,
+                        None,
+                    );
+                    continue;
                 }
 
                 if agent.restart_count > 0 {
@@ -369,6 +396,8 @@ struct AppRow {
     start_command: Option<String>,
     image: Option<String>,
     port: i64,
+    restart_count: i32,
+    last_attempt_at: Option<String>,
 }
 
 /// Reconcile published app containers — restart any that should be running but aren't.
@@ -376,7 +405,8 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
     let apps: Vec<AppRow> = {
         let conn = db.conn();
         let mut stmt = match conn.prepare(
-            "SELECT id, agent_id, start_command, image, port FROM apps
+            "SELECT id, agent_id, start_command, image, port, restart_count, last_attempt_at
+             FROM apps
              WHERE status IN ('running', 'starting') AND start_command IS NOT NULL",
         ) {
             Ok(s) => s,
@@ -389,6 +419,8 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
                 start_command: row.get(2)?,
                 image: row.get(3)?,
                 port: row.get(4)?,
+                restart_count: row.get(5)?,
+                last_attempt_at: row.get(6)?,
             })
         })
         .unwrap_or_else(|_| panic!("query apps"))
@@ -401,16 +433,36 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
         let agent_id = &app.agent_id;
         let container_name = format!("app-{app_id}");
         if docker.is_container_running(&container_name).await {
-            continue; // Already running
+            // Running — reset restart count if it was elevated
+            if app.restart_count > 0 {
+                let conn = db.conn();
+                let _ = conn.execute("UPDATE apps SET restart_count = 0 WHERE id = ?1", [app_id]);
+            }
+            continue;
         }
 
         let Some(cmd) = app.start_command else {
             continue;
         };
+
+        // Backoff: don't restart every 10s if it keeps failing
+        if !should_attempt(app.restart_count, app.last_attempt_at.as_deref()) {
+            debug!(
+                app_id,
+                restart_count = app.restart_count,
+                "app restart backoff"
+            );
+            continue;
+        }
+
         let image = app.image.unwrap_or_else(|| "node:20-alpine".to_string());
         let app_port = app.port as u16;
 
-        info!(app_id, "restarting app container");
+        info!(
+            app_id,
+            restart_count = app.restart_count,
+            "restarting app container"
+        );
 
         let volume_name = format!("xpressclaw-workspace-{agent_id}");
         let spec = crate::docker::manager::ContainerSpec {
@@ -428,6 +480,15 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), cmd]),
             working_dir: Some(format!("/workspace/apps/{app_id}")),
         };
+
+        // Record attempt time + bump restart count
+        {
+            let conn = db.conn();
+            let _ = conn.execute(
+                "UPDATE apps SET restart_count = restart_count + 1, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [app_id],
+            );
+        }
 
         match docker.launch(&container_name, &spec).await {
             Ok(info) => {
@@ -581,6 +642,26 @@ fn reconcile_idle_tasks(db: &Arc<Database>, config: &Config) {
 
         // Seed scratch pad on first use
         seed_scratch_pad(&agent_cfg.name, &config.system.data_dir);
+
+        // Memory consolidation: process Inbox/ → Zettel/ during idle periods.
+        // Runs as a background task since we're in a sync context.
+        if crate::memory::hooks::has_remember_hook(&agent_cfg.hooks) {
+            if let Some(ref cid) = agent.container_id {
+                let db2 = db.clone();
+                let eviction = config.memory.eviction.clone();
+                let agent_name = agent_cfg.name.clone();
+                let cid2 = cid.clone();
+                tokio::spawn(async move {
+                    if let Ok(docker) = DockerManager::connect().await {
+                        if let Some(port) = docker.get_container_port(&cid2).await {
+                            let mem_hooks = crate::memory::hooks::MemoryHooks::new(db2, &eviction);
+                            mem_hooks.consolidate(&agent_name, port).await;
+                            debug!(agent = agent_name, "memory consolidation during idle");
+                        }
+                    }
+                });
+            }
+        }
 
         // Create the hidden idle task
         match board.create_idle_task(&agent_cfg.name, &description) {

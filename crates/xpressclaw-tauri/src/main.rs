@@ -286,41 +286,56 @@ pub fn confirm_quit(app: &tauri::AppHandle) {
 }
 
 /// Gracefully stop agents and kill the sidecar.
-/// Runs `xpressclaw down` (which stops Docker containers via the API),
-/// then kills the sidecar child process.
+///
+/// Sends SIGTERM to the sidecar so it can run its graceful shutdown
+/// (stop Docker containers, flush state). Falls back to SIGKILL if
+/// the process doesn't exit within 10 seconds.
 pub fn shutdown_sidecar(app: &tauri::AppHandle) {
-    let port = std::env::var("XPRESSCLAW_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
-    // Resolve the sidecar binary path from the stored child's info,
-    // or fall back to the CLI name on PATH.
-    let cli_name = if cfg!(target_os = "windows") {
-        "xpressclaw.exe"
-    } else {
-        "xpressclaw"
-    };
-    let sidecar_path = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join(cli_name)))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from(cli_name));
-
-    // Run `xpressclaw down --port <port>` to stop all agents/containers
-    info!("running xpressclaw down");
-    let _ = std::process::Command::new(&sidecar_path)
-        .args(["down", "--port", &port.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Kill the sidecar server process
     let mut child = app.state::<SidecarState>().0.lock().unwrap().take();
-    if let Some(ref mut child) = child {
-        info!("killing sidecar process");
+    let Some(ref mut child) = child else {
+        return;
+    };
+
+    let pid = child.id();
+    info!(pid, "sending SIGTERM to sidecar");
+
+    // Send SIGTERM so the server's graceful shutdown runs
+    // (stops Docker containers, cancels background tasks).
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: no SIGTERM equivalent, just kill
         let _ = child.kill();
-        let _ = child.wait();
+    }
+
+    // Wait up to 15s for graceful exit, then force kill
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                info!(pid, ?status, "sidecar exited");
+                return;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    warn!(pid, "sidecar did not exit in time — sending SIGKILL");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                warn!(pid, error = %e, "error waiting for sidecar");
+                let _ = child.kill();
+                return;
+            }
+        }
     }
 }
 

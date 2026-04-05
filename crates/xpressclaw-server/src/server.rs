@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::frontend;
 use crate::routes;
@@ -59,28 +59,39 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         });
     }
 
+    // Shutdown token: cancels all background tasks on Ctrl+C.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     // Start the task dispatcher background loop.
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config();
+    let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        xpressclaw_core::tasks::dispatcher::start_dispatcher(dispatcher_db, dispatcher_config)
-            .await;
+        tokio::select! {
+            _ = xpressclaw_core::tasks::dispatcher::start_dispatcher(dispatcher_db, dispatcher_config) => {}
+            _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
+        }
     });
 
     // Start the cron schedule runner.
     let scheduler_db = state.db.clone();
+    let scheduler_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db).await;
+        tokio::select! {
+            _ = xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db) => {}
+            _ = scheduler_shutdown.cancelled() => { info!("scheduler stopped"); }
+        }
     });
 
     // Start the desired-state reconciler (ADR-018).
-    // Continuously converges agents, images, and tasks toward desired state.
-    // Passes the RwLock config so the reconciler always sees the latest config
-    // after user changes (add/remove agents, update API keys, etc.)
     let reconciler_db = state.db.clone();
-    let reconciler_config = state.config.clone(); // Arc<RwLock<Arc<Config>>>
+    let reconciler_config = state.config.clone();
+    let reconciler_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port).await;
+        tokio::select! {
+            _ = xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port) => {}
+            _ = reconciler_shutdown.cancelled() => { info!("reconciler stopped"); }
+        }
     });
 
     let app = create_router(state.clone());
@@ -93,37 +104,70 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    // Graceful shutdown: stop all agent and app containers
-    info!("shutting down — stopping containers");
-    if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-        let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-        if let Ok(agents) = registry.list() {
-            for agent in &agents {
-                let _ = docker.stop(&agent.id).await;
+    // Cancel all background tasks immediately
+    shutdown.cancel();
+
+    // Graceful shutdown: stop containers with a timeout.
+    // A second Ctrl+C during shutdown forces immediate exit.
+    info!("shutting down — stopping containers (Ctrl+C again to force quit)");
+
+    let shutdown_task = async {
+        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
+            let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
+            if let Ok(agents) = registry.list() {
+                for agent in &agents {
+                    let _ = docker.stop(&agent.id).await;
+                }
             }
+            let apps: Vec<String> = {
+                let conn = state.db.conn();
+                conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([], |row| row.get::<_, String>(0))
+                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                    })
+                    .unwrap_or_default()
+            };
+            for app_id in &apps {
+                let _ = docker.stop(&format!("app-{app_id}")).await;
+            }
+            info!("all containers stopped");
         }
-        // Stop app containers
-        let apps: Vec<String> = {
-            let conn = state.db.conn();
-            conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| row.get::<_, String>(0))
-                        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                })
-                .unwrap_or_default()
-        };
-        for app_id in &apps {
-            let _ = docker.stop(&format!("app-{app_id}")).await;
+    };
+
+    tokio::select! {
+        _ = shutdown_task => {}
+        _ = tokio::signal::ctrl_c() => {
+            info!("force quit — skipping container cleanup");
         }
-        info!("all containers stopped");
+        _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {
+            warn!("shutdown timed out after 15s — skipping remaining containers");
+        }
     }
 
     Ok(())
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install Ctrl+C handler");
-    info!("received shutdown signal");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("received SIGINT");
+            }
+            _ = sigterm.recv() => {
+                info!("received SIGTERM");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+        info!("received shutdown signal");
+    }
 }

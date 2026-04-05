@@ -15,6 +15,11 @@ RUN pip install --no-cache-dir -r /tmp/claude-requirements.txt
 
 COPY harness.py .
 
+# Disable Claude Code telemetry and attribution headers
+ENV CLAUDE_CODE_ATTRIBUTION_HEADER=0
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+ENV DISABLE_TELEMETRY=1
+
 # Default workspace mount point
 RUN mkdir -p /workspace
 

@@ -138,12 +138,11 @@ impl DockerManager {
     pub fn is_docker_desktop_installed() -> bool {
         #[cfg(target_os = "macos")]
         {
-            return std::path::Path::new("/Applications/Docker.app").exists();
+            std::path::Path::new("/Applications/Docker.app").exists()
         }
         #[cfg(target_os = "windows")]
         {
-            return std::path::Path::new("C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe")
-                .exists();
+            std::path::Path::new("C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe").exists()
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
@@ -158,11 +157,12 @@ impl DockerManager {
                 .status()
                 .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
             if status.success() {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(Error::DockerNotAvailable(
+                    "Failed to start Docker Desktop".to_string(),
+                ))
             }
-            return Err(Error::DockerNotAvailable(
-                "Failed to start Docker Desktop".to_string(),
-            ));
         }
         #[cfg(target_os = "windows")]
         {
@@ -176,11 +176,12 @@ impl DockerManager {
                 .status()
                 .map_err(|e| Error::DockerNotAvailable(format!("Failed to start Docker: {e}")))?;
             if status.success() {
-                return Ok(());
+                Ok(())
+            } else {
+                Err(Error::DockerNotAvailable(
+                    "Failed to start Docker Desktop".to_string(),
+                ))
             }
-            return Err(Error::DockerNotAvailable(
-                "Failed to start Docker Desktop".to_string(),
-            ));
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Err(Error::DockerNotAvailable(
@@ -304,7 +305,9 @@ impl DockerManager {
     pub async fn stop(&self, agent_id: &str) -> Result<()> {
         let container_name = format!("xpressclaw-{agent_id}");
 
-        let stop_opts = StopContainerOptions { t: 10 };
+        // Short timeout — containers will be restarted on next boot.
+        // Node.js/Python processes that don't handle SIGTERM get SIGKILL after this.
+        let stop_opts = StopContainerOptions { t: 2 };
         if let Err(e) = self
             .docker
             .stop_container(&container_name, Some(stop_opts))
@@ -448,6 +451,27 @@ impl DockerManager {
     /// Check if an image exists locally.
     pub async fn has_image(&self, image: &str) -> bool {
         self.docker.inspect_image(image).await.is_ok()
+    }
+
+    /// Check if a container's image matches the latest local image.
+    /// Returns false if the container is running an outdated image.
+    pub async fn container_image_matches(
+        &self,
+        container_name: &str,
+        expected_image: &str,
+    ) -> bool {
+        let container_image = match self.docker.inspect_container(container_name, None).await {
+            Ok(info) => info.image,
+            Err(_) => return true, // Can't check, assume ok
+        };
+        let latest_image = match self.docker.inspect_image(expected_image).await {
+            Ok(info) => info.id,
+            Err(_) => return true, // Image not found locally, assume ok
+        };
+        match (container_image, latest_image) {
+            (Some(container_sha), Some(latest_sha)) => container_sha == latest_sha,
+            _ => true, // Can't compare, assume ok
+        }
     }
 
     /// Check if a named container is running.

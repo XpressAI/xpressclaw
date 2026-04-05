@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
-	import { statusColor, timeAgo } from '$lib/utils';
+	import { statusColor, timeAgo, agentAvatar } from '$lib/utils';
 
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
@@ -64,9 +64,12 @@
 			{#each agentList as agent}
 				<div class="rounded-lg border border-border bg-card p-4 space-y-3">
 					<div class="flex items-start justify-between">
-						<div>
-							<a href="/agents/{agent.id}" class="text-sm font-semibold hover:underline">{agent.name}</a>
-							<div class="text-xs text-muted-foreground mt-0.5">{agent.backend}</div>
+						<div class="flex items-center gap-3">
+							<img src={agentAvatar(agent)} alt="" class="h-9 w-9 rounded-full object-cover flex-shrink-0" />
+							<div>
+								<a href="/agents/{agent.id}" class="text-sm font-semibold hover:underline">{agent.config?.display_name || agent.name}</a>
+								<div class="text-xs text-muted-foreground mt-0.5">{agent.backend}</div>
+							</div>
 						</div>
 						<span class="inline-flex items-center gap-1.5 text-xs {statusColor(agent.status)}">
 							<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : agent.status === 'starting' || agent.status === 'stopping' ? 'bg-amber-400 animate-pulse' : agent.status === 'error' ? 'bg-red-400' : 'bg-muted-foreground/30'}"></span>

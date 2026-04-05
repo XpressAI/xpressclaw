@@ -19,12 +19,15 @@ use tracing::{debug, error, info, warn};
 
 use serde_json::json;
 
+use crate::activity::ActivityManager;
 use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
+use crate::config::HooksConfig;
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::DockerManager;
+use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
@@ -56,6 +59,8 @@ pub enum DriverResult {
     Skipped,
     /// Agent not ready — put back in queue for later.
     Requeue,
+    /// Task paused — agent requested user input.
+    Paused,
 }
 
 /// Mutable context carried between state machine transitions.
@@ -63,13 +68,13 @@ struct Context {
     task: Task,
     agent_id: String,
     harness_port: u16,
-    model: String,
     system_prompt: String,
     turn: usize,
     max_turns: usize,
     current_prompt: String,
     last_response: String,
     subtasks: Vec<Task>,
+    hooks: HooksConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,9 +94,9 @@ async fn run_task(
         state = match state {
             State::LoadTask => load_task(db, config, task_id, agent_id, &mut ctx).await,
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
-            State::CallAgent => call_agent(ctx.as_mut().unwrap()).await,
-            State::ProcessResponse => process_response(db, ctx.as_mut().unwrap()),
-            State::Evaluate => evaluate(db, ctx.as_mut().unwrap()),
+            State::CallAgent => call_agent(db, config, ctx.as_mut().unwrap()).await,
+            State::ProcessResponse => process_response(db, config, ctx.as_mut().unwrap()),
+            State::Evaluate => evaluate(db, config, ctx.as_mut().unwrap()),
             State::Done(result) => return result,
         };
     }
@@ -117,15 +122,15 @@ async fn load_task(
 
     // Verify task is actionable
     match task.status {
-        TaskStatus::Pending | TaskStatus::InProgress => {}
+        TaskStatus::Pending | TaskStatus::InProgress | TaskStatus::WaitingForInput => {}
         _ => {
             debug!(task_id, status = ?task.status, "task not actionable, skipping");
             return State::Done(DriverResult::Skipped);
         }
     }
 
-    // Mark as in_progress if pending
-    if task.status == TaskStatus::Pending {
+    // Mark as in_progress if pending or resuming from waiting_for_input
+    if task.status == TaskStatus::Pending || task.status == TaskStatus::WaitingForInput {
         if let Err(e) = board.update_status(task_id, "in_progress", Some(agent_id)) {
             warn!(task_id, error = %e, "failed to set task in_progress");
             return State::Done(DriverResult::Failed(e.to_string()));
@@ -134,9 +139,6 @@ async fn load_task(
 
     // Get agent config
     let agent_cfg = config.agents.iter().find(|a| a.name == agent_id);
-    let model = agent_cfg
-        .and_then(|a| a.model.clone())
-        .unwrap_or_else(|| "local".to_string());
     let system_prompt = agent_cfg
         .map(|a| a.full_system_prompt())
         .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
@@ -198,17 +200,19 @@ async fn load_task(
         "loaded task for execution"
     );
 
+    let agent_hooks = agent_cfg.map(|a| a.hooks.clone()).unwrap_or_default();
+
     *ctx = Some(Context {
         task: board.get(task_id).unwrap_or(task),
         agent_id: agent_id.to_string(),
         harness_port,
-        model,
         system_prompt,
         turn: 0,
         max_turns,
         current_prompt: String::new(),
         last_response: String::new(),
         subtasks,
+        hooks: agent_hooks,
     });
 
     State::BuildPrompt
@@ -221,8 +225,11 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     let mut prompt = String::new();
 
     if ctx.turn == 0 {
-        // Initial prompt
-        prompt.push_str(&format!("# Task: {}\n\n", ctx.task.title));
+        // Initial prompt — include the task ID so the agent can call complete_task
+        prompt.push_str(&format!(
+            "# Task: {}\nTask ID: {}\n\n",
+            ctx.task.title, ctx.task.id
+        ));
         if let Some(ref desc) = ctx.task.description {
             prompt.push_str(desc);
             prompt.push_str("\n\n");
@@ -285,39 +292,49 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
             }
         }
 
-        prompt.push_str(
-            "Work on this task using the tools available to you. \
-             When you are done, use the `complete_task` tool to mark it complete.",
-        );
+        if !ctx.subtasks.is_empty() {
+            prompt.push_str(
+                "Work on the current step. Mark each step complete as you finish it. \
+                 When all steps are done, use `complete_task` to mark the parent complete.",
+            );
+        } else {
+            prompt.push_str(&format!(
+                "Work on this task using the tools available to you. \
+                 For complex tasks, consider creating subtasks with `create_task` \
+                 (set parent_task_id to \"{task_id}\") to show progress. \
+                 When done, call `complete_task` with task_id \"{task_id}\". \
+                 If you need clarification from the user, use `request_input`.",
+                task_id = ctx.task.id,
+            ));
+        }
     } else {
-        // Continuation prompt
-        prompt.push_str("Continue working on the current task.\n\n");
+        // Continuation prompt — the agent session preserves context,
+        // so we don't replay history (that causes it to render inside
+        // the system message in the UI). Just nudge the agent forward.
+        prompt.push_str("Continue working on the current task.");
 
         if let Some(subtask) = current_subtask(&ctx.subtasks) {
-            prompt.push_str(&format!("Current step: {}\n", subtask.title));
+            prompt.push_str(&format!("\n\nCurrent step: {}", subtask.title));
             if let Some(ref desc) = subtask.description {
-                prompt.push_str(desc);
-                prompt.push('\n');
+                prompt.push_str(&format!("\n{}", desc));
             }
         }
 
-        // Include recent history for context
-        let recent: Vec<_> = history.iter().rev().take(4).rev().collect();
-        if !recent.is_empty() {
-            prompt.push_str("\nRecent conversation:\n");
-            for msg in recent {
+        // If the user sent a message, highlight it
+        if let Some(last) = history.last() {
+            if last.role == "user" {
                 prompt.push_str(&format!(
-                    "[{}]: {}\n",
-                    msg.role,
-                    truncate(&msg.content, 500)
+                    "\n\nThe user responded:\n> {}",
+                    truncate(&last.content, 500)
                 ));
             }
         }
 
-        prompt.push_str(
-            "\nContinue from where you left off. \
-             Use `complete_task` when this task is fully done.",
-        );
+        prompt.push_str(&format!(
+            "\n\nIMPORTANT: Call `complete_task` with task_id \"{}\" when done. \
+             The task stays open until you call the tool.",
+            ctx.task.id,
+        ));
     }
 
     // Save the user-side prompt as a task message
@@ -327,7 +344,9 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::CallAgent
 }
 
-async fn call_agent(ctx: &mut Context) -> State {
+async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+    use futures_util::StreamExt;
+
     let harness = HarnessClient::new(ctx.harness_port);
 
     debug!(
@@ -337,17 +356,80 @@ async fn call_agent(ctx: &mut Context) -> State {
         "calling agent harness"
     );
 
+    // Memory recall hook: first turn only, if agent has memories.
+    if ctx.turn == 0 && hooks::has_recall_hook(&ctx.hooks) {
+        let mem_hooks = MemoryHooks::new(db.clone(), &config.memory.eviction);
+        if let Some(recollection) = mem_hooks
+            .recall(&ctx.agent_id, &ctx.current_prompt, ctx.harness_port)
+            .await
+        {
+            // Save recollection as a task message (visible in task UI)
+            let conv = TaskConversation::new(db.clone());
+            let _ = conv.add_message(
+                &ctx.task.id,
+                "system",
+                &format!("*Recollection:* {recollection}"),
+            );
+            // Prepend to the prompt so the agent sees it this turn
+            ctx.current_prompt = format!(
+                "Memory recollection:\n{recollection}\n\n{}",
+                ctx.current_prompt
+            );
+        }
+    }
+
+    let conv_id = ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id);
+
+    // Use streaming session endpoint so tool calls and intermediate
+    // text appear in task_messages as they happen.
     match harness
-        .send_task(&ctx.system_prompt, &ctx.current_prompt, &ctx.model)
+        .send_session_message(
+            &ctx.current_prompt,
+            conv_id,
+            "system",
+            "system",
+            &ctx.system_prompt,
+        )
         .await
     {
-        Ok(response) => {
-            let text = response
-                .choices
-                .first()
-                .map(|c| c.message.content.clone())
-                .unwrap_or_default();
-            ctx.last_response = text;
+        Ok(mut stream) => {
+            let conv = TaskConversation::new(db.clone());
+            // Create a streaming message that we update as content arrives.
+            // This lets the frontend's 3s polling show incremental progress.
+            let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
+            let msg_id = streaming_msg.map(|m| m.id);
+
+            let mut full_content = String::new();
+            let mut last_saved_len = 0;
+
+            while let Some(result) = stream.next().await {
+                if let Ok(chunk) = result {
+                    if let Some(choice) = chunk.choices.first() {
+                        if let Some(ref text) = choice.delta.content {
+                            full_content.push_str(text);
+                        }
+                    }
+                }
+
+                // Update the streaming message whenever a tool_call
+                // completes or every 2KB of new content — whichever
+                // comes first. This keeps the UI responsive.
+                let new_bytes = full_content.len() - last_saved_len;
+                let tool_call_ended = full_content[last_saved_len..].contains("</tool_call>");
+                if let Some(id) = msg_id {
+                    if tool_call_ended || new_bytes >= 2048 {
+                        let _ = conv.update_message_content(id, &full_content);
+                        last_saved_len = full_content.len();
+                    }
+                }
+            }
+
+            // Final update with complete content
+            if let Some(id) = msg_id {
+                let _ = conv.update_message_content(id, &full_content);
+            }
+
+            ctx.last_response = full_content;
             State::ProcessResponse
         }
         Err(e) => {
@@ -355,19 +437,30 @@ async fn call_agent(ctx: &mut Context) -> State {
                 task_id = ctx.task.id,
                 turn = ctx.turn,
                 error = %e,
-                "harness call failed"
+                "harness session call failed"
             );
             State::Done(DriverResult::Failed(format!("harness error: {e}")))
         }
     }
 }
 
-fn process_response(db: &Arc<Database>, ctx: &mut Context) -> State {
-    // Save agent response as task message
-    let conv = TaskConversation::new(db.clone());
-    let _ = conv.add_message(&ctx.task.id, "assistant", &ctx.last_response);
-
+fn process_response(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+    // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
+
+    // Async memory remember hook — runs in background, doesn't block
+    if hooks::has_remember_hook(&ctx.hooks) {
+        let db2 = db.clone();
+        let eviction = config.memory.eviction.clone();
+        let aid = ctx.agent_id.clone();
+        let prompt = ctx.current_prompt.clone();
+        let resp = ctx.last_response.clone();
+        let hp = ctx.harness_port;
+        tokio::spawn(async move {
+            let mem_hooks = MemoryHooks::new(db2, &eviction);
+            mem_hooks.remember(&aid, &prompt, &resp, hp).await;
+        });
+    }
 
     debug!(
         task_id = ctx.task.id,
@@ -379,7 +472,7 @@ fn process_response(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::Evaluate
 }
 
-fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
+fn evaluate(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     let board = TaskBoard::new(db.clone());
 
     // Reload task status (agent may have completed it via MCP tools)
@@ -400,6 +493,15 @@ fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
     if ctx.task.status == TaskStatus::Cancelled {
         info!(task_id = ctx.task.id, "task was cancelled");
         return State::Done(DriverResult::Skipped);
+    }
+
+    if ctx.task.status == TaskStatus::WaitingForInput {
+        info!(
+            task_id = ctx.task.id,
+            turns = ctx.turn,
+            "task paused, waiting for user input"
+        );
+        return State::Done(DriverResult::Paused);
     }
 
     // IDLE tasks auto-complete after a single agent response and get deleted.
@@ -453,7 +555,7 @@ fn evaluate(db: &Arc<Database>, ctx: &mut Context) -> State {
         ctx.subtasks = board.list_subtasks(&ctx.task.id).unwrap_or_default();
 
         // Send progress update to conversation if subtasks advanced
-        notify_conversation(db, &ctx.task.id, &ctx.agent_id, "in_progress");
+        notify_conversation(db, config, &ctx.task.id, &ctx.agent_id, "in_progress");
 
         // Check if all subtasks are done
         let all_done = ctx
@@ -532,7 +634,13 @@ fn reset_idle_count(db: &Arc<Database>, agent_id: &str) {
 
 /// Send a task status notification back to the originating conversation.
 /// Includes subtask progress (completed/total) for inline progress bars.
-fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status: &str) {
+fn notify_conversation(
+    db: &Arc<Database>,
+    config: &Config,
+    task_id: &str,
+    agent_id: &str,
+    status: &str,
+) {
     let board = TaskBoard::new(db.clone());
     let task = match board.get(task_id) {
         Ok(t) => t,
@@ -562,12 +670,20 @@ fn notify_conversation(db: &Arc<Database>, task_id: &str, agent_id: &str, status
     })
     .to_string();
 
+    // Use display_name if available, fall back to agent_id
+    let display_name = config
+        .agents
+        .iter()
+        .find(|a| a.name == agent_id)
+        .and_then(|a| a.display_name.clone())
+        .unwrap_or_else(|| agent_id.to_string());
+
     if let Err(e) = mgr.send_message(
         &conv_id,
         &SendMessage {
             sender_type: "system".into(),
             sender_id: agent_id.to_string(),
-            sender_name: Some(agent_id.to_string()),
+            sender_name: Some(display_name.clone()),
             content,
             message_type: Some("task_status".into()),
         },
@@ -742,14 +858,38 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                 if !is_idle {
                     let _ = board.update_status(&claimed.task_id, "completed", None);
                     reset_idle_count(db, &claimed.agent_id);
-                    notify_conversation(db, &claimed.task_id, &claimed.agent_id, "completed");
+                    notify_conversation(
+                        db,
+                        config,
+                        &claimed.task_id,
+                        &claimed.agent_id,
+                        "completed",
+                    );
+                }
+                // Log activity
+                if !is_idle {
+                    let activity = ActivityManager::new(db.clone());
+                    let title = board
+                        .get(&claimed.task_id)
+                        .map(|t| t.title)
+                        .unwrap_or_default();
+                    let _ = activity.log(
+                        "task_completed",
+                        Some(&claimed.agent_id),
+                        Some(&json!({
+                            "task_id": claimed.task_id,
+                            "title": title,
+                        })),
+                        None,
+                    );
                 }
                 info!(task_id = claimed.task_id, "task completed");
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
+                let _ = board.update_status(&claimed.task_id, "cancelled", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
-                notify_conversation(db, &claimed.task_id, &claimed.agent_id, "failed");
+                notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
             }
             DriverResult::Skipped => {
                 let _ = queue.complete(claimed.id, "skipped");
@@ -763,6 +903,10 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                     task_id = claimed.task_id,
                     "task requeued (agent became unavailable mid-execution)"
                 );
+            }
+            DriverResult::Paused => {
+                let _ = queue.complete(claimed.id, "waiting_for_input");
+                info!(task_id = claimed.task_id, "task paused for user input");
             }
         }
     }

@@ -5,10 +5,7 @@
 	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
 	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
 	import { settings } from '$lib/api';
-	import { marked } from 'marked';
-	import DOMPurify from 'dompurify';
-
-	marked.setOptions({ breaks: true, gfm: true });
+	import { renderContent } from '$lib/formatMessage';
 
 	let conv = $state<Conversation | null>(null);
 	let messages = $state<ConversationMessage[]>([]);
@@ -220,6 +217,22 @@
 		}
 	}
 
+	async function stopAgent() {
+		if (!conv) return;
+		try {
+			await conversations.stop(conv.id, thinkingAgent ?? undefined);
+			if (cancelStream) {
+				cancelStream();
+				cancelStream = null;
+			}
+			sending = false;
+			thinkingAgent = null;
+			streamingContent = '';
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
 	function scrollToBottom() {
 		if (messagesEl) {
 			messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -274,69 +287,6 @@
 
 		showMentionPicker = false;
 		textarea.focus();
-	}
-
-	function renderContent(content: string): string {
-		let result = content;
-
-		const thinkingBlocks: string[] = [];
-
-		result = result.replace(/<think>([\s\S]*?)<\/think>/g, (_match: string, thinking: string) => {
-			const trimmed = thinking.trim();
-			if (!trimmed) return '';
-			const idx = thinkingBlocks.length;
-			thinkingBlocks.push(trimmed);
-			return `%%THINK_${idx}%%`;
-		});
-
-		result = result.replace(/<think>([\s\S]*)$/g, (_match: string, thinking: string) => {
-			const trimmed = thinking.trim();
-			const idx = thinkingBlocks.length;
-			thinkingBlocks.push(trimmed || '');
-			return `%%THINKSTREAM_${idx}%%`;
-		});
-
-		const toolCallBlocks: { name: string; args: string }[] = [];
-		result = result.replace(/<tool_call name="([^"]*)">([\s\S]*?)<\/tool_call>/g, (_match: string, name: string, args: string) => {
-			const idx = toolCallBlocks.length;
-			toolCallBlocks.push({ name, args: args.trim() });
-			return `%%TOOL_${idx}%%`;
-		});
-
-		result = result.replace(/@\[AGENT:([^:]+):([^\]]+)\]/g, '**@$2**');
-
-		result = DOMPurify.sanitize(marked.parse(result) as string, {
-			ADD_TAGS: ['details', 'summary'],
-			ADD_ATTR: ['open']
-		});
-
-		for (let i = 0; i < thinkingBlocks.length; i++) {
-			const thinking = thinkingBlocks[i];
-			const escaped = DOMPurify.sanitize(marked.parse(thinking) as string);
-
-			result = result.replace(
-				`%%THINK_${i}%%`,
-				`<details class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-muted-foreground select-none">Thinking...</summary><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`
-			);
-
-			const streamHtml = thinking
-				? `<div class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><div class="px-3 py-1.5 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`
-				: '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
-			result = result.replace(`%%THINKSTREAM_${i}%%`, streamHtml);
-		}
-
-		for (let i = 0; i < toolCallBlocks.length; i++) {
-			const { name, args } = toolCallBlocks[i];
-			let prettyArgs = args;
-			try { prettyArgs = JSON.stringify(JSON.parse(args), null, 2); } catch {}
-			const escapedArgs = prettyArgs.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-			result = result.replace(
-				`%%TOOL_${i}%%`,
-				`<details class="mb-2 rounded-lg border border-blue-500/30 bg-blue-500/5 text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-blue-400 select-none flex items-center gap-1.5"><span>&#x1f527;</span> ${name}</summary><pre class="px-3 py-2 text-muted-foreground/80 border-t border-blue-500/20 overflow-x-auto">${escapedArgs}</pre></details>`
-			);
-		}
-
-		return result;
 	}
 
 	function convTitle(): string {
@@ -626,7 +576,7 @@
 							{@const askQuestions = parseAskUserQuestion(msg.content)}
 							{@const msgKey = msg.id.toString()}
 							<div class="flex items-center gap-2">
-								<span class="text-xs font-semibold text-foreground">{msg.sender_name ?? msg.sender_id}</span>
+								<span class="text-xs font-semibold text-foreground">{agent?.config?.display_name || msg.sender_name || msg.sender_id}</span>
 								<span class="text-xs text-muted-foreground">{timeAgo(msg.created_at)}</span>
 							</div>
 
@@ -807,13 +757,23 @@
 							disabled={sending}
 						></textarea>
 					</div>
-					<button
-						onclick={sendMessage}
-						disabled={!input.trim() || sending}
-						class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
-					>
-						<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-					</button>
+					{#if sending}
+						<button
+							onclick={stopAgent}
+							class="flex h-11 w-11 items-center justify-center rounded-xl bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors flex-shrink-0 shadow-lg shadow-destructive/20"
+							title="Stop agent"
+						>
+							<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+						</button>
+					{:else}
+						<button
+							onclick={sendMessage}
+							disabled={!input.trim()}
+							class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
+						>
+							<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+						</button>
+					{/if}
 				</div>
 			</div>
 		</div>

@@ -16,6 +16,7 @@
 	import TasksTab from './TasksTab.svelte';
 	import SchedulesTab from './SchedulesTab.svelte';
 	import ChannelsTab from './ChannelsTab.svelte';
+	import LogsTab from './LogsTab.svelte';
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
@@ -45,6 +46,7 @@
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Schedules' },
 		{ id: 'channels', label: 'Channels' },
+		{ id: 'logs', label: 'Logs' },
 	];
 
 	onMount(() => {
@@ -269,6 +271,8 @@
 				<SchedulesTab agentId={agent.id} />
 			{:else if activeTab === 'channels'}
 				<ChannelsTab />
+			{:else if activeTab === 'logs'}
+				<LogsTab agentId={agent.id} />
 			{/if}
 		</div>
 

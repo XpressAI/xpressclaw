@@ -116,15 +116,24 @@
 			</div>
 			<div class="divide-y divide-border">
 				{#each recentActivity.slice(0, 8) as event}
-					<div class="px-4 py-2.5">
+					{@const data = typeof event.event_data === 'string' ? (() => { try { return JSON.parse(event.event_data); } catch { return event.event_data; } })() : event.event_data}
+					<a href={event.agent_id ? `/agents/${event.agent_id}?tab=logs` : '#'}
+						class="block px-4 py-2.5 hover:bg-accent/50 transition-colors">
 						<div class="flex items-center justify-between">
-							<span class="text-xs font-medium text-muted-foreground">{event.event_type}</span>
+							<span class="text-xs font-medium {event.event_type === 'task_completed' ? 'text-emerald-400' : event.event_type === 'agent_response' ? 'text-blue-400' : 'text-muted-foreground'}">
+								{event.event_type === 'agent_response' ? 'Conversation' : event.event_type === 'task_completed' ? 'Task completed' : event.event_type.replace('_', ' ')}
+							</span>
 							<span class="text-xs text-muted-foreground">{timeAgo(event.timestamp)}</span>
 						</div>
-						{#if event.agent_id}
-							<div class="text-xs text-muted-foreground mt-0.5">Agent: {event.agent_id}</div>
-						{/if}
-					</div>
+						<div class="text-xs text-muted-foreground mt-0.5">
+							{#if event.agent_id}
+								<span class="text-foreground/70">{event.agent_id}</span>
+							{/if}
+							{#if data?.title}
+								— {data.title}
+							{/if}
+						</div>
+					</a>
 				{:else}
 					<div class="px-4 py-6 text-center text-sm text-muted-foreground">No recent activity</div>
 				{/each}

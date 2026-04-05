@@ -1,16 +1,21 @@
-"""Claude Agent SDK harness.
+"""Claude Agent SDK harness with persistent sessions.
 
-Runs a Claude agent using the official claude-agent-sdk package.
-The SDK bundles the Claude Code CLI — no separate installation required.
-The agent uses the Anthropic Messages API (ANTHROPIC_BASE_URL) which the
-xpressclaw server exposes at /v1/messages, routing to any configured LLM.
+Each agent runs a persistent Claude SDK session. Messages from conversations
+are injected as events, and the agent responds within the same session context.
+The SDK handles compaction automatically.
+
+Architecture (ADR-021):
+- Session persists across messages (context preserved)
+- Messages arrive as: SYSTEM: Message in conversation "conv-id" from Sender: content
+- Agent responds, response is routed back to the conversation
+- Daily session lifecycle: morning start with workspace listing, end-of-day notes
 
 Environment variables:
-  ANTHROPIC_API_KEY  — API key (real or placeholder for local models).
-  ANTHROPIC_BASE_URL — API base URL (set by xpressclaw to route through server).
+  ANTHROPIC_API_KEY  — API key (real or placeholder for local models)
+  ANTHROPIC_BASE_URL — API base URL (routed through xpressclaw server)
   LLM_MODEL          — Model to use (default: claude-sonnet-4-6)
   WORKSPACE_DIR      — Agent workspace (default: /workspace)
-  MCP_SERVERS        — JSON dict of MCP server configs (injected by xpressclaw)
+  MCP_SERVERS        — JSON dict of MCP server configs
 """
 
 import asyncio
@@ -20,6 +25,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from uuid import uuid4
 
 sys.path.insert(0, "/app")
@@ -29,11 +35,16 @@ from claude_agent_sdk import (
     ResultMessage,
     AssistantMessage,
     query,
+    list_sessions,
+    get_session_info,
 )
 try:
     from claude_agent_sdk import StreamEvent
 except ImportError:
     from claude_agent_sdk.types import StreamEvent
+
+from fastapi import Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from server import BaseHarness, logger, AGENT_ID, AGENT_NAME
 
 LLM_MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
@@ -41,11 +52,7 @@ WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
 
 
 def load_mcp_servers() -> dict:
-    """Load MCP server configs from the MCP_SERVERS environment variable.
-
-    Returns a dict of {name: McpStdioServerConfig} for the SDK.
-    The SDK passes these to the CLI via --mcp-config.
-    """
+    """Load MCP server configs from the MCP_SERVERS environment variable."""
     raw = os.environ.get("MCP_SERVERS", "")
     if not raw:
         return {}
@@ -73,32 +80,28 @@ def load_mcp_servers() -> dict:
     return sdk_servers
 
 
-def _build_options(model: str, system_prompt: str, mcp_servers: dict) -> ClaudeAgentOptions:
-    """Build ClaudeAgentOptions for a request."""
+def _build_options(model: str, system_prompt: str, mcp_servers: dict,
+                   session_id: str | None = None) -> ClaudeAgentOptions:
+    """Build ClaudeAgentOptions with optional session continuation."""
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=system_prompt or f"You are {AGENT_NAME}, an AI assistant.",
         permission_mode="bypassPermissions",
         cwd=WORKSPACE_DIR,
         max_turns=25,
-        # AskUserQuestion auto-skips in bypassPermissions mode (no terminal).
-        # The agent should ask via regular text messages in the conversation.
         disallowed_tools=["AskUserQuestion"],
-        # Enable project settings so MCP servers and skills can load.
-        # Without this, the SDK sets --setting-sources "" which may block MCP.
         setting_sources=["project", "user"],
+        include_partial_messages=True,
     )
     if mcp_servers:
         options.mcp_servers = mcp_servers
+    if session_id:
+        options.resume = session_id
     return options
 
 
 def _extract_task(messages: list[dict]) -> tuple[str, str]:
-    """Extract system prompt and build a conversation prompt from all messages.
-
-    The Claude SDK query() takes a single prompt string. We format the full
-    conversation history so the agent has context from prior exchanges.
-    """
+    """Extract system prompt and task from OpenAI-format messages."""
     system_prompt = ""
     parts = []
     for msg in messages:
@@ -109,100 +112,220 @@ def _extract_task(messages: list[dict]) -> tuple[str, str]:
         elif msg["role"] == "assistant":
             parts.append(f"Assistant: {msg['content']}")
 
-    # If there's only one user message, use it directly (no "User:" prefix)
     user_messages = [m for m in messages if m["role"] == "user"]
     if len(user_messages) <= 1:
         task = user_messages[-1]["content"] if user_messages else ""
     else:
-        # Multiple turns: format as conversation, ask to continue
         task = "\n\n".join(parts) + "\n\nContinue the conversation. Respond to the last user message."
 
     return system_prompt, task
 
 
 class ClaudeSdkHarness(BaseHarness):
-    """Runs a Claude Agent SDK agent per request with streaming support."""
+    """Persistent session agent using Claude Agent SDK."""
 
-    async def complete(
-        self,
-        messages: list[dict],
-        model: str,
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        system_prompt, task = _extract_task(messages)
-        if not task:
-            return "No task provided."
+    def __init__(self):
+        super().__init__()
+        self.session_id: str | None = None
+        self.mcp_servers = load_mcp_servers()
+        self._register_session_routes()
 
+    def _register_session_routes(self):
+        """Register the session message endpoint."""
+
+        @self.app.post("/v1/session/send")
+        async def session_send(request: Request):
+            """Send a message to the agent's persistent session.
+
+            Body: {
+                "message": "user's message text",
+                "conversation_id": "conv-123",
+                "sender_name": "Eduardo",
+                "sender_type": "user",  # or "system"
+                "system_prompt": "optional system prompt override"
+            }
+
+            The message is formatted and injected into the persistent session.
+            The agent responds within the same context.
+            Streams SSE if Accept: text/event-stream, otherwise returns JSON.
+            """
+            data = await request.json()
+            message = data.get("message", "")
+            conversation_id = data.get("conversation_id", "unknown")
+            sender_name = data.get("sender_name", "User")
+            sender_type = data.get("sender_type", "user")
+            system_prompt = data.get("system_prompt", "")
+            stream = data.get("stream", True)
+
+            # Format the message as a session event
+            if sender_type == "system":
+                prompt = f"SYSTEM: {message}"
+            else:
+                prompt = (
+                    f'Message in conversation "{conversation_id}" '
+                    f"from {sender_name}:\n{message}"
+                )
+
+            model = LLM_MODEL
+
+            # Set current conversation so MCP tools (create_task, etc.)
+            # can auto-link to it without the agent passing it explicitly.
+            os.environ["CURRENT_CONVERSATION_ID"] = conversation_id
+
+            if stream:
+                return StreamingResponse(
+                    self._session_stream(prompt, model, system_prompt),
+                    media_type="text/event-stream",
+                )
+            else:
+                content = await self._session_complete(prompt, model, system_prompt)
+                return JSONResponse({
+                    "content": content,
+                    "session_id": self.session_id,
+                })
+
+        @self.app.get("/v1/session/info")
+        async def session_info():
+            """Get current session info."""
+            info = None
+            if self.session_id:
+                try:
+                    info = get_session_info(self.session_id, directory=WORKSPACE_DIR)
+                except Exception:
+                    pass
+            return {
+                "session_id": self.session_id,
+                "agent_id": AGENT_ID,
+                "info": {
+                    "created_at": info.created_at if info else None,
+                    "cwd": info.cwd if info else WORKSPACE_DIR,
+                } if info else None,
+            }
+
+        @self.app.post("/v1/session/new")
+        async def new_session(request: Request):
+            """Start a new session (e.g. daily reset)."""
+            data = await request.json()
+            notes = data.get("notes", "")
+
+            # End current session with notes if provided
+            if self.session_id and notes:
+                try:
+                    await self._session_complete(
+                        f"SYSTEM: Session ending. Please write down any important "
+                        f"notes for your next session and clean up your workspace.\n"
+                        f"Previous notes: {notes}",
+                        LLM_MODEL, ""
+                    )
+                except Exception as e:
+                    logger.warning("failed to end session with notes: %s", e)
+
+            # Start fresh session
+            self.session_id = None
+            self._ensure_session()
+
+            return {"session_id": self.session_id}
+
+        @self.app.post("/v1/session/compact")
+        async def compact_session():
+            """Trigger session compaction.
+
+            Starts a new session, preserving context through the SDK's
+            continue_conversation mechanism. The old session's context
+            gets compacted (summarized) by the SDK automatically.
+            """
+            old_session = self.session_id
+            self.session_id = None
+            logger.info("compaction triggered, old_session=%s", old_session)
+            # Next query will start a fresh session. The SDK's internal
+            # compaction has already happened by this point since the
+            # server triggered consolidation before calling this.
+            return {"status": "compacted", "old_session": old_session}
+
+    def _ensure_session(self):
+        """Ensure we have an active session, creating one if needed."""
+        if self.session_id:
+            return
+        # No session_id yet — the first query() call will create one.
+        # With continue_conversation=True, subsequent calls continue it.
+        logger.info("no active session — next query will create one")
+
+    async def _session_complete(self, prompt: str, model: str,
+                                system_prompt: str) -> str:
+        """Run a prompt in the persistent session (non-streaming)."""
         use_model = model if model != AGENT_NAME else LLM_MODEL
-        mcp_servers = load_mcp_servers()
-        options = _build_options(use_model, system_prompt, mcp_servers)
+        options = _build_options(use_model, system_prompt, self.mcp_servers,
+                                self.session_id)
 
         logger.info(
-            "running claude agent: model=%s task_len=%d workspace=%s",
-            use_model, len(task), WORKSPACE_DIR,
+            "session query: model=%s session=%s prompt_len=%d",
+            use_model, self.session_id or "new", len(prompt),
         )
 
         result_text = ""
-        async for message in query(prompt=task, options=options):
-            if isinstance(message, ResultMessage):
-                if message.is_error:
-                    return f"Agent error: {message.result or 'unknown error'}"
-                result_text = message.result or ""
-            elif isinstance(message, AssistantMessage):
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            result_text = block.text
+        try:
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, ResultMessage):
+                    # Always capture session_id — it may change after compaction
+                    new_sid = _extract_session_id(message)
+                    if new_sid:
+                        self.session_id = new_sid
+                    if message.is_error:
+                        return f"Agent error: {message.result or 'unknown error'}"
+                    result_text = message.result or ""
+                elif isinstance(message, AssistantMessage):
+                    if hasattr(message, "content"):
+                        for block in message.content:
+                            if hasattr(block, "text"):
+                                result_text = block.text
+        except Exception as e:
+            error_msg = str(e)
+            logger.error("session query failed: %s", error_msg)
+            if "maximum buffer size" in error_msg or "exit code 1" in error_msg:
+                # Session is dead after a buffer overflow or CLI crash.
+                # Reset so next call starts fresh.
+                logger.warning("session crashed, resetting session_id")
+                self.session_id = None
+                return (
+                    f"Error: {error_msg}\n\n"
+                    "The previous operation produced output that was too large. "
+                    "Try using more specific queries or smaller operations."
+                )
+            raise
 
+        logger.info("session query complete: session=%s result_len=%d",
+                     self.session_id, len(result_text))
         return result_text or "No response from agent."
 
-    async def _stream_response(
-        self,
-        messages: list,
-        model: str,
-        temperature: float,
-        max_tokens: int,
-    ):
-        """Stream OpenAI-format SSE chunks from the Claude SDK query.
-
-        Runs the Claude SDK in a separate thread with its own event loop to
-        completely isolate anyio's cancel scopes from FastAPI's async context.
-        """
-        system_prompt, task = _extract_task(messages)
-        if not task:
-            yield _sse_chunk(model, {"role": "assistant", "content": "No task provided."}, "stop")
-            yield "data: [DONE]\n\n"
-            return
-
+    async def _session_stream(self, prompt: str, model: str,
+                              system_prompt: str):
+        """Run a prompt in the persistent session with SSE streaming."""
         use_model = model if model != AGENT_NAME else LLM_MODEL
-        mcp_servers = load_mcp_servers()
-        options = _build_options(use_model, system_prompt, mcp_servers)
-        options.include_partial_messages = True
+        options = _build_options(use_model, system_prompt, self.mcp_servers,
+                                self.session_id)
 
         logger.info(
-            "streaming claude agent: model=%s task_len=%d workspace=%s",
-            use_model, len(task), WORKSPACE_DIR,
+            "session stream: model=%s session=%s prompt_len=%d",
+            use_model, self.session_id or "new", len(prompt),
         )
 
         conv_id = uuid4().hex[:16]
         q: queue.Queue[str | None] = queue.Queue()
 
         def _run_in_thread():
-            """Run the Claude SDK query in a fresh event loop on a separate thread."""
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(_query_to_queue(q, conv_id, use_model, task, options))
+                loop.run_until_complete(
+                    _session_query_to_queue(q, conv_id, use_model, prompt,
+                                           options, self)
+                )
             except Exception as e:
-                logger.exception("query thread failed")
+                logger.exception("session query thread failed")
                 error_payload = {"error": {"message": str(e), "type": "server_error"}}
                 q.put(f"data: {json.dumps(error_payload)}\n\n")
             finally:
-                q.put(None)  # sentinel
-                # Clean up async generators before closing the loop.
-                # Without this, the query() generator gets destroyed mid-flight,
-                # killing the TCP connection before the server finishes reading.
+                q.put(None)
                 try:
                     loop.run_until_complete(loop.shutdown_asyncgens())
                 except Exception:
@@ -212,29 +335,44 @@ class ClaudeSdkHarness(BaseHarness):
         thread = threading.Thread(target=_run_in_thread, daemon=True)
         thread.start()
 
-        # Yield chunks from the thread-safe queue
         while True:
             try:
-                chunk = await asyncio.get_event_loop().run_in_executor(None, q.get, True, 300)
+                chunk = await asyncio.get_event_loop().run_in_executor(
+                    None, q.get, True, 300
+                )
             except Exception:
                 break
             if chunk is None:
                 break
             yield chunk
 
+    # Keep legacy endpoints for backward compatibility (tasks use these)
+    async def complete(self, messages, model, temperature, max_tokens) -> str:
+        system_prompt, task = _extract_task(messages)
+        if not task:
+            return "No task provided."
+        return await self._session_complete(task, model, system_prompt)
 
-async def _query_to_queue(
+    async def _stream_response(self, messages, model, temperature, max_tokens):
+        system_prompt, task = _extract_task(messages)
+        if not task:
+            yield _sse_chunk(model, {"role": "assistant", "content": "No task provided."}, "stop")
+            yield "data: [DONE]\n\n"
+            return
+
+        async for chunk in self._session_stream(task, model, system_prompt):
+            yield chunk
+
+
+async def _session_query_to_queue(
     q: "queue.Queue[str | None]",
     conv_id: str,
     model: str,
-    task: str,
+    prompt: str,
     options: ClaudeAgentOptions,
+    harness: ClaudeSdkHarness,
 ):
-    """Run the Claude SDK query and push SSE chunks to a thread-safe queue.
-
-    Wraps reasoning in <think> tags and tool calls in <tool_call> tags
-    so the frontend can render them as collapsible panels.
-    """
+    """Run a session query and push SSE chunks to a thread-safe queue."""
     sent_role = False
     in_thinking = False
     in_tool_call = False
@@ -248,7 +386,7 @@ async def _query_to_queue(
         q.put(_sse_chunk_raw(conv_id, model, delta, None))
 
     try:
-        async for message in query(prompt=task, options=options):
+        async for message in query(prompt=prompt, options=options):
             if isinstance(message, StreamEvent):
                 event = message.event
                 event_type = event.get("type", "")
@@ -261,7 +399,6 @@ async def _query_to_queue(
                         _send("<think>")
                     elif block_type == "tool_use":
                         tool_name = block.get("name", "tool")
-                        # Strip MCP server prefix (e.g. mcp__xpressclaw__publish_app → publish_app)
                         if "__" in tool_name:
                             tool_name = tool_name.rsplit("__", 1)[-1]
                         _send(f'<tool_call name="{tool_name}">')
@@ -293,8 +430,6 @@ async def _query_to_queue(
                         in_tool_call = False
 
             elif isinstance(message, AssistantMessage):
-                # Skip if we already streamed content via StreamEvent — AssistantMessage
-                # contains the same text that was already sent token-by-token.
                 if not sent_role and hasattr(message, "content"):
                     for block in message.content:
                         if hasattr(block, "text") and block.text:
@@ -303,6 +438,10 @@ async def _query_to_queue(
             elif isinstance(message, ResultMessage):
                 logger.info("ResultMessage: is_error=%s result_len=%d",
                             message.is_error, len(message.result or ""))
+                # Always capture session_id — may change after compaction
+                new_sid = _extract_session_id(message)
+                if new_sid:
+                    harness.session_id = new_sid
                 if message.is_error:
                     _send(f"Agent error: {message.result or 'unknown error'}")
                 elif not sent_role and message.result:
@@ -312,19 +451,43 @@ async def _query_to_queue(
                 return
 
     except Exception as e:
-        logger.exception("_query_to_queue error")
-        error_payload = {"error": {"message": str(e), "type": "server_error"}}
-        q.put(f"data: {json.dumps(error_payload)}\n\n")
+        error_msg = str(e)
+        logger.exception("session query error")
+        if "maximum buffer size" in error_msg or "exit code 1" in error_msg:
+            # Session crashed — reset so next call starts fresh
+            logger.warning("session crashed, resetting session_id")
+            harness.session_id = None
+            _send(
+                "\n\nError: A tool produced output that was too large "
+                "(>1MB). The session has been reset. "
+                "Try using more specific queries or smaller operations."
+            )
+        else:
+            error_payload = {"error": {"message": error_msg, "type": "server_error"}}
+            q.put(f"data: {json.dumps(error_payload)}\n\n")
 
-    # No ResultMessage
     if not sent_role:
         _send("No response from agent.")
     q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
     q.put("data: [DONE]\n\n")
 
 
-def _sse_chunk_raw(conv_id: str, model: str, delta: dict, finish_reason: str | None) -> str:
-    """Format a single SSE chunk in OpenAI chat.completion.chunk format."""
+def _extract_session_id(message: ResultMessage) -> str | None:
+    """Extract session_id from a ResultMessage.
+
+    The SDK exposes session_id directly on ResultMessage. We capture
+    it on the first query and pass it back via ClaudeAgentOptions.session_id
+    + continue_conversation=True on subsequent calls to maintain the
+    persistent session.
+    """
+    session_id = getattr(message, "session_id", None)
+    if session_id:
+        logger.info("captured session_id: %s", session_id)
+    return session_id
+
+
+def _sse_chunk_raw(conv_id: str, model: str, delta: dict,
+                   finish_reason: str | None) -> str:
     payload = {
         "id": f"chatcmpl-{conv_id}",
         "object": "chat.completion.chunk",

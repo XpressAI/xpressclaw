@@ -31,6 +31,12 @@ AGENT_BACKEND = os.environ.get("AGENT_BACKEND", "generic")
 AGENT_CONFIG = os.environ.get("AGENT_CONFIG", "{}")
 
 
+# Shared cancel flag — written by the /v1/cancel endpoint,
+# read by MCP tool handlers to stop at the next tool call.
+_workdir = os.environ.get("WORKSPACE_DIR", os.path.expanduser("~/.xpressclaw"))
+CANCEL_FLAG = os.path.join(_workdir, ".cancel")
+
+
 class BaseHarness(ABC):
     """Override `complete()` to implement an agent backend."""
 
@@ -42,6 +48,20 @@ class BaseHarness(ABC):
         @self.app.get("/health")
         async def health():
             return {"status": "ok", "agent_id": AGENT_ID, "backend": AGENT_BACKEND}
+
+        @self.app.post("/v1/cancel")
+        async def cancel():
+            """Set the cancel flag so MCP tools stop at the next call."""
+            with open(CANCEL_FLAG, "w") as f:
+                f.write("1")
+            logger.info("cancel requested — will stop at next tool call")
+            return {"status": "cancelled"}
+
+        @self.app.post("/v1/session/compact")
+        async def compact():
+            """Trigger session compaction. Override in subclasses."""
+            logger.info("compact requested (no-op in base harness)")
+            return {"status": "compacted"}
 
         @self.app.get("/v1/models")
         async def models():
@@ -141,6 +161,10 @@ class BaseHarness(ABC):
 
     def run(self, host: str = "0.0.0.0", port: int = 8080):
         import uvicorn
+
+        # Clear stale cancel flag from previous runs
+        if os.path.exists(CANCEL_FLAG):
+            os.remove(CANCEL_FLAG)
 
         logger.info(
             "starting harness: agent_id=%s backend=%s on %s:%d",

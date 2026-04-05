@@ -213,14 +213,12 @@ impl LlamaCppProvider {
 
         let params = {
             let p = LlamaModelParams::default();
-            // Offload all layers to GPU (CUDA/Metal)
-            #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-            let p = p.with_n_gpu_layers(u32::MAX);
-            // Intel Macs: Metal works but GPU layer offloading has bugs.
-            // Use CPU-only (ngl=0) for stability.
-            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-            let p = p.with_n_gpu_layers(0);
-            p
+            // Intel Macs: GPU layer offloading produces garbage output.
+            // Use ngl=0 (CPU-only). All other platforms: offload everything.
+            let is_intel_mac = cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64";
+            let ngl = if is_intel_mac { 0 } else { u32::MAX };
+            tracing::info!(ngl, is_intel_mac, "setting GPU layer count");
+            p.with_n_gpu_layers(ngl)
         };
         let model = Arc::new(
             LlamaModel::load_from_file(&backend, path, &params)
@@ -455,6 +453,7 @@ impl LlamaCppProvider {
         }
 
         // Generation loop
+        let gen_start = std::time::Instant::now();
         let mut n_cur = batch.n_tokens();
         let mut output = String::new();
         let mut completion_tokens = 0i64;
@@ -514,6 +513,20 @@ impl LlamaCppProvider {
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Llm(format!("decode failed: {e}")))?;
         }
+
+        let gen_elapsed = gen_start.elapsed();
+        let tok_per_sec = if gen_elapsed.as_secs_f64() > 0.0 {
+            completion_tokens as f64 / gen_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        tracing::info!(
+            prompt_tokens,
+            completion_tokens,
+            elapsed_ms = gen_elapsed.as_millis() as u64,
+            tok_per_sec = format!("{tok_per_sec:.1}"),
+            "generation complete"
+        );
 
         Ok((
             output.trim().to_string(),

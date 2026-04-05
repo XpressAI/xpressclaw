@@ -48,6 +48,15 @@ impl TaskConversation {
         Ok(msg)
     }
 
+    pub fn update_message_content(&self, message_id: i64, content: &str) -> Result<()> {
+        let conn = self.db.conn();
+        conn.execute(
+            "UPDATE task_messages SET content = ?1 WHERE id = ?2",
+            rusqlite::params![content, message_id],
+        )?;
+        Ok(())
+    }
+
     pub fn get_messages(&self, task_id: &str) -> Result<Vec<TaskMessage>> {
         let conn = self.db.conn();
         let mut stmt =

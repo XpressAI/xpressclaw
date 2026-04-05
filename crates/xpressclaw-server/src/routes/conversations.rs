@@ -116,6 +116,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/messages", get(get_messages).post(send_message))
         .route("/{id}/messages/stream", axum::routing::post(stream_message))
+        .route("/{id}/stop", axum::routing::post(stop_processing))
         .route("/{id}/events", get(subscribe_events))
         .route(
             "/{id}/participants",
@@ -276,6 +277,47 @@ async fn send_message(
 /// Streaming version of send_message. Returns SSE events:
 /// SSE event subscription for a conversation (ADR-019).
 /// Replays messages after `after` ID, then streams live events.
+#[derive(Deserialize)]
+struct StopParams {
+    agent_id: Option<String>,
+}
+
+async fn stop_processing(
+    State(state): State<AppState>,
+    Path(conv_id): Path<String>,
+    Query(params): Query<StopParams>,
+) -> StatusCode {
+    let mgr = ConversationManager::new(state.db.clone());
+    let _ = mgr.set_processing_status(&conv_id, "idle");
+    let _ = mgr.mark_processed(&conv_id);
+
+    // Send cancel to the specific agent (or all if none specified).
+    let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
+    let target_agents = if let Some(ref aid) = params.agent_id {
+        vec![aid.clone()]
+    } else {
+        mgr.resolve_target_agents(&conv_id, "").unwrap_or_default()
+    };
+
+    for agent_id in &target_agents {
+        if let Ok(agent) = registry.get(agent_id) {
+            if let Some(ref cid) = agent.container_id {
+                if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await
+                {
+                    if let Some(port) = docker.get_container_port(cid).await {
+                        let client = xpressclaw_core::agents::harness::HarnessClient::new(port);
+                        let _ = client.cancel().await;
+                        tracing::info!(agent_id, "sent cancel to harness");
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::info!(conv_id, "processing stopped by user");
+    StatusCode::OK
+}
+
 /// The client can disconnect and reconnect — missed messages are
 /// replayed from the DB on reconnect.
 #[derive(Deserialize)]

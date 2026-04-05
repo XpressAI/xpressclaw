@@ -128,7 +128,9 @@ def handle_tool(name: str, arguments: dict) -> str:
         if not results:
             return f"No memories found for: {query}"
         lines = []
-        for m in results:
+        for item in results:
+            # API returns { "memory": {...}, "relevance_score": ... }
+            m = item.get("memory", item) if isinstance(item, dict) else item
             lines.append(f"[{m['id'][:8]}] {m.get('summary', '')}")
             lines.append(f"  {m.get('content', '')[:200]}")
             if m.get('tags'):
@@ -158,7 +160,9 @@ def handle_tool(name: str, arguments: dict) -> str:
         if not results:
             return "No memories stored yet."
         lines = []
-        for m in results:
+        for item in results:
+            # API returns { "memory": {...}, "relevance_score": ... }
+            m = item.get("memory", item) if isinstance(item, dict) else item
             tags = f" [{', '.join(m.get('tags', []))}]" if m.get('tags') else ""
             lines.append(f"- [{m['id'][:8]}] {m.get('summary', '')}{tags}")
         return "\n".join(lines)

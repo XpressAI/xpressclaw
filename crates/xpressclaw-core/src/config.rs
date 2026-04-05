@@ -176,12 +176,33 @@ pub struct WakeOnConfig {
     pub condition: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Internal hook configuration. Always includes memory hooks.
+/// Deserialization is skipped so YAML values are ignored — the
+/// defaults always apply. Serialization is kept so the API can
+/// report which hooks are active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
-    #[serde(default)]
+    #[serde(skip_deserializing, default = "default_before_hooks")]
     pub before_message: Vec<String>,
-    #[serde(default)]
+    #[serde(skip_deserializing, default = "default_after_hooks")]
     pub after_message: Vec<String>,
+}
+
+fn default_before_hooks() -> Vec<String> {
+    vec!["memory_recall".to_string()]
+}
+
+fn default_after_hooks() -> Vec<String> {
+    vec!["memory_remember".to_string()]
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            before_message: vec!["memory_recall".to_string()],
+            after_message: vec!["memory_remember".to_string()],
+        }
+    }
 }
 
 /// Per-agent LLM override. When set, the agent uses this provider/key/url
@@ -285,6 +306,65 @@ impl AgentConfig {
             parts.join("\n")
         }
     }
+}
+
+/// Generate a URL-safe slug from a display name.
+///
+/// Handles Unicode (including Japanese) by:
+/// 1. Lowercasing ASCII characters
+/// 2. Replacing spaces/punctuation with hyphens
+/// 3. Keeping alphanumeric ASCII and Unicode letters/numbers
+/// 4. Collapsing multiple hyphens
+/// 5. Trimming leading/trailing hyphens
+///
+/// If the result is empty (e.g. all emoji), falls back to "agent".
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut last_was_hyphen = true; // prevent leading hyphen
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_hyphen = false;
+        } else if ch.is_alphanumeric() {
+            // Keep non-ASCII letters/numbers (Japanese, etc.)
+            slug.push(ch);
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            slug.push('-');
+            last_was_hyphen = true;
+        }
+    }
+
+    // Trim trailing hyphen
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "agent".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Generate a unique agent ID from a display name, given existing IDs.
+/// Appends a numeric suffix if the slug already exists.
+pub fn unique_agent_id(display_name: &str, existing_ids: &[&str]) -> String {
+    let base = slugify(display_name);
+
+    if !existing_ids.contains(&base.as_str()) {
+        return base;
+    }
+
+    // Append numeric suffix
+    for i in 2.. {
+        let candidate = format!("{base}-{i}");
+        if !existing_ids.contains(&candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -539,12 +619,6 @@ agents:
       - **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts
       - **Be proactive:** If someone tells you about themselves or their work, SAVE IT
 
-    hooks:
-      before_message:
-        - memory_recall
-      after_message:
-        - memory_remember
-
     # Volumes mounted into the agent container
     volumes:
       - ~/agent-workspace:/workspace
@@ -729,5 +803,40 @@ memory:
         );
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("yaml.bak"));
+    }
+
+    #[test]
+    fn test_slugify_ascii() {
+        assert_eq!(slugify("My Agent"), "my-agent");
+        assert_eq!(slugify("Code Reviewer"), "code-reviewer");
+        assert_eq!(slugify("  hello  world  "), "hello-world");
+        assert_eq!(slugify("agent!@#$%name"), "agent-name");
+    }
+
+    #[test]
+    fn test_slugify_japanese() {
+        assert_eq!(slugify("エリ"), "エリ");
+        assert_eq!(slugify("パーソナルアシスタント"), "パーソナルアシスタント");
+        assert_eq!(slugify("My エージェント"), "my-エージェント");
+    }
+
+    #[test]
+    fn test_slugify_empty() {
+        assert_eq!(slugify(""), "agent");
+        assert_eq!(slugify("!!!"), "agent");
+        assert_eq!(slugify("   "), "agent");
+    }
+
+    #[test]
+    fn test_unique_agent_id() {
+        assert_eq!(unique_agent_id("Atlas", &[]), "atlas");
+        assert_eq!(unique_agent_id("Atlas", &["atlas"]), "atlas-2");
+        assert_eq!(unique_agent_id("Atlas", &["atlas", "atlas-2"]), "atlas-3");
+    }
+
+    #[test]
+    fn test_unique_agent_id_japanese() {
+        assert_eq!(unique_agent_id("エリ", &[]), "エリ");
+        assert_eq!(unique_agent_id("エリ", &["エリ"]), "エリ-2");
     }
 }
