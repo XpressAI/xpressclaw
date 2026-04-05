@@ -176,15 +176,24 @@ pub struct WakeOnConfig {
     pub condition: Option<String>,
 }
 
-/// Internal hook configuration. Not user-facing — always includes
-/// memory hooks. Deserialized hooks from YAML are ignored; the
-/// defaults always apply.
+/// Internal hook configuration. Always includes memory hooks.
+/// Deserialization is skipped so YAML values are ignored — the
+/// defaults always apply. Serialization is kept so the API can
+/// report which hooks are active.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
-    #[serde(skip)]
+    #[serde(skip_deserializing, default = "default_before_hooks")]
     pub before_message: Vec<String>,
-    #[serde(skip)]
+    #[serde(skip_deserializing, default = "default_after_hooks")]
     pub after_message: Vec<String>,
+}
+
+fn default_before_hooks() -> Vec<String> {
+    vec!["memory_recall".to_string()]
+}
+
+fn default_after_hooks() -> Vec<String> {
+    vec!["memory_remember".to_string()]
 }
 
 impl Default for HooksConfig {
