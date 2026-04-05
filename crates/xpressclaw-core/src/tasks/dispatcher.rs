@@ -91,7 +91,7 @@ async fn run_task(
         state = match state {
             State::LoadTask => load_task(db, config, task_id, agent_id, &mut ctx).await,
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
-            State::CallAgent => call_agent(ctx.as_mut().unwrap()).await,
+            State::CallAgent => call_agent(db, ctx.as_mut().unwrap()).await,
             State::ProcessResponse => process_response(db, ctx.as_mut().unwrap()),
             State::Evaluate => evaluate(db, config, ctx.as_mut().unwrap()),
             State::Done(result) => return result,
@@ -334,7 +334,7 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::CallAgent
 }
 
-async fn call_agent(ctx: &mut Context) -> State {
+async fn call_agent(db: &Arc<Database>, ctx: &mut Context) -> State {
     use futures_util::StreamExt;
 
     let harness = HarnessClient::new(ctx.harness_port);
@@ -361,7 +361,15 @@ async fn call_agent(ctx: &mut Context) -> State {
         .await
     {
         Ok(mut stream) => {
+            let conv = TaskConversation::new(db.clone());
+            // Create a streaming message that we update as content arrives.
+            // This lets the frontend's 3s polling show incremental progress.
+            let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
+            let msg_id = streaming_msg.map(|m| m.id);
+
             let mut full_content = String::new();
+            let mut last_saved_len = 0;
+
             while let Some(result) = stream.next().await {
                 if let Ok(chunk) = result {
                     if let Some(choice) = chunk.choices.first() {
@@ -370,7 +378,25 @@ async fn call_agent(ctx: &mut Context) -> State {
                         }
                     }
                 }
+
+                // Update the streaming message whenever a tool_call
+                // completes or every 2KB of new content — whichever
+                // comes first. This keeps the UI responsive.
+                let new_bytes = full_content.len() - last_saved_len;
+                let tool_call_ended = full_content[last_saved_len..].contains("</tool_call>");
+                if let Some(id) = msg_id {
+                    if tool_call_ended || new_bytes >= 2048 {
+                        let _ = conv.update_message_content(id, &full_content);
+                        last_saved_len = full_content.len();
+                    }
+                }
             }
+
+            // Final update with complete content
+            if let Some(id) = msg_id {
+                let _ = conv.update_message_content(id, &full_content);
+            }
+
             ctx.last_response = full_content;
             State::ProcessResponse
         }
@@ -391,6 +417,9 @@ async fn call_agent(ctx: &mut Context) -> State {
                         .first()
                         .map(|c| c.message.content.clone())
                         .unwrap_or_default();
+                    // Legacy path doesn't stream, so save the full message here.
+                    let conv = TaskConversation::new(db.clone());
+                    let _ = conv.add_message(&ctx.task.id, "assistant", &text);
                     ctx.last_response = text;
                     State::ProcessResponse
                 }
@@ -408,11 +437,8 @@ async fn call_agent(ctx: &mut Context) -> State {
     }
 }
 
-fn process_response(db: &Arc<Database>, ctx: &mut Context) -> State {
-    // Save agent response as task message
-    let conv = TaskConversation::new(db.clone());
-    let _ = conv.add_message(&ctx.task.id, "assistant", &ctx.last_response);
-
+fn process_response(_db: &Arc<Database>, ctx: &mut Context) -> State {
+    // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
 
     debug!(
