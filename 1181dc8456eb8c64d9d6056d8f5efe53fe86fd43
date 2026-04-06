@@ -1,0 +1,1 @@
+Added advance_workflow() hook in dispatcher.rs. After DriverResult::Completed or DriverResult::Failed, looks up WorkflowEngine.find_execution_by_task(). If found, gets last assistant message from TaskConversation.get_messages() and calls engine.on_task_completed(). Also committed record_event() on ConnectorManager (was added but uncommitted from prior work).
