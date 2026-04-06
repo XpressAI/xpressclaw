@@ -52,7 +52,12 @@
       "Bash(docker run:*)",
       "Bash(bash build.sh --skip-tauri --skip-docker --skip-test)",
       "WebFetch(domain:registry.modelcontextprotocol.io)",
-      "Bash(gh pr:*)"
+      "Bash(gh pr:*)",
+      "Bash(sqlite3:*)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:svelteflow.dev)",
+      "WebFetch(domain:workflowengine.io)",
+      "Bash(npx svelte-check:*)"
     ]
   }
 }

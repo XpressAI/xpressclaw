@@ -59,7 +59,10 @@ fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
 
 fn main() {
     // Embed git commit hash at compile time
-    if let Ok(output) = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
         if output.status.success() {
             let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
             println!("cargo:rustc-env=XPRESSCLAW_GIT_HASH={hash}");
