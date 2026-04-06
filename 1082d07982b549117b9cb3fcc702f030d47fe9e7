@@ -1,0 +1,1 @@
+Full rewrite of workflow editor. Left sidebar with drag-and-drop node palette (Task, Trigger, Sink, Decision, Human templates). Edge selection + condition editing panel with syntax help. Dark theme forced with !important CSS overrides on .svelte-flow backgrounds. Better default template (3 connected nodes). Node list in sidebar for navigation. Empty state hint.
