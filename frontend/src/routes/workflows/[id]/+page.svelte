@@ -184,6 +184,16 @@
 	function handleEdgeClick({ edge }: { edge: Edge }) { selectedEdgeId = edge.id; selectedNodeId = null; }
 	function handlePaneClick() { selectedNodeId = null; selectedEdgeId = null; }
 
+	/** When an existing node is dropped after dragging, check if it landed on an edge. */
+	function handleNodeDragStop({ targetNode }: { targetNode: Node | null; nodes: Node[]; event: MouseEvent | TouchEvent }) {
+		if (!targetNode) return;
+		// Only insert if the node has no connections (both incoming and outgoing)
+		const hasConnections = edges.some(e => e.source === targetNode.id || e.target === targetNode.id);
+		if (!hasConnections) {
+			insertNodeOnNearestEdge(targetNode.id);
+		}
+	}
+
 	function handleConnect(connection: Connection) {
 		const id = `${connection.source}-${connection.target}-${Date.now()}`;
 		edges = [...edges, {
@@ -239,60 +249,79 @@
 
 		// Try to insert into an edge if dropped near one
 		if (type !== 'trigger') {
-			const inserted = tryInsertOnEdge(newNode, x, y);
-			if (inserted) return;
+			insertNodeOnNearestEdge(newNode.id);
 		}
 	}
 
-	/** If the drop position is near an edge, split it and insert the node in between. */
-	function tryInsertOnEdge(newNode: Node, dropX: number, dropY: number): boolean {
-		const THRESHOLD = 60; // pixels proximity to edge midpoint
+	/** Get the center point of a node. */
+	function nodeCenter(n: Node): { x: number; y: number } {
+		const w = 220; // all nodes are 220px wide
+		const h = n.measured?.height ?? 100;
+		return { x: n.position.x + w / 2, y: n.position.y + h / 2 };
+	}
+
+	/** Distance from point P to line segment AB. */
+	function pointToSegmentDist(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+		const dx = bx - ax, dy = by - ay;
+		const lenSq = dx * dx + dy * dy;
+		if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+		let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+		t = Math.max(0, Math.min(1, t));
+		return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+	}
+
+	/** If the node is near an edge line, split that edge and insert the node. */
+	function insertNodeOnNearestEdge(nodeId: string): boolean {
+		const THRESHOLD = 80;
+		const theNode = nodes.find(n => n.id === nodeId);
+		if (!theNode) return false;
+		const nc = nodeCenter(theNode);
+
+		let bestEdge: Edge | null = null;
+		let bestDist = THRESHOLD;
 
 		for (const edge of edges) {
-			const sourceNode = nodes.find(n => n.id === edge.source);
-			const targetNode = nodes.find(n => n.id === edge.target);
-			if (!sourceNode || !targetNode) continue;
+			if (edge.source === nodeId || edge.target === nodeId) continue;
+			const src = nodes.find(n => n.id === edge.source);
+			const tgt = nodes.find(n => n.id === edge.target);
+			if (!src || !tgt) continue;
 
-			// Edge midpoint (approximate — vertical layout, source bottom → target top)
-			const midX = (sourceNode.position.x + targetNode.position.x) / 2 + 110; // +110 = half node width
-			const midY = (sourceNode.position.y + (sourceNode.measured?.height ?? 80)) / 2 +
-				(targetNode.position.y) / 2 +
-				((sourceNode.measured?.height ?? 80) / 2);
-			// Simpler: average of source bottom and target top
-			const srcBottomY = sourceNode.position.y + (sourceNode.measured?.height ?? 100);
-			const tgtTopY = targetNode.position.y;
-			const edgeMidY = (srcBottomY + tgtTopY) / 2;
-			const edgeMidX = (sourceNode.position.x + targetNode.position.x) / 2 + 110;
-
-			const dx = (dropX + 110) - edgeMidX;
-			const dy = (dropY + 50) - edgeMidY;
-			const dist = Math.sqrt(dx * dx + dy * dy);
-
-			if (dist < THRESHOLD) {
-				// Split: remove old edge, add source→new and new→target
-				const oldCondition = edge.data?.condition || 'completed';
-				edges = [
-					...edges.filter(e => e.id !== edge.id),
-					{
-						id: `${edge.source}-${newNode.id}-${Date.now()}`,
-						source: edge.source, target: newNode.id,
-						sourceHandle: edge.sourceHandle,
-						type: 'smoothstep', style: edgeStyle(),
-						data: { condition: oldCondition }
-					},
-					{
-						id: `${newNode.id}-${edge.target}-${Date.now() + 1}`,
-						source: newNode.id, target: edge.target,
-						type: 'smoothstep', style: edgeStyle(),
-						data: { condition: 'completed' }
-					}
-				];
-				// Reposition the new node at the midpoint
-				nodes = nodes.map(n => n.id !== newNode.id ? n : { ...n, position: { x: sourceNode.position.x, y: edgeMidY - 50 } });
-				return true;
+			const sc = nodeCenter(src);
+			const tc = nodeCenter(tgt);
+			const dist = pointToSegmentDist(nc.x, nc.y, sc.x, sc.y, tc.x, tc.y);
+			if (dist < bestDist) {
+				bestDist = dist;
+				bestEdge = edge;
 			}
 		}
-		return false;
+
+		if (!bestEdge) return false;
+
+		const oldCondition = bestEdge.data?.condition || 'completed';
+		const now = Date.now();
+		edges = [
+			...edges.filter(e => e.id !== bestEdge!.id),
+			{
+				id: `${bestEdge.source}-${nodeId}-${now}`,
+				source: bestEdge.source, target: nodeId,
+				sourceHandle: bestEdge.sourceHandle,
+				type: 'smoothstep', style: edgeStyle(),
+				data: { condition: oldCondition }
+			},
+			{
+				id: `${nodeId}-${bestEdge.target}-${now + 1}`,
+				source: nodeId, target: bestEdge.target,
+				type: 'smoothstep', style: edgeStyle(),
+				data: { condition: 'completed' }
+			}
+		];
+
+		// Snap the node to the source node's x for clean alignment
+		const srcNode = nodes.find(n => n.id === bestEdge!.source);
+		if (srcNode) {
+			nodes = nodes.map(n => n.id !== nodeId ? n : { ...n, position: { ...n.position, x: srcNode!.position.x } });
+		}
+		return true;
 	}
 
 	// --- Edit helpers ---
@@ -358,10 +387,10 @@
 		<div class="flex-1"></div>
 
 		{#if workflow}
-			<button onclick={toggleEnabled}
-				class="relative h-5 w-9 rounded-full transition-colors {workflow.enabled ? 'bg-emerald-600' : 'bg-[hsl(225,18%,25%)]'}" title={workflow.enabled ? 'Disable' : 'Enable'}>
-				<span class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform {workflow.enabled ? 'translate-x-4' : 'translate-x-0.5'}"></span>
-			</button>
+			<label class="relative inline-flex items-center cursor-pointer shrink-0" title={workflow.enabled ? 'Disable' : 'Enable'}>
+				<input type="checkbox" checked={workflow.enabled} onchange={toggleEnabled} class="sr-only peer" />
+				<div class="w-8 h-[18px] bg-muted rounded-full peer peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:after:translate-x-full"></div>
+			</label>
 		{/if}
 
 		<button onclick={() => (showYaml = !showYaml)}
@@ -469,7 +498,8 @@
 			<SvelteFlow bind:nodes bind:edges {nodeTypes} fitView snapGrid={[15, 15]}
 				defaultEdgeOptions={{ type: 'smoothstep' }}
 				onnodeclick={handleNodeClick} onedgeclick={handleEdgeClick}
-				onpaneclick={handlePaneClick} onconnect={handleConnect}>
+				onpaneclick={handlePaneClick} onconnect={handleConnect}
+				onnodedragstop={handleNodeDragStop}>
 				<Background variant={BackgroundVariant.Dots} gap={20} size={1} />
 				<Controls position="bottom-left" />
 				<MiniMap position="bottom-right"

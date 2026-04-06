@@ -115,15 +115,10 @@
 								<p class="mt-0.5 text-xs text-muted-foreground line-clamp-2">{wf.description}</p>
 							{/if}
 						</div>
-						<button
-							onclick={() => toggleEnabled(wf)}
-							class="relative ml-3 flex-shrink-0 h-5 w-9 rounded-full transition-colors {wf.enabled ? 'bg-emerald-600' : 'bg-[hsl(225,18%,25%)]'}"
-							title={wf.enabled ? 'Disable' : 'Enable'}
-						>
-							<span
-								class="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform {wf.enabled ? 'translate-x-4' : 'translate-x-0.5'}"
-							></span>
-						</button>
+						<label class="relative inline-flex items-center cursor-pointer shrink-0 ml-3" title={wf.enabled ? 'Disable' : 'Enable'}>
+							<input type="checkbox" checked={wf.enabled} onchange={() => toggleEnabled(wf)} class="sr-only peer" />
+							<div class="w-8 h-[18px] bg-muted rounded-full peer peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:after:translate-x-full"></div>
+						</label>
 					</div>
 
 					<div class="flex items-center gap-3 text-[10px] text-muted-foreground">
