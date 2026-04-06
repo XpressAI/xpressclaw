@@ -31,6 +31,7 @@ use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
+use crate::workflows::engine::WorkflowEngine;
 
 const DEFAULT_MAX_TURNS: usize = 15;
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -884,12 +885,16 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
                     );
                 }
                 info!(task_id = claimed.task_id, "task completed");
+                // Advance workflow if this task is part of one
+                advance_workflow(db, &claimed.task_id, "completed");
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
                 let _ = board.update_status(&claimed.task_id, "cancelled", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
                 notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
+                // Advance workflow if this task is part of one
+                advance_workflow(db, &claimed.task_id, "failed");
             }
             DriverResult::Skipped => {
                 let _ = queue.complete(claimed.id, "skipped");
@@ -912,6 +917,33 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
     }
 
     Ok(())
+}
+
+/// If a completed/failed task is part of a workflow, advance the workflow.
+fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str) {
+    let engine = WorkflowEngine::new(db.clone());
+    match engine.find_execution_by_task(task_id) {
+        Ok(Some(_)) => {
+            // Get the last assistant message as output
+            let tc = TaskConversation::new(db.clone());
+            let output = tc
+                .get_messages(task_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|m| m.role == "assistant")
+                .map(|m| m.content)
+                .unwrap_or_default();
+
+            if let Err(e) = engine.on_task_completed(task_id, status, &output) {
+                warn!(task_id, error = %e, "failed to advance workflow");
+            }
+        }
+        Ok(None) => {} // Not part of a workflow
+        Err(e) => {
+            debug!(task_id, error = %e, "workflow lookup failed");
+        }
+    }
 }
 
 #[cfg(test)]
