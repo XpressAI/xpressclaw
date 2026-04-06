@@ -206,33 +206,49 @@
 
 	// --- Drag-and-drop from sidebar ---
 
+	let canvasEl: HTMLDivElement;
+	let dragging = $state(false);
+
 	function onDragStart(event: DragEvent, type: string) {
 		if (!event.dataTransfer) return;
-		// Use text/plain for WebKit compatibility (custom MIME types may be ignored)
 		event.dataTransfer.setData('text/plain', type);
 		event.dataTransfer.effectAllowed = 'move';
 		dragType = type;
+		// Show overlay on next tick so it doesn't interfere with drag start
+		requestAnimationFrame(() => { dragging = true; });
 	}
 
-	function onDragOver(event: DragEvent) {
+	function onDragEnd() {
+		dragging = false;
+		dragType = null;
+	}
+
+	function onOverlayDragOver(event: DragEvent) {
 		event.preventDefault();
+		event.stopPropagation();
 		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
 	}
 
-	function onDragEnter(event: DragEvent) {
+	function onOverlayDragEnter(event: DragEvent) {
 		event.preventDefault();
+		event.stopPropagation();
 	}
 
-	function onDrop(event: DragEvent) {
+	function onOverlayDragLeave() {
+		// Keep overlay visible — user might re-enter
+	}
+
+	function onOverlayDrop(event: DragEvent) {
 		event.preventDefault();
-		// Try dataTransfer first, fall back to the stored dragType (WebKit may
-		// clear dataTransfer data by the time the drop event fires in some cases)
+		event.stopPropagation();
+		dragging = false;
+
 		const type = event.dataTransfer?.getData('text/plain') || dragType;
 		if (!type) return;
 		dragType = null;
 
-		// Convert screen position to flow position
-		const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+		// Convert screen position to flow position using the canvas container
+		const bounds = canvasEl.getBoundingClientRect();
 		const x = event.clientX - bounds.left - 100;
 		const y = event.clientY - bounds.top - 30;
 
@@ -434,7 +450,7 @@
 
 			<div class="px-2 pb-3 space-y-1.5">
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'task')}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'task')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-border/50 bg-background px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-primary/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-full bg-[hsl(225,50%,25%)] text-[10px] font-bold text-[hsl(220,20%,92%)]">T</div>
 					<div>
@@ -444,7 +460,7 @@
 				</div>
 
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'trigger')}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'trigger')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-emerald-800/30 bg-emerald-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-emerald-600/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-600/20">
 						<svg class="h-3.5 w-3.5 text-emerald-400" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 10 10-12h-9l1-10z" /></svg>
@@ -456,7 +472,7 @@
 				</div>
 
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'sink')}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'sink')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-blue-800/30 bg-blue-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-blue-600/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600/20">
 						<svg class="h-3.5 w-3.5 text-blue-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" /></svg>
@@ -472,7 +488,7 @@
 				</div>
 
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'condition')}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'condition')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-amber-800/30 bg-amber-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-amber-600/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-600/20">
 						<svg class="h-3.5 w-3.5 text-amber-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" /></svg>
@@ -484,7 +500,7 @@
 				</div>
 
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'human')}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'human')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-purple-800/30 bg-purple-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-purple-600/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-purple-600/20">
 						<svg class="h-3.5 w-3.5 text-purple-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0" /></svg>
@@ -513,8 +529,16 @@
 		</div>
 
 		<!-- Canvas -->
-		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="flex-1 relative" ondragover={onDragOver} ondragenter={onDragEnter} ondrop={onDrop}>
+		<div class="flex-1 relative" bind:this={canvasEl}>
+			<!-- Drop overlay: sits above SvelteFlow during drag so WebKit drop events fire -->
+			{#if dragging}
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div class="absolute inset-0 z-10"
+					ondragover={onOverlayDragOver}
+					ondragenter={onOverlayDragEnter}
+					ondragleave={onOverlayDragLeave}
+					ondrop={onOverlayDrop}></div>
+			{/if}
 			<SvelteFlow bind:nodes bind:edges {nodeTypes} fitView snapGrid={[15, 15]}
 				defaultEdgeOptions={{ type: 'smoothstep' }}
 				onnodeclick={handleNodeClick} onedgeclick={handleEdgeClick}
