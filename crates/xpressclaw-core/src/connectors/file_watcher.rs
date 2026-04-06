@@ -24,6 +24,12 @@ pub struct FileWatcherConnector {
     config: Value,
 }
 
+impl Default for FileWatcherConnector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileWatcherConnector {
     pub fn new() -> Self {
         Self {

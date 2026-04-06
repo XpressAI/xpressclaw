@@ -24,6 +24,12 @@ pub struct TelegramConnector {
     poll_handle: Option<JoinHandle<()>>,
 }
 
+impl Default for TelegramConnector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TelegramConnector {
     pub fn new() -> Self {
         Self {

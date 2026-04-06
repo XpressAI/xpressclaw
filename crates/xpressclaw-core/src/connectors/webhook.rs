@@ -21,6 +21,12 @@ pub struct WebhookConnector {
     config: Value,
 }
 
+impl Default for WebhookConnector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebhookConnector {
     pub fn new() -> Self {
         Self {

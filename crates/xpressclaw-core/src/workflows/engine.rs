@@ -267,6 +267,7 @@ impl WorkflowEngine {
     }
 
     /// After a node completes, evaluate outgoing edges and advance or complete.
+    #[allow(clippy::too_many_arguments)]
     fn check_completion_after_node(
         &self,
         instance_id: &str,
@@ -379,7 +380,7 @@ impl WorkflowEngine {
                 let current_exec = execs
                     .iter()
                     .filter(|e| e.node_id == *current_node_id && e.status == "running")
-                    .last();
+                    .next_back();
 
                 if let Some(exec) = current_exec {
                     if let Some(ref task_id) = exec.task_id {
