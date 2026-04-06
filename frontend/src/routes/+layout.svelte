@@ -52,10 +52,23 @@
 
 	let { children } = $props();
 
-	// Collapsible sidebar — collapsed by default on content-heavy pages
-	let sidebarCollapsed = $state(true);
+	// Collapsible sidebar — expanded by default, auto-collapses on workflow editor
+	let sidebarCollapsed = $state(false);
+	let sidebarManuallySet = false;
+
+	// Auto-collapse on workflow editor pages, expand otherwise
+	$effect(() => {
+		const path = $page.url.pathname;
+		if (sidebarManuallySet) return; // user overrode, don't auto-toggle
+		if (/^\/workflows\/[^/]+$/.test(path)) {
+			sidebarCollapsed = true;
+		} else {
+			sidebarCollapsed = false;
+		}
+	});
 
 	function toggleSidebar() {
+		sidebarManuallySet = true;
 		sidebarCollapsed = !sidebarCollapsed;
 	}
 
@@ -169,12 +182,17 @@
 		<aside class="flex flex-col transition-all duration-200 ease-in-out {sidebarCollapsed ? 'w-12' : 'w-64'}" style="background: hsl(var(--sidebar))">
 			<!-- Header -->
 			<div class="flex h-11 items-center {sidebarCollapsed ? 'justify-center px-0' : 'gap-2 px-4'}">
-				<button onclick={toggleSidebar} class="flex items-center gap-2 hover:opacity-80 transition-opacity" title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+				{#if sidebarCollapsed}
+					<button onclick={toggleSidebar} class="flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors" title="Expand sidebar">
+						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" /></svg>
+					</button>
+				{:else}
 					<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded flex-shrink-0" />
-					{#if !sidebarCollapsed}
-						<span class="text-xs font-medium text-muted-foreground">xpressclaw</span>
-					{/if}
-				</button>
+					<span class="text-xs font-medium text-muted-foreground flex-1">xpressclaw</span>
+					<button onclick={toggleSidebar} class="flex items-center justify-center h-6 w-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors" title="Collapse sidebar">
+						<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
+					</button>
+				{/if}
 			</div>
 
 			<!-- Tab-dependent sidebar content (hidden when collapsed) -->
