@@ -9,13 +9,35 @@ version: 1
 
 nodes:
   - id: step1
-    label: "First Step"
+    label: "Process Input"
     agent: ""
     prompt: |
-      Describe what this step should do.
-    position: { x: 300, y: 100 }
+      Process the incoming request.
+    position: { x: 300, y: 50 }
 
-edges: []
+  - id: step2
+    label: "Review Output"
+    agent: ""
+    prompt: |
+      Review the output from the previous step.
+    position: { x: 300, y: 250 }
+
+  - id: notify
+    label: "Send Notification"
+    type: sink
+    sinks:
+      - connector: ""
+        channel: ""
+        template: "Workflow completed!"
+    position: { x: 300, y: 450 }
+
+edges:
+  - from: step1
+    to: step2
+    condition: completed
+  - from: step2
+    to: notify
+    condition: completed
 `;
 
 	let error = $state('');
