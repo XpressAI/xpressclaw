@@ -20,7 +20,7 @@
         "minHeight": 600,
         "url": "http://localhost:8935",
         "visible": false,
-        "dragDropEnabled": true,
+        "dragDropEnabled": false,
         "hiddenTitle": true
       }
     ],
