@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@lucide/svelte": "^0.515.0",
+    "@xyflow/svelte": "^1.5.2",
     "clsx": "^2.1.1",
     "dompurify": "^3.3.3",
     "marked": "^17.0.4",

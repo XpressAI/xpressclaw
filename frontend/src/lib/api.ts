@@ -688,3 +688,103 @@ export const apps = {
 		request<App>('/api/apps', { method: 'POST', body: JSON.stringify(data) }),
 	delete: (id: string) => request<{ deleted: boolean }>(`/api/apps/${id}`, { method: 'DELETE' }),
 };
+
+// -- Connectors --
+
+export interface Connector {
+	id: string;
+	name: string;
+	connector_type: string;
+	config: Record<string, unknown>;
+	enabled: boolean;
+	status: string;
+	error_message: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface Channel {
+	id: string;
+	connector_id: string;
+	name: string;
+	channel_type: string;
+	config: Record<string, unknown>;
+	agent_id: string | null;
+	enabled: boolean;
+	created_at: string;
+}
+
+export const connectors = {
+	list: () => request<Connector[]>('/api/connectors'),
+	create: (data: { name: string; connector_type: string; config: Record<string, unknown> }) =>
+		request<Connector>('/api/connectors', { method: 'POST', body: JSON.stringify(data) }),
+	get: (id: string) => request<Connector>(`/api/connectors/${id}`),
+	update: (id: string, data: Partial<{ name: string; config: Record<string, unknown>; enabled: boolean }>) =>
+		request<Connector>(`/api/connectors/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	delete: (id: string) => request<void>(`/api/connectors/${id}`, { method: 'DELETE' }),
+	test: (id: string) => request<{ ok: boolean; error?: string }>(`/api/connectors/${id}/test`, { method: 'POST' }),
+	channels: (id: string) => request<Channel[]>(`/api/connectors/${id}/channels`),
+	createChannel: (connectorId: string, data: { name: string; channel_type?: string; config?: Record<string, unknown>; agent_id?: string }) =>
+		request<Channel>(`/api/connectors/${connectorId}/channels`, { method: 'POST', body: JSON.stringify(data) }),
+	updateChannel: (connectorId: string, channelId: string, data: Partial<{ agent_id: string | null; config: Record<string, unknown> }>) =>
+		request<Channel>(`/api/connectors/${connectorId}/channels/${channelId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	deleteChannel: (connectorId: string, channelId: string) =>
+		request<void>(`/api/connectors/${connectorId}/channels/${channelId}`, { method: 'DELETE' }),
+};
+
+// -- Workflows --
+
+export interface Workflow {
+	id: string;
+	name: string;
+	description: string | null;
+	yaml_content: string;
+	enabled: boolean;
+	version: number;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WorkflowInstance {
+	id: string;
+	workflow_id: string;
+	workflow_version: number;
+	status: string;
+	trigger_data: string | null;
+	current_node_id: string | null;
+	context: string;
+	started_at: string;
+	completed_at: string | null;
+	error_message: string | null;
+	node_executions?: NodeExecution[];
+}
+
+export interface NodeExecution {
+	id: string;
+	instance_id: string;
+	node_id: string;
+	task_id: string | null;
+	status: string;
+	input_context: string | null;
+	output: string | null;
+	attempt: number;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+export const workflows = {
+	list: () => request<Workflow[]>('/api/workflows'),
+	create: (data: { name: string; description?: string; yaml_content: string }) =>
+		request<Workflow>('/api/workflows', { method: 'POST', body: JSON.stringify(data) }),
+	get: (id: string) => request<Workflow>(`/api/workflows/${id}`),
+	update: (id: string, data: { yaml_content: string; description?: string }) =>
+		request<Workflow>(`/api/workflows/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
+	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),
+	disable: (id: string) => request<Workflow>(`/api/workflows/${id}/disable`, { method: 'POST' }),
+	run: (id: string, triggerData?: Record<string, unknown>) =>
+		request<WorkflowInstance>(`/api/workflows/${id}/run`, { method: 'POST', body: JSON.stringify(triggerData || {}) }),
+	instances: (id: string) => request<WorkflowInstance[]>(`/api/workflows/${id}/instances`),
+	getInstance: (instanceId: string) => request<WorkflowInstance>(`/api/workflows/instances/${instanceId}`),
+	cancelInstance: (instanceId: string) => request<void>(`/api/workflows/instances/${instanceId}/cancel`, { method: 'POST' }),
+};
