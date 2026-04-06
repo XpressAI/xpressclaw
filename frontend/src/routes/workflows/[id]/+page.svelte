@@ -236,6 +236,63 @@
 		}
 		nodes = [...nodes, newNode];
 		selectedNodeId = newNode.id; selectedEdgeId = null;
+
+		// Try to insert into an edge if dropped near one
+		if (type !== 'trigger') {
+			const inserted = tryInsertOnEdge(newNode, x, y);
+			if (inserted) return;
+		}
+	}
+
+	/** If the drop position is near an edge, split it and insert the node in between. */
+	function tryInsertOnEdge(newNode: Node, dropX: number, dropY: number): boolean {
+		const THRESHOLD = 60; // pixels proximity to edge midpoint
+
+		for (const edge of edges) {
+			const sourceNode = nodes.find(n => n.id === edge.source);
+			const targetNode = nodes.find(n => n.id === edge.target);
+			if (!sourceNode || !targetNode) continue;
+
+			// Edge midpoint (approximate — vertical layout, source bottom → target top)
+			const midX = (sourceNode.position.x + targetNode.position.x) / 2 + 110; // +110 = half node width
+			const midY = (sourceNode.position.y + (sourceNode.measured?.height ?? 80)) / 2 +
+				(targetNode.position.y) / 2 +
+				((sourceNode.measured?.height ?? 80) / 2);
+			// Simpler: average of source bottom and target top
+			const srcBottomY = sourceNode.position.y + (sourceNode.measured?.height ?? 100);
+			const tgtTopY = targetNode.position.y;
+			const edgeMidY = (srcBottomY + tgtTopY) / 2;
+			const edgeMidX = (sourceNode.position.x + targetNode.position.x) / 2 + 110;
+
+			const dx = (dropX + 110) - edgeMidX;
+			const dy = (dropY + 50) - edgeMidY;
+			const dist = Math.sqrt(dx * dx + dy * dy);
+
+			if (dist < THRESHOLD) {
+				// Split: remove old edge, add source→new and new→target
+				const oldCondition = edge.data?.condition || 'completed';
+				edges = [
+					...edges.filter(e => e.id !== edge.id),
+					{
+						id: `${edge.source}-${newNode.id}-${Date.now()}`,
+						source: edge.source, target: newNode.id,
+						sourceHandle: edge.sourceHandle,
+						type: 'smoothstep', style: edgeStyle(),
+						data: { condition: oldCondition }
+					},
+					{
+						id: `${newNode.id}-${edge.target}-${Date.now() + 1}`,
+						source: newNode.id, target: edge.target,
+						type: 'smoothstep', style: edgeStyle(),
+						data: { condition: 'completed' }
+					}
+				];
+				// Reposition the new node at the midpoint
+				nodes = nodes.map(n => n.id !== newNode.id ? n : { ...n, position: { x: sourceNode.position.x, y: edgeMidY - 50 } });
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// --- Edit helpers ---

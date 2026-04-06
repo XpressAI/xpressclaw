@@ -43,11 +43,21 @@ edges:
 	let error = $state('');
 
 	onMount(async () => {
+		// Find a unique name by checking existing workflows
 		try {
+			const existing = await workflows.list();
+			const names = new Set(existing.map(w => w.name));
+			let name = 'New Workflow';
+			let n = 2;
+			while (names.has(name)) {
+				name = `New Workflow ${n}`;
+				n++;
+			}
+			const yamlWithName = DEFAULT_YAML.replace('name: new-workflow', `name: ${name.toLowerCase().replace(/\s+/g, '-')}`);
 			const wf = await workflows.create({
-				name: 'New Workflow',
+				name,
 				description: '',
-				yaml_content: DEFAULT_YAML
+				yaml_content: yamlWithName
 			});
 			goto(`/workflows/${wf.id}`, { replaceState: true });
 		} catch (e) {

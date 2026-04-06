@@ -144,6 +144,32 @@
 	all: revert;
 }
 
+/* Dark-mode form controls — Linux renders native widgets that ignore CSS colors */
+.dark select,
+.dark input[type="text"],
+.dark input[type="number"],
+.dark input[type="email"],
+.dark input[type="password"],
+.dark input[type="url"],
+.dark textarea {
+	color-scheme: dark;
+	background-color: hsl(var(--background));
+	color: hsl(var(--foreground));
+	border-color: hsl(var(--input));
+}
+.dark select {
+	appearance: none;
+	-webkit-appearance: none;
+	background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237a7f96' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+	background-repeat: no-repeat;
+	background-position: right 0.5rem center;
+	padding-right: 1.75rem;
+}
+.dark input[type="checkbox"] {
+	color-scheme: dark;
+	accent-color: hsl(var(--primary));
+}
+
 /* Custom scrollbar for dark theme */
 .dark ::-webkit-scrollbar {
 	width: 6px;

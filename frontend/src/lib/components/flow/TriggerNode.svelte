@@ -5,7 +5,7 @@
 </script>
 
 <div
-	class="w-[200px] rounded-lg border border-emerald-800/60 bg-emerald-950/40 shadow-lg select-none"
+	class="w-[220px] rounded-lg border border-emerald-800/60 bg-emerald-950/40 shadow-lg select-none"
 >
 	<div class="flex items-center gap-2.5 px-3 py-2.5">
 		<div

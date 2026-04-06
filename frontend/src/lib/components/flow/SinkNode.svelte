@@ -19,7 +19,7 @@
 </script>
 
 <div
-	class="w-[200px] rounded-lg border border-blue-800/60 bg-blue-950/40 shadow-lg select-none"
+	class="w-[220px] rounded-lg border border-blue-800/60 bg-blue-950/40 shadow-lg select-none"
 >
 	<!-- Target handle (top) -->
 	<Handle type="target" position={Position.Top} class="!w-2.5 !h-2.5 !bg-blue-400 !border-blue-800 !border-2" />
