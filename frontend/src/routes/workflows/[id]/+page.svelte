@@ -208,7 +208,8 @@
 
 	function onDragStart(event: DragEvent, type: string) {
 		if (!event.dataTransfer) return;
-		event.dataTransfer.setData('application/workflow-node', type);
+		// Use text/plain for WebKit compatibility (custom MIME types may be ignored)
+		event.dataTransfer.setData('text/plain', type);
 		event.dataTransfer.effectAllowed = 'move';
 		dragType = type;
 	}
@@ -218,9 +219,15 @@
 		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
 	}
 
+	function onDragEnter(event: DragEvent) {
+		event.preventDefault();
+	}
+
 	function onDrop(event: DragEvent) {
 		event.preventDefault();
-		const type = event.dataTransfer?.getData('application/workflow-node');
+		// Try dataTransfer first, fall back to the stored dragType (WebKit may
+		// clear dataTransfer data by the time the drop event fires in some cases)
+		const type = event.dataTransfer?.getData('text/plain') || dragType;
 		if (!type) return;
 		dragType = null;
 
@@ -507,7 +514,7 @@
 
 		<!-- Canvas -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div class="flex-1 relative" ondragover={onDragOver} ondrop={onDrop}>
+		<div class="flex-1 relative" ondragover={onDragOver} ondragenter={onDragEnter} ondrop={onDrop}>
 			<SvelteFlow bind:nodes bind:edges {nodeTypes} fitView snapGrid={[15, 15]}
 				defaultEdgeOptions={{ type: 'smoothstep' }}
 				onnodeclick={handleNodeClick} onedgeclick={handleEdgeClick}
@@ -739,6 +746,11 @@
 </div>
 
 <style>
+	/* WebKit drag-and-drop compatibility */
+	[draggable="true"] {
+		-webkit-user-drag: element;
+		user-select: none;
+	}
 	:global(.svelte-flow) {
 		--xy-background-color: hsl(228, 22%, 8%) !important;
 		--xy-node-border-radius: 0.5rem;
