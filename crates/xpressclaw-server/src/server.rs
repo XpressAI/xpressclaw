@@ -94,6 +94,37 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Recover any running workflow instances after restart.
+    {
+        let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());
+        match engine.recover() {
+            Ok(()) => info!("workflow engine recovery complete"),
+            Err(e) => warn!(error = %e, "workflow engine recovery failed"),
+        }
+    }
+
+    // Start workflow event processing loop (polls connector_events).
+    let workflow_db = state.db.clone();
+    let workflow_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(workflow_db);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    match engine.process_events() {
+                        Ok(n) if n > 0 => info!(count = n, "processed connector events"),
+                        Err(e) => warn!(error = %e, "workflow event processing failed"),
+                        _ => {}
+                    }
+                }
+                _ = workflow_shutdown.cancelled() => {
+                    info!("workflow event processor stopped");
+                    break;
+                }
+            }
+        }
+    });
+
     let app = create_router(state.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
