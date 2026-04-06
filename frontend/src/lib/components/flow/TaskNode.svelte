@@ -4,12 +4,12 @@
 	let { data, id } = $props();
 
 	const statusColors: Record<string, string> = {
-		completed: 'border-l-emerald-500',
-		running: 'border-l-blue-500',
-		pending: 'border-l-amber-500',
-		failed: 'border-l-red-500',
-		error: 'border-l-red-500',
-		default: 'border-l-[hsl(225,18%,25%)]'
+		completed: 'border-t-emerald-500',
+		running: 'border-t-blue-500',
+		pending: 'border-t-amber-500',
+		failed: 'border-t-red-500',
+		error: 'border-t-red-500',
+		default: 'border-t-[hsl(225,18%,25%)]'
 	};
 
 	let borderClass = $derived(
@@ -29,8 +29,11 @@
 </script>
 
 <div
-	class="w-[220px] rounded-lg border border-[hsl(225,18%,18%)] bg-[hsl(228,22%,11%)] shadow-lg border-l-[3px] {borderClass} select-none"
+	class="w-[220px] rounded-lg border border-[hsl(225,18%,18%)] bg-[hsl(228,22%,11%)] shadow-lg border-t-[3px] {borderClass} select-none"
 >
+	<!-- Target handle (top) -->
+	<Handle type="target" position={Position.Top} class="!w-2.5 !h-2.5 !bg-[hsl(225,15%,40%)] !border-[hsl(225,18%,25%)] !border-2" />
+
 	<!-- Header -->
 	<div class="flex items-center gap-2 px-3 pt-2.5 pb-1.5">
 		<div
@@ -71,21 +74,18 @@
 		</div>
 	{/if}
 
-	<!-- Target handle (left) -->
-	<Handle type="target" position={Position.Left} class="!w-2.5 !h-2.5 !bg-[hsl(225,15%,40%)] !border-[hsl(225,18%,25%)] !border-2" />
-
-	<!-- Source handle(s) (right) -->
+	<!-- Source handle(s) (bottom) -->
 	{#if outputs.length > 1}
 		{#each outputs as output, i}
 			<Handle
 				type="source"
-				position={Position.Right}
+				position={Position.Bottom}
 				id={output}
-				style="top: {30 + (i * 100) / (outputs.length)}%"
+				style="left: {20 + (i * 60) / (outputs.length)}%"
 				class="!w-2.5 !h-2.5 !bg-[hsl(225,65%,55%)] !border-[hsl(225,18%,25%)] !border-2"
 			/>
 		{/each}
 	{:else}
-		<Handle type="source" position={Position.Right} class="!w-2.5 !h-2.5 !bg-[hsl(225,65%,55%)] !border-[hsl(225,18%,25%)] !border-2" />
+		<Handle type="source" position={Position.Bottom} class="!w-2.5 !h-2.5 !bg-[hsl(225,65%,55%)] !border-[hsl(225,18%,25%)] !border-2" />
 	{/if}
 </div>

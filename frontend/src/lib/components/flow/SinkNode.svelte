@@ -21,8 +21,10 @@
 <div
 	class="w-[200px] rounded-lg border border-blue-800/60 bg-blue-950/40 shadow-lg select-none"
 >
+	<!-- Target handle (top) -->
+	<Handle type="target" position={Position.Top} class="!w-2.5 !h-2.5 !bg-blue-400 !border-blue-800 !border-2" />
+
 	<div class="flex items-center gap-2.5 px-3 py-2.5">
-		<!-- Send icon -->
 		<div
 			class="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-blue-600/20"
 		>
@@ -57,7 +59,4 @@
 			{/each}
 		</div>
 	{/if}
-
-	<!-- Target handle (left) -->
-	<Handle type="target" position={Position.Left} class="!w-2.5 !h-2.5 !bg-blue-400 !border-blue-800 !border-2" />
 </div>

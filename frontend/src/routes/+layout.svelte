@@ -52,6 +52,13 @@
 
 	let { children } = $props();
 
+	// Collapsible sidebar — collapsed by default on content-heavy pages
+	let sidebarCollapsed = $state(true);
+
+	function toggleSidebar() {
+		sidebarCollapsed = !sidebarCollapsed;
+	}
+
 	async function loadSidebar() {
 		const [c, a, ap] = await Promise.all([
 			conversations.list().catch(() => []),
@@ -159,15 +166,19 @@
 {:else}
 	<div class="flex h-screen">
 		<!-- Sidebar -->
-		<aside class="flex w-64 flex-col" style="background: hsl(var(--sidebar))">
+		<aside class="flex flex-col transition-all duration-200 ease-in-out {sidebarCollapsed ? 'w-12' : 'w-64'}" style="background: hsl(var(--sidebar))">
 			<!-- Header -->
-			<div class="flex h-11 items-center gap-2 px-4">
-				<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded" />
-				<span class="text-xs font-medium text-muted-foreground">xpressclaw</span>
+			<div class="flex h-11 items-center {sidebarCollapsed ? 'justify-center px-0' : 'gap-2 px-4'}">
+				<button onclick={toggleSidebar} class="flex items-center gap-2 hover:opacity-80 transition-opacity" title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+					<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded flex-shrink-0" />
+					{#if !sidebarCollapsed}
+						<span class="text-xs font-medium text-muted-foreground">xpressclaw</span>
+					{/if}
+				</button>
 			</div>
 
-			<!-- Tab-dependent sidebar content -->
-			<div class="flex-1 overflow-y-auto">
+			<!-- Tab-dependent sidebar content (hidden when collapsed) -->
+			<div class="flex-1 overflow-y-auto {sidebarCollapsed ? 'hidden' : ''}">
 
 				{#if activeTab === 'agents'}
 					<!-- AGENTS TAB: Apps, Conversations, Agents, Knowledge -->
@@ -317,8 +328,8 @@
 			</div>
 
 			<!-- Bottom Tab Bar -->
-			<div class="border-t border-border/50 px-2 py-2">
-				<div class="flex items-center justify-around">
+			<div class="border-t border-border/50 px-1 py-2">
+				<div class="{sidebarCollapsed ? 'flex flex-col items-center gap-1' : 'flex items-center justify-around'}">
 					{#each tabs as tab}
 						{@const active = activeTab === tab.id}
 						<a
@@ -331,7 +342,7 @@
 							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
 								<path stroke-linecap="round" stroke-linejoin="round" d={tab.icon} />
 							</svg>
-							<span>{tab.label}</span>
+							{#if !sidebarCollapsed}<span>{tab.label}</span>{/if}
 						</a>
 					{/each}
 				</div>

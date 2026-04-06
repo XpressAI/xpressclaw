@@ -8,7 +8,6 @@
 	class="w-[200px] rounded-lg border border-emerald-800/60 bg-emerald-950/40 shadow-lg select-none"
 >
 	<div class="flex items-center gap-2.5 px-3 py-2.5">
-		<!-- Bolt icon -->
 		<div
 			class="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-emerald-600/20"
 		>
@@ -45,6 +44,6 @@
 		</div>
 	{/if}
 
-	<!-- Source handle (right) -->
-	<Handle type="source" position={Position.Right} class="!w-2.5 !h-2.5 !bg-emerald-400 !border-emerald-800 !border-2" />
+	<!-- Source handle (bottom) -->
+	<Handle type="source" position={Position.Bottom} class="!w-2.5 !h-2.5 !bg-emerald-400 !border-emerald-800 !border-2" />
 </div>
