@@ -405,6 +405,8 @@
 		if (event.key === 'Delete' || event.key === 'Backspace') {
 			const tag = (event.target as HTMLElement)?.tagName;
 			if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+			// Prevent WebKit from navigating back on Backspace
+			event.preventDefault();
 			deleteSelected();
 		}
 	}
