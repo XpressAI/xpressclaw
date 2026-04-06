@@ -58,6 +58,16 @@ fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
 }
 
 fn main() {
+    // Embed git commit hash at compile time
+    if let Ok(output) = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+        if output.status.success() {
+            let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            println!("cargo:rustc-env=XPRESSCLAW_GIT_HASH={hash}");
+        }
+    }
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads");
+
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_root = Path::new(&manifest_dir).parent().unwrap().parent().unwrap();
     let frontend_dir = workspace_root.join("frontend");

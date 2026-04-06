@@ -3,8 +3,11 @@
 	import { settings } from '$lib/api';
 	import { setCachedProfile } from '$lib/utils';
 
+	import { health } from '$lib/api';
+
 	let userProfile = $state<{ name: string; avatar: string | null }>({ name: 'You', avatar: null });
 	let editingProfile = $state(false);
+	let buildInfo = $state<{ version: string; git_hash: string } | null>(null);
 	let profileName = $state('');
 	let profileSaved = $state(false);
 	let fileInput: HTMLInputElement;
@@ -76,10 +79,16 @@
 	}
 
 	onMount(async () => {
-		const profile = await settings.getProfile().catch(() => null);
+		const [profile, info] = await Promise.all([
+			settings.getProfile().catch(() => null),
+			health.check().catch(() => null),
+		]);
 		if (profile) {
 			userProfile = profile;
 			setCachedProfile(profile);
+		}
+		if (info) {
+			buildInfo = { version: info.version, git_hash: info.git_hash };
 		}
 	});
 </script>
@@ -145,4 +154,21 @@
 			</div>
 		</div>
 	</div>
+
+	<!-- Build info -->
+	{#if buildInfo}
+		<div class="rounded-lg border border-border bg-card p-4">
+			<h2 class="text-sm font-semibold mb-2">About</h2>
+			<div class="text-xs text-muted-foreground space-y-1">
+				<div class="flex gap-2">
+					<span>Version:</span>
+					<span class="font-mono text-foreground">{buildInfo.version}</span>
+				</div>
+				<div class="flex gap-2">
+					<span>Build:</span>
+					<span class="font-mono text-foreground">{buildInfo.git_hash}</span>
+				</div>
+			</div>
+		</div>
+	{/if}
 </div>

@@ -520,7 +520,7 @@ export const activity = {
 // -- Health --
 
 export const health = {
-	check: () => request<{ status: string; version: string }>('/api/health')
+	check: () => request<{ status: string; version: string; git_hash: string }>('/api/health')
 };
 
 // -- Setup --
