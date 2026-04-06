@@ -379,8 +379,7 @@ impl WorkflowEngine {
                 let execs = self.instances.list_node_executions(&instance.id)?;
                 let current_exec = execs
                     .iter()
-                    .filter(|e| e.node_id == *current_node_id && e.status == "running")
-                    .next_back();
+                    .rfind(|e| e.node_id == *current_node_id && e.status == "running");
 
                 if let Some(exec) = current_exec {
                     if let Some(ref task_id) = exec.task_id {
