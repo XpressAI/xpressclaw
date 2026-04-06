@@ -275,13 +275,16 @@
 		const THRESHOLD = 80;
 		const theNode = nodes.find(n => n.id === nodeId);
 		if (!theNode) return false;
+
+		// Don't insert if node already has connections
+		if (edges.some(e => e.source === nodeId || e.target === nodeId)) return false;
+
 		const nc = nodeCenter(theNode);
 
 		let bestEdge: Edge | null = null;
 		let bestDist = THRESHOLD;
 
 		for (const edge of edges) {
-			if (edge.source === nodeId || edge.target === nodeId) continue;
 			const src = nodes.find(n => n.id === edge.source);
 			const tgt = nodes.find(n => n.id === edge.target);
 			if (!src || !tgt) continue;
@@ -297,27 +300,37 @@
 
 		if (!bestEdge) return false;
 
+		// Capture values before mutating
+		const srcId = bestEdge.source;
+		const tgtId = bestEdge.target;
 		const oldCondition = bestEdge.data?.condition || 'completed';
+		const oldSourceHandle = bestEdge.sourceHandle;
+		const edgeToRemove = bestEdge.id;
 		const now = Date.now();
+
+		// Remove ALL edges between source and target (not just by ID — handles
+		// cases where edge IDs changed due to reconnection)
+		const newEdgeId1 = `${srcId}-${nodeId}-${now}`;
+		const newEdgeId2 = `${nodeId}-${tgtId}-${now + 1}`;
 		edges = [
-			...edges.filter(e => e.id !== bestEdge!.id),
+			...edges.filter(e => !(e.source === srcId && e.target === tgtId)),
 			{
-				id: `${bestEdge.source}-${nodeId}-${now}`,
-				source: bestEdge.source, target: nodeId,
-				sourceHandle: bestEdge.sourceHandle,
+				id: newEdgeId1,
+				source: srcId, target: nodeId,
+				sourceHandle: oldSourceHandle,
 				type: 'smoothstep', style: edgeStyle(),
 				data: { condition: oldCondition }
 			},
 			{
-				id: `${nodeId}-${bestEdge.target}-${now + 1}`,
-				source: nodeId, target: bestEdge.target,
+				id: newEdgeId2,
+				source: nodeId, target: tgtId,
 				type: 'smoothstep', style: edgeStyle(),
 				data: { condition: 'completed' }
 			}
 		];
 
 		// Snap the node to the source node's x for clean alignment
-		const srcNode = nodes.find(n => n.id === bestEdge!.source);
+		const srcNode = nodes.find(n => n.id === srcId);
 		if (srcNode) {
 			nodes = nodes.map(n => n.id !== nodeId ? n : { ...n, position: { ...n.position, x: srcNode!.position.x } });
 		}
