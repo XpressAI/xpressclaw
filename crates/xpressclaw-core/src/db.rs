@@ -142,6 +142,7 @@ impl Database {
             (19, MIGRATION_V19),
             (20, MIGRATION_V20),
             (21, MIGRATION_V21),
+            (22, MIGRATION_V22),
         ];
 
         for &(target, sql) in migrations {
@@ -654,6 +655,17 @@ CREATE INDEX IF NOT EXISTS idx_wf_node_exec_instance ON workflow_node_executions
 CREATE INDEX IF NOT EXISTS idx_wf_node_exec_task ON workflow_node_executions(task_id);
 ";
 
+const MIGRATION_V22: &str = "
+-- Channel-to-conversation bindings for direct agent routing.
+CREATE TABLE IF NOT EXISTS conversation_channel_bindings (
+    conversation_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel_id, agent_id)
+);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,7 +683,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "21");
+        assert_eq!(version, "22");
     }
 
     #[test]

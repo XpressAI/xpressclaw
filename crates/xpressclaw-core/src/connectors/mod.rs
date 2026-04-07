@@ -1,6 +1,7 @@
 pub mod file_watcher;
 pub mod manager;
 pub mod registry;
+pub mod router;
 pub mod stubs;
 pub mod telegram;
 pub mod traits;

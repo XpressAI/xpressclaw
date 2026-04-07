@@ -103,22 +103,50 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // Start workflow event processing loop (polls connector_events).
-    let workflow_db = state.db.clone();
-    let workflow_shutdown = shutdown.clone();
+    // Start connector runtime: launch all enabled connectors and route their events.
+    let connector_db = state.db.clone();
+    let connector_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(workflow_db);
+        use xpressclaw_core::connectors::registry::ConnectorRegistry;
+        use xpressclaw_core::connectors::router;
+        use xpressclaw_core::workflows::engine::WorkflowEngine;
+
+        let mut registry = ConnectorRegistry::new(connector_db.clone());
+        let mut event_rx = registry.take_event_receiver().unwrap();
+
+        // Start all enabled connectors (telegram polling, file watchers, etc.)
+        match registry.start_all().await {
+            Ok(()) => info!("connector registry started"),
+            Err(e) => warn!(error = %e, "some connectors failed to start"),
+        }
+
+        let engine = WorkflowEngine::new(connector_db.clone());
+
+        // Event processing loop: route incoming connector events
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                Some(event) = event_rx.recv() => {
+                    // Route event: direct agent binding → conversation, or → workflow engine
+                    router::route_event(&connector_db, &event);
+                    // Also let the workflow engine check for matching triggers
+                    match engine.process_events() {
+                        Ok(n) if n > 0 => info!(count = n, "triggered workflow instances"),
+                        Err(e) => warn!(error = %e, "workflow event processing failed"),
+                        _ => {}
+                    }
+                }
+                // Also poll periodically for events recorded via webhook API
+                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
                     match engine.process_events() {
                         Ok(n) if n > 0 => info!(count = n, "processed connector events"),
                         Err(e) => warn!(error = %e, "workflow event processing failed"),
                         _ => {}
                     }
                 }
-                _ = workflow_shutdown.cancelled() => {
-                    info!("workflow event processor stopped");
+                _ = connector_shutdown.cancelled() => {
+                    info!("stopping connectors...");
+                    let _ = registry.stop_all().await;
+                    info!("connector runtime stopped");
                     break;
                 }
             }
