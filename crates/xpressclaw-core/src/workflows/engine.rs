@@ -113,14 +113,41 @@ impl WorkflowEngine {
         let ctx = context::build_context(trigger_data, node_outputs);
         let ctx_json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
 
-        // Check if this is a sink node
-        let is_sink = node
-            .node_type
-            .as_deref()
-            .map(|t| t == "sink")
-            .unwrap_or(false);
+        let node_type = node.node_type.as_deref().unwrap_or("task");
 
-        if is_sink {
+        // Router/branch nodes evaluate conditions immediately without creating a task.
+        // They look at the previous node's output and route to the appropriate edge.
+        if node_type == "router" || node_type == "branch" {
+            let exec =
+                self.instances
+                    .create_node_execution(instance_id, &node.id, Some(&ctx_json))?;
+            self.instances.set_current_node(instance_id, &node.id)?;
+
+            // Use the last completed node's output as the "task output" for condition evaluation
+            let last_output = node_outputs.last().map(|(_, o)| o.as_str()).unwrap_or("");
+
+            self.instances
+                .update_node_status(&exec.id, "completed", Some("routed"))?;
+
+            info!(
+                instance_id,
+                node_id = node.id.as_str(),
+                "router node evaluating conditions"
+            );
+
+            self.check_completion_after_node(
+                instance_id,
+                &node.id,
+                "completed",
+                last_output,
+                definition,
+                trigger_data,
+                node_outputs,
+            )?;
+            return Ok(());
+        }
+
+        if node_type == "sink" {
             // Sink nodes don't create tasks — they deliver messages.
             // Create a node execution and immediately mark it completed.
             let exec =

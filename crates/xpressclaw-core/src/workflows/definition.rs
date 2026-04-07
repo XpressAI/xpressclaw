@@ -35,7 +35,7 @@ pub struct WorkflowNode {
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default, rename = "type")]
-    pub node_type: Option<String>, // "task" (default), "sink"
+    pub node_type: Option<String>, // "task" (default), "sink", "router"
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]

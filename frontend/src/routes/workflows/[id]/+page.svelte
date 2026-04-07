@@ -14,13 +14,14 @@
 	import TaskNode from '$lib/components/flow/TaskNode.svelte';
 	import TriggerNode from '$lib/components/flow/TriggerNode.svelte';
 	import SinkNode from '$lib/components/flow/SinkNode.svelte';
+	import BranchNode from '$lib/components/flow/BranchNode.svelte';
 	import { workflows, agents, connectors } from '$lib/api';
 	import type { Workflow, Agent, Connector } from '$lib/api';
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
 	import yaml from 'js-yaml';
 
-	const nodeTypes = { task: TaskNode, trigger: TriggerNode, sink: SinkNode };
+	const nodeTypes = { task: TaskNode, trigger: TriggerNode, sink: SinkNode, router: BranchNode };
 
 	let nodes = $state.raw<Node[]>([]);
 	let edges = $state.raw<Edge[]>([]);
@@ -75,10 +76,10 @@
 
 		for (let i = 0; i < def.nodes.length; i++) {
 			const n = def.nodes[i];
-			const isSink = n.type === 'sink';
+			const nodeType = n.type === 'sink' ? 'sink' : n.type === 'router' ? 'router' : 'task';
 			const outEdges = def.edges.filter(e => e.from === n.id);
 			const outputs = outEdges.length > 1 ? outEdges.map(e => e.condition || 'completed') : [];
-			gn.push({ id: n.id, type: isSink ? 'sink' : 'task', position: n.position ?? { x: 300, y: i * 180 },
+			gn.push({ id: n.id, type: nodeType, position: n.position ?? { x: 300, y: i * 180 },
 				data: { label: n.label ?? n.id, agent: n.agent, prompt: n.prompt, procedure: n.procedure, sinks: n.sinks ?? [], outputs }
 			});
 		}
@@ -113,6 +114,7 @@
 		def.nodes = regularNodes.map(n => {
 			const node: Record<string, unknown> = { id: n.id, label: n.data.label || n.id, position: { x: Math.round(n.position.x), y: Math.round(n.position.y) } };
 			if (n.type === 'sink') { node.type = 'sink'; if ((n.data.sinks as any[])?.length) node.sinks = n.data.sinks; }
+			else if (n.type === 'router') { node.type = 'router'; }
 			else { if (n.data.agent) node.agent = n.data.agent; if (n.data.prompt) node.prompt = n.data.prompt; if (n.data.procedure) node.procedure = n.data.procedure; }
 			return node;
 		});
@@ -260,10 +262,8 @@
 			newNode = { id: '__trigger__', type: 'trigger', position: { x, y }, data: { connector: '', channel: '', event: '' } };
 		} else if (type === 'sink') {
 			newNode = { id, type: 'sink', position: { x, y }, data: { label: 'Send Notification', sinks: [{ connector: '', channel: '', template: '' }] } };
-		} else if (type === 'condition') {
-			newNode = { id, type: 'task', position: { x, y }, data: { label: 'Decision', agent: '', prompt: 'Evaluate and decide: approve or reject.' } };
-		} else if (type === 'human') {
-			newNode = { id, type: 'task', position: { x, y }, data: { label: 'Human Review', agent: '', prompt: 'A human needs to review and decide.' } };
+		} else if (type === 'branch') {
+			newNode = { id, type: 'router', position: { x, y }, data: { label: 'Branch', outputs: [] } };
 		} else {
 			newNode = { id, type: 'task', position: { x, y }, data: { label: 'New Task', agent: '', prompt: '' } };
 		}
@@ -486,30 +486,18 @@
 				</div>
 
 				<div class="pt-2 pb-1">
-					<div class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Templates</div>
+					<div class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Control Flow</div>
 				</div>
 
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'condition')} ondragend={onDragEnd}
+				<div draggable="true" ondragstart={(e) => onDragStart(e, 'branch')} ondragend={onDragEnd}
 					class="flex items-center gap-2.5 rounded-lg border border-amber-800/30 bg-amber-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-amber-600/40 transition-colors">
 					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-600/20">
-						<svg class="h-3.5 w-3.5 text-amber-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" /></svg>
+						<svg class="h-4 w-4 text-amber-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
 					</div>
 					<div>
-						<div class="text-xs font-medium text-amber-300">Decision</div>
-						<div class="text-[10px] text-muted-foreground">Approve/reject branch</div>
-					</div>
-				</div>
-
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'human')} ondragend={onDragEnd}
-					class="flex items-center gap-2.5 rounded-lg border border-purple-800/30 bg-purple-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-purple-600/40 transition-colors">
-					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-purple-600/20">
-						<svg class="h-3.5 w-3.5 text-purple-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0" /></svg>
-					</div>
-					<div>
-						<div class="text-xs font-medium text-purple-300">Human</div>
-						<div class="text-[10px] text-muted-foreground">Human review step</div>
+						<div class="text-xs font-medium text-amber-300">Branch</div>
+						<div class="text-[10px] text-muted-foreground">Route by condition</div>
 					</div>
 				</div>
 			</div>
@@ -552,6 +540,7 @@
 					nodeColor={(node) => {
 						if (node.type === 'trigger') return 'hsl(142, 71%, 45%)';
 						if (node.type === 'sink') return 'hsl(217, 91%, 60%)';
+						if (node.type === 'router') return 'hsl(45, 93%, 47%)';
 						return 'hsl(225, 65%, 55%)';
 					}} />
 			</SvelteFlow>
@@ -589,7 +578,7 @@
 				<div class="flex items-center justify-between border-b border-border px-4 py-3">
 					<h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
 						{#if selectedNode}
-							{selectedNode.type === 'trigger' ? 'Trigger' : selectedNode.type === 'sink' ? 'Sink' : 'Task'} Properties
+							{selectedNode.type === 'trigger' ? 'Trigger' : selectedNode.type === 'sink' ? 'Sink' : selectedNode.type === 'router' ? 'Branch' : 'Task'} Properties
 						{:else}
 							Edge Properties
 						{/if}
@@ -712,6 +701,41 @@
 								</div>
 							{/each}
 						</div>
+
+					{:else if selectedNode?.type === 'router'}
+						<!-- Branch/router node -->
+						<div>
+							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Label</label>
+							<input type="text" value={selectedNode.data.label || ''}
+								oninput={(e) => updateNodeData(selectedNode!.id, { label: e.currentTarget.value })}
+								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
+						</div>
+						<div class="rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 space-y-2">
+							<div class="text-xs font-medium text-amber-300">How it works</div>
+							<p class="text-[10px] text-muted-foreground leading-relaxed">
+								A branch node evaluates the <strong>previous node's output</strong> against each outgoing edge's condition.
+								No agent is needed — it routes instantly.
+							</p>
+							<p class="text-[10px] text-muted-foreground leading-relaxed">
+								Connect multiple edges from this node, then click each edge to set its condition
+								(e.g. <code class="bg-muted px-1 rounded">output.verdict == "approve"</code>).
+							</p>
+						</div>
+						{#if (() => { const outs = edges.filter(e => e.source === selectedNode?.id); return outs.length; })() > 0}
+							<div>
+								<label class="block text-[10px] font-medium text-muted-foreground mb-1">Outgoing Branches</label>
+								<div class="space-y-1">
+									{#each edges.filter(e => e.source === selectedNode?.id) as edge}
+										<div class="flex items-center gap-2 text-xs">
+											<span class="text-amber-400">→</span>
+											<span class="font-mono text-muted-foreground">{edge.data?.condition || 'completed'}</span>
+											<span class="text-muted-foreground/50">→</span>
+											<span class="text-foreground">{nodes.find(n => n.id === edge.target)?.data.label || edge.target}</span>
+										</div>
+									{/each}
+								</div>
+							</div>
+						{/if}
 
 					{:else if selectedNode?.type === 'trigger'}
 						<!-- Trigger node -->
