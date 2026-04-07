@@ -106,6 +106,7 @@
 		return 'stroke: hsl(225, 25%, 35%); stroke-width: 2;';
 	}
 
+
 	function graphToYaml(gn: Node[], ge: Edge[]): string {
 		const triggerNode = gn.find(n => n.type === 'trigger');
 		const regularNodes = gn.filter(n => n.type !== 'trigger');
@@ -359,13 +360,13 @@
 				source: srcId, target: nodeId,
 				sourceHandle: oldSourceHandle,
 				type: 'smoothstep', style: edgeStyle(),
-				data: { condition: oldCondition }
+				label: oldCondition as string, data: { condition: oldCondition }
 			},
 			{
 				id: newEdgeId2,
 				source: nodeId, target: tgtId,
 				type: 'smoothstep', style: edgeStyle(),
-				data: { condition: 'completed' }
+				label: 'completed', data: { condition: 'completed' }
 			}
 		];
 
@@ -917,7 +918,8 @@
 	:global(.svelte-flow .svelte-flow__node) { border: none; background: none; padding: 0; border-radius: 0; box-shadow: none; }
 	:global(.svelte-flow .svelte-flow__node.selected) { outline: 2px solid hsl(225, 65%, 55%); outline-offset: 2px; border-radius: 0.5rem; }
 	:global(.svelte-flow .svelte-flow__edge.selected .svelte-flow__edge-path) { stroke: hsl(225, 65%, 55%); }
-	:global(.svelte-flow .svelte-flow__edge-text) { font-size: 10px; }
+	:global(.svelte-flow .svelte-flow__edge-text) { font-size: 10px; font-weight: 500; }
+	:global(.svelte-flow .svelte-flow__edge-textbg) { fill: hsl(228, 22%, 11%); rx: 4; stroke: hsl(225, 18%, 22%); stroke-width: 1; }
 	:global(.svelte-flow .svelte-flow__minimap) { background: hsl(228, 22%, 11%); border: 1px solid hsl(225, 18%, 18%); border-radius: 0.375rem; }
 	:global(.svelte-flow .svelte-flow__controls) { background: hsl(228, 22%, 11%); border: 1px solid hsl(225, 18%, 18%); border-radius: 0.375rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
 	:global(.svelte-flow .svelte-flow__controls button) { background: hsl(228, 22%, 11%); border-color: hsl(225, 18%, 18%); color: hsl(225, 15%, 55%); }
