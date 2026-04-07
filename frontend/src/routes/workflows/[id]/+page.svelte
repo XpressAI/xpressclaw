@@ -50,7 +50,7 @@
 	interface WfDef {
 		name?: string; description?: string; version?: number;
 		trigger?: { connector: string; channel: string; event: string; filter?: Record<string, unknown> };
-		nodes: { id: string; label?: string; type?: string; agent?: string; prompt?: string; procedure?: string; sinks?: { connector: string; channel: string; template?: string }[]; position?: { x: number; y: number } }[];
+		nodes: { id: string; label?: string; type?: string; agent?: string; prompt?: string; procedure?: string; sinks?: { connector: string; channel: string; template?: string }[]; outputs?: string[]; position?: { x: number; y: number } }[];
 		edges: { from: string; to: string; condition?: string; label?: string }[];
 	}
 
@@ -78,7 +78,10 @@
 			const n = def.nodes[i];
 			const nodeType = n.type === 'sink' ? 'sink' : n.type === 'router' ? 'router' : 'task';
 			const outEdges = def.edges.filter(e => e.from === n.id);
-			const outputs = outEdges.length > 1 ? outEdges.map(e => e.condition || 'completed') : [];
+			// Router nodes use their defined outputs; task nodes infer from edges
+			const outputs = n.type === 'router' && n.outputs?.length
+				? n.outputs
+				: (outEdges.length > 1 ? outEdges.map(e => e.condition || 'completed') : []);
 			gn.push({ id: n.id, type: nodeType, position: n.position ?? { x: 300, y: i * 180 },
 				data: { label: n.label ?? n.id, agent: n.agent, prompt: n.prompt, procedure: n.procedure, sinks: n.sinks ?? [], outputs }
 			});
@@ -114,7 +117,7 @@
 		def.nodes = regularNodes.map(n => {
 			const node: Record<string, unknown> = { id: n.id, label: n.data.label || n.id, position: { x: Math.round(n.position.x), y: Math.round(n.position.y) } };
 			if (n.type === 'sink') { node.type = 'sink'; if ((n.data.sinks as any[])?.length) node.sinks = n.data.sinks; }
-			else if (n.type === 'router') { node.type = 'router'; }
+			else if (n.type === 'router') { node.type = 'router'; if ((n.data.outputs as string[])?.length) node.outputs = n.data.outputs; }
 			else { if (n.data.agent) node.agent = n.data.agent; if (n.data.prompt) node.prompt = n.data.prompt; if (n.data.procedure) node.procedure = n.data.procedure; }
 			return node;
 		});
@@ -263,7 +266,7 @@
 		} else if (type === 'sink') {
 			newNode = { id, type: 'sink', position: { x, y }, data: { label: 'Send Notification', sinks: [{ connector: '', channel: '', template: '' }] } };
 		} else if (type === 'branch') {
-			newNode = { id, type: 'router', position: { x, y }, data: { label: 'Branch', outputs: [] } };
+			newNode = { id, type: 'router', position: { x, y }, data: { label: 'Branch', outputs: ['approved', 'rejected'] } };
 		} else {
 			newNode = { id, type: 'task', position: { x, y }, data: { label: 'New Task', agent: '', prompt: '' } };
 		}
@@ -710,32 +713,53 @@
 								oninput={(e) => updateNodeData(selectedNode!.id, { label: e.currentTarget.value })}
 								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
 						</div>
-						<div class="rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 space-y-2">
-							<div class="text-xs font-medium text-amber-300">How it works</div>
-							<p class="text-[10px] text-muted-foreground leading-relaxed">
-								A branch node evaluates the <strong>previous node's output</strong> against each outgoing edge's condition.
-								No agent is needed — it routes instantly.
-							</p>
-							<p class="text-[10px] text-muted-foreground leading-relaxed">
-								Connect multiple edges from this node, then click each edge to set its condition
-								(e.g. <code class="bg-muted px-1 rounded">output.verdict == "approve"</code>).
+
+						<div>
+							<div class="flex items-center justify-between mb-1">
+								<label class="text-[10px] font-medium text-muted-foreground">Outputs</label>
+								<button onclick={() => {
+									const outs = [...((selectedNode!.data.outputs as string[]) || []), `output_${Date.now().toString(36)}`];
+									updateNodeData(selectedNode!.id, { outputs: outs });
+								}} class="rounded px-1.5 py-0.5 text-[10px] text-primary hover:bg-primary/10">+ Add</button>
+							</div>
+							<div class="space-y-1.5">
+								{#each ((selectedNode.data.outputs || []) as string[]) as output, i}
+									<div class="flex items-center gap-1.5">
+										<span class="text-amber-400 text-xs">→</span>
+										<input type="text" value={output}
+											oninput={(e) => {
+												const outs = [...((selectedNode!.data.outputs as string[]) || [])];
+												outs[i] = e.currentTarget.value;
+												updateNodeData(selectedNode!.id, { outputs: outs });
+											}}
+											class="flex-1 rounded border border-input bg-background px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+											placeholder="condition name" />
+										{#if ((selectedNode.data.outputs as string[]) || []).length > 2}
+											<button onclick={() => {
+												const outs = ((selectedNode!.data.outputs as string[]) || []).filter((_, idx) => idx !== i);
+												updateNodeData(selectedNode!.id, { outputs: outs });
+											}} class="text-muted-foreground hover:text-destructive text-xs px-1">x</button>
+										{/if}
+									</div>
+								{/each}
+							</div>
+							<p class="mt-2 text-[10px] text-muted-foreground/70">
+								Each output becomes a handle. Connect edges from each handle to different target nodes.
+								The edge condition determines which branch is taken.
 							</p>
 						</div>
-						{#if (() => { const outs = edges.filter(e => e.source === selectedNode?.id); return outs.length; })() > 0}
-							<div>
-								<label class="block text-[10px] font-medium text-muted-foreground mb-1">Outgoing Branches</label>
-								<div class="space-y-1">
-									{#each edges.filter(e => e.source === selectedNode?.id) as edge}
-										<div class="flex items-center gap-2 text-xs">
-											<span class="text-amber-400">→</span>
-											<span class="font-mono text-muted-foreground">{edge.data?.condition || 'completed'}</span>
-											<span class="text-muted-foreground/50">→</span>
-											<span class="text-foreground">{nodes.find(n => n.id === edge.target)?.data.label || edge.target}</span>
-										</div>
-									{/each}
-								</div>
-							</div>
-						{/if}
+
+						<div class="rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 space-y-1.5">
+							<div class="text-[10px] font-medium text-amber-300">How branching works</div>
+							<p class="text-[10px] text-muted-foreground leading-relaxed">
+								When the previous task completes, its output is checked against each outgoing edge condition.
+								No agent needed — routing is instant.
+							</p>
+							<p class="text-[10px] text-muted-foreground leading-relaxed">
+								Click an edge to set its condition, e.g.
+								<code class="bg-muted px-1 rounded">output.verdict == "approve"</code>
+							</p>
+						</div>
 
 					{:else if selectedNode?.type === 'trigger'}
 						<!-- Trigger node -->

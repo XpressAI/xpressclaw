@@ -45,6 +45,8 @@ pub struct WorkflowNode {
     #[serde(default)]
     pub sinks: Vec<SinkConfig>,
     #[serde(default)]
+    pub outputs: Vec<String>,
+    #[serde(default)]
     pub position: NodePosition,
 }
 
