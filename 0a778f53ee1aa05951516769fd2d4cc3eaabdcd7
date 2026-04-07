@@ -1,0 +1,15 @@
+Major fix commit addressing 6 critical gaps found in audit:
+
+1. SINK DELIVERY: New connectors/deliver.rs module provides standalone delivery for telegram (sendMessage API via tokio::spawn), webhook (HTTP POST), file_watcher (file write). Engine's advance_to_node() now calls deliver::deliver() instead of just logging. Stubs log with warning.
+
+2. RESPONSE ROUTING: Added route_response_to_channel() in conversations/processor.rs. After agent stores response, looks up conversation_channel_bindings table for channel binding, then calls deliver::deliver() to send response back through connector (telegram reply, webhook POST, etc.).
+
+3. EDGE CONDITIONS VISIBLE: All edges now always show condition as label (was hiding 'completed'). New edges from handleConnect() also get label:'completed'.
+
+4. INSTANCE TRACKING: 'Runs' button in toolbar toggles bottom panel showing workflow instances — status with live pulse indicator, current node, timestamps, cancel button. Loads on page open and after manual run.
+
+5. YAML SYNC: Opening YAML editor auto-refreshes from canvas state.
+
+6. STUB WARNINGS: Connectors settings page shows amber 'Not yet implemented' warning for email/github/jira/slack instead of neutral 'coming soon'.
+
+7. BRANCH DEFAULTS: Router nodes now start with ['approved','rejected'] outputs. Properties panel allows add/remove/rename with min 2 enforced. Outputs saved to YAML. WorkflowNode.outputs field added to Rust definition.
