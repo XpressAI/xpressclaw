@@ -496,9 +496,9 @@
 							<span class="text-muted-foreground">Watch subdirectories recursively</span>
 						</label>
 					{:else if comingSoonTypes.includes(addForm.connector_type)}
-						<div class="rounded-lg border border-border bg-muted/30 p-4 text-center space-y-2">
-							<p class="text-sm text-muted-foreground">Full {typeLabel(addForm.connector_type)} support coming soon</p>
-							<p class="text-xs text-muted-foreground/70">Basic stub connector will be created. Configuration can be updated later.</p>
+						<div class="rounded-lg border border-amber-800/40 bg-amber-950/20 p-4 text-center space-y-2">
+							<p class="text-sm text-amber-300">Not yet implemented</p>
+							<p class="text-xs text-muted-foreground">{typeLabel(addForm.connector_type)} connector is not functional. Messages will be logged but not actually sent or received. Use Webhook, Telegram, or File Watcher for real integrations.</p>
 						</div>
 					{/if}
 

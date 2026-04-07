@@ -1,3 +1,4 @@
+pub mod deliver;
 pub mod file_watcher;
 pub mod manager;
 pub mod registry;

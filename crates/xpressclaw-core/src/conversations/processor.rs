@@ -514,6 +514,9 @@ fn record_and_store(
                 message: json!(agent_msg),
             },
         );
+
+        // Route response back through connector if this is a channel-bound conversation
+        route_response_to_channel(&ctx.db, conv_id, agent_id, content);
     }
 
     // Log activity for dashboard
@@ -529,4 +532,45 @@ fn record_and_store(
         })),
         None,
     );
+}
+
+/// If this conversation is bound to a connector channel, send the agent's
+/// response back through the connector.
+fn route_response_to_channel(db: &Arc<Database>, conv_id: &str, _agent_id: &str, content: &str) {
+    // Look up channel binding for this conversation
+    let binding: Option<(String, String)> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT b.channel_id, c.connector_id
+             FROM conversation_channel_bindings b
+             JOIN connector_channels c ON c.id = b.channel_id
+             WHERE b.conversation_id = ?1
+             LIMIT 1",
+            rusqlite::params![conv_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
+    });
+
+    let Some((channel_id, connector_id)) = binding else {
+        return; // Not a channel-bound conversation
+    };
+
+    let mgr = crate::connectors::manager::ConnectorManager::new(db.clone());
+    let connector = match mgr.get(&connector_id) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let channel = match mgr.get_channel(&channel_id) {
+        Ok(ch) => ch,
+        Err(_) => return,
+    };
+
+    debug!(
+        conv_id,
+        connector = connector.name.as_str(),
+        channel = channel.name.as_str(),
+        "routing agent response back to connector channel"
+    );
+
+    crate::connectors::deliver::deliver(db, &connector.name, &channel.name, content);
 }

@@ -16,7 +16,7 @@
 	import SinkNode from '$lib/components/flow/SinkNode.svelte';
 	import BranchNode from '$lib/components/flow/BranchNode.svelte';
 	import { workflows, agents, connectors } from '$lib/api';
-	import type { Workflow, Agent, Connector } from '$lib/api';
+	import type { Workflow, WorkflowInstance, Agent, Connector } from '$lib/api';
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
 	import yaml from 'js-yaml';
@@ -37,6 +37,8 @@
 	let workflowName = $state('');
 	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
 	let dragType = $state<string | null>(null);
+	let instances = $state<WorkflowInstance[]>([]);
+	let showInstances = $state(false);
 
 	let selectedNode = $derived(
 		selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) ?? null : null
@@ -88,11 +90,12 @@
 		}
 
 		for (const e of def.edges) {
-			const condLabel = e.label || (e.condition && e.condition !== 'completed' ? e.condition : undefined);
+			const cond = e.condition || 'completed';
+			const condLabel = e.label || cond;
 			const sourceOutEdges = def.edges.filter(ed => ed.from === e.from);
-			const sourceHandle = sourceOutEdges.length > 1 ? e.condition || 'completed' : undefined;
-			ge.push({ id: `${e.from}-${e.to}-${e.condition || 'completed'}`, source: e.from, target: e.to, sourceHandle, type: 'smoothstep',
-				label: condLabel, style: edgeStyle(), data: { condition: e.condition || 'completed' }
+			const sourceHandle = sourceOutEdges.length > 1 ? cond : undefined;
+			ge.push({ id: `${e.from}-${e.to}-${cond}`, source: e.from, target: e.to, sourceHandle, type: 'smoothstep',
+				label: condLabel, style: edgeStyle(), data: { condition: cond }
 			});
 		}
 		return { nodes: gn, edges: ge };
@@ -142,6 +145,7 @@
 			workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = al; connectorList = cl;
 			const graph = yamlToGraph(wf.yaml_content);
 			nodes = graph.nodes; edges = graph.edges;
+			instances = await workflows.instances(id).catch(() => []);
 		} catch (e) { showToast(`Failed to load: ${e}`, 'error'); }
 	});
 
@@ -173,9 +177,19 @@
 	async function runWorkflow() {
 		if (!workflow) return;
 		running = true;
-		try { const inst = await workflows.run(workflow.id); showToast(`Instance started: ${inst.id.slice(0, 8)}...`, 'success'); }
-		catch (e) { showToast(`Run failed: ${e}`, 'error'); }
+		try {
+			const inst = await workflows.run(workflow.id);
+			showToast(`Instance started: ${inst.id.slice(0, 8)}...`, 'success');
+			showInstances = true;
+			await loadInstances();
+		} catch (e) { showToast(`Run failed: ${e}`, 'error'); }
 		running = false;
+	}
+
+	async function loadInstances() {
+		if (!workflow) return;
+		try { instances = await workflows.instances(workflow.id); }
+		catch { instances = []; }
 	}
 
 	function applyYaml() {
@@ -204,7 +218,7 @@
 		edges = [...edges, {
 			id, source: connection.source, target: connection.target,
 			sourceHandle: connection.sourceHandle ?? undefined, targetHandle: connection.targetHandle ?? undefined,
-			type: 'smoothstep', style: edgeStyle(), data: { condition: 'completed' }, label: undefined
+			type: 'smoothstep', style: edgeStyle(), data: { condition: 'completed' }, label: 'completed'
 		}];
 		selectedEdgeId = id; selectedNodeId = null;
 	}
@@ -434,7 +448,11 @@
 			</label>
 		{/if}
 
-		<button onclick={() => (showYaml = !showYaml)}
+		<button onclick={() => { showInstances = !showInstances; if (showInstances) loadInstances(); }}
+			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showInstances ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'} flex items-center gap-1.5">
+			Runs{#if instances.length > 0}<span class="rounded-full bg-muted px-1.5 text-[10px]">{instances.length}</span>{/if}
+		</button>
+		<button onclick={() => { showYaml = !showYaml; if (showYaml) yamlContent = graphToYaml(nodes, edges); }}
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showYaml ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">YAML</button>
 		<button onclick={runWorkflow} disabled={running}
 			class="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 flex items-center gap-1.5">
@@ -809,6 +827,61 @@
 			</div>
 		{/if}
 	</div>
+
+	<!-- Instance tracking panel -->
+	{#if showInstances}
+		<div class="border-t border-border bg-card flex-shrink-0 max-h-48 overflow-y-auto">
+			<div class="flex items-center justify-between px-4 py-2 border-b border-border/50">
+				<span class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Workflow Runs</span>
+				<div class="flex items-center gap-2">
+					<button onclick={loadInstances} class="text-[10px] text-muted-foreground hover:text-foreground">Refresh</button>
+					<button onclick={() => (showInstances = false)} class="text-muted-foreground hover:text-foreground">
+						<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+					</button>
+				</div>
+			</div>
+			{#if instances.length === 0}
+				<div class="px-4 py-3 text-xs text-muted-foreground">No runs yet. Click "Run" to start one.</div>
+			{:else}
+				<table class="w-full text-xs">
+					<thead>
+						<tr class="text-[10px] text-muted-foreground border-b border-border/30">
+							<th class="text-left font-medium px-4 py-1.5">Instance</th>
+							<th class="text-left font-medium px-4 py-1.5">Status</th>
+							<th class="text-left font-medium px-4 py-1.5">Current Node</th>
+							<th class="text-left font-medium px-4 py-1.5">Started</th>
+							<th class="text-right font-medium px-4 py-1.5"></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each instances as inst}
+							<tr class="border-b border-border/20 hover:bg-accent/30">
+								<td class="px-4 py-1.5 font-mono text-muted-foreground">{inst.id.slice(0, 8)}...</td>
+								<td class="px-4 py-1.5">
+									<span class="inline-flex items-center gap-1">
+										<span class="h-1.5 w-1.5 rounded-full {
+											inst.status === 'running' ? 'bg-blue-400 animate-pulse' :
+											inst.status === 'completed' ? 'bg-emerald-400' :
+											inst.status === 'failed' ? 'bg-red-400' :
+											'bg-muted-foreground'}"></span>
+										{inst.status}
+									</span>
+								</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_node_id || '—'}</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
+								<td class="px-4 py-1.5 text-right">
+									{#if inst.status === 'running'}
+										<button onclick={async () => { await workflows.cancelInstance(inst.id); loadInstances(); }}
+											class="text-[10px] text-muted-foreground hover:text-destructive">Cancel</button>
+									{/if}
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		</div>
+	{/if}
 
 	<!-- Toast -->
 	{#if toast}

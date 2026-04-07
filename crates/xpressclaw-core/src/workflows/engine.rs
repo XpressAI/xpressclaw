@@ -154,20 +154,17 @@ impl WorkflowEngine {
                 self.instances
                     .create_node_execution(instance_id, &node.id, Some(&ctx_json))?;
 
-            // Deliver sink messages (log for now; actual delivery will be
-            // handled by the connector registry integration).
+            // Deliver sink messages through connectors
             for sink in &node.sinks {
                 let rendered = match &sink.template {
                     Some(tmpl) => context::render_template(tmpl, &ctx),
                     None => format!("Workflow node '{}' completed", node.id),
                 };
-                info!(
-                    instance_id,
-                    node_id = node.id.as_str(),
-                    connector = sink.connector.as_str(),
-                    channel = sink.channel.as_str(),
-                    message = rendered.as_str(),
-                    "sink message ready for delivery"
+                crate::connectors::deliver::deliver(
+                    &self.db,
+                    &sink.connector,
+                    &sink.channel,
+                    &rendered,
                 );
             }
 
