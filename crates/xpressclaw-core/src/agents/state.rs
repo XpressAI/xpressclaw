@@ -64,8 +64,7 @@ pub fn compute_status(desired: &DesiredStatus, observed: &ObservedStatus) -> &'s
     }
 }
 
-// Keep the old enum around until all callers are migrated.
-// TODO(ADR-018): remove once the reconciler handles all lifecycle transitions.
+/// Agent lifecycle status used by runtime and API routes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
