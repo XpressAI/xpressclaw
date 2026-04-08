@@ -59,7 +59,7 @@
 	let triggerConfig = $state<{ connector: string; channel: string; event: string; filter?: Record<string, unknown> } | null>(null);
 	let globalVars = $state<Record<string, unknown>>({});
 
-	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number } | null>(null);
+	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number; loopContext?: { asVar: string; overVar: string } } | null>(null);
 
 	let currentBlocks = $derived(flows[currentFlow]?.blocks ?? []);
 	let flowNames = $derived(Object.keys(flows));
@@ -307,19 +307,30 @@
 
 	// --- Variables ---
 
-	function availableVariables(upToIdx: number): { name: string; type?: string; source?: string }[] {
+	function availableVariables(upToIdx: number, loopContext?: { asVar: string; overVar: string }): { name: string; type?: string; source?: string }[] {
 		const vars: { name: string; type?: string; source?: string }[] = [];
 		if (triggerConfig) vars.push({ name: 'trigger.payload', type: 'object', source: 'Trigger' });
 		for (const [k, v] of Object.entries(globalVars)) {
 			vars.push({ name: k, type: typeof v, source: 'Global' });
 		}
 		const blocks = flows[currentFlow]?.blocks ?? [];
-		for (let i = 0; i < upToIdx && i < blocks.length; i++) {
+		for (let i = 0; i <= upToIdx && i < blocks.length; i++) {
 			const b = blocks[i];
 			if (b.outputs) {
 				for (const [name, schema] of Object.entries(b.outputs)) {
 					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
 				}
+			}
+			// Include loop iteration variable if this block is the loop we're inside
+			if (b.type === 'loop' && b.asVar && i === upToIdx) {
+				vars.push({ name: b.asVar, type: 'any', source: `Loop: ${b.label}` });
+			}
+		}
+		// Also add loop context if explicitly provided (for nested steps)
+		if (loopContext) {
+			// Don't duplicate if already added
+			if (!vars.some(v => v.name === loopContext.asVar)) {
+				vars.push({ name: loopContext.asVar, type: 'any', source: `Loop item (${loopContext.overVar})` });
 			}
 		}
 		return vars;
@@ -327,7 +338,7 @@
 
 	let popupRef = $state<{ handleKey: (e: KeyboardEvent) => boolean } | null>(null);
 
-	function handlePromptKeydown(e: KeyboardEvent, blockIdx: number) {
+	function handlePromptKeydown(e: KeyboardEvent, blockIdx: number, loopContext?: { asVar: string; overVar: string }) {
 		// If popup is open, delegate keyboard events to it
 		if (variablePopup && popupRef) {
 			if (popupRef.handleKey(e)) return;
@@ -355,7 +366,7 @@
 			const lines = text.split('\n').length;
 			const caretY = rect.top + lines * lineHeight;
 			const caretX = rect.left + 12;
-			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: ta, blockIdx };
+			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: ta, blockIdx, loopContext };
 		}
 	}
 
@@ -591,7 +602,7 @@
 													<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} outputs={child.outputs || {}}
 														expanded={child.expanded} compact={compactView} {agentList}
 														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
-														onpromptkeydown={(e) => handlePromptKeydown(e, idx)}
+														onpromptkeydown={(e) => handlePromptKeydown(e, idx, { asVar: block.asVar || 'item', overVar: block.overVar || '' })}
 													/>
 												{:else if child.type === 'when'}
 													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
@@ -756,7 +767,7 @@
 	{#if variablePopup}
 		<VariablePopup
 			bind:this={popupRef}
-			variables={availableVariables(variablePopup.blockIdx ?? currentBlocks.length)}
+			variables={availableVariables(variablePopup.blockIdx ?? currentBlocks.length, variablePopup.loopContext)}
 			filter={variablePopup.filter}
 			x={variablePopup.x} y={variablePopup.y}
 			onselect={insertVariable}
