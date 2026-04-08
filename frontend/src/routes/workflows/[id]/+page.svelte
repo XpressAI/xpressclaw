@@ -511,11 +511,11 @@
 				<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
 				{#if name !== 'main'}
 					{#if confirmDeleteFlow === name}
-						<span class="ml-1 flex items-center gap-1" onclick={(e) => e.stopPropagation()}>
+						<span class="ml-1 flex items-center gap-1.5" onclick={(e) => e.stopPropagation()}>
 							<button onclick={() => { removeFlow(name); confirmDeleteFlow = null; }}
-								class="text-[10px] text-destructive hover:underline">delete</button>
+								class="rounded border border-destructive/50 bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive hover:bg-destructive/20">Delete</button>
 							<button onclick={() => (confirmDeleteFlow = null)}
-								class="text-[10px] text-muted-foreground hover:underline">cancel</button>
+								class="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent">Cancel</button>
 						</span>
 					{:else}
 						<button onclick={(e) => { e.stopPropagation(); confirmDeleteFlow = name; }}

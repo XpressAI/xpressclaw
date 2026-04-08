@@ -302,9 +302,11 @@
 
 						<!-- Delete button -->
 						{#if confirmDeleteConnector === connector.id}
-							<span class="flex items-center gap-1 text-[10px] shrink-0">
-								<button onclick={() => deleteConnector(connector.id)} class="text-destructive hover:underline">delete</button>
-								<button onclick={() => (confirmDeleteConnector = null)} class="text-muted-foreground hover:underline">cancel</button>
+							<span class="flex items-center gap-1.5 shrink-0">
+								<button onclick={() => deleteConnector(connector.id)}
+									class="rounded border border-destructive/50 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive hover:bg-destructive/20 transition-colors">Delete</button>
+								<button onclick={() => (confirmDeleteConnector = null)}
+									class="rounded border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-accent transition-colors">Cancel</button>
 							</span>
 						{:else}
 						<button
@@ -365,9 +367,11 @@
 												</td>
 												<td class="py-2.5 text-right">
 													{#if confirmDeleteChannel === channel.id}
-													<span class="flex items-center gap-1 text-[10px]">
-														<button onclick={() => deleteChannel(connector.id, channel.id)} class="text-destructive hover:underline">delete</button>
-														<button onclick={() => (confirmDeleteChannel = null)} class="text-muted-foreground hover:underline">cancel</button>
+													<span class="flex items-center justify-end gap-1.5">
+														<button onclick={() => deleteChannel(connector.id, channel.id)}
+															class="rounded border border-destructive/50 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive hover:bg-destructive/20 transition-colors">Delete</button>
+														<button onclick={() => (confirmDeleteChannel = null)}
+															class="rounded border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-accent transition-colors">Cancel</button>
 													</span>
 												{:else}
 												<button
