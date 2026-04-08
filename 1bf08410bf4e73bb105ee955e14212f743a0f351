@@ -1,0 +1,1 @@
+Workflow v2 backend complete. All 6 workflow modules rewritten from scratch. Sequential step execution replaces node/edge graph. Sub-workflows (flows map), step types (step/when/loop/sink/jump), typed outputs, variable store with @mention syntax. Version is 1 (user explicitly requested, no v1 to migrate from). V23 migration drops old tables. 341+49 tests pass, clippy clean.
