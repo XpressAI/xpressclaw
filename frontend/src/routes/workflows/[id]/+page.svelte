@@ -192,11 +192,22 @@
 
 	// --- Flow management ---
 
+	let addingFlow = $state(false);
+	let newFlowName = $state('');
+	let confirmDeleteFlow = $state<string | null>(null);
+
 	function addFlow() {
-		const name = prompt('Sub-workflow name (e.g. on_rejected):');
-		if (!name || flows[name]) return;
+		addingFlow = true;
+		newFlowName = 'on_';
+	}
+
+	function confirmAddFlow() {
+		const name = newFlowName.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+		if (!name || flows[name]) { showToast('Flow name already exists or is empty', 'error'); return; }
 		flows = { ...flows, [name]: { color: '#8b5cf6', blocks: [] } };
 		currentFlow = name;
+		addingFlow = false;
+		newFlowName = '';
 	}
 
 	function removeFlow(name: string) {
@@ -494,14 +505,33 @@
 				<span>{name}</span>
 				<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
 				{#if name !== 'main'}
-					<button onclick={(e) => { e.stopPropagation(); if (confirm(`Delete flow "${name}"?`)) removeFlow(name); }}
-						class="ml-0.5 text-muted-foreground/30 hover:text-destructive">
-						<svg class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-					</button>
+					{#if confirmDeleteFlow === name}
+						<span class="ml-1 flex items-center gap-1" onclick={(e) => e.stopPropagation()}>
+							<button onclick={() => { removeFlow(name); confirmDeleteFlow = null; }}
+								class="text-[10px] text-destructive hover:underline">delete</button>
+							<button onclick={() => (confirmDeleteFlow = null)}
+								class="text-[10px] text-muted-foreground hover:underline">cancel</button>
+						</span>
+					{:else}
+						<button onclick={(e) => { e.stopPropagation(); confirmDeleteFlow = name; }}
+							class="ml-0.5 text-muted-foreground/30 hover:text-destructive">
+							<svg class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+						</button>
+					{/if}
 				{/if}
 			</button>
 		{/each}
-		<button onclick={addFlow} class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50" title="Add sub-workflow">+</button>
+		{#if addingFlow}
+			<form onsubmit={(e) => { e.preventDefault(); confirmAddFlow(); }} class="flex items-center gap-1">
+				<input type="text" bind:value={newFlowName} autofocus
+					class="rounded border border-input bg-background px-2 py-0.5 text-xs w-28 focus:outline-none focus:ring-1 focus:ring-ring"
+					placeholder="flow_name" />
+				<button type="submit" class="text-[10px] text-primary hover:underline">add</button>
+				<button type="button" onclick={() => (addingFlow = false)} class="text-[10px] text-muted-foreground hover:underline">cancel</button>
+			</form>
+		{:else}
+			<button onclick={addFlow} class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50" title="Add sub-workflow">+</button>
+		{/if}
 	</div>
 
 	<!-- Main content -->

@@ -104,9 +104,7 @@
 			const updated = await connectors.update(connector.id, { enabled: !connector.enabled });
 			const idx = connectorList.findIndex(c => c.id === connector.id);
 			if (idx >= 0) connectorList[idx] = updated;
-		} catch (e) {
-			alert(String(e));
-		}
+		} catch {}
 	}
 
 	async function testConnection(id: string) {
@@ -119,26 +117,25 @@
 		}
 	}
 
-	async function deleteConnector(id: string, name: string) {
-		if (!confirm(`Delete connector "${name}" and all its channels?`)) return;
+	let confirmDeleteConnector = $state<string | null>(null);
+	let confirmDeleteChannel = $state<string | null>(null);
+
+	async function deleteConnector(id: string) {
 		try {
 			await connectors.delete(id);
 			if (expandedId === id) expandedId = null;
 			delete channelMap[id];
+			confirmDeleteConnector = null;
 			await load();
-		} catch (e) {
-			alert(String(e));
-		}
+		} catch {}
 	}
 
-	async function deleteChannel(connectorId: string, channelId: string, name: string) {
-		if (!confirm(`Delete channel "${name}"?`)) return;
+	async function deleteChannel(connectorId: string, channelId: string) {
 		try {
 			await connectors.deleteChannel(connectorId, channelId);
 			channelMap[connectorId] = await connectors.channels(connectorId).catch(() => []);
-		} catch (e) {
-			alert(String(e));
-		}
+			confirmDeleteChannel = null;
+		} catch {}
 	}
 
 	// --- Add Connector ---
@@ -304,8 +301,14 @@
 						</label>
 
 						<!-- Delete button -->
+						{#if confirmDeleteConnector === connector.id}
+							<span class="flex items-center gap-1 text-[10px] shrink-0">
+								<button onclick={() => deleteConnector(connector.id)} class="text-destructive hover:underline">delete</button>
+								<button onclick={() => (confirmDeleteConnector = null)} class="text-muted-foreground hover:underline">cancel</button>
+							</span>
+						{:else}
 						<button
-							onclick={() => deleteConnector(connector.id, connector.name)}
+							onclick={() => (confirmDeleteConnector = connector.id)}
 							class="shrink-0 rounded-md p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
 							title="Delete connector"
 						>
@@ -313,6 +316,7 @@
 								<path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" />
 							</svg>
 						</button>
+						{/if}
 
 						<!-- Expand/collapse -->
 						<button
@@ -360,15 +364,22 @@
 													<code class="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded font-mono">{truncateJson(channel.config)}</code>
 												</td>
 												<td class="py-2.5 text-right">
-													<button
-														onclick={() => deleteChannel(connector.id, channel.id, channel.name)}
-														class="rounded-md p-1 text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
-														title="Delete channel"
-													>
-														<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-															<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
-														</svg>
+													{#if confirmDeleteChannel === channel.id}
+													<span class="flex items-center gap-1 text-[10px]">
+														<button onclick={() => deleteChannel(connector.id, channel.id)} class="text-destructive hover:underline">delete</button>
+														<button onclick={() => (confirmDeleteChannel = null)} class="text-muted-foreground hover:underline">cancel</button>
+													</span>
+												{:else}
+												<button
+													onclick={() => (confirmDeleteChannel = channel.id)}
+													class="rounded-md p-1 text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+													title="Delete channel"
+												>
+													<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+														<path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
+													</svg>
 													</button>
+												{/if}
 												</td>
 											</tr>
 										{/each}
