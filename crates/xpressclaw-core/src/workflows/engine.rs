@@ -837,17 +837,32 @@ impl WorkflowEngine {
                     );
                 }
             } else {
-                // No declared outputs — store raw
-                var_store.insert(
-                    exec.step_id.clone(),
-                    serde_json::json!({ "output": output_value }),
-                );
+                // No declared outputs — store the JSON as-is if it's an object,
+                // otherwise wrap it so @step.output works
+                match &output_value {
+                    Value::Object(_) => {
+                        var_store.insert(exec.step_id.clone(), output_value.clone());
+                    }
+                    _ => {
+                        var_store.insert(
+                            exec.step_id.clone(),
+                            serde_json::json!({ "output": output_value }),
+                        );
+                    }
+                }
             }
         } else {
-            var_store.insert(
-                exec.step_id.clone(),
-                serde_json::json!({ "output": output_value }),
-            );
+            match &output_value {
+                Value::Object(_) => {
+                    var_store.insert(exec.step_id.clone(), output_value.clone());
+                }
+                _ => {
+                    var_store.insert(
+                        exec.step_id.clone(),
+                        serde_json::json!({ "output": output_value }),
+                    );
+                }
+            }
         }
 
         self.save_variable_store(&exec.instance_id, &var_store)?;
@@ -1679,5 +1694,294 @@ flows:
         let execs = engine.instances.list_step_executions(&instance_id).unwrap();
         assert_eq!(execs.len(), 1);
         assert!(execs[0].task_id.is_some());
+    }
+
+    #[test]
+    fn test_recover_running_instance_with_completed_task() {
+        let (db, engine) = setup();
+        let wf_id = create_workflow(&db, SIMPLE_WORKFLOW);
+
+        // Start a workflow — creates task for step1
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({"summary": "test"}))
+            .unwrap();
+
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.current_flow, "main");
+        assert_eq!(instance.current_step_index, 0);
+
+        // Get the task that was created
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let task_id = execs[0].task_id.as_ref().unwrap().clone();
+
+        // Simulate: task completed during downtime (update task status directly)
+        let board = TaskBoard::new(db.clone());
+        board.update_status(&task_id, "completed", None).unwrap();
+
+        // Simulate server restart — create a new engine instance and call recover
+        let engine2 = WorkflowEngine::new(db.clone());
+        engine2.recover().unwrap();
+
+        // The instance should have advanced past step1
+        let instance = engine2.instances.get_instance(&instance_id).unwrap();
+        // It should now be at step2 (index 1), or still running with a new task
+        assert_eq!(instance.status, "running");
+        // Step execution for step1 should be completed
+        let execs = engine2
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap();
+        let step1_exec = execs.iter().find(|e| e.step_id == "step1").unwrap();
+        assert_eq!(step1_exec.status, "completed");
+        // Step2 should have been started
+        assert!(execs.iter().any(|e| e.step_id == "step2"));
+    }
+
+    #[test]
+    fn test_recover_running_instance_task_still_pending() {
+        let (db, engine) = setup();
+        let wf_id = create_workflow(&db, SIMPLE_WORKFLOW);
+
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({}))
+            .unwrap();
+
+        // Task is still pending (not completed) — recovery should leave it alone
+        let engine2 = WorkflowEngine::new(db.clone());
+        engine2.recover().unwrap();
+
+        let instance = engine2.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.current_step_index, 0);
+        // Only one step execution — step1 still running
+        let execs = engine2
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap();
+        assert_eq!(execs.len(), 1);
+        assert_eq!(execs[0].step_id, "step1");
+        assert_eq!(execs[0].status, "running");
+    }
+
+    #[test]
+    fn test_full_pipeline_two_steps() {
+        let (db, engine) = setup();
+        let wf_id = create_workflow(&db, SIMPLE_WORKFLOW);
+
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({"summary": "build feature"}))
+            .unwrap();
+
+        // Step1 task created
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(execs.len(), 1);
+        let task1_id = execs[0].task_id.as_ref().unwrap().clone();
+
+        // Complete step1 with output
+        engine
+            .on_task_completed(&task1_id, "completed", r#"{"output": "step1 done"}"#)
+            .unwrap();
+
+        // Step2 should now be running
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "running");
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert_eq!(execs.len(), 2);
+        let step2_exec = execs.iter().find(|e| e.step_id == "step2").unwrap();
+        assert_eq!(step2_exec.status, "running");
+        let task2_id = step2_exec.task_id.as_ref().unwrap().clone();
+
+        // Complete step2 — workflow should finish
+        engine
+            .on_task_completed(&task2_id, "completed", "all done")
+            .unwrap();
+
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "completed");
+    }
+
+    #[test]
+    fn test_when_cycle_back_to_earlier_step() {
+        let (db, engine) = setup();
+
+        let yaml = r#"
+name: cycle-test
+version: 1
+flows:
+  main:
+    steps:
+      - id: do_work
+        type: step
+        label: "Do Work"
+        agent: dev
+        prompt: "Do work"
+      - id: review
+        type: step
+        label: "Review"
+        agent: reviewer
+        prompt: "Review work"
+      - id: check
+        type: when
+        label: "Check verdict"
+        switch: "@review.verdict"
+        arms:
+          - match: "approved"
+            continue: true
+          - match: "rejected"
+            goto: step do_work
+      - id: done
+        type: sink
+        label: "Notify"
+        sinks:
+          - connector: webhook
+            channel: alerts
+            template: "Done"
+"#;
+        let wf_id = create_workflow(&db, yaml);
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({}))
+            .unwrap();
+
+        // Complete do_work
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let task1_id = execs[0].task_id.as_ref().unwrap().clone();
+        engine
+            .on_task_completed(&task1_id, "completed", r#"{"output": "first attempt"}"#)
+            .unwrap();
+
+        // Complete review with rejected verdict
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let review_exec = execs
+            .iter()
+            .find(|e| e.step_id == "review" && e.status == "running")
+            .unwrap();
+        let task2_id = review_exec.task_id.as_ref().unwrap().clone();
+        engine
+            .on_task_completed(&task2_id, "completed", r#"{"verdict": "rejected"}"#)
+            .unwrap();
+
+        // Should cycle back to do_work (step 0)
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "running");
+        assert_eq!(instance.current_step_index, 0);
+
+        // do_work should have a second execution
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let do_work_execs: Vec<_> = execs.iter().filter(|e| e.step_id == "do_work").collect();
+        assert!(do_work_execs.len() >= 2, "do_work should run a second time");
+    }
+
+    #[test]
+    fn test_loop_step_iterates() {
+        let (db, engine) = setup();
+
+        let yaml = r#"
+name: loop-test
+version: 1
+flows:
+  main:
+    steps:
+      - id: prep
+        type: step
+        label: "Prepare"
+        agent: atlas
+        prompt: "Prepare items"
+        outputs:
+          items: { type: array }
+      - id: process
+        type: loop
+        label: "Process Items"
+        over: "@prep.items"
+        as: item
+        steps:
+          - id: handle
+            type: step
+            label: "Handle"
+            agent: atlas
+            prompt: "Handle: @item"
+      - id: finish
+        type: sink
+        label: "Done"
+        sinks: []
+"#;
+        let wf_id = create_workflow(&db, yaml);
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({}))
+            .unwrap();
+
+        // Complete prep with an array of 2 items
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let task_id = execs[0].task_id.as_ref().unwrap().clone();
+        engine
+            .on_task_completed(&task_id, "completed", r#"{"items": ["a", "b"]}"#)
+            .unwrap();
+
+        // Loop should have started executing — a task for the first body step
+        // should be created (loop body task steps are async)
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        // Should have: prep (completed) + loop (running) + handle (running for first item)
+        assert!(
+            execs.len() >= 2,
+            "loop should have created body task: got {} execs",
+            execs.len()
+        );
+        let handle_exec = execs.iter().find(|e| e.step_id == "handle");
+        assert!(
+            handle_exec.is_some(),
+            "handle step should have been created inside loop"
+        );
+    }
+
+    #[test]
+    fn test_cross_flow_jump() {
+        let (db, engine) = setup();
+
+        let yaml = r##"
+name: cross-flow-test
+version: 1
+flows:
+  main:
+    steps:
+      - id: start
+        type: step
+        label: "Start"
+        agent: atlas
+        prompt: "Start"
+      - id: go
+        type: jump
+        label: "Jump to other"
+        target: flow other
+  other:
+    color: "#f97316"
+    steps:
+      - id: other_step
+        type: step
+        label: "Other Step"
+        agent: atlas
+        prompt: "In other flow"
+"##;
+        let wf_id = create_workflow(&db, yaml);
+        let instance_id = engine
+            .start_instance(&wf_id, serde_json::json!({}))
+            .unwrap();
+
+        // Complete the start step
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        let task_id = execs[0].task_id.as_ref().unwrap().clone();
+        engine
+            .on_task_completed(&task_id, "completed", "started")
+            .unwrap();
+
+        // Should have jumped to the other flow
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.current_flow, "other");
+        assert_eq!(instance.current_step_index, 0);
+
+        // other_step should be running
+        let execs = engine.instances.list_step_executions(&instance_id).unwrap();
+        assert!(execs
+            .iter()
+            .any(|e| e.step_id == "other_step" && e.status == "running"));
     }
 }

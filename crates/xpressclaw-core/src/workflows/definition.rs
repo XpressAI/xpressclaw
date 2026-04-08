@@ -67,8 +67,8 @@ pub struct Step {
     pub over: Option<String>,
     #[serde(rename = "as", default)]
     pub as_var: Option<String>,
-    #[serde(default)]
-    pub body: Option<Vec<Step>>, // nested steps for loops
+    #[serde(default, rename = "steps", alias = "body")]
+    pub body: Option<Vec<Step>>, // nested steps for loops (YAML key: "steps")
     // Jump fields
     #[serde(default)]
     pub target: Option<String>,
