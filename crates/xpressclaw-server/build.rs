@@ -116,8 +116,19 @@ fn main() {
     };
 
     if needs_build {
-        // Install deps if needed
-        if !frontend_dir.join("node_modules").exists() {
+        // Install deps if node_modules is missing or package.json is newer
+        let needs_install = !frontend_dir.join("node_modules").exists()
+            || frontend_dir
+                .join("package.json")
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                > frontend_dir
+                    .join("node_modules")
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if needs_install {
             println!("cargo:warning=Installing frontend dependencies...");
             let status = Command::new(npm())
                 .args(["ci", "--silent"])
