@@ -385,7 +385,7 @@
 		</a>
 		<span class="text-xs text-muted-foreground/50">/</span>
 		<input type="text" bind:value={workflowName}
-			class="border-none bg-transparent text-sm font-semibold text-foreground focus:outline-none w-48" placeholder="Workflow name" />
+			class="border-none text-sm font-semibold text-foreground focus:outline-none w-48" style="background: transparent;" placeholder="Workflow name" />
 		<div class="flex-1"></div>
 
 		{#if workflow}
