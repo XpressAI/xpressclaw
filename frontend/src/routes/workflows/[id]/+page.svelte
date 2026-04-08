@@ -556,33 +556,33 @@
 		{/if}
 
 		<!-- Column header -->
-		<div class="max-w-3xl mx-auto px-4">
-			<div class="flex items-center text-[10px] font-medium text-muted-foreground/50 uppercase tracking-wider pt-3 pb-1 px-1">
-				<span class="w-10">Line</span>
-				<span class="flex-1">Block</span>
+		<div class="mx-auto px-4" style="max-width: 56rem;">
+			<div class="flex items-center text-[10px] font-medium text-muted-foreground/40 uppercase tracking-wider pt-3 pb-1 border-b border-border/30">
+				<span class="w-12 text-center">Line</span>
+				<span class="flex-1 pl-1">Block</span>
+				<span class="w-32 text-right pr-1">Returns</span>
 			</div>
 		</div>
 
 		<!-- Block list -->
-		<div class="max-w-3xl mx-auto px-4 pb-6">
+		<div class="mx-auto px-4 pb-6" style="max-width: 56rem;">
 			<!-- Trigger (shown in main flow only) -->
 			{#if currentFlow === 'main'}
 				{#if triggerConfig}
-					<div class="flex items-start gap-0">
-						<div class="w-10 pt-2.5 text-right pr-3 text-xs font-mono text-muted-foreground/40">01</div>
-						<div class="flex-1">
+					<div class="flex items-start border-b border-border/20 hover:bg-accent/5 transition-colors">
+						<div class="w-12 py-2 text-center text-xs font-mono text-muted-foreground/40">01</div>
+						<div class="flex-1 min-w-0">
 							<TriggerBlock
 								connector={triggerConfig.connector} channel={triggerConfig.channel} event={triggerConfig.event}
-								expanded={!compactView} {connectorList}
+								expanded={!compactView} compact={compactView} {connectorList}
 								onupdate={(u) => { triggerConfig = { ...triggerConfig!, ...u } as typeof triggerConfig; }}
 								ontoggle={() => {}}
 							/>
 						</div>
-						<button onclick={removeTrigger} class="mt-2.5 ml-1 text-muted-foreground/20 hover:text-destructive">
+						<button onclick={removeTrigger} class="mt-2 mr-1 text-muted-foreground/20 hover:text-destructive">
 							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
 						</button>
 					</div>
-					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
 				{:else}
 					<div class="flex items-center gap-0 mb-2">
 						<div class="w-10"></div>
@@ -598,7 +598,8 @@
 			<!-- Steps -->
 			{#each currentBlocks as block, idx (block.id)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div class="flex items-start gap-0" data-step-id={block.id}
+				<div class="flex items-start border-b border-border/20 hover:bg-accent/5 transition-colors {dragOverIdx === idx ? 'bg-primary/5' : ''}"
+					data-step-id={block.id}
 					draggable="true"
 					ondragstart={(e) => { e.dataTransfer?.setData('text/plain', String(idx)); dragIdx = idx; }}
 					ondragover={(e) => { e.preventDefault(); dragOverIdx = idx; }}
@@ -607,12 +608,12 @@
 					ondragend={() => { dragIdx = null; dragOverIdx = null; }}
 				>
 					<!-- Line number -->
-					<div class="w-10 pt-2.5 text-right pr-3 text-xs font-mono text-muted-foreground/40 select-none cursor-grab active:cursor-grabbing">
+					<div class="w-12 py-2 text-center text-xs font-mono text-muted-foreground/40 select-none cursor-grab active:cursor-grabbing">
 						{stepNum(block.id)}
 					</div>
 
 					<!-- Block -->
-					<div class="flex-1 {dragOverIdx === idx ? 'ring-2 ring-primary/30 rounded-lg' : ''}">
+					<div class="flex-1 min-w-0">
 						{#if block.type === 'step'}
 							<StepBlock
 								label={block.label} agent={block.agent || ''} prompt={block.prompt || ''} procedure={block.procedure || ''}
@@ -638,6 +639,7 @@
 							<div data-loop-id={block.id}>
 							<LoopBlock
 								label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
+								childCount={block.children?.length ?? 0}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -682,9 +684,6 @@
 												{/if}
 											</div>
 										</div>
-										{#if ci < (block.children?.length ?? 0) - 1}
-											<div class="flex"><div class="w-8"></div><BlockConnector /></div>
-										{/if}
 									{/each}
 									<!-- Add step inside loop -->
 									<div class="flex items-center gap-0 mt-2">
@@ -724,18 +723,11 @@
 					</div>
 				</div>
 
-				<!-- Connector between blocks -->
-				{#if idx < currentBlocks.length - 1}
-					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
-				{/if}
 			{/each}
 
 			<!-- Add block buttons -->
-			<div class="flex"><div class="w-10"></div>
-				{#if currentBlocks.length > 0}<BlockConnector />{/if}
-			</div>
-			<div class="flex items-center gap-0">
-				<div class="w-10"></div>
+			<div class="flex items-center gap-0 pt-3">
+				<div class="w-12"></div>
 				<div class="flex items-center gap-2 py-1">
 					<button onclick={() => addBlock('step')}
 						class="rounded-lg border border-dashed border-border hover:border-blue-500/50 hover:bg-blue-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-blue-300 transition-all flex items-center gap-1.5">
