@@ -8,7 +8,8 @@
 		agentList = [],
 		onupdate = (_: Record<string, unknown>) => {},
 		ontoggle = () => {},
-		onremove = () => {}
+		onremove = () => {},
+		onpromptkeydown = (_: KeyboardEvent) => {}
 	}: {
 		label?: string; agent?: string; prompt?: string; procedure?: string;
 		outputs?: Record<string, { type?: string; description?: string }>;
@@ -17,6 +18,7 @@
 		onupdate?: (updates: Record<string, unknown>) => void;
 		ontoggle?: () => void;
 		onremove?: () => void;
+		onpromptkeydown?: (e: KeyboardEvent) => void;
 	} = $props();
 </script>
 
@@ -59,6 +61,7 @@
 			<div>
 				<label class="block text-[10px] font-medium text-muted-foreground mb-1">PROMPT</label>
 				<textarea value={prompt} oninput={(e) => onupdate({ prompt: e.currentTarget.value })}
+					onkeydown={onpromptkeydown}
 					rows="3" class="w-full rounded border border-input bg-background px-2 py-1.5 text-xs font-mono resize-none"
 					placeholder="What should this agent do? Use @step.field for variables"></textarea>
 			</div>

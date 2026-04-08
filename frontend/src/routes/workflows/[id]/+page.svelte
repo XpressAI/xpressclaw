@@ -460,6 +460,7 @@
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
+								onpromptkeydown={(e) => handlePromptKeydown(e, idx)}
 							/>
 						{:else if block.type === 'when'}
 							<WhenBlock
@@ -482,27 +483,40 @@
 							>
 								{#snippet children()}
 									{#each block.children || [] as child, ci (child.id)}
-										<div class="flex items-start gap-0">
-											<div class="w-8 pt-2 text-right pr-2 text-[10px] font-mono text-muted-foreground/30">
-												{stepNum(block.id)}.{String.fromCharCode(97 + ci)}
-											</div>
+										{@const childUpdate = (u: Record<string, unknown>) => {
+													const children = [...(block.children || [])];
+													children[ci] = { ...children[ci], ...u } as Block;
+													updateBlock(currentFlow, idx, { children });
+												}}
+												{@const childToggle = () => {
+													const children = [...(block.children || [])];
+													children[ci] = { ...children[ci], expanded: !children[ci].expanded };
+													updateBlock(currentFlow, idx, { children });
+												}}
+												{@const childRemove = () => {
+													updateBlock(currentFlow, idx, { children: (block.children || []).filter((_: Block, i: number) => i !== ci) });
+												}}
+											<div class="flex items-start gap-0">
+												<div class="w-8 pt-2 text-right pr-2 text-[10px] font-mono text-muted-foreground/30">
+													{stepNum(block.id)}.{String.fromCharCode(97 + ci)}
+												</div>
 											<div class="flex-1">
 												{#if child.type === 'step'}
 													<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} outputs={child.outputs || {}}
 														expanded={child.expanded} compact={compactView} {agentList}
-														onupdate={(u) => {
-															const children = [...(block.children || [])];
-															children[ci] = { ...children[ci], ...u } as Block;
-															updateBlock(currentFlow, idx, { children });
-														}}
-														ontoggle={() => {
-															const children = [...(block.children || [])];
-															children[ci] = { ...children[ci], expanded: !children[ci].expanded };
-															updateBlock(currentFlow, idx, { children });
-														}}
-														onremove={() => {
-															updateBlock(currentFlow, idx, { children: (block.children || []).filter((_, i) => i !== ci) });
-														}}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+														onpromptkeydown={(e) => handlePromptKeydown(e, idx)}
+													/>
+												{:else if child.type === 'when'}
+													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
+														{flowNames} {flowColors} stepIds={allStepIds}
+														expanded={child.expanded} compact={compactView}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+													/>
+												{:else if child.type === 'sink'}
+													<SinkBlock label={child.label} sinks={child.sinks || []}
+														expanded={child.expanded} compact={compactView} {connectorList}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
 													/>
 												{/if}
 											</div>
