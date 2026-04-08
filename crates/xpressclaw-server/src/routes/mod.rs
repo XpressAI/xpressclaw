@@ -8,6 +8,7 @@ mod agents;
 mod apps;
 mod browser;
 mod budget;
+mod connectors;
 mod conversations;
 mod health;
 pub mod llm;
@@ -21,6 +22,7 @@ mod setup;
 mod skills;
 mod tasks;
 mod tools_proxy;
+mod workflows;
 
 pub fn tools_proxy_routes() -> Router<AppState> {
     tools_proxy::routes()
@@ -48,4 +50,8 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/setup", setup::routes())
         .nest("/office", office::routes())
         .nest("/browser", browser::routes())
+        .nest("/connectors", connectors::routes())
+        .nest("/workflows", workflows::routes())
+        // Webhook receiver lives outside /connectors to keep the URL clean
+        .merge(connectors::webhook_routes())
 }

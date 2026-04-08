@@ -36,6 +36,7 @@ ready-agent-cog = { workspace = true }
 croner = "2"
 bytes = "1"
 sysinfo = "0.34"
+notify = "7"
 
 # Local LLM (optional, enabled by default via "local-llm" feature)
 llama-cpp-2 = { workspace = true, optional = true }

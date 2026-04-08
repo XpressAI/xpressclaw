@@ -52,6 +52,13 @@
 
 	let { children } = $props();
 
+	// Collapsible sidebar — expanded by default, manual toggle only
+	let sidebarCollapsed = $state(false);
+
+	function toggleSidebar() {
+		sidebarCollapsed = !sidebarCollapsed;
+	}
+
 	async function loadSidebar() {
 		const [c, a, ap] = await Promise.all([
 			conversations.list().catch(() => []),
@@ -159,15 +166,24 @@
 {:else}
 	<div class="flex h-screen">
 		<!-- Sidebar -->
-		<aside class="flex w-64 flex-col" style="background: hsl(var(--sidebar))">
+		<aside class="flex flex-col transition-all duration-200 ease-in-out {sidebarCollapsed ? 'w-12' : 'w-64'}" style="background: hsl(var(--sidebar))">
 			<!-- Header -->
-			<div class="flex h-11 items-center gap-2 px-4">
-				<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded" />
-				<span class="text-xs font-medium text-muted-foreground">xpressclaw</span>
+			<div class="flex h-11 items-center {sidebarCollapsed ? 'justify-center px-0' : 'gap-2 px-4'}">
+				{#if sidebarCollapsed}
+					<button onclick={toggleSidebar} class="flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors" title="Expand sidebar">
+						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" /></svg>
+					</button>
+				{:else}
+					<img src="/icon-32.png" alt="xpressclaw" class="h-5 w-5 rounded flex-shrink-0" />
+					<span class="text-xs font-medium text-muted-foreground flex-1">xpressclaw</span>
+					<button onclick={toggleSidebar} class="flex items-center justify-center h-6 w-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors" title="Collapse sidebar">
+						<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
+					</button>
+				{/if}
 			</div>
 
-			<!-- Tab-dependent sidebar content -->
-			<div class="flex-1 overflow-y-auto">
+			<!-- Tab-dependent sidebar content (hidden when collapsed) -->
+			<div class="flex-1 overflow-y-auto {sidebarCollapsed ? 'hidden' : ''}">
 
 				{#if activeTab === 'agents'}
 					<!-- AGENTS TAB: Apps, Conversations, Agents, Knowledge -->
@@ -276,10 +292,9 @@
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4.26 10.147a60.438 60.438 0 00-.491 6.347A48.62 48.62 0 0112 20.904a48.62 48.62 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.636 50.636 0 00-2.658-.813A59.906 59.906 0 0112 3.493a59.903 59.903 0 0110.399 5.84c-.896.248-1.783.52-2.658.814m-15.482 0A50.717 50.717 0 0112 13.489a50.702 50.702 0 017.74-3.342M6.75 15a.75.75 0 100-1.5.75.75 0 000 1.5zm0 0v-3.675A55.378 55.378 0 0112 8.443m-7.007 11.55A5.981 5.981 0 006.75 15.75v-1.5" /></svg>
 							<span>Skills</span>
 						</a>
-						<a href="/workflows" class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-muted-foreground/50 cursor-default">
+						<a href="/workflows" class={linkClass(isActive('/workflows', $page.url.pathname))}>
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
 							<span>Workflows</span>
-							<span class="text-[10px] text-muted-foreground/40 ml-auto">soon</span>
 						</a>
 					</div>
 
@@ -308,10 +323,9 @@
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
 							<span>Budgets</span>
 						</a>
-						<a href="/settings/connectors" class="flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-muted-foreground/50 cursor-default">
+						<a href="/settings/connectors" class={linkClass(isActive('/settings/connectors', $page.url.pathname))}>
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" /></svg>
 							<span>Connectors</span>
-							<span class="text-[10px] text-muted-foreground/40 ml-auto">soon</span>
 						</a>
 					</div>
 				{/if}
@@ -319,8 +333,8 @@
 			</div>
 
 			<!-- Bottom Tab Bar -->
-			<div class="border-t border-border/50 px-2 py-2">
-				<div class="flex items-center justify-around">
+			<div class="border-t border-border/50 px-1 py-2">
+				<div class="{sidebarCollapsed ? 'flex flex-col items-center gap-1' : 'flex items-center justify-around'}">
 					{#each tabs as tab}
 						{@const active = activeTab === tab.id}
 						<a
@@ -333,7 +347,7 @@
 							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
 								<path stroke-linecap="round" stroke-linejoin="round" d={tab.icon} />
 							</svg>
-							<span>{tab.label}</span>
+							{#if !sidebarCollapsed}<span>{tab.label}</span>{/if}
 						</a>
 					{/each}
 				</div>

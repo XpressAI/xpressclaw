@@ -113,6 +113,26 @@ pub enum Error {
     #[error("migration failed (target v{version}): {message}")]
     Migration { version: u32, message: String },
 
+    // Connectors
+    #[error("connector error: {0}")]
+    Connector(String),
+
+    #[error("connector not found: {id}")]
+    ConnectorNotFound { id: String },
+
+    #[error("channel not found: {id}")]
+    ChannelNotFound { id: String },
+
+    // Workflows
+    #[error("workflow error: {0}")]
+    Workflow(String),
+
+    #[error("workflow not found: {id}")]
+    WorkflowNotFound { id: String },
+
+    #[error("workflow instance not found: {id}")]
+    WorkflowInstanceNotFound { id: String },
+
     // LLM
     #[error("LLM error: {0}")]
     Llm(String),

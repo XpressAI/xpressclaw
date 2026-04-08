@@ -141,6 +141,9 @@ impl Database {
             (18, MIGRATION_V18),
             (19, MIGRATION_V19),
             (20, MIGRATION_V20),
+            (21, MIGRATION_V21),
+            (22, MIGRATION_V22),
+            (23, MIGRATION_V23),
         ];
 
         for &(target, sql) in migrations {
@@ -575,6 +578,133 @@ ALTER TABLE apps ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE apps ADD COLUMN last_attempt_at TIMESTAMP;
 ";
 
+const MIGRATION_V21: &str = "
+-- ADR-022: Connectors and Workflows.
+
+CREATE TABLE IF NOT EXISTS connectors (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    connector_type TEXT NOT NULL,
+    config TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'disconnected',
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS connector_channels (
+    id TEXT PRIMARY KEY,
+    connector_id TEXT NOT NULL REFERENCES connectors(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    channel_type TEXT NOT NULL DEFAULT 'both',
+    config TEXT NOT NULL DEFAULT '{}',
+    agent_id TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS connector_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connector_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    processed INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_conn_events_unprocessed ON connector_events(processed, created_at);
+
+CREATE TABLE IF NOT EXISTS workflows (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    yaml_content TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS workflow_instances (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    workflow_version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    trigger_data TEXT,
+    current_node_id TEXT,
+    context TEXT DEFAULT '{}',
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_instances_status ON workflow_instances(status);
+
+CREATE TABLE IF NOT EXISTS workflow_node_executions (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    task_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_context TEXT,
+    output TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_wf_node_exec_instance ON workflow_node_executions(instance_id);
+CREATE INDEX IF NOT EXISTS idx_wf_node_exec_task ON workflow_node_executions(task_id);
+";
+
+const MIGRATION_V22: &str = "
+-- Channel-to-conversation bindings for direct agent routing.
+CREATE TABLE IF NOT EXISTS conversation_channel_bindings (
+    conversation_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel_id, agent_id)
+);
+";
+
+const MIGRATION_V23: &str = "
+-- V2 workflow engine: sequential step-based execution replaces node/edge graph.
+-- Drop old tables (v1 was never released, no data to preserve).
+DROP TABLE IF EXISTS workflow_node_executions;
+DROP TABLE IF EXISTS workflow_instances;
+
+CREATE TABLE workflow_instances (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'running',
+    current_flow TEXT DEFAULT 'main',
+    current_step_index INTEGER DEFAULT 0,
+    trigger_data TEXT,
+    variable_store TEXT DEFAULT '{}',
+    loop_state TEXT,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_instances_status ON workflow_instances(status);
+
+CREATE TABLE workflow_step_executions (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    flow_name TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    task_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_context TEXT,
+    output TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_wf_step_exec_instance ON workflow_step_executions(instance_id);
+CREATE INDEX IF NOT EXISTS idx_wf_step_exec_task ON workflow_step_executions(task_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +722,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "20");
+        assert_eq!(version, "23");
     }
 
     #[test]
