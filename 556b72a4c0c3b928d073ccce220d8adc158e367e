@@ -1,0 +1,31 @@
+Final audit — all pieces verified:
+
+BACKEND:
+- definition.rs: 13 types (WorkflowDefinition, SubWorkflow, Step, OutputSchema, WhenArm, SinkConfig, WorkflowTrigger + impl methods)
+- engine.rs: 14 functions (start_instance, execute_step, on_task_completed, advance, process_events, recover, handle_task/when/loop/sink/jump steps)
+- instance.rs: 17 methods (CRUD for instances + step executions, variable store, loop state)
+- context.rs: build_context, resolve_variable, render_template (supports @var.path and {{var.path}})
+- condition.rs: Completed, Failed, Default, Match, Comparison variants
+- deliver.rs: telegram/webhook/file connector delivery
+- router.rs: event routing (agent binding → conversation, else → connector_events)
+- V23 migration: drops old tables, creates workflow_instances + workflow_step_executions
+
+SERVER:
+- Connector runtime starts on boot (ConnectorRegistry.start_all)
+- Event loop: route_event for direct binding + engine.process_events for triggers
+- Dispatcher: advance_workflow hook on task completion/failure
+- Sink delivery: engine calls deliver() for sink steps and response routing
+
+FRONTEND (9 block components):
+- StepBlock, WhenBlock, LoopBlock, SinkBlock, JumpBlock, TriggerBlock, BlockConnector, VariablePopup, JumpArrows
+- Editor page: sub-workflow tabs, step numbering, full/compact, YAML editor, instance tracking, drag reorder
+- @variable popup wired to StepBlock prompt textarea
+- Jump arrows: SVG overlay with dashed curved arrows
+- Agent ChannelsTab: bind/unbind channels to agents
+- Connectors settings: full CRUD with type-specific forms
+
+MCP TOOLS (7):
+- create_workflow, update_workflow, list_workflows, get_workflow, run_workflow, create_procedure, list_procedures
+- Integrated into unified mcp_xpressclaw.py server
+
+ADR-022 rewritten for v2 block-based system.
