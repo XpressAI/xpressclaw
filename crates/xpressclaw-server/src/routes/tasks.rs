@@ -130,6 +130,10 @@ async fn update_task(
     Json(req): Json<UpdateTask>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
+
+    // Check if agent is being assigned — we may need to enqueue
+    let new_agent = req.agent_id.clone();
+
     let task = board.update(&id, &req).map_err(|e| match &e {
         xpressclaw_core::error::Error::TaskNotFound { .. } => (
             StatusCode::NOT_FOUND,
@@ -137,6 +141,24 @@ async fn update_task(
         ),
         _ => internal_error(e),
     })?;
+
+    // If agent was assigned and task is actionable, enqueue for dispatcher
+    if let Some(ref agent_id) = new_agent {
+        if !agent_id.is_empty()
+            && (task.status == xpressclaw_core::tasks::board::TaskStatus::Pending
+                || task.status == xpressclaw_core::tasks::board::TaskStatus::InProgress)
+        {
+            let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
+            let _ = queue.enqueue(&task.id, agent_id);
+            // Also set to in_progress if it was pending
+            if task.status == xpressclaw_core::tasks::board::TaskStatus::Pending {
+                let _ = board.update_status(&task.id, "in_progress", Some(agent_id));
+            }
+        }
+    }
+
+    // Re-fetch to get updated status
+    let task = board.get(&id).map_err(internal_error)?;
     Ok(Json(json!(task)))
 }
 

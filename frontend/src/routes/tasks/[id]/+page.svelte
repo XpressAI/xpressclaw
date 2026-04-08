@@ -154,12 +154,13 @@
 	async function saveEdit() {
 		if (!task) return;
 		try {
-			// Update title/description
-			await tasks.updateStatus(task.id, task.status); // no-op but keeps consistency
-			// Update agent assignment via status endpoint with agent_id
-			if (editAgentId !== (task.agent_id || '')) {
-				await tasks.updateStatus(task.id, task.status);
-			}
+			// Update task fields
+			await tasks.update(task.id, {
+				title: editTitle,
+				description: editDesc || undefined,
+				agent_id: editAgentId || undefined,
+				priority: editPriority,
+			});
 			// Add new dependencies
 			const currentDeps = task.depends_on || [];
 			for (const depId of editDeps) {
@@ -170,7 +171,7 @@
 			editing = false;
 			await load();
 		} catch (e) {
-			alert(String(e));
+			console.error('Save failed:', e);
 		}
 	}
 

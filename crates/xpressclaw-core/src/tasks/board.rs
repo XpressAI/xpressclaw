@@ -86,6 +86,8 @@ pub struct CreateTask {
 pub struct UpdateTask {
     pub title: Option<String>,
     pub description: Option<String>,
+    pub agent_id: Option<String>,
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -334,6 +336,20 @@ impl TaskBoard {
                 conn.execute(
                     "UPDATE tasks SET description = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![desc, now, task_id],
+                )?;
+            }
+
+            if let Some(ref agent_id) = req.agent_id {
+                conn.execute(
+                    "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![agent_id, now, task_id],
+                )?;
+            }
+
+            if let Some(priority) = req.priority {
+                conn.execute(
+                    "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![priority, now, task_id],
                 )?;
             }
         }

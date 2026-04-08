@@ -319,6 +319,11 @@ export const tasks = {
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
 	create: (data: { title: string; description?: string; agent_id?: string; priority?: number }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { title?: string; description?: string; agent_id?: string; priority?: number }) =>
+		request<Task>(`/api/tasks/${id}`, {
+			method: 'PATCH',
+			body: JSON.stringify(data)
+		}),
 	updateStatus: (id: string, status: string) =>
 		request<Task>(`/api/tasks/${id}/status`, {
 			method: 'PATCH',
