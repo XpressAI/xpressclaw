@@ -576,11 +576,9 @@
 								expanded={!compactView} {connectorList}
 								onupdate={(u) => { triggerConfig = { ...triggerConfig!, ...u } as typeof triggerConfig; }}
 								ontoggle={() => {}}
+								onremove={removeTrigger}
 							/>
 						</div>
-						<button onclick={removeTrigger} class="mt-2.5 ml-1 text-muted-foreground/20 hover:text-destructive">
-							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-						</button>
 					</div>
 					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
 				{:else}
