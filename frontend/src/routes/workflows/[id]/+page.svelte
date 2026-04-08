@@ -677,7 +677,7 @@
 										{inst.status}
 									</span>
 								</td>
-								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_node_id || '—'}</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_flow ? `${inst.current_flow}[${inst.current_step_index}]` : '—'}</td>
 								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
 								<td class="px-4 py-1.5 text-right">
 									{#if inst.status === 'running'}

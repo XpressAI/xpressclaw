@@ -1,57 +1,65 @@
 use serde_json::Value;
+use std::collections::HashMap;
 
-/// Build the context object from trigger data and completed node outputs.
-///
-/// The resulting JSON has the shape:
-/// ```json
-/// {
-///   "trigger": { "payload": <trigger_data> },
-///   "nodes": {
-///     "<node_id>": { "output": "<output_text>" },
-///     ...
-///   }
-/// }
-/// ```
-pub fn build_context(trigger_data: &Value, node_outputs: &[(String, String)]) -> Value {
-    let mut nodes = serde_json::Map::new();
-    for (node_id, output) in node_outputs {
-        nodes.insert(
-            node_id.clone(),
-            serde_json::json!({
-                "output": output,
-            }),
-        );
+/// Build the context from trigger data, global variables, and step outputs.
+pub fn build_context(
+    trigger_data: &Value,
+    global_vars: &HashMap<String, Value>,
+    step_outputs: &HashMap<String, Value>,
+) -> Value {
+    let mut ctx = serde_json::Map::new();
+    ctx.insert(
+        "trigger".to_string(),
+        serde_json::json!({ "payload": trigger_data }),
+    );
+    for (k, v) in global_vars {
+        ctx.insert(k.clone(), v.clone());
     }
-    serde_json::json!({
-        "trigger": {
-            "payload": trigger_data,
-        },
-        "nodes": Value::Object(nodes),
-    })
+    for (k, v) in step_outputs {
+        ctx.insert(k.clone(), v.clone());
+    }
+    Value::Object(ctx)
 }
 
-/// Render a template string by replacing `{{path.to.field}}` with values from context.
+/// Resolve a variable reference like "@classify.intent" or "trigger.payload.text".
+pub fn resolve_variable(expr: &str, context: &Value) -> Option<Value> {
+    let path = expr.trim_start_matches('@');
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = context;
+    for part in &parts {
+        current = current.get(part)?;
+    }
+    Some(current.clone())
+}
+
+/// Render a template, replacing `@var.path` and `{{var.path}}` with values.
 ///
-/// - Finds all `{{...}}` patterns
-/// - Splits path by `.`
-/// - Walks the context JSON tree following each segment
-/// - String values are inserted directly, numbers/bools are converted to string,
-///   objects/arrays are serialized to JSON
-/// - If path resolution fails, the placeholder is left unchanged
+/// - `@step.field` references are replaced when followed by whitespace, end of
+///   string, or punctuation (anything that isn't alphanumeric, `.`, or `_`).
+/// - `{{var.path}}` references work the same as before.
+/// - If a reference cannot be resolved, the placeholder is left as-is.
 pub fn render_template(template: &str, context: &Value) -> String {
+    // First pass: handle {{var.path}}
+    let after_braces = render_brace_placeholders(template, context);
+    // Second pass: handle @var.path
+    render_at_references(&after_braces, context)
+}
+
+/// Handle `{{var.path}}` replacements.
+fn render_brace_placeholders(template: &str, context: &Value) -> String {
     let mut result = String::with_capacity(template.len());
     let mut remaining = template;
 
     while let Some(start) = remaining.find("{{") {
-        // Push everything before the opening braces
         result.push_str(&remaining[..start]);
 
         let after_open = &remaining[start + 2..];
         if let Some(end) = after_open.find("}}") {
             let path_str = after_open[..end].trim();
-            let replacement = resolve_template_path(path_str, context);
-            match replacement {
-                Some(val) => result.push_str(&val),
+            // Strip leading @ if present inside braces
+            let path_str = path_str.trim_start_matches('@');
+            match resolve_variable(path_str, context) {
+                Some(val) => result.push_str(&value_to_string(&val)),
                 None => {
                     // Leave placeholder unchanged
                     result.push_str("{{");
@@ -71,24 +79,64 @@ pub fn render_template(template: &str, context: &Value) -> String {
     result
 }
 
-/// Resolve a dotted path against a JSON context value.
-fn resolve_template_path(path: &str, context: &Value) -> Option<String> {
-    let segments: Vec<&str> = path.split('.').collect();
-    if segments.is_empty() {
-        return None;
-    }
+/// Handle `@var.path` replacements.
+///
+/// An `@` reference is: `@` followed by a dotted identifier path
+/// (alphanumeric, `_`, `.`), terminated by anything else or end of string.
+fn render_at_references(template: &str, context: &Value) -> String {
+    let mut result = String::with_capacity(template.len());
+    let chars: Vec<char> = template.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
 
-    let mut current = context;
-    for seg in &segments {
-        match current {
-            Value::Object(map) => {
-                current = map.get(*seg)?;
+    while i < len {
+        if chars[i] == '@' && i + 1 < len && is_ident_start(chars[i + 1]) {
+            // Found potential @reference
+            let ref_start = i;
+            i += 1; // skip '@'
+
+            // Consume the path: alphanumeric, '_', '.'
+            let path_start = i;
+            while i < len && is_ident_char(chars[i]) {
+                i += 1;
             }
-            _ => return None,
+            // Trim trailing dots (e.g., "@foo." at end of sentence)
+            let mut path_end = i;
+            while path_end > path_start && chars[path_end - 1] == '.' {
+                path_end -= 1;
+                i -= 1;
+            }
+
+            let path: String = chars[path_start..path_end].iter().collect();
+            if path.is_empty() {
+                // Not a valid reference, emit the '@'
+                result.push('@');
+                continue;
+            }
+
+            match resolve_variable(&path, context) {
+                Some(val) => result.push_str(&value_to_string(&val)),
+                None => {
+                    // Leave as-is
+                    let orig: String = chars[ref_start..path_end].iter().collect();
+                    result.push_str(&orig);
+                }
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
         }
     }
 
-    Some(value_to_string(current))
+    result
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.'
 }
 
 /// Convert a JSON value to a string suitable for template insertion.
@@ -98,7 +146,6 @@ fn value_to_string(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Null => "null".to_string(),
-        // Objects and arrays are serialized to JSON
         other => serde_json::to_string(other).unwrap_or_else(|_| String::new()),
     }
 }
@@ -110,26 +157,58 @@ mod tests {
     #[test]
     fn test_build_context() {
         let trigger_data = serde_json::json!({"summary": "Fix bug"});
-        let node_outputs = vec![
-            ("spec".to_string(), "The specification text".to_string()),
-            ("impl".to_string(), "Code was written".to_string()),
-        ];
+        let global_vars = HashMap::new();
+        let mut step_outputs = HashMap::new();
+        step_outputs.insert(
+            "spec".to_string(),
+            serde_json::json!({"output": "The specification text"}),
+        );
+        step_outputs.insert(
+            "impl".to_string(),
+            serde_json::json!({"output": "Code was written"}),
+        );
 
-        let ctx = build_context(&trigger_data, &node_outputs);
+        let ctx = build_context(&trigger_data, &global_vars, &step_outputs);
 
         assert_eq!(ctx["trigger"]["payload"]["summary"], "Fix bug");
-        assert_eq!(ctx["nodes"]["spec"]["output"], "The specification text");
-        assert_eq!(ctx["nodes"]["impl"]["output"], "Code was written");
+        assert_eq!(ctx["spec"]["output"], "The specification text");
+        assert_eq!(ctx["impl"]["output"], "Code was written");
     }
 
     #[test]
-    fn test_render_basic_replacement() {
+    fn test_build_context_with_global_vars() {
+        let trigger_data = serde_json::json!({});
+        let mut global_vars = HashMap::new();
+        global_vars.insert("default_agent".to_string(), serde_json::json!("atlas"));
+
+        let ctx = build_context(&trigger_data, &global_vars, &HashMap::new());
+        assert_eq!(ctx["default_agent"], "atlas");
+    }
+
+    #[test]
+    fn test_resolve_variable() {
         let ctx = serde_json::json!({
-            "trigger": {
-                "payload": {
-                    "summary": "Fix the login bug"
-                }
-            }
+            "trigger": {"payload": {"text": "hello"}},
+            "classify": {"intent": "bug"}
+        });
+
+        assert_eq!(
+            resolve_variable("trigger.payload.text", &ctx),
+            Some(serde_json::json!("hello"))
+        );
+        assert_eq!(
+            resolve_variable("@classify.intent", &ctx),
+            Some(serde_json::json!("bug"))
+        );
+        assert!(resolve_variable("nonexistent.path", &ctx).is_none());
+    }
+
+    // -- Brace syntax tests --
+
+    #[test]
+    fn test_render_brace_basic() {
+        let ctx = serde_json::json!({
+            "trigger": {"payload": {"summary": "Fix the login bug"}}
         });
         let template = "Handle this: {{trigger.payload.summary}}";
         let result = render_template(template, &ctx);
@@ -137,21 +216,17 @@ mod tests {
     }
 
     #[test]
-    fn test_render_nested_path() {
+    fn test_render_brace_nested_path() {
         let ctx = serde_json::json!({
-            "nodes": {
-                "spec": {
-                    "output": "The specification"
-                }
-            }
+            "spec": {"output": "The specification"}
         });
-        let template = "Implement: {{nodes.spec.output}}";
+        let template = "Implement: {{spec.output}}";
         let result = render_template(template, &ctx);
         assert_eq!(result, "Implement: The specification");
     }
 
     #[test]
-    fn test_render_missing_path_unchanged() {
+    fn test_render_brace_missing_path_unchanged() {
         let ctx = serde_json::json!({});
         let template = "Missing: {{does.not.exist}}";
         let result = render_template(template, &ctx);
@@ -159,41 +234,32 @@ mod tests {
     }
 
     #[test]
-    fn test_render_multiple_placeholders() {
-        let ctx = serde_json::json!({
-            "a": "hello",
-            "b": "world"
-        });
+    fn test_render_brace_multiple() {
+        let ctx = serde_json::json!({"a": "hello", "b": "world"});
         let template = "{{a}} {{b}}!";
         let result = render_template(template, &ctx);
         assert_eq!(result, "hello world!");
     }
 
     #[test]
-    fn test_render_number_value() {
-        let ctx = serde_json::json!({
-            "count": 42
-        });
+    fn test_render_brace_number() {
+        let ctx = serde_json::json!({"count": 42});
         let template = "Count: {{count}}";
         let result = render_template(template, &ctx);
         assert_eq!(result, "Count: 42");
     }
 
     #[test]
-    fn test_render_bool_value() {
-        let ctx = serde_json::json!({
-            "ok": true
-        });
+    fn test_render_brace_bool() {
+        let ctx = serde_json::json!({"ok": true});
         let template = "Status: {{ok}}";
         let result = render_template(template, &ctx);
         assert_eq!(result, "Status: true");
     }
 
     #[test]
-    fn test_render_complex_value_serialized() {
-        let ctx = serde_json::json!({
-            "data": {"nested": [1, 2, 3]}
-        });
+    fn test_render_brace_complex_serialized() {
+        let ctx = serde_json::json!({"data": {"nested": [1, 2, 3]}});
         let template = "Data: {{data}}";
         let result = render_template(template, &ctx);
         assert_eq!(result, r#"Data: {"nested":[1,2,3]}"#);
@@ -223,21 +289,97 @@ mod tests {
 
     #[test]
     fn test_render_whitespace_in_braces() {
-        let ctx = serde_json::json!({
-            "a": "hello"
-        });
-        // Whitespace inside {{ }} should be trimmed
+        let ctx = serde_json::json!({"a": "hello"});
         let template = "{{ a }}";
         let result = render_template(template, &ctx);
         assert_eq!(result, "hello");
     }
 
+    // -- @ syntax tests --
+
+    #[test]
+    fn test_render_at_basic() {
+        let ctx = serde_json::json!({
+            "classify": {"intent": "bug"}
+        });
+        let template = "The intent is @classify.intent here";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "The intent is bug here");
+    }
+
+    #[test]
+    fn test_render_at_end_of_string() {
+        let ctx = serde_json::json!({
+            "classify": {"intent": "bug"}
+        });
+        let template = "Intent: @classify.intent";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "Intent: bug");
+    }
+
+    #[test]
+    fn test_render_at_missing_unchanged() {
+        let ctx = serde_json::json!({});
+        let template = "Missing @does.not.exist value";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "Missing @does.not.exist value");
+    }
+
+    #[test]
+    fn test_render_at_multiple() {
+        let ctx = serde_json::json!({
+            "a": {"x": "hello"},
+            "b": {"y": "world"}
+        });
+        let template = "@a.x @b.y!";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "hello world!");
+    }
+
+    #[test]
+    fn test_render_mixed_at_and_braces() {
+        let ctx = serde_json::json!({
+            "trigger": {"payload": {"text": "hello"}},
+            "classify": {"intent": "bug"}
+        });
+        let template = "Text: {{trigger.payload.text}}, Intent: @classify.intent";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "Text: hello, Intent: bug");
+    }
+
+    #[test]
+    fn test_render_at_with_brace_inside() {
+        // @ inside {{}} should also work
+        let ctx = serde_json::json!({
+            "classify": {"intent": "bug"}
+        });
+        let template = "Intent: {{@classify.intent}}";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "Intent: bug");
+    }
+
+    #[test]
+    fn test_render_at_not_followed_by_ident() {
+        let ctx = serde_json::json!({});
+        let template = "email: user@example.com";
+        let result = render_template(template, &ctx);
+        // @example.com would be treated as a reference; since it doesn't resolve,
+        // it stays as-is
+        assert_eq!(result, "email: user@example.com");
+    }
+
+    #[test]
+    fn test_render_at_number_value() {
+        let ctx = serde_json::json!({"step1": {"count": 42}});
+        let template = "Count: @step1.count";
+        let result = render_template(template, &ctx);
+        assert_eq!(result, "Count: 42");
+    }
+
     #[test]
     fn test_render_partial_path_missing() {
         let ctx = serde_json::json!({
-            "trigger": {
-                "payload": {}
-            }
+            "trigger": {"payload": {}}
         });
         let template = "{{trigger.payload.missing_field}}";
         let result = render_template(template, &ctx);

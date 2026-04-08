@@ -748,21 +748,23 @@ export interface Workflow {
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
-	workflow_version: number;
 	status: string;
+	current_flow: string;
+	current_step_index: number;
 	trigger_data: string | null;
-	current_node_id: string | null;
-	context: string;
+	variable_store: string;
+	loop_state: string | null;
 	started_at: string;
 	completed_at: string | null;
 	error_message: string | null;
-	node_executions?: NodeExecution[];
+	step_executions?: StepExecution[];
 }
 
-export interface NodeExecution {
+export interface StepExecution {
 	id: string;
 	instance_id: string;
-	node_id: string;
+	flow_name: string;
+	step_id: string;
 	task_id: string | null;
 	status: string;
 	input_context: string | null;

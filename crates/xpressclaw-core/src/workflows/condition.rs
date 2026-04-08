@@ -5,6 +5,9 @@ pub enum Condition {
     Completed,
     Failed,
     Default,
+    Match {
+        value: String,
+    },
     Comparison {
         path: Vec<String>,
         op: ComparisonOp,
@@ -26,6 +29,7 @@ pub enum ComparisonOp {
 /// - `"completed"` -> `Condition::Completed`
 /// - `"failed"` -> `Condition::Failed`
 /// - `"default"` -> `Condition::Default`
+/// - `"match:<value>"` -> `Condition::Match { value }`
 /// - `"output.verdict == \"pass\""` -> Comparison with Eq
 /// - `"output.verdict != \"pass\""` -> Comparison with NotEq
 /// - `"output contains \"error\""` -> Comparison with Contains
@@ -90,9 +94,10 @@ pub fn parse(s: &str) -> Result<Condition> {
         });
     }
 
-    Err(Error::Workflow(format!(
-        "unrecognized condition expression: {s}"
-    )))
+    // Treat any other string as a Match value (for when arms)
+    Ok(Condition::Match {
+        value: s.to_string(),
+    })
 }
 
 /// Parse a dotted path string into a Vec of segments.
@@ -120,6 +125,10 @@ pub fn evaluate(condition: &Condition, task_status: &str, task_output: &str) -> 
         Condition::Completed => task_status == "completed",
         Condition::Failed => task_status == "failed" || task_status == "cancelled",
         Condition::Default => true,
+        Condition::Match { value } => {
+            // Match is used in when arms — always evaluated against evaluate_match
+            evaluate_match(value, task_output)
+        }
         Condition::Comparison { path, op, value } => {
             let resolved = resolve_path(path, task_output);
             match op {
@@ -130,6 +139,14 @@ pub fn evaluate(condition: &Condition, task_status: &str, task_output: &str) -> 
             }
         }
     }
+}
+
+/// Evaluate a match: string comparison between expected and actual.
+pub fn evaluate_match(match_value: &str, actual_value: &str) -> bool {
+    if match_value == "default" {
+        return true;
+    }
+    match_value == actual_value
 }
 
 /// Resolve a dotted path against the task output.
@@ -259,8 +276,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_invalid() {
-        assert!(parse("something weird").is_err());
+    fn test_parse_match_value() {
+        // Unrecognized string is now a Match instead of error
+        let c = parse("bug").unwrap();
+        match c {
+            Condition::Match { value } => assert_eq!(value, "bug"),
+            _ => panic!("expected Match"),
+        }
     }
 
     #[test]
@@ -298,6 +320,22 @@ mod tests {
     fn test_evaluate_default() {
         let c = Condition::Default;
         assert!(evaluate(&c, "anything", "anything"));
+    }
+
+    #[test]
+    fn test_evaluate_match() {
+        let c = Condition::Match {
+            value: "bug".into(),
+        };
+        assert!(evaluate(&c, "", "bug"));
+        assert!(!evaluate(&c, "", "feature"));
+    }
+
+    #[test]
+    fn test_evaluate_match_default() {
+        // "default" match value always returns true
+        assert!(evaluate_match("default", "anything"));
+        assert!(evaluate_match("default", ""));
     }
 
     #[test]
@@ -351,7 +389,6 @@ mod tests {
             op: ComparisonOp::Eq,
             value: "something".into(),
         };
-        // When path not found in JSON, falls back to raw string
         assert!(!evaluate(&c, "completed", r#"{"verdict": "pass"}"#));
     }
 
@@ -362,7 +399,6 @@ mod tests {
             op: ComparisonOp::Contains,
             value: "hello".into(),
         };
-        // Not valid JSON — falls back to raw string comparison
         assert!(evaluate(&c, "completed", "hello world"));
         assert!(!evaluate(&c, "completed", "goodbye world"));
     }

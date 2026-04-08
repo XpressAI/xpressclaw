@@ -179,19 +179,17 @@ mod tests {
 name: test-workflow
 description: A test workflow
 version: 1
-nodes:
-  - id: step1
-    label: "First Step"
-    agent: atlas
-    prompt: "Do something"
-  - id: step2
-    label: "Second Step"
-    agent: atlas
-    prompt: "Do another thing"
-edges:
-  - from: step1
-    to: step2
-    condition: completed
+flows:
+  main:
+    steps:
+      - id: step1
+        label: "First Step"
+        agent: atlas
+        prompt: "Do something"
+      - id: step2
+        label: "Second Step"
+        agent: atlas
+        prompt: "Do another thing"
 "#;
 
     #[test]
@@ -230,8 +228,7 @@ edges:
         let (_, mgr) = setup();
         let yaml = r#"
 name: empty
-nodes: []
-edges: []
+flows: {}
 "#;
         let result = mgr.create(&CreateWorkflow {
             name: "empty".into(),
