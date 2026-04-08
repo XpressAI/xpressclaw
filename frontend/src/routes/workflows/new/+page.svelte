@@ -26,6 +26,10 @@ flows:
         agent: ""
         prompt: |
           Review: @step_1.result
+
+  on_error:
+    color: "#ef4444"
+    steps: []
 `;
 
 	let error = $state('');
