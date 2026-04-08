@@ -106,7 +106,7 @@
 			description: workflow?.description || '',
 			version: 1,
 		};
-		if (triggerConfig?.connector) def.trigger = triggerConfig;
+		if (triggerConfig) def.trigger = triggerConfig;
 		if (Object.keys(globalVars).length > 0) def.variables = globalVars;
 
 		const flowsOut: Record<string, unknown> = {};
