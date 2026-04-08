@@ -7,62 +7,58 @@
 description: ""
 version: 1
 
-nodes:
-  - id: step1
-    label: "Process Input"
-    agent: ""
-    prompt: |
-      Process the incoming request.
-    position: { x: 300, y: 50 }
+flows:
+  main:
+    color: "#22c55e"
+    steps:
+      - id: step1
+        type: step
+        label: "Process Input"
+        agent: ""
+        prompt: |
+          Process the incoming request.
+        outputs:
+          result: { type: string, description: "Processing result" }
 
-  - id: step2
-    label: "Review Output"
-    agent: ""
-    prompt: |
-      Review the output from the previous step.
-    position: { x: 300, y: 250 }
+      - id: step2
+        type: step
+        label: "Review Output"
+        agent: ""
+        prompt: |
+          Review: @step1.result
 
-  - id: notify
-    label: "Send Notification"
-    type: sink
-    sinks:
-      - connector: ""
-        channel: ""
-        template: "Workflow completed!"
-    position: { x: 300, y: 450 }
+      - id: notify
+        type: sink
+        label: "Send Notification"
+        sinks:
+          - connector: ""
+            channel: ""
+            template: "Workflow completed: @step1.result"
 
-edges:
-  - from: step1
-    to: step2
-    condition: completed
-  - from: step2
-    to: notify
-    condition: completed
+  on_error:
+    color: "#ef4444"
+    steps:
+      - id: log_error
+        type: step
+        label: "Log Error"
+        agent: ""
+        prompt: |
+          An error occurred. Log it.
 `;
 
 	let error = $state('');
 
 	onMount(async () => {
-		// Find a unique name by checking existing workflows
 		try {
 			const existing = await workflows.list();
 			const names = new Set(existing.map(w => w.name));
 			let name = 'New Workflow';
 			let n = 2;
-			while (names.has(name)) {
-				name = `New Workflow ${n}`;
-				n++;
-			}
+			while (names.has(name)) { name = `New Workflow ${n}`; n++; }
 			const yamlWithName = DEFAULT_YAML.replace('name: new-workflow', `name: ${name.toLowerCase().replace(/\s+/g, '-')}`);
-			const wf = await workflows.create({
-				name,
-				description: '',
-				yaml_content: yamlWithName
-			});
+			const wf = await workflows.create({ name, description: '', yaml_content: yamlWithName });
 			goto(`/workflows/${wf.id}`, { replaceState: true });
-		} catch (e) {
-			error = String(e);
-		}
+		} catch (e) { error = String(e); }
 	});
 </script>
 
@@ -70,18 +66,11 @@ edges:
 	{#if error}
 		<div class="rounded-lg border border-border bg-card p-8 text-center space-y-3 max-w-sm">
 			<div class="text-sm text-destructive">{error}</div>
-			<a
-				href="/workflows"
-				class="inline-flex rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors"
-			>
-				Back to Workflows
-			</a>
+			<a href="/workflows" class="inline-flex rounded-md border border-border px-3 py-1.5 text-sm hover:bg-accent transition-colors">Back to Workflows</a>
 		</div>
 	{:else}
 		<div class="text-sm text-muted-foreground flex items-center gap-2">
-			<svg class="h-4 w-4 animate-spin" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-				<path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M0 0" />
-			</svg>
+			<svg class="h-4 w-4 animate-spin" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182M0 0" /></svg>
 			Creating workflow...
 		</div>
 	{/if}

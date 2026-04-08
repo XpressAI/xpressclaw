@@ -26,13 +26,12 @@
 		loading = false;
 	}
 
-	function parseYamlCounts(yaml: string): { nodes: number; edges: number } {
-		// Quick regex count — not full parsing, just for display
-		const nodeMatches = yaml.match(/^\s+-\s+id:/gm);
-		const edgeMatches = yaml.match(/^\s+-\s+from:/gm);
+	function parseYamlCounts(yamlStr: string): { steps: number; flows: number } {
+		const stepMatches = yamlStr.match(/^\s+- id:/gm);
+		const flowMatches = yamlStr.match(/^\s{2}\w+:\s*$/gm);
 		return {
-			nodes: nodeMatches?.length ?? 0,
-			edges: edgeMatches?.length ?? 0
+			steps: stepMatches?.length ?? 0,
+			flows: Math.max(1, (flowMatches?.length ?? 1) - 1) // subtract non-flow top-level keys
 		};
 	}
 
@@ -126,13 +125,13 @@
 							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
 								<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6z" />
 							</svg>
-							{counts.nodes} node{counts.nodes !== 1 ? 's' : ''}
+							{counts.steps} step{counts.steps !== 1 ? 's' : ''}
 						</span>
 						<span class="flex items-center gap-1">
 							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-								<path stroke-linecap="round" stroke-linejoin="round" d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244" />
+								<path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
 							</svg>
-							{counts.edges} edge{counts.edges !== 1 ? 's' : ''}
+							{counts.flows} flow{counts.flows !== 1 ? 's' : ''}
 						</span>
 						<span>v{wf.version}</span>
 					</div>
