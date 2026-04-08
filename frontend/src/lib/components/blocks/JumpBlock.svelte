@@ -3,6 +3,7 @@
 		label = '', target = '',
 		flowNames = [],
 		flowColors = {},
+		stepIds = [],
 		expanded = false, compact = false,
 		onupdate = (_: Record<string, unknown>) => {},
 		ontoggle = () => {},
@@ -11,6 +12,7 @@
 		label?: string; target?: string;
 		flowNames?: string[];
 		flowColors?: Record<string, string>;
+		stepIds?: { id: string; label: string; number: string }[];
 		expanded?: boolean; compact?: boolean;
 		onupdate?: (updates: Record<string, unknown>) => void;
 		ontoggle?: () => void;
@@ -67,18 +69,33 @@
 					onchange={(e) => onupdate({ target: e.currentTarget.value })}
 					class="w-full rounded border border-input bg-background px-2 py-1.5 text-xs mb-1">
 					<option value="">Select target...</option>
-					<optgroup label="Jump to flow">
+					<optgroup label="Go to step (current flow)">
+						{#each stepIds as s}
+							<option value="step {s.id}">→ {s.number} ({s.label})</option>
+						{/each}
+					</optgroup>
+					<optgroup label="Jump to flow (start)">
 						{#each flowNames as f}
 							<option value="flow {f}">{f}</option>
 						{/each}
 					</optgroup>
+					{#each flowNames as f}
+						{@const fSteps = stepIds.filter(() => true)}
+						{#if fSteps.length > 0}
+							<optgroup label="Jump to {f} → step">
+								{#each stepIds as s}
+									<option value="flow {f} step {s.id}">{f} → {s.number} ({s.label})</option>
+								{/each}
+							</optgroup>
+						{/if}
+					{/each}
 					<option value="">Custom target...</option>
 				</select>
-				{#if !flowNames.some(f => target === `flow ${f}`)}
+				{#if target && !target.startsWith('step ') && !target.startsWith('flow ') && target !== ''}
 					<input type="text" value={target}
 						oninput={(e) => onupdate({ target: e.currentTarget.value })}
 						class="w-full rounded border border-input bg-background px-2 py-1.5 text-xs font-mono"
-						placeholder="flow X / flow X step Y / workflow Z" />
+						placeholder="workflow name" />
 				{/if}
 			</div>
 		</div>

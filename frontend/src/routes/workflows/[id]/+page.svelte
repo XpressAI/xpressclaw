@@ -605,7 +605,7 @@
 						{:else if block.type === 'jump'}
 							<JumpBlock
 								label={block.label} target={block.target || ''}
-								{flowNames} {flowColors}
+								{flowNames} {flowColors} stepIds={allStepIds}
 								expanded={block.expanded} compact={compactView}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
