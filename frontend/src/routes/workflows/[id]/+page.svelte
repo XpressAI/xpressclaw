@@ -417,7 +417,13 @@
 		{#each Object.entries(flows) as [name, flow]}
 			<button onclick={() => (currentFlow = name)}
 				class="flex items-center gap-1.5 rounded-md px-3 py-1 text-xs transition-colors {currentFlow === name ? 'bg-accent text-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'}">
-				<span class="h-2 w-2 rounded-full flex-shrink-0" style="background: {flow.color}"></span>
+				<!-- Color picker disguised as a dot -->
+				<label class="relative h-2.5 w-2.5 flex-shrink-0 cursor-pointer" onclick={(e) => e.stopPropagation()}>
+					<span class="absolute inset-0 rounded-full" style="background: {flow.color}"></span>
+					<input type="color" value={flow.color}
+						oninput={(e) => { flows = { ...flows, [name]: { ...flow, color: e.currentTarget.value } }; }}
+						class="absolute inset-0 opacity-0 w-full h-full cursor-pointer" />
+				</label>
 				<span>{name}</span>
 				<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
 				{#if name !== 'main'}

@@ -11,39 +11,21 @@ flows:
   main:
     color: "#22c55e"
     steps:
-      - id: step1
+      - id: step_1
         type: step
-        label: "Process Input"
+        label: "Step 1"
         agent: ""
         prompt: |
           Process the incoming request.
         outputs:
           result: { type: string, description: "Processing result" }
 
-      - id: step2
+      - id: step_2
         type: step
-        label: "Review Output"
+        label: "Step 2"
         agent: ""
         prompt: |
-          Review: @step1.result
-
-      - id: notify
-        type: sink
-        label: "Send Notification"
-        sinks:
-          - connector: ""
-            channel: ""
-            template: "Workflow completed: @step1.result"
-
-  on_error:
-    color: "#ef4444"
-    steps:
-      - id: log_error
-        type: step
-        label: "Log Error"
-        agent: ""
-        prompt: |
-          An error occurred. Log it.
+          Review: @step_1.result
 `;
 
 	let error = $state('');
