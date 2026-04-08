@@ -779,7 +779,7 @@ export const workflows = {
 	create: (data: { name: string; description?: string; yaml_content: string }) =>
 		request<Workflow>('/api/workflows', { method: 'POST', body: JSON.stringify(data) }),
 	get: (id: string) => request<Workflow>(`/api/workflows/${id}`),
-	update: (id: string, data: { yaml_content: string; description?: string }) =>
+	update: (id: string, data: { name: string; yaml_content: string; description?: string }) =>
 		request<Workflow>(`/api/workflows/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),

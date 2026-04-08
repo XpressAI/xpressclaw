@@ -155,7 +155,7 @@
 		try {
 			const y = flowsToYaml();
 			yamlContent = y;
-			await workflows.update(workflow.id, { yaml_content: y, description: workflow.description ?? undefined });
+			await workflows.update(workflow.id, { name: workflowName, yaml_content: y, description: workflow.description ?? undefined });
 			workflow = await workflows.get(workflow.id);
 			showToast('Saved', 'success');
 		} catch (e) { showToast(`Save failed: ${e}`, 'error'); }
@@ -338,11 +338,15 @@
 
 	let popupRef = $state<{ handleKey: (e: KeyboardEvent) => boolean } | null>(null);
 
-	function handlePromptKeydown(e: KeyboardEvent, blockIdx: number, loopContext?: { asVar: string; overVar: string }) {
+	/** Global keydown handler for @ variable popup — works in any text input/textarea */
+	function handleGlobalKeydown(e: KeyboardEvent) {
+		const target = e.target as HTMLElement;
+		const isInput = target.tagName === 'TEXTAREA' || (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text');
+		if (!isInput) return;
+
 		// If popup is open, delegate keyboard events to it
 		if (variablePopup && popupRef) {
 			if (popupRef.handleKey(e)) return;
-			// If it's a printable character, update the filter
 			if (e.key.length === 1 && e.key !== '@') {
 				variablePopup = { ...variablePopup, filter: variablePopup.filter + e.key };
 				return;
@@ -358,15 +362,36 @@
 		}
 
 		if (e.key === '@') {
-			const ta = e.target as HTMLTextAreaElement;
-			// Estimate caret position using a hidden span measurement
-			const rect = ta.getBoundingClientRect();
-			const lineHeight = parseInt(getComputedStyle(ta).lineHeight) || 16;
-			const text = ta.value.slice(0, ta.selectionStart);
+			const el = target as HTMLTextAreaElement | HTMLInputElement;
+			const rect = el.getBoundingClientRect();
+			const lineHeight = parseInt(getComputedStyle(el).lineHeight) || 16;
+			const text = el.value.slice(0, el.selectionStart ?? 0);
 			const lines = text.split('\n').length;
 			const caretY = rect.top + lines * lineHeight;
 			const caretX = rect.left + 12;
-			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: ta, blockIdx, loopContext };
+
+			// Determine block index and loop context from DOM ancestry
+			const blockEl = el.closest('[data-step-id]');
+			const loopEl = el.closest('[data-loop-id]');
+			let blockIdx = currentBlocks.length;
+			let loopContext: { asVar: string; overVar: string } | undefined;
+
+			if (blockEl) {
+				const stepId = blockEl.getAttribute('data-step-id');
+				const idx = currentBlocks.findIndex(b => b.id === stepId);
+				if (idx >= 0) blockIdx = idx;
+			}
+			if (loopEl) {
+				const loopId = loopEl.getAttribute('data-loop-id');
+				const loopBlock = currentBlocks.find(b => b.id === loopId);
+				if (loopBlock) {
+					loopContext = { asVar: loopBlock.asVar || 'item', overVar: loopBlock.overVar || '' };
+					const loopIdx = currentBlocks.findIndex(b => b.id === loopId);
+					if (loopIdx >= 0) blockIdx = loopIdx;
+				}
+			}
+
+			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: el as HTMLTextAreaElement, blockIdx, loopContext };
 		}
 	}
 
@@ -476,7 +501,8 @@
 	</div>
 
 	<!-- Main content -->
-	<div class="flex-1 overflow-y-auto relative" bind:this={scrollContainerEl}>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="flex-1 overflow-y-auto relative" bind:this={scrollContainerEl} onkeydown={handleGlobalKeydown}>
 		{#if showYaml}
 			<div class="absolute inset-0 z-20 flex flex-col bg-background/95 backdrop-blur-sm">
 				<div class="flex items-center justify-between px-4 py-2 border-b border-border">
@@ -557,8 +583,7 @@
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
-								onpromptkeydown={(e) => handlePromptKeydown(e, idx)}
-							/>
+								/>
 						{:else if block.type === 'when'}
 							<WhenBlock
 								label={block.label} switchVar={block.switchVar || ''}
@@ -571,6 +596,7 @@
 								onremove={() => removeBlock(currentFlow, idx)}
 							/>
 						{:else if block.type === 'loop'}
+							<div data-loop-id={block.id}>
 							<LoopBlock
 								label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
 								expanded={block.expanded} compact={compactView}
@@ -602,7 +628,6 @@
 													<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} outputs={child.outputs || {}}
 														expanded={child.expanded} compact={compactView} {agentList}
 														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
-														onpromptkeydown={(e) => handlePromptKeydown(e, idx, { asVar: block.asVar || 'item', overVar: block.overVar || '' })}
 													/>
 												{:else if child.type === 'when'}
 													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
@@ -637,6 +662,7 @@
 									</div>
 								{/snippet}
 							</LoopBlock>
+							</div>
 						{:else if block.type === 'sink'}
 							<SinkBlock
 								label={block.label} sinks={block.sinks || []}
