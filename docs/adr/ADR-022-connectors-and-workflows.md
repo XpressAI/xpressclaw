@@ -1,15 +1,14 @@
 # ADR-022: Connectors and Workflows
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 
-Xpressclaw agents are isolated — they can execute tasks and have conversations, but they can't interact with the outside world or orchestrate work across multiple agents in a structured way. Two capabilities are missing:
+Xpressclaw agents are isolated — they can execute tasks and have conversations, but they can't interact with the outside world or orchestrate work across multiple agents in a structured way. Two capabilities are needed:
 
-1. **External connectivity**: Agents need to receive messages from Telegram, respond to GitHub events, watch filesystems, and send notifications. Currently the only way to talk to an agent is through the web UI.
-
-2. **Multi-agent orchestration**: There's no way to define "when X happens, agent A does Y, then agent B does Z, and if it fails, go back to A." The task dependency system (ADR-020) handles DAGs but not cycles, conditional branching, or event-triggered chains.
+1. **External connectivity**: Agents need to receive messages from Telegram, respond to events, watch filesystems, and send notifications.
+2. **Multi-agent orchestration**: There's no way to define "when X happens, agent A does Y, then agent B does Z, and if it fails, go back to A."
 
 ## Decision
 
@@ -17,171 +16,196 @@ Xpressclaw agents are isolated — they can execute tasks and have conversations
 
 Connectors are external integrations that provide **channels** — named endpoints for receiving events (sources) and sending messages (sinks).
 
-#### Connector Types
-
-| Type | Source | Sink | Implementation |
-|------|--------|------|----------------|
-| Webhook | HTTP POST received | HTTP POST to URL | Full |
-| Telegram | Bot API long polling | sendMessage API | Full |
-| File Watcher | Filesystem events via `notify` | Write file | Full |
-| Email | IMAP polling | SMTP send | Stub (future) |
-| GitHub | Webhook receiver | API calls | Stub (future) |
-| Jira | Webhook receiver | API calls | Stub (future) |
-| Slack | Bot events | Web API | Stub (future) |
-
 #### Two Modes of Use
 
-**Direct agent binding**: A channel is bound to an agent via `connector_channels.agent_id`. Incoming messages are injected into a conversation with that agent. Agent responses are sent back through the channel. This reuses the entire conversation system — no workflow needed.
+**Direct agent binding**: A channel is bound to an agent via `connector_channels.agent_id`. Incoming messages are injected into a conversation with that agent. Agent responses are sent back through the channel. No workflow needed.
 
-```
-Telegram message → Conversation → Agent Session → Response → Telegram reply
-```
+**Workflow trigger/sink**: Unbound channels emit events to the `connector_events` table. The workflow engine matches events against workflow triggers and starts instances. Sink steps deliver messages through connectors.
 
-**Workflow trigger/sink**: Unbound channels emit events to the `connector_events` table. The workflow engine polls for unprocessed events and starts matching workflow instances. Sink nodes deliver messages through connectors.
+#### Connector Types
 
-```
-Jira ticket → connector_events → Workflow Engine → Tasks → Sink → Telegram + Email
-```
-
-#### Connector Trait
-
-```rust
-#[async_trait]
-pub trait Connector: Send + Sync {
-    fn connector_type(&self) -> &str;
-    async fn validate_config(&self, config: &Value) -> ValidationResult;
-    async fn start(&mut self, config: &Value, channels: &[ChannelConfig],
-                   event_tx: mpsc::Sender<ConnectorEvent>) -> Result<()>;
-    async fn stop(&mut self) -> Result<()>;
-    async fn send(&self, message: &SinkMessage) -> Result<()>;
-    async fn health(&self) -> bool;
-}
-```
-
-The `ConnectorRegistry` holds live connector instances and manages their lifecycle. On server startup, it starts all enabled connectors. Events flow through an `mpsc` channel to a central handler that either injects into conversations (direct binding) or records to `connector_events` (workflow trigger).
+| Type | Source | Sink | Status |
+|------|--------|------|--------|
+| Webhook | HTTP POST received | HTTP POST to URL | Full |
+| Telegram | Bot API long polling | sendMessage API | Full |
+| File Watcher | Filesystem events (notify) | Write file | Full |
+| Email | IMAP | SMTP | Stub |
+| GitHub | Webhook receiver | API calls | Stub |
+| Jira | Webhook receiver | API calls | Stub |
+| Slack | Bot events | Web API | Stub |
 
 ### Workflows
 
-Workflows are visual state machines that chain tasks across agents. Each node is a task template; each edge is a conditional transition.
+Workflows are a **task templating system** — each step creates a task assigned to an agent with either an ad-hoc prompt or a procedure (SOP). The definition is a YAML file that can be shared and version-controlled.
 
-#### Definition Format (YAML)
+#### Block-Based Editor
+
+The editor uses a linear block-based approach (not a node graph). Blocks stack vertically like steps in a recipe. This was chosen over a free-form canvas because:
+- Reads naturally top-to-bottom
+- Simpler mental model
+- Works on all platforms (no WebKit DnD issues)
+- Components are reusable in the procedure editor
+
+#### Sub-workflows
+
+A workflow consists of multiple **flows** (sub-workflows), each with its own tab:
+- `main` (green) — primary flow, starts with a trigger
+- `on_error` (red) — error handling, entered automatically on failure
+- Custom flows (e.g. `on_rejected`) — user-defined, entered via jumps
+
+Each flow is a linear sequence of steps. Flows share a common variable namespace.
+
+#### Step Types
+
+| Type | Description |
+|------|-------------|
+| **step** | Task: agent executes a prompt or procedure, produces typed outputs |
+| **when** | Conditional: switch on a variable, match arms with goto/continue |
+| **loop** | For-each: iterate over an array variable, execute nested steps per item |
+| **sink** | Notification: deliver messages through connectors |
+| **jump** | Control flow: jump to another flow, step, or workflow |
+
+#### Variables and Outputs
+
+Each task step declares **output variables** with types and descriptions. When a task completes, the agent's response is parsed as JSON and the declared fields are extracted into the workflow's **variable store**. Downstream steps reference variables via `@step_id.field` syntax.
+
+Global workflow variables (declared in the YAML) enable accumulator patterns across loops and sub-workflows.
+
+The `@` mention popup in the editor shows available variables from preceding steps, the trigger payload, global variables, and loop variables.
+
+#### YAML Format
 
 ```yaml
-name: code-review-pipeline
-description: Jira ticket through PM, Dev, Test cycle
+name: support-intake
 version: 1
 
 trigger:
-  connector: jira
-  channel: my-project
-  event: issue_created
-  filter:
-    type: Story
+  connector: telegram
+  channel: support-intake
+  event: message_received
 
-nodes:
-  - id: spec
-    label: "Write Specification"
-    agent: pm-agent
-    prompt: |
-      Write a spec for: {{trigger.payload.summary}}
-    position: { x: 250, y: 0 }
+variables:
+  escalation_count: 0
 
-  - id: implement
-    label: "Implement Feature"
-    agent: dev-agent
-    prompt: |
-      Implement: {{nodes.spec.output}}
-    position: { x: 250, y: 150 }
+flows:
+  main:
+    color: "#22c55e"
+    steps:
+      - id: classify
+        type: step
+        label: "Classify Intent"
+        agent: router-sm
+        prompt: "Classify: @trigger.payload.text"
+        outputs:
+          intent: { type: string, description: "Classified intent" }
+          entities: { type: array, description: "Extracted entities" }
 
-  - id: test
-    label: "Run Tests"
-    agent: tester-agent
-    procedure: run-tests
-    position: { x: 250, y: 300 }
+      - id: process
+        type: loop
+        label: "Process Entities"
+        over: "@classify.entities"
+        as: entity
+        steps:
+          - id: enrich
+            type: step
+            label: "Enrich"
+            agent: enricher
+            prompt: "Enrich: @entity"
 
-edges:
-  - from: spec
-    to: implement
-    condition: completed
+      - id: route
+        type: when
+        label: "Route by Intent"
+        switch: "@classify.intent"
+        arms:
+          - match: "complaint"
+            goto: flow on_rejected
+          - match: default
+            continue: true
 
-  - from: test
-    to: implement
-    condition: output.verdict == "fail"
-    label: "Tests Fail"
+      - id: notify
+        type: sink
+        label: "Notify"
+        sinks:
+          - connector: telegram
+            channel: ops
+            template: "Done: @classify.intent"
+
+  on_error:
+    color: "#ef4444"
+    steps:
+      - id: log_err
+        type: step
+        label: "Log Error"
+        agent: logger
+        prompt: "Log: @error"
+
+  on_rejected:
+    color: "#f97316"
+    steps:
+      - id: escalate
+        type: step
+        label: "Escalate"
+        agent: escalator
+        prompt: "Escalate case"
+      - id: back
+        type: jump
+        label: "Back to main"
+        target: flow main step notify
 ```
 
-Workflows explicitly support cycles (test → implement above). The `attempt` column in `workflow_node_executions` tracks revisits, with a configurable max (default 10) to prevent infinite loops.
+#### Execution Model
 
-#### Condition Language
+The workflow engine walks `flows[flow].steps[index]` sequentially:
 
-Simple expressions evaluated against task output:
-- `completed` / `failed` — task status shorthand
-- `output.field == "value"` — JSON path comparison
-- `output.field contains "text"` — substring match
-- `default` — catch-all fallback
+1. **step**: Render prompt (append output schema), create task, enqueue for dispatcher. Wait for completion. Extract JSON outputs into variable store.
+2. **when**: Resolve switch variable, match arms. Execute goto (step/flow/workflow) or continue to next step.
+3. **loop**: Resolve variable to array, iterate, execute nested steps per item.
+4. **sink**: Deliver messages through connectors, advance.
+5. **jump**: Switch to target flow/step or start a new workflow instance.
 
-Not a full expression language — deliberately minimal. Covers the stated requirements (approve/reject cycles, output-based branching).
-
-#### Integration with Task System
-
-Workflows do NOT replace the task dispatcher. Each workflow node creates a real task via `TaskBoard::create()` + `TaskQueue::enqueue()`. The existing dispatcher processes it normally. Agents don't need to know they're in a workflow.
-
-After a task completes, the dispatcher calls the workflow engine:
-
-```rust
-// In evaluate(), after task completion:
-if let Some(exec) = engine.find_execution_by_task(&task.id) {
-    engine.on_task_completed(&exec.instance_id, &exec.node_id, &result);
-}
-```
-
-The engine records the output, evaluates outgoing edge conditions, and creates the next task(s).
-
-#### Context Passing
-
-Each node's output (the last assistant message from its task) is stored in `workflow_node_executions.output`. When building the prompt for the next node, the engine renders `{{nodes.spec.output}}` templates by looking up completed node executions.
+If a step fails and `on_error` flow exists, execution jumps there automatically.
 
 #### Crash Recovery
 
-On startup, the engine loads all `workflow_instances` with `status = 'running'`. For each, it checks if the current node's task completed but wasn't advanced (server crashed between task completion and engine advancement). If so, it resumes by calling `on_task_completed()`.
+On server startup, the engine loads running instances and checks if the current step's task has completed. If so, it resumes execution.
 
-### Visual Editor
+### Database Schema
 
-The workflow editor at `/workflows/[id]` uses @xyflow/svelte (Svelte Flow) with custom node types:
-- **TaskNode**: agent avatar, label, conditional output handles
-- **TriggerNode**: connector icon, channel name
-- **SinkNode**: sink connector icons
+Six tables (connectors unchanged from initial design):
 
-Definitions are saved as YAML — the graph is the source of truth, and node positions are persisted in the YAML for editor layout.
-
-## Database Schema
-
-Six new tables in migration V21:
-
-- `connectors` — connector definitions (type, config, status)
-- `connector_channels` — channel instances with optional `agent_id` for direct binding
-- `connector_events` — event log for workflow matching
+- `connectors` — connector definitions
+- `connector_channels` — channels with optional agent binding
+- `connector_events` — event log for workflow trigger matching
+- `conversation_channel_bindings` — channel → conversation mapping for direct binding
 - `workflows` — workflow definitions (YAML content)
-- `workflow_instances` — running instances with current state
-- `workflow_node_executions` — per-node execution history with task linkage
+- `workflow_instances` — running instances with current flow/step/variables
+- `workflow_step_executions` — per-step execution history
+
+### MCP Tools
+
+Agents can create and manage workflows programmatically via MCP tools:
+- `create_workflow`, `update_workflow`, `list_workflows`, `run_workflow`
+- `create_procedure` — procedures share editing concepts with workflows
+
+### Component Reuse
+
+The block editor components (StepBlock, WhenBlock, LoopBlock) are designed to be reusable in the procedure editor, since procedures are a similar sequential step model within a single task.
 
 ## Consequences
 
 ### Positive
-- Agents can interact with the outside world without custom code
-- Multi-agent workflows with cycles handle real-world processes (approval loops)
-- Direct agent binding provides zero-config Telegram/Slack bots
-- YAML definitions are shareable and version-controllable
-- Crash recovery ensures workflows survive server restarts
-- Visual editor makes workflow creation accessible to non-developers
+- Block editor is intuitive — reads like a recipe
+- Sub-workflows handle complex error/rejection flows cleanly
+- Variables with `@` mention provide good DX for prompt authoring
+- Reusable components reduce future work on procedure editor
+- Agents can create workflows, enabling meta-automation
+- YAML files are portable and version-controllable
 
 ### Negative
-- Connector stubs (email, GitHub, Jira, Slack) need future implementation
-- Simple condition language may be limiting for complex branching logic
-- Long-polling connectors (Telegram) consume a thread per connector
-- Workflow YAML format is custom (not an industry standard like BPMN)
+- Sequential model can't express arbitrary parallel execution
+- Loop execution is synchronous (one item at a time)
+- Stub connectors (email, GitHub, Jira, Slack) need future implementation
 
 ### Risks
-- Telegram Bot API rate limits may throttle high-volume channels
-- Filesystem watcher may miss events during brief disconnections
-- Cyclic workflows with loose conditions could loop unexpectedly (mitigated by max_cycles)
+- LLM output parsing for structured variables is best-effort
+- Complex goto patterns could create confusing execution flows
