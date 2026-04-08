@@ -119,11 +119,16 @@
 
 	function blockToStep(b: Block): Record<string, unknown> {
 		const s: Record<string, unknown> = { id: b.id, type: b.type, label: b.label };
-		if (b.type === 'step') { if (b.agent) s.agent = b.agent; if (b.prompt) s.prompt = b.prompt; if (b.procedure) s.procedure = b.procedure; if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs; }
-		if (b.type === 'sink' && b.sinks?.length) s.sinks = b.sinks;
-		if (b.type === 'when') { if (b.switchVar) s.switch = b.switchVar; if (b.arms?.length) s.arms = b.arms; }
-		if (b.type === 'loop') { if (b.overVar) s.over = b.overVar; if (b.asVar) s.as = b.asVar; if (b.children?.length) s.steps = b.children.map(blockToStep); }
-		if (b.type === 'jump' && b.target) s.target = b.target;
+		if (b.type === 'step') {
+			s.agent = b.agent ?? '';
+			s.prompt = b.prompt ?? '';
+			if (b.procedure) s.procedure = b.procedure;
+			if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs;
+		}
+		if (b.type === 'sink') s.sinks = b.sinks ?? [];
+		if (b.type === 'when') { s.switch = b.switchVar ?? ''; s.arms = b.arms ?? []; }
+		if (b.type === 'loop') { s.over = b.overVar ?? ''; s.as = b.asVar ?? 'item'; s.steps = (b.children ?? []).map(blockToStep); }
+		if (b.type === 'jump') s.target = b.target ?? '';
 		return s;
 	}
 
