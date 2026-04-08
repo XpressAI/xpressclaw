@@ -13,9 +13,38 @@
 		onclose?: () => void;
 	} = $props();
 
+	let selectedIdx = $state(0);
+
 	let filtered = $derived(
 		variables.filter(v => !filter || v.name.toLowerCase().includes(filter.toLowerCase()))
 	);
+
+	// Reset selection when filter changes
+	$effect(() => { filter; selectedIdx = 0; });
+
+	export function handleKey(e: KeyboardEvent): boolean {
+		if (e.key === 'ArrowDown') {
+			e.preventDefault();
+			selectedIdx = Math.min(selectedIdx + 1, filtered.length - 1);
+			return true;
+		}
+		if (e.key === 'ArrowUp') {
+			e.preventDefault();
+			selectedIdx = Math.max(selectedIdx - 1, 0);
+			return true;
+		}
+		if (e.key === 'Enter' || e.key === 'Tab') {
+			e.preventDefault();
+			if (filtered.length > 0) onselect(filtered[selectedIdx].name);
+			return true;
+		}
+		if (e.key === 'Escape') {
+			e.preventDefault();
+			onclose();
+			return true;
+		}
+		return false;
+	}
 </script>
 
 <svelte:window onclick={onclose} />
@@ -26,9 +55,10 @@
 	{#if filtered.length === 0}
 		<div class="px-3 py-2 text-xs text-muted-foreground">No matching variables</div>
 	{:else}
-		{#each filtered as v}
+		{#each filtered as v, i}
 			<button onclick={() => onselect(v.name)}
-				class="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-accent transition-colors text-left">
+				class="flex w-full items-center gap-2 px-3 py-1.5 text-xs transition-colors text-left
+					{i === selectedIdx ? 'bg-accent text-foreground' : 'hover:bg-accent/50'}">
 				<span class="text-amber-400 font-mono">@</span>
 				<span class="font-mono text-foreground flex-1">{v.name}</span>
 				{#if v.type}

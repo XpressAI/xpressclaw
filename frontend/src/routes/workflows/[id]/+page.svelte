@@ -59,7 +59,7 @@
 	let triggerConfig = $state<{ connector: string; channel: string; event: string; filter?: Record<string, unknown> } | null>(null);
 	let globalVars = $state<Record<string, unknown>>({});
 
-	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null } | null>(null);
+	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number } | null>(null);
 
 	let currentBlocks = $derived(flows[currentFlow]?.blocks ?? []);
 	let flowNames = $derived(Object.keys(flows));
@@ -325,11 +325,37 @@
 		return vars;
 	}
 
+	let popupRef = $state<{ handleKey: (e: KeyboardEvent) => boolean } | null>(null);
+
 	function handlePromptKeydown(e: KeyboardEvent, blockIdx: number) {
+		// If popup is open, delegate keyboard events to it
+		if (variablePopup && popupRef) {
+			if (popupRef.handleKey(e)) return;
+			// If it's a printable character, update the filter
+			if (e.key.length === 1 && e.key !== '@') {
+				variablePopup = { ...variablePopup, filter: variablePopup.filter + e.key };
+				return;
+			}
+			if (e.key === 'Backspace') {
+				if (variablePopup.filter.length > 0) {
+					variablePopup = { ...variablePopup, filter: variablePopup.filter.slice(0, -1) };
+				} else {
+					variablePopup = null;
+				}
+				return;
+			}
+		}
+
 		if (e.key === '@') {
 			const ta = e.target as HTMLTextAreaElement;
+			// Estimate caret position using a hidden span measurement
 			const rect = ta.getBoundingClientRect();
-			variablePopup = { x: rect.left + 20, y: rect.bottom, filter: '', target: ta };
+			const lineHeight = parseInt(getComputedStyle(ta).lineHeight) || 16;
+			const text = ta.value.slice(0, ta.selectionStart);
+			const lines = text.split('\n').length;
+			const caretY = rect.top + lines * lineHeight;
+			const caretX = rect.left + 12;
+			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: ta, blockIdx };
 		}
 	}
 
@@ -339,8 +365,9 @@
 		const pos = ta.selectionStart;
 		const before = ta.value.slice(0, pos);
 		const after = ta.value.slice(pos);
-		ta.value = `${before}@${name}${after}`;
-		ta.selectionStart = ta.selectionEnd = pos + name.length + 1;
+		// The @ was already typed by the user — just insert the name
+		ta.value = `${before}${name}${after}`;
+		ta.selectionStart = ta.selectionEnd = pos + name.length;
 		ta.dispatchEvent(new Event('input', { bubbles: true }));
 		variablePopup = null;
 		ta.focus();
@@ -728,7 +755,8 @@
 	<!-- Variable popup -->
 	{#if variablePopup}
 		<VariablePopup
-			variables={availableVariables(currentBlocks.length)}
+			bind:this={popupRef}
+			variables={availableVariables(variablePopup.blockIdx ?? currentBlocks.length)}
 			filter={variablePopup.filter}
 			x={variablePopup.x} y={variablePopup.y}
 			onselect={insertVariable}
