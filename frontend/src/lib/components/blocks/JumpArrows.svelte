@@ -54,10 +54,10 @@
 
 			const d = `M ${fromX} ${fromY} C ${cpX} ${fromY}, ${cpX} ${toY}, ${toX} ${toY}`;
 
-			// Arrow head at end
-			const headSize = 5;
-			const headDir = side === 'right' ? -1 : 1;
-			const headD = `M ${toX} ${toY} l ${headDir * headSize} ${-headSize} M ${toX} ${toY} l ${headDir * headSize} ${headSize}`;
+			// Arrow head at end — points inward toward the target block (left)
+			const headSize = 6;
+			const headInward = side === 'right' ? 1 : -1;
+			const headD = `M ${toX} ${toY} l ${headInward * headSize} ${-headSize} M ${toX} ${toY} l ${headInward * headSize} ${headSize}`;
 
 			result.push({
 				d: d + ' ' + headD,
