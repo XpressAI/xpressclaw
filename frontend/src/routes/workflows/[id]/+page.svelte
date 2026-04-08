@@ -12,6 +12,7 @@
 	import TriggerBlock from '$lib/components/blocks/TriggerBlock.svelte';
 	import BlockConnector from '$lib/components/blocks/BlockConnector.svelte';
 	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
+	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
 
 	// --- Types ---
 
@@ -322,6 +323,32 @@
 	// --- Drag ---
 	let dragIdx = $state<number | null>(null);
 	let dragOverIdx = $state<number | null>(null);
+	let scrollContainerEl = $state<HTMLElement | null>(null);
+
+	// Compute jump arrows from when arms and jump blocks
+	let jumpArrows = $derived((() => {
+		const arrows: { fromId: string; toId: string; color: string; label?: string; side: 'right' | 'left' }[] = [];
+		const blocks = currentBlocks;
+		for (const block of blocks) {
+			if (block.type === 'when' && block.arms) {
+				for (const arm of block.arms) {
+					if (arm.goto?.startsWith('step ')) {
+						const targetId = arm.goto.replace('step ', '');
+						arrows.push({ fromId: block.id, toId: targetId, color: '#f59e0b', label: arm.match || '', side: 'right' });
+					} else if (arm.goto?.startsWith('flow ')) {
+						const flowName = arm.goto.replace('flow ', '').split(' ')[0];
+						const color = flowColors[flowName] || '#8b5cf6';
+						arrows.push({ fromId: block.id, toId: block.id, color, label: `→ ${flowName}`, side: 'right' });
+					}
+				}
+			}
+			if (block.type === 'jump' && block.target?.startsWith('step ')) {
+				const targetId = block.target.replace('step ', '');
+				arrows.push({ fromId: block.id, toId: targetId, color: '#818cf8', label: '', side: 'right' });
+			}
+		}
+		return arrows;
+	})());
 </script>
 
 <div class="flex h-full flex-col overflow-hidden">
@@ -379,7 +406,7 @@
 	</div>
 
 	<!-- Main content -->
-	<div class="flex-1 overflow-y-auto relative">
+	<div class="flex-1 overflow-y-auto relative" bind:this={scrollContainerEl}>
 		{#if showYaml}
 			<div class="absolute inset-0 z-20 flex flex-col bg-background/95 backdrop-blur-sm">
 				<div class="flex items-center justify-between px-4 py-2 border-b border-border">
@@ -436,7 +463,7 @@
 			<!-- Steps -->
 			{#each currentBlocks as block, idx (block.id)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div class="flex items-start gap-0"
+				<div class="flex items-start gap-0" data-step-id={block.id}
 					draggable="true"
 					ondragstart={(e) => { e.dataTransfer?.setData('text/plain', String(idx)); dragIdx = idx; }}
 					ondragover={(e) => { e.preventDefault(); dragOverIdx = idx; }}
@@ -601,6 +628,9 @@
 				</div>
 			</div>
 		</div>
+
+		<!-- Jump arrows overlay -->
+		<JumpArrows arrows={jumpArrows} containerEl={scrollContainerEl} />
 	</div>
 
 	<!-- Instance tracking panel -->
