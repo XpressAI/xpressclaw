@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 
-	/** Each arrow: from element → to element, with a color and optional label */
 	interface Arrow {
 		fromId: string;
 		toId: string;
@@ -19,12 +18,19 @@
 	} = $props();
 
 	let paths = $state<{ d: string; color: string; label?: string; labelX: number; labelY: number }[]>([]);
+	let svgHeight = $state(0);
+	let svgWidth = $state(0);
 
 	function computePaths() {
 		if (!containerEl || arrows.length === 0) { paths = []; return; }
+
 		const containerRect = containerEl.getBoundingClientRect();
 		const scrollTop = containerEl.scrollTop;
+		svgHeight = containerEl.scrollHeight;
+		svgWidth = containerEl.scrollWidth;
+
 		const result: typeof paths = [];
+		const R = 8; // corner radius
 
 		for (const arrow of arrows) {
 			const fromEl = containerEl.querySelector(`[data-step-id="${arrow.fromId}"]`);
@@ -34,72 +40,100 @@
 			const fromRect = fromEl.getBoundingClientRect();
 			const toRect = toEl.getBoundingClientRect();
 
-			// Positions relative to container
+			// Y positions relative to scroll container
 			const fromY = fromRect.top - containerRect.top + scrollTop + fromRect.height / 2;
 			const toY = toRect.top - containerRect.top + scrollTop + toRect.height / 2;
 
-			const side = arrow.side;
-			const margin = side === 'right' ? 40 : -40;
-			const fromX = side === 'right'
-				? fromRect.right - containerRect.left + 8
-				: fromRect.left - containerRect.left - 8;
-			const toX = side === 'right'
-				? toRect.right - containerRect.left + 8
-				: toRect.left - containerRect.left - 8;
+			// X: right edge of the blocks + offset
+			const rightEdge = Math.max(fromRect.right, toRect.right) - containerRect.left + 16;
+			const offset = 28; // how far right the vertical line goes
+			const xRight = rightEdge + offset;
 
-			// Curve control point — offset to the side
-			const cpX = side === 'right'
-				? Math.max(fromX, toX) + margin
-				: Math.min(fromX, toX) + margin;
+			// Arrowhead tip goes to the right edge of the target block
+			const toX = toRect.right - containerRect.left + 4;
+			const fromX = fromRect.right - containerRect.left + 4;
 
-			const d = `M ${fromX} ${fromY} C ${cpX} ${fromY}, ${cpX} ${toY}, ${toX} ${toY}`;
+			// Draw a rounded rectangle path: right from source → down/up → left to target
+			// Like a bracket on the right side: ┐ │ └→
+			const goingDown = toY > fromY;
 
-			// Arrow head at end — points inward toward the target block (left)
-			const headSize = 6;
-			const headInward = side === 'right' ? 1 : -1;
-			const headD = `M ${toX} ${toY} l ${headInward * headSize} ${-headSize} M ${toX} ${toY} l ${headInward * headSize} ${headSize}`;
+			let d: string;
+			if (goingDown) {
+				d = [
+					`M ${fromX} ${fromY}`,              // start at source right edge
+					`L ${xRight - R} ${fromY}`,         // horizontal to near corner
+					`Q ${xRight} ${fromY} ${xRight} ${fromY + R}`,  // round top-right corner
+					`L ${xRight} ${toY - R}`,           // vertical down
+					`Q ${xRight} ${toY} ${xRight - R} ${toY}`,      // round bottom-right corner
+					`L ${toX + 6} ${toY}`,              // horizontal to arrowhead
+					// Arrowhead
+					`M ${toX + 6} ${toY} L ${toX + 12} ${toY - 4}`,
+					`M ${toX + 6} ${toY} L ${toX + 12} ${toY + 4}`,
+				].join(' ');
+			} else {
+				d = [
+					`M ${fromX} ${fromY}`,
+					`L ${xRight - R} ${fromY}`,
+					`Q ${xRight} ${fromY} ${xRight} ${fromY - R}`,
+					`L ${xRight} ${toY + R}`,
+					`Q ${xRight} ${toY} ${xRight - R} ${toY}`,
+					`L ${toX + 6} ${toY}`,
+					`M ${toX + 6} ${toY} L ${toX + 12} ${toY - 4}`,
+					`M ${toX + 6} ${toY} L ${toX + 12} ${toY + 4}`,
+				].join(' ');
+			}
 
 			result.push({
-				d: d + ' ' + headD,
+				d,
 				color: arrow.color,
 				label: arrow.label,
-				labelX: cpX + (side === 'right' ? 4 : -4),
-				labelY: (fromY + toY) / 2
+				labelX: xRight + 6,
+				labelY: (fromY + toY) / 2,
 			});
 		}
 
 		paths = result;
 	}
 
+	// Recompute on any change
 	$effect(() => {
-		// Re-compute when arrows change
 		arrows;
 		tick().then(computePaths);
 	});
 
 	onMount(() => {
 		computePaths();
-		// Recompute on scroll/resize
-		const observer = new ResizeObserver(computePaths);
+
+		// Recompute on resize, scroll, and DOM mutations (compact toggle)
+		const resizeObs = new ResizeObserver(computePaths);
+		const mutationObs = new MutationObserver(() => { requestAnimationFrame(computePaths); });
+
 		if (containerEl) {
-			observer.observe(containerEl);
+			resizeObs.observe(containerEl);
 			containerEl.addEventListener('scroll', computePaths);
+			mutationObs.observe(containerEl, { childList: true, subtree: true, attributes: true });
 		}
+
+		// Also recompute on window resize
+		window.addEventListener('resize', computePaths);
+
 		return () => {
-			observer.disconnect();
+			resizeObs.disconnect();
+			mutationObs.disconnect();
 			containerEl?.removeEventListener('scroll', computePaths);
+			window.removeEventListener('resize', computePaths);
 		};
 	});
 </script>
 
 {#if paths.length > 0}
-	<svg class="absolute inset-0 pointer-events-none z-10 overflow-visible" style="width: 100%; height: 100%;">
+	<svg class="absolute inset-0 pointer-events-none z-10" style="width: {svgWidth}px; height: {svgHeight}px; overflow: visible;">
 		{#each paths as path}
 			<path d={path.d} fill="none" stroke={path.color} stroke-width="1.5"
-				stroke-dasharray="4 3" opacity="0.6" />
+				stroke-dasharray="4 3" opacity="0.5" />
 			{#if path.label}
 				<text x={path.labelX} y={path.labelY} fill={path.color} font-size="9"
-					text-anchor="middle" dominant-baseline="middle" opacity="0.7"
+					dominant-baseline="middle" opacity="0.6"
 					font-family="monospace">{path.label}</text>
 			{/if}
 		{/each}
