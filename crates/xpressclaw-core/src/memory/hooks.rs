@@ -1,17 +1,19 @@
-//! Memory hooks — automatic recall and remember via sub-agent calls.
+//! Memory hooks — automatic recall and remember.
 //!
-//! The memory system uses a "hippocampus" model: a sub-agent silently
-//! manages memory before and after the main agent responds.
+//! The memory system uses a "hippocampus" model:
 //!
-//! - **Recall** (before first response): searches memory, synthesizes
-//!   a narrative recollection, injected as a message (not system prompt
-//!   — preserves prompt caching).
+//! - **Recall** (before first response): searches memory in Rust,
+//!   sends results to LLM for synthesis into a brief narrative.
 //!
-//! - **Remember** (async, after each response): reviews the conversation
-//!   turn and creates fleeting notes in Inbox/.
+//! - **Remember** (async, after each response): sends the exchange
+//!   to LLM for analysis, parses the response, saves notes in Rust.
 //!
-//! - **Consolidate** (pre-compaction / end-of-session): processes Inbox/
-//!   into permanent Zettel/ notes, adds links.
+//! - **Consolidate** (pre-compaction): processes inbox notes into
+//!   permanent zettel notes.
+//!
+//! Memory search and save happen in Rust — the LLM is only used for
+//! natural language synthesis and analysis. No MCP tools are exposed
+//! to the sub-agent calls.
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use crate::agents::harness::HarnessClient;
 use crate::config::HooksConfig;
 use crate::db::Database;
 use crate::memory::manager::MemoryManager;
+use crate::memory::zettelkasten::CreateMemory;
 
 /// Orchestrates memory hooks for an agent.
 pub struct MemoryHooks {
@@ -39,7 +42,6 @@ impl MemoryHooks {
     /// Check if an agent has any memories at all (quick DB count).
     pub fn has_memories(&self, agent_id: &str) -> bool {
         let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
-        // Check both agent-specific and shared memories
         mgr.get_recent(None, Some(agent_id), 1)
             .map(|r| !r.is_empty())
             .unwrap_or(false)
@@ -49,18 +51,17 @@ impl MemoryHooks {
                 .unwrap_or(false)
     }
 
-    /// Recall: search memory and synthesize a recollection via sub-agent.
+    /// Recall: search memory and synthesize a recollection.
     ///
-    /// Returns the recollection text to inject into the conversation,
-    /// or None if no memories exist or the harness call fails.
+    /// 1. Searches memory in Rust for relevant entries
+    /// 2. Sends the results to the LLM for natural language synthesis
+    /// 3. Returns the recollection text to inject into the conversation
     pub async fn recall(
         &self,
         agent_id: &str,
-        conversation_context: &str,
+        user_query: &str,
         harness_port: u16,
     ) -> Option<String> {
-        // Use agent_id as model name — the harness maps it to LLM_MODEL.
-        let model = agent_id;
         if !self.has_memories(agent_id) {
             debug!(agent_id, "no memories found, skipping recall");
             return None;
@@ -68,32 +69,46 @@ impl MemoryHooks {
 
         info!(agent_id, "recalling memories for first turn");
 
+        // Step 1: Search memory in Rust
+        let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
+        let query = truncate(user_query, 300);
+
+        let results = mgr.search_text(query, 8).unwrap_or_default();
+        if results.is_empty() {
+            debug!(agent_id, "memory search returned no results");
+            return None;
+        }
+
+        // Format search results as context
+        let mut memory_context = String::new();
+        for (i, result) in results.iter().enumerate() {
+            let summary = if result.memory.summary.is_empty() {
+                &result.memory.content
+            } else {
+                &result.memory.summary
+            };
+            memory_context.push_str(&format!("{}. {}\n", i + 1, truncate(summary, 200)));
+        }
+
+        // Step 2: Send to LLM for synthesis (no tools — just text in, text out)
         let harness = HarnessClient::new(harness_port);
         let prompt = format!(
-            "SYSTEM: You are the memory subsystem for agent '{agent_id}'. \
-             Your job is to search memory for context relevant to the \
-             upcoming conversation and synthesize a brief recollection.\n\n\
-             Use the `search_memory` tool to find relevant memories for \
-             this context:\n\n\
-             {context}\n\n\
-             Then write a concise narrative recollection (2-4 sentences) \
-             that will help the agent respond naturally. Focus on facts, \
-             preferences, past decisions, and anything the agent would \
-             naturally remember. Write in first person as if you ARE the \
-             agent recalling things. If you find nothing relevant, just \
-             say 'No relevant memories found.'\n\n\
-             Do NOT use any tools other than search_memory and list_memories.",
+            "You are synthesizing memories for an AI agent named '{agent_id}'.\n\n\
+             The user's query is:\n\
+             \"{query}\"\n\n\
+             Here are relevant memories found in the agent's memory store:\n\
+             {memories}\n\
+             Write a concise recollection (2-3 sentences) that will help the \
+             agent respond to the user's query. Write in first person as the \
+             agent. Focus only on facts relevant to the query.\n\n\
+             If none of the memories are relevant, respond with exactly: \
+             No relevant memories found.",
             agent_id = agent_id,
-            context = truncate(conversation_context, 500),
+            query = truncate(user_query, 400),
+            memories = memory_context,
         );
 
-        match harness
-            .send_task(
-                "", // no separate system prompt needed
-                &prompt, model,
-            )
-            .await
-        {
+        match harness.send_task("", &prompt, agent_id).await {
             Ok(response) => {
                 let text = response
                     .choices
@@ -101,7 +116,7 @@ impl MemoryHooks {
                     .map(|c| c.message.content.clone())
                     .unwrap_or_default();
 
-                if text.is_empty() || text.contains("No relevant memories") {
+                if text.is_empty() || text.contains("No relevant memories found") {
                     debug!(agent_id, "recall returned no relevant memories");
                     return None;
                 }
@@ -120,11 +135,11 @@ impl MemoryHooks {
         }
     }
 
-    /// Remember: review a conversation turn and create fleeting notes.
+    /// Remember: review a conversation turn and save noteworthy information.
     ///
-    /// This runs asynchronously after the agent has already responded.
-    /// It spawns a sub-agent call to analyze the exchange and save
-    /// noteworthy information to the Inbox/.
+    /// 1. Sends the exchange to the LLM for analysis
+    /// 2. Parses the response for memory-worthy items
+    /// 3. Saves them as fleeting notes in Rust
     pub async fn remember(
         &self,
         agent_id: &str,
@@ -132,7 +147,6 @@ impl MemoryHooks {
         agent_response: &str,
         harness_port: u16,
     ) {
-        // Skip very short exchanges — nothing worth remembering
         if user_message.len() + agent_response.len() < 200 {
             debug!(agent_id, "exchange too short, skipping remember");
             return;
@@ -142,26 +156,63 @@ impl MemoryHooks {
 
         let harness = HarnessClient::new(harness_port);
         let prompt = format!(
-            "SYSTEM: You are the memory subsystem for agent '{agent_id}'. \
-             Review this conversation exchange and save any noteworthy \
-             information as fleeting notes.\n\n\
-             USER MESSAGE:\n{user_msg}\n\n\
-             AGENT RESPONSE:\n{agent_resp}\n\n\
-             Use `save_memory` to save important facts, decisions, user \
-             preferences, or anything the agent should remember later. \
-             Tag each memory with 'inbox' (these are fleeting notes that \
-             will be consolidated later). Include context about WHY this \
-             matters.\n\n\
-             Save at most 2 memories. Skip if nothing is worth remembering. \
-             Do NOT use any tools other than save_memory.",
+            "You are the memory subsystem for an AI agent named '{agent_id}'.\n\n\
+             Review this conversation exchange and identify facts worth remembering.\n\n\
+             USER SAID:\n\"{user_msg}\"\n\n\
+             AGENT RESPONDED:\n\"{agent_resp}\"\n\n\
+             List 0-2 facts worth saving for future conversations. Each fact \
+             should be a single clear sentence. Format each on its own line \
+             prefixed with \"SAVE: \". Include context about why it matters.\n\n\
+             If nothing is worth remembering, respond with: Nothing to save.\n\n\
+             Examples:\n\
+             SAVE: User prefers Python over JavaScript for backend work.\n\
+             SAVE: The project deadline is March 15th 2026.",
             agent_id = agent_id,
             user_msg = truncate(user_message, 500),
-            agent_resp = truncate(agent_response, 1000),
+            agent_resp = truncate(agent_response, 800),
         );
 
         match harness.send_task("", &prompt, agent_id).await {
-            Ok(_) => {
-                info!(agent_id, "async remember complete");
+            Ok(response) => {
+                let text = response
+                    .choices
+                    .first()
+                    .map(|c| c.message.content.clone())
+                    .unwrap_or_default();
+
+                // Parse SAVE: lines and store them
+                let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
+                let mut saved = 0;
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(content) = trimmed
+                        .strip_prefix("SAVE:")
+                        .or_else(|| trimmed.strip_prefix("SAVE :"))
+                    {
+                        let content = content.trim();
+                        if content.is_empty() {
+                            continue;
+                        }
+                        match mgr.add(&CreateMemory {
+                            content: content.to_string(),
+                            summary: content.to_string(),
+                            source: "memory_hook".to_string(),
+                            layer: "agent".to_string(),
+                            agent_id: Some(agent_id.to_string()),
+                            user_id: None,
+                            tags: vec!["inbox".to_string()],
+                        }) {
+                            Ok(_) => saved += 1,
+                            Err(e) => warn!(agent_id, error = %e, "failed to save memory"),
+                        }
+                    }
+                }
+
+                if saved > 0 {
+                    info!(agent_id, count = saved, "saved memories from exchange");
+                } else {
+                    debug!(agent_id, "nothing worth remembering");
+                }
             }
             Err(e) => {
                 warn!(agent_id, error = %e, "async remember failed");
@@ -170,58 +221,130 @@ impl MemoryHooks {
     }
 
     /// Consolidate: process Inbox/ fleeting notes into permanent Zettel/ notes.
-    ///
-    /// Called before compaction or at end-of-session. The sub-agent reviews
-    /// all inbox-tagged memories, links related ones, promotes important
-    /// ones to permanent notes, and cleans up duplicates.
     pub async fn consolidate(&self, agent_id: &str, harness_port: u16) {
         info!(agent_id, "running memory consolidation");
 
+        let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
+
+        // Get all inbox-tagged memories
+        let inbox = mgr.search_by_tag("inbox", 50).unwrap_or_default();
+        if inbox.is_empty() {
+            debug!(agent_id, "no inbox notes to consolidate");
+            return;
+        }
+
+        let mut inbox_text = String::new();
+        for (i, mem) in inbox.iter().enumerate() {
+            inbox_text.push_str(&format!(
+                "{}. {}\n",
+                i + 1,
+                if mem.memory.summary.is_empty() {
+                    &mem.memory.content
+                } else {
+                    &mem.memory.summary
+                }
+            ));
+        }
+
         let harness = HarnessClient::new(harness_port);
         let prompt = format!(
-            "SYSTEM: You are the memory subsystem for agent '{agent_id}'. \
-             It's time to consolidate your memory.\n\n\
-             1. Use `list_memories` with tag 'inbox' to see all fleeting notes.\n\
-             2. Review them and decide which are worth keeping permanently.\n\
-             3. For important ones, use `save_memory` with tag 'zettel' \
-                (permanent note) and a clear, descriptive summary.\n\
-             4. Delete processed inbox notes with `delete_memory`.\n\
-             5. Look for related memories and note connections in the content \
-                using [[wiki-style]] links.\n\n\
-             Be selective — only promote genuinely useful information to \
-             permanent notes. Merge duplicates. Add context and links.",
+            "You are consolidating memory for agent '{agent_id}'.\n\n\
+             Here are {count} inbox notes (fleeting observations):\n\
+             {notes}\n\
+             Review them and produce a consolidated summary. Group related \
+             facts together. Remove duplicates. For each consolidated fact, \
+             write it on its own line prefixed with \"KEEP: \".\n\n\
+             For notes that are no longer relevant or are duplicates, \
+             write: DELETE: <note number>\n\n\
+             Example:\n\
+             KEEP: User works on the xpressclaw project, an AI agent runtime.\n\
+             KEEP: The project uses Rust backend and SvelteKit frontend.\n\
+             DELETE: 3\n\
+             DELETE: 5",
             agent_id = agent_id,
+            count = inbox.len(),
+            notes = inbox_text,
         );
 
         match harness.send_task("", &prompt, agent_id).await {
-            Ok(_) => {
-                info!(agent_id, "memory consolidation complete");
+            Ok(response) => {
+                let text = response
+                    .choices
+                    .first()
+                    .map(|c| c.message.content.clone())
+                    .unwrap_or_default();
+
+                let mut kept = 0;
+                let mut deleted = 0;
+
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if let Some(content) = trimmed.strip_prefix("KEEP:") {
+                        let content = content.trim();
+                        if content.is_empty() {
+                            continue;
+                        }
+                        let _ = mgr.add(&CreateMemory {
+                            content: content.to_string(),
+                            summary: content.to_string(),
+                            source: "consolidation".to_string(),
+                            layer: "agent".to_string(),
+                            agent_id: Some(agent_id.to_string()),
+                            user_id: None,
+                            tags: vec!["zettel".to_string()],
+                        });
+                        kept += 1;
+                    }
+                    if let Some(num_str) = trimmed.strip_prefix("DELETE:") {
+                        if let Ok(idx) = num_str.trim().parse::<usize>() {
+                            if idx > 0 && idx <= inbox.len() {
+                                let _ = mgr.delete(&inbox[idx - 1].memory.id);
+                                deleted += 1;
+                            }
+                        }
+                    }
+                }
+
+                info!(
+                    agent_id,
+                    kept,
+                    deleted,
+                    total_inbox = inbox.len(),
+                    "consolidation complete"
+                );
             }
             Err(e) => {
-                warn!(agent_id, error = %e, "memory consolidation failed");
+                warn!(agent_id, error = %e, "consolidation failed");
             }
         }
     }
 }
 
-/// Check if hooks are enabled for an agent.
+/// Check if the recall hook is configured.
 pub fn has_recall_hook(hooks: &HooksConfig) -> bool {
-    hooks.before_message.iter().any(|h| h == "memory_recall")
+    hooks
+        .before_message
+        .iter()
+        .any(|h| h == "memory_recall" || h == "memory:recall")
 }
 
+/// Check if the remember hook is configured.
 pub fn has_remember_hook(hooks: &HooksConfig) -> bool {
-    hooks.after_message.iter().any(|h| h == "memory_remember")
+    hooks
+        .after_message
+        .iter()
+        .any(|h| h == "memory_remember" || h == "memory:remember")
 }
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
     } else {
-        // Find a safe char boundary
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) {
-            end -= 1;
-        }
-        &s[..end]
+        &s[..s
+            .char_indices()
+            .take(max)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0)]
     }
 }

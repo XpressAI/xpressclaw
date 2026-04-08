@@ -361,7 +361,11 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     if ctx.turn == 0 && hooks::has_recall_hook(&ctx.hooks) {
         let mem_hooks = MemoryHooks::new(db.clone(), &config.memory.eviction);
         if let Some(recollection) = mem_hooks
-            .recall(&ctx.agent_id, &ctx.current_prompt, ctx.harness_port)
+            .recall(
+                &ctx.agent_id,
+                ctx.task.description.as_deref().unwrap_or(&ctx.task.title),
+                ctx.harness_port,
+            )
             .await
         {
             // Save recollection as a task message (visible in task UI)
