@@ -106,7 +106,7 @@
 			description: workflow?.description || '',
 			version: 1,
 		};
-		if (triggerConfig?.connector) def.trigger = triggerConfig;
+		if (triggerConfig) def.trigger = triggerConfig;
 		if (Object.keys(globalVars).length > 0) def.variables = globalVars;
 
 		const flowsOut: Record<string, unknown> = {};
@@ -119,11 +119,16 @@
 
 	function blockToStep(b: Block): Record<string, unknown> {
 		const s: Record<string, unknown> = { id: b.id, type: b.type, label: b.label };
-		if (b.type === 'step') { if (b.agent) s.agent = b.agent; if (b.prompt) s.prompt = b.prompt; if (b.procedure) s.procedure = b.procedure; if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs; }
-		if (b.type === 'sink' && b.sinks?.length) s.sinks = b.sinks;
-		if (b.type === 'when') { if (b.switchVar) s.switch = b.switchVar; if (b.arms?.length) s.arms = b.arms; }
-		if (b.type === 'loop') { if (b.overVar) s.over = b.overVar; if (b.asVar) s.as = b.asVar; if (b.children?.length) s.steps = b.children.map(blockToStep); }
-		if (b.type === 'jump' && b.target) s.target = b.target;
+		if (b.type === 'step') {
+			s.agent = b.agent ?? '';
+			s.prompt = b.prompt ?? '';
+			if (b.procedure) s.procedure = b.procedure;
+			if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs;
+		}
+		if (b.type === 'sink') s.sinks = b.sinks ?? [];
+		if (b.type === 'when') { s.switch = b.switchVar ?? ''; s.arms = b.arms ?? []; }
+		if (b.type === 'loop') { s.over = b.overVar ?? ''; s.as = b.asVar ?? 'item'; s.steps = (b.children ?? []).map(blockToStep); }
+		if (b.type === 'jump') s.target = b.target ?? '';
 		return s;
 	}
 
@@ -192,11 +197,22 @@
 
 	// --- Flow management ---
 
+	let addingFlow = $state(false);
+	let newFlowName = $state('');
+	let confirmDeleteFlow = $state<string | null>(null);
+
 	function addFlow() {
-		const name = prompt('Sub-workflow name (e.g. on_rejected):');
-		if (!name || flows[name]) return;
+		addingFlow = true;
+		newFlowName = 'on_';
+	}
+
+	function confirmAddFlow() {
+		const name = newFlowName.trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_');
+		if (!name || flows[name]) { showToast('Flow name already exists or is empty', 'error'); return; }
 		flows = { ...flows, [name]: { color: '#8b5cf6', blocks: [] } };
 		currentFlow = name;
+		addingFlow = false;
+		newFlowName = '';
 	}
 
 	function removeFlow(name: string) {
@@ -494,14 +510,33 @@
 				<span>{name}</span>
 				<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
 				{#if name !== 'main'}
-					<button onclick={(e) => { e.stopPropagation(); if (confirm(`Delete flow "${name}"?`)) removeFlow(name); }}
-						class="ml-0.5 text-muted-foreground/30 hover:text-destructive">
-						<svg class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-					</button>
+					{#if confirmDeleteFlow === name}
+						<span class="ml-1 flex items-center gap-1.5" onclick={(e) => e.stopPropagation()}>
+							<button onclick={() => { removeFlow(name); confirmDeleteFlow = null; }}
+								class="rounded border border-destructive/50 bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive hover:bg-destructive/20">Delete</button>
+							<button onclick={() => (confirmDeleteFlow = null)}
+								class="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent">Cancel</button>
+						</span>
+					{:else}
+						<button onclick={(e) => { e.stopPropagation(); confirmDeleteFlow = name; }}
+							class="ml-0.5 text-muted-foreground/30 hover:text-destructive">
+							<svg class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+						</button>
+					{/if}
 				{/if}
 			</button>
 		{/each}
-		<button onclick={addFlow} class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50" title="Add sub-workflow">+</button>
+		{#if addingFlow}
+			<form onsubmit={(e) => { e.preventDefault(); confirmAddFlow(); }} class="flex items-center gap-1">
+				<input type="text" bind:value={newFlowName} autofocus
+					class="rounded border border-input bg-background px-2 py-0.5 text-xs w-28 focus:outline-none focus:ring-1 focus:ring-ring"
+					placeholder="flow_name" />
+				<button type="submit" class="text-[10px] text-primary hover:underline">add</button>
+				<button type="button" onclick={() => (addingFlow = false)} class="text-[10px] text-muted-foreground hover:underline">cancel</button>
+			</form>
+		{:else}
+			<button onclick={addFlow} class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50" title="Add sub-workflow">+</button>
+		{/if}
 	</div>
 
 	<!-- Main content -->
@@ -541,11 +576,9 @@
 								expanded={!compactView} {connectorList}
 								onupdate={(u) => { triggerConfig = { ...triggerConfig!, ...u } as typeof triggerConfig; }}
 								ontoggle={() => {}}
+								onremove={removeTrigger}
 							/>
 						</div>
-						<button onclick={removeTrigger} class="mt-2.5 ml-1 text-muted-foreground/20 hover:text-destructive">
-							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-						</button>
 					</div>
 					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
 				{:else}

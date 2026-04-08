@@ -43,19 +43,17 @@
 				await workflows.enable(wf.id);
 			}
 			await load();
-		} catch (e) {
-			alert(String(e));
-		}
+		} catch {}
 	}
 
+	let confirmDeleteId = $state<string | null>(null);
+
 	async function deleteWorkflow(id: string) {
-		if (!confirm('Delete this workflow? This cannot be undone.')) return;
 		try {
 			await workflows.delete(id);
+			confirmDeleteId = null;
 			await load();
-		} catch (e) {
-			alert(String(e));
-		}
+		} catch {}
 	}
 </script>
 
@@ -147,13 +145,21 @@
 							>
 								View
 							</a>
-							<button
-								onclick={() => deleteWorkflow(wf.id)}
-								class="rounded-md border border-border bg-secondary px-2.5 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/10 transition-colors opacity-0 group-hover:opacity-100"
-								title="Delete"
-							>
-								Delete
-							</button>
+							{#if confirmDeleteId === wf.id}
+								<span class="flex items-center gap-1.5">
+									<button onclick={() => deleteWorkflow(wf.id)}
+										class="rounded border border-destructive/50 bg-destructive/10 px-2.5 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/20 transition-colors">Delete</button>
+									<button onclick={() => (confirmDeleteId = null)}
+										class="rounded border border-border px-2.5 py-1 text-[10px] text-muted-foreground hover:bg-accent transition-colors">Cancel</button>
+								</span>
+							{:else}
+								<button
+									onclick={() => (confirmDeleteId = wf.id)}
+									class="rounded-md border border-border bg-secondary px-2.5 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/10 transition-colors opacity-0 group-hover:opacity-100"
+								>
+									Delete
+								</button>
+							{/if}
 						</div>
 					</div>
 				</div>
