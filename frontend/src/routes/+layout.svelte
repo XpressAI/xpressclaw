@@ -52,23 +52,10 @@
 
 	let { children } = $props();
 
-	// Collapsible sidebar — expanded by default, auto-collapses on workflow editor
+	// Collapsible sidebar — expanded by default, manual toggle only
 	let sidebarCollapsed = $state(false);
-	let sidebarManuallySet = false;
-
-	// Auto-collapse on workflow editor pages, expand otherwise
-	$effect(() => {
-		const path = $page.url.pathname;
-		if (sidebarManuallySet) return; // user overrode, don't auto-toggle
-		if (/^\/workflows\/[^/]+$/.test(path)) {
-			sidebarCollapsed = true;
-		} else {
-			sidebarCollapsed = false;
-		}
-	});
 
 	function toggleSidebar() {
-		sidebarManuallySet = true;
 		sidebarCollapsed = !sidebarCollapsed;
 	}
 
