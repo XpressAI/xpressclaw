@@ -164,13 +164,13 @@ async fn get_instance(
         xpressclaw_core::error::Error::WorkflowInstanceNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
-    // Include node executions
+    // Include step executions
     let executions = im
-        .list_node_executions(&instance_id)
+        .list_step_executions(&instance_id)
         .map_err(internal_error)?;
     Ok(Json(json!({
         "instance": instance,
-        "node_executions": executions,
+        "step_executions": executions,
     })))
 }
 
@@ -179,7 +179,7 @@ async fn cancel_instance(
     Path(instance_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let im = InstanceManager::new(state.db.clone());
-    im.update_instance_status(&instance_id, "cancelled", None)
+    im.update_status(&instance_id, "cancelled", None)
         .map_err(|e| match &e {
             xpressclaw_core::error::Error::WorkflowInstanceNotFound { .. } => not_found(&e),
             _ => internal_error(e),

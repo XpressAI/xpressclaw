@@ -153,7 +153,7 @@
 .dark input[type="url"],
 .dark textarea {
 	color-scheme: dark;
-	background-color: hsl(var(--background));
+	background-color: hsl(var(--card));
 	color: hsl(var(--foreground));
 	border-color: hsl(var(--input));
 }
@@ -164,6 +164,11 @@
 	background-repeat: no-repeat;
 	background-position: right 0.5rem center;
 	padding-right: 1.75rem;
+}
+.dark select option,
+.dark select optgroup {
+	background-color: hsl(var(--card));
+	color: hsl(var(--foreground));
 }
 .dark input[type="checkbox"] {
 	color-scheme: dark;

@@ -143,6 +143,7 @@ impl Database {
             (20, MIGRATION_V20),
             (21, MIGRATION_V21),
             (22, MIGRATION_V22),
+            (23, MIGRATION_V23),
         ];
 
         for &(target, sql) in migrations {
@@ -666,6 +667,44 @@ CREATE TABLE IF NOT EXISTS conversation_channel_bindings (
 );
 ";
 
+const MIGRATION_V23: &str = "
+-- V2 workflow engine: sequential step-based execution replaces node/edge graph.
+-- Drop old tables (v1 was never released, no data to preserve).
+DROP TABLE IF EXISTS workflow_node_executions;
+DROP TABLE IF EXISTS workflow_instances;
+
+CREATE TABLE workflow_instances (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'running',
+    current_flow TEXT DEFAULT 'main',
+    current_step_index INTEGER DEFAULT 0,
+    trigger_data TEXT,
+    variable_store TEXT DEFAULT '{}',
+    loop_state TEXT,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_instances_status ON workflow_instances(status);
+
+CREATE TABLE workflow_step_executions (
+    id TEXT PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    flow_name TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    task_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    input_context TEXT,
+    output TEXT,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_wf_step_exec_instance ON workflow_step_executions(instance_id);
+CREATE INDEX IF NOT EXISTS idx_wf_step_exec_task ON workflow_step_executions(task_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,7 +722,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "22");
+        assert_eq!(version, "23");
     }
 
     #[test]

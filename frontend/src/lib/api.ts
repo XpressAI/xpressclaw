@@ -748,21 +748,23 @@ export interface Workflow {
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
-	workflow_version: number;
 	status: string;
+	current_flow: string;
+	current_step_index: number;
 	trigger_data: string | null;
-	current_node_id: string | null;
-	context: string;
+	variable_store: string;
+	loop_state: string | null;
 	started_at: string;
 	completed_at: string | null;
 	error_message: string | null;
-	node_executions?: NodeExecution[];
+	step_executions?: StepExecution[];
 }
 
-export interface NodeExecution {
+export interface StepExecution {
 	id: string;
 	instance_id: string;
-	node_id: string;
+	flow_name: string;
+	step_id: string;
 	task_id: string | null;
 	status: string;
 	input_context: string | null;
@@ -777,7 +779,7 @@ export const workflows = {
 	create: (data: { name: string; description?: string; yaml_content: string }) =>
 		request<Workflow>('/api/workflows', { method: 'POST', body: JSON.stringify(data) }),
 	get: (id: string) => request<Workflow>(`/api/workflows/${id}`),
-	update: (id: string, data: { yaml_content: string; description?: string }) =>
+	update: (id: string, data: { name: string; yaml_content: string; description?: string }) =>
 		request<Workflow>(`/api/workflows/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),

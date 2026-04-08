@@ -1,139 +1,130 @@
 <script lang="ts">
-	import {
-		SvelteFlow,
-		Background,
-		BackgroundVariant,
-		Controls,
-		MiniMap,
-		useSvelteFlow,
-		type Node,
-		type Edge,
-		type Connection
-	} from '@xyflow/svelte';
-	import '@xyflow/svelte/dist/style.css';
-	import TaskNode from '$lib/components/flow/TaskNode.svelte';
-	import TriggerNode from '$lib/components/flow/TriggerNode.svelte';
-	import SinkNode from '$lib/components/flow/SinkNode.svelte';
-	import BranchNode from '$lib/components/flow/BranchNode.svelte';
 	import { workflows, agents, connectors } from '$lib/api';
 	import type { Workflow, WorkflowInstance, Agent, Connector } from '$lib/api';
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
 	import yaml from 'js-yaml';
+	import StepBlock from '$lib/components/blocks/StepBlock.svelte';
+	import WhenBlock from '$lib/components/blocks/WhenBlock.svelte';
+	import LoopBlock from '$lib/components/blocks/LoopBlock.svelte';
+	import SinkBlock from '$lib/components/blocks/SinkBlock.svelte';
+	import JumpBlock from '$lib/components/blocks/JumpBlock.svelte';
+	import TriggerBlock from '$lib/components/blocks/TriggerBlock.svelte';
+	import BlockConnector from '$lib/components/blocks/BlockConnector.svelte';
+	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
+	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
 
-	const nodeTypes = { task: TaskNode, trigger: TriggerNode, sink: SinkNode, router: BranchNode };
+	// --- Types ---
 
-	let nodes = $state.raw<Node[]>([]);
-	let edges = $state.raw<Edge[]>([]);
+	interface OutputSchema { type?: string; description?: string }
+	interface SinkCfg { connector: string; channel: string; template?: string }
+	interface WhenArmDef { match?: string; continue?: boolean; goto?: string }
+
+	interface Block {
+		id: string;
+		type: 'trigger' | 'step' | 'when' | 'loop' | 'sink' | 'jump';
+		label: string;
+		agent?: string; prompt?: string; procedure?: string;
+		outputs?: Record<string, OutputSchema>;
+		connector?: string; channel?: string; event?: string;
+		filter?: Record<string, unknown>;
+		sinks?: SinkCfg[];
+		switchVar?: string;
+		arms?: WhenArmDef[];
+		overVar?: string; asVar?: string;
+		children?: Block[];
+		target?: string;
+		expanded: boolean;
+	}
+
+	interface FlowDef { color: string; blocks: Block[] }
+
+	// --- State ---
+
 	let workflow = $state<Workflow | null>(null);
-	let selectedNodeId = $state<string | null>(null);
-	let selectedEdgeId = $state<string | null>(null);
-	let showYaml = $state(false);
-	let yamlContent = $state('');
+	let workflowName = $state('');
 	let saving = $state(false);
 	let running = $state(false);
+	let showYaml = $state(false);
+	let yamlContent = $state('');
 	let agentList = $state<Agent[]>([]);
 	let connectorList = $state<Connector[]>([]);
-	let workflowName = $state('');
-	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
-	let dragType = $state<string | null>(null);
 	let instances = $state<WorkflowInstance[]>([]);
 	let showInstances = $state(false);
+	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
+	let compactView = $state(false);
 
-	let selectedNode = $derived(
-		selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) ?? null : null
-	);
-	let selectedEdge = $derived(
-		selectedEdgeId ? edges.find((e) => e.id === selectedEdgeId) ?? null : null
-	);
+	let flows = $state<Record<string, FlowDef>>({});
+	let currentFlow = $state('main');
+	let triggerConfig = $state<{ connector: string; channel: string; event: string; filter?: Record<string, unknown> } | null>(null);
+	let globalVars = $state<Record<string, unknown>>({});
 
-	// --- YAML ↔ Graph ---
+	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number; loopContext?: { asVar: string; overVar: string } } | null>(null);
 
-	interface WfDef {
+	let currentBlocks = $derived(flows[currentFlow]?.blocks ?? []);
+	let flowNames = $derived(Object.keys(flows));
+	let flowColors = $derived(Object.fromEntries(Object.entries(flows).map(([k, v]) => [k, v.color])));
+
+	// --- YAML ↔ Flows ---
+
+	interface YamlDef {
 		name?: string; description?: string; version?: number;
 		trigger?: { connector: string; channel: string; event: string; filter?: Record<string, unknown> };
-		nodes: { id: string; label?: string; type?: string; agent?: string; prompt?: string; procedure?: string; sinks?: { connector: string; channel: string; template?: string }[]; outputs?: string[]; position?: { x: number; y: number } }[];
-		edges: { from: string; to: string; condition?: string; label?: string }[];
+		variables?: Record<string, unknown>;
+		flows?: Record<string, { color?: string; steps?: any[] }>;
 	}
 
-	function yamlToGraph(yamlStr: string): { nodes: Node[]; edges: Edge[] } {
-		let def: WfDef;
-		try { def = yaml.load(yamlStr) as WfDef; } catch { return { nodes: [], edges: [] }; }
-		if (!def?.nodes) return { nodes: [], edges: [] };
+	function yamlToFlows(yamlStr: string): { flows: Record<string, FlowDef>; trigger: typeof triggerConfig; variables: Record<string, unknown> } {
+		let def: YamlDef;
+		try { def = yaml.load(yamlStr) as YamlDef; } catch { return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} }; }
+		if (!def?.flows) return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} };
 
-		const gn: Node[] = [];
-		const ge: Edge[] = [];
-
-		if (def.trigger) {
-			gn.push({ id: '__trigger__', type: 'trigger', position: { x: 50, y: 150 },
-				data: { connector: def.trigger.connector, channel: def.trigger.channel, event: def.trigger.event, filter: def.trigger.filter }
-			});
-			const targets = new Set(def.edges.map(e => e.to));
-			for (const node of def.nodes) {
-				if (!targets.has(node.id)) {
-					ge.push({ id: `__trigger__-${node.id}`, source: '__trigger__', target: node.id, type: 'smoothstep', animated: true, style: edgeStyle('trigger') });
-				}
-			}
+		const result: Record<string, FlowDef> = {};
+		for (const [name, flow] of Object.entries(def.flows)) {
+			result[name] = {
+				color: flow.color || (name === 'main' ? '#22c55e' : name === 'on_error' ? '#ef4444' : '#8b5cf6'),
+				blocks: (flow.steps || []).map(stepToBlock)
+			};
 		}
-
-		for (let i = 0; i < def.nodes.length; i++) {
-			const n = def.nodes[i];
-			const nodeType = n.type === 'sink' ? 'sink' : n.type === 'router' ? 'router' : 'task';
-			const outEdges = def.edges.filter(e => e.from === n.id);
-			// Router nodes use their defined outputs; task nodes infer from edges
-			const outputs = n.type === 'router' && n.outputs?.length
-				? n.outputs
-				: (outEdges.length > 1 ? outEdges.map(e => e.condition || 'completed') : []);
-			gn.push({ id: n.id, type: nodeType, position: n.position ?? { x: 300, y: i * 180 },
-				data: { label: n.label ?? n.id, agent: n.agent, prompt: n.prompt, procedure: n.procedure, sinks: n.sinks ?? [], outputs }
-			});
-		}
-
-		for (const e of def.edges) {
-			const cond = e.condition || 'completed';
-			const sourceOutEdges = def.edges.filter(ed => ed.from === e.from);
-			const sourceHandle = sourceOutEdges.length > 1 ? cond : undefined;
-			// Only show label when there are multiple edges from the same source, or a non-default condition
-			const condLabel = e.label || (sourceOutEdges.length > 1 || cond !== 'completed' ? cond : undefined);
-			ge.push({ id: `${e.from}-${e.to}-${cond}`, source: e.from, target: e.to, sourceHandle, type: 'smoothstep',
-				label: condLabel, style: edgeStyle(), data: { condition: cond }
-			});
-		}
-		return { nodes: gn, edges: ge };
+		return { flows: result, trigger: def.trigger || null, variables: def.variables || {} };
 	}
 
-	function edgeStyle(type?: string) {
-		if (type === 'trigger') return 'stroke: hsl(142, 71%, 45%); stroke-width: 2;';
-		return 'stroke: hsl(225, 25%, 35%); stroke-width: 2;';
+	function stepToBlock(s: any): Block {
+		const type = s.type || 'step';
+		const block: Block = { id: s.id, type, label: s.label || s.id, expanded: false };
+		if (type === 'step') { block.agent = s.agent; block.prompt = s.prompt; block.procedure = s.procedure; block.outputs = s.outputs; }
+		if (type === 'sink') { block.sinks = s.sinks; }
+		if (type === 'when') { block.switchVar = s.switch; block.arms = s.arms; }
+		if (type === 'loop') { block.overVar = s.over; block.asVar = s.as; block.children = (s.steps || s.body || []).map(stepToBlock); }
+		if (type === 'jump') { block.target = s.target; }
+		return block;
 	}
 
+	function flowsToYaml(): string {
+		const def: Record<string, unknown> = {
+			name: workflowName || 'workflow',
+			description: workflow?.description || '',
+			version: 1,
+		};
+		if (triggerConfig?.connector) def.trigger = triggerConfig;
+		if (Object.keys(globalVars).length > 0) def.variables = globalVars;
 
-	function graphToYaml(gn: Node[], ge: Edge[]): string {
-		const triggerNode = gn.find(n => n.type === 'trigger');
-		const regularNodes = gn.filter(n => n.type !== 'trigger');
-		const def: Record<string, unknown> = { name: workflowName || 'workflow', description: workflow?.description || '', version: workflow?.version ?? 1 };
-
-		if (triggerNode) {
-			const t: Record<string, unknown> = { connector: triggerNode.data.connector || '', channel: triggerNode.data.channel || '', event: triggerNode.data.event || '' };
-			if (triggerNode.data.filter && typeof triggerNode.data.filter === 'object' && Object.keys(triggerNode.data.filter as object).length > 0) t.filter = triggerNode.data.filter;
-			def.trigger = t;
+		const flowsOut: Record<string, unknown> = {};
+		for (const [name, flow] of Object.entries(flows)) {
+			flowsOut[name] = { color: flow.color, steps: flow.blocks.map(blockToStep) };
 		}
-
-		def.nodes = regularNodes.map(n => {
-			const node: Record<string, unknown> = { id: n.id, label: n.data.label || n.id, position: { x: Math.round(n.position.x), y: Math.round(n.position.y) } };
-			if (n.type === 'sink') { node.type = 'sink'; if ((n.data.sinks as any[])?.length) node.sinks = n.data.sinks; }
-			else if (n.type === 'router') { node.type = 'router'; if ((n.data.outputs as string[])?.length) node.outputs = n.data.outputs; }
-			else { if (n.data.agent) node.agent = n.data.agent; if (n.data.prompt) node.prompt = n.data.prompt; if (n.data.procedure) node.procedure = n.data.procedure; }
-			return node;
-		});
-
-		def.edges = ge.filter(e => e.source !== '__trigger__').map(e => {
-			const edge: Record<string, unknown> = { from: e.source, to: e.target, condition: e.data?.condition || e.sourceHandle || 'completed' };
-			if (e.label && e.label !== edge.condition) edge.label = e.label;
-			return edge;
-		});
-
+		def.flows = flowsOut;
 		return yaml.dump(def, { lineWidth: -1, noRefs: true, quotingType: '"' });
+	}
+
+	function blockToStep(b: Block): Record<string, unknown> {
+		const s: Record<string, unknown> = { id: b.id, type: b.type, label: b.label };
+		if (b.type === 'step') { if (b.agent) s.agent = b.agent; if (b.prompt) s.prompt = b.prompt; if (b.procedure) s.procedure = b.procedure; if (b.outputs && Object.keys(b.outputs).length) s.outputs = b.outputs; }
+		if (b.type === 'sink' && b.sinks?.length) s.sinks = b.sinks;
+		if (b.type === 'when') { if (b.switchVar) s.switch = b.switchVar; if (b.arms?.length) s.arms = b.arms; }
+		if (b.type === 'loop') { if (b.overVar) s.over = b.overVar; if (b.asVar) s.as = b.asVar; if (b.children?.length) s.steps = b.children.map(blockToStep); }
+		if (b.type === 'jump' && b.target) s.target = b.target;
+		return s;
 	}
 
 	// --- Data loading ---
@@ -145,8 +136,9 @@
 				workflows.get(id), agents.list().catch(() => []), connectors.list().catch(() => [])
 			]);
 			workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = al; connectorList = cl;
-			const graph = yamlToGraph(wf.yaml_content);
-			nodes = graph.nodes; edges = graph.edges;
+			const parsed = yamlToFlows(wf.yaml_content);
+			flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
+			if (!flows.main) { flows = { main: { color: '#22c55e', blocks: [] }, ...flows }; }
 			instances = await workflows.instances(id).catch(() => []);
 		} catch (e) { showToast(`Failed to load: ${e}`, 'error'); }
 	});
@@ -161,9 +153,9 @@
 		if (!workflow) return;
 		saving = true;
 		try {
-			const updatedYaml = graphToYaml(nodes, edges);
-			yamlContent = updatedYaml;
-			await workflows.update(workflow.id, { yaml_content: updatedYaml, description: workflow.description ?? undefined });
+			const y = flowsToYaml();
+			yamlContent = y;
+			await workflows.update(workflow.id, { name: workflowName, yaml_content: y, description: workflow.description ?? undefined });
 			workflow = await workflows.get(workflow.id);
 			showToast('Saved', 'success');
 		} catch (e) { showToast(`Save failed: ${e}`, 'error'); }
@@ -180,258 +172,277 @@
 		if (!workflow) return;
 		running = true;
 		try {
-			const inst = await workflows.run(workflow.id);
-			showToast(`Instance started: ${inst.id.slice(0, 8)}...`, 'success');
-			showInstances = true;
-			await loadInstances();
+			await workflows.run(workflow.id);
+			showToast('Instance started', 'success');
+			showInstances = true; await loadInstances();
 		} catch (e) { showToast(`Run failed: ${e}`, 'error'); }
 		running = false;
 	}
 
 	async function loadInstances() {
 		if (!workflow) return;
-		try { instances = await workflows.instances(workflow.id); }
-		catch { instances = []; }
+		try { instances = await workflows.instances(workflow.id); } catch { instances = []; }
 	}
 
 	function applyYaml() {
-		const graph = yamlToGraph(yamlContent);
-		nodes = graph.nodes; edges = graph.edges; showYaml = false;
+		const parsed = yamlToFlows(yamlContent);
+		flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
+		showYaml = false;
 	}
 
-	// --- Node/Edge events ---
+	// --- Flow management ---
 
-	function handleNodeClick({ node }: { node: Node }) { selectedNodeId = node.id; selectedEdgeId = null; }
-	function handleEdgeClick({ edge }: { edge: Edge }) { selectedEdgeId = edge.id; selectedNodeId = null; }
-	function handlePaneClick() { selectedNodeId = null; selectedEdgeId = null; }
+	function addFlow() {
+		const name = prompt('Sub-workflow name (e.g. on_rejected):');
+		if (!name || flows[name]) return;
+		flows = { ...flows, [name]: { color: '#8b5cf6', blocks: [] } };
+		currentFlow = name;
+	}
 
-	/** When an existing node is dropped after dragging, check if it landed on an edge. */
-	function handleNodeDragStop({ targetNode }: { targetNode: Node | null; nodes: Node[]; event: MouseEvent | TouchEvent }) {
-		if (!targetNode) return;
-		// Only insert if the node has no connections (both incoming and outgoing)
-		const hasConnections = edges.some(e => e.source === targetNode.id || e.target === targetNode.id);
-		if (!hasConnections) {
-			insertNodeOnNearestEdge(targetNode.id);
+	function removeFlow(name: string) {
+		if (name === 'main') return;
+		const { [name]: _, ...rest } = flows;
+		flows = rest;
+		if (currentFlow === name) currentFlow = 'main';
+	}
+
+	// --- Block manipulation ---
+
+	function slugify(label: string): string {
+		return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || `step_${Date.now().toString(36)}`;
+	}
+
+	function nextStepNumber(): number {
+		let count = 0;
+		for (const flow of Object.values(flows)) {
+			count += flow.blocks.filter(b => b.type === 'step').length;
 		}
+		return count + 1;
 	}
 
-	function handleConnect(connection: Connection) {
-		const id = `${connection.source}-${connection.target}-${Date.now()}`;
-		edges = [...edges, {
-			id, source: connection.source, target: connection.target,
-			sourceHandle: connection.sourceHandle ?? undefined, targetHandle: connection.targetHandle ?? undefined,
-			type: 'smoothstep', style: edgeStyle(), data: { condition: 'completed' }
-		}];
-		selectedEdgeId = id; selectedNodeId = null;
-	}
-
-	// --- Drag-and-drop from sidebar ---
-
-	let canvasEl: HTMLDivElement;
-	let dragging = $state(false);
-
-	function onDragStart(event: DragEvent, type: string) {
-		if (!event.dataTransfer) return;
-		event.dataTransfer.setData('text/plain', type);
-		event.dataTransfer.effectAllowed = 'move';
-		dragType = type;
-		// Show overlay on next tick so it doesn't interfere with drag start
-		requestAnimationFrame(() => { dragging = true; });
-	}
-
-	function onDragEnd() {
-		dragging = false;
-		dragType = null;
-	}
-
-	function onOverlayDragOver(event: DragEvent) {
-		event.preventDefault();
-		event.stopPropagation();
-		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
-	}
-
-	function onOverlayDragEnter(event: DragEvent) {
-		event.preventDefault();
-		event.stopPropagation();
-	}
-
-	function onOverlayDragLeave() {
-		// Keep overlay visible — user might re-enter
-	}
-
-	function onOverlayDrop(event: DragEvent) {
-		event.preventDefault();
-		event.stopPropagation();
-		dragging = false;
-
-		const type = event.dataTransfer?.getData('text/plain') || dragType;
-		if (!type) return;
-		dragType = null;
-
-		// Convert screen position to flow position using the canvas container
-		const bounds = canvasEl.getBoundingClientRect();
-		const x = event.clientX - bounds.left - 100;
-		const y = event.clientY - bounds.top - 30;
-
-		const id = `${type}_${Date.now().toString(36)}`;
-		let newNode: Node;
-
-		if (type === 'trigger') {
-			if (nodes.some(n => n.type === 'trigger')) { showToast('Only one trigger allowed', 'error'); return; }
-			newNode = { id: '__trigger__', type: 'trigger', position: { x, y }, data: { connector: '', channel: '', event: '' } };
-		} else if (type === 'sink') {
-			newNode = { id, type: 'sink', position: { x, y }, data: { label: 'Send Notification', sinks: [{ connector: '', channel: '', template: '' }] } };
-		} else if (type === 'branch') {
-			newNode = { id, type: 'router', position: { x, y }, data: { label: 'Branch', outputs: ['approved', 'rejected'] } };
-		} else {
-			newNode = { id, type: 'task', position: { x, y }, data: { label: 'New Task', agent: '', prompt: '' } };
+	function addBlock(type: Block['type'], afterIdx?: number) {
+		let label: string;
+		let id: string;
+		switch (type) {
+			case 'step': label = `Step ${nextStepNumber()}`; break;
+			case 'when': label = 'Condition'; break;
+			case 'loop': label = 'For Each'; break;
+			case 'sink': label = 'Notify'; break;
+			case 'jump': label = 'Jump'; break;
+			default: return;
 		}
-		nodes = [...nodes, newNode];
-		selectedNodeId = newNode.id; selectedEdgeId = null;
+		id = slugify(label);
+		// Ensure unique ID
+		const allIds = new Set(Object.values(flows).flatMap(f => f.blocks.map(b => b.id)));
+		while (allIds.has(id)) { id = `${slugify(label)}_${Date.now().toString(36)}`; }
 
-		// Try to insert into an edge if dropped near one
-		if (type !== 'trigger') {
-			insertNodeOnNearestEdge(newNode.id);
+		let block: Block;
+		switch (type) {
+			case 'step': block = { id, type, label, agent: '', prompt: '', expanded: true }; break;
+			case 'when': block = { id, type, label, switchVar: '', expanded: true,
+				arms: [{ match: 'approved', continue: true }, { match: 'rejected', goto: 'step ' }] }; break;
+			case 'loop': block = { id, type, label, overVar: '', asVar: 'item', children: [], expanded: true }; break;
+			case 'sink': block = { id, type, label, sinks: [{ connector: '', channel: '', template: '' }], expanded: true }; break;
+			case 'jump': block = { id, type, label, target: '', expanded: true }; break;
+			default: return;
 		}
+		const blocks = [...(flows[currentFlow]?.blocks ?? [])];
+		const idx = afterIdx !== undefined ? afterIdx + 1 : blocks.length;
+		blocks.splice(idx, 0, block);
+		flows = { ...flows, [currentFlow]: { ...flows[currentFlow], blocks } };
 	}
 
-	/** Get the center point of a node. */
-	function nodeCenter(n: Node): { x: number; y: number } {
-		const w = 220; // all nodes are 220px wide
-		const h = n.measured?.height ?? 100;
-		return { x: n.position.x + w / 2, y: n.position.y + h / 2 };
+	function addTrigger() {
+		if (triggerConfig) { showToast('Trigger already exists', 'error'); return; }
+		triggerConfig = { connector: '', channel: '', event: '' };
 	}
 
-	/** Distance from point P to line segment AB. */
-	function pointToSegmentDist(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
-		const dx = bx - ax, dy = by - ay;
-		const lenSq = dx * dx + dy * dy;
-		if (lenSq === 0) return Math.hypot(px - ax, py - ay);
-		let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
-		t = Math.max(0, Math.min(1, t));
-		return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+	function removeTrigger() { triggerConfig = null; }
+
+	function updateBlock(flowName: string, idx: number, updates: Record<string, unknown>) {
+		const blocks = [...(flows[flowName]?.blocks ?? [])];
+		blocks[idx] = { ...blocks[idx], ...updates } as Block;
+		flows = { ...flows, [flowName]: { ...flows[flowName], blocks } };
 	}
 
-	/** If the node is near an edge line, split that edge and insert the node. */
-	function insertNodeOnNearestEdge(nodeId: string): boolean {
-		const THRESHOLD = 80;
-		const theNode = nodes.find(n => n.id === nodeId);
-		if (!theNode) return false;
+	function removeBlock(flowName: string, idx: number) {
+		const blocks = (flows[flowName]?.blocks ?? []).filter((_, i) => i !== idx);
+		flows = { ...flows, [flowName]: { ...flows[flowName], blocks } };
+	}
 
-		// Don't insert if node already has connections
-		if (edges.some(e => e.source === nodeId || e.target === nodeId)) return false;
+	function moveBlock(flowName: string, fromIdx: number, toIdx: number) {
+		if (fromIdx === toIdx) return;
+		const blocks = [...(flows[flowName]?.blocks ?? [])];
+		const [item] = blocks.splice(fromIdx, 1);
+		blocks.splice(toIdx > fromIdx ? toIdx - 1 : toIdx, 0, item);
+		flows = { ...flows, [flowName]: { ...flows[flowName], blocks } };
+	}
 
-		const nc = nodeCenter(theNode);
+	// --- Step numbering ---
 
-		let bestEdge: Edge | null = null;
-		let bestDist = THRESHOLD;
+	function computeStepNumbers(blocks: Block[], prefix = ''): { id: string; number: string; label: string }[] {
+		const result: { id: string; number: string; label: string }[] = [];
+		let num = 1;
+		for (const b of blocks) {
+			if (b.type === 'trigger') continue;
+			const n = prefix ? `${prefix}.${String.fromCharCode(96 + num)}` : String(num).padStart(2, '0');
+			result.push({ id: b.id, number: n, label: b.label });
+			if (b.type === 'loop' && b.children) {
+				result.push(...computeStepNumbers(b.children, n));
+			}
+			num++;
+		}
+		return result;
+	}
 
-		for (const edge of edges) {
-			const src = nodes.find(n => n.id === edge.source);
-			const tgt = nodes.find(n => n.id === edge.target);
-			if (!src || !tgt) continue;
+	let stepNumbers = $derived(computeStepNumbers(currentBlocks));
+	function stepNum(id: string): string { return stepNumbers.find(s => s.id === id)?.number ?? ''; }
 
-			const sc = nodeCenter(src);
-			const tc = nodeCenter(tgt);
-			const dist = pointToSegmentDist(nc.x, nc.y, sc.x, sc.y, tc.x, tc.y);
-			if (dist < bestDist) {
-				bestDist = dist;
-				bestEdge = edge;
+	// All step IDs across flows for when block goto targets
+	let allStepIds = $derived(
+		Object.entries(flows).flatMap(([, flow]) =>
+			computeStepNumbers(flow.blocks)
+		)
+	);
+
+	// --- Variables ---
+
+	function availableVariables(upToIdx: number, loopContext?: { asVar: string; overVar: string }): { name: string; type?: string; source?: string }[] {
+		const vars: { name: string; type?: string; source?: string }[] = [];
+		if (triggerConfig) vars.push({ name: 'trigger.payload', type: 'object', source: 'Trigger' });
+		for (const [k, v] of Object.entries(globalVars)) {
+			vars.push({ name: k, type: typeof v, source: 'Global' });
+		}
+		const blocks = flows[currentFlow]?.blocks ?? [];
+		for (let i = 0; i <= upToIdx && i < blocks.length; i++) {
+			const b = blocks[i];
+			if (b.outputs) {
+				for (const [name, schema] of Object.entries(b.outputs)) {
+					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
+				}
+			}
+			// Include loop iteration variable if this block is the loop we're inside
+			if (b.type === 'loop' && b.asVar && i === upToIdx) {
+				vars.push({ name: b.asVar, type: 'any', source: `Loop: ${b.label}` });
+			}
+		}
+		// Also add loop context if explicitly provided (for nested steps)
+		if (loopContext) {
+			// Don't duplicate if already added
+			if (!vars.some(v => v.name === loopContext.asVar)) {
+				vars.push({ name: loopContext.asVar, type: 'any', source: `Loop item (${loopContext.overVar})` });
+			}
+		}
+		return vars;
+	}
+
+	let popupRef = $state<{ handleKey: (e: KeyboardEvent) => boolean } | null>(null);
+
+	/** Global keydown handler for @ variable popup — works in any text input/textarea */
+	function handleGlobalKeydown(e: KeyboardEvent) {
+		const target = e.target as HTMLElement;
+		const isInput = target.tagName === 'TEXTAREA' || (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text');
+		if (!isInput) return;
+
+		// If popup is open, delegate keyboard events to it
+		if (variablePopup && popupRef) {
+			if (popupRef.handleKey(e)) return;
+			if (e.key.length === 1 && e.key !== '@') {
+				variablePopup = { ...variablePopup, filter: variablePopup.filter + e.key };
+				return;
+			}
+			if (e.key === 'Backspace') {
+				if (variablePopup.filter.length > 0) {
+					variablePopup = { ...variablePopup, filter: variablePopup.filter.slice(0, -1) };
+				} else {
+					variablePopup = null;
+				}
+				return;
 			}
 		}
 
-		if (!bestEdge) return false;
+		if (e.key === '@') {
+			const el = target as HTMLTextAreaElement | HTMLInputElement;
+			const rect = el.getBoundingClientRect();
+			const lineHeight = parseInt(getComputedStyle(el).lineHeight) || 16;
+			const text = el.value.slice(0, el.selectionStart ?? 0);
+			const lines = text.split('\n').length;
+			const caretY = rect.top + lines * lineHeight;
+			const caretX = rect.left + 12;
 
-		// Capture values before mutating
-		const srcId = bestEdge.source;
-		const tgtId = bestEdge.target;
-		const oldCondition = bestEdge.data?.condition || 'completed';
-		const oldSourceHandle = bestEdge.sourceHandle;
-		const edgeToRemove = bestEdge.id;
-		const now = Date.now();
+			// Determine block index and loop context from DOM ancestry
+			const blockEl = el.closest('[data-step-id]');
+			const loopEl = el.closest('[data-loop-id]');
+			let blockIdx = currentBlocks.length;
+			let loopContext: { asVar: string; overVar: string } | undefined;
 
-		// Remove ALL edges between source and target (not just by ID — handles
-		// cases where edge IDs changed due to reconnection)
-		const newEdgeId1 = `${srcId}-${nodeId}-${now}`;
-		const newEdgeId2 = `${nodeId}-${tgtId}-${now + 1}`;
-		edges = [
-			...edges.filter(e => !(e.source === srcId && e.target === tgtId)),
-			{
-				id: newEdgeId1,
-				source: srcId, target: nodeId,
-				sourceHandle: oldSourceHandle,
-				type: 'smoothstep', style: edgeStyle(),
-				data: { condition: oldCondition }
-			},
-			{
-				id: newEdgeId2,
-				source: nodeId, target: tgtId,
-				type: 'smoothstep', style: edgeStyle(),
-				data: { condition: 'completed' }
+			if (blockEl) {
+				const stepId = blockEl.getAttribute('data-step-id');
+				const idx = currentBlocks.findIndex(b => b.id === stepId);
+				if (idx >= 0) blockIdx = idx;
 			}
-		];
+			if (loopEl) {
+				const loopId = loopEl.getAttribute('data-loop-id');
+				const loopBlock = currentBlocks.find(b => b.id === loopId);
+				if (loopBlock) {
+					loopContext = { asVar: loopBlock.asVar || 'item', overVar: loopBlock.overVar || '' };
+					const loopIdx = currentBlocks.findIndex(b => b.id === loopId);
+					if (loopIdx >= 0) blockIdx = loopIdx;
+				}
+			}
 
-		// Snap the node to the source node's x for clean alignment
-		const srcNode = nodes.find(n => n.id === srcId);
-		if (srcNode) {
-			nodes = nodes.map(n => n.id !== nodeId ? n : { ...n, position: { ...n.position, x: srcNode!.position.x } });
-		}
-		return true;
-	}
-
-	// --- Edit helpers ---
-
-	function updateNodeData(nodeId: string, updates: Record<string, unknown>) {
-		nodes = nodes.map(n => n.id !== nodeId ? n : { ...n, data: { ...n.data, ...updates } });
-	}
-
-	function updateEdgeData(edgeId: string, updates: Partial<Edge>) {
-		edges = edges.map(e => {
-			if (e.id !== edgeId) return e;
-			const updated = { ...e, ...updates };
-			if (updates.data) updated.data = { ...e.data, ...updates.data };
-			return updated;
-		});
-	}
-
-	function updateSink(nodeId: string, idx: number, field: string, value: string) {
-		const node = nodes.find(n => n.id === nodeId); if (!node) return;
-		const sinks = [...((node.data.sinks as any[]) || [])];
-		sinks[idx] = { ...sinks[idx], [field]: value };
-		updateNodeData(nodeId, { sinks });
-	}
-	function addSinkEntry(nodeId: string) {
-		const node = nodes.find(n => n.id === nodeId); if (!node) return;
-		updateNodeData(nodeId, { sinks: [...((node.data.sinks as any[]) || []), { connector: '', channel: '', template: '' }] });
-	}
-	function removeSinkEntry(nodeId: string, idx: number) {
-		const node = nodes.find(n => n.id === nodeId); if (!node) return;
-		updateNodeData(nodeId, { sinks: ((node.data.sinks as any[]) || []).filter((_: any, i: number) => i !== idx) });
-	}
-
-	function deleteSelected() {
-		if (selectedEdgeId) {
-			edges = edges.filter(e => e.id !== selectedEdgeId);
-			selectedEdgeId = null;
-		} else if (selectedNodeId) {
-			nodes = nodes.filter(n => n.id !== selectedNodeId);
-			edges = edges.filter(e => e.source !== selectedNodeId && e.target !== selectedNodeId);
-			selectedNodeId = null;
+			variablePopup = { x: caretX, y: Math.min(caretY, rect.bottom), filter: '', target: el as HTMLTextAreaElement, blockIdx, loopContext };
 		}
 	}
 
-	function handleKeyDown(event: KeyboardEvent) {
-		if (event.key === 'Delete' || event.key === 'Backspace') {
-			const tag = (event.target as HTMLElement)?.tagName;
-			if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-			// Prevent WebKit from navigating back on Backspace
-			event.preventDefault();
-			deleteSelected();
-		}
+	function insertVariable(name: string) {
+		if (!variablePopup?.target) return;
+		const ta = variablePopup.target;
+		const pos = ta.selectionStart;
+		const before = ta.value.slice(0, pos);
+		const after = ta.value.slice(pos);
+		// The @ was already typed by the user — just insert the name
+		ta.value = `${before}${name}${after}`;
+		ta.selectionStart = ta.selectionEnd = pos + name.length;
+		ta.dispatchEvent(new Event('input', { bubbles: true }));
+		variablePopup = null;
+		ta.focus();
 	}
+
+	// --- Drag ---
+	let dragIdx = $state<number | null>(null);
+	let dragOverIdx = $state<number | null>(null);
+	let scrollContainerEl = $state<HTMLElement | null>(null);
+
+	// Compute jump arrows from when arms and jump blocks
+	const armColors = ['#22c55e', '#ef4444', '#f97316', '#8b5cf6', '#06b6d4', '#eab308'];
+
+	let jumpArrows = $derived((() => {
+		const arrows: { fromId: string; toId: string; color: string; label?: string; side: 'right' | 'left' }[] = [];
+		const blocks = currentBlocks;
+		for (const block of blocks) {
+			if (block.type === 'when' && block.arms) {
+				for (let ai = 0; ai < block.arms.length; ai++) {
+					const arm = block.arms[ai];
+					const color = armColors[ai % armColors.length];
+					if (arm.goto?.startsWith('step ')) {
+						const targetId = arm.goto.replace('step ', '');
+						arrows.push({ fromId: block.id, toId: targetId, color, label: arm.match || '', side: 'right' });
+					} else if (arm.goto?.startsWith('flow ')) {
+						const flowName = arm.goto.replace('flow ', '').split(' ')[0];
+						const fColor = flowColors[flowName] || color;
+						arrows.push({ fromId: block.id, toId: block.id, color: fColor, label: `→ ${flowName}`, side: 'right' });
+					}
+				}
+			}
+			if (block.type === 'jump' && block.target?.startsWith('step ')) {
+				const targetId = block.target.replace('step ', '');
+				arrows.push({ fromId: block.id, toId: targetId, color: '#818cf8', label: '', side: 'right' });
+			}
+		}
+		return arrows;
+	})());
 </script>
-
-<svelte:window onkeydown={handleKeyDown} />
 
 <div class="flex h-full flex-col overflow-hidden">
 	<!-- Toolbar -->
@@ -439,8 +450,9 @@
 		<a href="/workflows" class="text-muted-foreground hover:text-foreground" title="Back">
 			<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
 		</a>
+		<span class="text-xs text-muted-foreground/50">/</span>
 		<input type="text" bind:value={workflowName}
-			class="border-none bg-transparent text-sm font-semibold text-foreground focus:outline-none w-48" placeholder="Workflow name" />
+			class="border-none text-sm font-semibold text-foreground focus:outline-none w-48" style="background: transparent;" placeholder="Workflow name" />
 		<div class="flex-1"></div>
 
 		{#if workflow}
@@ -454,8 +466,10 @@
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showInstances ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'} flex items-center gap-1.5">
 			Runs{#if instances.length > 0}<span class="rounded-full bg-muted px-1.5 text-[10px]">{instances.length}</span>{/if}
 		</button>
-		<button onclick={() => { showYaml = !showYaml; if (showYaml) yamlContent = graphToYaml(nodes, edges); }}
+		<button onclick={() => { showYaml = !showYaml; if (showYaml) yamlContent = flowsToYaml(); }}
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showYaml ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">YAML</button>
+		<button onclick={() => (compactView = !compactView)}
+			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {compactView ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">{compactView ? 'Full' : 'Compact'}</button>
 		<button onclick={runWorkflow} disabled={running}
 			class="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 flex items-center gap-1.5">
 			<svg class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
@@ -465,369 +479,260 @@
 			class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving ? 'Saving...' : 'Save'}</button>
 	</div>
 
-	<!-- Main area -->
-	<div class="flex flex-1 overflow-hidden">
-		<!-- Left sidebar: Node palette -->
-		<div class="w-52 flex-shrink-0 border-r border-border bg-card overflow-y-auto">
-			<div class="px-3 pt-3 pb-2">
-				<div class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">Drag to add</div>
-			</div>
+	<!-- Sub-workflow tabs -->
+	<div class="flex items-center gap-1 border-b border-border bg-card/50 px-4 py-1.5 flex-shrink-0 overflow-x-auto">
+		{#each Object.entries(flows) as [name, flow]}
+			<button onclick={() => (currentFlow = name)}
+				class="flex items-center gap-1.5 rounded-md px-3 py-1 text-xs transition-colors {currentFlow === name ? 'bg-accent text-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-accent/50'}">
+				<!-- Color picker disguised as a dot -->
+				<label class="relative h-2.5 w-2.5 flex-shrink-0 cursor-pointer" onclick={(e) => e.stopPropagation()}>
+					<span class="absolute inset-0 rounded-full" style="background: {flow.color}"></span>
+					<input type="color" value={flow.color}
+						oninput={(e) => { flows = { ...flows, [name]: { ...flow, color: e.currentTarget.value } }; }}
+						class="absolute inset-0 opacity-0 w-full h-full cursor-pointer" />
+				</label>
+				<span>{name}</span>
+				<span class="text-[10px] text-muted-foreground/60">{flow.blocks.length}</span>
+				{#if name !== 'main'}
+					<button onclick={(e) => { e.stopPropagation(); if (confirm(`Delete flow "${name}"?`)) removeFlow(name); }}
+						class="ml-0.5 text-muted-foreground/30 hover:text-destructive">
+						<svg class="h-2.5 w-2.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+					</button>
+				{/if}
+			</button>
+		{/each}
+		<button onclick={addFlow} class="rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50" title="Add sub-workflow">+</button>
+	</div>
 
-			<div class="px-2 pb-3 space-y-1.5">
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'task')} ondragend={onDragEnd}
-					class="flex items-center gap-2.5 rounded-lg border border-border/50 bg-background px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-primary/40 transition-colors">
-					<div class="flex h-7 w-7 items-center justify-center rounded-full bg-[hsl(225,50%,25%)] text-[10px] font-bold text-[hsl(220,20%,92%)]">T</div>
-					<div>
-						<div class="text-xs font-medium text-foreground">Task</div>
-						<div class="text-[10px] text-muted-foreground">Agent performs work</div>
+	<!-- Main content -->
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="flex-1 overflow-y-auto relative" bind:this={scrollContainerEl} onkeydown={handleGlobalKeydown}>
+		{#if showYaml}
+			<div class="absolute inset-0 z-20 flex flex-col bg-background/95 backdrop-blur-sm">
+				<div class="flex items-center justify-between px-4 py-2 border-b border-border">
+					<span class="text-xs font-medium text-muted-foreground">YAML Editor</span>
+					<div class="flex gap-2">
+						<button onclick={applyYaml} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90">Apply</button>
+						<button onclick={() => (showYaml = false)} class="rounded-md border border-border px-3 py-1 text-xs hover:bg-accent">Close</button>
 					</div>
 				</div>
-
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'trigger')} ondragend={onDragEnd}
-					class="flex items-center gap-2.5 rounded-lg border border-emerald-800/30 bg-emerald-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-emerald-600/40 transition-colors">
-					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-600/20">
-						<svg class="h-3.5 w-3.5 text-emerald-400" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 10 10-12h-9l1-10z" /></svg>
-					</div>
-					<div>
-						<div class="text-xs font-medium text-emerald-300">Trigger</div>
-						<div class="text-[10px] text-muted-foreground">Start from event</div>
-					</div>
-				</div>
-
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'sink')} ondragend={onDragEnd}
-					class="flex items-center gap-2.5 rounded-lg border border-blue-800/30 bg-blue-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-blue-600/40 transition-colors">
-					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600/20">
-						<svg class="h-3.5 w-3.5 text-blue-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" /></svg>
-					</div>
-					<div>
-						<div class="text-xs font-medium text-blue-300">Sink</div>
-						<div class="text-[10px] text-muted-foreground">Send notification</div>
-					</div>
-				</div>
-
-				<div class="pt-2 pb-1">
-					<div class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Control Flow</div>
-				</div>
-
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div draggable="true" ondragstart={(e) => onDragStart(e, 'branch')} ondragend={onDragEnd}
-					class="flex items-center gap-2.5 rounded-lg border border-amber-800/30 bg-amber-950/20 px-3 py-2.5 cursor-grab active:cursor-grabbing hover:border-amber-600/40 transition-colors">
-					<div class="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-600/20">
-						<svg class="h-4 w-4 text-amber-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
-					</div>
-					<div>
-						<div class="text-xs font-medium text-amber-300">Branch</div>
-						<div class="text-[10px] text-muted-foreground">Route by condition</div>
-					</div>
-				</div>
-			</div>
-
-			{#if nodes.length > 0}
-				<div class="border-t border-border px-3 py-3">
-					<div class="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">Nodes ({nodes.length})</div>
-					<div class="space-y-0.5">
-						{#each nodes as n}
-							<button onclick={() => { selectedNodeId = n.id; selectedEdgeId = null; }}
-								class="w-full text-left rounded px-2 py-1 text-xs transition-colors truncate
-									{selectedNodeId === n.id ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-accent'}">
-								{n.data.label || n.id}
-							</button>
-						{/each}
-					</div>
-				</div>
-			{/if}
-		</div>
-
-		<!-- Canvas -->
-		<div class="flex-1 relative" bind:this={canvasEl}>
-			<!-- Drop overlay: sits above SvelteFlow during drag so WebKit drop events fire -->
-			{#if dragging}
-				<!-- svelte-ignore a11y_no_static_element_interactions -->
-				<div class="absolute inset-0 z-10"
-					ondragover={onOverlayDragOver}
-					ondragenter={onOverlayDragEnter}
-					ondragleave={onOverlayDragLeave}
-					ondrop={onOverlayDrop}></div>
-			{/if}
-			<SvelteFlow bind:nodes bind:edges {nodeTypes} fitView snapGrid={[15, 15]}
-				defaultEdgeOptions={{ type: 'smoothstep' }}
-				onnodeclick={handleNodeClick} onedgeclick={handleEdgeClick}
-				onpaneclick={handlePaneClick} onconnect={handleConnect}
-				onnodedragstop={handleNodeDragStop}>
-				<Background variant={BackgroundVariant.Dots} gap={20} size={1} />
-				<Controls position="bottom-left" />
-				<MiniMap position="bottom-right"
-					nodeColor={(node) => {
-						if (node.type === 'trigger') return 'hsl(142, 71%, 45%)';
-						if (node.type === 'sink') return 'hsl(217, 91%, 60%)';
-						if (node.type === 'router') return 'hsl(45, 93%, 47%)';
-						return 'hsl(225, 65%, 55%)';
-					}} />
-			</SvelteFlow>
-
-			<!-- YAML overlay -->
-			{#if showYaml}
-				<div class="absolute inset-0 z-20 flex flex-col bg-background/95 backdrop-blur-sm">
-					<div class="flex items-center justify-between px-4 py-2 border-b border-border">
-						<span class="text-xs font-medium text-muted-foreground">YAML Editor</span>
-						<div class="flex gap-2">
-							<button onclick={applyYaml} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90">Apply</button>
-							<button onclick={() => { yamlContent = graphToYaml(nodes, edges); }} class="rounded-md border border-border px-3 py-1 text-xs hover:bg-accent">Refresh from Canvas</button>
-							<button onclick={() => (showYaml = false)} class="rounded-md border border-border px-3 py-1 text-xs hover:bg-accent">Close</button>
-						</div>
-					</div>
-					<textarea bind:value={yamlContent}
-						class="flex-1 w-full bg-transparent p-4 font-mono text-xs text-foreground resize-none focus:outline-none" spellcheck="false"></textarea>
-				</div>
-			{/if}
-
-			<!-- Empty state hint -->
-			{#if nodes.length === 0}
-				<div class="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-					<div class="text-center text-muted-foreground/50 space-y-2">
-						<svg class="h-12 w-12 mx-auto" fill="none" stroke="currentColor" stroke-width="1" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
-						<div class="text-sm">Drag nodes from the sidebar to build your workflow</div>
-					</div>
-				</div>
-			{/if}
-		</div>
-
-		<!-- Right panel: Properties -->
-		{#if selectedNode || selectedEdge}
-			<div class="w-72 flex-shrink-0 border-l border-border bg-card overflow-y-auto">
-				<div class="flex items-center justify-between border-b border-border px-4 py-3">
-					<h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-						{#if selectedNode}
-							{selectedNode.type === 'trigger' ? 'Trigger' : selectedNode.type === 'sink' ? 'Sink' : selectedNode.type === 'router' ? 'Branch' : 'Task'} Properties
-						{:else}
-							Edge Properties
-						{/if}
-					</h3>
-					<div class="flex items-center gap-1">
-						<button onclick={deleteSelected} class="rounded p-1 text-muted-foreground hover:text-destructive hover:bg-destructive/10" title="Delete">
-							<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0" /></svg>
-						</button>
-						<button onclick={() => { selectedNodeId = null; selectedEdgeId = null; }} class="rounded p-1 text-muted-foreground hover:text-foreground" title="Close">
-							<svg class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-						</button>
-					</div>
-				</div>
-
-				<div class="p-4 space-y-4">
-					{#if selectedEdge}
-						<!-- Edge properties -->
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Condition</label>
-							<select value={selectedEdge.data?.condition || 'completed'}
-								onchange={(e) => updateEdgeData(selectedEdge!.id, { data: { condition: e.currentTarget.value }, label: e.currentTarget.value !== 'completed' ? e.currentTarget.value : undefined })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring">
-								<option value="completed">completed</option>
-								<option value="failed">failed</option>
-								<option value="default">default (always)</option>
-							</select>
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Custom Condition</label>
-							<input type="text" value={selectedEdge.data?.condition || ''}
-								oninput={(e) => updateEdgeData(selectedEdge!.id, { data: { condition: e.currentTarget.value }, label: e.currentTarget.value !== 'completed' ? e.currentTarget.value : undefined })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-ring"
-								placeholder='output.verdict == "pass"' />
-							<div class="mt-1.5 text-[10px] text-muted-foreground/70 space-y-0.5">
-								<div><code class="bg-muted px-1 rounded">completed</code> — task finished</div>
-								<div><code class="bg-muted px-1 rounded">failed</code> — task failed</div>
-								<div><code class="bg-muted px-1 rounded">output.field == "val"</code></div>
-								<div><code class="bg-muted px-1 rounded">output contains "text"</code></div>
-								<div><code class="bg-muted px-1 rounded">default</code> — fallback</div>
-							</div>
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Label</label>
-							<input type="text" value={selectedEdge.label ?? ''}
-								oninput={(e) => updateEdgeData(selectedEdge!.id, { label: e.currentTarget.value || undefined })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-								placeholder="Edge label (optional)" />
-						</div>
-						<div class="text-[10px] text-muted-foreground">
-							{edges.find(e => e.id === selectedEdgeId)?.source} &rarr; {edges.find(e => e.id === selectedEdgeId)?.target}
-						</div>
-
-					{:else if selectedNode?.type === 'task'}
-						<!-- Task node -->
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Label</label>
-							<input type="text" value={selectedNode.data.label || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { label: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Agent</label>
-							<select value={selectedNode.data.agent || ''}
-								onchange={(e) => updateNodeData(selectedNode!.id, { agent: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring">
-								<option value="">Select agent...</option>
-								{#each agentList as agent}
-									<option value={agent.name}>{agent.config?.display_name || agent.name}</option>
-								{/each}
-							</select>
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Prompt</label>
-							<textarea value={(selectedNode.data.prompt as string) || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { prompt: e.currentTarget.value })}
-								rows="6" class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-2 focus:ring-ring"
-								placeholder={'What should this agent do?\n\nUse {{trigger.payload.field}} for trigger data\nUse {{nodes.step1.output}} for previous output'}></textarea>
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Procedure (optional)</label>
-							<input type="text" value={selectedNode.data.procedure || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { procedure: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" placeholder="procedure-name" />
-						</div>
-
-					{:else if selectedNode?.type === 'sink'}
-						<!-- Sink node -->
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Label</label>
-							<input type="text" value={selectedNode.data.label || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { label: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
-						</div>
-						<div class="space-y-3">
-							<div class="flex items-center justify-between">
-								<label class="text-[10px] font-medium text-muted-foreground">Sinks</label>
-								<button onclick={() => addSinkEntry(selectedNode!.id)} class="rounded px-1.5 py-0.5 text-[10px] text-primary hover:bg-primary/10">+ Add</button>
-							</div>
-							{#each ((selectedNode.data.sinks || []) as any[]) as sink, i}
-								<div class="rounded-md border border-border p-2.5 space-y-2 relative">
-									<button onclick={() => removeSinkEntry(selectedNode!.id, i)} class="absolute top-1.5 right-1.5 text-muted-foreground hover:text-destructive text-xs">x</button>
-									<div>
-										<label class="block text-[10px] text-muted-foreground mb-0.5">Connector</label>
-										<select value={sink.connector} onchange={(e) => updateSink(selectedNode!.id, i, 'connector', e.currentTarget.value)}
-											class="w-full rounded border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring">
-											<option value="">Select...</option>
-											{#each connectorList as c}<option value={c.name}>{c.name} ({c.connector_type})</option>{/each}
-										</select>
-									</div>
-									<div>
-										<label class="block text-[10px] text-muted-foreground mb-0.5">Channel</label>
-										<input type="text" value={sink.channel} oninput={(e) => updateSink(selectedNode!.id, i, 'channel', e.currentTarget.value)}
-											class="w-full rounded border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring" placeholder="channel-name" />
-									</div>
-									<div>
-										<label class="block text-[10px] text-muted-foreground mb-0.5">Template</label>
-										<textarea value={sink.template || ''} oninput={(e) => updateSink(selectedNode!.id, i, 'template', e.currentTarget.value)}
-											rows="2" class="w-full rounded border border-input bg-background px-2 py-1 text-xs font-mono resize-none focus:outline-none focus:ring-1 focus:ring-ring" placeholder="Message template..."></textarea>
-									</div>
-								</div>
-							{/each}
-						</div>
-
-					{:else if selectedNode?.type === 'router'}
-						<!-- Branch/router node -->
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Label</label>
-							<input type="text" value={selectedNode.data.label || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { label: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" />
-						</div>
-
-						<div>
-							<div class="flex items-center justify-between mb-1">
-								<label class="text-[10px] font-medium text-muted-foreground">Outputs</label>
-								<button onclick={() => {
-									const outs = [...((selectedNode!.data.outputs as string[]) || []), `output_${Date.now().toString(36)}`];
-									updateNodeData(selectedNode!.id, { outputs: outs });
-								}} class="rounded px-1.5 py-0.5 text-[10px] text-primary hover:bg-primary/10">+ Add</button>
-							</div>
-							<div class="space-y-1.5">
-								{#each ((selectedNode.data.outputs || []) as string[]) as output, i}
-									<div class="flex items-center gap-1.5">
-										<span class="text-amber-400 text-xs">→</span>
-										<input type="text" value={output}
-											oninput={(e) => {
-												const outs = [...((selectedNode!.data.outputs as string[]) || [])];
-												outs[i] = e.currentTarget.value;
-												updateNodeData(selectedNode!.id, { outputs: outs });
-											}}
-											class="flex-1 rounded border border-input bg-background px-2 py-1 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"
-											placeholder="condition name" />
-										{#if ((selectedNode.data.outputs as string[]) || []).length > 2}
-											<button onclick={() => {
-												const outs = ((selectedNode!.data.outputs as string[]) || []).filter((_, idx) => idx !== i);
-												updateNodeData(selectedNode!.id, { outputs: outs });
-											}} class="text-muted-foreground hover:text-destructive text-xs px-1">x</button>
-										{/if}
-									</div>
-								{/each}
-							</div>
-							<p class="mt-2 text-[10px] text-muted-foreground/70">
-								Each output becomes a handle. Connect edges from each handle to different target nodes.
-								The edge condition determines which branch is taken.
-							</p>
-						</div>
-
-						<div class="rounded-lg border border-amber-800/30 bg-amber-950/20 p-3 space-y-1.5">
-							<div class="text-[10px] font-medium text-amber-300">How branching works</div>
-							<p class="text-[10px] text-muted-foreground leading-relaxed">
-								When the previous task completes, its output is checked against each outgoing edge condition.
-								No agent needed — routing is instant.
-							</p>
-							<p class="text-[10px] text-muted-foreground leading-relaxed">
-								Click an edge to set its condition, e.g.
-								<code class="bg-muted px-1 rounded">output.verdict == "approve"</code>
-							</p>
-						</div>
-
-					{:else if selectedNode?.type === 'trigger'}
-						<!-- Trigger node -->
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Connector</label>
-							<select value={selectedNode.data.connector || ''}
-								onchange={(e) => updateNodeData(selectedNode!.id, { connector: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring">
-								<option value="">Select...</option>
-								{#each connectorList as c}<option value={c.name}>{c.name} ({c.connector_type})</option>{/each}
-								<option value="webhook">webhook</option>
-								<option value="jira">jira</option>
-								<option value="github">github</option>
-								<option value="telegram">telegram</option>
-								<option value="file_watcher">file_watcher</option>
-							</select>
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Channel</label>
-							<input type="text" value={selectedNode.data.channel || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { channel: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" placeholder="channel-name" />
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Event</label>
-							<input type="text" value={selectedNode.data.event || ''}
-								oninput={(e) => updateNodeData(selectedNode!.id, { event: e.currentTarget.value })}
-								class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring" placeholder="e.g. issue_created" />
-						</div>
-						<div>
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Filter (JSON)</label>
-							<textarea value={selectedNode.data.filter ? JSON.stringify(selectedNode.data.filter, null, 2) : ''}
-								oninput={(e) => { try { updateNodeData(selectedNode!.id, { filter: JSON.parse(e.currentTarget.value || '{}') }); } catch {} }}
-								rows="3" class="w-full rounded-md border border-input bg-background px-2.5 py-1.5 text-xs font-mono resize-none focus:outline-none focus:ring-2 focus:ring-ring"
-								placeholder={'{"type": "Story"}'}></textarea>
-						</div>
-					{/if}
-
-					<!-- Node ID -->
-					{#if selectedNode}
-						<div class="pt-2 border-t border-border">
-							<label class="block text-[10px] font-medium text-muted-foreground mb-1">Node ID</label>
-							<div class="rounded-md bg-muted px-2.5 py-1.5 text-xs font-mono text-muted-foreground">{selectedNode.id}</div>
-						</div>
-					{/if}
-				</div>
+				<textarea bind:value={yamlContent} class="flex-1 w-full bg-transparent p-4 font-mono text-xs text-foreground resize-none focus:outline-none" spellcheck="false"></textarea>
 			</div>
 		{/if}
+
+		<!-- Column header -->
+		<div class="max-w-3xl mx-auto px-4">
+			<div class="flex items-center text-[10px] font-medium text-muted-foreground/50 uppercase tracking-wider pt-3 pb-1 px-1">
+				<span class="w-10">Line</span>
+				<span class="flex-1">Block</span>
+			</div>
+		</div>
+
+		<!-- Block list -->
+		<div class="max-w-3xl mx-auto px-4 pb-6">
+			<!-- Trigger (shown in main flow only) -->
+			{#if currentFlow === 'main'}
+				{#if triggerConfig}
+					<div class="flex items-start gap-0">
+						<div class="w-10 pt-2.5 text-right pr-3 text-xs font-mono text-muted-foreground/40">01</div>
+						<div class="flex-1">
+							<TriggerBlock
+								connector={triggerConfig.connector} channel={triggerConfig.channel} event={triggerConfig.event}
+								expanded={!compactView} {connectorList}
+								onupdate={(u) => { triggerConfig = { ...triggerConfig!, ...u } as typeof triggerConfig; }}
+								ontoggle={() => {}}
+							/>
+						</div>
+						<button onclick={removeTrigger} class="mt-2.5 ml-1 text-muted-foreground/20 hover:text-destructive">
+							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+						</button>
+					</div>
+					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
+				{:else}
+					<div class="flex items-center gap-0 mb-2">
+						<div class="w-10"></div>
+						<button onclick={addTrigger}
+							class="rounded-lg border border-dashed border-emerald-600/30 hover:border-emerald-500/50 bg-emerald-950/10 hover:bg-emerald-950/20 px-4 py-2 text-xs text-emerald-400/60 hover:text-emerald-300 transition-all flex items-center gap-2">
+							<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24"><path d="M13 2L3 14h9l-1 10 10-12h-9l1-10z" /></svg>
+							Add Trigger
+						</button>
+					</div>
+				{/if}
+			{/if}
+
+			<!-- Steps -->
+			{#each currentBlocks as block, idx (block.id)}
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div class="flex items-start gap-0" data-step-id={block.id}
+					draggable="true"
+					ondragstart={(e) => { e.dataTransfer?.setData('text/plain', String(idx)); dragIdx = idx; }}
+					ondragover={(e) => { e.preventDefault(); dragOverIdx = idx; }}
+					ondragleave={() => { if (dragOverIdx === idx) dragOverIdx = null; }}
+					ondrop={(e) => { e.preventDefault(); dragOverIdx = null; const from = parseInt(e.dataTransfer?.getData('text/plain') || ''); if (!isNaN(from)) moveBlock(currentFlow, from, idx); }}
+					ondragend={() => { dragIdx = null; dragOverIdx = null; }}
+				>
+					<!-- Line number -->
+					<div class="w-10 pt-2.5 text-right pr-3 text-xs font-mono text-muted-foreground/40 select-none cursor-grab active:cursor-grabbing">
+						{stepNum(block.id)}
+					</div>
+
+					<!-- Block -->
+					<div class="flex-1 {dragOverIdx === idx ? 'ring-2 ring-primary/30 rounded-lg' : ''}">
+						{#if block.type === 'step'}
+							<StepBlock
+								label={block.label} agent={block.agent || ''} prompt={block.prompt || ''} procedure={block.procedure || ''}
+								outputs={block.outputs || {}}
+								expanded={block.expanded} compact={compactView}
+								{agentList}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+								/>
+						{:else if block.type === 'when'}
+							<WhenBlock
+								label={block.label} switchVar={block.switchVar || ''}
+								arms={block.arms || []}
+								{flowNames} {flowColors}
+								stepIds={allStepIds}
+								expanded={block.expanded} compact={compactView}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
+						{:else if block.type === 'loop'}
+							<div data-loop-id={block.id}>
+							<LoopBlock
+								label={block.label} overVar={block.overVar || ''} asVar={block.asVar || 'item'}
+								expanded={block.expanded} compact={compactView}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							>
+								{#snippet children()}
+									{#each block.children || [] as child, ci (child.id)}
+										{@const childUpdate = (u: Record<string, unknown>) => {
+													const children = [...(block.children || [])];
+													children[ci] = { ...children[ci], ...u } as Block;
+													updateBlock(currentFlow, idx, { children });
+												}}
+												{@const childToggle = () => {
+													const children = [...(block.children || [])];
+													children[ci] = { ...children[ci], expanded: !children[ci].expanded };
+													updateBlock(currentFlow, idx, { children });
+												}}
+												{@const childRemove = () => {
+													updateBlock(currentFlow, idx, { children: (block.children || []).filter((_: Block, i: number) => i !== ci) });
+												}}
+											<div class="flex items-start gap-0">
+												<div class="w-8 pt-2 text-right pr-2 text-[10px] font-mono text-muted-foreground/30">
+													{stepNum(block.id)}.{String.fromCharCode(97 + ci)}
+												</div>
+											<div class="flex-1">
+												{#if child.type === 'step'}
+													<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} outputs={child.outputs || {}}
+														expanded={child.expanded} compact={compactView} {agentList}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+													/>
+												{:else if child.type === 'when'}
+													<WhenBlock label={child.label} switchVar={child.switchVar || ''} arms={child.arms || []}
+														{flowNames} {flowColors} stepIds={allStepIds}
+														expanded={child.expanded} compact={compactView}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+													/>
+												{:else if child.type === 'sink'}
+													<SinkBlock label={child.label} sinks={child.sinks || []}
+														expanded={child.expanded} compact={compactView} {connectorList}
+														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
+													/>
+												{/if}
+											</div>
+										</div>
+										{#if ci < (block.children?.length ?? 0) - 1}
+											<div class="flex"><div class="w-8"></div><BlockConnector /></div>
+										{/if}
+									{/each}
+									<!-- Add step inside loop -->
+									<div class="flex items-center gap-0 mt-2">
+										<div class="w-8"></div>
+										<button onclick={() => {
+											const n = (block.children?.length ?? 0) + 1;
+											const label = `Step ${nextStepNumber()}`;
+											const id = slugify(label) + '_' + Date.now().toString(36);
+											const children = [...(block.children || []), { id, type: 'step' as const, label, agent: '', prompt: '', expanded: true }];
+											updateBlock(currentFlow, idx, { children });
+										}} class="rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-border transition-colors">
+											+ Add Step
+										</button>
+									</div>
+								{/snippet}
+							</LoopBlock>
+							</div>
+						{:else if block.type === 'sink'}
+							<SinkBlock
+								label={block.label} sinks={block.sinks || []}
+								expanded={block.expanded} compact={compactView}
+								{connectorList}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
+						{:else if block.type === 'jump'}
+							<JumpBlock
+								label={block.label} target={block.target || ''}
+								{flowNames} {flowColors} stepIds={allStepIds}
+								expanded={block.expanded} compact={compactView}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
+						{/if}
+					</div>
+				</div>
+
+				<!-- Connector between blocks -->
+				{#if idx < currentBlocks.length - 1}
+					<div class="flex"><div class="w-10"></div><BlockConnector /></div>
+				{/if}
+			{/each}
+
+			<!-- Add block buttons -->
+			<div class="flex"><div class="w-10"></div>
+				{#if currentBlocks.length > 0}<BlockConnector />{/if}
+			</div>
+			<div class="flex items-center gap-0">
+				<div class="w-10"></div>
+				<div class="flex items-center gap-2 py-1">
+					<button onclick={() => addBlock('step')}
+						class="rounded-lg border border-dashed border-border hover:border-blue-500/50 hover:bg-blue-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-blue-300 transition-all flex items-center gap-1.5">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
+						Step
+					</button>
+					<button onclick={() => addBlock('when')}
+						class="rounded-lg border border-dashed border-border hover:border-amber-500/50 hover:bg-amber-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-amber-300 transition-all flex items-center gap-1.5">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
+						When
+					</button>
+					<button onclick={() => addBlock('loop')}
+						class="rounded-lg border border-dashed border-border hover:border-red-500/50 hover:bg-red-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-red-300 transition-all flex items-center gap-1.5">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182" /></svg>
+						Loop
+					</button>
+					<button onclick={() => addBlock('sink')}
+						class="rounded-lg border border-dashed border-border hover:border-purple-500/50 hover:bg-purple-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-purple-300 transition-all flex items-center gap-1.5">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" /></svg>
+						Notify
+					</button>
+					<button onclick={() => addBlock('jump')}
+						class="rounded-lg border border-dashed border-border hover:border-indigo-500/50 hover:bg-indigo-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-indigo-300 transition-all flex items-center gap-1.5">
+						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" /></svg>
+						Jump
+					</button>
+				</div>
+			</div>
+		</div>
+
+		<!-- Jump arrows overlay -->
+		<JumpArrows arrows={jumpArrows} containerEl={scrollContainerEl} />
 	</div>
 
 	<!-- Instance tracking panel -->
@@ -843,14 +748,15 @@
 				</div>
 			</div>
 			{#if instances.length === 0}
-				<div class="px-4 py-3 text-xs text-muted-foreground">No runs yet. Click "Run" to start one.</div>
+				<div class="px-4 py-3 text-xs text-muted-foreground">No runs yet.</div>
 			{:else}
 				<table class="w-full text-xs">
 					<thead>
 						<tr class="text-[10px] text-muted-foreground border-b border-border/30">
 							<th class="text-left font-medium px-4 py-1.5">Instance</th>
 							<th class="text-left font-medium px-4 py-1.5">Status</th>
-							<th class="text-left font-medium px-4 py-1.5">Current Node</th>
+							<th class="text-left font-medium px-4 py-1.5">Flow</th>
+							<th class="text-left font-medium px-4 py-1.5">Step</th>
 							<th class="text-left font-medium px-4 py-1.5">Started</th>
 							<th class="text-right font-medium px-4 py-1.5"></th>
 						</tr>
@@ -858,18 +764,20 @@
 					<tbody>
 						{#each instances as inst}
 							<tr class="border-b border-border/20 hover:bg-accent/30">
-								<td class="px-4 py-1.5 font-mono text-muted-foreground">{inst.id.slice(0, 8)}...</td>
+								<td class="px-4 py-1.5 font-mono text-muted-foreground">{inst.id.slice(0, 8)}</td>
 								<td class="px-4 py-1.5">
 									<span class="inline-flex items-center gap-1">
-										<span class="h-1.5 w-1.5 rounded-full {
-											inst.status === 'running' ? 'bg-blue-400 animate-pulse' :
-											inst.status === 'completed' ? 'bg-emerald-400' :
-											inst.status === 'failed' ? 'bg-red-400' :
-											'bg-muted-foreground'}"></span>
+										<span class="h-1.5 w-1.5 rounded-full {inst.status === 'running' ? 'bg-blue-400 animate-pulse' : inst.status === 'completed' ? 'bg-emerald-400' : inst.status === 'failed' ? 'bg-red-400' : 'bg-muted-foreground'}"></span>
 										{inst.status}
 									</span>
 								</td>
-								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_node_id || '—'}</td>
+								<td class="px-4 py-1.5">
+									<span class="inline-flex items-center gap-1">
+										{#if flows[inst.current_flow]}<span class="h-1.5 w-1.5 rounded-full" style="background: {flows[inst.current_flow].color}"></span>{/if}
+										{inst.current_flow}
+									</span>
+								</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_step_index}</td>
 								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
 								<td class="px-4 py-1.5 text-right">
 									{#if inst.status === 'running'}
@@ -885,6 +793,18 @@
 		</div>
 	{/if}
 
+	<!-- Variable popup -->
+	{#if variablePopup}
+		<VariablePopup
+			bind:this={popupRef}
+			variables={availableVariables(variablePopup.blockIdx ?? currentBlocks.length, variablePopup.loopContext)}
+			filter={variablePopup.filter}
+			x={variablePopup.x} y={variablePopup.y}
+			onselect={insertVariable}
+			onclose={() => (variablePopup = null)}
+		/>
+	{/if}
+
 	<!-- Toast -->
 	{#if toast}
 		<div class="fixed bottom-4 right-4 z-50 rounded-lg border px-4 py-2.5 text-xs font-medium shadow-lg
@@ -893,40 +813,3 @@
 		</div>
 	{/if}
 </div>
-
-<style>
-	/* WebKit drag-and-drop compatibility */
-	[draggable="true"] {
-		-webkit-user-drag: element;
-		user-select: none;
-	}
-	:global(.svelte-flow) {
-		--xy-background-color: hsl(228, 22%, 8%) !important;
-		--xy-node-border-radius: 0.5rem;
-		--xy-edge-stroke: hsl(225, 25%, 35%);
-		--xy-edge-stroke-selected: hsl(225, 65%, 55%);
-		--xy-edge-stroke-width: 2;
-		--xy-connectionline-stroke: hsl(225, 65%, 55%);
-		--xy-connectionline-stroke-width: 2;
-		--xy-attribution-background-color: transparent;
-	}
-	:global(.svelte-flow__background) {
-		background-color: hsl(228, 22%, 8%) !important;
-	}
-	:global(.svelte-flow__renderer) {
-		background-color: hsl(228, 22%, 8%) !important;
-	}
-	:global(.svelte-flow .svelte-flow__node) { border: none; background: none; padding: 0; border-radius: 0; box-shadow: none; }
-	:global(.svelte-flow .svelte-flow__node.selected) { outline: 2px solid hsl(225, 65%, 55%); outline-offset: 2px; border-radius: 0.5rem; }
-	:global(.svelte-flow .svelte-flow__edge.selected .svelte-flow__edge-path) { stroke: hsl(225, 65%, 55%); }
-	:global(.svelte-flow .svelte-flow__edge-text) { font-size: 10px; font-weight: 500; fill: hsl(225, 15%, 65%) !important; }
-	:global(.svelte-flow .svelte-flow__edge-textbg) { fill: hsl(228, 22%, 11%) !important; rx: 4; stroke: hsl(225, 18%, 22%); stroke-width: 1; }
-	:global(.svelte-flow .svelte-flow__minimap) { background: hsl(228, 22%, 11%); border: 1px solid hsl(225, 18%, 18%); border-radius: 0.375rem; }
-	:global(.svelte-flow .svelte-flow__controls) { background: hsl(228, 22%, 11%); border: 1px solid hsl(225, 18%, 18%); border-radius: 0.375rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
-	:global(.svelte-flow .svelte-flow__controls button) { background: hsl(228, 22%, 11%); border-color: hsl(225, 18%, 18%); color: hsl(225, 15%, 55%); }
-	:global(.svelte-flow .svelte-flow__controls button:hover) { background: hsl(225, 50%, 25%); color: hsl(220, 20%, 92%); }
-	:global(.svelte-flow .svelte-flow__controls button svg) { fill: currentColor; }
-	:global(.svelte-flow .svelte-flow__background) { opacity: 0.4; }
-	:global(.svelte-flow .svelte-flow__edge-path) { stroke: hsl(225, 25%, 35%); }
-	:global(.svelte-flow .svelte-flow__pane) { background-color: hsl(228, 22%, 8%) !important; }
-</style>
