@@ -18,7 +18,7 @@
 	} = $props();
 </script>
 
-<div class="group rounded-lg border-2 border-dashed border-amber-600/40 bg-amber-950/10 loop-border">
+<div class="group rounded-lg bg-amber-950/10 loop-animated-border">
 	<!-- Header -->
 	<div class="flex items-center gap-2 px-3 py-2">
 		<span class="text-[10px] font-bold tracking-wider text-red-400">LOOP</span>
@@ -68,16 +68,20 @@
 </div>
 
 <style>
-	.loop-border {
-		background-image: repeating-linear-gradient(
-			90deg,
-			transparent,
-			transparent 4px,
-			hsl(25 95% 53% / 0.15) 4px,
-			hsl(25 95% 53% / 0.15) 8px
-		);
-		background-size: 100% 2px;
-		background-position: 0 0, 0 100%;
-		background-repeat: no-repeat;
+	.loop-animated-border {
+		--border-color: hsl(25 95% 53% / 0.5);
+		background-image:
+			repeating-linear-gradient(90deg, var(--border-color) 0, var(--border-color) 6px, transparent 6px, transparent 12px),
+			repeating-linear-gradient(90deg, var(--border-color) 0, var(--border-color) 6px, transparent 6px, transparent 12px),
+			repeating-linear-gradient(0deg, var(--border-color) 0, var(--border-color) 6px, transparent 6px, transparent 12px),
+			repeating-linear-gradient(0deg, var(--border-color) 0, var(--border-color) 6px, transparent 6px, transparent 12px);
+		background-size: 12px 2px, 12px 2px, 2px 12px, 2px 12px;
+		background-position: 0 0, 0 100%, 0 0, 100% 0;
+		background-repeat: repeat-x, repeat-x, repeat-y, repeat-y;
+		border-radius: 0.5rem;
+		animation: loop-march 0.8s linear infinite;
+	}
+	@keyframes loop-march {
+		to { background-position: 12px 0, -12px 100%, 0 -12px, 100% 12px; }
 	}
 </style>

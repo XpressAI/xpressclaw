@@ -415,19 +415,23 @@
 	let scrollContainerEl = $state<HTMLElement | null>(null);
 
 	// Compute jump arrows from when arms and jump blocks
+	const armColors = ['#22c55e', '#ef4444', '#f97316', '#8b5cf6', '#06b6d4', '#eab308'];
+
 	let jumpArrows = $derived((() => {
 		const arrows: { fromId: string; toId: string; color: string; label?: string; side: 'right' | 'left' }[] = [];
 		const blocks = currentBlocks;
 		for (const block of blocks) {
 			if (block.type === 'when' && block.arms) {
-				for (const arm of block.arms) {
+				for (let ai = 0; ai < block.arms.length; ai++) {
+					const arm = block.arms[ai];
+					const color = armColors[ai % armColors.length];
 					if (arm.goto?.startsWith('step ')) {
 						const targetId = arm.goto.replace('step ', '');
-						arrows.push({ fromId: block.id, toId: targetId, color: '#f59e0b', label: arm.match || '', side: 'right' });
+						arrows.push({ fromId: block.id, toId: targetId, color, label: arm.match || '', side: 'right' });
 					} else if (arm.goto?.startsWith('flow ')) {
 						const flowName = arm.goto.replace('flow ', '').split(' ')[0];
-						const color = flowColors[flowName] || '#8b5cf6';
-						arrows.push({ fromId: block.id, toId: block.id, color, label: `→ ${flowName}`, side: 'right' });
+						const fColor = flowColors[flowName] || color;
+						arrows.push({ fromId: block.id, toId: block.id, color: fColor, label: `→ ${flowName}`, side: 'right' });
 					}
 				}
 			}
