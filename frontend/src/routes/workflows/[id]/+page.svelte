@@ -208,16 +208,42 @@
 
 	// --- Block manipulation ---
 
+	function slugify(label: string): string {
+		return label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || `step_${Date.now().toString(36)}`;
+	}
+
+	function nextStepNumber(): number {
+		let count = 0;
+		for (const flow of Object.values(flows)) {
+			count += flow.blocks.filter(b => b.type === 'step').length;
+		}
+		return count + 1;
+	}
+
 	function addBlock(type: Block['type'], afterIdx?: number) {
-		const id = `${type}_${Date.now().toString(36)}`;
+		let label: string;
+		let id: string;
+		switch (type) {
+			case 'step': label = `Step ${nextStepNumber()}`; break;
+			case 'when': label = 'Condition'; break;
+			case 'loop': label = 'For Each'; break;
+			case 'sink': label = 'Notify'; break;
+			case 'jump': label = 'Jump'; break;
+			default: return;
+		}
+		id = slugify(label);
+		// Ensure unique ID
+		const allIds = new Set(Object.values(flows).flatMap(f => f.blocks.map(b => b.id)));
+		while (allIds.has(id)) { id = `${slugify(label)}_${Date.now().toString(36)}`; }
+
 		let block: Block;
 		switch (type) {
-			case 'step': block = { id, type, label: 'New Step', agent: '', prompt: '', expanded: true }; break;
-			case 'when': block = { id, type, label: 'Condition', switchVar: '', expanded: true,
+			case 'step': block = { id, type, label, agent: '', prompt: '', expanded: true }; break;
+			case 'when': block = { id, type, label, switchVar: '', expanded: true,
 				arms: [{ match: 'approved', continue: true }, { match: 'rejected', goto: 'step ' }] }; break;
-			case 'loop': block = { id, type, label: 'For Each', overVar: '', asVar: 'item', children: [], expanded: true }; break;
-			case 'sink': block = { id, type, label: 'Notify', sinks: [{ connector: '', channel: '', template: '' }], expanded: true }; break;
-			case 'jump': block = { id, type, label: 'Jump', target: '', expanded: true }; break;
+			case 'loop': block = { id, type, label, overVar: '', asVar: 'item', children: [], expanded: true }; break;
+			case 'sink': block = { id, type, label, sinks: [{ connector: '', channel: '', template: '' }], expanded: true }; break;
+			case 'jump': block = { id, type, label, target: '', expanded: true }; break;
 			default: return;
 		}
 		const blocks = [...(flows[currentFlow]?.blocks ?? [])];
@@ -556,8 +582,10 @@
 									<div class="flex items-center gap-0 mt-2">
 										<div class="w-8"></div>
 										<button onclick={() => {
-											const id = `loop_step_${Date.now().toString(36)}`;
-											const children = [...(block.children || []), { id, type: 'step' as const, label: 'New Step', agent: '', prompt: '', expanded: true }];
+											const n = (block.children?.length ?? 0) + 1;
+											const label = `Step ${nextStepNumber()}`;
+											const id = slugify(label) + '_' + Date.now().toString(36);
+											const children = [...(block.children || []), { id, type: 'step' as const, label, agent: '', prompt: '', expanded: true }];
 											updateBlock(currentFlow, idx, { children });
 										}} class="rounded border border-dashed border-border/40 px-3 py-1.5 text-[10px] text-muted-foreground hover:text-foreground hover:border-border transition-colors">
 											+ Add Step
