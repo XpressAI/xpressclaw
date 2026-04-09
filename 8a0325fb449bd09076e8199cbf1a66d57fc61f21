@@ -1,0 +1,1 @@
+XCLAW-82 fix. Three bugs in reconcile_apps: (1) Container name mismatch — is_container_running checked 'app-{id}' but launch creates 'xpressclaw-app-{id}'. Fixed by checking 'xpressclaw-app-{id}' for running, passing 'app-{id}' to launch. (2) No image pull — apps never had their images pulled unlike agents. Added has_image/pull_image with backoff. (3) Missing image name in logs.
