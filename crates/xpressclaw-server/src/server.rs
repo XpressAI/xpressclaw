@@ -105,6 +105,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     // Start connector runtime: launch all enabled connectors and route their events.
     let connector_db = state.db.clone();
+    let connector_state = state.clone();
     let connector_shutdown = shutdown.clone();
     tokio::spawn(async move {
         use xpressclaw_core::connectors::registry::ConnectorRegistry;
@@ -127,7 +128,30 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     // Route event: direct agent binding → conversation, or → workflow engine
-                    router::route_event(&connector_db, &event);
+                    if let Some((conv_id, _agent_id)) = router::route_event(&connector_db, &event) {
+                        // Message was injected into a conversation — spawn the processor
+                        let mgr = xpressclaw_core::conversations::ConversationManager::new(connector_db.clone());
+                        if !mgr.is_processing(&conv_id) {
+                            if let Some(llm_router) = connector_state.llm_router() {
+                                let config = connector_state.config();
+                                let agent_roles = config.agents.iter()
+                                    .map(|a| (a.name.clone(), a.full_system_prompt()))
+                                    .collect();
+                                xpressclaw_core::conversations::processor::spawn(
+                                    conv_id,
+                                    xpressclaw_core::conversations::processor::ProcessorContext {
+                                        db: connector_db.clone(),
+                                        config,
+                                        llm_router,
+                                        event_bus: connector_state.event_bus.clone(),
+                                        rate_limiter: connector_state.rate_limiter(),
+                                        agent_roles,
+                                        docker: connector_state.docker().await,
+                                    },
+                                );
+                            }
+                        }
+                    }
                     // Also let the workflow engine check for matching triggers
                     match engine.process_events() {
                         Ok(n) if n > 0 => info!(count = n, "triggered workflow instances"),
