@@ -400,7 +400,7 @@ struct AppRow {
     last_attempt_at: Option<String>,
 }
 
-/// Reconcile published app containers — restart any that should be running but aren't.
+/// Reconcile published app containers — pull images and restart any that should be running.
 async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
     let apps: Vec<AppRow> = {
         let conn = db.conn();
@@ -431,7 +431,10 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
     for app in apps {
         let app_id = &app.id;
         let agent_id = &app.agent_id;
-        let container_name = format!("app-{app_id}");
+        // Container name must match what docker.launch() produces: "xpressclaw-{name}"
+        // So we pass "app-{app_id}" to launch, and check "xpressclaw-app-{app_id}" for running.
+        let launch_name = format!("app-{app_id}");
+        let container_name = format!("xpressclaw-{launch_name}");
         if docker.is_container_running(&container_name).await {
             // Running — reset restart count if it was elevated
             if app.restart_count > 0 {
@@ -458,10 +461,36 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
         let image = app.image.unwrap_or_else(|| "node:20-alpine".to_string());
         let app_port = app.port as u16;
 
+        // Pull image if not available locally
+        if !docker.has_image(&image).await {
+            info!(app_id, image = image.as_str(), "pulling app image");
+            match docker.pull_image(&image).await {
+                Ok(_) => {
+                    info!(app_id, image = image.as_str(), "app image pulled");
+                }
+                Err(e) => {
+                    warn!(
+                        app_id,
+                        image = image.as_str(),
+                        error = %e,
+                        "failed to pull app image, skipping"
+                    );
+                    // Record attempt so backoff works
+                    let conn = db.conn();
+                    let _ = conn.execute(
+                        "UPDATE apps SET restart_count = restart_count + 1, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                        [app_id],
+                    );
+                    continue;
+                }
+            }
+        }
+
         info!(
             app_id,
+            image = image.as_str(),
             restart_count = app.restart_count,
-            "restarting app container"
+            "starting app container"
         );
 
         let volume_name = format!("xpressclaw-workspace-{agent_id}");
@@ -490,7 +519,7 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             );
         }
 
-        match docker.launch(&container_name, &spec).await {
+        match docker.launch(&launch_name, &spec).await {
             Ok(info) => {
                 let conn = db.conn();
                 let _ = conn.execute(
@@ -500,11 +529,11 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
                 info!(
                     app_id,
                     container_id = &info.container_id[..12],
-                    "app restarted"
+                    "app started"
                 );
             }
             Err(e) => {
-                warn!(app_id, error = %e, "failed to restart app");
+                warn!(app_id, error = %e, "failed to start app container");
                 let conn = db.conn();
                 let _ = conn.execute(
                     "UPDATE apps SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
