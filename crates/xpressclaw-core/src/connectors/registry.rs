@@ -7,9 +7,12 @@ use tracing::{error, info, warn};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
+use super::email::EmailConnector;
 use super::file_watcher::FileWatcherConnector;
+use super::github::GitHubConnector;
+use super::jira::JiraConnector;
 use super::manager::ConnectorManager;
-use super::stubs::{EmailConnector, GitHubConnector, JiraConnector, SlackConnector};
+use super::slack::SlackConnector;
 use super::telegram::TelegramConnector;
 use super::traits::{ChannelConfig, Connector, ConnectorEvent};
 use super::webhook::WebhookConnector;
@@ -177,10 +180,10 @@ fn create_connector(connector_type: &str) -> Box<dyn Connector> {
         "webhook" => Box::new(WebhookConnector::new()),
         "telegram" => Box::new(TelegramConnector::new()),
         "file_watcher" => Box::new(FileWatcherConnector::new()),
-        "email" => Box::new(EmailConnector),
-        "github" => Box::new(GitHubConnector),
-        "jira" => Box::new(JiraConnector),
-        "slack" => Box::new(SlackConnector),
+        "email" => Box::new(EmailConnector::new()),
+        "github" => Box::new(GitHubConnector::new()),
+        "jira" => Box::new(JiraConnector::new()),
+        "slack" => Box::new(SlackConnector::new()),
         _ => {
             warn!(
                 connector_type = connector_type,

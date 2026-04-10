@@ -37,6 +37,11 @@ croner = "2"
 bytes = "1"
 sysinfo = "0.34"
 notify = "7"
+lettre = { version = "0.11", features = ["tokio1-native-tls", "builder"] }
+async-imap = "0.10"
+async-native-tls = "0.5"
+async-std = { version = "1", features = ["default"] }
+base64 = "0.22"
 
 # Local LLM (optional, enabled by default via "local-llm" feature)
 llama-cpp-2 = { workspace = true, optional = true }
