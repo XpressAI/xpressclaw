@@ -1,0 +1,1 @@
+XCLAW-89 fix. agentAvatar() in utils.ts ignored agent.config.avatar entirely — always returned hash-based default. Fixed to check config.avatar first, fall back to hash default. Type widened to accept optional config field. All callers already pass full Agent objects with config, so no call-site changes needed.
