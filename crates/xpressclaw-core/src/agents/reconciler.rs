@@ -138,14 +138,19 @@ async fn reconcile_models(config: &Config) {
 
 /// Pull images for all configured backends. Returns the set of images
 /// that are available (either pulled successfully or already local).
-/// Uses backoff to avoid hammering the registry on repeated failures.
+/// Pulls images on first cycle (startup) to get latest versions, then only
+/// pulls if missing. Uses backoff to avoid hammering the registry on failures.
 async fn reconcile_images(
     config: &Config,
     docker: &DockerManager,
 ) -> std::collections::HashSet<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
-    static PULL_FAILURES: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
 
+    static PULL_FAILURES: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+    static FIRST_RUN_DONE: AtomicBool = AtomicBool::new(false);
+
+    let is_first_run = !FIRST_RUN_DONE.load(Ordering::Relaxed);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -161,9 +166,14 @@ async fn reconcile_images(
             }
             continue;
         }
-        if docker.has_image(image).await {
+
+        let has_local = docker.has_image(image).await;
+
+        // On first run (server startup), always pull to check for updates.
+        // On subsequent cycles, only pull if the image is missing locally.
+        if has_local && !is_first_run {
             available.insert(image.to_string());
-            continue; // Already local — no need to pull every cycle
+            continue;
         }
 
         // Backoff: don't retry failed pulls for 5 minutes
@@ -173,32 +183,48 @@ async fn reconcile_images(
                 if let Some(&last_fail) = map.get(image) {
                     if now - last_fail < 300 {
                         debug!(image, "skipping image pull (backoff)");
+                        if has_local {
+                            available.insert(image.to_string());
+                        }
                         continue;
                     }
                 }
             }
         }
 
-        // Image not local — must pull before agents can start
-        info!(image, "pulling required harness image");
+        if is_first_run {
+            info!(image, "checking for harness image updates");
+        } else {
+            info!(image, "pulling required harness image");
+        }
         match docker.pull_image(image).await {
             Ok(_) => {
-                info!(image, "harness image pulled successfully");
+                info!(image, "harness image up to date");
                 available.insert(image.to_string());
-                // Clear failure record
                 let mut failures = PULL_FAILURES.lock().unwrap();
                 if let Some(ref mut map) = *failures {
                     map.remove(image);
                 }
             }
             Err(e) => {
-                error!(image, error = %e, "failed to pull harness image");
+                if has_local {
+                    warn!(image, error = %e, "failed to pull latest, using local image");
+                    available.insert(image.to_string());
+                } else {
+                    error!(image, error = %e, "failed to pull harness image");
+                }
                 let mut failures = PULL_FAILURES.lock().unwrap();
                 let map = failures.get_or_insert_with(std::collections::HashMap::new);
                 map.insert(image.to_string(), now);
             }
         }
     }
+
+    if is_first_run {
+        FIRST_RUN_DONE.store(true, Ordering::Relaxed);
+        info!("initial image check complete");
+    }
+
     available
 }
 
