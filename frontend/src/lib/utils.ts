@@ -37,9 +37,13 @@ export async function openExternal(url: string): Promise<void> {
 
 const AVATAR_COUNT = 32;
 
-/** Get a deterministic avatar path for an agent based on its name. */
-export function agentAvatar(agent: { name: string; id: string }): string {
-	// Simple hash of the agent name to pick a consistent avatar
+/** Get the avatar for an agent — custom upload if set, deterministic default otherwise. */
+export function agentAvatar(agent: { name: string; id: string; config?: { avatar?: string | null } }): string {
+	// Use custom avatar if the agent has one configured
+	if (agent.config?.avatar) {
+		return agent.config.avatar;
+	}
+	// Fall back to deterministic hash-based default
 	let hash = 0;
 	const key = agent.name || agent.id;
 	for (let i = 0; i < key.length; i++) {
