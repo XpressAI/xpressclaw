@@ -16,7 +16,11 @@ use crate::db::Database;
 
 /// Route a connector event to conversations (direct binding) or to the
 /// connector_events table (for workflow matching).
-pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) {
+///
+/// Returns `Some((conv_id, agent_id))` if the message was injected into
+/// a conversation (direct agent binding), so the caller can spawn the
+/// conversation processor.
+pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) -> Option<(String, String)> {
     let mgr = ConnectorManager::new(db.clone());
 
     // Look up the channel to check for direct agent binding
@@ -28,13 +32,13 @@ pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) {
                 error = %e,
                 "failed to look up channel for event routing"
             );
-            return;
+            return None;
         }
     };
 
     if let Some(ref agent_id) = channel.agent_id {
         // Direct binding: inject into a conversation with this agent
-        inject_into_conversation(db, event, agent_id);
+        return inject_into_conversation(db, event, agent_id);
     } else {
         // No agent binding: store for workflow engine
         if let Err(e) = mgr.record_event(
@@ -53,10 +57,16 @@ pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) {
             );
         }
     }
+    None
 }
 
 /// Find or create a conversation for this channel+agent and inject the message.
-fn inject_into_conversation(db: &Arc<Database>, event: &ConnectorEvent, agent_id: &str) {
+/// Returns (conv_id, agent_id) on success so the caller can spawn the processor.
+fn inject_into_conversation(
+    db: &Arc<Database>,
+    event: &ConnectorEvent,
+    agent_id: &str,
+) -> Option<(String, String)> {
     let conv_mgr = ConversationManager::new(db.clone());
 
     // Extract text content from the event payload
@@ -66,7 +76,7 @@ fn inject_into_conversation(db: &Arc<Database>, event: &ConnectorEvent, agent_id
             channel_id = event.channel_id.as_str(),
             "skipping empty message from connector"
         );
-        return;
+        return None;
     }
 
     // Extract sender name from payload
@@ -102,14 +112,15 @@ fn inject_into_conversation(db: &Arc<Database>, event: &ConnectorEvent, agent_id
                 }
                 Err(e) => {
                     error!(error = %e, "failed to create conversation for channel");
-                    return;
+                    return None;
                 }
             }
         }
     };
 
-    // Send the message into the conversation
-    match conv_mgr.send_message(
+    // Send the message into the conversation (must use send_user_message
+    // which sets processed=0 so the processor picks it up)
+    match conv_mgr.send_user_message(
         &conv_id,
         &SendMessage {
             sender_type: "user".to_string(),
@@ -133,8 +144,11 @@ fn inject_into_conversation(db: &Arc<Database>, event: &ConnectorEvent, agent_id
                 error = %e,
                 "failed to inject connector message"
             );
+            return None;
         }
     }
+
+    Some((conv_id, agent_id.to_string()))
 }
 
 /// Extract text content from various connector payload formats.
