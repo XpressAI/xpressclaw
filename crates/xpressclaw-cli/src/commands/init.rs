@@ -1,8 +1,6 @@
 use std::path::Path;
 
 use xpressclaw_core::config::DEFAULT_CONFIG_TEMPLATE;
-use xpressclaw_core::docker::images;
-use xpressclaw_core::docker::manager::DockerManager;
 
 pub async fn run(path: &str) -> anyhow::Result<()> {
     let dir = Path::new(path);
@@ -22,23 +20,6 @@ pub async fn run(path: &str) -> anyhow::Result<()> {
     let data_dir = Path::new(&home).join(".xpressclaw");
     std::fs::create_dir_all(&data_dir)?;
     println!("Created data directory: {}", data_dir.display());
-
-    // Pull default harness image
-    match DockerManager::connect().await {
-        Ok(docker) => {
-            println!("Pulling default harness image...");
-            match images::pull_defaults(&docker).await {
-                Ok(_) => println!("Harness image ready."),
-                Err(e) => eprintln!("Warning: failed to pull harness image: {e}"),
-            }
-        }
-        Err(_) => {
-            eprintln!(
-                "Warning: Docker/Podman not running. \
-                 Harness images will be pulled when you run `xpressclaw up`."
-            );
-        }
-    }
 
     println!();
     println!("xpressclaw initialized! Next steps:");

@@ -32,19 +32,6 @@ pub enum Error {
     #[error("backend not found: {name}")]
     BackendNotFound { name: String },
 
-    // Docker / Isolation
-    #[error("docker error: {0}")]
-    Docker(String),
-
-    #[error("docker not available: {0}")]
-    DockerNotAvailable(String),
-
-    #[error("container error: {0}")]
-    Container(String),
-
-    #[error("container not found: {id}")]
-    ContainerNotFound { id: String },
-
     // Memory
     #[error("memory error: {0}")]
     Memory(String),
@@ -162,12 +149,6 @@ impl From<serde_json::Error> for Error {
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::Llm(e.to_string())
-    }
-}
-
-impl From<bollard::errors::Error> for Error {
-    fn from(e: bollard::errors::Error) -> Self {
-        Error::Docker(e.to_string())
     }
 }
 

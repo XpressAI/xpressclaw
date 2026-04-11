@@ -19,13 +19,15 @@ import mcp_tasks
 import mcp_memory
 import mcp_skills
 import mcp_apps
+import mcp_workflows
 
 # Merge all tools from all modules
 ALL_TOOLS = (
     mcp_tasks.TOOLS +
     mcp_memory.TOOLS +
     mcp_skills.TOOLS +
-    mcp_apps.TOOLS
+    mcp_apps.TOOLS +
+    mcp_workflows.TOOLS
 )
 
 # Map tool names to their handler modules
@@ -38,6 +40,8 @@ for tool in mcp_skills.TOOLS:
     HANDLERS[tool["name"]] = mcp_skills.handle_tool
 for tool in mcp_apps.TOOLS:
     HANDLERS[tool["name"]] = mcp_apps.handle_tool
+for tool in mcp_workflows.TOOLS:
+    HANDLERS[tool["name"]] = mcp_workflows.handle_tool
 
 
 def handle_tool(name: str, arguments: dict) -> str:

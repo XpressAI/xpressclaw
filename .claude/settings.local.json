@@ -57,7 +57,27 @@
       "WebFetch(domain:www.npmjs.com)",
       "WebFetch(domain:svelteflow.dev)",
       "WebFetch(domain:workflowengine.io)",
-      "Bash(npx svelte-check:*)"
+      "Bash(npx svelte-check:*)",
+      "mcp__claude_ai_Atlassian__getAccessibleAtlassianResources",
+      "mcp__claude_ai_Atlassian__getJiraIssue",
+      "Bash(find:*)",
+      "Bash(journalctl --user -u xpressclaw --no-pager -n 50)",
+      "Bash(awk '{print $2}')",
+      "Read(//home/egonzalez/.xpressclaw/**)",
+      "Read(//tmp/**)",
+      "Read(//dev/**)",
+      "Bash(awk '{print $6,$7,$8,$9}')",
+      "Bash(npm search:*)",
+      "Bash(pip search:*)",
+      "Bash(mkdir -p /tmp/wanix-runtime)",
+      "Bash(unzip -o runtime.zip)",
+      "Bash(cp /tmp/wanix-runtime/assets/wanix.min.js /tmp/wanix-runtime/assets/wanix.tinygo.wasm frontend/static/wanix/)",
+      "Bash(cp -r /tmp/wanix-runtime/wasi frontend/static/wanix/)",
+      "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/routes/apps.rs)",
+      "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/routes/setup.rs)",
+      "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/routes/conversations.rs)",
+      "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/server.rs)",
+      "Bash(sed -i '/docker: state\\\\.docker\\(\\)\\\\.await,/d' crates/xpressclaw-server/src/routes/conversations.rs)"
     ]
   }
 }

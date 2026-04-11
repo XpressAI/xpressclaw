@@ -91,6 +91,10 @@ pub struct MessageParams {
 pub struct SendMessageInput {
     pub content: String,
     pub sender_name: Option<String>,
+    /// Optional: allows the browser-based Wanix harness to store agent
+    /// responses.  Defaults to "user" / "local" when omitted.
+    pub sender_type: Option<String>,
+    pub sender_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -218,19 +222,36 @@ async fn send_message(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
 
-    // Store user message as unprocessed
-    let user_msg = mgr
-        .send_user_message(
+    let sender_type = req.sender_type.as_deref().unwrap_or("user");
+    let sender_id = req.sender_id.as_deref().unwrap_or("local");
+
+    // Store message — use send_user_message for users (marks unprocessed),
+    // plain send_message for agent responses from the Wanix harness.
+    let user_msg = if sender_type == "user" {
+        mgr.send_user_message(
             &conv_id,
             &SendMessage {
-                sender_type: "user".into(),
-                sender_id: "local".into(),
+                sender_type: sender_type.into(),
+                sender_id: sender_id.into(),
                 sender_name: req.sender_name.clone(),
                 content: req.content.clone(),
                 message_type: None,
             },
         )
-        .map_err(internal_error)?;
+        .map_err(internal_error)?
+    } else {
+        mgr.send_message(
+            &conv_id,
+            &SendMessage {
+                sender_type: sender_type.into(),
+                sender_id: sender_id.into(),
+                sender_name: req.sender_name.clone(),
+                content: req.content.clone(),
+                message_type: None,
+            },
+        )
+        .map_err(internal_error)?
+    };
 
     // Broadcast the user message to any connected event subscribers
     state.event_bus.send(
@@ -263,7 +284,6 @@ async fn send_message(
                     event_bus: state.event_bus.clone(),
                     rate_limiter: state.rate_limiter(),
                     agent_roles: agent_skills_map,
-                    docker: state.docker().await,
                 },
             );
         }
@@ -279,40 +299,18 @@ async fn send_message(
 /// Replays messages after `after` ID, then streams live events.
 #[derive(Deserialize)]
 struct StopParams {
+    #[allow(dead_code)]
     agent_id: Option<String>,
 }
 
 async fn stop_processing(
     State(state): State<AppState>,
     Path(conv_id): Path<String>,
-    Query(params): Query<StopParams>,
+    Query(_params): Query<StopParams>,
 ) -> StatusCode {
     let mgr = ConversationManager::new(state.db.clone());
     let _ = mgr.set_processing_status(&conv_id, "idle");
     let _ = mgr.mark_processed(&conv_id);
-
-    // Send cancel to the specific agent (or all if none specified).
-    let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-    let target_agents = if let Some(ref aid) = params.agent_id {
-        vec![aid.clone()]
-    } else {
-        mgr.resolve_target_agents(&conv_id, "").unwrap_or_default()
-    };
-
-    for agent_id in &target_agents {
-        if let Ok(agent) = registry.get(agent_id) {
-            if let Some(ref cid) = agent.container_id {
-                if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await
-                {
-                    if let Some(port) = docker.get_container_port(cid).await {
-                        let client = xpressclaw_core::agents::harness::HarnessClient::new(port);
-                        let _ = client.cancel().await;
-                        tracing::info!(agent_id, "sent cancel to harness");
-                    }
-                }
-            }
-        }
-    }
 
     tracing::info!(conv_id, "processing stopped by user");
     StatusCode::OK
@@ -487,10 +485,9 @@ async fn stream_message(
                 RateLimitResult::Allowed => {}
             }
 
-            let agent = match registry.get(agent_id) {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
+            if registry.get(agent_id).is_err() {
+                continue;
+            }
             let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
             let model = agent_cfg
@@ -537,23 +534,7 @@ async fn stream_message(
                 yield Ok(evt);
             }
 
-            // Route through harness container if running, otherwise LLM router
-            let stream_result = if let Some(ref cid) = agent.container_id {
-                match xpressclaw_core::docker::manager::DockerManager::connect().await {
-                    Ok(docker) => {
-                        match docker.get_container_port(cid).await {
-                            Some(port) => {
-                                let harness = xpressclaw_core::agents::harness::HarnessClient::new(port);
-                                harness.chat_stream(&llm_req).await
-                            }
-                            None => llm_router.chat_stream(&llm_req).await,
-                        }
-                    }
-                    Err(_) => llm_router.chat_stream(&llm_req).await,
-                }
-            } else {
-                llm_router.chat_stream(&llm_req).await
-            };
+            let stream_result = llm_router.chat_stream(&llm_req).await;
 
             match stream_result {
                 Ok(mut chunk_stream) => {

@@ -4,9 +4,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{info, warn};
-
-use xpressclaw_core::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
+use tracing::info;
 
 use crate::state::AppState;
 
@@ -19,7 +17,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/logs", get(get_app_logs))
 }
 
-/// Proxy routes mounted at /apps/{name}/ — forwards to app containers.
+/// Proxy routes mounted at /apps/{name}/ — will be served from Wanix in the future.
 pub fn proxy_routes() -> Router<AppState> {
     Router::new().route("/{*rest}", get(proxy_handler).post(proxy_handler))
 }
@@ -32,7 +30,6 @@ struct App {
     description: Option<String>,
     agent_id: String,
     conversation_id: Option<String>,
-    container_id: Option<String>,
     port: i64,
     source_version: i64,
     status: String,
@@ -44,7 +41,7 @@ async fn list_apps(State(state): State<AppState>) -> Json<Vec<App>> {
     let db = state.db.conn();
     let mut stmt = db
         .prepare(
-            "SELECT id, title, icon, description, agent_id, conversation_id, container_id,
+            "SELECT id, title, icon, description, agent_id, conversation_id,
                     port, source_version, status, created_at, updated_at
              FROM apps ORDER BY created_at ASC",
         )
@@ -59,12 +56,11 @@ async fn list_apps(State(state): State<AppState>) -> Json<Vec<App>> {
                 description: row.get(3)?,
                 agent_id: row.get(4)?,
                 conversation_id: row.get(5)?,
-                container_id: row.get(6)?,
-                port: row.get(7)?,
-                source_version: row.get(8)?,
-                status: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                port: row.get(6)?,
+                source_version: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })
         .unwrap()
@@ -80,7 +76,7 @@ async fn get_app(
 ) -> Result<Json<App>, (StatusCode, Json<Value>)> {
     let db = state.db.conn();
     db.query_row(
-        "SELECT id, title, icon, description, agent_id, conversation_id, container_id,
+        "SELECT id, title, icon, description, agent_id, conversation_id,
                 port, source_version, status, created_at, updated_at
          FROM apps WHERE id = ?1",
         [&id],
@@ -92,12 +88,11 @@ async fn get_app(
                 description: row.get(3)?,
                 agent_id: row.get(4)?,
                 conversation_id: row.get(5)?,
-                container_id: row.get(6)?,
-                port: row.get(7)?,
-                source_version: row.get(8)?,
-                status: row.get(9)?,
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                port: row.get(6)?,
+                source_version: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         },
     )
@@ -154,26 +149,6 @@ async fn delete_app(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Look up container before any .await
-    let container_id: Option<String> = {
-        let db = state.db.conn();
-        db.query_row(
-            "SELECT container_id FROM apps WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten()
-    };
-
-    // Stop container if running (now safe to .await — MutexGuard dropped)
-    if let Some(_cid) = &container_id {
-        if let Ok(docker) = DockerManager::connect().await {
-            let _ = docker.stop(&format!("app-{id}")).await;
-            info!(app_id = %id, "stopped app container");
-        }
-    }
-
     let db = state.db.conn();
     let affected = db
         .execute("DELETE FROM apps WHERE id = ?1", [&id])
@@ -191,11 +166,12 @@ async fn delete_app(
         ));
     }
 
+    info!(app_id = %id, "deleted app");
     Ok(Json(json!({ "deleted": true })))
 }
 
 // ---------------------------------------------------------------------------
-// Publish: register app + launch container
+// Publish: register app + mark as running
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -217,7 +193,7 @@ async fn publish_app(
     let app_port = req.port.unwrap_or(3000) as u16;
     let port_str = app_port.to_string();
 
-    // Register/update in database (scope the MutexGuard)
+    // Register/update in database
     {
         let icon = req.icon.as_deref().unwrap_or("");
         let desc = req.description.as_deref().unwrap_or("");
@@ -225,14 +201,14 @@ async fn publish_app(
         let db = state.db.conn();
         db.execute(
             "INSERT INTO apps (id, title, icon, description, agent_id, port, status, start_command)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 icon = excluded.icon,
                 description = excluded.description,
                 start_command = excluded.start_command,
                 source_version = source_version + 1,
-                status = 'starting',
+                status = 'running',
                 updated_at = CURRENT_TIMESTAMP",
             [
                 &req.id,
@@ -252,262 +228,34 @@ async fn publish_app(
         })?;
     }
 
-    // If source_dir and start_command provided, launch a container
-    if let (Some(source_dir), Some(start_command)) = (&req.source_dir, &req.start_command) {
-        let app_id = req.id.clone();
-        let _source = source_dir.clone();
-        let cmd = start_command.clone();
-
-        // The agent's workspace is a Docker named volume shared between the agent
-        // and app containers. The app source at /workspace/apps/{name}/ is accessible
-        // from the same volume mounted in the app container.
-        let volume_name = workspace_volume_name(&req.agent_id);
-
-        // Detect image from start command keywords (not just prefix,
-        // since commands may be wrapped in "cd ... &&" or "sh -c ...")
-        let image = if ["node", "npm", "npx"].iter().any(|k| cmd.contains(k)) {
-            "node:20-alpine"
-        } else if ["python", "pip"].iter().any(|k| cmd.contains(k)) {
-            "python:3.11-slim"
-        } else {
-            "alpine:latest"
-        };
-
-        // Persist image for reconciler restarts
-        {
-            let db = state.db.conn();
-            let _ = db.execute("UPDATE apps SET image = ?1 WHERE id = ?2", [image, &req.id]);
-        }
-
-        let spec = ContainerSpec {
-            image: image.to_string(),
-            memory_limit: Some(512 * 1024 * 1024), // 512MB
-            cpu_limit: None,
-            environment: vec![format!("APP_ID={app_id}"), format!("PORT={app_port}")],
-            volumes: vec![VolumeMount {
-                // Mount the agent's workspace volume — the app source is at
-                // /workspace/apps/{name}/ inside this volume
-                source: volume_name,
-                target: "/workspace".to_string(),
-                read_only: true,
-            }],
-            network_mode: Some("bridge".to_string()),
-            expose_port: Some(app_port),
-            cmd: None,         // Set by launch_app_container
-            working_dir: None, // Set by launch_app_container
-        };
-
-        // Launch synchronously so the caller gets the real result.
-        match launch_app_container(&app_id, &spec, &cmd, &state.db).await {
-            Ok(container_id) => {
-                info!(app_id = %app_id, container_id = &container_id[..12], "app container started");
-                return Ok(Json(json!({
-                    "id": req.id,
-                    "published": true,
-                    "status": "running",
-                    "container_id": container_id,
-                })));
-            }
-            Err(e) => {
-                warn!(app_id = %app_id, error = %e, "failed to launch app container");
-                let conn = state.db.conn();
-                let _ = conn.execute(
-                    "UPDATE apps SET status = 'error', updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                    [&app_id],
-                );
-                return Ok(Json(json!({
-                    "id": req.id,
-                    "published": true,
-                    "status": "error",
-                    "error": e.to_string(),
-                })));
-            }
-        }
-    }
-
-    Ok(Json(json!({ "id": req.id, "published": true })))
-}
-
-async fn launch_app_container(
-    app_id: &str,
-    spec: &ContainerSpec,
-    start_command: &str,
-    db: &xpressclaw_core::db::Database,
-) -> std::result::Result<String, String> {
-    let docker = DockerManager::connect()
-        .await
-        .map_err(|e| format!("docker connect: {e}"))?;
-
-    // Stop existing container if any
-    let _ = docker.stop(&format!("app-{app_id}")).await;
-
-    let mut launch_spec = spec.clone();
-    // Set the command and working directory for the app
-    // The app source is at /workspace/apps/{app_id}/ in the shared volume
-    launch_spec.cmd = Some(vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        start_command.to_string(),
-    ]);
-    launch_spec.working_dir = Some(format!("/workspace/apps/{app_id}"));
-
-    let info = docker
-        .launch(&format!("app-{app_id}"), &launch_spec)
-        .await
-        .map_err(|e| format!("launch: {e}"))?;
-
-    // Update DB with container info
-    let conn = db.conn();
-    let _host_port = info.host_port;
-    let _ = conn.execute(
-        "UPDATE apps SET container_id = ?1, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-        [&info.container_id, app_id],
-    );
-
-    Ok(info.container_id)
+    info!(app_id = %req.id, "published app");
+    Ok(Json(json!({
+        "id": req.id,
+        "published": true,
+        "status": "running",
+    })))
 }
 
 async fn get_app_logs(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let docker = DockerManager::connect().await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    let logs = docker.logs(&format!("app-{id}"), 100).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    Ok(Json(json!({ "logs": logs })))
-}
-
-/// Get the workspace volume name for an agent.
-/// The agent's /workspace is a Docker named volume shared between the agent
-/// and its app containers, so apps can read the agent's source code directly.
-fn workspace_volume_name(agent_id: &str) -> String {
-    format!("xpressclaw-workspace-{agent_id}")
+    // Logs will be served from Wanix in the future; return empty for now
+    let _ = id;
+    Ok(Json(json!({ "logs": [] })))
 }
 
 // ---------------------------------------------------------------------------
-// App proxy: forward HTTP requests to app containers
+// App proxy: will be served from Wanix in the future
 // ---------------------------------------------------------------------------
 
 async fn proxy_handler(
-    State(state): State<AppState>,
-    Path(rest): Path<String>,
-    req: axum::extract::Request,
+    State(_state): State<AppState>,
+    Path(_rest): Path<String>,
+    _req: axum::extract::Request,
 ) -> axum::response::Response {
-    // Split rest into app_id and path: "myapp/foo/bar" → ("myapp", "foo/bar")
-    let (app_id, path) = rest.split_once('/').unwrap_or((&rest, ""));
-
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
-    let err_response = |status: StatusCode, msg: &str| {
-        axum::response::Response::builder()
-            .status(status)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(json!({"error": msg}).to_string()))
-            .unwrap()
-    };
-
-    let row = {
-        let db = state.db.conn();
-        db.query_row(
-            "SELECT container_id, port, status FROM apps WHERE id = ?1",
-            [app_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-    };
-
-    let (container_id, _port, status) = match row {
-        Ok(r) => r,
-        Err(_) => return err_response(StatusCode::NOT_FOUND, "App not found"),
-    };
-
-    if status != "running" {
-        return err_response(StatusCode::SERVICE_UNAVAILABLE, &format!("App is {status}"));
-    }
-
-    let container_id = match container_id {
-        Some(cid) => cid,
-        None => return err_response(StatusCode::SERVICE_UNAVAILABLE, "App has no container"),
-    };
-
-    let docker = match DockerManager::connect().await {
-        Ok(d) => d,
-        Err(e) => return err_response(StatusCode::SERVICE_UNAVAILABLE, &format!("Docker: {e}")),
-    };
-
-    let host_port = match docker.inspect(&container_id).await {
-        Ok(Some(p)) => p,
-        _ => {
-            // Container may be starting up — retry once after a brief delay
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            match docker.inspect(&container_id).await {
-                Ok(Some(p)) => p,
-                _ => {
-                    return err_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Container port not available",
-                    )
-                }
-            }
-        }
-    };
-
-    let target_url = format!("http://127.0.0.1:{host_port}/{path}");
-
-    let client = reqwest::Client::new();
-    let mut proxy_req = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        &target_url,
-    );
-
-    for (key, val) in headers.iter() {
-        if !matches!(key.as_str(), "host" | "connection" | "transfer-encoding") {
-            if let Ok(v) = reqwest::header::HeaderValue::from_bytes(val.as_bytes()) {
-                proxy_req = proxy_req.header(key.as_str(), v);
-            }
-        }
-    }
-
-    if !body.is_empty() {
-        proxy_req = proxy_req.body(body.to_vec());
-    }
-
-    let resp = match proxy_req.send().await {
-        Ok(r) => r,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("proxy: {e}")),
-    };
-
-    let resp_status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let resp_headers = resp.headers().clone();
-    let resp_body = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("body: {e}")),
-    };
-
-    let mut response = axum::response::Response::builder().status(resp_status);
-    for (key, val) in resp_headers.iter() {
-        if !matches!(key.as_str(), "transfer-encoding" | "connection") {
-            response = response.header(key, val);
-        }
-    }
-    response
-        .body(axum::body::Body::from(resp_body))
-        .unwrap_or_else(|_| {
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-        })
+    axum::response::Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"error": "app proxy not available"}).to_string(),
+        ))
+        .unwrap()
 }

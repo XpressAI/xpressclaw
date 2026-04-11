@@ -26,7 +26,6 @@ use crate::config::Config;
 use crate::config::HooksConfig;
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
-use crate::docker::manager::DockerManager;
 use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
@@ -163,27 +162,9 @@ async fn load_task(
         return State::Done(DriverResult::Requeue);
     }
 
-    let container_id = match record.container_id {
-        Some(ref cid) => cid.clone(),
-        None => {
-            debug!(agent_id, "agent has no container, requeuing");
-            return State::Done(DriverResult::Requeue);
-        }
-    };
-
-    let harness_port = match DockerManager::connect().await {
-        Ok(docker) => match docker.get_container_port(&container_id).await {
-            Some(port) => port,
-            None => {
-                warn!(agent_id, "container has no port, requeuing");
-                return State::Done(DriverResult::Requeue);
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "docker not available, requeuing");
-            return State::Done(DriverResult::Requeue);
-        }
-    };
+    // Without Docker, there's no harness container. Tasks are processed
+    // via the LLM router directly. We use port 0 as a sentinel.
+    let harness_port: u16 = 0;
 
     // Load subtasks
     let subtasks = board.list_subtasks(task_id).unwrap_or_default();

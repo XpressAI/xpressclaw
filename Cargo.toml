@@ -41,9 +41,6 @@ serde_yaml = "0.9"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Docker
-bollard = "0.18"
-
 # Scheduling
 tokio-cron-scheduler = "0.13"
 

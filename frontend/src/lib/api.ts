@@ -70,10 +70,15 @@ export const conversations = {
 		if (beforeId) params.set('before_id', String(beforeId));
 		return request<ConversationMessage[]>(`/api/conversations/${id}/messages?${params}`);
 	},
-	sendMessage: (id: string, content: string, senderName?: string) =>
+	sendMessage: (id: string, content: string, senderName?: string, senderId?: string, senderType?: string) =>
 		request<ConversationMessage[]>(`/api/conversations/${id}/messages`, {
 			method: 'POST',
-			body: JSON.stringify({ content, sender_name: senderName })
+			body: JSON.stringify({
+				content,
+				sender_name: senderName,
+				...(senderType && { sender_type: senderType }),
+				...(senderId && { sender_id: senderId })
+			})
 		}),
 	streamMessage: (id: string, content: string, senderName: string | undefined, callbacks: StreamCallbacks): (() => void) => {
 		const controller = new AbortController();

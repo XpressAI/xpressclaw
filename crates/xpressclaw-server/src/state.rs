@@ -5,39 +5,27 @@ use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
-use xpressclaw_core::docker::manager::DockerManager;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 
 /// Shared application state passed to all Axum handlers.
-///
-/// Fields that can change at runtime (config reload, setup completion)
-/// are wrapped in `Arc<RwLock<>>` so all cloned handles see updates.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Arc<Config>>>,
     pub db: Arc<Database>,
     pub llm_router: Arc<RwLock<Option<Arc<LlmRouter>>>>,
     pub rate_limiter: Arc<RwLock<Arc<RateLimiter>>>,
-    /// Path to the config file (for setup wizard to write to).
     pub config_path: PathBuf,
-    /// Whether initial setup has been completed.
     pub setup_complete: Arc<RwLock<bool>>,
-    /// GGUF model download progress (for setup wizard progress bar).
     #[cfg(feature = "local-llm")]
     pub download_progress: Arc<RwLock<DownloadProgress>>,
-    /// MCP tool server manager.
     pub mcp_manager: Arc<McpManager>,
-    /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
-    /// Shared Docker connection (reused across all requests).
-    pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
 }
 
 impl AppState {
-    /// Create a new AppState. Wraps mutable fields in RwLock.
     pub fn new(
         config: Arc<Config>,
         db: Arc<Database>,
@@ -57,52 +45,25 @@ impl AppState {
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
-            docker: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Read the current config.
     pub fn config(&self) -> Arc<Config> {
         self.config.read().unwrap().clone()
     }
 
-    /// Read the current LLM router.
     pub fn llm_router(&self) -> Option<Arc<LlmRouter>> {
         self.llm_router.read().unwrap().clone()
     }
 
-    /// Get the rate limiter.
     pub fn rate_limiter(&self) -> Arc<RateLimiter> {
         self.rate_limiter.read().unwrap().clone()
     }
 
-    /// Get the shared Docker connection, creating it on first use.
-    /// Returns None if Docker is unavailable.
-    pub async fn docker(&self) -> Option<Arc<DockerManager>> {
-        // Fast path: already connected
-        {
-            let guard = self.docker.read().unwrap();
-            if let Some(ref d) = *guard {
-                return Some(d.clone());
-            }
-        }
-        // Slow path: try to connect
-        match DockerManager::connect().await {
-            Ok(d) => {
-                let d = Arc::new(d);
-                *self.docker.write().unwrap() = Some(d.clone());
-                Some(d)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Check if setup is complete.
     pub fn is_setup_complete(&self) -> bool {
         *self.setup_complete.read().unwrap()
     }
 
-    /// Update config and LLM router after setup/reload.
     pub fn apply_config(&self, config: Arc<Config>, llm_router: Option<Arc<LlmRouter>>) {
         let rate_limiter = Arc::new(RateLimiter::new(config.clone()));
         *self.config.write().unwrap() = config;

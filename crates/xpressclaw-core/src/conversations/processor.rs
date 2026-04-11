@@ -34,8 +34,6 @@ pub struct ProcessorContext {
     pub rate_limiter: Arc<RateLimiter>,
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
     pub agent_roles: std::collections::HashMap<String, String>,
-    /// Shared Docker connection for harness access.
-    pub docker: Option<Arc<crate::docker::manager::DockerManager>>,
 }
 
 /// Spawn a background task to process agent responses for a conversation.
@@ -195,37 +193,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 continue;
             }
 
-            // Memory recall hook: on first turn, if agent has memories,
-            // spawn a sub-agent to synthesize a recollection.
-            let harness_port = get_harness_port(ctx, &registry, agent_id).await;
-            let agent_hooks = agent_cfg.map(|c| &c.hooks);
-            let mut recollection: Option<String> = None;
-
-            if let Some(port) = harness_port {
-                if let Some(hooks_cfg) = agent_hooks {
-                    if hooks::has_recall_hook(hooks_cfg) {
-                        let eviction = &ctx.config.memory.eviction;
-                        let mem_hooks = MemoryHooks::new(ctx.db.clone(), eviction);
-                        recollection = mem_hooks.recall(agent_id, &last_user_msg, port).await;
-                    }
-                }
-            }
-
-            // If we got a recollection, inject it as a system message
-            // (visible to the agent but doesn't change the system prompt).
-            if let Some(ref recall_text) = recollection {
-                let _ = mgr.send_message(
-                    conv_id,
-                    &SendMessage {
-                        sender_type: "system".into(),
-                        sender_id: "memory".to_string(),
-                        sender_name: Some("Memory".to_string()),
-                        content: format!("*Recollection:* {recall_text}"),
-                        message_type: Some("memory_recall".into()),
-                    },
-                );
-            }
-
             // Broadcast "thinking" event
             ctx.event_bus.send(
                 conv_id,
@@ -235,142 +202,19 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             );
             tokio::task::yield_now().await;
 
-            if let Some(port) = harness_port {
-                let harness = crate::agents::harness::HarnessClient::new(port);
-
-                // Send to the agent's persistent session
-                match harness
-                    .send_session_message(
-                        &last_user_msg,
-                        conv_id,
-                        &sender_name,
-                        "user",
-                        &role,
-                        &history_json,
-                    )
-                    .await
-                {
-                    Ok(mut stream) => {
-                        let mut full_content = String::new();
-                        let mut total_tokens: i64 = 0;
-
-                        while let Some(result) = stream.next().await {
-                            match result {
-                                Ok(chunk) => {
-                                    if let Some(choice) = chunk.choices.first() {
-                                        if let Some(ref text) = choice.delta.content {
-                                            full_content.push_str(text);
-                                            total_tokens += text.len() as i64;
-                                            ctx.event_bus.send(
-                                                conv_id,
-                                                ConversationEvent::Chunk {
-                                                    agent_id: agent_id.clone(),
-                                                    content: text.clone(),
-                                                },
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(agent_id, error = %e, "session stream error");
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !full_content.is_empty() {
-                            record_and_store(
-                                &mgr,
-                                &cost_tracker,
-                                &budget_mgr,
-                                &ctx.rate_limiter,
-                                ctx,
-                                conv_id,
-                                agent_id,
-                                &model,
-                                &full_content,
-                                total_tokens,
-                            );
-
-                            // Async memory remember hook — runs in background.
-                            // Also checks if we're approaching the context limit
-                            // and triggers consolidation + compaction if needed.
-                            if let Some(hooks_cfg) = agent_hooks {
-                                if hooks::has_remember_hook(hooks_cfg) {
-                                    let db = ctx.db.clone();
-                                    let eviction = ctx.config.memory.eviction.clone();
-                                    let aid = agent_id.to_string();
-                                    let user_msg = last_user_msg.clone();
-                                    let resp = full_content.clone();
-                                    let hp = port;
-                                    let conv_id_owned = conv_id.to_string();
-                                    let db_for_tokens = ctx.db.clone();
-                                    // Rough context limit: 80% of 128k tokens (~100k chars)
-                                    let context_limit: usize = 100_000;
-                                    tokio::spawn(async move {
-                                        let mem_hooks = MemoryHooks::new(db.clone(), &eviction);
-                                        mem_hooks.remember(&aid, &user_msg, &resp, hp).await;
-
-                                        // Check conversation size and trigger
-                                        // consolidation + compaction if approaching limit.
-                                        let conv_mgr = ConversationManager::new(db_for_tokens);
-                                        let total_chars: usize = conv_mgr
-                                            .get_messages(&conv_id_owned, 1000, None)
-                                            .unwrap_or_default()
-                                            .iter()
-                                            .map(|m| m.content.len())
-                                            .sum();
-
-                                        if total_chars > context_limit {
-                                            info!(
-                                                conv_id = conv_id_owned,
-                                                total_chars,
-                                                "approaching context limit, consolidating memory"
-                                            );
-                                            mem_hooks.consolidate(&aid, hp).await;
-                                            // Trigger compaction in the harness
-                                            let harness =
-                                                crate::agents::harness::HarnessClient::new(hp);
-                                            let _ = harness.compact().await;
-                                            info!(conv_id = conv_id_owned, "compaction triggered");
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(agent_id, error = %e, "harness session failed, falling back to LLM router");
-                        // Fall back to LLM router streaming
-                        stream_from_llm_router(
-                            ctx,
-                            &mgr,
-                            &cost_tracker,
-                            &budget_mgr,
-                            conv_id,
-                            agent_id,
-                            &model,
-                            &role,
-                            &history,
-                        )
-                        .await;
-                    }
-                }
-            } else {
-                // No harness container — stream from LLM router (no tools)
-                stream_from_llm_router(
-                    ctx,
-                    &mgr,
-                    &cost_tracker,
-                    &budget_mgr,
-                    conv_id,
-                    agent_id,
-                    &model,
-                    &role,
-                    &history,
-                )
-                .await;
-            }
+            // Run the agentic loop: call LLM, execute tools, repeat.
+            run_agent_loop(
+                ctx,
+                &mgr,
+                &cost_tracker,
+                &budget_mgr,
+                conv_id,
+                agent_id,
+                &model,
+                &role,
+                &history,
+            )
+            .await;
         }
 
         if !mgr.has_unprocessed(conv_id) {
@@ -387,21 +231,9 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
     info!(conv_id, "background processing complete");
 }
 
-/// Get the harness port for an agent's container.
-async fn get_harness_port(
-    ctx: &ProcessorContext,
-    registry: &AgentRegistry,
-    agent_id: &str,
-) -> Option<u16> {
-    let docker = ctx.docker.as_ref()?;
-    let record = registry.get(agent_id).ok()?;
-    let cid = record.container_id.as_ref()?;
-    docker.get_container_port(cid).await
-}
-
-/// Fall back to streaming from the LLM router (no tools, but responsive).
+/// Agentic loop: stream from the LLM, execute tool calls, repeat until done.
 #[allow(clippy::too_many_arguments)]
-async fn stream_from_llm_router(
+async fn run_agent_loop(
     ctx: &ProcessorContext,
     mgr: &ConversationManager,
     cost_tracker: &CostTracker,
@@ -412,6 +244,10 @@ async fn stream_from_llm_router(
     role: &str,
     history: &[crate::conversations::ConversationMessage],
 ) {
+    use crate::conversations::tools;
+    use crate::llm::router::{ToolCall, ToolCallFunction};
+    use std::collections::HashMap;
+
     let mut llm_messages = vec![ChatMessage::text("system", role)];
     for m in history {
         match m.sender_type.as_str() {
@@ -424,75 +260,156 @@ async fn stream_from_llm_router(
         }
     }
 
-    let llm_req = ChatCompletionRequest {
-        model: model.to_string(),
-        messages: llm_messages,
-        temperature: Some(0.7),
-        max_tokens: Some(4096),
-        stream: Some(true),
-        ..Default::default()
-    };
+    let tool_defs = tools::tool_definitions();
+    let max_turns = 15;
+    let mut full_content = String::new();
+    let mut total_tokens: i64 = 0;
 
-    match ctx.llm_router.chat_stream(&llm_req).await {
-        Ok(mut chunk_stream) => {
-            let mut full_content = String::new();
-            let mut total_tokens: i64 = 0;
+    for turn in 0..max_turns {
+        let llm_req = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: llm_messages.clone(),
+            temperature: Some(0.7),
+            max_tokens: Some(4096),
+            stream: Some(true),
+            tools: if tool_defs.is_empty() { None } else { Some(tool_defs.clone()) },
+            ..Default::default()
+        };
 
-            while let Some(result) = chunk_stream.next().await {
-                match result {
-                    Ok(chunk) => {
-                        if let Some(choice) = chunk.choices.first() {
-                            if let Some(ref text) = choice.delta.content {
-                                full_content.push_str(text);
-                                total_tokens += text.len() as i64;
-                                ctx.event_bus.send(
-                                    conv_id,
-                                    ConversationEvent::Chunk {
-                                        agent_id: agent_id.to_string(),
-                                        content: text.clone(),
-                                    },
-                                );
+        // Stream the response, collecting text and tool call deltas
+        let mut turn_text = String::new();
+        let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new(); // index → (id, name, args)
+
+        match ctx.llm_router.chat_stream(&llm_req).await {
+            Ok(mut stream) => {
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(chunk) => {
+                            if let Some(choice) = chunk.choices.first() {
+                                // Stream text to frontend immediately
+                                if let Some(ref text) = choice.delta.content {
+                                    if !text.is_empty() {
+                                        turn_text.push_str(text);
+                                        total_tokens += 1;
+                                        ctx.event_bus.send(
+                                            conv_id,
+                                            ConversationEvent::Chunk {
+                                                agent_id: agent_id.to_string(),
+                                                content: text.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                                // Accumulate tool call deltas
+                                if let Some(ref tcs) = choice.delta.tool_calls {
+                                    for tc in tcs {
+                                        let entry = tool_call_acc
+                                            .entry(tc.index)
+                                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                        if let Some(ref id) = tc.id {
+                                            entry.0 = id.clone();
+                                        }
+                                        if let Some(ref func) = tc.function {
+                                            if let Some(ref name) = func.name {
+                                                entry.1 = name.clone();
+                                            }
+                                            if let Some(ref args) = func.arguments {
+                                                entry.2.push_str(args);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        ctx.event_bus.send(
-                            conv_id,
-                            ConversationEvent::Error {
-                                agent_id: Some(agent_id.to_string()),
-                                error: e.to_string(),
-                            },
-                        );
-                        break;
+                        Err(e) => {
+                            warn!(agent_id, error = %e, "stream error");
+                            break;
+                        }
                     }
                 }
             }
-
-            if !full_content.is_empty() {
-                record_and_store(
-                    mgr,
-                    cost_tracker,
-                    budget_mgr,
-                    &ctx.rate_limiter,
-                    ctx,
+            Err(e) => {
+                warn!(conv_id, agent_id, error = %e, "LLM stream failed");
+                ctx.event_bus.send(
                     conv_id,
-                    agent_id,
-                    model,
-                    &full_content,
-                    total_tokens,
+                    ConversationEvent::Error {
+                        agent_id: Some(agent_id.to_string()),
+                        error: e.to_string(),
+                    },
                 );
+                return;
             }
         }
-        Err(e) => {
-            warn!(conv_id, agent_id, error = %e, "LLM stream failed");
+
+        full_content.push_str(&turn_text);
+
+        // Collect accumulated tool calls
+        if tool_call_acc.is_empty() {
+            break; // No tool calls — we're done
+        }
+
+        let mut tool_calls: Vec<ToolCall> = tool_call_acc
+            .into_iter()
+            .map(|(_, (id, name, args))| ToolCall {
+                id,
+                call_type: "function".into(),
+                function: ToolCallFunction {
+                    name,
+                    arguments: args,
+                },
+            })
+            .collect();
+        tool_calls.sort_by_key(|tc| tc.id.clone());
+
+        // Add assistant message with tool calls to conversation
+        llm_messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: turn_text,
+            tool_calls: Some(tool_calls.clone()),
+            ..Default::default()
+        });
+
+        // Execute each tool call
+        for tc in &tool_calls {
+            debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
+
             ctx.event_bus.send(
                 conv_id,
-                ConversationEvent::Error {
-                    agent_id: Some(agent_id.to_string()),
-                    error: e.to_string(),
+                ConversationEvent::Chunk {
+                    agent_id: agent_id.to_string(),
+                    content: format!(
+                        "\n<tool_call name=\"{}\">{}</tool_call>",
+                        tc.function.name, tc.function.arguments
+                    ),
                 },
             );
+
+            let (result, _is_error) = tools::execute(
+                &tc.function.name,
+                &tc.function.arguments,
+                agent_id,
+                conv_id,
+                &ctx.db,
+            )
+            .await;
+
+            llm_messages.push(ChatMessage::tool_result(&tc.id, result));
         }
+    }
+
+    if !full_content.is_empty() {
+        record_and_store(
+            mgr,
+            cost_tracker,
+            budget_mgr,
+            &ctx.rate_limiter,
+            ctx,
+            conv_id,
+            agent_id,
+            model,
+            &full_content,
+            total_tokens,
+        );
     }
 }
 

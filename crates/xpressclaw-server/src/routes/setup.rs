@@ -24,8 +24,6 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/status", get(setup_status))
-        .route("/check-docker", get(check_docker))
-        .route("/start-docker", post(start_docker))
         .route("/system-info", get(system_info))
         .route("/check-ollama", get(check_ollama))
         .route("/recommend-model", get(recommend_model))
@@ -130,30 +128,6 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
 /// Check whether setup has been completed.
 async fn setup_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "setup_complete": state.is_setup_complete() }))
-}
-
-/// Check if Docker/Podman is available.
-async fn check_docker() -> Json<Value> {
-    use xpressclaw_core::docker::manager::DockerManager;
-    let available = DockerManager::connect().await.is_ok();
-    let installed = DockerManager::is_docker_desktop_installed();
-    Json(json!({
-        "available": available,
-        "installed": installed,
-        "can_start": installed && !available,
-    }))
-}
-
-/// Try to start Docker Desktop. Only works on macOS/Windows.
-async fn start_docker() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    use xpressclaw_core::docker::manager::DockerManager;
-    DockerManager::start_docker_desktop().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    Ok(Json(json!({ "started": true })))
 }
 
 /// Detect system hardware (RAM, CPU, GPU).

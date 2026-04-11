@@ -10,7 +10,7 @@ use xpressclaw_core::agents::state::{DesiredStatus, ObservedStatus};
 use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, RateLimitConfig, WakeOnConfig,
 };
-use xpressclaw_core::docker::manager::DockerManager;
+
 
 use crate::state::AppState;
 
@@ -29,8 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/logs", get(get_agent_logs))
 }
 
-/// Build a JSON response for an agent by merging YAML config, DB desired state,
-/// and live Docker observed state.
+/// Build a JSON response for an agent by merging YAML config and DB state.
 fn agent_json(
     record: &AgentRecord,
     config: &xpressclaw_core::config::Config,
@@ -74,19 +73,6 @@ fn agent_json(
     })
 }
 
-/// Query live observed status from Docker for an agent.
-/// Query live observed status from Docker for an agent.
-async fn observe_with(docker: &DockerManager, agent_id: &str) -> ObservedStatus {
-    let container_name = format!("xpressclaw-{agent_id}");
-    if docker.is_container_running(&container_name).await {
-        ObservedStatus::Running
-    } else if docker.inspect_by_name(&container_name).await.is_some() {
-        ObservedStatus::Exited
-    } else {
-        ObservedStatus::NotFound
-    }
-}
-
 async fn list_agents(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -94,14 +80,9 @@ async fn list_agents(
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
 
-    // Use shared Docker connection from AppState
-    let docker = state.docker().await;
     let mut result = Vec::new();
     for a in &agents {
-        let observed = match &docker {
-            Some(d) => observe_with(d, &a.id).await,
-            None => ObservedStatus::DockerUnavailable,
-        };
+        let observed = ObservedStatus::DockerUnavailable;
         result.push(agent_json(a, &config, &observed));
     }
     Ok(Json(json!(result)))
@@ -117,10 +98,7 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
+    let observed = ObservedStatus::DockerUnavailable;
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -131,10 +109,6 @@ async fn delete_agent(
     let registry = AgentRegistry::new(state.db.clone());
     // Set desired=stopped so the reconciler stops the container
     let _ = registry.set_desired_status(&id, &DesiredStatus::Stopped);
-    // Also stop immediately for responsiveness
-    if let Some(docker) = state.docker().await {
-        let _ = docker.stop(&id).await;
-    }
     registry.delete(&id).map_err(internal_error)?;
 
     // Remove from YAML config
@@ -188,10 +162,7 @@ async fn start_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
+    let observed = ObservedStatus::DockerUnavailable;
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -220,10 +191,7 @@ async fn stop_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
+    let observed = ObservedStatus::DockerUnavailable;
     Ok(Json(agent_json(&record, &config, &observed)))
 }
 
@@ -413,15 +381,16 @@ struct LogsQuery {
 async fn get_agent_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(query): Query<LogsQuery>,
+    Query(_query): Query<LogsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tail = query.tail.unwrap_or(100);
-    let docker = state
-        .docker()
-        .await
-        .ok_or_else(|| internal_error("Docker not available"))?;
-    let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
-    Ok(Json(json!({ "logs": logs })))
+    // Validate agent exists
+    let registry = AgentRegistry::new(state.db.clone());
+    let _ = registry.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+
+    Ok(Json(json!({ "logs": "Logs not available without container runtime" })))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
