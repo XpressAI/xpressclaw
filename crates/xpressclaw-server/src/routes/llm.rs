@@ -765,7 +765,10 @@ fn extract_tool_result_content(block: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Convert an OpenAI ChatCompletionResponse into an Anthropic Messages API response.
-fn openai_to_anthropic_response(resp: ChatCompletionResponse, tool_name_map: &HashMap<String, String>) -> AnthropicMessagesResponse {
+fn openai_to_anthropic_response(
+    resp: ChatCompletionResponse,
+    tool_name_map: &HashMap<String, String>,
+) -> AnthropicMessagesResponse {
     let mut content = Vec::new();
 
     if let Some(choice) = resp.choices.first() {

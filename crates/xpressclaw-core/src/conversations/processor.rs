@@ -240,7 +240,14 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
 
                 // Send to the agent's persistent session
                 match harness
-                    .send_session_message(&last_user_msg, conv_id, &sender_name, "user", &role, &history_json)
+                    .send_session_message(
+                        &last_user_msg,
+                        conv_id,
+                        &sender_name,
+                        "user",
+                        &role,
+                        &history_json,
+                    )
                     .await
                 {
                     Ok(mut stream) => {
