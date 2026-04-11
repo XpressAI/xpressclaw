@@ -126,8 +126,32 @@ async fn test_connector(
     // Basic validation: check config is well-formed for the type
     let ok = match c.connector_type.as_str() {
         "telegram" => c.config.get("bot_token").and_then(|v| v.as_str()).is_some(),
-        "webhook" => true, // Webhooks always work
-        "file_watcher" => c.config.get("paths").and_then(|v| v.as_array()).is_some(),
+        "webhook" => true,
+        "file_watcher" => {
+            c.config.get("paths").and_then(|v| v.as_str()).is_some()
+                || c.config.get("paths").and_then(|v| v.as_array()).is_some()
+        }
+        "slack" => c
+            .config
+            .get("bot_token")
+            .and_then(|v| v.as_str())
+            .map(|t| t.starts_with("xoxb-"))
+            .unwrap_or(false),
+        "github" => {
+            c.config.get("token").and_then(|v| v.as_str()).is_some()
+                && c.config.get("owner").and_then(|v| v.as_str()).is_some()
+                && c.config.get("repo").and_then(|v| v.as_str()).is_some()
+        }
+        "jira" => {
+            c.config.get("base_url").and_then(|v| v.as_str()).is_some()
+                && c.config.get("email").and_then(|v| v.as_str()).is_some()
+                && c.config.get("api_token").and_then(|v| v.as_str()).is_some()
+        }
+        "email" => {
+            c.config.get("imap_host").and_then(|v| v.as_str()).is_some()
+                && c.config.get("username").and_then(|v| v.as_str()).is_some()
+                && c.config.get("password").and_then(|v| v.as_str()).is_some()
+        }
         _ => true,
     };
 

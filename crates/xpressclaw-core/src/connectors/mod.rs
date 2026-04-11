@@ -1,9 +1,12 @@
 pub mod deliver;
+pub mod email;
 pub mod file_watcher;
+pub mod github;
+pub mod jira;
 pub mod manager;
 pub mod registry;
 pub mod router;
-pub mod stubs;
+pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod webhook;

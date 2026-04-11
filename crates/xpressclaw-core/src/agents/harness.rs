@@ -132,6 +132,10 @@ impl HarnessClient {
 
     /// Send a message to the agent's persistent session.
     /// Returns a stream of SSE chunks (may be buffered by the SDK).
+    ///
+    /// `history` is the full conversation so far (excluding the current message).
+    /// The harness injects it when starting a fresh session so the agent has context
+    /// even after a container restart.
     pub async fn send_session_message(
         &self,
         message: &str,
@@ -139,6 +143,7 @@ impl HarnessClient {
         sender_name: &str,
         sender_type: &str,
         system_prompt: &str,
+        history: &serde_json::Value,
     ) -> Result<ChatStream> {
         let url = format!("{}/v1/session/send", self.base_url);
 
@@ -148,6 +153,7 @@ impl HarnessClient {
             "sender_name": sender_name,
             "sender_type": sender_type,
             "system_prompt": system_prompt,
+            "history": history,
             "stream": true,
         });
 

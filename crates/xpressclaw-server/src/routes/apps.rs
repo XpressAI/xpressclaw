@@ -263,10 +263,11 @@ async fn publish_app(
         // from the same volume mounted in the app container.
         let volume_name = workspace_volume_name(&req.agent_id);
 
-        // Detect image from start command
-        let image = if cmd.starts_with("node") || cmd.starts_with("npm") || cmd.starts_with("npx") {
+        // Detect image from start command keywords (not just prefix,
+        // since commands may be wrapped in "cd ... &&" or "sh -c ...")
+        let image = if ["node", "npm", "npx"].iter().any(|k| cmd.contains(k)) {
             "node:20-alpine"
-        } else if cmd.starts_with("python") || cmd.starts_with("pip") {
+        } else if ["python", "pip"].iter().any(|k| cmd.contains(k)) {
             "python:3.11-slim"
         } else {
             "alpine:latest"

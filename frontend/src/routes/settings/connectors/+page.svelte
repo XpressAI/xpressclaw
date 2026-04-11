@@ -200,7 +200,7 @@
 		channelSaving = false;
 	}
 
-	const comingSoonTypes = ['email', 'github', 'jira', 'slack'];
+	const comingSoonTypes: string[] = []; // all connectors are now fully implemented
 </script>
 
 <div class="p-6 space-y-6">
@@ -510,10 +510,101 @@
 							/>
 							<span class="text-muted-foreground">Watch subdirectories recursively</span>
 						</label>
-					{:else if comingSoonTypes.includes(addForm.connector_type)}
-						<div class="rounded-lg border border-amber-800/40 bg-amber-950/20 p-4 text-center space-y-2">
-							<p class="text-sm text-amber-300">Not yet implemented</p>
-							<p class="text-xs text-muted-foreground">{typeLabel(addForm.connector_type)} connector is not functional. Messages will be logged but not actually sent or received. Use Webhook, Telegram, or File Watcher for real integrations.</p>
+					{:else if addForm.connector_type === 'slack'}
+						<div>
+							<label class="block text-sm font-medium mb-1">Bot Token</label>
+							<input type="password" placeholder="xoxb-..."
+								value={addForm.config.bot_token ?? ''}
+								oninput={(e) => { addForm.config = { ...addForm.config, bot_token: (e.target as HTMLInputElement).value }; }}
+								class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+							<p class="text-xs text-muted-foreground mt-1">Slack Bot User OAuth Token (starts with xoxb-)</p>
+						</div>
+					{:else if addForm.connector_type === 'github'}
+						<div class="space-y-3">
+							<div>
+								<label class="block text-sm font-medium mb-1">Personal Access Token</label>
+								<input type="password" placeholder="ghp_..."
+									value={addForm.config.token ?? ''}
+									oninput={(e) => { addForm.config = { ...addForm.config, token: (e.target as HTMLInputElement).value }; }}
+									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+							</div>
+							<div class="grid grid-cols-2 gap-3">
+								<div>
+									<label class="block text-sm font-medium mb-1">Owner</label>
+									<input type="text" placeholder="XpressAI"
+										value={addForm.config.owner ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, owner: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+								<div>
+									<label class="block text-sm font-medium mb-1">Repository</label>
+									<input type="text" placeholder="xpressclaw"
+										value={addForm.config.repo ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, repo: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+							</div>
+						</div>
+					{:else if addForm.connector_type === 'jira'}
+						<div class="space-y-3">
+							<div>
+								<label class="block text-sm font-medium mb-1">Jira Site URL</label>
+								<input type="text" placeholder="https://mysite.atlassian.net"
+									value={addForm.config.base_url ?? ''}
+									oninput={(e) => { addForm.config = { ...addForm.config, base_url: (e.target as HTMLInputElement).value }; }}
+									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+							</div>
+							<div class="grid grid-cols-2 gap-3">
+								<div>
+									<label class="block text-sm font-medium mb-1">Email</label>
+									<input type="email" placeholder="user@example.com"
+										value={addForm.config.email ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, email: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+								<div>
+									<label class="block text-sm font-medium mb-1">API Token</label>
+									<input type="password" placeholder="Atlassian API token"
+										value={addForm.config.api_token ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, api_token: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+							</div>
+						</div>
+					{:else if addForm.connector_type === 'email'}
+						<div class="space-y-3">
+							<div class="grid grid-cols-2 gap-3">
+								<div>
+									<label class="block text-sm font-medium mb-1">IMAP Host</label>
+									<input type="text" placeholder="imap.gmail.com"
+										value={addForm.config.imap_host ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, imap_host: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+								<div>
+									<label class="block text-sm font-medium mb-1">SMTP Host</label>
+									<input type="text" placeholder="smtp.gmail.com"
+										value={addForm.config.smtp_host ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, smtp_host: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+							</div>
+							<div class="grid grid-cols-2 gap-3">
+								<div>
+									<label class="block text-sm font-medium mb-1">Username</label>
+									<input type="email" placeholder="user@gmail.com"
+										value={addForm.config.username ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, username: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+								<div>
+									<label class="block text-sm font-medium mb-1">Password</label>
+									<input type="password" placeholder="App password"
+										value={addForm.config.password ?? ''}
+										oninput={(e) => { addForm.config = { ...addForm.config, password: (e.target as HTMLInputElement).value }; }}
+										class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+								</div>
+							</div>
 						</div>
 					{/if}
 

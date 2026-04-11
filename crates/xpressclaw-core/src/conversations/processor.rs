@@ -155,8 +155,10 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                     .unwrap_or_else(|| "You are a helpful AI assistant.".to_string())
             });
 
-            // Get the last user message to send to the session
-            let history = mgr.get_messages(conv_id, 5, None).unwrap_or_default();
+            // Get conversation history so the harness can restore context
+            // after a container restart. We send the full history — the harness
+            // only injects it when starting a fresh session.
+            let history = mgr.get_messages(conv_id, 1000, None).unwrap_or_default();
             let last_user_msg = history
                 .iter()
                 .rev()
@@ -169,6 +171,25 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
                 .find(|m| m.sender_type == "user")
                 .and_then(|m| m.sender_name.clone())
                 .unwrap_or_else(|| "User".to_string());
+            // Serialize history for the harness, excluding the current
+            // message (which will be sent as a live query after session
+            // reconstruction).
+            let last_msg_id = history
+                .iter()
+                .rev()
+                .find(|m| m.sender_type == "user" && m.content == last_user_msg)
+                .map(|m| m.id);
+            let history_json: serde_json::Value = history
+                .iter()
+                .filter(|m| Some(m.id) != last_msg_id)
+                .map(|m| {
+                    json!({
+                        "sender_type": m.sender_type,
+                        "sender_name": m.sender_name,
+                        "content": m.content,
+                    })
+                })
+                .collect();
 
             if last_user_msg.is_empty() {
                 continue;
@@ -219,7 +240,14 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
 
                 // Send to the agent's persistent session
                 match harness
-                    .send_session_message(&last_user_msg, conv_id, &sender_name, "user", &role)
+                    .send_session_message(
+                        &last_user_msg,
+                        conv_id,
+                        &sender_name,
+                        "user",
+                        &role,
+                        &history_json,
+                    )
                     .await
                 {
                     Ok(mut stream) => {

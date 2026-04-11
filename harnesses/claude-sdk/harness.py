@@ -142,7 +142,8 @@ class ClaudeSdkHarness(BaseHarness):
                 "conversation_id": "conv-123",
                 "sender_name": "Eduardo",
                 "sender_type": "user",  # or "system"
-                "system_prompt": "optional system prompt override"
+                "system_prompt": "optional system prompt override",
+                "history": [{"sender_type": "user", "sender_name": "X", "content": "..."}]
             }
 
             The message is formatted and injected into the persistent session.
@@ -156,6 +157,7 @@ class ClaudeSdkHarness(BaseHarness):
             sender_type = data.get("sender_type", "user")
             system_prompt = data.get("system_prompt", "")
             stream = data.get("stream", True)
+            history = data.get("history", [])
 
             # Format the message as a session event
             if sender_type == "system":
@@ -165,6 +167,13 @@ class ClaudeSdkHarness(BaseHarness):
                     f'Message in conversation "{conversation_id}" '
                     f"from {sender_name}:\n{message}"
                 )
+
+            # On a fresh session, reconstruct the session JSONL from
+            # conversation history so the agent has full context even
+            # after a container restart.  The SDK resumes from the
+            # reconstructed file — no prompt hacking, no replaying.
+            if self.session_id is None and history:
+                self.session_id = _reconstruct_session(history)
 
             model = LLM_MODEL
 
@@ -470,6 +479,101 @@ async def _session_query_to_queue(
         _send("No response from agent.")
     q.put(_sse_chunk_raw(conv_id, model, {}, "stop"))
     q.put("data: [DONE]\n\n")
+
+
+def _reconstruct_session(history: list[dict]) -> str:
+    """Write a Claude CLI session JSONL from conversation history.
+
+    Returns the session_id so the SDK can resume from the reconstructed file.
+    The CLI reads sessions from /workspace/.claude/projects/-workspace/{id}.jsonl.
+    """
+    session_id = str(uuid4())
+    now = datetime.now().isoformat() + "Z"
+    # Claude CLI project dir: /{cwd} → "-" + cwd with slashes replaced by "-"
+    project_slug = "-" + WORKSPACE_DIR.lstrip("/").replace("/", "-")
+    session_dir = os.path.join(WORKSPACE_DIR, ".claude", "projects", project_slug)
+    os.makedirs(session_dir, exist_ok=True)
+    session_file = os.path.join(session_dir, f"{session_id}.jsonl")
+
+    lines: list[str] = []
+    prev_uuid = None
+
+    for msg in history:
+        sender_type = msg.get("sender_type", "user")
+        sender_name = msg.get("sender_name") or "User"
+        content = msg.get("content", "")
+
+        if sender_type in ("user", "system"):
+            uuid_val = str(uuid4())
+            entry = {
+                "parentUuid": prev_uuid,
+                "isSidechain": False,
+                "promptId": str(uuid4()),
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": content,
+                },
+                "uuid": uuid_val,
+                "timestamp": now,
+                "permissionMode": "bypassPermissions",
+                "userType": "external",
+                "entrypoint": "sdk-py",
+                "cwd": WORKSPACE_DIR,
+                "sessionId": session_id,
+                "version": "2.1.92",
+            }
+            lines.append(json.dumps(entry))
+            prev_uuid = uuid_val
+
+        elif sender_type == "agent":
+            uuid_val = str(uuid4())
+            entry = {
+                "parentUuid": prev_uuid,
+                "isSidechain": False,
+                "message": {
+                    "content": [{"type": "text", "text": content}],
+                    "id": f"msg_{uuid4().hex[:32]}",
+                    "model": LLM_MODEL,
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "type": "message",
+                    "usage": {
+                        "input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 1,
+                    },
+                },
+                "type": "assistant",
+                "uuid": uuid_val,
+                "timestamp": now,
+                "userType": "external",
+                "entrypoint": "sdk-py",
+                "cwd": WORKSPACE_DIR,
+                "sessionId": session_id,
+                "version": "2.1.92",
+            }
+            lines.append(json.dumps(entry))
+            prev_uuid = uuid_val
+
+    if lines:
+        # Add last-prompt marker
+        lines.append(json.dumps({
+            "type": "last-prompt",
+            "lastPrompt": prev_uuid,
+            "sessionId": session_id,
+        }))
+
+    with open(session_file, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    logger.info(
+        "reconstructed session %s from %d history messages (%d lines) at %s",
+        session_id, len(history), len(lines), session_file,
+    )
+    return session_id
 
 
 def _extract_session_id(message: ResultMessage) -> str | None:
