@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 use axum::extract::State;
@@ -226,6 +227,11 @@ async fn anthropic_messages(
         )
     })?;
 
+    // Build a lookup from unprefixed tool name → full MCP-prefixed name.
+    // Small local models often drop the "mcp__server__" prefix when generating
+    // tool calls, so we rewrite them in the response before the CLI sees them.
+    let tool_name_map = build_tool_name_map(req.tools.as_deref());
+
     let openai_req = anthropic_to_openai_request(req);
 
     if streaming {
@@ -238,7 +244,7 @@ async fn anthropic_messages(
                 })),
             )
         })?;
-        Ok(anthropic_live_streaming_response(model, chunk_stream).into_response())
+        Ok(anthropic_live_streaming_response(model, chunk_stream, tool_name_map).into_response())
     } else {
         let response = router.chat(&openai_req).await.map_err(|e| {
             (
@@ -250,7 +256,7 @@ async fn anthropic_messages(
             )
         })?;
 
-        let anthropic_resp = openai_to_anthropic_response(response);
+        let anthropic_resp = openai_to_anthropic_response(response, &tool_name_map);
         let body = serde_json::to_value(&anthropic_resp).unwrap_or(json!({}));
         Ok(Json(body).into_response())
     }
@@ -334,6 +340,7 @@ async fn proxy_to_anthropic(
 fn anthropic_live_streaming_response(
     model: String,
     chunk_stream: xpressclaw_core::llm::router::ChatStream,
+    tool_name_map: HashMap<String, String>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         use futures_util::StreamExt;
@@ -452,7 +459,7 @@ fn anthropic_live_streaming_response(
                                 }
                                 if let Some(ref func) = tc.function {
                                     if let Some(ref name) = func.name {
-                                        state.name = name.clone();
+                                        state.name = tool_name_map.get(name.as_str()).cloned().unwrap_or_else(|| name.clone());
                                         // Emit content_block_start for this tool_use
                                         yield Ok(Event::default().event("content_block_start").data(
                                             json!({
@@ -544,6 +551,38 @@ fn anthropic_live_streaming_response(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ---------------------------------------------------------------------------
+// Tool name rewriting for local models
+// ---------------------------------------------------------------------------
+
+/// Build a map from unprefixed tool names to their full MCP-prefixed names.
+///
+/// Local models often generate tool calls with short names (e.g. `publish_app`)
+/// instead of the full MCP-prefixed name the Claude CLI expects
+/// (e.g. `mcp__xpressclaw__publish_app`). This map lets us rewrite them.
+fn build_tool_name_map(tools: Option<&[Value]>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(tools) = tools else { return map };
+    for tool in tools {
+        let Some(full_name) = tool.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Only care about MCP-prefixed names (contain "__")
+        if let Some(base) = full_name.rsplit("__").next() {
+            if base != full_name {
+                // If two tools share a base name, remove the entry to avoid
+                // ambiguous rewrites — let the CLI report the error instead.
+                if map.contains_key(base) {
+                    map.remove(base);
+                } else {
+                    map.insert(base.to_string(), full_name.to_string());
+                }
+            }
+        }
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -726,7 +765,7 @@ fn extract_tool_result_content(block: &Value) -> String {
 // ---------------------------------------------------------------------------
 
 /// Convert an OpenAI ChatCompletionResponse into an Anthropic Messages API response.
-fn openai_to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessagesResponse {
+fn openai_to_anthropic_response(resp: ChatCompletionResponse, tool_name_map: &HashMap<String, String>) -> AnthropicMessagesResponse {
     let mut content = Vec::new();
 
     if let Some(choice) = resp.choices.first() {
@@ -760,7 +799,7 @@ fn openai_to_anthropic_response(resp: ChatCompletionResponse) -> AnthropicMessag
                 content.push(json!({
                     "type": "tool_use",
                     "id": tc.id,
-                    "name": tc.function.name,
+                    "name": tool_name_map.get(&tc.function.name).unwrap_or(&tc.function.name),
                     "input": input,
                 }));
             }

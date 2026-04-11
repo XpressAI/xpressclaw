@@ -394,6 +394,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
             "system",
             "system",
             &ctx.system_prompt,
+            &serde_json::json!([]),
         )
         .await
     {
