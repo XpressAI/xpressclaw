@@ -448,6 +448,18 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
             })
             .collect();
 
+        // Loop detection: if the exact same set of tool calls repeats, break
+        let mut tool_key_parts: Vec<String> = tool_calls
+            .iter()
+            .map(|tc| format!("{}:{}", tc.function.name, tc.function.arguments))
+            .collect();
+        tool_key_parts.sort();
+        let loop_key = tool_key_parts.join("|");
+        if !loop_key.is_empty() && !seen_tool_keys.insert(loop_key) {
+            warn!(task_id = ctx.task.id, tool_turn, "duplicate tool call set in task, breaking");
+            break;
+        }
+
         llm_messages.push(ChatMessage {
             role: "assistant".into(),
             content: turn_text,
@@ -464,6 +476,21 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
                 db,
             )
             .await;
+
+            // Record what the agent did so the task message isn't empty
+            let action = format!("**{}**: {}", tc.function.name, result.chars().take(200).collect::<String>());
+            if full_content.is_empty() {
+                full_content = action;
+            } else {
+                full_content.push_str("\n");
+                full_content.push_str(&action);
+            }
+
+            // Update the streaming message with progress
+            if let Some(id) = msg_id {
+                let _ = conv.update_message_content(id, &full_content);
+            }
+
             llm_messages.push(ChatMessage::tool_result(&tc.id, result));
         }
     }
