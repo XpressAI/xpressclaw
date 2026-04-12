@@ -682,22 +682,23 @@ fn notify_conversation(
         .and_then(|a| a.display_name.clone())
         .unwrap_or_else(|| agent_id.to_string());
 
-    if let Err(e) = mgr.send_message(
-        &conv_id,
-        &SendMessage {
-            sender_type: "system".into(),
-            sender_id: agent_id.to_string(),
-            sender_name: Some(display_name.clone()),
-            content,
-            message_type: Some("task_status".into()),
-        },
-    ) {
-        warn!(
-            task_id,
-            conv_id,
-            error = %e,
-            "failed to notify conversation of task status"
-        );
+    // Update the existing task_status message if one exists for this task,
+    // otherwise create a new one. This keeps a single card in the conversation
+    // that transitions through pending → in_progress → completed/failed.
+    let updated = mgr.update_task_status_message(&conv_id, task_id, &content);
+    if !updated {
+        if let Err(e) = mgr.send_message(
+            &conv_id,
+            &SendMessage {
+                sender_type: "system".into(),
+                sender_id: agent_id.to_string(),
+                sender_name: Some(display_name.clone()),
+                content,
+                message_type: Some("task_status".into()),
+            },
+        ) {
+            warn!(task_id, conv_id, error = %e, "failed to notify conversation of task status");
+        }
     }
 
     // On completion or failure, send an unprocessed "user" message so the

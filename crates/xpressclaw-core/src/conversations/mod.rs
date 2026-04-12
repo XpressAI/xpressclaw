@@ -431,6 +431,27 @@ impl ConversationManager {
             .flatten()
     }
 
+    /// Update an existing task_status message for a given task_id.
+    /// Returns true if a message was found and updated.
+    pub fn update_task_status_message(&self, conv_id: &str, task_id: &str, new_content: &str) -> bool {
+        // Find the message by searching for the task_id in content
+        // (task_status messages are JSON with a task_id field)
+        let search = format!("\"task_id\":\"{}\"", task_id);
+        self.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE conversation_messages SET content = ?1
+                     WHERE conversation_id = ?2
+                       AND message_type = 'task_status'
+                       AND content LIKE ?3
+                     ORDER BY id DESC LIMIT 1",
+                    rusqlite::params![new_content, conv_id, format!("%{search}%")],
+                )
+            })
+            .unwrap_or(0)
+            > 0
+    }
+
     /// Mark all unprocessed user messages as processed.
     pub fn mark_processed(&self, conv_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
