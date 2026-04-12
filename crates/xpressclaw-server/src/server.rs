@@ -83,6 +83,25 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Background processor scanner: checks for unprocessed messages
+    // that were injected by the task dispatcher (or connectors) and
+    // spawns processors for them. Runs every 5 seconds.
+    {
+        let scan_state = state.clone();
+        let scan_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        scan_for_unprocessed(&scan_state).await;
+                    }
+                } => {}
+                _ = scan_shutdown.cancelled() => { info!("processor scanner stopped"); }
+            }
+        });
+    }
+
     // Start the desired-state reconciler (ADR-018).
     let reconciler_db = state.db.clone();
     let reconciler_config = state.config.clone();
@@ -257,6 +276,50 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install Ctrl+C handler");
         info!("received shutdown signal");
+    }
+}
+
+/// Scan all conversations for unprocessed messages and spawn processors.
+/// This catches messages injected by the task dispatcher or connectors
+/// that weren't picked up by the HTTP handler.
+async fn scan_for_unprocessed(state: &AppState) {
+    use xpressclaw_core::conversations::ConversationManager;
+
+    let mgr = ConversationManager::new(state.db.clone());
+    let convs = match mgr.list(100) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for conv in convs {
+        if !mgr.has_unprocessed(&conv.id) || mgr.is_processing(&conv.id) {
+            continue;
+        }
+
+        let Some(llm_router) = state.llm_router() else {
+            continue;
+        };
+
+        let config = state.config();
+        let agent_skills_map = config
+            .agents
+            .iter()
+            .map(|a| (a.name.clone(), a.full_system_prompt()))
+            .collect();
+
+        tracing::debug!(conv_id = conv.id, "scanner: spawning processor for unprocessed messages");
+
+        xpressclaw_core::conversations::processor::spawn(
+            conv.id.clone(),
+            xpressclaw_core::conversations::processor::ProcessorContext {
+                db: state.db.clone(),
+                config,
+                llm_router,
+                event_bus: state.event_bus.clone(),
+                rate_limiter: state.rate_limiter(),
+                agent_roles: agent_skills_map,
+            },
+        );
     }
 }
 

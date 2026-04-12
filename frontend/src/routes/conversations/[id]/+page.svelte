@@ -550,8 +550,16 @@
 						</div>
 					{/if}
 				{:else}
-				{@const isUser = msg.sender_type === 'user'}
+				{@const isSystemNotification = msg.sender_id === 'system' || msg.message_type === 'task_wake' || msg.message_type === 'system'}
+				{@const isUser = msg.sender_type === 'user' && !isSystemNotification}
 				{@const agent = getAgentForMessage(msg)}
+				{#if isSystemNotification}
+					<div class="flex justify-center">
+						<div class="rounded-lg px-3 py-1.5 text-xs text-muted-foreground bg-muted/30 border border-border/30 max-w-[80%]">
+							{msg.content.replace('SYSTEM: ', '')}
+						</div>
+					</div>
+				{:else}
 				<div class="flex gap-3 {isUser ? 'flex-row-reverse' : ''}">
 					<!-- Avatar -->
 					{#if isUser}
@@ -676,6 +684,7 @@
 						{/if}
 					</div>
 				</div>
+				{/if}
 				{/if}
 			{:else}
 				<div class="flex h-full items-center justify-center text-muted-foreground text-sm">
