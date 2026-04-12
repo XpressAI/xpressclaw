@@ -374,14 +374,22 @@ async fn run_agent_loop(
             ..Default::default()
         });
 
-        // Execute each tool call, deduplicating repeated calls
+        // Execute each tool call, blocking duplicates
+        let mut has_duplicate = false;
         for tc in &tool_calls {
             let call_key = format!("{}:{}", tc.function.name, tc.function.arguments);
 
-            // Check if we've seen this exact call before
-            let result = if let Some(prev) = seen_calls.get(&call_key) {
-                warn!(conv_id, agent_id, tool = tc.function.name, "duplicate tool call, returning cached result");
-                prev.clone()
+            let result = if seen_calls.contains_key(&call_key) {
+                warn!(conv_id, agent_id, tool = tc.function.name, "duplicate tool call blocked");
+                has_duplicate = true;
+                format!(
+                    "ERROR: You already called {} with these exact arguments. \
+                     The result was: {}\n\
+                     Do NOT call this tool again with the same arguments. \
+                     Move on to the next step or respond to the user.",
+                    tc.function.name,
+                    seen_calls.get(&call_key).unwrap()
+                )
             } else {
                 debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
                 let (r, _is_error) = tools::execute(
@@ -409,16 +417,35 @@ async fn run_agent_loop(
 
             llm_messages.push(ChatMessage::tool_result(&tc.id, result));
         }
+
+        // If every tool call this turn was a duplicate, break
+        let all_dupes = tool_calls.iter().all(|tc| {
+            let key = format!("{}:{}", tc.function.name, tc.function.arguments);
+            // The key exists BEFORE this turn added it = it was a dupe
+            seen_calls.contains_key(&key)
+        });
+        if all_dupes && has_duplicate {
+            warn!(conv_id, agent_id, turn, "all tool calls are duplicates, breaking loop");
+            break;
+        }
     }
 
-    // Store the final response. Use the last text the model produced.
-    // If the model only made tool calls on its last turn, use all_content.
+    // If we exhausted max_turns, tell the model to create a continuation task
+    if all_content.is_empty() && last_text.is_empty() {
+        // The model never produced text — only tool calls.
+        // Store a summary of what happened.
+        last_text = format!(
+            "I was working on your request and used several tools, but ran out of \
+             turns before completing. I'll create a task to continue this work."
+        );
+        all_content = last_text.clone();
+    }
+
     let store_content = if !last_text.is_empty() {
         &last_text
     } else if !all_content.is_empty() {
         &all_content
     } else {
-        // Agent produced no text at all — store a placeholder
         "(No response)"
     };
     record_and_store(
