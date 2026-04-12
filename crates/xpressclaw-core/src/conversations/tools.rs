@@ -326,7 +326,7 @@ fn execute_create_task(
                     sender_id: agent_id.to_string(),
                     sender_name: Some(agent_id.to_string()),
                     content: card_json.to_string(),
-                    message_type: Some("task_created".into()),
+                    message_type: Some("task_status".into()),
                 },
             );
 
