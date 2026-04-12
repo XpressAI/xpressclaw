@@ -552,6 +552,42 @@ async fn run_agent_loop(
         &store_content,
         total_tokens,
     );
+
+    // Inject task cards AFTER the agent's response, and broadcast them
+    // so the frontend sees them live without needing a page reload.
+    for (_, result) in &seen_calls {
+        if let Some(rest) = result.strip_prefix("TASK_CREATED:") {
+            let parts: Vec<&str> = rest.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                let task_id = parts[0];
+                let title = parts[1];
+                let card_json = serde_json::json!({
+                    "task_id": task_id,
+                    "title": title,
+                    "status": "pending",
+                    "subtasks_total": 0,
+                    "subtasks_completed": 0,
+                });
+                if let Ok(msg) = mgr.send_message(
+                    conv_id,
+                    &SendMessage {
+                        sender_type: "system".into(),
+                        sender_id: agent_id.to_string(),
+                        sender_name: Some(agent_id.to_string()),
+                        content: card_json.to_string(),
+                        message_type: Some("task_status".into()),
+                    },
+                ) {
+                    ctx.event_bus.send(
+                        conv_id,
+                        ConversationEvent::Message {
+                            message: serde_json::json!(msg),
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Record costs, update budget, and store the agent message.

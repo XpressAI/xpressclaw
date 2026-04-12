@@ -6,6 +6,7 @@
 	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
 	import { settings } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
+	import TaskCard from '$lib/TaskCard.svelte';
 
 	let conv = $state<Conversation | null>(null);
 	let messages = $state<ConversationMessage[]>([]);
@@ -509,45 +510,12 @@
 				{#if msg.message_type === 'task_status'}
 					{@const taskData = (() => { try { return JSON.parse(msg.content); } catch { return null; } })()}
 					{#if taskData}
-						<div class="flex gap-3">
-							<div class="flex-shrink-0 h-9 w-9 rounded-full flex items-center justify-center text-xs bg-secondary text-muted-foreground">
-								&#x2611;
-							</div>
-							<div class="flex-1 max-w-[75%]">
-								<div class="rounded-xl border px-4 py-3 text-sm
-									{taskData.status === 'completed' ? 'border-emerald-500/30 bg-emerald-500/5' :
-									 taskData.status === 'failed' ? 'border-red-500/30 bg-red-500/5' :
-									 taskData.status === 'in_progress' ? 'border-blue-500/30 bg-blue-500/5' :
-									 'border-amber-500/30 bg-amber-500/5'}">
-									<div class="flex items-center gap-2">
-										<span class="h-2 w-2 rounded-full
-											{taskData.status === 'completed' ? 'bg-emerald-400' :
-											 taskData.status === 'failed' ? 'bg-red-400' :
-											 taskData.status === 'in_progress' ? 'bg-blue-400 animate-pulse' :
-											 'bg-amber-400'}"></span>
-										<span class="font-medium">{taskData.title}</span>
-									</div>
-									{#if taskData.subtasks_total > 0}
-										<div class="mt-2">
-											<div class="flex items-center justify-between text-xs text-muted-foreground mb-1">
-												<span>{taskData.subtasks_completed}/{taskData.subtasks_total} subtasks</span>
-												<span>{Math.round((taskData.subtasks_completed / taskData.subtasks_total) * 100)}%</span>
-											</div>
-											<div class="h-1.5 rounded-full bg-muted overflow-hidden">
-												<div class="h-full rounded-full transition-all duration-500 {taskData.status === 'completed' ? 'bg-emerald-500' : taskData.status === 'failed' ? 'bg-red-500' : 'bg-blue-500'}"
-													style="width: {(taskData.subtasks_completed / taskData.subtasks_total) * 100}%"></div>
-											</div>
-										</div>
-									{/if}
-									<div class="text-xs text-muted-foreground mt-1.5 flex items-center gap-2">
-										<span>Task {taskData.status === 'in_progress' ? 'in progress' : taskData.status}</span>
-										<span>&middot;</span>
-										<span>{timeAgo(msg.created_at)}</span>
-										<a href="/tasks/{taskData.task_id}" class="underline hover:text-foreground ml-auto">View task</a>
-									</div>
-								</div>
-							</div>
-						</div>
+						<TaskCard
+							taskId={taskData.task_id}
+							initialTitle={taskData.title}
+							initialStatus={taskData.status}
+							createdAt={msg.created_at}
+						/>
 					{/if}
 				{:else}
 				{@const isSystemNotification = msg.sender_id === 'system' || msg.message_type === 'task_wake' || msg.message_type === 'system'}
