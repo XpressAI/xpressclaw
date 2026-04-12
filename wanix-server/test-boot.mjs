@@ -80,7 +80,9 @@ function createDirHandle(name, entries) {
                 if (opts?.create) {
                     entries[childName] = { kind: 'file', name: childName, data: new Uint8Array(0) };
                 } else {
-                    throw new DOMException('Not found', 'NotFoundError');
+                    const err = new Error('A requested file or directory could not be found.');
+                    err.name = 'NotFoundError';
+                    throw err;
                 }
             }
             return createFileHandle(entries[childName]);

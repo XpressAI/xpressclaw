@@ -77,7 +77,9 @@
       "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/routes/setup.rs)",
       "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/routes/conversations.rs)",
       "Bash(sed -i '/use xpressclaw_core::docker/d' crates/xpressclaw-server/src/server.rs)",
-      "Bash(sed -i '/docker: state\\\\.docker\\(\\)\\\\.await,/d' crates/xpressclaw-server/src/routes/conversations.rs)"
+      "Bash(sed -i '/docker: state\\\\.docker\\(\\)\\\\.await,/d' crates/xpressclaw-server/src/routes/conversations.rs)",
+      "Bash(npm ls:*)",
+      "Bash(cat /tmp/claude-1000/-home-egonzalez-Projects-xpressai-xpressclaw/94cfabb2-4568-4825-999f-8cc162b8ab2f/tasks/*.output)"
     ]
   }
 }
