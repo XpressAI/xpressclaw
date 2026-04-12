@@ -351,11 +351,32 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     );
     let mut llm_messages = vec![
         ChatMessage::text("system", &system_with_tools),
-        ChatMessage::text("user", &ctx.current_prompt),
     ];
 
-    let tool_defs = tools::task_tool_definitions(&ctx.task.id);
+    // Include previous task conversation as context so the model
+    // remembers what it already did across turns.
     let conv = TaskConversation::new(db.clone());
+    let history = conv.get_messages(&ctx.task.id).unwrap_or_default();
+    for msg in &history {
+        match msg.role.as_str() {
+            "assistant" => {
+                if msg.content != "(No response)" && !msg.content.is_empty() {
+                    llm_messages.push(ChatMessage::text("assistant", &msg.content));
+                }
+            }
+            "system" => {
+                llm_messages.push(ChatMessage::text("user", &format!("SYSTEM: {}", msg.content)));
+            }
+            _ => {
+                llm_messages.push(ChatMessage::text("user", &msg.content));
+            }
+        }
+    }
+
+    // Add the current prompt as the latest user message
+    llm_messages.push(ChatMessage::text("user", &ctx.current_prompt));
+
+    let tool_defs = tools::task_tool_definitions(&ctx.task.id);
     let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
     let msg_id = streaming_msg.map(|m| m.id);
 

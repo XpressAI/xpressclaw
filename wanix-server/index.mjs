@@ -320,7 +320,9 @@ async function main() {
                         return { content };
                     }
                     case 'listDir': {
-                        const entries = await w.readDir('workspace/' + (args.path || ''));
+                        const path = (args.path || '').replace(/^\.?\/?$/, '');
+                        const fullPath = path ? 'workspace/' + path : 'workspace';
+                        const entries = await w.readDir(fullPath);
                         return { content: entries.join('\n') };
                     }
                     case 'makeDir': {
