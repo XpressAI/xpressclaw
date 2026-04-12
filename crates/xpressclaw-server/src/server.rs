@@ -280,8 +280,11 @@ async fn shutdown_signal() {
 }
 
 /// Scan all conversations for unprocessed messages and spawn processors.
-/// This catches messages injected by the task dispatcher or connectors
-/// that weren't picked up by the HTTP handler.
+///
+/// Only picks up messages that have been sitting unprocessed for at least
+/// 10 seconds — this avoids racing with the HTTP handler which spawns
+/// processors immediately. The scanner catches messages injected by the
+/// task dispatcher, connectors, or other non-HTTP sources.
 async fn scan_for_unprocessed(state: &AppState) {
     use xpressclaw_core::conversations::ConversationManager;
 
@@ -292,7 +295,18 @@ async fn scan_for_unprocessed(state: &AppState) {
     };
 
     for conv in convs {
-        if !mgr.has_unprocessed(&conv.id) || mgr.is_processing(&conv.id) {
+        // Skip if already processing or no unprocessed messages
+        if mgr.is_processing(&conv.id) || !mgr.has_unprocessed(&conv.id) {
+            continue;
+        }
+
+        // Only process if the unprocessed message has been sitting for > 10s.
+        // This gives the HTTP handler time to spawn its own processor first.
+        let stale = mgr
+            .oldest_unprocessed_age(&conv.id)
+            .map(|age| age > 10)
+            .unwrap_or(false);
+        if !stale {
             continue;
         }
 
@@ -307,7 +321,7 @@ async fn scan_for_unprocessed(state: &AppState) {
             .map(|a| (a.name.clone(), a.full_system_prompt()))
             .collect();
 
-        tracing::debug!(conv_id = conv.id, "scanner: spawning processor for unprocessed messages");
+        info!(conv_id = conv.id, "scanner: spawning processor for stale unprocessed message");
 
         xpressclaw_core::conversations::processor::spawn(
             conv.id.clone(),

@@ -415,6 +415,22 @@ impl ConversationManager {
             > 0
     }
 
+    /// Age (in seconds) of the oldest unprocessed user message.
+    pub fn oldest_unprocessed_age(&self, conv_id: &str) -> Option<i64> {
+        self.db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT CAST((julianday('now') - julianday(MIN(created_at))) * 86400 AS INTEGER)
+                     FROM conversation_messages
+                     WHERE conversation_id = ?1 AND sender_type = 'user' AND processed = 0",
+                    [conv_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+            })
+            .ok()
+            .flatten()
+    }
+
     /// Mark all unprocessed user messages as processed.
     pub fn mark_processed(&self, conv_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {

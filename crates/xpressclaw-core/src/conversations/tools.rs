@@ -309,6 +309,27 @@ fn execute_create_task(
         Ok(task) => {
             // Enqueue the task so the dispatcher picks it up
             let _ = queue.enqueue(&task.id, agent_id);
+
+            // Inject a system message so the conversation renders a task card
+            let conv_mgr = crate::conversations::ConversationManager::new(db.clone());
+            let card_json = serde_json::json!({
+                "task_id": task.id,
+                "title": task.title,
+                "status": "pending",
+                "subtasks_total": 0,
+                "subtasks_completed": 0,
+            });
+            let _ = conv_mgr.send_message(
+                conv_id,
+                &crate::conversations::SendMessage {
+                    sender_type: "system".into(),
+                    sender_id: agent_id.to_string(),
+                    sender_name: Some(agent_id.to_string()),
+                    content: card_json.to_string(),
+                    message_type: Some("task_created".into()),
+                },
+            );
+
             (format!("Created task '{}' (id: {}). It is now queued for execution.", task.title, task.id), false)
         }
         Err(e) => (format!("Failed to create task: {e}"), true),
