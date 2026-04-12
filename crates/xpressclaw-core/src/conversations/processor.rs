@@ -281,7 +281,8 @@ async fn run_agent_loop(
 
         // Stream the response, collecting text and tool call deltas
         let mut turn_text = String::new();
-        let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new(); // index → (id, name, args)
+        let mut in_thinking = false;
+        let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new();
 
         match ctx.llm_router.chat_stream(&llm_req).await {
             Ok(mut stream) => {
@@ -289,9 +290,41 @@ async fn run_agent_loop(
                     match result {
                         Ok(chunk) => {
                             if let Some(choice) = chunk.choices.first() {
+                                // Stream reasoning content as <think> blocks
+                                if let Some(ref reasoning) = choice.delta.reasoning_content {
+                                    if !reasoning.is_empty() {
+                                        if !in_thinking {
+                                            in_thinking = true;
+                                            ctx.event_bus.send(
+                                                conv_id,
+                                                ConversationEvent::Chunk {
+                                                    agent_id: agent_id.to_string(),
+                                                    content: "<think>".to_string(),
+                                                },
+                                            );
+                                        }
+                                        ctx.event_bus.send(
+                                            conv_id,
+                                            ConversationEvent::Chunk {
+                                                agent_id: agent_id.to_string(),
+                                                content: reasoning.clone(),
+                                            },
+                                        );
+                                    }
+                                }
                                 // Stream text to frontend immediately
                                 if let Some(ref text) = choice.delta.content {
                                     if !text.is_empty() {
+                                        if in_thinking {
+                                            in_thinking = false;
+                                            ctx.event_bus.send(
+                                                conv_id,
+                                                ConversationEvent::Chunk {
+                                                    agent_id: agent_id.to_string(),
+                                                    content: "</think>".to_string(),
+                                                },
+                                            );
+                                        }
                                         turn_text.push_str(text);
                                         total_tokens += 1;
                                         ctx.event_bus.send(
