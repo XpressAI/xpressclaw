@@ -439,20 +439,17 @@ async fn run_agent_loop(
         };
 
         // --- Loop detection ---
-        // Use both content text and reasoning_content as the "reasoning".
-        // If neither is unique compared to previous turns, the model is looping.
-        let reasoning_key = if !turn_text.trim().is_empty() {
-            turn_text.trim().to_string()
-        } else {
-            // Use a hash of the reasoning_content (it can be very long)
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            turn_reasoning.hash(&mut h);
-            format!("__reasoning_{}", h.finish())
-        };
+        // Build a key from the tool calls (name + args). If the exact same
+        // set of tool calls appears twice, the model is looping.
+        let mut tool_key_parts: Vec<String> = tool_calls
+            .iter()
+            .map(|tc| format!("{}:{}", tc.function.name, tc.function.arguments))
+            .collect();
+        tool_key_parts.sort();
+        let loop_key = tool_key_parts.join("|");
 
-        if !reasoning_key.is_empty() && !seen_reasoning.insert(reasoning_key) {
-            warn!(conv_id, agent_id, turn, "duplicate reasoning, breaking loop");
+        if !loop_key.is_empty() && !seen_reasoning.insert(loop_key) {
+            warn!(conv_id, agent_id, turn, "duplicate tool call set, breaking loop");
             break;
         }
 
