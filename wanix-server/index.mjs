@@ -193,19 +193,84 @@ async function main() {
     });
     console.log('Create WASI task:', JSON.stringify(taskResult));
 
-    console.log('\n=== Wanix headless server ready ===');
-    console.log(`Wanix running in headless Chrome, controllable via page.evaluate()`);
+    // --- Tool execution API ---
+    // The xpressclaw Rust server calls these endpoints to execute tools
+    // in the Wanix environment.
+    const apiServer = createServer(async (req, res) => {
+        if (req.method !== 'POST') {
+            res.writeHead(405);
+            res.end('POST only');
+            return;
+        }
+
+        const body = await new Promise(resolve => {
+            let data = '';
+            req.on('data', chunk => data += chunk);
+            req.on('end', () => resolve(data));
+        });
+
+        let request;
+        try {
+            request = JSON.parse(body);
+        } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid JSON' }));
+            return;
+        }
+
+        const { tool, args } = request;
+
+        try {
+            const result = await page.evaluate(async ({ tool, args }) => {
+                const w = window.__wanixInstance;
+                switch (tool) {
+                    case 'writeFile': {
+                        await w.writeFile('workspace/' + args.path, args.content);
+                        return { content: `Wrote ${args.content.length} bytes to ${args.path}` };
+                    }
+                    case 'readFile': {
+                        const content = await w.readText('workspace/' + args.path);
+                        return { content };
+                    }
+                    case 'listDir': {
+                        const entries = await w.readDir('workspace/' + (args.path || ''));
+                        return { content: entries.join('\n') };
+                    }
+                    case 'makeDir': {
+                        await w.makeDir('workspace/' + args.path);
+                        return { content: `Created directory ${args.path}` };
+                    }
+                    case 'remove': {
+                        await w.remove('workspace/' + args.path);
+                        return { content: `Removed ${args.path}` };
+                    }
+                    default:
+                        return { content: `Unknown tool: ${tool}`, isError: true };
+                }
+            }, { tool, args });
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+        } catch (e) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ content: e.message || String(e), isError: true }));
+        }
+    });
+
+    apiServer.listen(PORT);
+    console.log(`\n=== Wanix headless server ready ===`);
+    console.log(`Tool API: http://localhost:${PORT}/`);
+    console.log(`Static: http://localhost:${staticPort}`);
     console.log('Press Ctrl+C to stop.\n');
 
-    // Keep alive
     process.on('SIGINT', async () => {
         console.log('Shutting down...');
         await browser.close();
         staticServer.close();
+        apiServer.close();
         process.exit(0);
     });
 
-    // Keep the process alive
     await new Promise(() => {});
 }
 

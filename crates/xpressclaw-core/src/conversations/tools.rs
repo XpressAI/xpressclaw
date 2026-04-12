@@ -13,9 +13,68 @@ use crate::memory::manager::MemoryManager;
 use crate::memory::zettelkasten::CreateMemory;
 use crate::tasks::board::{CreateTask, TaskBoard};
 
+/// Default Wanix server URL.
+const WANIX_URL: &str = "http://localhost:9100";
+
 /// Tool definitions sent to the LLM so it knows what's available.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Read a file from the agent's workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "Path relative to workspace (e.g. 'src/main.py')" }
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "description": "Write content to a file in the agent's workspace. Creates the file if it does not exist.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "Path relative to workspace" },
+                        "content": { "type": "string", "description": "Content to write" }
+                    },
+                    "required": ["file_path", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ListDir",
+                "description": "List files and directories in the agent's workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path relative to workspace (empty for root)" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "MakeDir",
+                "description": "Create a directory in the agent's workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path relative to workspace" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
         json!({
             "type": "function",
             "function": {
@@ -39,7 +98,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "content": { "type": "string", "description": "The information to remember" },
-                        "tags": { "type": "string", "description": "Comma-separated tags for categorization" }
+                        "tags": { "type": "string", "description": "Comma-separated tags" }
                     },
                     "required": ["content"]
                 }
@@ -64,11 +123,11 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "list_tasks",
-                "description": "List tasks on the task board, optionally filtered by status.",
+                "description": "List tasks on the task board.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed, failed" }
+                        "status": { "type": "string", "description": "Filter: pending, in_progress, completed" }
                     }
                 }
             }
@@ -82,7 +141,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "task_id": { "type": "string", "description": "The task ID" },
-                        "status": { "type": "string", "description": "New status: pending, in_progress, completed, failed" }
+                        "status": { "type": "string", "description": "New status" }
                     },
                     "required": ["task_id", "status"]
                 }
@@ -102,6 +161,25 @@ pub async fn execute(
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
     match name {
+        // Filesystem tools → Wanix
+        "Read" => {
+            let path = args["file_path"].as_str().unwrap_or("");
+            call_wanix("readFile", json!({"path": path})).await
+        }
+        "Write" => {
+            let path = args["file_path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            call_wanix("writeFile", json!({"path": path, "content": content})).await
+        }
+        "ListDir" => {
+            let path = args["path"].as_str().unwrap_or("");
+            call_wanix("listDir", json!({"path": path})).await
+        }
+        "MakeDir" => {
+            let path = args["path"].as_str().unwrap_or("");
+            call_wanix("makeDir", json!({"path": path})).await
+        }
+        // Database tools → direct
         "search_memory" => {
             let query = args["query"].as_str().unwrap_or("");
             execute_search_memory(query, agent_id, db).await
@@ -129,6 +207,30 @@ pub async fn execute(
             warn!(name, "unknown tool call");
             (format!("Unknown tool: {name}"), true)
         }
+    }
+}
+
+/// Call the Wanix headless server to execute a filesystem tool.
+async fn call_wanix(tool: &str, args: Value) -> (String, bool) {
+    let client = reqwest::Client::new();
+    let body = json!({ "tool": tool, "args": args });
+
+    match client
+        .post(WANIX_URL)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => match resp.json::<Value>().await {
+            Ok(data) => {
+                let content = data["content"].as_str().unwrap_or("").to_string();
+                let is_error = data["isError"].as_bool().unwrap_or(false);
+                (content, is_error)
+            }
+            Err(e) => (format!("Wanix response error: {e}"), true),
+        },
+        Err(e) => (format!("Wanix not available: {e}"), true),
     }
 }
 
