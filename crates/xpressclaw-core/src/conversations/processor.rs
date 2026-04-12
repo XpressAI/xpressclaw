@@ -250,9 +250,9 @@ async fn run_agent_loop(
 
     let system_prompt = format!(
         "{role}\n\n\
-         IMPORTANT: When using tools, always write ONE short sentence explaining \
-         your intent before the tool call. Keep it concise — no plans, no lists, \
-         just state what you're doing and why in a single sentence."
+         When using tools, write ONE short sentence stating what you're about to \
+         do before each tool call. Example: \"Searching memory for user context.\" \
+         Keep it concise — no plans, no lists."
     );
     let mut llm_messages = vec![ChatMessage::text("system", &system_prompt)];
     for m in history {
@@ -287,6 +287,7 @@ async fn run_agent_loop(
 
         // Stream the response, collecting text and tool call deltas
         let mut turn_text = String::new();
+        let mut turn_reasoning = String::new();
         let mut pending_text = String::new();
         let mut in_thinking = false;
         let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new();
@@ -300,6 +301,7 @@ async fn run_agent_loop(
                                 // Stream reasoning content as <think> blocks
                                 if let Some(ref reasoning) = choice.delta.reasoning_content {
                                     if !reasoning.is_empty() {
+                                        turn_reasoning.push_str(reasoning);
                                         if !in_thinking {
                                             in_thinking = true;
                                             ctx.event_bus.send(
@@ -436,38 +438,21 @@ async fn run_agent_loop(
             tcs
         };
 
-        // --- Reasoning gate ---
-        // The model MUST produce text (reasoning) alongside tool calls.
-        // The reasoning must be unique — if we've seen the same reasoning
-        // before, the model is looping and we break.
-        let reasoning = turn_text.trim().to_string();
+        // --- Loop detection ---
+        // Use both content text and reasoning_content as the "reasoning".
+        // If neither is unique compared to previous turns, the model is looping.
+        let reasoning_key = if !turn_text.trim().is_empty() {
+            turn_text.trim().to_string()
+        } else {
+            // Use a hash of the reasoning_content (it can be very long)
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            turn_reasoning.hash(&mut h);
+            format!("__reasoning_{}", h.finish())
+        };
 
-        if reasoning.is_empty() {
-            // No reasoning provided — tell the model to explain itself
-            warn!(conv_id, agent_id, turn, "tool calls without reasoning, requesting explanation");
-            llm_messages.push(ChatMessage {
-                role: "assistant".into(),
-                content: String::new(),
-                tool_calls: Some(tool_calls.clone()),
-                ..Default::default()
-            });
-            for tc in &tool_calls {
-                llm_messages.push(ChatMessage::tool_result(
-                    &tc.id,
-                    format!(
-                        "BLOCKED: Before calling tools, write ONE concise sentence \
-                         explaining why you are calling {}. Be brief — just state your \
-                         intent, then call the tool.",
-                        tc.function.name
-                    ),
-                ));
-            }
-            continue;
-        }
-
-        if !seen_reasoning.insert(reasoning.clone()) {
-            // Duplicate reasoning — model is looping
-            warn!(conv_id, agent_id, turn, reasoning = reasoning, "duplicate reasoning, breaking loop");
+        if !reasoning_key.is_empty() && !seen_reasoning.insert(reasoning_key) {
+            warn!(conv_id, agent_id, turn, "duplicate reasoning, breaking loop");
             break;
         }
 
