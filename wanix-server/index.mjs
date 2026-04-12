@@ -193,6 +193,22 @@ async function main() {
     });
     console.log('Create WASI task:', JSON.stringify(taskResult));
 
+    // Ensure the workspace exists (idempotent).
+    // Called on every tool request in case the tmpfs was remounted.
+    async function ensureWorkspace() {
+        try {
+            await page.evaluate(async () => {
+                const w = window.__wanixInstance;
+                try { await w.stat('workspace'); } catch {
+                    // Workspace doesn't exist — mount a tmpfs
+                    const capId = (await w.readText('cap/new/tmpfs')).trim();
+                    await w.writeFile('cap/' + capId + '/ctl', 'mount');
+                    await w.bind('#cap/' + capId + '/mount', 'workspace');
+                }
+            });
+        } catch {}
+    }
+
     // --- Tool execution API ---
     // The xpressclaw Rust server calls these endpoints to execute tools
     // in the Wanix environment.
@@ -201,6 +217,7 @@ async function main() {
 
         // GET /app/{name}/{path} — serve files from the Wanix workspace
         if (req.method === 'GET' && url.pathname.startsWith('/app/')) {
+            await ensureWorkspace();
             const parts = url.pathname.slice(5); // strip "/app/"
             // Try workspace/{path} first, then workspace/apps/{path}
             const filePath = 'workspace/' + parts;
@@ -270,6 +287,8 @@ async function main() {
             res.end('POST only');
             return;
         }
+
+        await ensureWorkspace();
 
         const body = await new Promise(resolve => {
             let data = '';
