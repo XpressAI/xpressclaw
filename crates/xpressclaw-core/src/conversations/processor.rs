@@ -322,9 +322,15 @@ async fn run_agent_loop(
                                     }
                                 }
                                 // Collect text content — we'll emit it after
-                                // we know whether this turn has tool calls
+                                // we know whether this turn has tool calls.
+                                // Filter out model-specific garbage tokens.
                                 if let Some(ref text) = choice.delta.content {
-                                    if !text.is_empty() {
+                                    let is_garbage = text.contains("<channel|>")
+                                        || text.contains("<turn|>")
+                                        || text.starts_with("thought")
+                                        || text.contains("<|im_end|>")
+                                        || text.contains("<|endoftext|>");
+                                    if !text.is_empty() && !is_garbage {
                                         if in_thinking {
                                             in_thinking = false;
                                             ctx.event_bus.send(
@@ -514,12 +520,25 @@ async fn run_agent_loop(
         all_content = last_text.clone();
     }
 
-    let store_content = if !last_text.is_empty() {
-        &last_text
-    } else if !all_content.is_empty() {
-        &all_content
+    // Clean model-specific garbage from stored content
+    fn clean_garbage(s: &str) -> String {
+        s.replace("<channel|>", "")
+            .replace("<turn|>", "")
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("thought\n", "")
+            .trim()
+            .to_string()
+    }
+    let cleaned_last = clean_garbage(&last_text);
+    let cleaned_all = clean_garbage(&all_content);
+
+    let store_content = if !cleaned_last.is_empty() {
+        cleaned_last
+    } else if !cleaned_all.is_empty() {
+        cleaned_all
     } else {
-        "(No response)"
+        "(No response)".to_string()
     };
     record_and_store(
         mgr,
@@ -530,7 +549,7 @@ async fn run_agent_loop(
         conv_id,
         agent_id,
         model,
-        store_content,
+        &store_content,
         total_tokens,
     );
 }
