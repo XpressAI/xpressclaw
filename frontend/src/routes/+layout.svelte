@@ -102,12 +102,14 @@
 	let serverConnected = $state(true);
 	let wasDisconnected = false;
 
+	let connectionFailCount = 0;
+
 	async function checkConnection() {
 		try {
-			const resp = await fetch('/api/agents', { signal: AbortSignal.timeout(3000) });
+			const resp = await fetch('/api/health', { signal: AbortSignal.timeout(5000) });
 			if (resp.ok) {
+				connectionFailCount = 0;
 				if (wasDisconnected) {
-					// Server is back — reload the page to reset all state
 					wasDisconnected = false;
 					serverConnected = true;
 					window.location.reload();
@@ -115,10 +117,14 @@
 				}
 				serverConnected = true;
 			} else {
-				serverConnected = false;
-				wasDisconnected = true;
+				connectionFailCount++;
 			}
 		} catch {
+			connectionFailCount++;
+		}
+		// Only show disconnected after 3 consecutive failures (15s)
+		// to avoid flickering during heavy LLM processing
+		if (connectionFailCount >= 3) {
 			serverConnected = false;
 			wasDisconnected = true;
 		}
