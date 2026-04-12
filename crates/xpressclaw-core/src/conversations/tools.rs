@@ -292,7 +292,10 @@ fn execute_create_task(
     conv_id: &str,
     db: &Arc<Database>,
 ) -> (String, bool) {
+    use crate::tasks::queue::TaskQueue;
+
     let board = TaskBoard::new(db.clone());
+    let queue = TaskQueue::new(db.clone());
     match board.create(&CreateTask {
         title: title.to_string(),
         description: description.map(String::from),
@@ -303,7 +306,11 @@ fn execute_create_task(
         priority: None,
         context: None,
     }) {
-        Ok(task) => (format!("Created task '{}' (id: {})", task.title, task.id), false),
+        Ok(task) => {
+            // Enqueue the task so the dispatcher picks it up
+            let _ = queue.enqueue(&task.id, agent_id);
+            (format!("Created task '{}' (id: {}). It is now queued for execution.", task.title, task.id), false)
+        }
         Err(e) => (format!("Failed to create task: {e}"), true),
     }
 }
