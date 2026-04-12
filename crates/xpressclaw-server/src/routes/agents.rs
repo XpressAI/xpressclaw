@@ -48,7 +48,6 @@ fn agent_json(
         "status": status,
         "desired_status": record.desired_status,
         "observed_status": observed.to_string(),
-        "container_id": record.container_id,
         "created_at": record.created_at,
         "started_at": record.started_at,
         "stopped_at": record.stopped_at,

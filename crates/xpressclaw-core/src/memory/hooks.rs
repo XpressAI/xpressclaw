@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use crate::agents::harness::HarnessClient;
 use crate::config::HooksConfig;
+use crate::llm::router::{ChatCompletionRequest, ChatMessage, LlmRouter};
 use crate::db::Database;
 use crate::memory::manager::MemoryManager;
 use crate::memory::zettelkasten::CreateMemory;
@@ -60,7 +60,7 @@ impl MemoryHooks {
         &self,
         agent_id: &str,
         user_query: &str,
-        harness_port: u16,
+        llm_router: &LlmRouter,
     ) -> Option<String> {
         if !self.has_memories(agent_id) {
             debug!(agent_id, "no memories found, skipping recall");
@@ -91,7 +91,6 @@ impl MemoryHooks {
         }
 
         // Step 2: Send to LLM for synthesis (no tools — just text in, text out)
-        let harness = HarnessClient::new(harness_port);
         let prompt = format!(
             "You are synthesizing memories for an AI agent named '{agent_id}'.\n\n\
              The user's query is:\n\
@@ -108,13 +107,8 @@ impl MemoryHooks {
             memories = memory_context,
         );
 
-        match harness.send_task("", &prompt, agent_id).await {
-            Ok(response) => {
-                let text = response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content.clone())
-                    .unwrap_or_default();
+        match llm_call(llm_router, &prompt).await {
+            Ok(text) => {
 
                 if text.is_empty() || text.contains("No relevant memories found") {
                     debug!(agent_id, "recall returned no relevant memories");
@@ -145,7 +139,7 @@ impl MemoryHooks {
         agent_id: &str,
         user_message: &str,
         agent_response: &str,
-        harness_port: u16,
+        llm_router: &LlmRouter,
     ) {
         if user_message.len() + agent_response.len() < 200 {
             debug!(agent_id, "exchange too short, skipping remember");
@@ -154,7 +148,6 @@ impl MemoryHooks {
 
         info!(agent_id, "running async memory remember");
 
-        let harness = HarnessClient::new(harness_port);
         let prompt = format!(
             "You are the memory subsystem for an AI agent named '{agent_id}'.\n\n\
              Review this conversation exchange and identify facts worth remembering.\n\n\
@@ -172,13 +165,8 @@ impl MemoryHooks {
             agent_resp = truncate(agent_response, 800),
         );
 
-        match harness.send_task("", &prompt, agent_id).await {
-            Ok(response) => {
-                let text = response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content.clone())
-                    .unwrap_or_default();
+        match llm_call(llm_router, &prompt).await {
+            Ok(text) => {
 
                 // Parse SAVE: lines and store them
                 let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
@@ -221,7 +209,7 @@ impl MemoryHooks {
     }
 
     /// Consolidate: process Inbox/ fleeting notes into permanent Zettel/ notes.
-    pub async fn consolidate(&self, agent_id: &str, harness_port: u16) {
+    pub async fn consolidate(&self, agent_id: &str, llm_router: &LlmRouter) {
         info!(agent_id, "running memory consolidation");
 
         let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
@@ -246,7 +234,6 @@ impl MemoryHooks {
             ));
         }
 
-        let harness = HarnessClient::new(harness_port);
         let prompt = format!(
             "You are consolidating memory for agent '{agent_id}'.\n\n\
              Here are {count} inbox notes (fleeting observations):\n\
@@ -266,14 +253,8 @@ impl MemoryHooks {
             notes = inbox_text,
         );
 
-        match harness.send_task("", &prompt, agent_id).await {
-            Ok(response) => {
-                let text = response
-                    .choices
-                    .first()
-                    .map(|c| c.message.content.clone())
-                    .unwrap_or_default();
-
+        match llm_call(llm_router, &prompt).await {
+            Ok(text) => {
                 let mut kept = 0;
                 let mut deleted = 0;
 
@@ -347,4 +328,25 @@ fn truncate(s: &str, max: usize) -> &str {
             .map(|(i, _)| i)
             .unwrap_or(0)]
     }
+}
+
+/// Simple LLM call without tools — text in, text out.
+async fn llm_call(router: &LlmRouter, prompt: &str) -> Result<String, crate::error::Error> {
+    let req = ChatCompletionRequest {
+        model: router
+            .models()
+            .first()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| "default".to_string()),
+        messages: vec![ChatMessage::text("user", prompt)],
+        temperature: Some(0.3),
+        max_tokens: Some(1024),
+        ..Default::default()
+    };
+    let resp = router.chat(&req).await?;
+    Ok(resp
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .unwrap_or_default())
 }
