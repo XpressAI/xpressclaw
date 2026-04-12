@@ -123,8 +123,8 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             info!(path = %script.display(), "starting Wanix headless server");
             match std::process::Command::new("node")
                 .arg(&script)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
                 .spawn()
             {
                 Ok(child) => {

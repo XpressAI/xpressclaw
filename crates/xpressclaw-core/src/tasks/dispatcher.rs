@@ -336,9 +336,14 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
 
     let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::build_from_config(&config.llm));
 
-    // Build messages
+    // Build messages — same system prompt + tool intent instruction as processor
+    let system_with_tools = format!(
+        "{}\n\nWhen using tools, write ONE short sentence stating what you're about \
+         to do before each tool call. Example: \"Writing calculator.py with basic operations.\"",
+        ctx.system_prompt
+    );
     let mut llm_messages = vec![
-        ChatMessage::text("system", &ctx.system_prompt),
+        ChatMessage::text("system", &system_with_tools),
         ChatMessage::text("user", &ctx.current_prompt),
     ];
 
@@ -349,6 +354,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
 
     let mut full_content = String::new();
     let max_tool_turns = 10;
+    let mut seen_tool_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for tool_turn in 0..max_tool_turns {
         let llm_req = ChatCompletionRequest {
@@ -374,8 +380,21 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
                 while let Some(result) = stream.next().await {
                     if let Ok(chunk) = result {
                         if let Some(choice) = chunk.choices.first() {
+                            // Capture reasoning_content as text (many models
+                            // put all output there instead of content)
+                            if let Some(ref reasoning) = choice.delta.reasoning_content {
+                                if !reasoning.is_empty() {
+                                    // Don't add to turn_text — reasoning is internal
+                                }
+                            }
                             if let Some(ref text) = choice.delta.content {
-                                if !text.is_empty() {
+                                // Filter model-specific garbage
+                                let is_garbage = text.contains("<channel|>")
+                                    || text.contains("<turn|>")
+                                    || text.starts_with("thought")
+                                    || text.contains("<|im_end|>")
+                                    || text.contains("<|endoftext|>");
+                                if !text.is_empty() && !is_garbage {
                                     turn_text.push_str(text);
                                 }
                             }
