@@ -91,6 +91,7 @@ impl LlmProvider for OpenAiProvider {
         );
 
         let resp = req
+            .header("Connection", "close")
             .send()
             .await
             .map_err(|e| Error::Llm(format!("OpenAI request failed: {e}")))?;
@@ -128,6 +129,7 @@ impl LlmProvider for OpenAiProvider {
         );
 
         let resp = req
+            .header("Connection", "close")
             .send()
             .await
             .map_err(|e| Error::Llm(format!("OpenAI stream request failed: {e}")))?;
