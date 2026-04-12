@@ -334,7 +334,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
         "calling LLM for task"
     );
 
-    let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::new(&config.llm));
+    let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::build_from_config(&config.llm));
 
     // Build messages
     let mut llm_messages = vec![
