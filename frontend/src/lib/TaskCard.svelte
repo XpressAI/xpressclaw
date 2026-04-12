@@ -24,12 +24,14 @@
 				const task = await tasks.get(taskId);
 				title = task.title;
 				status = task.status;
-				// Check subtasks
+				// Check subtasks — count from the actual subtask list, not global counts
 				const sub = await tasks.subtasks(taskId).catch(() => null);
-				if (sub) {
-					const c = sub.counts;
-					subtasksTotal = c.pending + c.in_progress + c.waiting_for_input + c.blocked + c.completed + c.cancelled;
-					subtasksCompleted = c.completed;
+				if (sub && sub.tasks.length > 0) {
+					subtasksTotal = sub.tasks.length;
+					subtasksCompleted = sub.tasks.filter((t: any) => t.status === 'completed').length;
+				} else {
+					subtasksTotal = 0;
+					subtasksCompleted = 0;
 				}
 			} catch { /* task may not exist yet */ }
 
