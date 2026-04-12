@@ -262,7 +262,8 @@ async fn run_agent_loop(
 
     let tool_defs = tools::tool_definitions();
     let max_turns = 15;
-    let mut full_content = String::new();
+    let mut all_content = String::new(); // All text across turns (for storage)
+    let mut last_text = String::new(); // Text from the most recent turn
     let mut total_tokens: i64 = 0;
 
     for turn in 0..max_turns {
@@ -341,7 +342,10 @@ async fn run_agent_loop(
             }
         }
 
-        full_content.push_str(&turn_text);
+        if !turn_text.is_empty() {
+            last_text = turn_text.clone();
+            all_content.push_str(&turn_text);
+        }
 
         // Collect accumulated tool calls
         if tool_call_acc.is_empty() {
@@ -397,20 +401,28 @@ async fn run_agent_loop(
         }
     }
 
-    if !full_content.is_empty() {
-        record_and_store(
-            mgr,
-            cost_tracker,
-            budget_mgr,
-            &ctx.rate_limiter,
-            ctx,
-            conv_id,
-            agent_id,
-            model,
-            &full_content,
-            total_tokens,
-        );
-    }
+    // Store the final response. Use the last text the model produced.
+    // If the model only made tool calls on its last turn, use all_content.
+    let store_content = if !last_text.is_empty() {
+        &last_text
+    } else if !all_content.is_empty() {
+        &all_content
+    } else {
+        // Agent produced no text at all — store a placeholder
+        "(No response)"
+    };
+    record_and_store(
+        mgr,
+        cost_tracker,
+        budget_mgr,
+        &ctx.rate_limiter,
+        ctx,
+        conv_id,
+        agent_id,
+        model,
+        store_content,
+        total_tokens,
+    );
 }
 
 /// Record costs, update budget, and store the agent message.

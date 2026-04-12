@@ -94,6 +94,48 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Start the Wanix headless server as a child process.
+    // Provides the agent filesystem environment at localhost:9100.
+    let wanix_shutdown = shutdown.clone();
+    let wanix_child = {
+        // Find the wanix-server directory relative to the executable or cwd
+        let wanix_script = find_wanix_server();
+        if let Some(script) = wanix_script {
+            info!(path = %script.display(), "starting Wanix headless server");
+            match std::process::Command::new("node")
+                .arg(&script)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => {
+                    let pid = child.id();
+                    info!(pid, "Wanix server started");
+                    Some(child)
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to start Wanix server — filesystem tools will be unavailable");
+                    None
+                }
+            }
+        } else {
+            warn!("wanix-server/index.mjs not found — filesystem tools will be unavailable");
+            None
+        }
+    };
+
+    // Clean up Wanix on shutdown
+    let wanix_child_arc = std::sync::Arc::new(std::sync::Mutex::new(wanix_child));
+    let wanix_cleanup = wanix_child_arc.clone();
+    tokio::spawn(async move {
+        wanix_shutdown.cancelled().await;
+        if let Some(ref mut child) = *wanix_cleanup.lock().unwrap() {
+            info!("stopping Wanix server");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    });
+
     // Recover any running workflow instances after restart.
     {
         let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());
@@ -216,4 +258,32 @@ async fn shutdown_signal() {
             .expect("failed to install Ctrl+C handler");
         info!("received shutdown signal");
     }
+}
+
+/// Find the wanix-server/index.mjs script.
+/// Checks: next to the executable, in the cwd, and in the source tree.
+fn find_wanix_server() -> Option<std::path::PathBuf> {
+    let candidates = [
+        // Next to the executable (installed/packaged)
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("wanix-server").join("index.mjs"))),
+        // Current working directory
+        Some(std::path::PathBuf::from("wanix-server/index.mjs")),
+        // Relative to the source tree (dev mode)
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| {
+                // target/release/xpressclaw → project root
+                p.ancestors().nth(3).map(|root| root.join("wanix-server").join("index.mjs"))
+            }),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
