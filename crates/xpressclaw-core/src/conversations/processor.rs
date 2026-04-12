@@ -261,10 +261,11 @@ async fn run_agent_loop(
     }
 
     let tool_defs = tools::tool_definitions();
-    let max_turns = 15;
-    let mut all_content = String::new(); // All text across turns (for storage)
-    let mut last_text = String::new(); // Text from the most recent turn
+    let max_turns = 10;
+    let mut all_content = String::new();
+    let mut last_text = String::new();
     let mut total_tokens: i64 = 0;
+    let mut seen_calls: HashMap<String, String> = HashMap::new(); // dedup tool calls
 
     for turn in 0..max_turns {
         let llm_req = ChatCompletionRequest {
@@ -373,9 +374,27 @@ async fn run_agent_loop(
             ..Default::default()
         });
 
-        // Execute each tool call
+        // Execute each tool call, deduplicating repeated calls
         for tc in &tool_calls {
-            debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
+            let call_key = format!("{}:{}", tc.function.name, tc.function.arguments);
+
+            // Check if we've seen this exact call before
+            let result = if let Some(prev) = seen_calls.get(&call_key) {
+                warn!(conv_id, agent_id, tool = tc.function.name, "duplicate tool call, returning cached result");
+                prev.clone()
+            } else {
+                debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
+                let (r, _is_error) = tools::execute(
+                    &tc.function.name,
+                    &tc.function.arguments,
+                    agent_id,
+                    conv_id,
+                    &ctx.db,
+                )
+                .await;
+                seen_calls.insert(call_key, r.clone());
+                r
+            };
 
             ctx.event_bus.send(
                 conv_id,
@@ -387,15 +406,6 @@ async fn run_agent_loop(
                     ),
                 },
             );
-
-            let (result, _is_error) = tools::execute(
-                &tc.function.name,
-                &tc.function.arguments,
-                agent_id,
-                conv_id,
-                &ctx.db,
-            )
-            .await;
 
             llm_messages.push(ChatMessage::tool_result(&tc.id, result));
         }
