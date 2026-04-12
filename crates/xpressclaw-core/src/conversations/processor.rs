@@ -281,6 +281,7 @@ async fn run_agent_loop(
 
         // Stream the response, collecting text and tool call deltas
         let mut turn_text = String::new();
+        let mut pending_text = String::new();
         let mut in_thinking = false;
         let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new();
 
@@ -312,7 +313,8 @@ async fn run_agent_loop(
                                         );
                                     }
                                 }
-                                // Stream text to frontend immediately
+                                // Collect text content — we'll emit it after
+                                // we know whether this turn has tool calls
                                 if let Some(ref text) = choice.delta.content {
                                     if !text.is_empty() {
                                         if in_thinking {
@@ -327,13 +329,9 @@ async fn run_agent_loop(
                                         }
                                         turn_text.push_str(text);
                                         total_tokens += 1;
-                                        ctx.event_bus.send(
-                                            conv_id,
-                                            ConversationEvent::Chunk {
-                                                agent_id: agent_id.to_string(),
-                                                content: text.clone(),
-                                            },
-                                        );
+                                        // Buffer text — emit after stream ends
+                                        // so we can wrap it in <think> if tools follow
+                                        pending_text.push_str(text);
                                     }
                                 }
                                 // Accumulate tool call deltas
@@ -377,14 +375,46 @@ async fn run_agent_loop(
             }
         }
 
+        // Close any open thinking block from reasoning_content
+        if in_thinking {
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Chunk {
+                    agent_id: agent_id.to_string(),
+                    content: "</think>".to_string(),
+                },
+            );
+        }
+
         if !turn_text.is_empty() {
             last_text = turn_text.clone();
             all_content.push_str(&turn_text);
         }
 
-        // No tool calls — we're done
+        // No tool calls — emit buffered text as regular content and finish
         if tool_call_acc.is_empty() {
+            if !pending_text.is_empty() {
+                ctx.event_bus.send(
+                    conv_id,
+                    ConversationEvent::Chunk {
+                        agent_id: agent_id.to_string(),
+                        content: pending_text,
+                    },
+                );
+            }
             break;
+        }
+
+        // Has tool calls — emit the reasoning text as a <think> block
+        if !pending_text.is_empty() {
+            let reasoning_chunk = format!("<think>{}</think>", pending_text.trim());
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Chunk {
+                    agent_id: agent_id.to_string(),
+                    content: reasoning_chunk,
+                },
+            );
         }
 
         let tool_calls: Vec<ToolCall> = {
@@ -419,14 +449,14 @@ async fn run_agent_loop(
                 llm_messages.push(ChatMessage::tool_result(
                     &tc.id,
                     format!(
-                        "BLOCKED: You must explain your reasoning BEFORE making tool calls. \
-                         Write a sentence explaining WHY you are calling {} and what you \
-                         expect to achieve. Then make the tool call again.",
+                        "BLOCKED: Before calling tools, write ONE concise sentence \
+                         explaining why you are calling {}. Be brief — just state your \
+                         intent, then call the tool.",
                         tc.function.name
                     ),
                 ));
             }
-            continue; // retry — the model should produce text next turn
+            continue;
         }
 
         if !seen_reasoning.insert(reasoning.clone()) {
