@@ -265,7 +265,8 @@ async fn run_agent_loop(
     let mut all_content = String::new();
     let mut last_text = String::new();
     let mut total_tokens: i64 = 0;
-    let mut seen_calls: HashMap<String, String> = HashMap::new(); // dedup tool calls
+    let mut seen_calls: HashMap<String, String> = HashMap::new();
+    let mut seen_reasoning: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for turn in 0..max_turns {
         let llm_req = ChatCompletionRequest {
@@ -348,25 +349,60 @@ async fn run_agent_loop(
             all_content.push_str(&turn_text);
         }
 
-        // Collect accumulated tool calls
+        // No tool calls — we're done
         if tool_call_acc.is_empty() {
-            break; // No tool calls — we're done
+            break;
         }
 
-        let mut tool_calls: Vec<ToolCall> = tool_call_acc
-            .into_iter()
-            .map(|(_, (id, name, args))| ToolCall {
-                id,
-                call_type: "function".into(),
-                function: ToolCallFunction {
-                    name,
-                    arguments: args,
-                },
-            })
-            .collect();
-        tool_calls.sort_by_key(|tc| tc.id.clone());
+        let tool_calls: Vec<ToolCall> = {
+            let mut tcs: Vec<ToolCall> = tool_call_acc
+                .into_iter()
+                .map(|(_, (id, name, args))| ToolCall {
+                    id,
+                    call_type: "function".into(),
+                    function: ToolCallFunction { name, arguments: args },
+                })
+                .collect();
+            tcs.sort_by_key(|tc| tc.id.clone());
+            tcs
+        };
 
-        // Add assistant message with tool calls to conversation
+        // --- Reasoning gate ---
+        // The model MUST produce text (reasoning) alongside tool calls.
+        // The reasoning must be unique — if we've seen the same reasoning
+        // before, the model is looping and we break.
+        let reasoning = turn_text.trim().to_string();
+
+        if reasoning.is_empty() {
+            // No reasoning provided — tell the model to explain itself
+            warn!(conv_id, agent_id, turn, "tool calls without reasoning, requesting explanation");
+            llm_messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(tool_calls.clone()),
+                ..Default::default()
+            });
+            for tc in &tool_calls {
+                llm_messages.push(ChatMessage::tool_result(
+                    &tc.id,
+                    format!(
+                        "BLOCKED: You must explain your reasoning BEFORE making tool calls. \
+                         Write a sentence explaining WHY you are calling {} and what you \
+                         expect to achieve. Then make the tool call again.",
+                        tc.function.name
+                    ),
+                ));
+            }
+            continue; // retry — the model should produce text next turn
+        }
+
+        if !seen_reasoning.insert(reasoning.clone()) {
+            // Duplicate reasoning — model is looping
+            warn!(conv_id, agent_id, turn, reasoning = reasoning, "duplicate reasoning, breaking loop");
+            break;
+        }
+
+        // Add assistant message with reasoning + tool calls
         llm_messages.push(ChatMessage {
             role: "assistant".into(),
             content: turn_text,
@@ -374,21 +410,16 @@ async fn run_agent_loop(
             ..Default::default()
         });
 
-        // Execute each tool call, blocking duplicates
-        let mut has_duplicate = false;
+        // Execute each tool call
         for tc in &tool_calls {
             let call_key = format!("{}:{}", tc.function.name, tc.function.arguments);
 
-            let result = if seen_calls.contains_key(&call_key) {
+            let result = if let Some(prev) = seen_calls.get(&call_key) {
                 warn!(conv_id, agent_id, tool = tc.function.name, "duplicate tool call blocked");
-                has_duplicate = true;
                 format!(
-                    "ERROR: You already called {} with these exact arguments. \
-                     The result was: {}\n\
-                     Do NOT call this tool again with the same arguments. \
-                     Move on to the next step or respond to the user.",
-                    tc.function.name,
-                    seen_calls.get(&call_key).unwrap()
+                    "ALREADY DONE: You already called {} with these arguments. Result: {}\n\
+                     Move on to the next step.",
+                    tc.function.name, prev
                 )
             } else {
                 debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
@@ -404,6 +435,8 @@ async fn run_agent_loop(
                 r
             };
 
+            // The reasoning was already streamed to the frontend above.
+            // Now show the tool call.
             ctx.event_bus.send(
                 conv_id,
                 ConversationEvent::Chunk {
@@ -416,17 +449,6 @@ async fn run_agent_loop(
             );
 
             llm_messages.push(ChatMessage::tool_result(&tc.id, result));
-        }
-
-        // If every tool call this turn was a duplicate, break
-        let all_dupes = tool_calls.iter().all(|tc| {
-            let key = format!("{}:{}", tc.function.name, tc.function.arguments);
-            // The key exists BEFORE this turn added it = it was a dupe
-            seen_calls.contains_key(&key)
-        });
-        if all_dupes && has_duplicate {
-            warn!(conv_id, agent_id, turn, "all tool calls are duplicates, breaking loop");
-            break;
         }
     }
 
