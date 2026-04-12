@@ -246,16 +246,45 @@ async fn get_app_logs(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
 // App proxy: will be served from Wanix in the future
 // ---------------------------------------------------------------------------
 
+/// Proxy app requests to the Wanix server which serves files from the
+/// agent's workspace filesystem.
 async fn proxy_handler(
     State(_state): State<AppState>,
-    Path(_rest): Path<String>,
+    Path(rest): Path<String>,
     _req: axum::extract::Request,
 ) -> axum::response::Response {
-    axum::response::Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            json!({"error": "app proxy not available"}).to_string(),
-        ))
-        .unwrap()
+    // Route: /apps/{app_id}/{path} → Wanix server GET /app/{app_id}/{path}
+    let wanix_url = format!("http://localhost:9100/app/{rest}");
+
+    let client = reqwest::Client::new();
+    match client
+        .get(&wanix_url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/plain")
+                .to_string();
+            let body = resp.bytes().await.unwrap_or_default();
+
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+        Err(e) => axum::response::Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"error": format!("Wanix server not available: {e}")}).to_string(),
+            ))
+            .unwrap(),
+    }
 }

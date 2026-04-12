@@ -197,6 +197,74 @@ async function main() {
     // The xpressclaw Rust server calls these endpoints to execute tools
     // in the Wanix environment.
     const apiServer = createServer(async (req, res) => {
+        const url = new URL(req.url, `http://localhost:${PORT}`);
+
+        // GET /app/{name}/{path} — serve files from the Wanix workspace
+        if (req.method === 'GET' && url.pathname.startsWith('/app/')) {
+            const parts = url.pathname.slice(5); // strip "/app/"
+            // Try workspace/{path} first, then workspace/apps/{path}
+            const filePath = 'workspace/' + parts;
+
+            try {
+                const result = await page.evaluate(async (path) => {
+                    const w = window.__wanixInstance;
+                    try {
+                        // Try direct path first, then apps/ subdirectory
+                        let stat = await w.stat(path).catch(() => null);
+                        if (!stat) {
+                            const altPath = path.replace('workspace/', 'workspace/apps/');
+                            stat = await w.stat(altPath).catch(() => null);
+                            if (stat) path = altPath;
+                        }
+                        if (!stat) return { status: 404 };
+
+                        if (stat.isDir) {
+                            // Try index.html
+                            const indexPath = path.endsWith('/') ? path + 'index.html' : path + '/index.html';
+                            try {
+                                const content = await w.readText(indexPath);
+                                return { status: 200, content, type: 'text/html' };
+                            } catch {
+                                // List directory
+                                const entries = await w.readDir(path);
+                                return { status: 200, content: entries.join('\n'), type: 'text/plain' };
+                            }
+                        }
+
+                        const content = await w.readText(path);
+                        return { status: 200, content };
+                    } catch (e) {
+                        return { status: 500, content: e.message || String(e) };
+                    }
+                }, filePath);
+
+                if (result.status === 404) {
+                    res.writeHead(404);
+                    res.end('not found');
+                    return;
+                }
+
+                // Detect content type from extension
+                const ext = parts.split('.').pop()?.toLowerCase() || '';
+                const types = {
+                    html: 'text/html', css: 'text/css', js: 'application/javascript',
+                    json: 'application/json', svg: 'image/svg+xml', png: 'image/png',
+                    txt: 'text/plain', xml: 'application/xml',
+                };
+                const contentType = result.type || types[ext] || 'text/plain';
+
+                res.writeHead(result.status, {
+                    'Content-Type': contentType,
+                    'Access-Control-Allow-Origin': '*',
+                });
+                res.end(result.content);
+            } catch (e) {
+                res.writeHead(500);
+                res.end(String(e));
+            }
+            return;
+        }
+
         if (req.method !== 'POST') {
             res.writeHead(405);
             res.end('POST only');
