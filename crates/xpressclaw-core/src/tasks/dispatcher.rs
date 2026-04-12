@@ -286,7 +286,14 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
         // Continuation prompt — the agent session preserves context,
         // so we don't replay history (that causes it to render inside
         // the system message in the UI). Just nudge the agent forward.
-        prompt.push_str("Continue working on the current task.");
+        prompt.push_str(&format!(
+            "Continue working on the current task.\n\
+             Task: {}\nDescription: {}\n\
+             DO NOT call list_tasks — you already know what to do. \
+             Focus on completing the work using Write, MakeDir, and other tools.",
+            ctx.task.title,
+            ctx.task.description.as_deref().unwrap_or("(no description)"),
+        ));
 
         if let Some(subtask) = current_subtask(&ctx.subtasks) {
             prompt.push_str(&format!("\n\nCurrent step: {}", subtask.title));
@@ -347,7 +354,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
         ChatMessage::text("user", &ctx.current_prompt),
     ];
 
-    let tool_defs = tools::tool_definitions();
+    let tool_defs = tools::task_tool_definitions(&ctx.task.id);
     let conv = TaskConversation::new(db.clone());
     let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
     let msg_id = streaming_msg.map(|m| m.id);
@@ -355,6 +362,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     let mut full_content = String::new();
     let max_tool_turns = 10;
     let mut seen_tool_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tool_name_counts: HashMap<String, usize> = HashMap::new();
 
     for tool_turn in 0..max_tool_turns {
         let llm_req = ChatCompletionRequest {
@@ -448,7 +456,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
             })
             .collect();
 
-        // Loop detection: if the exact same set of tool calls repeats, break
+        // Loop detection
         let mut tool_key_parts: Vec<String> = tool_calls
             .iter()
             .map(|tc| format!("{}:{}", tc.function.name, tc.function.arguments))
@@ -456,8 +464,18 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
         tool_key_parts.sort();
         let loop_key = tool_key_parts.join("|");
         if !loop_key.is_empty() && !seen_tool_keys.insert(loop_key) {
-            warn!(task_id = ctx.task.id, tool_turn, "duplicate tool call set in task, breaking");
+            warn!(task_id = ctx.task.id, tool_turn, "duplicate tool call set, breaking");
             break;
+        }
+        // Also break if any single tool is called too many times
+        for tc in &tool_calls {
+            let count = tool_name_counts.entry(tc.function.name.clone()).or_insert(0);
+            *count += 1;
+            if *count > 3 {
+                warn!(task_id = ctx.task.id, tool = tc.function.name, count, "tool called too many times, breaking");
+                // Don't execute this turn's tools
+                break;
+            }
         }
 
         llm_messages.push(ChatMessage {

@@ -16,18 +16,39 @@ use crate::tasks::board::{CreateTask, TaskBoard};
 /// Default Wanix server URL.
 const WANIX_URL: &str = "http://localhost:9100";
 
-/// Tool definitions sent to the LLM so it knows what's available.
-pub fn tool_definitions() -> Vec<Value> {
+/// Tool definitions for task execution — only workspace + complete_task.
+/// No list_tasks, create_task, or search_memory to avoid meta-loops.
+pub fn task_tool_definitions(task_id: &str) -> Vec<Value> {
+    let mut tools = workspace_tools();
+    tools.push(json!({
+        "type": "function",
+        "function": {
+            "name": "complete_task",
+            "description": "Mark the current task as completed. Call this when all work is done.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string", "description": "The task ID", "const": task_id }
+                },
+                "required": ["task_id"]
+            }
+        }
+    }));
+    tools
+}
+
+/// Workspace file tools shared by both conversations and tasks.
+fn workspace_tools() -> Vec<Value> {
     vec![
         json!({
             "type": "function",
             "function": {
                 "name": "Read",
-                "description": "Read a file from the agent's workspace.",
+                "description": "Read a file from the workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "file_path": { "type": "string", "description": "Path relative to workspace (e.g. 'src/main.py')" }
+                        "file_path": { "type": "string", "description": "Path relative to workspace" }
                     },
                     "required": ["file_path"]
                 }
@@ -37,7 +58,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "Write",
-                "description": "Write content to a file in the agent's workspace. Creates the file if it does not exist.",
+                "description": "Write content to a file in the workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -52,11 +73,11 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "ListDir",
-                "description": "List files and directories in the agent's workspace.",
+                "description": "List files and directories in the workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory path relative to workspace (empty for root)" }
+                        "path": { "type": "string", "description": "Directory path relative to workspace" }
                     }
                 }
             }
@@ -65,16 +86,23 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "MakeDir",
-                "description": "Create a directory in the agent's workspace.",
+                "description": "Create a directory in the workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory path relative to workspace" }
+                        "path": { "type": "string", "description": "Directory path" }
                     },
                     "required": ["path"]
                 }
             }
         }),
+    ]
+}
+
+/// Full tool definitions for conversations (workspace + memory + tasks).
+pub fn tool_definitions() -> Vec<Value> {
+    let mut tools = workspace_tools();
+    tools.extend(vec![
         json!({
             "type": "function",
             "function": {
@@ -147,7 +175,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ]);
+    tools
 }
 
 /// Execute a tool call and return the result as a string.
@@ -198,9 +227,11 @@ pub async fn execute(
             let status = args["status"].as_str();
             execute_list_tasks(status, agent_id, db)
         }
-        "update_task" => {
+        "update_task" | "complete_task" => {
             let task_id = args["task_id"].as_str().unwrap_or("");
-            let status = args["status"].as_str().unwrap_or("");
+            let status = if name == "complete_task" { "completed" } else {
+                args["status"].as_str().unwrap_or("")
+            };
             execute_update_task(task_id, status, db)
         }
         _ => {
