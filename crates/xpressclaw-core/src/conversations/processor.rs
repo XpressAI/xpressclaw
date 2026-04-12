@@ -248,7 +248,13 @@ async fn run_agent_loop(
     use crate::llm::router::{ToolCall, ToolCallFunction};
     use std::collections::HashMap;
 
-    let mut llm_messages = vec![ChatMessage::text("system", role)];
+    let system_prompt = format!(
+        "{role}\n\n\
+         IMPORTANT: When using tools, always write ONE short sentence explaining \
+         your intent before the tool call. Keep it concise — no plans, no lists, \
+         just state what you're doing and why in a single sentence."
+    );
+    let mut llm_messages = vec![ChatMessage::text("system", &system_prompt)];
     for m in history {
         match m.sender_type.as_str() {
             "agent" => llm_messages.push(ChatMessage::text("assistant", &m.content)),
