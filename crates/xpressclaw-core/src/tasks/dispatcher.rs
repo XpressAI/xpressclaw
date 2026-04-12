@@ -20,7 +20,6 @@ use tracing::{debug, error, info, warn};
 use serde_json::json;
 
 use crate::activity::ActivityManager;
-use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
 use crate::config::HooksConfig;
@@ -67,7 +66,6 @@ pub enum DriverResult {
 struct Context {
     task: Task,
     agent_id: String,
-    harness_port: u16,
     system_prompt: String,
     turn: usize,
     max_turns: usize,
@@ -162,10 +160,6 @@ async fn load_task(
         return State::Done(DriverResult::Requeue);
     }
 
-    // Without Docker, there's no harness container. Tasks are processed
-    // via the LLM router directly. We use port 0 as a sentinel.
-    let harness_port: u16 = 0;
-
     // Load subtasks
     let subtasks = board.list_subtasks(task_id).unwrap_or_default();
     let max_turns = if subtasks.is_empty() {
@@ -187,7 +181,6 @@ async fn load_task(
     *ctx = Some(Context {
         task: board.get(task_id).unwrap_or(task),
         agent_id: agent_id.to_string(),
-        harness_port,
         system_prompt,
         turn: 0,
         max_turns,
@@ -327,127 +320,151 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
 }
 
 async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+    use crate::conversations::tools;
+    use crate::llm::router::{
+        ChatCompletionRequest, ChatMessage, LlmRouter, ToolCall, ToolCallFunction,
+    };
     use futures_util::StreamExt;
-
-    let harness = HarnessClient::new(ctx.harness_port);
+    use std::collections::HashMap;
 
     debug!(
         task_id = ctx.task.id,
         turn = ctx.turn,
         agent_id = ctx.agent_id,
-        "calling agent harness"
+        "calling LLM for task"
     );
 
-    // Memory recall hook: first turn only, if agent has memories.
-    if ctx.turn == 0 && hooks::has_recall_hook(&ctx.hooks) {
-        let mem_hooks = MemoryHooks::new(db.clone(), &config.memory.eviction);
-        if let Some(recollection) = mem_hooks
-            .recall(
-                &ctx.agent_id,
-                ctx.task.description.as_deref().unwrap_or(&ctx.task.title),
-                ctx.harness_port,
-            )
-            .await
-        {
-            // Save recollection as a task message (visible in task UI)
-            let conv = TaskConversation::new(db.clone());
-            let _ = conv.add_message(
-                &ctx.task.id,
-                "system",
-                &format!("*Recollection:* {recollection}"),
-            );
-            // Prepend to the prompt so the agent sees it this turn
-            ctx.current_prompt = format!(
-                "Memory recollection:\n{recollection}\n\n{}",
-                ctx.current_prompt
-            );
-        }
-    }
+    let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::new(&config.llm));
 
-    let conv_id = ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id);
+    // Build messages
+    let mut llm_messages = vec![
+        ChatMessage::text("system", &ctx.system_prompt),
+        ChatMessage::text("user", &ctx.current_prompt),
+    ];
 
-    // Use streaming session endpoint so tool calls and intermediate
-    // text appear in task_messages as they happen.
-    match harness
-        .send_session_message(
-            &ctx.current_prompt,
-            conv_id,
-            "system",
-            "system",
-            &ctx.system_prompt,
-            &serde_json::json!([]),
-        )
-        .await
-    {
-        Ok(mut stream) => {
-            let conv = TaskConversation::new(db.clone());
-            // Create a streaming message that we update as content arrives.
-            // This lets the frontend's 3s polling show incremental progress.
-            let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
-            let msg_id = streaming_msg.map(|m| m.id);
+    let tool_defs = tools::tool_definitions();
+    let conv = TaskConversation::new(db.clone());
+    let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
+    let msg_id = streaming_msg.map(|m| m.id);
 
-            let mut full_content = String::new();
-            let mut last_saved_len = 0;
+    let mut full_content = String::new();
+    let max_tool_turns = 10;
 
-            while let Some(result) = stream.next().await {
-                if let Ok(chunk) = result {
-                    if let Some(choice) = chunk.choices.first() {
-                        if let Some(ref text) = choice.delta.content {
-                            full_content.push_str(text);
+    for tool_turn in 0..max_tool_turns {
+        let llm_req = ChatCompletionRequest {
+            model: config
+                .agents
+                .iter()
+                .find(|a| a.name == ctx.agent_id)
+                .and_then(|a| a.model.clone())
+                .unwrap_or_else(|| "default".to_string()),
+            messages: llm_messages.clone(),
+            temperature: Some(0.7),
+            max_tokens: Some(4096),
+            stream: Some(true),
+            tools: Some(tool_defs.clone()),
+            ..Default::default()
+        };
+
+        let mut turn_text = String::new();
+        let mut tool_call_acc: HashMap<i64, (String, String, String)> = HashMap::new();
+
+        match llm_router.chat_stream(&llm_req).await {
+            Ok(mut stream) => {
+                while let Some(result) = stream.next().await {
+                    if let Ok(chunk) = result {
+                        if let Some(choice) = chunk.choices.first() {
+                            if let Some(ref text) = choice.delta.content {
+                                if !text.is_empty() {
+                                    turn_text.push_str(text);
+                                }
+                            }
+                            if let Some(ref tcs) = choice.delta.tool_calls {
+                                for tc in tcs {
+                                    let entry = tool_call_acc
+                                        .entry(tc.index)
+                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(ref id) = tc.id {
+                                        entry.0 = id.clone();
+                                    }
+                                    if let Some(ref func) = tc.function {
+                                        if let Some(ref name) = func.name {
+                                            entry.1 = name.clone();
+                                        }
+                                        if let Some(ref args) = func.arguments {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-
-                // Update the streaming message whenever a tool_call
-                // completes or every 2KB of new content — whichever
-                // comes first. This keeps the UI responsive.
-                let new_bytes = full_content.len() - last_saved_len;
-                let tool_call_ended = full_content[last_saved_len..].contains("</tool_call>");
-                if let Some(id) = msg_id {
-                    if tool_call_ended || new_bytes >= 2048 {
-                        let _ = conv.update_message_content(id, &full_content);
-                        last_saved_len = full_content.len();
-                    }
-                }
             }
-
-            // Final update with complete content
-            if let Some(id) = msg_id {
-                let _ = conv.update_message_content(id, &full_content);
+            Err(e) => {
+                return State::Done(DriverResult::Failed(format!("LLM error: {e}")));
             }
-
-            ctx.last_response = full_content;
-            State::ProcessResponse
         }
-        Err(e) => {
-            error!(
-                task_id = ctx.task.id,
-                turn = ctx.turn,
-                error = %e,
-                "harness session call failed"
-            );
-            State::Done(DriverResult::Failed(format!("harness error: {e}")))
+
+        if !turn_text.is_empty() {
+            full_content = turn_text.clone();
+        }
+
+        // Update streaming message
+        if let Some(id) = msg_id {
+            let display = if full_content.is_empty() { "(working...)" } else { &full_content };
+            let _ = conv.update_message_content(id, display);
+        }
+
+        if tool_call_acc.is_empty() {
+            break;
+        }
+
+        let tool_calls: Vec<ToolCall> = tool_call_acc
+            .into_iter()
+            .map(|(_, (id, name, args))| ToolCall {
+                id,
+                call_type: "function".into(),
+                function: ToolCallFunction { name, arguments: args },
+            })
+            .collect();
+
+        llm_messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: turn_text,
+            tool_calls: Some(tool_calls.clone()),
+            ..Default::default()
+        });
+
+        for tc in &tool_calls {
+            let (result, _) = tools::execute(
+                &tc.function.name,
+                &tc.function.arguments,
+                &ctx.agent_id,
+                ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id),
+                db,
+            )
+            .await;
+            llm_messages.push(ChatMessage::tool_result(&tc.id, result));
         }
     }
+
+    // Final update
+    if let Some(id) = msg_id {
+        let display = if full_content.is_empty() { "(No response)" } else { &full_content };
+        let _ = conv.update_message_content(id, display);
+    }
+
+    ctx.last_response = full_content;
+    State::ProcessResponse
 }
 
 fn process_response(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
     // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
 
-    // Async memory remember hook — runs in background, doesn't block
-    if hooks::has_remember_hook(&ctx.hooks) {
-        let db2 = db.clone();
-        let eviction = config.memory.eviction.clone();
-        let aid = ctx.agent_id.clone();
-        let prompt = ctx.current_prompt.clone();
-        let resp = ctx.last_response.clone();
-        let hp = ctx.harness_port;
-        tokio::spawn(async move {
-            let mem_hooks = MemoryHooks::new(db2, &eviction);
-            mem_hooks.remember(&aid, &prompt, &resp, hp).await;
-        });
-    }
+    // Memory hooks disabled — no harness port for sub-agent recall.
+    // TODO: implement memory hooks via Wanix or direct LLM calls.
 
     debug!(
         task_id = ctx.task.id,
