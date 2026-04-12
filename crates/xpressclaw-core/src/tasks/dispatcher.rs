@@ -360,7 +360,7 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
                 .unwrap_or_else(|| "default".to_string()),
             messages: llm_messages.clone(),
             temperature: Some(0.7),
-            max_tokens: Some(4096),
+            max_tokens: Some(32768),
             stream: Some(true),
             tools: Some(tool_defs.clone()),
             ..Default::default()

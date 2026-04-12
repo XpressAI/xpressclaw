@@ -279,7 +279,7 @@ async fn run_agent_loop(
             model: model.to_string(),
             messages: llm_messages.clone(),
             temperature: Some(0.7),
-            max_tokens: Some(4096),
+            max_tokens: Some(32768),
             stream: Some(true),
             tools: if tool_defs.is_empty() { None } else { Some(tool_defs.clone()) },
             ..Default::default()
