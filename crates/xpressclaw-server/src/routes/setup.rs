@@ -533,6 +533,7 @@ async fn complete_setup(
                 agents: old_config.agents.clone(),
                 mcp_servers: old_config.mcp_servers.clone(),
                 system: old_config.system.clone(),
+                pi: old_config.pi.clone(),
                 ..Default::default()
             };
             let _ = new_config.save(&state.config_path);
@@ -573,6 +574,7 @@ async fn complete_setup(
                         agents: old_config.agents.clone(),
                         mcp_servers: old_config.mcp_servers.clone(),
                         system: old_config.system.clone(),
+                        pi: old_config.pi.clone(),
                         ..Default::default()
                     };
                     let _ = new_config.save(&config_path);
@@ -707,6 +709,7 @@ async fn add_agent(
         llm: old_config.llm.clone(),
         mcp_servers: new_mcp,
         system: old_config.system.clone(),
+        pi: old_config.pi.clone(),
         ..Default::default()
     };
     new_config

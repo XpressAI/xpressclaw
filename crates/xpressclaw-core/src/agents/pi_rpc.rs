@@ -195,6 +195,65 @@ pub struct PiProcess {
     alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Resolve a configured path against well-known locations.
+///
+/// 1. If absolute and exists, use as-is.
+/// 2. Search: cwd, $XPRESSCLAW_REPO, exe-dir, exe-dir/../.. (dev tree).
+/// 3. Fall back to the configured value (will fail with a clear error
+///    when c2w-net tries to read it).
+fn resolve_path(p: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(p);
+    if path.is_absolute() && path.exists() {
+        return path.to_path_buf();
+    }
+    let mut candidates: Vec<std::path::PathBuf> = vec![std::env::current_dir()
+        .unwrap_or_else(|_| ".".into())
+        .join(p)];
+    if let Ok(repo) = std::env::var("XPRESSCLAW_REPO") {
+        candidates.push(std::path::PathBuf::from(repo).join(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            candidates.push(d.join(p));
+        }
+        if let Some(root) = exe.ancestors().nth(3) {
+            candidates.push(root.join(p));
+        }
+    }
+    for c in &candidates {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Find an executable: absolute path, $PATH, or common install dirs.
+fn find_exe(name: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(name);
+    if p.is_absolute() && p.exists() {
+        return p.to_path_buf();
+    }
+    if let Ok(out) = std::process::Command::new("which").arg(name).output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return std::path::PathBuf::from(s);
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidates = [".local/bin", "bin", ".cargo/bin"];
+        for sub in candidates {
+            let cand = std::path::PathBuf::from(&home).join(sub).join(name);
+            if cand.exists() {
+                return cand;
+            }
+        }
+    }
+    p.to_path_buf()
+}
+
 impl PiProcess {
     /// Spawn the pi WASM container without broadcasting terminal output.
     pub async fn spawn(cfg: &PiLaunchConfig) -> Result<Self> {
@@ -208,7 +267,30 @@ impl PiProcess {
         cfg: &PiLaunchConfig,
         terminal: Option<Arc<PiTerminalBus>>,
     ) -> Result<Self> {
-        let shim_dir = std::path::Path::new(&cfg.wasmtime_shim)
+        let shim_path = resolve_path(&cfg.wasmtime_shim);
+        let wasm_path = resolve_path(&cfg.wasm_path);
+        let c2w_net_path = find_exe(&cfg.c2w_net);
+
+        if !shim_path.exists() {
+            return Err(Error::Agent(format!(
+                "wasmtime-shim not found at {} — set config.pi.wasmtime_shim",
+                shim_path.display()
+            )));
+        }
+        if !wasm_path.exists() {
+            return Err(Error::Agent(format!(
+                "pi-agent.wasm not found at {} — run scripts/build-pi-agent-wasm.sh",
+                wasm_path.display()
+            )));
+        }
+        if !c2w_net_path.exists() {
+            return Err(Error::Agent(format!(
+                "c2w-net not found ({}) — install from container2wasm releases",
+                c2w_net_path.display()
+            )));
+        }
+
+        let shim_dir = shim_path
             .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".".into());
@@ -228,9 +310,9 @@ impl PiProcess {
             "spawning pi-agent WASM container"
         );
 
-        let mut child = Command::new(&cfg.c2w_net)
+        let mut child = Command::new(&c2w_net_path)
             .arg("-invoke")
-            .arg(&cfg.wasm_path)
+            .arg(&wasm_path)
             .arg("--net=socket")
             .env("PATH", &path)
             .env("WASMTIME_EXTRA_ENV", &extra_env)
