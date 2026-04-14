@@ -5,22 +5,30 @@
 //!
 //! The subprocess chain is:
 //!
-//!     xpressclaw  ──stdin──▶  c2w-net -invoke pi-agent.wasm --net=socket
-//!                              │
-//!                              └─▶ wasmtime (patched Bochs) boots Linux
-//!                                  ├─ entrypoint.sh mounts mcpfs
-//!                                  └─ pi --mode rpc (reads stdin, writes stdout)
+//! ```text
+//!     xpressclaw  --stdin-->  c2w-net -invoke pi-agent.wasm --net=socket
+//!                              |
+//!                              +-> wasmtime (patched Bochs) boots Linux
+//!                                  |- entrypoint.sh mounts mcpfs
+//!                                  +- pi --mode rpc (reads stdin, writes stdout)
+//! ```
 //!
 //! We send prompts as:
-//!     {"type":"prompt","message":"..."}
+//!
+//! ```text
+//! {"type":"prompt","message":"..."}
+//! ```
 //!
 //! Pi streams back event lines like:
-//!     {"type":"agent_start"}
-//!     {"type":"message_update","assistantMessageEvent":{"type":"thinking_delta", ...}}
-//!     {"type":"message_update","assistantMessageEvent":{"type":"text_delta", ...}}
-//!     {"type":"tool_execution_start","tool":"...","params":{...}}
-//!     {"type":"tool_execution_end","tool":"...","result":...}
-//!     {"type":"agent_end", ...}
+//!
+//! ```text
+//! {"type":"agent_start"}
+//! {"type":"message_update","assistantMessageEvent":{"type":"thinking_delta", ...}}
+//! {"type":"message_update","assistantMessageEvent":{"type":"text_delta", ...}}
+//! {"type":"tool_execution_start","tool":"...","params":{...}}
+//! {"type":"tool_execution_end","tool":"...","result":...}
+//! {"type":"agent_end", ...}
+//! ```
 //!
 //! Network: host services are reachable at `192.168.127.254` from inside
 //! the container (c2w-net's NAT gateway).
