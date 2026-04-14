@@ -433,7 +433,12 @@ impl ConversationManager {
 
     /// Update an existing task_status message for a given task_id.
     /// Returns true if a message was found and updated.
-    pub fn update_task_status_message(&self, conv_id: &str, task_id: &str, new_content: &str) -> bool {
+    pub fn update_task_status_message(
+        &self,
+        conv_id: &str,
+        task_id: &str,
+        new_content: &str,
+    ) -> bool {
         // Find the message by searching for the task_id in content
         // (task_status messages are JSON with a task_id field)
         let search = format!("\"task_id\":\"{}\"", task_id);
