@@ -1,0 +1,1 @@
+CI lint fix. Removed unused MemoryHooks/LlmRouter imports, _-prefixed unused params in process_response, #[allow(dead_code)] on the truly-dead hooks/tail/source_dir fields, replaced format!(static_string) with .to_string(), &format!() with format!(), push_str("\n") with push('\n'), for (_, x) in map with map.values(). Then cargo fmt over the four crates the CI checks.
