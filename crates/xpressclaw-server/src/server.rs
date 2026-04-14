@@ -16,6 +16,8 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/v1", routes::llm::routes())
         .nest("/v1/tools", routes::tools_proxy_routes())
         .nest("/apps", routes::app_proxy_routes())
+        // MCP endpoint for pi-agent WASM containers (mounted via mcpfs).
+        .merge(routes::mcp_server::routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())

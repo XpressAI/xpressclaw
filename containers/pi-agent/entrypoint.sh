@@ -6,7 +6,9 @@ set -euo pipefail
 # Starts mcpfs to mount xpressclaw tools, then runs pi in RPC mode.
 # Communication with xpressclaw is via JSONL over stdin/stdout.
 
-XPRESSCLAW_URL="${XPRESSCLAW_URL:-http://host.docker.internal:8935}"
+# c2w-net NATs the host to 192.168.127.254 for the guest. The xpressclaw
+# main server hosts the `/mcp` endpoint on port 8935.
+XPRESSCLAW_URL="${XPRESSCLAW_URL:-http://192.168.127.254:8935}"
 AGENT_ID="${AGENT_ID:-assistant}"
 WORKSPACE="/workspace"
 
@@ -28,8 +30,8 @@ fi
 
 # --- Configure pi ---
 # Set the model from environment (xpressclaw passes this)
-export PI_MODEL="${LLM_MODEL:-claude-sonnet-4-20250514}"
-export PI_PROVIDER="${LLM_PROVIDER:-anthropic}"
+export PI_MODEL="${LLM_MODEL:-local}"
+export PI_PROVIDER="${LLM_PROVIDER:-xpressclaw}"
 
 # API keys from environment
 # (xpressclaw injects these based on agent config)

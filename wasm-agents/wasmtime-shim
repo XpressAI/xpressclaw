@@ -1,0 +1,23 @@
+#!/bin/bash
+# Shim that injects env vars before the `--` separator.
+# c2w-net calls: wasmtime run <flags> -- <wasm> <args>
+# We splice --env flags in from WASMTIME_EXTRA_ENV.
+
+REAL_WASMTIME="$HOME/.wasmtime/bin/wasmtime"
+
+if [ -n "${WASMTIME_EXTRA_ENV:-}" ]; then
+    new_args=()
+    injected=0
+    for arg in "$@"; do
+        if [ "$arg" = "--" ] && [ "$injected" = "0" ]; then
+            for kv in $WASMTIME_EXTRA_ENV; do
+                new_args+=("--env" "$kv")
+            done
+            injected=1
+        fi
+        new_args+=("$arg")
+    done
+    exec "$REAL_WASMTIME" "${new_args[@]}"
+else
+    exec "$REAL_WASMTIME" "$@"
+fi

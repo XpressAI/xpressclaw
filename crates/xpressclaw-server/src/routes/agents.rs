@@ -126,6 +126,7 @@ async fn delete_agent(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        pi: old_config.pi.clone(),
     };
     let _ = new_config.save(&state.config_path);
     let new_config = std::sync::Arc::new(new_config);
@@ -314,6 +315,7 @@ async fn update_agent_config(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        pi: old_config.pi.clone(),
     };
     new_config
         .save(&state.config_path)

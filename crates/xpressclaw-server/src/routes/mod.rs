@@ -12,6 +12,7 @@ mod connectors;
 mod conversations;
 mod health;
 pub mod llm;
+pub mod mcp_server;
 mod memory;
 mod office;
 mod open_url;

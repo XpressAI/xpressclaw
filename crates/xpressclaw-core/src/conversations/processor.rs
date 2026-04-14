@@ -202,19 +202,37 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             );
             tokio::task::yield_now().await;
 
-            // Run the agentic loop: call LLM, execute tools, repeat.
-            run_agent_loop(
-                ctx,
-                &mgr,
-                &cost_tracker,
-                &budget_mgr,
-                conv_id,
-                agent_id,
-                &model,
-                &role,
-                &history,
-            )
-            .await;
+            // Run the agent. Pi WASM path when configured; otherwise
+            // the built-in Rust LLM loop.
+            if ctx.config.pi.enabled {
+                run_pi_agent(
+                    ctx,
+                    &mgr,
+                    &cost_tracker,
+                    &budget_mgr,
+                    conv_id,
+                    agent_id,
+                    &model,
+                    &role,
+                    &last_user_msg,
+                    &sender_name,
+                    &history_json,
+                )
+                .await;
+            } else {
+                run_agent_loop(
+                    ctx,
+                    &mgr,
+                    &cost_tracker,
+                    &budget_mgr,
+                    conv_id,
+                    agent_id,
+                    &model,
+                    &role,
+                    &history,
+                )
+                .await;
+            }
         }
 
         if !mgr.has_unprocessed(conv_id) {
@@ -653,6 +671,223 @@ fn record_and_store(
             "response_len": content.len(),
         })),
         None,
+    );
+}
+
+/// Run a turn via a pi-agent WASM container (ADR-003 rewrite).
+///
+/// Streams pi events into the conversation event bus as `<think>` blocks
+/// and text chunks, then stores the final assistant message.
+#[allow(clippy::too_many_arguments)]
+async fn run_pi_agent(
+    ctx: &ProcessorContext,
+    mgr: &ConversationManager,
+    cost_tracker: &CostTracker,
+    budget_mgr: &BudgetManager,
+    conv_id: &str,
+    agent_id: &str,
+    model: &str,
+    role: &str,
+    user_msg: &str,
+    sender_name: &str,
+    history: &serde_json::Value,
+) {
+    use crate::agents::pi_rpc::{turn_to_stored_content, PiEvent, PiLaunchConfig, PiProcess};
+
+    let mut launch = PiLaunchConfig::defaults_for(agent_id);
+    launch.c2w_net = ctx.config.pi.c2w_net.clone();
+    launch.wasm_path = ctx.config.pi.wasm_path.clone();
+    launch.wasmtime_shim = ctx.config.pi.wasmtime_shim.clone();
+    launch.xpressclaw_url = ctx.config.pi.xpressclaw_url.clone();
+    launch.llm_url = ctx.config.pi.llm_url.clone();
+    launch.llm_key = ctx.config.pi.llm_key.clone();
+    launch.llm_model = ctx.config.pi.llm_model.clone();
+
+    let pi = match PiProcess::spawn(&launch).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(conv_id, agent_id, error = %e, "failed to spawn pi-agent WASM");
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Error {
+                    agent_id: Some(agent_id.to_string()),
+                    error: format!("pi spawn failed: {e}"),
+                },
+            );
+            return;
+        }
+    };
+
+    // Construct the prompt pi will see. We prepend the role + history as
+    // a single composite message — `--no-session` on pi means we reprime
+    // context each turn.
+    let history_block = history
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let s_type = m.get("sender_type")?.as_str()?;
+                    let content = m.get("content")?.as_str()?;
+                    let name = m
+                        .get("sender_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("user");
+                    Some(format!("[{s_type}:{name}] {content}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let composite_message = if history_block.is_empty() {
+        format!("ROLE:\n{role}\n\n[user:{sender_name}] {user_msg}")
+    } else {
+        format!(
+            "ROLE:\n{role}\n\nHISTORY:\n{history_block}\n\n[user:{sender_name}] {user_msg}"
+        )
+    };
+
+    // Track streaming state to translate pi events → ConversationEvent.
+    let event_bus = ctx.event_bus.clone();
+    let conv_id_cb = conv_id.to_string();
+    let agent_id_cb = agent_id.to_string();
+    let thinking_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let last_thinking_len = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let last_text_len = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let thinking_open_cb = thinking_open.clone();
+    let last_thinking_len_cb = last_thinking_len.clone();
+    let last_text_len_cb = last_text_len.clone();
+
+    let turn = pi
+        .send_prompt(&composite_message, move |ev| {
+            use std::sync::atomic::Ordering;
+            if let PiEvent::MessageUpdate { inner: Some(inner) } = ev {
+                let ev_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                // Pi sends cumulative partial text, not deltas — compute the
+                // newly-appended suffix by comparing to what we already streamed.
+                let partial_text = inner
+                    .get("partial")
+                    .and_then(|p| p.get("content"))
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find_map(|item| {
+                            let kind = item.get("type").and_then(|v| v.as_str())?;
+                            if ev_type == "thinking_delta" && kind == "thinking" {
+                                item.get("thinking").and_then(|v| v.as_str()).map(String::from)
+                            } else if ev_type == "text_delta" && kind == "text" {
+                                item.get("text").and_then(|v| v.as_str()).map(String::from)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                if ev_type == "thinking_delta" {
+                    if !thinking_open_cb.swap(true, Ordering::SeqCst) {
+                        event_bus.send(
+                            &conv_id_cb,
+                            ConversationEvent::Chunk {
+                                agent_id: agent_id_cb.clone(),
+                                content: "<think>".to_string(),
+                            },
+                        );
+                    }
+                    if let Some(t) = partial_text {
+                        let seen = last_thinking_len_cb.load(Ordering::SeqCst);
+                        if t.len() > seen {
+                            let suffix = t[seen..].to_string();
+                            last_thinking_len_cb.store(t.len(), Ordering::SeqCst);
+                            event_bus.send(
+                                &conv_id_cb,
+                                ConversationEvent::Chunk {
+                                    agent_id: agent_id_cb.clone(),
+                                    content: suffix,
+                                },
+                            );
+                        }
+                    }
+                } else if ev_type == "text_delta" {
+                    if thinking_open_cb.swap(false, Ordering::SeqCst) {
+                        event_bus.send(
+                            &conv_id_cb,
+                            ConversationEvent::Chunk {
+                                agent_id: agent_id_cb.clone(),
+                                content: "</think>".to_string(),
+                            },
+                        );
+                    }
+                    if let Some(t) = partial_text {
+                        let seen = last_text_len_cb.load(Ordering::SeqCst);
+                        if t.len() > seen {
+                            let suffix = t[seen..].to_string();
+                            last_text_len_cb.store(t.len(), Ordering::SeqCst);
+                            event_bus.send(
+                                &conv_id_cb,
+                                ConversationEvent::Chunk {
+                                    agent_id: agent_id_cb.clone(),
+                                    content: suffix,
+                                },
+                            );
+                        }
+                    }
+                }
+            } else if let PiEvent::ToolExecutionStart { tool, params } = ev {
+                let tool_name = tool.clone().unwrap_or_default();
+                let args = params
+                    .as_ref()
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .unwrap_or_default();
+                event_bus.send(
+                    &conv_id_cb,
+                    ConversationEvent::Chunk {
+                        agent_id: agent_id_cb.clone(),
+                        content: format!("\n<tool_call name=\"{tool_name}\">{args}</tool_call>"),
+                    },
+                );
+            }
+        })
+        .await;
+
+    // Close any dangling <think> block.
+    if thinking_open.load(std::sync::atomic::Ordering::SeqCst) {
+        ctx.event_bus.send(
+            conv_id,
+            ConversationEvent::Chunk {
+                agent_id: agent_id.to_string(),
+                content: "</think>".to_string(),
+            },
+        );
+    }
+
+    // Clean shutdown — next message will spawn a fresh process.
+    pi.shutdown().await;
+
+    let turn = match turn {
+        Ok(t) => t,
+        Err(e) => {
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Error {
+                    agent_id: Some(agent_id.to_string()),
+                    error: format!("pi rpc failed: {e}"),
+                },
+            );
+            return;
+        }
+    };
+
+    let stored = turn_to_stored_content(&turn);
+    record_and_store(
+        mgr,
+        cost_tracker,
+        budget_mgr,
+        &ctx.rate_limiter,
+        ctx,
+        conv_id,
+        agent_id,
+        model,
+        &stored,
+        turn.tokens,
     );
 }
 

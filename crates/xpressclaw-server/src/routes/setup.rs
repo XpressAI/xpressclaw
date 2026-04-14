@@ -862,6 +862,7 @@ async fn upsert_mcp_server(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        pi: old_config.pi.clone(),
     };
     new_config
         .save(&state.config_path)
@@ -896,6 +897,7 @@ async fn delete_mcp_server(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        pi: old_config.pi.clone(),
     };
     new_config
         .save(&state.config_path)

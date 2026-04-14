@@ -448,6 +448,50 @@ impl Default for LlmConfig {
     }
 }
 
+/// Pi-agent WASM container backend config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PiConfig {
+    /// When true, conversations and tasks run through a pi-agent WASM
+    /// container via c2w-net RPC instead of the built-in Rust LLM loop.
+    pub enabled: bool,
+    /// Path to the c2w-net binary.
+    pub c2w_net: String,
+    /// Path to the pi-agent WASM image (produced by scripts/build-pi-agent-wasm.sh).
+    pub wasm_path: String,
+    /// Path to the wasmtime shim that injects --env flags.
+    pub wasmtime_shim: String,
+    /// URL the container uses to reach xpressclaw's MCP/HTTP endpoint.
+    /// `192.168.127.254` is c2w-net's NAT gateway to the host.
+    pub xpressclaw_url: String,
+    /// URL the container uses to reach the host's LLM server.
+    pub llm_url: String,
+    /// API key the container sends (the xpressclaw LLM proxy accepts anything).
+    pub llm_key: String,
+    /// Model id the custom provider exposes.
+    pub llm_model: String,
+    /// Port the xpressclaw MCP HTTP server listens on (exposed as `xpressclaw_url`).
+    pub mcp_port: u16,
+}
+
+impl Default for PiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            c2w_net: "c2w-net".to_string(),
+            wasm_path: "wasm-agents/pi-agent.wasm".to_string(),
+            wasmtime_shim: "wasm-agents/wasmtime-shim".to_string(),
+            // c2w-net NATs the host to 192.168.127.254 for the guest.
+            // Main xpressclaw port (8935) hosts the `/mcp` endpoint.
+            xpressclaw_url: "http://192.168.127.254:8935".to_string(),
+            llm_url: "http://192.168.127.254:8081/v1".to_string(),
+            llm_key: "opensesame".to_string(),
+            llm_model: "local".to_string(),
+            mcp_port: 8935,
+        }
+    }
+}
+
 /// Root configuration for xpressclaw.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -465,6 +509,8 @@ pub struct Config {
     pub tool_policies: Vec<ToolPolicyRule>,
     pub memory: MemoryConfig,
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub pi: PiConfig,
 }
 
 impl Config {

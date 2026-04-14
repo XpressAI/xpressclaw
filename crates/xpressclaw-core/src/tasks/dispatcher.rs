@@ -327,6 +327,11 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
 }
 
 async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+    // Pi WASM path — delegates to the pi-agent container via JSONL RPC.
+    if config.pi.enabled {
+        return call_agent_pi(db, config, ctx).await;
+    }
+
     use crate::conversations::tools;
     use crate::llm::router::{
         ChatCompletionRequest, ChatMessage, LlmRouter, ToolCall, ToolCallFunction,
@@ -541,6 +546,73 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     }
 
     ctx.last_response = full_content;
+    State::ProcessResponse
+}
+
+async fn call_agent_pi(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+    use crate::agents::pi_rpc::{turn_to_stored_content, PiLaunchConfig, PiProcess};
+
+    debug!(
+        task_id = ctx.task.id,
+        turn = ctx.turn,
+        agent_id = ctx.agent_id,
+        "dispatching task to pi-agent WASM"
+    );
+
+    let mut launch = PiLaunchConfig::defaults_for(&ctx.agent_id);
+    launch.c2w_net = config.pi.c2w_net.clone();
+    launch.wasm_path = config.pi.wasm_path.clone();
+    launch.wasmtime_shim = config.pi.wasmtime_shim.clone();
+    launch.xpressclaw_url = config.pi.xpressclaw_url.clone();
+    launch.llm_url = config.pi.llm_url.clone();
+    launch.llm_key = config.pi.llm_key.clone();
+    launch.llm_model = config.pi.llm_model.clone();
+
+    let pi = match PiProcess::spawn(&launch).await {
+        Ok(p) => p,
+        Err(e) => {
+            return State::Done(DriverResult::Failed(format!("pi spawn failed: {e}")));
+        }
+    };
+
+    // Build the message: role + prior task history + current prompt.
+    let conv = TaskConversation::new(db.clone());
+    let history = conv.get_messages(&ctx.task.id).unwrap_or_default();
+    let history_block: String = history
+        .iter()
+        .filter(|m| !(m.role == "assistant" && (m.content.is_empty() || m.content == "(No response)")))
+        .map(|m| format!("[{}] {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let composite = if history_block.is_empty() {
+        format!(
+            "ROLE:\n{}\n\nTASK:\n{}",
+            ctx.system_prompt, ctx.current_prompt
+        )
+    } else {
+        format!(
+            "ROLE:\n{}\n\nHISTORY:\n{}\n\nTASK:\n{}",
+            ctx.system_prompt, history_block, ctx.current_prompt
+        )
+    };
+
+    let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
+    let msg_id = streaming_msg.map(|m| m.id);
+
+    let turn = pi.send_prompt(&composite, |_ev| {}).await;
+    pi.shutdown().await;
+
+    let turn = match turn {
+        Ok(t) => t,
+        Err(e) => return State::Done(DriverResult::Failed(format!("pi rpc failed: {e}"))),
+    };
+
+    let content = turn_to_stored_content(&turn);
+    if let Some(id) = msg_id {
+        let _ = conv.update_message_content(id, &content);
+    }
+    ctx.last_response = content;
     State::ProcessResponse
 }
 
