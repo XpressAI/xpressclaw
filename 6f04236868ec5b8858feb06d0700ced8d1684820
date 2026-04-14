@@ -1,0 +1,1 @@
+Reconciler now owns the pi-pool lifecycle. desired=running → background spawn (warm pool, log to terminal SSE). desired=stopped → evict. First user message no longer pays the 30s Bochs boot. Background spawn is fire-and-forget; failures retry on the next 10s reconcile cycle.
