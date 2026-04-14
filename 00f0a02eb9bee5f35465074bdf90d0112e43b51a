@@ -1,0 +1,47 @@
+First cut of the c2w migration.
+
+Design choices:
+- Pi WASM is spawned per-prompt (not pooled) via `c2w-net -invoke
+  pi-agent.wasm --net=socket`. Bochs boot is ~30s. Process pooling
+  / persistent sessions are a follow-up — I chose the simpler shape
+  first because pi's --no-session means each prompt reprimes context
+  anyway, and I didn't want to conflate two problems.
+- Environment variables: c2w-net DOES NOT forward --env flags to
+  wasmtime. Worked around this with `wasm-agents/wasmtime-shim`
+  (bash) that reads WASMTIME_EXTRA_ENV and injects --env flags before
+  the `--` separator. The shim's directory is prepended to PATH
+  before spawning c2w-net. Ugly but contained.
+- Host reachability: from inside c2w the host is 192.168.127.254
+  (c2w-net's gvisor-tap-vsock gateway). NOT 10.0.2.2 (wrong; that's
+  QEMU SLIRP which c2w does not use). NOT host.docker.internal.
+- Must pass `--net=socket` AFTER the wasm path — it's consumed by
+  Bochs (patched fork with wasi-ext socket netdev), not c2w-net.
+- Kept the Rust agent loop intact; pi path is opt-in via
+  `config.pi.enabled`. Don't delete the Rust loop until pi path has
+  been exercised under real load.
+- Rust processor's thinking/text streaming: pi sends CUMULATIVE
+  partial content per message_update, not incremental deltas. I
+  track last seen length per turn and emit only the new suffix to
+  the event bus. Different from the LLM-router path which sends real
+  deltas.
+- MCP server at `/mcp` is a bare-minimum JSON-RPC 2.0 handshake:
+  initialize + tools/list + tools/call. Exposes 5 tools (list_tasks,
+  create_task, update_task, search_memory, save_memory). No SSE
+  upgrade. Full MCP resources/prompts/notifications are follow-up.
+  Port 8935 (same as main server) on purpose — keeps one listener.
+
+Known gaps (follow-ups):
+- Per-agent long-lived PiProcess pool to avoid 30s boot/prompt.
+- Tool-execution events from pi aren't fully wired into the
+  conversation message store yet (only streamed as chunks).
+- Dispatcher path doesn't stream deltas (just collects final turn).
+- No snapshotting yet — c2w filesystem snapshots before writes to
+  ~/.pi/ is a separate design.
+- wanix-server/ is still started by the main binary; safe to delete
+  once pi path replaces all paths.
+
+Validation: manual e2e runs in the session before this commit showed
+pi receiving JSONL, reaching llama-server via c2w-net NAT, and
+streaming thinking_delta events. No automated test yet — WASM is
+1.3GB and boots slowly; a smoke test would need a special mock or a
+lighter target.
