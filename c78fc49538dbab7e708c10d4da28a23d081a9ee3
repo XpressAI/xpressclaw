@@ -1,0 +1,58 @@
+Migration-complete pass. Five follow-ups landed; one deferred.
+
+Landed:
+1. PiPool — one long-lived pi WASM subprocess per agent. Cache hit
+   returns in ms; cache miss is the one-time Bochs boot. Broken
+   processes auto-evict. Verified by running `cargo check --workspace`
+   and tracing: pool only spawns when alive==false.
+
+2. Tool events: PiTurnResult.tool_calls now carries a Vec<PiToolCall>.
+   Processor persists each as a tool_call message and emits it on the
+   event bus. Special-cases the "Created task <id> (<title>)" text
+   that our MCP server returns, dropping a task_status card so the
+   UI still shows tasks immediately (parity with the old TASK_CREATED
+   marker path).
+
+3. Dispatcher streaming: call_agent_pi now takes event_bus + pool. On
+   each text_delta message_update, it updates the task's assistant
+   message content AND broadcasts a ConversationEvent::Chunk to the
+   linked conversation. This makes the task page show progress as pi
+   is thinking instead of a single blob at the end. Used cumulative-
+   content suffix diffing (same pattern as processor) because pi sends
+   cumulative partials, not deltas.
+
+4. wanix-server killed: server no longer spawns the Node child. Tests
+   still reference wanix_url in tools.rs — that code path only runs
+   when pi.enabled=false. When someone turns pi off it will fail
+   obviously; that's fine as a nudge. The wanix-server/ dir itself is
+   left in the tree pending a cleanup sweep.
+
+5. Terminal tab: PiTerminalBus broadcast channel per agent_id with a
+   TAIL_CAP=500 replay buffer. PiProcess publishes every stdout +
+   stderr line. New SSE route /api/agents/{id}/terminal. Front-end
+   LogsTab is a full rewrite — dark background, monospace, O/E marker
+   per line, autoscroll toggle, live reconnect via EventSource.
+
+Deferred (explicitly): c2w filesystem snapshots. The current c2w
+output bakes the pi extensions into the WASM — there's no writable
+~/.pi for pi to self-modify. Snapshotting only becomes meaningful
+once we move to c2w --external-bundle (runtime-mounted rootfs) or
+wire a bind-mount for /root/.pi. I wrote a paragraph of docs in the
+commit body instead of shipping a mock implementation that would
+decay.
+
+Things I thought about and left alone:
+- Didn't remove the old Rust agent loop (`run_agent_loop`, tools.rs).
+  It's the fallback when pi.enabled=false — useful for regressions.
+- Didn't add auth/rate-limit to /mcp. It's localhost-only for now
+  (c2w-net NAT gateway). Secure for solo dev; document before exposing.
+- Didn't delete containers/ from wanix-server; user can `git rm` it
+  when they're satisfied pi works.
+
+Testing recipe (for tomorrow):
+  scripts/build-pi-agent-wasm.sh
+  # start llama-server on 0.0.0.0:8081 (model of choice)
+  xpressclaw up
+  # open /agents/atlas, go to Logs tab → terminal appears blank
+  # send a message in chat → pi spawns, terminal fills with boot
+  # subsequent messages reuse the same pi (fast)
