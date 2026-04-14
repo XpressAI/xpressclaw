@@ -21,7 +21,6 @@ use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::llm::router::{ChatCompletionRequest, ChatMessage, LlmRouter};
-use crate::memory::hooks::{self, MemoryHooks};
 
 use futures_util::StreamExt;
 
@@ -301,7 +300,11 @@ async fn run_agent_loop(
             temperature: Some(0.7),
             max_tokens: Some(32768),
             stream: Some(true),
-            tools: if tool_defs.is_empty() { None } else { Some(tool_defs.clone()) },
+            tools: if tool_defs.is_empty() {
+                None
+            } else {
+                Some(tool_defs.clone())
+            },
             ..Default::default()
         };
 
@@ -371,9 +374,10 @@ async fn run_agent_loop(
                                 // Accumulate tool call deltas
                                 if let Some(ref tcs) = choice.delta.tool_calls {
                                     for tc in tcs {
-                                        let entry = tool_call_acc
-                                            .entry(tc.index)
-                                            .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                        let entry =
+                                            tool_call_acc.entry(tc.index).or_insert_with(|| {
+                                                (String::new(), String::new(), String::new())
+                                            });
                                         if let Some(ref id) = tc.id {
                                             entry.0 = id.clone();
                                         }
@@ -457,7 +461,10 @@ async fn run_agent_loop(
                 .map(|(_, (id, name, args))| ToolCall {
                     id,
                     call_type: "function".into(),
-                    function: ToolCallFunction { name, arguments: args },
+                    function: ToolCallFunction {
+                        name,
+                        arguments: args,
+                    },
                 })
                 .collect();
             tcs.sort_by_key(|tc| tc.id.clone());
@@ -475,7 +482,10 @@ async fn run_agent_loop(
         let loop_key = tool_key_parts.join("|");
 
         if !loop_key.is_empty() && !seen_reasoning.insert(loop_key) {
-            warn!(conv_id, agent_id, turn, "duplicate tool call set, breaking loop");
+            warn!(
+                conv_id,
+                agent_id, turn, "duplicate tool call set, breaking loop"
+            );
             break;
         }
 
@@ -492,14 +502,25 @@ async fn run_agent_loop(
             let call_key = format!("{}:{}", tc.function.name, tc.function.arguments);
 
             let result = if let Some(prev) = seen_calls.get(&call_key) {
-                warn!(conv_id, agent_id, tool = tc.function.name, "duplicate tool call blocked");
+                warn!(
+                    conv_id,
+                    agent_id,
+                    tool = tc.function.name,
+                    "duplicate tool call blocked"
+                );
                 format!(
                     "ALREADY DONE: You already called {} with these arguments. Result: {}\n\
                      Move on to the next step.",
                     tc.function.name, prev
                 )
             } else {
-                debug!(conv_id, agent_id, tool = tc.function.name, turn, "executing tool");
+                debug!(
+                    conv_id,
+                    agent_id,
+                    tool = tc.function.name,
+                    turn,
+                    "executing tool"
+                );
                 let (r, _is_error) = tools::execute(
                     &tc.function.name,
                     &tc.function.arguments,
@@ -533,10 +554,9 @@ async fn run_agent_loop(
     if all_content.is_empty() && last_text.is_empty() {
         // The model never produced text — only tool calls.
         // Store a summary of what happened.
-        last_text = format!(
-            "I was working on your request and used several tools, but ran out of \
-             turns before completing. I'll create a task to continue this work."
-        );
+        last_text = "I was working on your request and used several tools, but ran out of \
+                     turns before completing. I'll create a task to continue this work."
+            .to_string();
         all_content = last_text.clone();
     }
 
@@ -575,7 +595,7 @@ async fn run_agent_loop(
 
     // Inject task cards AFTER the agent's response, and broadcast them
     // so the frontend sees them live without needing a page reload.
-    for (_, result) in &seen_calls {
+    for result in seen_calls.values() {
         if let Some(rest) = result.strip_prefix("TASK_CREATED:") {
             let parts: Vec<&str> = rest.splitn(3, ':').collect();
             if parts.len() >= 2 {
@@ -745,9 +765,7 @@ async fn run_pi_agent(
     let composite_message = if history_block.is_empty() {
         format!("ROLE:\n{role}\n\n[user:{sender_name}] {user_msg}")
     } else {
-        format!(
-            "ROLE:\n{role}\n\nHISTORY:\n{history_block}\n\n[user:{sender_name}] {user_msg}"
-        )
+        format!("ROLE:\n{role}\n\nHISTORY:\n{history_block}\n\n[user:{sender_name}] {user_msg}")
     };
 
     // Track streaming state to translate pi events → ConversationEvent.
@@ -776,7 +794,9 @@ async fn run_pi_agent(
                         arr.iter().find_map(|item| {
                             let kind = item.get("type").and_then(|v| v.as_str())?;
                             if ev_type == "thinking_delta" && kind == "thinking" {
-                                item.get("thinking").and_then(|v| v.as_str()).map(String::from)
+                                item.get("thinking")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from)
                             } else if ev_type == "text_delta" && kind == "text" {
                                 item.get("text").and_then(|v| v.as_str()).map(String::from)
                             } else {

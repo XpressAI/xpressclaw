@@ -13,7 +13,6 @@ use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, RateLimitConfig, WakeOnConfig,
 };
 
-
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -412,6 +411,7 @@ async fn update_agent_config(
 
 #[derive(Debug, Deserialize)]
 struct LogsQuery {
+    #[allow(dead_code)]
     tail: Option<usize>,
 }
 
@@ -427,7 +427,9 @@ async fn get_agent_logs(
         _ => internal_error(e),
     })?;
 
-    Ok(Json(json!({ "logs": "Logs not available without container runtime" })))
+    Ok(Json(
+        json!({ "logs": "Logs not available without container runtime" }),
+    ))
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

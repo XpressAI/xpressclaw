@@ -129,8 +129,8 @@ fn reconcile_idle_tasks(db: &Arc<Database>, config: &Config) {
         };
 
         let agent_id = &agent_cfg.name;
-        let record = match registry.get(agent_id) {
-            Ok(r) if r.status == "running" => r,
+        match registry.get(agent_id) {
+            Ok(r) if r.status == "running" => {}
             _ => continue,
         };
 

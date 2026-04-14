@@ -20,8 +20,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::config::HooksConfig;
-use crate::llm::router::{ChatCompletionRequest, ChatMessage, LlmRouter};
 use crate::db::Database;
+use crate::llm::router::{ChatCompletionRequest, ChatMessage, LlmRouter};
 use crate::memory::manager::MemoryManager;
 use crate::memory::zettelkasten::CreateMemory;
 
@@ -109,7 +109,6 @@ impl MemoryHooks {
 
         match llm_call(llm_router, &prompt).await {
             Ok(text) => {
-
                 if text.is_empty() || text.contains("No relevant memories found") {
                     debug!(agent_id, "recall returned no relevant memories");
                     return None;
@@ -167,7 +166,6 @@ impl MemoryHooks {
 
         match llm_call(llm_router, &prompt).await {
             Ok(text) => {
-
                 // Parse SAVE: lines and store them
                 let mgr = MemoryManager::new(self.db.clone(), &self.eviction_strategy);
                 let mut saved = 0;

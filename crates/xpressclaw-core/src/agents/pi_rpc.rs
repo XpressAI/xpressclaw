@@ -472,8 +472,7 @@ impl PiProcess {
                         {
                             for item in content {
                                 if item.get("type").and_then(|v| v.as_str()) == Some("thinking") {
-                                    if let Some(s) = item.get("thinking").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(s) = item.get("thinking").and_then(|v| v.as_str()) {
                                         if s.len() > result.thinking.len() {
                                             result.thinking = s.to_string();
                                         }
@@ -514,12 +513,9 @@ impl PiProcess {
                         .unwrap_or(false);
                     // Match by name to the last in-flight call with no result.
                     let target = tool.as_deref();
-                    if let Some(tc) = result
-                        .tool_calls
-                        .iter_mut()
-                        .rev()
-                        .find(|tc| tc.result.is_none() && target.map(|t| t == tc.name).unwrap_or(true))
-                    {
+                    if let Some(tc) = result.tool_calls.iter_mut().rev().find(|tc| {
+                        tc.result.is_none() && target.map(|t| t == tc.name).unwrap_or(true)
+                    }) {
                         tc.result = res.clone();
                         tc.is_error = is_err;
                     }

@@ -229,7 +229,9 @@ pub async fn execute(
         }
         "update_task" | "complete_task" => {
             let task_id = args["task_id"].as_str().unwrap_or("");
-            let status = if name == "complete_task" { "completed" } else {
+            let status = if name == "complete_task" {
+                "completed"
+            } else {
                 args["status"].as_str().unwrap_or("")
             };
             execute_update_task(task_id, status, db)
@@ -265,11 +267,7 @@ async fn call_wanix(tool: &str, args: Value) -> (String, bool) {
     }
 }
 
-async fn execute_search_memory(
-    query: &str,
-    _agent_id: &str,
-    db: &Arc<Database>,
-) -> (String, bool) {
+async fn execute_search_memory(query: &str, _agent_id: &str, db: &Arc<Database>) -> (String, bool) {
     let mem_mgr = MemoryManager::new(db.clone(), "least-recently-relevant");
     match mem_mgr.search(query, 5) {
         Ok(results) => {
@@ -341,17 +339,16 @@ fn execute_create_task(
             let _ = queue.enqueue(&task.id, agent_id);
             // Return a special marker that the processor can detect
             // to inject the task card AFTER the agent's response
-            (format!("TASK_CREATED:{}:{}:{}", task.id, task.title, "pending"), false)
+            (
+                format!("TASK_CREATED:{}:{}:{}", task.id, task.title, "pending"),
+                false,
+            )
         }
         Err(e) => (format!("Failed to create task: {e}"), true),
     }
 }
 
-fn execute_list_tasks(
-    status: Option<&str>,
-    agent_id: &str,
-    db: &Arc<Database>,
-) -> (String, bool) {
+fn execute_list_tasks(status: Option<&str>, agent_id: &str, db: &Arc<Database>) -> (String, bool) {
     let board = TaskBoard::new(db.clone());
     match board.list(status, Some(agent_id), 50) {
         Ok(filtered) => {
@@ -360,12 +357,7 @@ fn execute_list_tasks(
             } else {
                 let lines: Vec<String> = filtered
                     .iter()
-                    .map(|t| {
-                        format!(
-                            "- [{}] {} ({})",
-                            t.status.as_str(), t.title, t.id
-                        )
-                    })
+                    .map(|t| format!("- [{}] {} ({})", t.status.as_str(), t.title, t.id))
                     .collect();
                 (lines.join("\n"), false)
             }

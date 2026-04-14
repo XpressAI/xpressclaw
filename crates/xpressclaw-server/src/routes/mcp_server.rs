@@ -56,7 +56,10 @@ struct JsonRpcError {
     message: String,
 }
 
-async fn handle(State(state): State<AppState>, Json(req): Json<JsonRpcRequest>) -> impl IntoResponse {
+async fn handle(
+    State(state): State<AppState>,
+    Json(req): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
     if req.jsonrpc != "2.0" {
         return Json(rpc_err(req.id.clone(), -32600, "invalid jsonrpc version"));
     }
@@ -247,10 +250,7 @@ async fn tools_call(state: &AppState, params: Value) -> Result<Value, String> {
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or("missing query")?;
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let mgr = MemoryManager::new(state.db.clone(), "least-recently-relevant");
             match mgr.search(query, limit) {
                 Ok(results) => {

@@ -304,7 +304,10 @@ async fn scan_for_unprocessed(state: &AppState) {
             .map(|a| (a.name.clone(), a.full_system_prompt()))
             .collect();
 
-        info!(conv_id = conv.id, "scanner: spawning processor for stale unprocessed message");
+        info!(
+            conv_id = conv.id,
+            "scanner: spawning processor for stale unprocessed message"
+        );
 
         xpressclaw_core::conversations::processor::spawn(
             conv.id.clone(),
@@ -320,4 +323,3 @@ async fn scan_for_unprocessed(state: &AppState) {
         );
     }
 }
-

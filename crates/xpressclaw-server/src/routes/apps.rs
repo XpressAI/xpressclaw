@@ -182,6 +182,7 @@ struct PublishAppRequest {
     description: Option<String>,
     agent_id: String,
     port: Option<i64>,
+    #[allow(dead_code)]
     source_dir: Option<String>,
     start_command: Option<String>,
 }

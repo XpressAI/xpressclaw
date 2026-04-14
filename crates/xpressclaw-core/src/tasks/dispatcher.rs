@@ -25,7 +25,6 @@ use crate::config::Config;
 use crate::config::HooksConfig;
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
-use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
@@ -72,6 +71,7 @@ struct Context {
     current_prompt: String,
     last_response: String,
     subtasks: Vec<Task>,
+    #[allow(dead_code)]
     hooks: HooksConfig,
 }
 
@@ -296,7 +296,10 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
              DO NOT call list_tasks — you already know what to do. \
              Focus on completing the work using Write, MakeDir, and other tools.",
             ctx.task.title,
-            ctx.task.description.as_deref().unwrap_or("(no description)"),
+            ctx.task
+                .description
+                .as_deref()
+                .unwrap_or("(no description)"),
         ));
 
         if let Some(subtask) = current_subtask(&ctx.subtasks) {
@@ -343,9 +346,7 @@ async fn call_agent(
     }
 
     use crate::conversations::tools;
-    use crate::llm::router::{
-        ChatCompletionRequest, ChatMessage, LlmRouter, ToolCall, ToolCallFunction,
-    };
+    use crate::llm::router::{ChatCompletionRequest, ChatMessage, ToolCall, ToolCallFunction};
     use futures_util::StreamExt;
     use std::collections::HashMap;
 
@@ -356,7 +357,9 @@ async fn call_agent(
         "calling LLM for task"
     );
 
-    let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::build_from_config(&config.llm));
+    let llm_router = std::sync::Arc::new(crate::llm::router::LlmRouter::build_from_config(
+        &config.llm,
+    ));
 
     // Build messages — same system prompt + tool intent instruction as processor
     let system_with_tools = format!(
@@ -364,9 +367,7 @@ async fn call_agent(
          to do before each tool call. Example: \"Writing calculator.py with basic operations.\"",
         ctx.system_prompt
     );
-    let mut llm_messages = vec![
-        ChatMessage::text("system", &system_with_tools),
-    ];
+    let mut llm_messages = vec![ChatMessage::text("system", &system_with_tools)];
 
     // Include previous task conversation as context so the model
     // remembers what it already did across turns.
@@ -380,7 +381,10 @@ async fn call_agent(
                 }
             }
             "system" => {
-                llm_messages.push(ChatMessage::text("user", &format!("SYSTEM: {}", msg.content)));
+                llm_messages.push(ChatMessage::text(
+                    "user",
+                    format!("SYSTEM: {}", msg.content),
+                ));
             }
             _ => {
                 llm_messages.push(ChatMessage::text("user", &msg.content));
@@ -444,9 +448,10 @@ async fn call_agent(
                             }
                             if let Some(ref tcs) = choice.delta.tool_calls {
                                 for tc in tcs {
-                                    let entry = tool_call_acc
-                                        .entry(tc.index)
-                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    let entry =
+                                        tool_call_acc.entry(tc.index).or_insert_with(|| {
+                                            (String::new(), String::new(), String::new())
+                                        });
                                     if let Some(ref id) = tc.id {
                                         entry.0 = id.clone();
                                     }
@@ -475,7 +480,11 @@ async fn call_agent(
 
         // Update streaming message
         if let Some(id) = msg_id {
-            let display = if full_content.is_empty() { "(working...)" } else { &full_content };
+            let display = if full_content.is_empty() {
+                "(working...)"
+            } else {
+                &full_content
+            };
             let _ = conv.update_message_content(id, display);
         }
 
@@ -488,7 +497,10 @@ async fn call_agent(
             .map(|(_, (id, name, args))| ToolCall {
                 id,
                 call_type: "function".into(),
-                function: ToolCallFunction { name, arguments: args },
+                function: ToolCallFunction {
+                    name,
+                    arguments: args,
+                },
             })
             .collect();
 
@@ -500,15 +512,25 @@ async fn call_agent(
         tool_key_parts.sort();
         let loop_key = tool_key_parts.join("|");
         if !loop_key.is_empty() && !seen_tool_keys.insert(loop_key) {
-            warn!(task_id = ctx.task.id, tool_turn, "duplicate tool call set, breaking");
+            warn!(
+                task_id = ctx.task.id,
+                tool_turn, "duplicate tool call set, breaking"
+            );
             break;
         }
         // Also break if any single tool is called too many times
         for tc in &tool_calls {
-            let count = tool_name_counts.entry(tc.function.name.clone()).or_insert(0);
+            let count = tool_name_counts
+                .entry(tc.function.name.clone())
+                .or_insert(0);
             *count += 1;
             if *count > 3 {
-                warn!(task_id = ctx.task.id, tool = tc.function.name, count, "tool called too many times, breaking");
+                warn!(
+                    task_id = ctx.task.id,
+                    tool = tc.function.name,
+                    count,
+                    "tool called too many times, breaking"
+                );
                 // Don't execute this turn's tools
                 break;
             }
@@ -532,11 +554,15 @@ async fn call_agent(
             .await;
 
             // Record what the agent did so the task message isn't empty
-            let action = format!("**{}**: {}", tc.function.name, result.chars().take(200).collect::<String>());
+            let action = format!(
+                "**{}**: {}",
+                tc.function.name,
+                result.chars().take(200).collect::<String>()
+            );
             if full_content.is_empty() {
                 full_content = action;
             } else {
-                full_content.push_str("\n");
+                full_content.push('\n');
                 full_content.push_str(&action);
             }
 
@@ -551,7 +577,11 @@ async fn call_agent(
 
     // Final update
     if let Some(id) = msg_id {
-        let display = if full_content.is_empty() { "(No response)" } else { &full_content };
+        let display = if full_content.is_empty() {
+            "(No response)"
+        } else {
+            &full_content
+        };
         let _ = conv.update_message_content(id, display);
     }
 
@@ -597,7 +627,9 @@ async fn call_agent_pi(
     let history = conv.get_messages(&ctx.task.id).unwrap_or_default();
     let history_block: String = history
         .iter()
-        .filter(|m| !(m.role == "assistant" && (m.content.is_empty() || m.content == "(No response)")))
+        .filter(|m| {
+            !(m.role == "assistant" && (m.content.is_empty() || m.content == "(No response)"))
+        })
         .map(|m| format!("[{}] {}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("\n");
@@ -687,7 +719,7 @@ async fn call_agent_pi(
     State::ProcessResponse
 }
 
-fn process_response(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+fn process_response(_db: &Arc<Database>, _config: &Config, ctx: &mut Context) -> State {
     // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
 
