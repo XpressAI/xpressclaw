@@ -114,10 +114,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Start the desired-state reconciler (ADR-018).
     let reconciler_db = state.db.clone();
     let reconciler_config = state.config.clone();
+    let reconciler_pool = state.pi_pool.clone();
     let reconciler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port) => {}
+            _ = xpressclaw_core::agents::reconciler::start(
+                reconciler_db,
+                reconciler_config,
+                port,
+                reconciler_pool,
+            ) => {}
             _ = reconciler_shutdown.cancelled() => { info!("reconciler stopped"); }
         }
     });
