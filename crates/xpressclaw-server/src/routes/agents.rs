@@ -1,7 +1,9 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures_util::stream::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -27,6 +29,40 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(get_agent_logs))
+        .route("/{id}/terminal", get(agent_terminal_stream))
+}
+
+/// SSE stream of the agent's pi-WASM container terminal (stdout + stderr).
+///
+/// The frontend Logs tab renders this as a tmux-style live terminal.
+/// On subscribe, the last N buffered lines replay so users see recent
+/// history even if the process has been quiet.
+async fn agent_terminal_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    let bus = state.pi_terminal.clone();
+    let stream = async_stream::stream! {
+        let (mut rx, tail) = bus.subscribe(&id).await;
+        for line in tail {
+            let payload = serde_json::to_string(&line).unwrap_or_default();
+            yield Ok(Event::default().event("line").data(payload));
+        }
+        loop {
+            match rx.recv().await {
+                Ok(line) => {
+                    let payload = serde_json::to_string(&line).unwrap_or_default();
+                    yield Ok(Event::default().event("line").data(payload));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Dropped some lines — continue from current.
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Build a JSON response for an agent by merging YAML config and DB state.

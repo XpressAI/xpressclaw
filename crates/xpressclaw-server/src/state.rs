@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use xpressclaw_core::agents::pi_rpc::PiPool;
+use xpressclaw_core::agents::pi_terminal::PiTerminalBus;
 use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
@@ -23,6 +25,10 @@ pub struct AppState {
     pub download_progress: Arc<RwLock<DownloadProgress>>,
     pub mcp_manager: Arc<McpManager>,
     pub event_bus: Arc<ConversationEventBus>,
+    /// Pool of persistent pi-agent WASM subprocesses.
+    pub pi_pool: Arc<PiPool>,
+    /// Broadcast bus for pi stdout/stderr lines, keyed by agent_id.
+    pub pi_terminal: Arc<PiTerminalBus>,
 }
 
 impl AppState {
@@ -34,6 +40,7 @@ impl AppState {
         setup_complete: bool,
     ) -> Self {
         let rate_limiter = Arc::new(RateLimiter::new(config.clone()));
+        let pi_terminal = Arc::new(PiTerminalBus::new());
         Self {
             config: Arc::new(RwLock::new(config)),
             db,
@@ -45,6 +52,8 @@ impl AppState {
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
+            pi_pool: Arc::new(PiPool::new().with_terminal(pi_terminal.clone())),
+            pi_terminal,
         }
     }
 

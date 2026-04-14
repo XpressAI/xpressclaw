@@ -15,6 +15,7 @@ pub struct TaskMessage {
 }
 
 /// Manages conversation threads for tasks.
+#[derive(Clone)]
 pub struct TaskConversation {
     db: Arc<Database>,
 }

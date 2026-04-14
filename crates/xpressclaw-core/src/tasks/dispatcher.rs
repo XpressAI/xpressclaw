@@ -84,6 +84,8 @@ async fn run_task(
     config: &Config,
     task_id: &str,
     agent_id: &str,
+    pi_pool: &Arc<crate::agents::pi_rpc::PiPool>,
+    event_bus: &Arc<crate::conversations::event_bus::ConversationEventBus>,
 ) -> DriverResult {
     let mut state = State::LoadTask;
     let mut ctx: Option<Context> = None;
@@ -92,7 +94,9 @@ async fn run_task(
         state = match state {
             State::LoadTask => load_task(db, config, task_id, agent_id, &mut ctx).await,
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
-            State::CallAgent => call_agent(db, config, ctx.as_mut().unwrap()).await,
+            State::CallAgent => {
+                call_agent(db, config, ctx.as_mut().unwrap(), pi_pool, event_bus).await
+            }
             State::ProcessResponse => process_response(db, config, ctx.as_mut().unwrap()),
             State::Evaluate => evaluate(db, config, ctx.as_mut().unwrap()),
             State::Done(result) => return result,
@@ -326,10 +330,16 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::CallAgent
 }
 
-async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+async fn call_agent(
+    db: &Arc<Database>,
+    config: &Config,
+    ctx: &mut Context,
+    pi_pool: &Arc<crate::agents::pi_rpc::PiPool>,
+    event_bus: &Arc<crate::conversations::event_bus::ConversationEventBus>,
+) -> State {
     // Pi WASM path — delegates to the pi-agent container via JSONL RPC.
     if config.pi.enabled {
-        return call_agent_pi(db, config, ctx).await;
+        return call_agent_pi(db, config, ctx, pi_pool, event_bus).await;
     }
 
     use crate::conversations::tools;
@@ -549,8 +559,15 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     State::ProcessResponse
 }
 
-async fn call_agent_pi(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
-    use crate::agents::pi_rpc::{turn_to_stored_content, PiLaunchConfig, PiProcess};
+async fn call_agent_pi(
+    db: &Arc<Database>,
+    config: &Config,
+    ctx: &mut Context,
+    pi_pool: &Arc<crate::agents::pi_rpc::PiPool>,
+    event_bus: &Arc<crate::conversations::event_bus::ConversationEventBus>,
+) -> State {
+    use crate::agents::pi_rpc::{turn_to_stored_content, PiEvent, PiLaunchConfig};
+    use crate::conversations::event_bus::ConversationEvent;
 
     debug!(
         task_id = ctx.task.id,
@@ -568,7 +585,7 @@ async fn call_agent_pi(db: &Arc<Database>, config: &Config, ctx: &mut Context) -
     launch.llm_key = config.pi.llm_key.clone();
     launch.llm_model = config.pi.llm_model.clone();
 
-    let pi = match PiProcess::spawn(&launch).await {
+    let pi = match pi_pool.get_or_spawn(&launch).await {
         Ok(p) => p,
         Err(e) => {
             return State::Done(DriverResult::Failed(format!("pi spawn failed: {e}")));
@@ -600,12 +617,66 @@ async fn call_agent_pi(db: &Arc<Database>, config: &Config, ctx: &mut Context) -
     let streaming_msg = conv.add_message(&ctx.task.id, "assistant", "").ok();
     let msg_id = streaming_msg.map(|m| m.id);
 
-    let turn = pi.send_prompt(&composite, |_ev| {}).await;
-    pi.shutdown().await;
+    // Stream into the linked conversation (if any) AND update the task
+    // message content incrementally so the UI sees progress.
+    let conv_id_opt = ctx.task.conversation_id.clone();
+    let agent_id_cb = ctx.agent_id.clone();
+    let last_text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let last_text_cb = last_text.clone();
+    let event_bus_cb = event_bus.clone();
+    let msg_id_cb = msg_id;
+    let conv_clone = conv.clone();
+
+    let turn = pi
+        .send_prompt(&composite, move |ev| {
+            if let PiEvent::MessageUpdate { inner: Some(inner) } = ev {
+                let ev_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ev_type == "text_delta" {
+                    if let Some(text) = inner
+                        .get("partial")
+                        .and_then(|p| p.get("content"))
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| {
+                            arr.iter().find_map(|item| {
+                                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                    item.get("text").and_then(|v| v.as_str()).map(String::from)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    {
+                        let mut last = last_text_cb.lock().unwrap();
+                        if text.len() > last.len() {
+                            let suffix = text[last.len()..].to_string();
+                            *last = text.clone();
+                            drop(last);
+
+                            if let Some(id) = msg_id_cb {
+                                let _ = conv_clone.update_message_content(id, &text);
+                            }
+                            if let Some(conv_id) = &conv_id_opt {
+                                event_bus_cb.send(
+                                    conv_id,
+                                    ConversationEvent::Chunk {
+                                        agent_id: agent_id_cb.clone(),
+                                        content: suffix,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await;
 
     let turn = match turn {
         Ok(t) => t,
-        Err(e) => return State::Done(DriverResult::Failed(format!("pi rpc failed: {e}"))),
+        Err(e) => {
+            pi_pool.evict(&ctx.agent_id).await;
+            return State::Done(DriverResult::Failed(format!("pi rpc failed: {e}")));
+        }
     };
 
     let content = turn_to_stored_content(&turn);
@@ -890,7 +961,12 @@ fn notify_conversation(
 /// On startup, recovers interrupted tasks (queue items stuck in 'running'
 /// state from a previous crash, and in_progress tasks with no queue entry).
 /// Then polls every few seconds for queued items and runs them.
-pub async fn start_dispatcher(db: Arc<Database>, config: Arc<Config>) {
+pub async fn start_dispatcher(
+    db: Arc<Database>,
+    config: Arc<Config>,
+    pi_pool: Arc<crate::agents::pi_rpc::PiPool>,
+    event_bus: Arc<crate::conversations::event_bus::ConversationEventBus>,
+) {
     info!("task dispatcher started");
 
     if let Err(e) = recover_on_startup(&db) {
@@ -898,7 +974,7 @@ pub async fn start_dispatcher(db: Arc<Database>, config: Arc<Config>) {
     }
 
     loop {
-        if let Err(e) = poll_once(&db, &config).await {
+        if let Err(e) = poll_once(&db, &config, &pi_pool, &event_bus).await {
             error!(error = %e, "dispatcher poll error");
         }
         tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
@@ -955,7 +1031,12 @@ fn recover_on_startup(db: &Arc<Database>) -> crate::error::Result<()> {
     Ok(())
 }
 
-async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<()> {
+async fn poll_once(
+    db: &Arc<Database>,
+    config: &Config,
+    pi_pool: &Arc<crate::agents::pi_rpc::PiPool>,
+    event_bus: &Arc<crate::conversations::event_bus::ConversationEventBus>,
+) -> crate::error::Result<()> {
     let queue = TaskQueue::new(db.clone());
     let board = TaskBoard::new(db.clone());
 
@@ -1005,7 +1086,15 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             "dispatching task"
         );
 
-        let result = run_task(db, config, &claimed.task_id, &claimed.agent_id).await;
+        let result = run_task(
+            db,
+            config,
+            &claimed.task_id,
+            &claimed.agent_id,
+            pi_pool,
+            event_bus,
+        )
+        .await;
 
         match &result {
             DriverResult::Completed => {

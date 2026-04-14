@@ -67,10 +67,17 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Start the task dispatcher background loop.
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config();
+    let dispatcher_pool = state.pi_pool.clone();
+    let dispatcher_bus = state.event_bus.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::tasks::dispatcher::start_dispatcher(dispatcher_db, dispatcher_config) => {}
+            _ = xpressclaw_core::tasks::dispatcher::start_dispatcher(
+                dispatcher_db,
+                dispatcher_config,
+                dispatcher_pool,
+                dispatcher_bus,
+            ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }
     });
@@ -115,46 +122,13 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    // Start the Wanix headless server as a child process.
-    // Provides the agent filesystem environment at localhost:9100.
-    let wanix_shutdown = shutdown.clone();
-    let wanix_child = {
-        // Find the wanix-server directory relative to the executable or cwd
-        let wanix_script = find_wanix_server();
-        if let Some(script) = wanix_script {
-            info!(path = %script.display(), "starting Wanix headless server");
-            match std::process::Command::new("node")
-                .arg(&script)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::inherit())
-                .spawn()
-            {
-                Ok(child) => {
-                    let pid = child.id();
-                    info!(pid, "Wanix server started");
-                    Some(child)
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to start Wanix server — filesystem tools will be unavailable");
-                    None
-                }
-            }
-        } else {
-            warn!("wanix-server/index.mjs not found — filesystem tools will be unavailable");
-            None
-        }
-    };
-
-    // Clean up Wanix on shutdown
-    let wanix_child_arc = std::sync::Arc::new(std::sync::Mutex::new(wanix_child));
-    let wanix_cleanup = wanix_child_arc.clone();
+    // Pi-pool cleanup on shutdown: kill all cached pi subprocesses.
+    let pool_shutdown = shutdown.clone();
+    let pool_cleanup = state.pi_pool.clone();
     tokio::spawn(async move {
-        wanix_shutdown.cancelled().await;
-        if let Some(ref mut child) = *wanix_cleanup.lock().unwrap() {
-            info!("stopping Wanix server");
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        pool_shutdown.cancelled().await;
+        info!("shutting down pi-agent pool");
+        pool_cleanup.shutdown_all().await;
     });
 
     // Recover any running workflow instances after restart.
@@ -209,6 +183,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                                         event_bus: connector_state.event_bus.clone(),
                                         rate_limiter: connector_state.rate_limiter(),
                                         agent_roles,
+                                        pi_pool: connector_state.pi_pool.clone(),
                                     },
                                 );
                             }
@@ -334,35 +309,9 @@ async fn scan_for_unprocessed(state: &AppState) {
                 event_bus: state.event_bus.clone(),
                 rate_limiter: state.rate_limiter(),
                 agent_roles: agent_skills_map,
+                pi_pool: state.pi_pool.clone(),
             },
         );
     }
 }
 
-/// Find the wanix-server/index.mjs script.
-/// Checks: next to the executable, in the cwd, and in the source tree.
-fn find_wanix_server() -> Option<std::path::PathBuf> {
-    let candidates = [
-        // Next to the executable (installed/packaged)
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("wanix-server").join("index.mjs"))),
-        // Current working directory
-        Some(std::path::PathBuf::from("wanix-server/index.mjs")),
-        // Relative to the source tree (dev mode)
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| {
-                // target/release/xpressclaw → project root
-                p.ancestors().nth(3).map(|root| root.join("wanix-server").join("index.mjs"))
-            }),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    None
-}

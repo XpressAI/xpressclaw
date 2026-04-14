@@ -25,6 +25,7 @@
 //! Network: host services are reachable at `192.168.127.254` from inside
 //! the container (c2w-net's NAT gateway).
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -32,8 +33,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::agents::pi_terminal::PiTerminalBus;
 use crate::error::{Error, Result};
 
 /// Configuration for launching a pi-agent WASM container.
@@ -149,6 +152,15 @@ pub enum PiEvent {
     Other,
 }
 
+/// A tool invocation pi made during the turn.
+#[derive(Debug, Clone)]
+pub struct PiToolCall {
+    pub name: String,
+    pub params: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+    pub is_error: bool,
+}
+
 /// What a pi turn produced, after stdout events have been drained.
 #[derive(Debug, Default)]
 pub struct PiTurnResult {
@@ -162,6 +174,8 @@ pub struct PiTurnResult {
     pub error: Option<String>,
     /// Model id pi reported using.
     pub model: Option<String>,
+    /// Tool calls pi made and their results.
+    pub tool_calls: Vec<PiToolCall>,
 }
 
 /// Outgoing RPC command sent on stdin.
@@ -173,16 +187,27 @@ enum PiCommand<'a> {
 
 /// A running pi subprocess with a mutex around its stdin.
 pub struct PiProcess {
-    child: Child,
+    child: Mutex<Option<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
     /// Parsed stdout events funnel through this channel.
     rx: Arc<Mutex<tokio::sync::mpsc::Receiver<PiEvent>>>,
     agent_id: String,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PiProcess {
-    /// Spawn the pi WASM container and wire up stdin/stdout.
+    /// Spawn the pi WASM container without broadcasting terminal output.
     pub async fn spawn(cfg: &PiLaunchConfig) -> Result<Self> {
+        Self::spawn_with_terminal(cfg, None).await
+    }
+
+    /// Spawn the pi WASM container and wire up stdin/stdout.
+    /// If `terminal` is Some, every stdout/stderr line is also published
+    /// to that bus keyed by agent_id for the Logs tab.
+    pub async fn spawn_with_terminal(
+        cfg: &PiLaunchConfig,
+        terminal: Option<Arc<PiTerminalBus>>,
+    ) -> Result<Self> {
         let shim_dir = std::path::Path::new(&cfg.wasmtime_shim)
             .parent()
             .map(|p| p.display().to_string())
@@ -228,16 +253,21 @@ impl PiProcess {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<PiEvent>(256);
         let agent_id = cfg.agent_id.clone();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        // Stdout reader task — parses JSONL.
+        // Stdout reader task — parses JSONL and mirrors to the terminal bus.
         let tx_out = tx.clone();
         let agent_id_log = agent_id.clone();
+        let alive_out = alive.clone();
+        let term_stdout = terminal.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(bus) = term_stdout.as_ref() {
+                    bus.publish(&agent_id_log, "stdout", line.clone()).await;
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() || !trimmed.starts_with('{') {
-                    // mcpfs banner, etc. — log and skip
                     debug!(agent_id = %agent_id_log, "pi stdout: {trimmed}");
                     continue;
                 }
@@ -252,26 +282,37 @@ impl PiProcess {
                     }
                 }
             }
+            alive_out.store(false, std::sync::atomic::Ordering::SeqCst);
             debug!(agent_id = %agent_id_log, "pi stdout reader exit");
         });
 
-        // Stderr reader task — just logs.
+        // Stderr reader task — log + mirror to terminal bus.
         if let Some(stderr) = stderr {
             let agent_id_log = agent_id.clone();
+            let term_stderr = terminal.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(bus) = term_stderr.as_ref() {
+                        bus.publish(&agent_id_log, "stderr", line.clone()).await;
+                    }
                     debug!(agent_id = %agent_id_log, "pi stderr: {line}");
                 }
             });
         }
 
         Ok(Self {
-            child,
+            child: Mutex::new(Some(child)),
             stdin: Arc::new(Mutex::new(stdin)),
             rx: Arc::new(Mutex::new(rx)),
             agent_id,
+            alive,
         })
+    }
+
+    /// Whether the underlying subprocess is still running (best-effort).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn agent_id(&self) -> &str {
@@ -375,6 +416,32 @@ impl PiProcess {
                         result.error = Some(err.to_string());
                     }
                 }
+                PiEvent::ToolExecutionStart { tool, params } => {
+                    result.tool_calls.push(PiToolCall {
+                        name: tool.clone().unwrap_or_default(),
+                        params: params.clone().unwrap_or(serde_json::Value::Null),
+                        result: None,
+                        is_error: false,
+                    });
+                }
+                PiEvent::ToolExecutionEnd { tool, result: res } => {
+                    let is_err = res
+                        .as_ref()
+                        .and_then(|v| v.get("isError"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // Match by name to the last in-flight call with no result.
+                    let target = tool.as_deref();
+                    if let Some(tc) = result
+                        .tool_calls
+                        .iter_mut()
+                        .rev()
+                        .find(|tc| tc.result.is_none() && target.map(|t| t == tc.name).unwrap_or(true))
+                    {
+                        tc.result = res.clone();
+                        tc.is_error = is_err;
+                    }
+                }
                 PiEvent::AgentEnd => {
                     break;
                 }
@@ -392,10 +459,79 @@ impl PiProcess {
         Ok(result)
     }
 
-    /// Force-kill the container. Consumes self.
-    pub async fn shutdown(mut self) {
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+    /// Force-kill the container. Safe to call multiple times.
+    pub async fn shutdown(&self) {
+        let mut guard = self.child.lock().await;
+        if let Some(mut child) = guard.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Pool of long-lived pi subprocesses keyed by agent_id.
+///
+/// On each request, re-uses the cached process if alive, otherwise spawns
+/// a fresh one. Amortizes the ~30s Bochs boot over many prompts.
+#[derive(Clone, Default)]
+pub struct PiPool {
+    inner: Arc<RwLock<HashMap<String, Arc<PiProcess>>>>,
+    terminal: Option<Arc<PiTerminalBus>>,
+}
+
+impl PiPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Attach a terminal bus so spawned processes mirror stdout/stderr there.
+    pub fn with_terminal(mut self, bus: Arc<PiTerminalBus>) -> Self {
+        self.terminal = Some(bus);
+        self
+    }
+
+    /// Return the cached pi process for this agent, spawning one if needed
+    /// or the existing one has died.
+    pub async fn get_or_spawn(&self, cfg: &PiLaunchConfig) -> Result<Arc<PiProcess>> {
+        // Fast path: cached + alive.
+        {
+            let guard = self.inner.read().await;
+            if let Some(proc) = guard.get(&cfg.agent_id) {
+                if proc.is_alive() {
+                    return Ok(proc.clone());
+                }
+            }
+        }
+
+        // Spawn + cache.
+        let mut guard = self.inner.write().await;
+        if let Some(proc) = guard.get(&cfg.agent_id) {
+            if proc.is_alive() {
+                return Ok(proc.clone());
+            }
+            // Previous died — drop it so the kill-on-drop fires.
+            guard.remove(&cfg.agent_id);
+        }
+        let fresh = Arc::new(PiProcess::spawn_with_terminal(cfg, self.terminal.clone()).await?);
+        guard.insert(cfg.agent_id.clone(), fresh.clone());
+        Ok(fresh)
+    }
+
+    /// Kill and forget the process for this agent (if any).
+    pub async fn evict(&self, agent_id: &str) {
+        let mut guard = self.inner.write().await;
+        if let Some(proc) = guard.remove(agent_id) {
+            proc.shutdown().await;
+        }
+    }
+
+    /// Kill every cached process.
+    pub async fn shutdown_all(&self) {
+        let mut guard = self.inner.write().await;
+        for (_, proc) in guard.drain() {
+            proc.shutdown().await;
+        }
     }
 }
 

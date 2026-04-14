@@ -477,7 +477,7 @@ pub struct PiConfig {
 impl Default for PiConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             c2w_net: "c2w-net".to_string(),
             wasm_path: "wasm-agents/pi-agent.wasm".to_string(),
             wasmtime_shim: "wasm-agents/wasmtime-shim".to_string(),

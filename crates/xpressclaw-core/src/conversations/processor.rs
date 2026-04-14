@@ -34,6 +34,8 @@ pub struct ProcessorContext {
     pub rate_limiter: Arc<RateLimiter>,
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
     pub agent_roles: std::collections::HashMap<String, String>,
+    /// Pool of persistent pi-agent WASM subprocesses (one per agent_id).
+    pub pi_pool: Arc<crate::agents::pi_rpc::PiPool>,
 }
 
 /// Spawn a background task to process agent responses for a conversation.
@@ -677,7 +679,8 @@ fn record_and_store(
 /// Run a turn via a pi-agent WASM container (ADR-003 rewrite).
 ///
 /// Streams pi events into the conversation event bus as `<think>` blocks
-/// and text chunks, then stores the final assistant message.
+/// and text chunks, then stores the final assistant message plus any
+/// tool calls pi made.
 #[allow(clippy::too_many_arguments)]
 async fn run_pi_agent(
     ctx: &ProcessorContext,
@@ -692,7 +695,7 @@ async fn run_pi_agent(
     sender_name: &str,
     history: &serde_json::Value,
 ) {
-    use crate::agents::pi_rpc::{turn_to_stored_content, PiEvent, PiLaunchConfig, PiProcess};
+    use crate::agents::pi_rpc::{turn_to_stored_content, PiEvent, PiLaunchConfig};
 
     let mut launch = PiLaunchConfig::defaults_for(agent_id);
     launch.c2w_net = ctx.config.pi.c2w_net.clone();
@@ -703,7 +706,7 @@ async fn run_pi_agent(
     launch.llm_key = ctx.config.pi.llm_key.clone();
     launch.llm_model = ctx.config.pi.llm_model.clone();
 
-    let pi = match PiProcess::spawn(&launch).await {
+    let pi = match ctx.pi_pool.get_or_spawn(&launch).await {
         Ok(p) => p,
         Err(e) => {
             warn!(conv_id, agent_id, error = %e, "failed to spawn pi-agent WASM");
@@ -859,12 +862,13 @@ async fn run_pi_agent(
         );
     }
 
-    // Clean shutdown — next message will spawn a fresh process.
-    pi.shutdown().await;
+    // PiProcess stays alive in the pool — do NOT shutdown here.
 
     let turn = match turn {
         Ok(t) => t,
         Err(e) => {
+            // Drop the dead process from the pool so next prompt respawns.
+            ctx.pi_pool.evict(agent_id).await;
             ctx.event_bus.send(
                 conv_id,
                 ConversationEvent::Error {
@@ -889,6 +893,74 @@ async fn run_pi_agent(
         &stored,
         turn.tokens,
     );
+
+    // Persist each tool call pi made as a `tool_call` / `tool_result` pair
+    // so the task board, history view, and any TASK_CREATED markers take
+    // effect the same way the Rust loop's tools.rs::execute did.
+    for tc in &turn.tool_calls {
+        let call_msg = serde_json::json!({
+            "tool": tc.name,
+            "params": tc.params,
+        });
+        if let Ok(m) = mgr.send_message(
+            conv_id,
+            &SendMessage {
+                sender_type: "system".into(),
+                sender_id: agent_id.to_string(),
+                sender_name: Some(agent_id.to_string()),
+                content: call_msg.to_string(),
+                message_type: Some("tool_call".into()),
+            },
+        ) {
+            ctx.event_bus.send(
+                conv_id,
+                ConversationEvent::Message {
+                    message: serde_json::json!(m),
+                },
+            );
+        }
+
+        if let Some(result) = &tc.result {
+            // Interpret xpressclaw MCP list_tasks/create_task payloads to
+            // drop task cards into the conversation.
+            let text_result = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|item| item.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if let Some(rest) = text_result.strip_prefix("Created task ") {
+                // Format: "Created task <id> (<title>)"
+                let (id_part, title_part) = rest.split_once(" (").unwrap_or((rest, ""));
+                let title = title_part.trim_end_matches(')').to_string();
+                let card = serde_json::json!({
+                    "task_id": id_part,
+                    "title": title,
+                    "status": "pending",
+                    "subtasks_total": 0,
+                    "subtasks_completed": 0,
+                });
+                if let Ok(msg) = mgr.send_message(
+                    conv_id,
+                    &SendMessage {
+                        sender_type: "system".into(),
+                        sender_id: agent_id.to_string(),
+                        sender_name: Some(agent_id.to_string()),
+                        content: card.to_string(),
+                        message_type: Some("task_status".into()),
+                    },
+                ) {
+                    ctx.event_bus.send(
+                        conv_id,
+                        ConversationEvent::Message {
+                            message: serde_json::json!(msg),
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// If this conversation is bound to a connector channel, send the agent's

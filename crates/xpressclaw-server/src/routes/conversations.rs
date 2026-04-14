@@ -284,6 +284,7 @@ async fn send_message(
                     event_bus: state.event_bus.clone(),
                     rate_limiter: state.rate_limiter(),
                     agent_roles: agent_skills_map,
+                    pi_pool: state.pi_pool.clone(),
                 },
             );
         }
