@@ -8,6 +8,7 @@ mod down;
 mod init;
 mod logs;
 mod memory;
+mod pi_smoke;
 mod sop;
 mod status;
 mod tasks;
@@ -113,6 +114,16 @@ pub enum Command {
     /// pi replaces it as the canonical smoke.
     C2wSmoke,
 
+    /// Smoke-test the pi harness layer (ADR-023 task 4).
+    ///
+    /// Launches a noop WASI guest through PiHarness so the pi-specific
+    /// defaults (per-agent workspace mount, env seeding for the LLM
+    /// sidecar and xclaw socket) are exercised end-to-end. OCI pull
+    /// isn't wired yet; the smoke uses a local WASM it generates
+    /// on-the-fly. Removed once tasks 5/6 deliver the real pi launch
+    /// path.
+    PiSmoke,
+
     /// View activity logs
     Logs {
         /// Filter by agent
@@ -145,6 +156,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
         Command::C2wSmoke => c2w_smoke::run().await,
+        Command::PiSmoke => pi_smoke::run().await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
     }
 }

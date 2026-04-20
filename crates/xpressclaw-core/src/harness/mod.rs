@@ -19,7 +19,9 @@ use crate::error::Result;
 pub use crate::docker::manager::{ContainerInfo as HarnessInfo, VolumeMount};
 
 pub mod c2w;
+pub mod pi;
 pub use c2w::C2wHarness;
+pub use pi::{HarnessImageResolver, PiHarness};
 
 /// Runtime abstraction over agent workloads.
 ///
