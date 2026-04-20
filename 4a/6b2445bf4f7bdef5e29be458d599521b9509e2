@@ -1,0 +1,63 @@
+Non-obvious choices here:
+
+**Why newline-JSON, not MCP/JSON-RPC over the wire.**
+The whole point of the bridge is that the agent *can't* speak MCP.
+Using JSON-RPC framing inside would add ceremony (id fields, error
+objects with specific shape) that buys nothing — we're not
+multiplexing, we're not long-lived per-connection, and the
+debuggability argument (socat / nc testing) is worth keeping. If we
+later want proper MCP tools exposed this way we can layer them on; the
+wire format is intentionally the least expressive thing that works.
+
+**Verb dispatch doesn't route through McpManager, even though the task
+description said it would.**
+Reason: the memory/tasks/budget MCP tools that exist today are
+accessed through harness containers' own MCP client. They're not
+first-class tools exported from the xpressclaw server. So routing
+"memory.add" through McpManager::call_tool would require first
+creating an "xpressclaw:memory.add" MCP tool and registering it.
+Easier to call MemoryManager directly; same outcome. If we later
+export these as MCP tools (for MCP-speaking harnesses to consume too),
+we can re-route through McpManager without touching the wire format.
+
+**Per-connection model, not persistent.**
+Pi's agent loop invokes `xclaw` as a fresh shell subprocess per call —
+there's nothing to keep a persistent connection for on the agent side.
+Server-side, accepting + dispatching + closing is a few microseconds.
+Not worth building connection pooling.
+
+**Positional args collected under _positional.**
+Rare but necessary — verbs like `xclaw log info "message with spaces"`
+don't naturally fit the flag model. Putting them under a reserved key
+keeps the flat-object shape consistent and doesn't force every verb to
+predeclare positional positions.
+
+**Why `xclaw` is a second bin in xpressclaw-cli, not its own crate.**
+Adding a workspace member costs dependency resolution time and a
+build.rs hop. xpressclaw-cli already has the core dep for shared
+protocol types; adding one more binary entry is trivial. If xclaw
+grows a lot of its own deps later we split it out; today it's 200 LoC
+and shares everything with the main CLI.
+
+**Unix-only by design.**
+The socket transport is Unix-specific. Windows support would require
+named pipes with a different API. The WASM guest doesn't care about
+the host OS — it sees a preopened "file" it can read/write. So the
+split is contained to this one module. Revisit when/if we have real
+Windows user demand.
+
+**Socket path.**
+<data_dir>/run/xclaw.sock places it with other xpressclaw state. Not
+/tmp (survives reboots if the data_dir is persistent), not /var/run
+(requires root), not ~/.xpressclaw (conflicts on shared hosts). The
+guest sees it mounted at /run/xclaw.sock per task 4 (the XCLAW_SOCKET
+env constant in harness/pi.rs).
+
+**Socket-to-guest bridging NOT implemented in this commit.**
+PiHarness in task 4 sets XCLAW_SOCKET=/run/xclaw.sock inside the guest,
+but the VolumeMount from host socket to guest /run/xclaw.sock isn't
+wired yet. That requires wasmtime-wasi to expose the unix socket as a
+preopen, which needs extra care (WASI p1 treats preopens as
+directories; a socket needs fd-level passing). Landing that
+alongside the actual pi image in a follow-up makes more sense than
+doing it speculatively now with no guest to test against.
