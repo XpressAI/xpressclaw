@@ -1,7 +1,7 @@
 # ADR-023: Pi-Agent as First-Class Harness, WASM Containers via c2w
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 
