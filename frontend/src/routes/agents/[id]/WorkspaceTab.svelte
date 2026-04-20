@@ -12,6 +12,7 @@
 	let { agentId, agentConfig, onSave }: Props = $props();
 	let newVolumePath = $state('');
 	let saving = $state(false);
+	let composing = $state(false);
 
 	interface FileEntry {
 		name: string;
@@ -231,7 +232,9 @@
 
 		<div class="flex gap-2">
 			<input type="text" bind:value={newVolumePath} placeholder="/path/on/host"
-				onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') addVolume(); }}
+				onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composing && e.keyCode !== 229) addVolume(); }}
+				oncompositionstart={() => (composing = true)}
+				oncompositionend={() => setTimeout(() => (composing = false), 0)}
 				class="flex-1 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
 			<button onclick={addVolume} disabled={!newVolumePath.trim()}
 				class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed">

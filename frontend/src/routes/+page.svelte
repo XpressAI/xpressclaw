@@ -13,6 +13,7 @@
 	let agentList = $state<Agent[]>([]);
 	let selectedAgent = $state('');
 	let sending = $state(false);
+	let composing = $state(false);
 
 	async function checkReady() {
 		try {
@@ -66,7 +67,7 @@
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter' && !e.shiftKey) {
+		if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !composing && e.keyCode !== 229) {
 			e.preventDefault();
 			send();
 		}
@@ -91,6 +92,8 @@
 				<textarea
 					bind:value={message}
 					onkeydown={handleKeydown}
+					oncompositionstart={() => (composing = true)}
+					oncompositionend={() => setTimeout(() => (composing = false), 0)}
 					placeholder="How can I help you today?"
 					rows="3"
 					disabled={sending}

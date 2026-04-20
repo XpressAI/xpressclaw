@@ -17,6 +17,7 @@
 	let searchQuery = $state('');
 	let searching = $state(false);
 	let deletingId = $state<string | null>(null);
+	let composing = $state(false);
 
 	onMount(() => {
 		loadMemories();
@@ -74,7 +75,9 @@
 				type="text"
 				bind:value={searchQuery}
 				placeholder="Search memories..."
-				onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') handleSearch(); }}
+				onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composing && e.keyCode !== 229) handleSearch(); }}
+				oncompositionstart={() => (composing = true)}
+				oncompositionend={() => setTimeout(() => (composing = false), 0)}
 				class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 			/>
 			<button

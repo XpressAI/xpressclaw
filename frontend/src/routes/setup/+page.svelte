@@ -55,6 +55,7 @@
 	// Workspace folders to mount into /workspace/{basename}
 	let workspaceFolders = $state<string[]>([]);
 	let newFolderPath = $state('');
+	let composingFolder = $state(false);
 
 	// Optional tool toggles + config
 	let gitEnabled = $state(false);
@@ -696,7 +697,9 @@
 			{/if}
 			<div class="flex gap-2">
 				<input type="text" bind:value={newFolderPath} placeholder="~/projects/my-app"
-					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
+					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composingFolder && e.keyCode !== 229 && newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
+					oncompositionstart={() => (composingFolder = true)}
+					oncompositionend={() => setTimeout(() => (composingFolder = false), 0)}
 					class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 				<button onclick={() => { if (newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
 					disabled={!newFolderPath.trim()}

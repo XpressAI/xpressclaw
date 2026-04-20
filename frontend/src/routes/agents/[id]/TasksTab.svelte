@@ -18,6 +18,7 @@
 	let showCreateForm = $state(false);
 	let newTaskTitle = $state('');
 	let creating = $state(false);
+	let composing = $state(false);
 
 	onMount(() => {
 		loadTasks();
@@ -71,7 +72,9 @@
 					type="text"
 					bind:value={newTaskTitle}
 					placeholder="Task title..."
-					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') createTask(); }}
+					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composing && e.keyCode !== 229) createTask(); }}
+					oncompositionstart={() => (composing = true)}
+					oncompositionend={() => setTimeout(() => (composing = false), 0)}
 					class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 				/>
 				<button
