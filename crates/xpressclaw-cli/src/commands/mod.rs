@@ -1,6 +1,7 @@
 use clap::Subcommand;
 
 mod budget;
+mod c2w_smoke;
 mod chat;
 mod client;
 mod down;
@@ -104,6 +105,14 @@ pub enum Command {
         port: u16,
     },
 
+    /// Smoke-test the c2w WASM runtime (ADR-023).
+    ///
+    /// Launches a minimal WASI hello-world guest via C2wHarness and
+    /// verifies the lifecycle (launch → run → exit → stop) works. Exists
+    /// while the pi harness (task 4) is under construction; removed once
+    /// pi replaces it as the canonical smoke.
+    C2wSmoke,
+
     /// View activity logs
     Logs {
         /// Filter by agent
@@ -135,6 +144,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Memory { command, port } => memory::run(command, port).await,
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
+        Command::C2wSmoke => c2w_smoke::run().await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
     }
 }

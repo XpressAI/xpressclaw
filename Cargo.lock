@@ -9101,10 +9101,12 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "wat",
  "xpressclaw-core",
  "xpressclaw-server",
 ]
@@ -9147,6 +9149,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
  "zerocopy",
 ]
 

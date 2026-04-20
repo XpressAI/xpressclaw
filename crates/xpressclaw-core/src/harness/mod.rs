@@ -18,6 +18,9 @@ use crate::error::Result;
 
 pub use crate::docker::manager::{ContainerInfo as HarnessInfo, VolumeMount};
 
+pub mod c2w;
+pub use c2w::C2wHarness;
+
 /// Runtime abstraction over agent workloads.
 ///
 /// Implementors own the lifecycle (launch/stop/observe) of agents. The

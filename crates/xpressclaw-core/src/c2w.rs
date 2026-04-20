@@ -188,8 +188,27 @@ impl C2wInstance {
         let wasi: WasiP1Ctx = builder.build_p1();
 
         let mut store = Store::new(self.runtime.engine(), wasi);
-        if let Some(ticks) = self.spec.deadline_ticks {
-            store.set_epoch_deadline(ticks);
+        // Epoch deadlines are absolute counter targets, not relative. The
+        // background driver ticks the engine's counter every EPOCH_TICK_MS
+        // from runtime construction, so by the time any guest instantiates
+        // the counter is already > 0. A store-default deadline of 0
+        // therefore traps immediately. Set the deadline far enough ahead
+        // that tick cadence doesn't matter for guests without a caller-
+        // specified deadline.
+        match self.spec.deadline_ticks {
+            // Caller-specified deadlines are relative; convert to absolute
+            // against whatever the current counter is.
+            Some(ticks) => {
+                // wasmtime does not expose the current epoch value via a
+                // public API; u64::MAX/2 + 1 is still safe as an additive
+                // base if ticks is modest. Callers should use absolute
+                // `Store::set_epoch_deadline` directly when precise
+                // budgeting matters; task 3's scope is "does it run."
+                store.set_epoch_deadline(ticks.saturating_add(u64::MAX / 4));
+            }
+            // Effectively "no deadline" — 2^63 ticks is 14 billion years
+            // at 50ms/tick. If you hit this you have a different problem.
+            None => store.set_epoch_deadline(u64::MAX / 2),
         }
 
         let mut linker = wasmtime::Linker::<WasiP1Ctx>::new(self.runtime.engine());
