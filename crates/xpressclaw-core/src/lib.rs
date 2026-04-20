@@ -17,3 +17,4 @@ pub mod memory;
 pub mod tasks;
 pub mod tools;
 pub mod workflows;
+pub mod xclaw;

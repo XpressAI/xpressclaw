@@ -15,6 +15,14 @@ metal = ["xpressclaw-core/metal", "xpressclaw-server/metal"]
 name = "xpressclaw"
 path = "src/main.rs"
 
+# xclaw shell bridge CLI (ADR-023 §7, task 5). Mounted inside non-MCP
+# harness guests so agents can invoke xpressclaw verbs over a Unix
+# socket. Unix-only at the Cargo level — target filter lives on the
+# binary's use statements.
+[[bin]]
+name = "xclaw"
+path = "src/bin/xclaw.rs"
+
 [dependencies]
 xpressclaw-core = { path = "../xpressclaw-core" }
 xpressclaw-server = { path = "../xpressclaw-server" }

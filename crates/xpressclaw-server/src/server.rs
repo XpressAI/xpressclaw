@@ -59,6 +59,24 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         });
     }
 
+    // Start the xclaw shell-bridge listener (ADR-023 task 5).
+    // Socket lives under the xpressclaw data dir so it moves with the
+    // rest of runtime state. The pi harness (task 4) mounts this socket
+    // into guest workspaces so agents can invoke `xclaw <verb>`.
+    if let Some(data_dir) = state.config_path.parent() {
+        let socket_path = crate::xclaw_bridge::default_socket_path(data_dir);
+        match crate::xclaw_bridge::start(socket_path.clone(), state.clone()) {
+            Ok(_handle) => info!(
+                socket = %socket_path.display(),
+                "xclaw bridge started"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "xclaw bridge failed to start; agents will not be able to call xclaw verbs"
+            ),
+        }
+    }
+
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
 

@@ -35,3 +35,4 @@ open = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"
+tempfile = "3"
