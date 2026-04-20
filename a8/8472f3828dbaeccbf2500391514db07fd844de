@@ -1,0 +1,64 @@
+Non-obvious choices in task 8:
+
+**Why directory-copy, not overlay / COW / ZFS snapshots.**
+The alternatives are faster but platform-specific. Overlay fs is
+Linux-only; APFS/BTRFS/ZFS snapshots need specific filesystems.
+Directory copy works on every macOS and Linux setup we ship against
+and has no hidden dependencies. For agent tool-call rollback the
+workspace is typically small (source files, test output), so the
+copy cost is acceptable. If real-world workspaces get big we can
+add a fast-path per OS without changing the trait.
+
+**Why snapshot doesn't stop the guest first.**
+Semantics chosen to match the ADR's checkpoint model: the guest
+keeps running while a snapshot is taken, so tool calls don't pay a
+stop/restart tax for every checkpoint. The snapshot is a consistent
+point-in-time copy for rollback purposes — if the guest races us
+while we copy, the next snapshot will capture the post-race state.
+Acceptable for rollback semantics; not acceptable for backup
+semantics (which we're not claiming).
+
+**Why restore doesn't re-launch the guest.**
+Splitting "revert filesystem" from "restart guest" gives the caller
+control. The task dispatcher (task 10) might want to restore FS only
+(so the guest sees the reverted state on next read), or stop +
+restore + relaunch (a full reset). Coupling them here would remove
+that flexibility. The ADR's "drop the Store and re-instantiate"
+flow is then: stop() → restore() → launch() — three explicit steps.
+
+**Why SnapshotId is a String.**
+Opaque-token pattern. Callers treat the id as a black box; internals
+pick whatever scheme fits — UUID in our case, but something else if
+we later back snapshots with content-addressed storage. Keeping the
+type thin (newtype around String) means no serialization drama when
+this eventually crosses an API boundary.
+
+**Symlinks are skipped, not followed.**
+A symlink inside a preopen could point anywhere on the host. If we
+followed them, a malicious guest could trick us into copying arbitrary
+host files into a snapshot — privilege escalation via copy. Skipping
+them is the safe default. Guests that legitimately need symlinked
+content inside their workspace can get it via additional preopens.
+
+**Why `preopens` stored on RunningAgent and not re-derived from spec.**
+ContainerSpec holds volumes (source, target, read_only). We compute
+InstanceSpec.preopens from that at launch time. Storing it on the
+RunningAgent means snapshot/restore don't have to re-run the
+spec→instance_spec conversion and stay internally consistent with
+what the guest actually got mounted.
+
+**Why the unit test bypasses the guest and mutates the workspace
+directly.**
+The point of the test is the snapshot/restore plumbing, not
+demonstrating that a real guest can mutate files (which we already
+know WASI fd_write does). Using host-side file IO to simulate guest
+mutations means the test is fast, hermetic, and not coupled to
+whatever WAT I author. The CLI smoke does the same — mutates the
+workspace from the outside to simulate a tool call.
+
+**Why restore removes the existing dir before copying back (instead
+of overlay-merging).**
+If restore merged (kept existing files + added snapshot files on top)
+then a guest that *created* a file post-snapshot would keep it after
+restore — the exact failure mode rollback is supposed to prevent.
+Clearing first guarantees the workspace matches the snapshot exactly.
