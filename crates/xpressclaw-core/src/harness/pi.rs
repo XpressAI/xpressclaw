@@ -53,15 +53,51 @@ pub const XCLAW_SOCKET_ENV: &str = "XCLAW_SOCKET";
 /// Resolves a `spec.image` reference (file path or OCI ref) to a
 /// concrete on-disk WASM module path.
 ///
-/// In this commit only file paths are supported. OCI pull (manifest →
-/// blob → cache → digest verify) is task 4b.
+/// Resolution order:
+/// 1. If `image_ref` is an existing filesystem path, use it directly.
+///    (The dev and smoke-test flow.)
+/// 2. If the fallback mode is enabled (constructor
+///    [`HarnessImageResolver::with_fallback`]) and the ref isn't a
+///    file, write the bundled noop-harness WASM into the cache dir
+///    and return that. This keeps the desktop app runnable end-to-end
+///    before a real pi image exists on GHCR.
+/// 3. Otherwise return a clear error naming the OCI-pull follow-up
+///    (task 10 phase 2).
 pub struct HarnessImageResolver {
     cache_dir: PathBuf,
+    use_bundled_fallback: bool,
 }
+
+/// Minimal WASI preview-1 guest used as a stand-in until the real pi
+/// harness image is published to GHCR. Its `_start` returns immediately,
+/// so agents "launch" cleanly and the lifecycle UI works; conversations
+/// fall back to the LLM router because the guest doesn't host an
+/// endpoint. This is enough to exercise the desktop app end-to-end.
+const BUNDLED_FALLBACK_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (func (export "_start")))
+"#;
+
+const BUNDLED_FALLBACK_FILENAME: &str = "bundled-noop-harness.wasm";
 
 impl HarnessImageResolver {
     pub fn new(cache_dir: PathBuf) -> Self {
-        Self { cache_dir }
+        Self {
+            cache_dir,
+            use_bundled_fallback: false,
+        }
+    }
+
+    /// Construct a resolver that falls back to the bundled noop harness
+    /// when the image ref can't be resolved. Used by the real server
+    /// startup path — OCI pulls aren't implemented yet, and without
+    /// this fallback every agent launch would fail.
+    pub fn with_fallback(cache_dir: PathBuf) -> Self {
+        Self {
+            cache_dir,
+            use_bundled_fallback: true,
+        }
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -69,21 +105,38 @@ impl HarnessImageResolver {
     }
 
     /// Resolve `image_ref` to a local `.wasm` path.
-    ///
-    /// - If `image_ref` names an existing file, it's used directly.
-    /// - Otherwise (typical OCI refs like `ghcr.io/...:tag`), an error
-    ///   is returned describing the task-4b gap.
     pub async fn resolve(&self, image_ref: &str) -> Result<PathBuf> {
         let as_path = PathBuf::from(image_ref);
         if as_path.is_file() {
             return Ok(as_path);
         }
+        if self.use_bundled_fallback {
+            return self.materialize_bundled_fallback();
+        }
         Err(Error::Container(format!(
-            "OCI image pull not yet implemented (ADR-023 task 4b); \
+            "OCI image pull not yet implemented (ADR-023 task 10 phase 2); \
              expected local .wasm path, got {image_ref:?}. \
              Cache dir would be {}.",
             self.cache_dir.display()
         )))
+    }
+
+    fn materialize_bundled_fallback(&self) -> Result<PathBuf> {
+        let dest = self.cache_dir.join(BUNDLED_FALLBACK_FILENAME);
+        if dest.is_file() {
+            return Ok(dest);
+        }
+        std::fs::create_dir_all(&self.cache_dir).map_err(|e| {
+            Error::Container(format!(
+                "create cache dir {}: {e}",
+                self.cache_dir.display()
+            ))
+        })?;
+        let wasm = wat::parse_str(BUNDLED_FALLBACK_WAT)
+            .map_err(|e| Error::Container(format!("bundled harness wat: {e}")))?;
+        std::fs::write(&dest, &wasm)
+            .map_err(|e| Error::Container(format!("write {}: {e}", dest.display())))?;
+        Ok(dest)
     }
 }
 
@@ -285,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_rejects_oci_ref_until_task_4b() {
+    async fn resolver_rejects_oci_ref_without_fallback() {
         let cache = tempdir().expect("cache");
         let r = HarnessImageResolver::new(cache.path().to_path_buf());
         let err = r
@@ -294,8 +347,23 @@ mod tests {
             .expect_err("should error until OCI pull ships");
         let msg = format!("{err}");
         assert!(
-            msg.contains("task 4b"),
-            "error message should mention follow-up task, got: {msg}"
+            msg.contains("OCI image pull"),
+            "error message should explain the missing feature, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_with_fallback_materializes_bundled_wasm() {
+        let cache = tempdir().expect("cache");
+        let r = HarnessImageResolver::with_fallback(cache.path().to_path_buf());
+        let path = r
+            .resolve("ghcr.io/xpressai/harnesses/pi:v0.1.0")
+            .await
+            .expect("fallback resolves");
+        assert!(path.is_file(), "resolved path should exist");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(BUNDLED_FALLBACK_FILENAME)
         );
     }
 }

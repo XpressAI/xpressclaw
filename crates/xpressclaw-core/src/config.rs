@@ -223,6 +223,11 @@ pub struct AgentLlmConfig {
 pub struct AgentConfig {
     pub name: String,
     pub backend: String,
+    /// Harness image reference (ADR-023). Path to a local `.wasm`
+    /// module, an OCI ref like `ghcr.io/xpressai/harnesses/pi:v0.1.0`
+    /// (when task-10 phase 2 lands), or `None` to use the bundled
+    /// fallback noop harness.
+    pub image: Option<String>,
     pub model: Option<String>,
     /// Per-agent LLM provider/key/url override.
     #[serde(default)]
@@ -264,6 +269,7 @@ impl Default for AgentConfig {
         Self {
             name: "default".to_string(),
             backend: "claude-sdk".to_string(),
+            image: None,
             model: None,
             llm: None,
             display_name: None,

@@ -81,10 +81,19 @@ impl AppState {
 
     /// Get the shared agent harness (ADR-023).
     ///
-    /// Returns `None` during the spike until task 10 wires the pi
-    /// harness (with GHCR OCI pull) into server startup.
+    /// Returns `None` if no harness has been installed — server startup
+    /// typically installs one via [`AppState::set_harness`] before any
+    /// handlers run, but if wasmtime init fails, downstream code should
+    /// degrade gracefully.
     pub async fn harness(&self) -> Option<Arc<dyn Harness>> {
         self.harness.read().unwrap().clone()
+    }
+
+    /// Install the shared agent harness. Called once at server startup.
+    /// Replacing an existing harness at runtime is supported but rare
+    /// (used by tests); the common case is a single install.
+    pub fn set_harness(&self, harness: Arc<dyn Harness>) {
+        *self.harness.write().unwrap() = Some(harness);
     }
 
     /// Check if setup is complete.

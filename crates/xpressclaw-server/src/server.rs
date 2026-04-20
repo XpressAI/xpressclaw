@@ -33,6 +33,36 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         crate::skills::extract_skills(data_dir);
     }
 
+    // ADR-023 task 10: install the WASM harness. C2wRuntime holds the
+    // shared wasmtime Engine; PiHarness layers pi-specific defaults on
+    // top. Stored in AppState so every handler can reach the same
+    // harness via `state.harness()`. When a wasmtime init fails we log
+    // and continue — the rest of the server still works, just with
+    // agent launching disabled.
+    if let Some(data_dir) = state.config_path.parent() {
+        let harness_cache = data_dir.join("harness-cache");
+        let workspaces_root = data_dir.join("workspaces");
+        for dir in [&harness_cache, &workspaces_root] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                warn!(path = %dir.display(), error = %e, "failed to create harness dir");
+            }
+        }
+        match xpressclaw_core::c2w::C2wRuntime::new() {
+            Ok(runtime) => {
+                let c2w = std::sync::Arc::new(xpressclaw_core::harness::C2wHarness::new(
+                    runtime,
+                    harness_cache.clone(),
+                ));
+                let resolver =
+                    xpressclaw_core::harness::HarnessImageResolver::with_fallback(harness_cache);
+                let pi = xpressclaw_core::harness::PiHarness::new(c2w, resolver, workspaces_root);
+                state.set_harness(std::sync::Arc::new(pi));
+                info!("wasm harness (pi on c2w/wasmtime) installed (ADR-023)");
+            }
+            Err(e) => warn!(error = %e, "failed to initialise wasm runtime — agents cannot launch"),
+        }
+    }
+
     // Start host-side MCP servers in background.
     // Skip servers with container-only paths — those only run inside Docker.
     let config = state.config();
@@ -101,13 +131,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    // Start the desired-state reconciler (ADR-018).
+    // Start the desired-state reconciler (ADR-018, ADR-023 task 10).
     let reconciler_db = state.db.clone();
     let reconciler_config = state.config.clone();
+    let reconciler_harness = state.harness().await;
     let reconciler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port) => {}
+            _ = xpressclaw_core::agents::reconciler::start(
+                reconciler_db, reconciler_config, port, reconciler_harness,
+            ) => {}
             _ = reconciler_shutdown.cancelled() => { info!("reconciler stopped"); }
         }
     });

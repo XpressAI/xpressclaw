@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+# ADR-023 task 10: compile the bundled fallback harness WASM at
+# startup from its WAT source. Small crate; moves out of dev-deps so
+# production paths can use it too.
+wat = "1"
 tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -52,4 +56,3 @@ encoding_rs = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
-wat = "1"
