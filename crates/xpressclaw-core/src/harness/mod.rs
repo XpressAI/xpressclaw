@@ -134,4 +134,28 @@ pub trait Harness: Send + Sync {
         let _ = snapshot;
         Ok(())
     }
+
+    /// Return a host-side descriptor the frontend can use to attach
+    /// to this agent's tmux session (ADR-023 task 9). Harnesses that
+    /// don't expose tmux (e.g. a pure c2w WASM guest) return `None`.
+    ///
+    /// Concrete descriptor shape is intentionally opaque at this layer
+    /// — callers resolve it via [`Harness::kind`]. The typical tmux
+    /// harness returns the unix-socket path of the tmux server so a
+    /// host-side xterm.js bridge can attach.
+    async fn attach_tmux(&self, agent_id: &str) -> Option<TmuxAttach> {
+        let _ = agent_id;
+        None
+    }
+}
+
+/// Descriptor for attaching to a harness's tmux session (ADR-023 task 9).
+///
+/// Not all harnesses expose tmux; those that do return this from
+/// [`Harness::attach_tmux`]. The frontend uses `session_name` + the
+/// harness-local `socket_path` to tunnel a terminal view to the user.
+#[derive(Debug, Clone)]
+pub struct TmuxAttach {
+    pub session_name: String,
+    pub socket_path: std::path::PathBuf,
 }

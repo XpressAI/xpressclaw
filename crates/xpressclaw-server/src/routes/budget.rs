@@ -63,7 +63,24 @@ async fn agent_budget(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = BudgetManager::new(state.db.clone(), state.config());
     let summary = mgr.get_summary(Some(&agent_id)).map_err(internal_error)?;
-    Ok(Json(json!(summary)))
+
+    // Include transparent-downgrade state so the UI can show the
+    // "running on local model (budget)" chip when the sidecar has
+    // swapped this agent's model (ADR-023 §6, task 9).
+    let state_record = mgr.get_state(&agent_id).map_err(internal_error)?;
+
+    let mut body = match serde_json::to_value(&summary) {
+        Ok(Value::Object(m)) => Value::Object(m),
+        _ => json!({}),
+    };
+    if let Value::Object(ref mut map) = body {
+        map.insert(
+            "degraded_model".to_string(),
+            json!(state_record.degraded_model),
+        );
+        map.insert("is_paused".to_string(), json!(state_record.is_paused));
+    }
+    Ok(Json(body))
 }
 
 async fn usage_history(

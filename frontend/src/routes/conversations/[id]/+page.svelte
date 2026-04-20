@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import { onMount, tick, untrack } from 'svelte';
-	import { conversations, agents } from '$lib/api';
-	import type { Conversation, ConversationMessage, Agent } from '$lib/api';
+	import { conversations, agents, budget, agentHarness } from '$lib/api';
+	import type { Conversation, ConversationMessage, Agent, AgentBudgetState, AgentTmuxStatus } from '$lib/api';
 	import { timeAgo, agentAvatar, getCachedProfile, setCachedProfile, isProfileLoaded } from '$lib/utils';
 	import { settings } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
@@ -27,6 +27,12 @@
 	let userProfile = $state(getCachedProfile());
 	let pendingMsgHandled = false;
 	let composing = $state(false);
+
+	// ADR-023 §6 task 9: per-agent budget state (so we can show the
+	// "running on local (budget)" chip) + tmux availability (for the
+	// terminal-attach button).
+	let primaryBudget = $state<AgentBudgetState | null>(null);
+	let primaryTmux = $state<AgentTmuxStatus | null>(null);
 
 	// Derive just the ID string so the $effect below only re-runs
 	// when the actual ID changes, not on every $page store emission.
@@ -58,6 +64,23 @@
 			? agentList.find(a => a.id === participantAgents[0])
 			: undefined
 	);
+
+	// Fetch budget + tmux status for the primary agent. Re-fetches
+	// whenever the primary-agent id changes so the header chip updates
+	// when the sidecar flips the agent's degraded_model mid-conversation.
+	let primaryAgentId = $derived(primaryAgent?.id);
+	$effect(() => {
+		const id = primaryAgentId;
+		if (!id) {
+			primaryBudget = null;
+			primaryTmux = null;
+			return;
+		}
+		untrack(() => {
+			budget.agent(id).then(b => { if (primaryAgentId === id) primaryBudget = b; }).catch(() => {});
+			agentHarness.tmux(id).then(t => { if (primaryAgentId === id) primaryTmux = t; }).catch(() => {});
+		});
+	});
 
 	$effect(() => {
 		const id = convId;
@@ -489,9 +512,34 @@
 							{agentId}
 						</span>
 					{/each}
+					{#if primaryBudget?.degraded_model}
+						<!-- ADR-023 §6: transparent budget downgrade. Make it
+						     visible so the user knows why responses look
+						     different from what their primary model would produce. -->
+						<span
+							class="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-300"
+							title="This agent hit its budget cap; the sidecar has transparently switched to {primaryBudget.degraded_model}."
+						>
+							<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3 10.5V6.75a.75.75 0 01.75-.75h16.5a.75.75 0 01.75.75v10.5a.75.75 0 01-.75.75H3.75a.75.75 0 01-.75-.75v-1.5M3 10.5h15M3 10.5v4.5"/></svg>
+							running on {primaryBudget.degraded_model} (budget)
+						</span>
+					{/if}
 				</div>
 			</div>
 			<div class="flex items-center gap-1">
+				{#if primaryTmux?.available}
+					<!-- ADR-023 task 9: attach to the agent's tmux session.
+					     Only shown when the harness actually exposes one.
+					     xterm.js integration lands alongside the first real
+					     tmux-exposing harness. -->
+					<button
+						onclick={() => alert(`Attach to session "${primaryTmux?.session ?? ''}" — xterm.js integration pending next task iteration.`)}
+						class="rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors"
+						title="Attach to agent terminal (tmux)"
+					>
+						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M6.75 7.5l3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0021 18V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v12a2.25 2.25 0 002.25 2.25z"/></svg>
+					</button>
+				{/if}
 				<a href="/tasks" class="rounded-lg p-2 text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors" title="Tasks">
 					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
 				</a>

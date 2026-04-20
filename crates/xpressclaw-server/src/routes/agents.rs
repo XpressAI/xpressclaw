@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(get_agent_logs))
+        .route("/{id}/tmux", get(get_agent_tmux))
 }
 
 /// Build a JSON response for an agent by merging YAML config, DB desired state,
@@ -421,6 +422,27 @@ async fn get_agent_logs(
         .ok_or_else(|| internal_error("no agent harness available"))?;
     let logs = harness.logs(&id, tail).await.map_err(internal_error)?;
     Ok(Json(json!({ "logs": logs })))
+}
+
+/// `GET /api/agents/:id/tmux` — report whether this agent's harness
+/// exposes a tmux session (ADR-023 task 9).
+///
+/// Shape: `{ available: bool, session?: string }`. The UI uses
+/// `available` to decide whether to show the "Attach terminal" button
+/// in the conversation header. The full session attach path (xterm.js
+/// + WebSocket) lands alongside the first tmux-exposing harness.
+async fn get_agent_tmux(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let tmux = match state.harness().await {
+        Some(harness) => harness.attach_tmux(&id).await,
+        None => None,
+    };
+    match tmux {
+        Some(t) => Json(json!({
+            "available": true,
+            "session": t.session_name,
+        })),
+        None => Json(json!({ "available": false })),
+    }
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
