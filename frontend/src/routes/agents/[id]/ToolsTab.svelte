@@ -55,6 +55,7 @@
 	let catalogQuery = $state('');
 	let catalogResults = $state<{name: string; description: string; url?: string}[]>([]);
 	let catalogLoading = $state(false);
+	let composing = $state(false);
 
 	const toolConfigs: Record<string, {label: string; desc: string}> = {
 		fetch: { label: 'Internet Access', desc: 'Configure allowed and blocked sites' },
@@ -455,7 +456,9 @@
 			</div>
 			<div class="flex gap-2">
 				<input type="text" bind:value={catalogQuery} placeholder="Search servers... (e.g. github, jira, slack)"
-					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter') searchCatalog(); }}
+					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composing && e.keyCode !== 229) searchCatalog(); }}
+					oncompositionstart={() => (composing = true)}
+					oncompositionend={() => setTimeout(() => (composing = false), 0)}
 					class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 				<button onclick={searchCatalog} disabled={catalogLoading}
 					class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">

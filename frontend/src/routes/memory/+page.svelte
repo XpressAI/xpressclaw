@@ -9,6 +9,7 @@
 	let searchQuery = $state('');
 	let loading = $state(true);
 	let searching = $state(false);
+	let composing = $state(false);
 
 	onMount(async () => {
 		const [list, s] = await Promise.all([
@@ -57,7 +58,9 @@
 			type="text"
 			placeholder="Search memories (semantic)..."
 			bind:value={searchQuery}
-			onkeydown={(e) => e.key === 'Enter' && handleSearch()}
+			onkeydown={(e) => e.key === 'Enter' && !e.isComposing && !composing && e.keyCode !== 229 && handleSearch()}
+			oncompositionstart={() => (composing = true)}
+			oncompositionend={() => setTimeout(() => (composing = false), 0)}
 			class="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
 		/>
 		<button

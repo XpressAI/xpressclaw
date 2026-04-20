@@ -21,6 +21,7 @@
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
 	let messageSending = $state(false);
+	let composing = $state(false);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl: HTMLDivElement;
 	let prevMessageCount = 0;
@@ -117,7 +118,7 @@
 	}
 
 	function handleMessageKeydown(e: KeyboardEvent) {
-		if (e.key === 'Enter' && !e.shiftKey) {
+		if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !composing && e.keyCode !== 229) {
 			e.preventDefault();
 			sendTaskMessage();
 		}
@@ -423,6 +424,8 @@
 								<textarea
 									bind:value={messageInput}
 									onkeydown={handleMessageKeydown}
+									oncompositionstart={() => (composing = true)}
+									oncompositionend={() => setTimeout(() => (composing = false), 0)}
 									placeholder="Send a message to the agent..."
 									rows={1}
 									class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"

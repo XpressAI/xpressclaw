@@ -33,7 +33,7 @@
 			selectedIdx = Math.max(selectedIdx - 1, 0);
 			return true;
 		}
-		if (e.key === 'Enter' || e.key === 'Tab') {
+		if ((e.key === 'Enter' || e.key === 'Tab') && !e.isComposing && e.keyCode !== 229) {
 			e.preventDefault();
 			if (filtered.length > 0) onselect(filtered[selectedIdx].name);
 			return true;

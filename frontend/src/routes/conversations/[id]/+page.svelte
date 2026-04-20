@@ -26,6 +26,7 @@
 	let startingAgents = $state(false);
 	let userProfile = $state(getCachedProfile());
 	let pendingMsgHandled = false;
+	let composing = $state(false);
 
 	// Derive just the ID string so the $effect below only re-runs
 	// when the actual ID changes, not on every $page store emission.
@@ -240,17 +241,18 @@
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
+		const imeActive = e.isComposing || composing || e.keyCode === 229;
 		if (showMentionPicker) {
 			if (e.key === 'Escape') {
 				showMentionPicker = false;
 				e.preventDefault();
-			} else if (e.key === 'Enter' && filteredAgents.length > 0) {
+			} else if (e.key === 'Enter' && !imeActive && filteredAgents.length > 0) {
 				insertMention(filteredAgents[0].id);
 				e.preventDefault();
 			}
 			return;
 		}
-		if (e.key === 'Enter' && !e.shiftKey) {
+		if (e.key === 'Enter' && !e.shiftKey && !imeActive) {
 			e.preventDefault();
 			sendMessage();
 		}
@@ -751,6 +753,8 @@
 							bind:value={input}
 							oninput={handleInput}
 							onkeydown={handleKeydown}
+							oncompositionstart={() => (composing = true)}
+							oncompositionend={() => setTimeout(() => (composing = false), 0)}
 							placeholder={participantAgents.length > 0 ? `Message ${participantAgents[0]}...  (@ to mention)` : 'Write your message...'}
 							rows={1}
 							class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"
