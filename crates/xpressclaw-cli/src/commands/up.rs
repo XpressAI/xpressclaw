@@ -4,7 +4,6 @@ use tracing::{info, warn};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
-use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
@@ -153,13 +152,9 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
 
     info!(agents = config.agents.len(), "loaded configuration");
 
-    // Validate Docker/Podman is available
-    match DockerManager::connect().await {
-        Ok(_) => info!("container runtime available"),
-        Err(e) => {
-            warn!(error = %e, "Docker/Podman not available — some features will be limited");
-        }
-    }
+    // ADR-023: Docker was removed. Agent workloads run on wasmtime +
+    // container2wasm, instantiated on first use by the pi harness.
+    info!("agent runtime: wasmtime + c2w (ADR-023)");
 
     // Open database
     let db_path = config.system.data_dir.join("xpressclaw.db");

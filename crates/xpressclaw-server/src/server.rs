@@ -164,7 +164,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                                         event_bus: connector_state.event_bus.clone(),
                                         rate_limiter: connector_state.rate_limiter(),
                                         agent_roles,
-                                        docker: connector_state.docker().await,
+                                        harness: connector_state.harness().await,
                                     },
                                 );
                             }
@@ -208,31 +208,19 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Cancel all background tasks immediately
     shutdown.cancel();
 
-    // Graceful shutdown: stop containers with a timeout.
-    // A second Ctrl+C during shutdown forces immediate exit.
-    info!("shutting down — stopping containers (Ctrl+C again to force quit)");
+    // Graceful shutdown: stop agents via the harness (if one is wired
+    // up). A second Ctrl+C during shutdown forces immediate exit.
+    info!("shutting down — stopping agents (Ctrl+C again to force quit)");
 
     let shutdown_task = async {
-        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-            let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-            if let Ok(agents) = registry.list() {
-                for agent in &agents {
-                    let _ = docker.stop(&agent.id).await;
-                }
+        if let Some(harness) = state.harness().await {
+            if let Err(e) = harness.stop_all().await {
+                warn!(error = %e, "harness stop_all failed");
+            } else {
+                info!("all agents stopped");
             }
-            let apps: Vec<String> = {
-                let conn = state.db.conn();
-                conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| row.get::<_, String>(0))
-                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    })
-                    .unwrap_or_default()
-            };
-            for app_id in &apps {
-                let _ = docker.stop(&format!("app-{app_id}")).await;
-            }
-            info!("all containers stopped");
+        } else {
+            info!("no harness wired (ADR-023 spike); nothing to stop");
         }
     };
 

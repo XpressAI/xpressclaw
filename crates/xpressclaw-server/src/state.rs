@@ -5,7 +5,6 @@ use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
-use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::harness::Harness;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
@@ -33,8 +32,11 @@ pub struct AppState {
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
-    /// Shared Docker connection (reused across all requests).
-    pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
+    /// Shared agent-workload harness (ADR-023). `None` during the
+    /// spike — the pi harness isn't wired to AppState yet (task 10).
+    /// Callers treat `None` as "no agent runtime available, route
+    /// around."
+    pub harness: Arc<RwLock<Option<Arc<dyn Harness>>>>,
 }
 
 impl AppState {
@@ -58,7 +60,7 @@ impl AppState {
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
-            docker: Arc::new(RwLock::new(None)),
+            harness: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -77,35 +79,12 @@ impl AppState {
         self.rate_limiter.read().unwrap().clone()
     }
 
-    /// Get the shared Docker connection, creating it on first use.
-    /// Returns None if Docker is unavailable.
-    pub async fn docker(&self) -> Option<Arc<DockerManager>> {
-        // Fast path: already connected
-        {
-            let guard = self.docker.read().unwrap();
-            if let Some(ref d) = *guard {
-                return Some(d.clone());
-            }
-        }
-        // Slow path: try to connect
-        match DockerManager::connect().await {
-            Ok(d) => {
-                let d = Arc::new(d);
-                *self.docker.write().unwrap() = Some(d.clone());
-                Some(d)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Get the shared agent harness (ADR-023). Returns `None` if no
-    /// harness backend is available (currently: Docker unavailable).
+    /// Get the shared agent harness (ADR-023).
     ///
-    /// New code should prefer this over [`AppState::docker`]. The
-    /// direct `docker()` accessor is scheduled for removal per ADR-023
-    /// decision 4 once all callers migrate.
+    /// Returns `None` during the spike until task 10 wires the pi
+    /// harness (with GHCR OCI pull) into server startup.
     pub async fn harness(&self) -> Option<Arc<dyn Harness>> {
-        self.docker().await.map(|d| d as Arc<dyn Harness>)
+        self.harness.read().unwrap().clone()
     }
 
     /// Check if setup is complete.

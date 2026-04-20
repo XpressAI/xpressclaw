@@ -41,10 +41,8 @@ serde_yaml = "0.9"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Docker (scheduled for removal per ADR-023)
-bollard = "0.18"
-
 # WASM runtime (ADR-023: hosts c2w-compiled agent harness workloads).
+# Replaces the previous bollard/Docker dependency per ADR-023 decision 4.
 # wasmtime is c2w's first-class host, Rust-native, WASIp2 stable, and
 # exposes epoch interruption as the rollback primitive.
 wasmtime = "27"

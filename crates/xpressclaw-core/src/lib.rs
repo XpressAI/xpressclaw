@@ -1,7 +1,6 @@
 pub mod config;
 pub mod db;
 pub mod error;
-pub mod runtime;
 pub mod system;
 
 pub mod activity;
@@ -10,7 +9,6 @@ pub mod budget;
 pub mod c2w;
 pub mod connectors;
 pub mod conversations;
-pub mod docker;
 pub mod harness;
 pub mod llm;
 pub mod memory;

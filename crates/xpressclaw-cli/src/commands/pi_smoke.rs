@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tempfile::{tempdir, NamedTempFile};
 use xpressclaw_core::c2w::C2wRuntime;
-use xpressclaw_core::docker::manager::ContainerSpec;
+use xpressclaw_core::harness::types::ContainerSpec;
 use xpressclaw_core::harness::{C2wHarness, Harness, HarnessImageResolver, PiHarness};
 
 const NOOP_WASM_WAT: &str = r#"

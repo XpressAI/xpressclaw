@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use crate::docker::manager::{ContainerInfo, ContainerSpec};
 use crate::error::{Error, Result};
+use crate::harness::types::{ContainerInfo, ContainerSpec};
 use crate::harness::{C2wHarness, Harness};
 
 /// Default mount point inside the guest where per-agent scratch lives.
@@ -139,7 +139,7 @@ impl PiHarness {
         // for the same target.
         let ws_target = DEFAULT_WORKSPACE_MOUNT.to_string();
         if !built.volumes.iter().any(|v| v.target == ws_target) {
-            built.volumes.push(crate::docker::manager::VolumeMount {
+            built.volumes.push(crate::harness::types::VolumeMount {
                 source: workspace.to_string_lossy().into_owned(),
                 target: ws_target,
                 read_only: false,

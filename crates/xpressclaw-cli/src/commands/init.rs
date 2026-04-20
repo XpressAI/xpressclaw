@@ -1,8 +1,6 @@
 use std::path::Path;
 
 use xpressclaw_core::config::DEFAULT_CONFIG_TEMPLATE;
-use xpressclaw_core::docker::images;
-use xpressclaw_core::docker::manager::DockerManager;
 
 pub async fn run(path: &str) -> anyhow::Result<()> {
     let dir = Path::new(path);
@@ -23,22 +21,9 @@ pub async fn run(path: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     println!("Created data directory: {}", data_dir.display());
 
-    // Pull default harness image
-    match DockerManager::connect().await {
-        Ok(docker) => {
-            println!("Pulling default harness image...");
-            match images::pull_defaults(&docker).await {
-                Ok(_) => println!("Harness image ready."),
-                Err(e) => eprintln!("Warning: failed to pull harness image: {e}"),
-            }
-        }
-        Err(_) => {
-            eprintln!(
-                "Warning: Docker/Podman not running. \
-                 Harness images will be pulled when you run `xpressclaw up`."
-            );
-        }
-    }
+    // ADR-023: Docker was removed. Harness images (pi, etc.) pull on
+    // demand from GHCR when they're first referenced (task 10); nothing
+    // to pre-pull at init time.
 
     println!();
     println!("xpressclaw initialized! Next steps:");

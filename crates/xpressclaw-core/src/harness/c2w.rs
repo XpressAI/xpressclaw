@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::c2w::{C2wInstance, C2wRuntime, InstanceSpec};
-use crate::docker::manager::{ContainerInfo, ContainerSpec};
 use crate::error::{Error, Result};
+use crate::harness::types::{ContainerInfo, ContainerSpec};
 use crate::harness::Harness;
 
 /// Per-agent runtime record.

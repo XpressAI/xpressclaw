@@ -132,28 +132,28 @@ async fn setup_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "setup_complete": state.is_setup_complete() }))
 }
 
-/// Check if Docker/Podman is available.
+/// Docker status endpoint — retained for frontend compatibility during
+/// the ADR-023 migration. Now always reports "not available"; the
+/// frontend setup wizard's Docker step is being removed in follow-up
+/// UI work (task 7 phase C).
 async fn check_docker() -> Json<Value> {
-    use xpressclaw_core::docker::manager::DockerManager;
-    let available = DockerManager::connect().await.is_ok();
-    let installed = DockerManager::is_docker_desktop_installed();
     Json(json!({
-        "available": available,
-        "installed": installed,
-        "can_start": installed && !available,
+        "available": false,
+        "installed": false,
+        "can_start": false,
+        "removed": true,
+        "reason": "Docker support removed per ADR-023 decision 4",
     }))
 }
 
-/// Try to start Docker Desktop. Only works on macOS/Windows.
+/// Retained endpoint for frontend compatibility. Always errors now.
 async fn start_docker() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    use xpressclaw_core::docker::manager::DockerManager;
-    DockerManager::start_docker_desktop().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    Ok(Json(json!({ "started": true })))
+    Err((
+        StatusCode::GONE,
+        Json(json!({
+            "error": "Docker support removed per ADR-023; the setup flow now uses wasmtime + c2w",
+        })),
+    ))
 }
 
 /// Detect system hardware (RAM, CPU, GPU).
