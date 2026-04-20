@@ -1,0 +1,11 @@
+Why --skip-push instead of --push-pi-wasm: every other step in build.sh is opt-out (runs by default unless --skip-X). My first pass made this opt-in, which would have been the only exception and surprise users who expect the 'do everything' default. User caught it in review. Corrected to match the established pattern.
+
+Why skip gracefully instead of hard-failing: the docker step already handles 'docker not installed' by skipping with a message. Push prerequisites (oras, a reachable registry) aren't standard dev-machine installs, so failing the whole build when they're absent would be user-hostile — especially for contributors who don't care about the harness pipeline and are just running build.sh to compile. Skip with diagnostic, move on.
+
+Why write-bundled-wasm as a CLI subcommand and not a standalone binary or build-time script: the bundled WAT source lives in xpressclaw-core. Reading it from anywhere else would either require duplicating the source (fork-risk) or shelling out to a Rust build. The CLI subcommand is free — one more entry in commands/mod.rs, delegating to HarnessImageResolver's existing materialize_bundled_fallback.
+
+Why OCI artifact with custom media type instead of a plain OCI image: 'oras push' with --artifact-type produces a manifest that calls out 'this is a xpressclaw harness WASM' in one field. Consumers can filter/validate without cracking the blob open. Generic OCI images would leave that discrimination to path conventions (repo names), which is fragile.
+
+Why --plain-http: local registries (podman/docker) don't ship TLS by default. Users aren't going to generate certs for a test registry. oras's default is HTTPS, so --plain-http has to be explicit.
+
+Follow-up: once a real pi-as-c2w image exists, replace the write-bundled-wasm step with an actual c2w build. Same oras push command works unchanged.
