@@ -9,6 +9,7 @@ mod init;
 mod logs;
 mod memory;
 mod pi_smoke;
+mod rollback_smoke;
 mod sop;
 mod status;
 mod tasks;
@@ -124,6 +125,15 @@ pub enum Command {
     /// path.
     PiSmoke,
 
+    /// Smoke-test workspace snapshot/restore (ADR-023 task 8, MVP criterion 7).
+    ///
+    /// Launches a c2w guest, seeds a file, snapshots the workspace,
+    /// simulates a rogue tool call by overwriting the workspace, then
+    /// restores the snapshot and verifies the original state comes
+    /// back. Removed once task 10 wires snapshot/restore into the
+    /// real task dispatcher.
+    RollbackSmoke,
+
     /// View activity logs
     Logs {
         /// Filter by agent
@@ -157,6 +167,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Sop { command, port } => sop::run(command, port).await,
         Command::C2wSmoke => c2w_smoke::run().await,
         Command::PiSmoke => pi_smoke::run().await,
+        Command::RollbackSmoke => rollback_smoke::run().await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
     }
 }
