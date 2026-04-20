@@ -36,3 +36,4 @@ open = { workspace = true }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
+async-trait = { workspace = true }
