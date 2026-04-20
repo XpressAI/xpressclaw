@@ -48,6 +48,10 @@ clap = { version = "4", features = ["derive"] }
 wasmtime = "27"
 wasmtime-wasi = "27"
 
+# OCI registry client (ADR-023 task 10 phase 2). Pulls harness images
+# as OCI artifacts from GHCR, local podman/docker registries, etc.
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
+
 # Scheduling
 tokio-cron-scheduler = "0.13"
 

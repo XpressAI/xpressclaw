@@ -105,20 +105,98 @@ impl HarnessImageResolver {
     }
 
     /// Resolve `image_ref` to a local `.wasm` path.
+    ///
+    /// Dispatches on shape:
+    /// - Existing filesystem path → use directly.
+    /// - `registry/repo:tag` (contains `/` and `:`) → OCI pull.
+    /// - Otherwise, with fallback enabled, write the bundled noop
+    ///   wasm; without, error.
     pub async fn resolve(&self, image_ref: &str) -> Result<PathBuf> {
         let as_path = PathBuf::from(image_ref);
         if as_path.is_file() {
             return Ok(as_path);
         }
+        if looks_like_oci_ref(image_ref) {
+            return self.pull_oci_artifact(image_ref).await;
+        }
         if self.use_bundled_fallback {
             return self.materialize_bundled_fallback();
         }
         Err(Error::Container(format!(
-            "OCI image pull not yet implemented (ADR-023 task 10 phase 2); \
-             expected local .wasm path, got {image_ref:?}. \
-             Cache dir would be {}.",
+            "could not resolve image {image_ref:?}: not a file, not an OCI ref, \
+             and no fallback configured. Cache dir would be {}.",
             self.cache_dir.display()
         )))
+    }
+
+    /// Pull `image_ref` as an OCI artifact and cache the first non-empty
+    /// layer's blob to disk. Suitable for the "single WASM module shipped
+    /// as an OCI artifact" pattern that `oras push` produces, and what
+    /// GHCR stores for harness images.
+    ///
+    /// Cached by manifest digest so repeated resolves are fast and we
+    /// don't redownload when a tag points to the same content.
+    async fn pull_oci_artifact(&self, image_ref: &str) -> Result<PathBuf> {
+        use oci_client::secrets::RegistryAuth;
+        use oci_client::{Client, Reference};
+
+        let reference: Reference = image_ref
+            .parse()
+            .map_err(|e| Error::Container(format!("invalid OCI ref {image_ref:?}: {e}")))?;
+
+        let mut client_config = oci_client::client::ClientConfig::default();
+        // Local podman/docker registries typically expose HTTP on
+        // localhost without TLS. Allow that for test workflows.
+        if is_local_registry(reference.registry()) {
+            client_config.protocol = oci_client::client::ClientProtocol::Http;
+        }
+        let client = Client::new(client_config);
+
+        // Token auth from env var — simplest path for GHCR. Falls back
+        // to anonymous for public images and local registries.
+        let auth = match std::env::var("XPRESSCLAW_REGISTRY_TOKEN").ok() {
+            Some(tok) => RegistryAuth::Bearer(tok),
+            None => RegistryAuth::Anonymous,
+        };
+
+        let (manifest, manifest_digest) = client
+            .pull_image_manifest(&reference, &auth)
+            .await
+            .map_err(|e| Error::Container(format!("OCI manifest for {image_ref}: {e}")))?;
+
+        // Cache path keyed by digest so retagged-but-unchanged content
+        // doesn't re-pull and stale cache entries don't serve the wrong bytes.
+        let safe_digest = manifest_digest.replace(':', "-");
+        let dest = self.cache_dir.join(format!("{safe_digest}.wasm"));
+        if dest.is_file() {
+            return Ok(dest);
+        }
+        std::fs::create_dir_all(&self.cache_dir).map_err(|e| {
+            Error::Container(format!(
+                "create cache dir {}: {e}",
+                self.cache_dir.display()
+            ))
+        })?;
+
+        let layer = manifest.layers.first().ok_or_else(|| {
+            Error::Container(format!("OCI manifest for {image_ref} has no layers"))
+        })?;
+        let mut blob = Vec::new();
+        client
+            .pull_blob(&reference, layer, &mut blob)
+            .await
+            .map_err(|e| Error::Container(format!("OCI blob pull for {image_ref}: {e}")))?;
+
+        std::fs::write(&dest, &blob)
+            .map_err(|e| Error::Container(format!("write {}: {e}", dest.display())))?;
+        tracing::info!(
+            image = image_ref,
+            digest = manifest_digest,
+            size = blob.len(),
+            path = %dest.display(),
+            "pulled OCI artifact"
+        );
+        Ok(dest)
     }
 
     fn materialize_bundled_fallback(&self) -> Result<PathBuf> {
@@ -138,6 +216,29 @@ impl HarnessImageResolver {
             .map_err(|e| Error::Container(format!("write {}: {e}", dest.display())))?;
         Ok(dest)
     }
+}
+
+/// True if `image_ref` looks like an OCI registry reference
+/// (host[:port]/path[:tag]). Heuristic: contains a `/`, and the part
+/// before the first `/` has a `.` or `:` or is `localhost`. This
+/// distinguishes `registry:5000/foo:tag` from a filesystem path like
+/// `/tmp/foo:tag` (no authority component).
+fn looks_like_oci_ref(image_ref: &str) -> bool {
+    let Some(slash_pos) = image_ref.find('/') else {
+        return false;
+    };
+    let authority = &image_ref[..slash_pos];
+    if authority.is_empty() {
+        return false;
+    }
+    authority == "localhost" || authority.contains('.') || authority.contains(':')
+}
+
+/// Heuristic: is this a local registry address? Used to allow plain
+/// HTTP for `podman run -p 5000:5000 registry:2` style test setups.
+fn is_local_registry(host_port: &str) -> bool {
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 /// Pi-agent harness. Wraps [`C2wHarness`] and applies pi's expected
@@ -338,17 +439,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_rejects_oci_ref_without_fallback() {
+    async fn resolver_rejects_unknown_ref_without_fallback() {
         let cache = tempdir().expect("cache");
         let r = HarnessImageResolver::new(cache.path().to_path_buf());
+        // Non-OCI, non-file → no resolution possible, no fallback.
         let err = r
-            .resolve("ghcr.io/xpressai/harnesses/pi:v0.1.0")
+            .resolve("placeholder-harness")
             .await
-            .expect_err("should error until OCI pull ships");
+            .expect_err("should error without fallback");
         let msg = format!("{err}");
         assert!(
-            msg.contains("OCI image pull"),
-            "error message should explain the missing feature, got: {msg}"
+            msg.contains("could not resolve"),
+            "error should explain why, got: {msg}"
         );
     }
 
@@ -356,8 +458,9 @@ mod tests {
     async fn resolver_with_fallback_materializes_bundled_wasm() {
         let cache = tempdir().expect("cache");
         let r = HarnessImageResolver::with_fallback(cache.path().to_path_buf());
+        // Non-OCI, non-file ref → fallback kicks in.
         let path = r
-            .resolve("ghcr.io/xpressai/harnesses/pi:v0.1.0")
+            .resolve("placeholder-harness")
             .await
             .expect("fallback resolves");
         assert!(path.is_file(), "resolved path should exist");
@@ -365,5 +468,24 @@ mod tests {
             path.file_name().and_then(|n| n.to_str()),
             Some(BUNDLED_FALLBACK_FILENAME)
         );
+    }
+
+    #[test]
+    fn oci_ref_heuristic() {
+        assert!(looks_like_oci_ref("ghcr.io/foo/bar:tag"));
+        assert!(looks_like_oci_ref("localhost:5000/pi:test"));
+        assert!(looks_like_oci_ref("registry.example.com/pi"));
+        assert!(!looks_like_oci_ref("/tmp/foo.wasm"));
+        assert!(!looks_like_oci_ref("pi:latest"));
+        assert!(!looks_like_oci_ref("placeholder"));
+    }
+
+    #[test]
+    fn local_registry_detection() {
+        assert!(is_local_registry("localhost:5000"));
+        assert!(is_local_registry("127.0.0.1:5000"));
+        assert!(is_local_registry("localhost"));
+        assert!(!is_local_registry("ghcr.io"));
+        assert!(!is_local_registry("registry.example.com:5000"));
     }
 }

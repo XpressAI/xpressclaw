@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+oci-client = { workspace = true }
 # ADR-023 task 10: compile the bundled fallback harness WASM at
 # startup from its WAT source. Small crate; moves out of dev-deps so
 # production paths can use it too.

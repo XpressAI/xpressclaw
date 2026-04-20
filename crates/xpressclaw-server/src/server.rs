@@ -35,28 +35,51 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     // ADR-023: install the agent harness.
     //
-    // Today this is the `EchoHarness` — an in-process harness that
-    // binds a per-agent TCP listener and serves OpenAI-compatible
-    // `/v1/chat/completions` by forwarding to the shared LlmRouter.
-    // It's a real harness in the architectural sense (separate per-
-    // agent listener, own identity via a pinned system prompt, lives
-    // behind the `Harness` trait) but it doesn't run inside a WASM
-    // sandbox. The c2w+PiHarness path is ready (tasks 2–4, 8) and
-    // takes over the moment a real pi-as-WASM image + wasi-sockets
-    // wiring lands (task 10 phase 2).
-    let echo = std::sync::Arc::new(crate::echo_harness::EchoHarness::new(
-        state.llm_router.clone(),
-    ));
-    state.set_harness(echo);
-    info!("echo harness installed (ADR-023, in-process demo pending c2w pi image)");
-
-    // Pre-create the harness + workspace dirs so PiHarness is ready
-    // to swap in the moment a real image is available, without a
-    // server restart on disk-layout concerns.
+    // Default: `EchoHarness` — in-process, binds a per-agent TCP
+    // listener and serves OpenAI-compatible chat completions by
+    // forwarding through the LlmRouter. Works out of the box; no
+    // external images required.
+    //
+    // Override: `XPRESSCLAW_HARNESS=pi` flips to `PiHarness` on c2w +
+    // wasmtime. Use this when you have a WASM harness image to test
+    // against (local podman registry during dev, GHCR in production).
+    let harness_backend = std::env::var("XPRESSCLAW_HARNESS").unwrap_or_else(|_| "echo".into());
     if let Some(data_dir) = state.config_path.parent() {
         for dir in [data_dir.join("harness-cache"), data_dir.join("workspaces")] {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 warn!(path = %dir.display(), error = %e, "failed to create harness dir");
+            }
+        }
+        match harness_backend.as_str() {
+            "pi" => match xpressclaw_core::c2w::C2wRuntime::new() {
+                Ok(runtime) => {
+                    let harness_cache = data_dir.join("harness-cache");
+                    let workspaces_root = data_dir.join("workspaces");
+                    let c2w = std::sync::Arc::new(xpressclaw_core::harness::C2wHarness::new(
+                        runtime,
+                        harness_cache.clone(),
+                    ));
+                    let resolver = xpressclaw_core::harness::HarnessImageResolver::with_fallback(
+                        harness_cache,
+                    );
+                    let pi =
+                        xpressclaw_core::harness::PiHarness::new(c2w, resolver, workspaces_root);
+                    state.set_harness(std::sync::Arc::new(pi));
+                    info!("pi harness installed (c2w on wasmtime, ADR-023 task 10 phase 2)");
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "failed to initialise wasm runtime for pi harness — falling back to echo"
+                ),
+            },
+            _ => {
+                let echo = std::sync::Arc::new(crate::echo_harness::EchoHarness::new(
+                    state.llm_router.clone(),
+                ));
+                state.set_harness(echo);
+                info!(
+                    "echo harness installed (ADR-023, default; set XPRESSCLAW_HARNESS=pi for c2w)"
+                );
             }
         }
     }
