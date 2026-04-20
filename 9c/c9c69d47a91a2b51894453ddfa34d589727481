@@ -1,0 +1,15 @@
+Non-obvious choices in the OCI pull:
+
+Why 'oci-client' crate and not 'oci-distribution': they're the same thing — oci-distribution was renamed to oci-client on 0.15+. Picked the current name to avoid shipping deprecated deps.
+
+Why rustls-tls not native-tls for oci-client: the rest of the workspace is already rustls-leaning (reqwest rustls-tls-native-roots, etc). Mixing TLS backends is a recipe for hard-to-debug OpenSSL-vs-rustls linkage issues. rustls also plays nicer on Alpine-based CI runners if we ever go there.
+
+Why http instead of https for localhost: this is the podman/docker-local-registry standard setup — TLS requires certs which are a pain to configure for one-off dev registries. The auto-http-for-localhost heuristic keeps the 'podman run -p 5000:5000 registry:2' path frictionless. Production GHCR is https because its host obviously isn't localhost.
+
+Why cache by manifest digest and not tag: tags are mutable. If I pushed 'pi:dev' then pushed a new WASM under the same tag, a tag-keyed cache would serve stale content forever. Manifest digest is the OCI-standard immutable handle — different content → different digest → different cache file. Retagged-but-same-bytes content hits the cache.
+
+Why pulling only the first layer: OCI artifacts in the 'single WASM file' pattern (what 'oras push' produces) put the payload in layer 0. Multi-layer artifacts aren't meaningful for our use case yet — if they become, the resolver can walk layers looking for a wasm-typed one. Keeping it simple today.
+
+Why heuristics ('looks_like_oci_ref', 'is_local_registry') and not a strict parser: the OCI spec's grammar for references is a distraction — we only need to distinguish 'filesystem path that happens to contain a slash' from 'registry/path:tag'. The heuristic (authority has dot, or is localhost, or has port) covers every real case and avoids dragging in a grammar parser. If it ever misfires we can tighten, but file paths that look like 'localhost:5000/foo:bar' don't exist in practice.
+
+Why the env var switch instead of config.yaml: harness choice is a DEV/test knob during the spike. Settling it into config.yaml would imply it's a supported long-term option, but the plan is 'echo harness goes away once pi works.' Env var keeps it ephemeral and obviously-a-workaround. When this settles we promote to config.
