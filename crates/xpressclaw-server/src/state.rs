@@ -6,6 +6,7 @@ use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::harness::Harness;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
@@ -95,6 +96,16 @@ impl AppState {
             }
             Err(_) => None,
         }
+    }
+
+    /// Get the shared agent harness (ADR-023). Returns `None` if no
+    /// harness backend is available (currently: Docker unavailable).
+    ///
+    /// New code should prefer this over [`AppState::docker`]. The
+    /// direct `docker()` accessor is scheduled for removal per ADR-023
+    /// decision 4 once all callers migrate.
+    pub async fn harness(&self) -> Option<Arc<dyn Harness>> {
+        self.docker().await.map(|d| d as Arc<dyn Harness>)
     }
 
     /// Check if setup is complete.
