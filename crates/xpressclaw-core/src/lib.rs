@@ -7,6 +7,7 @@ pub mod system;
 pub mod activity;
 pub mod agents;
 pub mod budget;
+pub mod c2w;
 pub mod connectors;
 pub mod conversations;
 pub mod docker;

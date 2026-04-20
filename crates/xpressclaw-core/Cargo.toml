@@ -22,6 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 bollard = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
