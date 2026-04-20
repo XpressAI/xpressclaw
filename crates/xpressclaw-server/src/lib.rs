@@ -1,3 +1,4 @@
+pub mod echo_harness;
 pub mod frontend;
 pub mod routes;
 pub mod server;
