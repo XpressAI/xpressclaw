@@ -301,10 +301,9 @@ async fn stop_processing(
 
     for agent_id in &target_agents {
         if let Ok(agent) = registry.get(agent_id) {
-            if let Some(ref cid) = agent.container_id {
-                if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await
-                {
-                    if let Some(port) = docker.get_container_port(cid).await {
+            if agent.container_id.is_some() {
+                if let Some(harness) = state.harness().await {
+                    if let Some(port) = harness.endpoint_port(agent_id).await {
                         let client = xpressclaw_core::agents::harness::HarnessClient::new(port);
                         let _ = client.cancel().await;
                         tracing::info!(agent_id, "sent cancel to harness");
@@ -538,18 +537,16 @@ async fn stream_message(
             }
 
             // Route through harness container if running, otherwise LLM router
-            let stream_result = if let Some(ref cid) = agent.container_id {
-                match xpressclaw_core::docker::manager::DockerManager::connect().await {
-                    Ok(docker) => {
-                        match docker.get_container_port(cid).await {
-                            Some(port) => {
-                                let harness = xpressclaw_core::agents::harness::HarnessClient::new(port);
-                                harness.chat_stream(&llm_req).await
-                            }
-                            None => llm_router.chat_stream(&llm_req).await,
+            let stream_result = if agent.container_id.is_some() {
+                match state.harness().await {
+                    Some(h) => match h.endpoint_port(agent_id).await {
+                        Some(port) => {
+                            let harness = xpressclaw_core::agents::harness::HarnessClient::new(port);
+                            harness.chat_stream(&llm_req).await
                         }
-                    }
-                    Err(_) => llm_router.chat_stream(&llm_req).await,
+                        None => llm_router.chat_stream(&llm_req).await,
+                    },
+                    None => llm_router.chat_stream(&llm_req).await,
                 }
             } else {
                 llm_router.chat_stream(&llm_req).await
