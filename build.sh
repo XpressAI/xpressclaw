@@ -4,12 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Flags
+# Flags (opt-out pattern — each step runs by default unless skipped).
 SKIP_TEST=false
 SKIP_TAURI=false
 SKIP_DOCKER=false
 SKIP_CHECK=false
+SKIP_PUSH=false
 TARGET_OVERRIDE=""
+# Image ref the pi harness WASM gets pushed to. Override with
+# XCLAW_PI_IMAGE env var or --pi-image=<ref>.
+XCLAW_PI_IMAGE="${XCLAW_PI_IMAGE:-localhost:5000/pi:dev}"
 
 for arg in "$@"; do
     case "$arg" in
@@ -25,6 +29,8 @@ for arg in "$@"; do
         --skip-tauri)  SKIP_TAURI=true ;;
         --skip-docker) SKIP_DOCKER=true ;;
         --skip-check)  SKIP_CHECK=true ;;
+        --skip-push)   SKIP_PUSH=true ;;
+        --pi-image=*)  XCLAW_PI_IMAGE="${arg#--pi-image=}" ;;
         --target=*)    TARGET_OVERRIDE="${arg#--target=}" ;;
     esac
 done
@@ -131,6 +137,51 @@ if [ "$SKIP_CHECK" = false ]; then
     cd frontend
     npm run check
     cd ..
+fi
+
+if [ "$SKIP_PUSH" = false ]; then
+    # ADR-023 task 10 phase 2: push the bundled harness WASM to a local
+    # OCI registry so the pi harness can be tested end-to-end against
+    # a real OCI pull. The registry ref is $XCLAW_PI_IMAGE (default
+    # localhost:5000/pi:dev); override with --pi-image=<ref>.
+    #
+    # Start the registry first:
+    #   podman run -d -p 5000:5000 --name xclaw-registry registry:2
+    # Then run with XPRESSCLAW_HARNESS=pi and set each agent's
+    # config `image:` field to $XCLAW_PI_IMAGE.
+    #
+    # Skipped gracefully if prerequisites are missing — matches how the
+    # docker step handles absent `docker`. Pass --skip-push to skip
+    # even when prerequisites are present.
+    REGISTRY_HOST="${XCLAW_PI_IMAGE%%/*}"
+    if ! command -v oras &>/dev/null; then
+        echo "==> Skipping pi WASM push: oras not on PATH (install from https://oras.land/ or pass --skip-push)."
+    elif ! curl -fsS --max-time 3 "http://${REGISTRY_HOST}/v2/" &>/dev/null; then
+        echo "==> Skipping pi WASM push: no registry responding at http://${REGISTRY_HOST}/v2/."
+        echo "    Start one with: podman run -d -p 5000:5000 --name xclaw-registry registry:2"
+    else
+        echo "==> Pushing pi harness WASM to ${XCLAW_PI_IMAGE}..."
+        WASM_STAGE="$(mktemp -d)"
+        trap 'rm -rf "$WASM_STAGE"' EXIT
+        WASM_FILE="${WASM_STAGE}/pi.wasm"
+        "target/release/xpressclaw" write-bundled-wasm "$WASM_FILE"
+
+        # Push as an OCI artifact. The custom media type keeps the
+        # artifact discoverable as "a WASM module intended for
+        # xpressclaw" rather than a generic blob, so future harness
+        # types can differentiate via media type even if they share a
+        # repo.
+        (
+            cd "$WASM_STAGE"
+            oras push --plain-http \
+                --artifact-type "application/vnd.xpressclaw.harness.wasm+v1" \
+                "$XCLAW_PI_IMAGE" \
+                "pi.wasm:application/wasm"
+        )
+        echo "    Pushed. Test with:"
+        echo "      XPRESSCLAW_HARNESS=pi ./target/release/xpressclaw up"
+        echo "    (and set agent config \`image: ${XCLAW_PI_IMAGE}\`)"
+    fi
 fi
 
 echo "==> All done!"

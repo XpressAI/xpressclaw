@@ -14,6 +14,7 @@ mod sop;
 mod status;
 mod tasks;
 mod up;
+mod write_bundled_wasm;
 
 /// Default port for the xpressclaw server.
 const DEFAULT_PORT: u16 = 8935;
@@ -134,6 +135,15 @@ pub enum Command {
     /// real task dispatcher.
     RollbackSmoke,
 
+    /// Write the bundled noop harness WASM to a file (ADR-023 task 10
+    /// scaffolding). Used by `build.sh --push-pi-wasm` to produce a
+    /// WASM artifact to push to a local registry without requiring
+    /// wat2wasm on the host.
+    WriteBundledWasm {
+        /// Destination file path for the WASM module.
+        path: String,
+    },
+
     /// View activity logs
     Logs {
         /// Filter by agent
@@ -168,6 +178,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::C2wSmoke => c2w_smoke::run().await,
         Command::PiSmoke => pi_smoke::run().await,
         Command::RollbackSmoke => rollback_smoke::run().await,
+        Command::WriteBundledWasm { path } => write_bundled_wasm::run(path.into()).await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
     }
 }
