@@ -34,8 +34,10 @@ pub struct ProcessorContext {
     pub rate_limiter: Arc<RateLimiter>,
     /// Pre-computed agent roles (agent_id → system prompt with skills injected).
     pub agent_roles: std::collections::HashMap<String, String>,
-    /// Shared Docker connection for harness access.
-    pub docker: Option<Arc<crate::docker::manager::DockerManager>>,
+    /// Shared agent harness handle. `None` means the server couldn't
+    /// bind to a harness runtime (always the case during ADR-023 spike
+    /// until task 10 lands).
+    pub harness: Option<Arc<dyn crate::harness::Harness>>,
 }
 
 /// Spawn a background task to process agent responses for a conversation.
@@ -387,16 +389,17 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
     info!(conv_id, "background processing complete");
 }
 
-/// Get the harness port for an agent's container.
+/// Get the harness port for an agent's workload.
 async fn get_harness_port(
     ctx: &ProcessorContext,
     registry: &AgentRegistry,
     agent_id: &str,
 ) -> Option<u16> {
-    let docker = ctx.docker.as_ref()?;
-    let record = registry.get(agent_id).ok()?;
-    let cid = record.container_id.as_ref()?;
-    docker.get_container_port(cid).await
+    let harness = ctx.harness.as_ref()?;
+    // Require the agent to actually exist in the registry; skip port
+    // lookup for unregistered agents.
+    registry.get(agent_id).ok()?;
+    harness.endpoint_port(agent_id).await
 }
 
 /// Fall back to streaming from the LLM router (no tools, but responsive).

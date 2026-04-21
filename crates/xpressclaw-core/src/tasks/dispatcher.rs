@@ -26,13 +26,16 @@ use crate::config::Config;
 use crate::config::HooksConfig;
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
-use crate::docker::manager::DockerManager;
 use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
 use crate::workflows::engine::WorkflowEngine;
 
+// DEFAULT_MAX_TURNS used to bound agent dispatch — currently unused
+// while the dispatcher is paused for the ADR-023 spike (harness
+// plumbing arrives in task 10). Re-enabled then.
+#[allow(dead_code)]
 const DEFAULT_MAX_TURNS: usize = 15;
 const POLL_INTERVAL_SECS: u64 = 5;
 
@@ -163,60 +166,26 @@ async fn load_task(
         return State::Done(DriverResult::Requeue);
     }
 
-    let container_id = match record.container_id {
-        Some(ref cid) => cid.clone(),
-        None => {
-            debug!(agent_id, "agent has no container, requeuing");
-            return State::Done(DriverResult::Requeue);
-        }
-    };
-
-    let harness_port = match DockerManager::connect().await {
-        Ok(docker) => match docker.get_container_port(&container_id).await {
-            Some(port) => port,
-            None => {
-                warn!(agent_id, "container has no port, requeuing");
-                return State::Done(DriverResult::Requeue);
-            }
-        },
-        Err(e) => {
-            warn!(error = %e, "docker not available, requeuing");
-            return State::Done(DriverResult::Requeue);
-        }
-    };
-
-    // Load subtasks
-    let subtasks = board.list_subtasks(task_id).unwrap_or_default();
-    let max_turns = if subtasks.is_empty() {
-        DEFAULT_MAX_TURNS
-    } else {
-        DEFAULT_MAX_TURNS.max(subtasks.len() * 5)
-    };
-
-    info!(
-        task_id,
+    // ADR-023: Docker is removed. The task dispatcher needs an
+    // `Arc<dyn Harness>` to look up the agent's endpoint port, which
+    // requires wider plumbing landing alongside task 10 (the pi
+    // harness GHCR pull). Until then, requeue so tasks survive the
+    // gap without being dispatched against a missing runtime.
+    //
+    // Intentionally early-return: the rest of this function builds a
+    // Context that needs a harness port. That path re-enables when task
+    // 10 wires Arc<dyn Harness> through to here.
+    let _ = agent_cfg;
+    let _ = task;
+    let _ = system_prompt;
+    let _ = board;
+    let _ = ctx;
+    warn!(
         agent_id,
-        subtasks = subtasks.len(),
-        max_turns,
-        "loaded task for execution"
+        "task dispatcher paused during ADR-023 spike: harness handle not wired here yet \
+         (task 10). Task requeued."
     );
-
-    let agent_hooks = agent_cfg.map(|a| a.hooks.clone()).unwrap_or_default();
-
-    *ctx = Some(Context {
-        task: board.get(task_id).unwrap_or(task),
-        agent_id: agent_id.to_string(),
-        harness_port,
-        system_prompt,
-        turn: 0,
-        max_turns,
-        current_prompt: String::new(),
-        last_response: String::new(),
-        subtasks,
-        hooks: agent_hooks,
-    });
-
-    State::BuildPrompt
+    State::Done(DriverResult::Requeue)
 }
 
 fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {

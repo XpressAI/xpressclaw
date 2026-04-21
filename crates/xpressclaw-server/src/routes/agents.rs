@@ -10,7 +10,7 @@ use xpressclaw_core::agents::state::{DesiredStatus, ObservedStatus};
 use xpressclaw_core::config::{
     AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, RateLimitConfig, WakeOnConfig,
 };
-use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::harness::Harness;
 
 use crate::state::AppState;
 
@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
         .route("/{id}/logs", get(get_agent_logs))
+        .route("/{id}/tmux", get(get_agent_tmux))
 }
 
 /// Build a JSON response for an agent by merging YAML config, DB desired state,
@@ -74,15 +75,15 @@ fn agent_json(
     })
 }
 
-/// Query live observed status from Docker for an agent.
-/// Query live observed status from Docker for an agent.
-async fn observe_with(docker: &DockerManager, agent_id: &str) -> ObservedStatus {
-    let container_name = format!("xpressclaw-{agent_id}");
-    if docker.is_container_running(&container_name).await {
+/// Query live observed status from the agent harness.
+async fn observe_with(harness: &dyn Harness, agent_id: &str) -> ObservedStatus {
+    if harness.is_running(agent_id).await {
         ObservedStatus::Running
-    } else if docker.inspect_by_name(&container_name).await.is_some() {
-        ObservedStatus::Exited
     } else {
+        // Without a persistent record of "exited vs never-launched" on
+        // the Harness trait, we conservatively report NotFound. Good
+        // enough for the spike; the reconciler's full lifecycle
+        // tracking comes back in task 10.
         ObservedStatus::NotFound
     }
 }
@@ -94,12 +95,11 @@ async fn list_agents(
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
 
-    // Use shared Docker connection from AppState
-    let docker = state.docker().await;
+    let harness = state.harness().await;
     let mut result = Vec::new();
     for a in &agents {
-        let observed = match &docker {
-            Some(d) => observe_with(d, &a.id).await,
+        let observed = match &harness {
+            Some(h) => observe_with(h.as_ref(), &a.id).await,
             None => ObservedStatus::DockerUnavailable,
         };
         result.push(agent_json(a, &config, &observed));
@@ -117,8 +117,8 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
+    let observed = match state.harness().await {
+        Some(h) => observe_with(h.as_ref(), &record.id).await,
         None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
@@ -132,8 +132,8 @@ async fn delete_agent(
     // Set desired=stopped so the reconciler stops the container
     let _ = registry.set_desired_status(&id, &DesiredStatus::Stopped);
     // Also stop immediately for responsiveness
-    if let Some(docker) = state.docker().await {
-        let _ = docker.stop(&id).await;
+    if let Some(harness) = state.harness().await {
+        let _ = harness.stop(&id).await;
     }
     registry.delete(&id).map_err(internal_error)?;
 
@@ -188,8 +188,8 @@ async fn start_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
+    let observed = match state.harness().await {
+        Some(h) => observe_with(h.as_ref(), &record.id).await,
         None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
@@ -220,8 +220,8 @@ async fn stop_agent(
 
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
+    let observed = match state.harness().await {
+        Some(h) => observe_with(h.as_ref(), &record.id).await,
         None => ObservedStatus::DockerUnavailable,
     };
     Ok(Json(agent_json(&record, &config, &observed)))
@@ -416,12 +416,33 @@ async fn get_agent_logs(
     Query(query): Query<LogsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let tail = query.tail.unwrap_or(100);
-    let docker = state
-        .docker()
+    let harness = state
+        .harness()
         .await
-        .ok_or_else(|| internal_error("Docker not available"))?;
-    let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
+        .ok_or_else(|| internal_error("no agent harness available"))?;
+    let logs = harness.logs(&id, tail).await.map_err(internal_error)?;
     Ok(Json(json!({ "logs": logs })))
+}
+
+/// `GET /api/agents/:id/tmux` — report whether this agent's harness
+/// exposes a tmux session (ADR-023 task 9).
+///
+/// Shape: `{ available: bool, session?: string }`. The UI uses
+/// `available` to decide whether to show the "Attach terminal" button
+/// in the conversation header. The full session attach path (xterm.js
+/// + WebSocket) lands alongside the first tmux-exposing harness.
+async fn get_agent_tmux(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let tmux = match state.harness().await {
+        Some(harness) => harness.attach_tmux(&id).await,
+        None => None,
+    };
+    match tmux {
+        Some(t) => Json(json!({
+            "available": true,
+            "session": t.session_name,
+        })),
+        None => Json(json!({ "available": false })),
+    }
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {

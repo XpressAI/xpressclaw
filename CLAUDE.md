@@ -88,7 +88,7 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 
 ### Key Subsystems
 
-1. **Container Isolation** - Each agent runs in a Docker container to minimize blast radius
+1. **Container Isolation** - Each agent runs in a c2w-compiled WASM guest on wasmtime (ADR-023). Docker was removed.
 2. **Memory System** - Zettelkasten-style notes with vector search (sqlite-vec), 8-slot near-term memory with eviction
 3. **Tool System** - MCP (Model Context Protocol) as the universal standard for all tools
 4. **Task System** - Kanban-style task board, SOPs that agents can create and follow
@@ -104,7 +104,7 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 
 - **Language**: Rust
 - **Database**: SQLite + sqlite-vec for vector storage
-- **Container Runtime**: Docker (via bollard)
+- **Container Runtime**: wasmtime + container2wasm (ADR-023). No Docker dependency.
 - **Web Framework**: Axum + SvelteKit (static SPA embedded via rust-embed)
 - **Desktop**: Tauri v2 with system tray
 - **Agent SDK**: claude-agent-sdk (via containers)

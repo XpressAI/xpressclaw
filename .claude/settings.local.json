@@ -57,7 +57,8 @@
       "WebFetch(domain:www.npmjs.com)",
       "WebFetch(domain:svelteflow.dev)",
       "WebFetch(domain:workflowengine.io)",
-      "Bash(npx svelte-check:*)"
+      "Bash(npx svelte-check:*)",
+      "Bash(./target/debug/xpressclaw c2w-smoke *)"
     ]
   }
 }

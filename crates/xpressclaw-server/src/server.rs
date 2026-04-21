@@ -33,6 +33,58 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         crate::skills::extract_skills(data_dir);
     }
 
+    // ADR-023: install the agent harness.
+    //
+    // Default: `EchoHarness` — in-process, binds a per-agent TCP
+    // listener and serves OpenAI-compatible chat completions by
+    // forwarding through the LlmRouter. Works out of the box; no
+    // external images required.
+    //
+    // Override: `XPRESSCLAW_HARNESS=pi` flips to `PiHarness` on c2w +
+    // wasmtime. Use this when you have a WASM harness image to test
+    // against (local podman registry during dev, GHCR in production).
+    let harness_backend = std::env::var("XPRESSCLAW_HARNESS").unwrap_or_else(|_| "echo".into());
+    if let Some(data_dir) = state.config_path.parent() {
+        for dir in [data_dir.join("harness-cache"), data_dir.join("workspaces")] {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!(path = %dir.display(), error = %e, "failed to create harness dir");
+            }
+        }
+        match harness_backend.as_str() {
+            "pi" => match xpressclaw_core::c2w::C2wRuntime::new() {
+                Ok(runtime) => {
+                    let harness_cache = data_dir.join("harness-cache");
+                    let workspaces_root = data_dir.join("workspaces");
+                    let c2w = std::sync::Arc::new(xpressclaw_core::harness::C2wHarness::new(
+                        runtime,
+                        harness_cache.clone(),
+                    ));
+                    let resolver = xpressclaw_core::harness::HarnessImageResolver::with_fallback(
+                        harness_cache,
+                    );
+                    let pi =
+                        xpressclaw_core::harness::PiHarness::new(c2w, resolver, workspaces_root);
+                    state.set_harness(std::sync::Arc::new(pi));
+                    info!("pi harness installed (c2w on wasmtime, ADR-023 task 10 phase 2)");
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    "failed to initialise wasm runtime for pi harness — falling back to echo"
+                ),
+            },
+            _ => {
+                let echo = std::sync::Arc::new(crate::echo_harness::EchoHarness::new(
+                    state.llm_router.clone(),
+                    state.mcp_manager.clone(),
+                ));
+                state.set_harness(echo);
+                info!(
+                    "echo harness installed (ADR-023, default; set XPRESSCLAW_HARNESS=pi for c2w)"
+                );
+            }
+        }
+    }
+
     // Start host-side MCP servers in background.
     // Skip servers with container-only paths — those only run inside Docker.
     let config = state.config();
@@ -59,6 +111,24 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         });
     }
 
+    // Start the xclaw shell-bridge listener (ADR-023 task 5).
+    // Socket lives under the xpressclaw data dir so it moves with the
+    // rest of runtime state. The pi harness (task 4) mounts this socket
+    // into guest workspaces so agents can invoke `xclaw <verb>`.
+    if let Some(data_dir) = state.config_path.parent() {
+        let socket_path = crate::xclaw_bridge::default_socket_path(data_dir);
+        match crate::xclaw_bridge::start(socket_path.clone(), state.clone()) {
+            Ok(_handle) => info!(
+                socket = %socket_path.display(),
+                "xclaw bridge started"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "xclaw bridge failed to start; agents will not be able to call xclaw verbs"
+            ),
+        }
+    }
+
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
 
@@ -83,13 +153,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    // Start the desired-state reconciler (ADR-018).
+    // Start the desired-state reconciler (ADR-018, ADR-023 task 10).
     let reconciler_db = state.db.clone();
     let reconciler_config = state.config.clone();
+    let reconciler_harness = state.harness().await;
     let reconciler_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port) => {}
+            _ = xpressclaw_core::agents::reconciler::start(
+                reconciler_db, reconciler_config, port, reconciler_harness,
+            ) => {}
             _ = reconciler_shutdown.cancelled() => { info!("reconciler stopped"); }
         }
     });
@@ -146,7 +219,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                                         event_bus: connector_state.event_bus.clone(),
                                         rate_limiter: connector_state.rate_limiter(),
                                         agent_roles,
-                                        docker: connector_state.docker().await,
+                                        harness: connector_state.harness().await,
                                     },
                                 );
                             }
@@ -190,31 +263,19 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Cancel all background tasks immediately
     shutdown.cancel();
 
-    // Graceful shutdown: stop containers with a timeout.
-    // A second Ctrl+C during shutdown forces immediate exit.
-    info!("shutting down — stopping containers (Ctrl+C again to force quit)");
+    // Graceful shutdown: stop agents via the harness (if one is wired
+    // up). A second Ctrl+C during shutdown forces immediate exit.
+    info!("shutting down — stopping agents (Ctrl+C again to force quit)");
 
     let shutdown_task = async {
-        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-            let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-            if let Ok(agents) = registry.list() {
-                for agent in &agents {
-                    let _ = docker.stop(&agent.id).await;
-                }
+        if let Some(harness) = state.harness().await {
+            if let Err(e) = harness.stop_all().await {
+                warn!(error = %e, "harness stop_all failed");
+            } else {
+                info!("all agents stopped");
             }
-            let apps: Vec<String> = {
-                let conn = state.db.conn();
-                conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| row.get::<_, String>(0))
-                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    })
-                    .unwrap_or_default()
-            };
-            for app_id in &apps {
-                let _ = docker.stop(&format!("app-{app_id}")).await;
-            }
-            info!("all containers stopped");
+        } else {
+            info!("no harness wired (ADR-023 spike); nothing to stop");
         }
     };
 

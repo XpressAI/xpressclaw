@@ -1,7 +1,9 @@
 # ADR-003: Container-based Agent Isolation
 
 ## Status
-Accepted
+Superseded by [ADR-023](ADR-023-pi-harness-and-wasm-containers.md) —
+Docker has been removed. See ADR-023 §4 for the rationale. This
+document stays in-repo as the pre-ADR-023 design of record.
 
 ## Context
 

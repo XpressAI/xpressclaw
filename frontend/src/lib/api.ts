@@ -493,8 +493,26 @@ export interface UsageRecord {
 	operation: string | null;
 }
 
+/**
+ * Per-agent budget state returned by `GET /api/budget/:agent_id`.
+ * `degraded_model` is the model the sidecar has transparently swapped
+ * this agent onto after exceeding its budget (ADR-023 §6, task 9).
+ */
+export interface AgentBudgetState {
+	daily_limit: number | null;
+	monthly_limit: number | null;
+	daily_spent: number;
+	monthly_spent: number;
+	total_spent: number;
+	/** Set when the agent is running on a fallback model due to budget
+	 *  overrun. UI renders a visible "running on local" chip when set. */
+	degraded_model: string | null;
+	is_paused: boolean;
+}
+
 export const budget = {
 	summary: () => request<BudgetSummary>('/api/budget'),
+	agent: (agentId: string) => request<AgentBudgetState>(`/api/budget/${encodeURIComponent(agentId)}`),
 	usage: (agentId?: string, limit?: number) => {
 		const params = new URLSearchParams();
 		if (agentId) params.set('agent_id', agentId);
@@ -506,6 +524,20 @@ export const budget = {
 		request<{ agent_id: string; is_paused: boolean; resumed: boolean }>(
 			`/api/budget/${agentId}/resume`, { method: 'POST' }
 		)
+};
+
+/**
+ * Agent tmux availability from `GET /api/agents/:id/tmux` (ADR-023
+ * task 9). `available: false` means this agent's harness doesn't
+ * expose a tmux session — don't show the attach UI.
+ */
+export interface AgentTmuxStatus {
+	available: boolean;
+	session?: string;
+}
+
+export const agentHarness = {
+	tmux: (agentId: string) => request<AgentTmuxStatus>(`/api/agents/${encodeURIComponent(agentId)}/tmux`),
 };
 
 // -- Activity --

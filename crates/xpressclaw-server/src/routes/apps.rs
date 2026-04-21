@@ -6,9 +6,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use xpressclaw_core::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
+use xpressclaw_core::harness::types::{ContainerSpec, VolumeMount};
 
 use crate::state::AppState;
+
+// NB: Agent-app container launching is disabled for the ADR-023 spike.
+// Docker was the only launch path and has been removed; WASM-based
+// app containers are a separate concern (ADR-017) that needs its own
+// c2w-flavored design once this spike lands. Until then, launch /
+// logs / proxy endpoints return 503.
 
 /// API routes for app management.
 pub fn routes() -> Router<AppState> {
@@ -166,12 +172,10 @@ async fn delete_app(
         .flatten()
     };
 
-    // Stop container if running (now safe to .await — MutexGuard dropped)
-    if let Some(_cid) = &container_id {
-        if let Ok(docker) = DockerManager::connect().await {
-            let _ = docker.stop(&format!("app-{id}")).await;
-            info!(app_id = %id, "stopped app container");
-        }
+    // Stop container if running (ADR-023: launch path is disabled so
+    // nothing is actually running; this is a no-op during the spike).
+    if container_id.is_some() {
+        info!(app_id = %id, "app container stop skipped: launch disabled in ADR-023 spike");
     }
 
     let db = state.db.conn();
@@ -329,58 +333,24 @@ async fn publish_app(
 }
 
 async fn launch_app_container(
-    app_id: &str,
-    spec: &ContainerSpec,
-    start_command: &str,
-    db: &xpressclaw_core::db::Database,
+    _app_id: &str,
+    _spec: &ContainerSpec,
+    _start_command: &str,
+    _db: &xpressclaw_core::db::Database,
 ) -> std::result::Result<String, String> {
-    let docker = DockerManager::connect()
-        .await
-        .map_err(|e| format!("docker connect: {e}"))?;
-
-    // Stop existing container if any
-    let _ = docker.stop(&format!("app-{app_id}")).await;
-
-    let mut launch_spec = spec.clone();
-    // Set the command and working directory for the app
-    // The app source is at /workspace/apps/{app_id}/ in the shared volume
-    launch_spec.cmd = Some(vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        start_command.to_string(),
-    ]);
-    launch_spec.working_dir = Some(format!("/workspace/apps/{app_id}"));
-
-    let info = docker
-        .launch(&format!("app-{app_id}"), &launch_spec)
-        .await
-        .map_err(|e| format!("launch: {e}"))?;
-
-    // Update DB with container info
-    let conn = db.conn();
-    let _host_port = info.host_port;
-    let _ = conn.execute(
-        "UPDATE apps SET container_id = ?1, status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
-        [&info.container_id, app_id],
-    );
-
-    Ok(info.container_id)
+    // ADR-023: app-container launching is disabled — Docker was the
+    // only launch path and has been removed; a WASM-based flow for
+    // published apps needs its own design (out of ADR-023 scope).
+    Err("app container launching is disabled per ADR-023 spike".into())
 }
 
-async fn get_app_logs(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let docker = DockerManager::connect().await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    let logs = docker.logs(&format!("app-{id}"), 100).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
-    Ok(Json(json!({ "logs": logs })))
+async fn get_app_logs(Path(_id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "app container logs unavailable — app launching disabled per ADR-023 spike",
+        })),
+    ))
 }
 
 /// Get the workspace volume name for an agent.
@@ -397,16 +367,11 @@ fn workspace_volume_name(agent_id: &str) -> String {
 async fn proxy_handler(
     State(state): State<AppState>,
     Path(rest): Path<String>,
-    req: axum::extract::Request,
+    _req: axum::extract::Request,
 ) -> axum::response::Response {
     // Split rest into app_id and path: "myapp/foo/bar" → ("myapp", "foo/bar")
-    let (app_id, path) = rest.split_once('/').unwrap_or((&rest, ""));
+    let (app_id, _path) = rest.split_once('/').unwrap_or((&rest, ""));
 
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
     let err_response = |status: StatusCode, msg: &str| {
         axum::response::Response::builder()
             .status(status)
@@ -415,99 +380,21 @@ async fn proxy_handler(
             .unwrap()
     };
 
+    // ADR-023: app containers are not launched during the spike. Keep
+    // the router mounted so frontend requests don't 404, but every
+    // proxy attempt gets a consistent 503. Look up the app first so
+    // we return NOT_FOUND vs SERVICE_UNAVAILABLE in the right cases.
     let row = {
         let db = state.db.conn();
-        db.query_row(
-            "SELECT container_id, port, status FROM apps WHERE id = ?1",
-            [app_id],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-    };
-
-    let (container_id, _port, status) = match row {
-        Ok(r) => r,
-        Err(_) => return err_response(StatusCode::NOT_FOUND, "App not found"),
-    };
-
-    if status != "running" {
-        return err_response(StatusCode::SERVICE_UNAVAILABLE, &format!("App is {status}"));
-    }
-
-    let container_id = match container_id {
-        Some(cid) => cid,
-        None => return err_response(StatusCode::SERVICE_UNAVAILABLE, "App has no container"),
-    };
-
-    let docker = match DockerManager::connect().await {
-        Ok(d) => d,
-        Err(e) => return err_response(StatusCode::SERVICE_UNAVAILABLE, &format!("Docker: {e}")),
-    };
-
-    let host_port = match docker.inspect(&container_id).await {
-        Ok(Some(p)) => p,
-        _ => {
-            // Container may be starting up — retry once after a brief delay
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            match docker.inspect(&container_id).await {
-                Ok(Some(p)) => p,
-                _ => {
-                    return err_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Container port not available",
-                    )
-                }
-            }
-        }
-    };
-
-    let target_url = format!("http://127.0.0.1:{host_port}/{path}");
-
-    let client = reqwest::Client::new();
-    let mut proxy_req = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        &target_url,
-    );
-
-    for (key, val) in headers.iter() {
-        if !matches!(key.as_str(), "host" | "connection" | "transfer-encoding") {
-            if let Ok(v) = reqwest::header::HeaderValue::from_bytes(val.as_bytes()) {
-                proxy_req = proxy_req.header(key.as_str(), v);
-            }
-        }
-    }
-
-    if !body.is_empty() {
-        proxy_req = proxy_req.body(body.to_vec());
-    }
-
-    let resp = match proxy_req.send().await {
-        Ok(r) => r,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("proxy: {e}")),
-    };
-
-    let resp_status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let resp_headers = resp.headers().clone();
-    let resp_body = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return err_response(StatusCode::BAD_GATEWAY, &format!("body: {e}")),
-    };
-
-    let mut response = axum::response::Response::builder().status(resp_status);
-    for (key, val) in resp_headers.iter() {
-        if !matches!(key.as_str(), "transfer-encoding" | "connection") {
-            response = response.header(key, val);
-        }
-    }
-    response
-        .body(axum::body::Body::from(resp_body))
-        .unwrap_or_else(|_| {
-            err_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        db.query_row("SELECT id FROM apps WHERE id = ?1", [app_id], |row| {
+            row.get::<_, String>(0)
         })
+    };
+    if row.is_err() {
+        return err_response(StatusCode::NOT_FOUND, "App not found");
+    }
+    err_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "App proxy unavailable — app launching disabled per ADR-023 spike",
+    )
 }

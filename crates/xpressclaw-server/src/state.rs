@@ -5,7 +5,7 @@ use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
-use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::harness::Harness;
 #[cfg(feature = "local-llm")]
 use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
@@ -32,8 +32,11 @@ pub struct AppState {
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
     pub event_bus: Arc<ConversationEventBus>,
-    /// Shared Docker connection (reused across all requests).
-    pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
+    /// Shared agent-workload harness (ADR-023). `None` during the
+    /// spike — the pi harness isn't wired to AppState yet (task 10).
+    /// Callers treat `None` as "no agent runtime available, route
+    /// around."
+    pub harness: Arc<RwLock<Option<Arc<dyn Harness>>>>,
 }
 
 impl AppState {
@@ -57,7 +60,7 @@ impl AppState {
             download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
-            docker: Arc::new(RwLock::new(None)),
+            harness: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -76,25 +79,21 @@ impl AppState {
         self.rate_limiter.read().unwrap().clone()
     }
 
-    /// Get the shared Docker connection, creating it on first use.
-    /// Returns None if Docker is unavailable.
-    pub async fn docker(&self) -> Option<Arc<DockerManager>> {
-        // Fast path: already connected
-        {
-            let guard = self.docker.read().unwrap();
-            if let Some(ref d) = *guard {
-                return Some(d.clone());
-            }
-        }
-        // Slow path: try to connect
-        match DockerManager::connect().await {
-            Ok(d) => {
-                let d = Arc::new(d);
-                *self.docker.write().unwrap() = Some(d.clone());
-                Some(d)
-            }
-            Err(_) => None,
-        }
+    /// Get the shared agent harness (ADR-023).
+    ///
+    /// Returns `None` if no harness has been installed — server startup
+    /// typically installs one via [`AppState::set_harness`] before any
+    /// handlers run, but if wasmtime init fails, downstream code should
+    /// degrade gracefully.
+    pub async fn harness(&self) -> Option<Arc<dyn Harness>> {
+        self.harness.read().unwrap().clone()
+    }
+
+    /// Install the shared agent harness. Called once at server startup.
+    /// Replacing an existing harness at runtime is supported but rare
+    /// (used by tests); the common case is a single install.
+    pub fn set_harness(&self, harness: Arc<dyn Harness>) {
+        *self.harness.write().unwrap() = Some(harness);
     }
 
     /// Check if setup is complete.

@@ -29,35 +29,66 @@ pub fn routes() -> Router<AppState> {
 // OpenAI-compatible endpoint
 // ---------------------------------------------------------------------------
 
+/// OpenAI-compatible `/v1/chat/completions` endpoint (ADR-023 §6).
+///
+/// This is the single LLM entry point every harness is expected to use.
+/// Harnesses authenticate with a placeholder key `Bearer sk-ant-{agent_id}`
+/// (or `sk-{agent_id}`) and don't hold real provider keys — the sidecar
+/// picks the provider based on the agent's configured model + current
+/// budget state.
+///
+/// Per-request flow:
+/// 1. Extract agent_id from `Authorization` header.
+/// 2. Enforce budget: if the agent is paused or configured for `stop` and
+///    over limit, return HTTP 429 with an explanation. Alerts are logged
+///    but don't block.
+/// 3. If the agent has a degraded model override active, swap
+///    `req.model` transparently to the local fallback.
+/// 4. Route to the provider via `LlmRouter`. Streaming (SSE) and
+///    non-streaming JSON both supported.
+/// 5. Record token usage + update spend on completion.
 async fn chat_completions(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(mut req): Json<ChatCompletionRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Check for budget degraded model override via API key
-    let auth = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if let Some(agent_id) = auth
-        .strip_prefix("Bearer sk-ant-")
-        .or_else(|| auth.strip_prefix("Bearer sk-"))
-    {
-        // Only check placeholder keys (real keys won't start with sk-ant- or sk-)
-        if !agent_id.contains("xpressclaw") {
-            let budget_mgr = xpressclaw_core::budget::manager::BudgetManager::new(
-                state.db.clone(),
-                state.config(),
-            );
-            if let Ok(Some(fallback)) = budget_mgr.degraded_model(agent_id) {
-                debug!(
-                    agent_id,
-                    original_model = %req.model,
-                    fallback_model = %fallback,
-                    "budget degraded: switching model"
-                );
-                req.model = fallback;
+) -> Result<axum::response::Response, (StatusCode, Json<Value>)> {
+    let agent_id = extract_agent_id(&headers);
+
+    if let Some(ref aid) = agent_id {
+        let budget_mgr =
+            xpressclaw_core::budget::manager::BudgetManager::new(state.db.clone(), state.config());
+
+        // Hard-stop enforcement. check_budget returns Err on paused OR
+        // stop-mode-over-limit; both cases refuse the request. Alert
+        // mode returns Ok(false) which we log but let through.
+        match budget_mgr.check_budget(aid) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(agent_id = %aid, "over budget but on_exceeded=alert; allowing");
             }
+            Err(e) => {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": {
+                            "type": "budget_exceeded",
+                            "message": e.to_string(),
+                        }
+                    })),
+                ));
+            }
+        }
+
+        // Transparent degrade (ADR-023 §6): a budget-degraded agent
+        // switches to the local model without the harness knowing.
+        if let Ok(Some(fallback)) = budget_mgr.degraded_model(aid) {
+            debug!(
+                agent_id = %aid,
+                original_model = %req.model,
+                fallback_model = %fallback,
+                "budget degraded: swapping model transparently"
+            );
+            req.model = fallback;
         }
     }
 
@@ -68,14 +99,143 @@ async fn chat_completions(
         )
     })?;
 
-    let response = router.chat(&req).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": e.to_string() })),
-        )
-    })?;
+    let model_used = req.model.clone();
+    let streaming = req.stream.unwrap_or(false);
 
-    Ok(Json(json!(response)))
+    if streaming {
+        let chunk_stream = router.chat_stream(&req).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(
+            openai_live_streaming_response(agent_id, model_used, state, chunk_stream)
+                .into_response(),
+        )
+    } else {
+        let response = router.chat(&req).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+        if let (Some(ref aid), Some(ref usage)) = (&agent_id, &response.usage) {
+            record_usage(
+                &state,
+                aid,
+                &model_used,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            );
+        }
+
+        Ok(Json(json!(response)).into_response())
+    }
+}
+
+/// Extract the agent id from the request's API-key-style authorization.
+///
+/// ADR-023 §6 specifies harnesses connect with a placeholder key
+/// `Bearer sk-ant-{agent_id}` or `Bearer sk-{agent_id}`. Real provider
+/// keys never flow through this endpoint — they're held server-side.
+fn extract_agent_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    auth.strip_prefix("Bearer sk-ant-")
+        .or_else(|| auth.strip_prefix("Bearer sk-"))
+        // Guard against a real provider key accidentally reaching here —
+        // our own placeholder keys are agent names, which shouldn't
+        // contain the word "xpressclaw" (a real key pattern we've seen).
+        .filter(|s| !s.contains("xpressclaw"))
+        .map(str::to_string)
+}
+
+/// Record token usage against an agent's budget. Fire-and-forget —
+/// errors are logged but don't fail the request. Called after both
+/// streaming and non-streaming completions.
+fn record_usage(
+    state: &AppState,
+    agent_id: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) {
+    let config = state.config();
+    let tracker = xpressclaw_core::budget::tracker::CostTracker::with_custom_pricing(
+        state.db.clone(),
+        &config.llm.custom_pricing,
+    );
+    match tracker.record(agent_id, model, input_tokens, output_tokens, "chat", None) {
+        Ok(record) => {
+            let budget_mgr = xpressclaw_core::budget::manager::BudgetManager::new(
+                state.db.clone(),
+                config.clone(),
+            );
+            if let Err(e) = budget_mgr.update_spending(agent_id, record.cost_usd) {
+                tracing::warn!(agent_id, error = %e, "budget update_spending failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(agent_id, error = %e, "usage record failed");
+        }
+    }
+}
+
+/// Stream OpenAI chat-completion chunks as SSE back to the client,
+/// passing each chunk through unchanged, then record approximate token
+/// usage after the stream closes.
+///
+/// Token counting on the streaming path is approximate (chars/4) because
+/// `ChatCompletionChunk` doesn't carry a usage payload; proper accounting
+/// requires extending the chunk type or parsing provider-specific final
+/// chunks. Tracked as a follow-up to this task.
+fn openai_live_streaming_response(
+    agent_id: Option<String>,
+    model: String,
+    state: AppState,
+    chunk_stream: xpressclaw_core::llm::router::ChatStream,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        use futures_util::StreamExt;
+
+        let mut approx_output_chars: usize = 0;
+
+        futures_util::pin_mut!(chunk_stream);
+        while let Some(chunk_result) = chunk_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    for choice in &chunk.choices {
+                        if let Some(ref text) = choice.delta.content {
+                            approx_output_chars += text.len();
+                        }
+                    }
+                    let data = serde_json::to_string(&chunk).unwrap_or_default();
+                    yield Ok(Event::default().data(data));
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "openai stream chunk error");
+                    break;
+                }
+            }
+        }
+
+        // OpenAI streaming convention: terminator sentinel on its own line.
+        yield Ok(Event::default().data("[DONE]"));
+
+        // Fire-and-forget usage record. Approximation: chars/4 as token
+        // count. Prompt tokens unknown on the streaming path; tracked
+        // as 0 with a follow-up noted in the task list.
+        if let Some(aid) = agent_id {
+            let approx_output_tokens = (approx_output_chars / 4).max(1) as i64;
+            record_usage(&state, &aid, &model, 0, approx_output_tokens);
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn list_models(
@@ -859,6 +1019,7 @@ impl IntoResponse for AnthropicMessagesResponse {
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
@@ -868,9 +1029,199 @@ mod tests {
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
     use xpressclaw_core::llm::openai::OpenAiProvider;
-    use xpressclaw_core::llm::router::LlmRouter;
+    use xpressclaw_core::llm::router::{
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LlmProvider,
+        LlmRouter, ModelInfo, Usage,
+    };
 
     use crate::state::AppState;
+
+    /// Canned provider for ADR-023 §6 tests. Records how many chat
+    /// calls it saw so tests can assert the router actually routed
+    /// through it, and what model it was asked for so tests can
+    /// verify degraded-model swapping.
+    struct CannedProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        last_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CannedProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                last_model: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn last_model(&self) -> Option<String> {
+            self.last_model.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CannedProvider {
+        async fn chat(
+            &self,
+            req: &ChatCompletionRequest,
+        ) -> xpressclaw_core::error::Result<ChatCompletionResponse> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.last_model.lock().unwrap() = Some(req.model.clone());
+            Ok(ChatCompletionResponse {
+                id: "canned-1".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: req.model.clone(),
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatMessage::text("assistant", "ok"),
+                    finish_reason: Some("stop".into()),
+                }],
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 3,
+                    total_tokens: 13,
+                    reasoning_tokens: None,
+                }),
+            })
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            vec![ModelInfo {
+                id: "canned-model".into(),
+                object: "model".into(),
+                owned_by: "canned".into(),
+            }]
+        }
+
+        fn name(&self) -> &str {
+            "canned"
+        }
+    }
+
+    fn test_app_with_canned() -> (Router, Arc<CannedProvider>, Arc<Database>) {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        config.llm.default_provider = "canned".into();
+        let config = Arc::new(config);
+
+        let provider = CannedProvider::new();
+        let mut router = LlmRouter::new(&config.llm);
+        router.register_provider("canned", provider.clone());
+
+        let state = AppState::new(
+            config,
+            db.clone(),
+            Some(Arc::new(router)),
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
+
+        let app = Router::new().nest("/v1", super::routes()).with_state(state);
+        (app, provider, db)
+    }
+
+    async fn post_chat(
+        app: &Router,
+        body: serde_json::Value,
+        auth: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json");
+        if let Some(a) = auth {
+            req = req.header("authorization", a);
+        }
+        app.clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// With a valid agent_id in the auth header, the endpoint should
+    /// complete and write a row to `usage_logs` recording the tokens
+    /// the canned provider reported.
+    #[tokio::test]
+    async fn chat_completions_records_usage_for_agent() {
+        let (app, provider, db) = test_app_with_canned();
+
+        let body = serde_json::json!({
+            "model": "canned-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = post_chat(&app, body, Some("Bearer sk-atlas")).await;
+        assert_eq!(resp.status(), 200, "expected 200");
+        assert_eq!(provider.call_count(), 1);
+
+        // Confirm a usage_logs row landed for this agent.
+        let conn = db.conn();
+        let (agent_id, input, output): (String, i64, i64) = conn
+            .query_row(
+                "SELECT agent_id, input_tokens, output_tokens FROM usage_logs \
+                 WHERE agent_id = 'atlas' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("usage_logs row should exist");
+        assert_eq!(agent_id, "atlas");
+        assert_eq!(input, 10);
+        assert_eq!(output, 3);
+    }
+
+    /// Without an auth header, the endpoint still works — usage isn't
+    /// recorded because there's no agent to attribute to.
+    #[tokio::test]
+    async fn chat_completions_works_without_auth() {
+        let (app, provider, db) = test_app_with_canned();
+
+        let body = serde_json::json!({
+            "model": "canned-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = post_chat(&app, body, None).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(provider.call_count(), 1);
+
+        let conn = db.conn();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no agent → no usage recorded");
+    }
+
+    /// When a degraded_model override is active in budget state, the
+    /// endpoint silently swaps the caller's model. Canned provider
+    /// records what model it actually saw.
+    #[tokio::test]
+    async fn chat_completions_honors_degraded_model_override() {
+        let (app, provider, db) = test_app_with_canned();
+
+        // Seed a degraded_model for this agent directly.
+        db.conn()
+            .execute(
+                "INSERT INTO budget_state (agent_id, daily_spent, monthly_spent, total_spent, \
+                 is_paused, degraded_model) VALUES ('atlas', 0, 0, 0, 0, 'local')",
+                [],
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "model": "canned-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let resp = post_chat(&app, body, Some("Bearer sk-atlas")).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            provider.last_model().as_deref(),
+            Some("local"),
+            "provider should have seen the degraded model, not the caller's original"
+        );
+    }
 
     async fn assert_ok(resp: axum::http::Response<Body>, context: &str) -> serde_json::Value {
         let status = resp.status();

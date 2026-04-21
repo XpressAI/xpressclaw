@@ -165,10 +165,4 @@ impl From<reqwest::Error> for Error {
     }
 }
 
-impl From<bollard::errors::Error> for Error {
-    fn from(e: bollard::errors::Error) -> Self {
-        Error::Docker(e.to_string())
-    }
-}
-
 pub type Result<T> = std::result::Result<T, Error>;
