@@ -75,6 +75,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             _ => {
                 let echo = std::sync::Arc::new(crate::echo_harness::EchoHarness::new(
                     state.llm_router.clone(),
+                    state.mcp_manager.clone(),
                 ));
                 state.set_harness(echo);
                 info!(

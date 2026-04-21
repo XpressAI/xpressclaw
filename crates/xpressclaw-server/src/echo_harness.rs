@@ -37,8 +37,10 @@ use xpressclaw_core::error::{Error, Result};
 use xpressclaw_core::harness::types::{ContainerInfo, ContainerSpec};
 use xpressclaw_core::harness::Harness;
 use xpressclaw_core::llm::router::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LlmRouter,
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, LlmRouter, ToolCall,
 };
+use xpressclaw_core::tools::mcp::McpContent;
+use xpressclaw_core::tools::mcp_manager::McpManager;
 
 /// System-prompt prefix prepended to every request so responses are
 /// visibly "from the harness" rather than a direct LLM fallback.
@@ -54,13 +56,20 @@ struct RunningAgent {
     server_task: JoinHandle<()>,
 }
 
-/// Shared handler state — just enough to reach the live LLM router on
-/// each request. Held in `AppState`-style: behind an `RwLock<Option<…>>`
-/// so config reloads swap it cleanly.
+/// Shared handler state — the LLM router (read-through so config
+/// reloads land) and the MCP tool manager (so the agent loop can
+/// expose tools and execute them).
 #[derive(Clone)]
 pub struct EchoHandlerState {
     pub router: Arc<RwLock<Option<Arc<LlmRouter>>>>,
+    pub mcp_manager: Arc<McpManager>,
 }
+
+/// Upper bound on the agent loop's tool-call rounds per request.
+/// Prevents runaway loops when the model repeatedly asks for tools
+/// without ever returning a final answer. Generous for normal
+/// multi-step tasks, tight enough to fail fast on pathological cases.
+const MAX_TOOL_TURNS: usize = 20;
 
 /// In-process harness that binds per-agent TCP listeners and serves
 /// OpenAI-compatible `/v1/chat/completions`.
@@ -70,9 +79,12 @@ pub struct EchoHarness {
 }
 
 impl EchoHarness {
-    pub fn new(router: Arc<RwLock<Option<Arc<LlmRouter>>>>) -> Self {
+    pub fn new(router: Arc<RwLock<Option<Arc<LlmRouter>>>>, mcp_manager: Arc<McpManager>) -> Self {
         Self {
-            state: EchoHandlerState { router },
+            state: EchoHandlerState {
+                router,
+                mcp_manager,
+            },
             agents: Arc::new(TokioRwLock::new(HashMap::new())),
         }
     }
@@ -223,17 +235,23 @@ impl Harness for EchoHarness {
     }
 }
 
-/// `POST /v1/chat/completions` on the per-agent listener. Matches the
-/// shape [`HarnessClient`](xpressclaw_core::agents::harness::HarnessClient)
-/// expects. Supports both streaming and non-streaming; the conversation
-/// processor always asks for streaming.
+/// `POST /v1/chat/completions` on the per-agent listener.
+///
+/// Implements an actual agent loop: injects available MCP tools into
+/// the request, calls the LLM, and — if the model returns tool calls
+/// — executes them via the MCP manager, appends the results to the
+/// message history, and re-queries. Loops until the LLM produces a
+/// plain text response or [`MAX_TOOL_TURNS`] is reached.
+///
+/// The final turn's response is what gets streamed back to the caller
+/// (or returned as JSON in non-streaming mode). Intermediate
+/// tool-using turns happen server-side without being surfaced as chat
+/// messages — the user sees the final answer with tools having been
+/// invoked. This matches the Docker-era claude-agent-sdk behavior.
 async fn chat_completions(
     AxumState(state): AxumState<EchoHandlerState>,
     Json(mut req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
-    // Prepend the harness banner to whatever system prompt the caller
-    // sent (or synthesize one if they didn't). Keeps the response
-    // visibly distinct from a direct llm-router fallback.
     banner_prepend_system(&mut req);
 
     let router = match state.router.read().unwrap().clone() {
@@ -249,9 +267,26 @@ async fn chat_completions(
         }
     };
 
-    if req.stream.unwrap_or(false) {
-        let chunks = match router.chat_stream(&req).await {
-            Ok(s) => s,
+    // Inject MCP tools so the LLM can actually call them. Caller-
+    // provided tools win — if a caller already specified tools (as a
+    // claude-agent-sdk harness might), don't override.
+    if req.tools.is_none() {
+        let schemas = state.mcp_manager.tool_schemas().await;
+        if !schemas.is_empty() {
+            req.tools = Some(schemas);
+        }
+    }
+
+    let streaming = req.stream.unwrap_or(false);
+
+    // Agent loop: run tool-using turns to completion, stream the final
+    // turn. If the first turn has no tool calls at all, the loop is a
+    // no-op and we stream that turn directly.
+    let mut working = req.clone();
+    working.stream = Some(false); // non-streaming for tool-use turns
+    for _ in 0..MAX_TOOL_TURNS {
+        let resp = match router.chat(&working).await {
+            Ok(r) => r,
             Err(e) => {
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -260,18 +295,111 @@ async fn chat_completions(
                     .into_response();
             }
         };
-        stream_response(chunks).into_response()
-    } else {
-        match router.chat(&req).await {
-            Ok(resp) => Json::<ChatCompletionResponse>(resp).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
+
+        let tool_calls = resp
+            .choices
+            .first()
+            .and_then(|c| c.message.tool_calls.clone())
+            .unwrap_or_default();
+
+        if tool_calls.is_empty() {
+            // Terminal turn. Either stream it now (if caller asked for
+            // streaming) or return the JSON we already have.
+            if streaming {
+                // Re-run the same conversation in streaming mode so the
+                // caller gets token-by-token output instead of a
+                // one-shot chunk.
+                let mut final_req = working.clone();
+                final_req.stream = Some(true);
+                let chunks = match router.chat_stream(&final_req).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({ "error": e.to_string() })),
+                        )
+                            .into_response();
+                    }
+                };
+                return stream_response(chunks).into_response();
+            } else {
+                return Json::<ChatCompletionResponse>(resp).into_response();
+            }
+        }
+
+        // Append the assistant message (with tool_calls) to history
+        // so the LLM sees its prior commitment in the next turn.
+        if let Some(choice) = resp.choices.first() {
+            working.messages.push(choice.message.clone());
+        }
+
+        // Execute each tool call and append results as tool messages.
+        for tc in &tool_calls {
+            let args: serde_json::Value =
+                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+            let tool_msg = match state.mcp_manager.call_tool(&tc.function.name, args).await {
+                Ok(result) => format_tool_result(&result),
+                Err(e) => format!("[tool error: {e}]"),
+            };
+            working
+                .messages
+                .push(ChatMessage::tool_result(tc.id.clone(), tool_msg));
         }
     }
+
+    // Loop exhausted — return a best-effort error response.
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        Json(serde_json::json!({
+            "error": format!(
+                "agent loop exceeded {MAX_TOOL_TURNS} tool-call turns; \
+                 the model is stuck in a tool-calling loop"
+            ),
+        })),
+    )
+        .into_response()
 }
+
+/// Flatten an MCP tool result's `content` blocks into a single string
+/// suitable for a `tool` role message. Text blocks concatenate;
+/// non-text blocks get a readable stand-in.
+fn format_tool_result(result: &xpressclaw_core::tools::mcp::McpToolResult) -> String {
+    let mut out = String::new();
+    for block in &result.content {
+        match block {
+            McpContent::Text { text } => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            McpContent::Image { mime_type, .. } => {
+                out.push_str(&format!("[image: {mime_type}]\n"));
+            }
+            McpContent::Resource { uri, text } => {
+                if let Some(t) = text {
+                    out.push_str(t);
+                    out.push('\n');
+                } else {
+                    out.push_str(&format!("[resource: {uri}]\n"));
+                }
+            }
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        if result.is_error {
+            "[tool returned empty error]".to_string()
+        } else {
+            "[tool returned no content]".to_string()
+        }
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// Silence the unused-import warning if ToolCall becomes unused in
+// some conditional path; keeps the public symbol visible.
+#[allow(dead_code)]
+fn _assert_tool_call_usable(_t: &ToolCall) {}
 
 fn banner_prepend_system(req: &mut ChatCompletionRequest) {
     if let Some(first) = req.messages.first_mut() {
@@ -348,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_launch_list_stop() {
         let router_slot: Arc<RwLock<Option<Arc<LlmRouter>>>> = Arc::new(RwLock::new(None));
-        let harness = EchoHarness::new(router_slot);
+        let harness = EchoHarness::new(router_slot, Arc::new(McpManager::new()));
         let spec = ContainerSpec::default();
 
         let info = harness.launch("test-agent", &spec).await.expect("launch");
