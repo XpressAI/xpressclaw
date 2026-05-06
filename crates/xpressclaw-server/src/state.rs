@@ -7,8 +7,6 @@ use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
-#[cfg(feature = "local-llm")]
-use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 
@@ -21,8 +19,6 @@ pub struct AppState {
     pub rate_limiter: Arc<RwLock<Arc<RateLimiter>>>,
     pub config_path: PathBuf,
     pub setup_complete: Arc<RwLock<bool>>,
-    #[cfg(feature = "local-llm")]
-    pub download_progress: Arc<RwLock<DownloadProgress>>,
     pub mcp_manager: Arc<McpManager>,
     pub event_bus: Arc<ConversationEventBus>,
     /// Pool of persistent pi-agent WASM subprocesses.
@@ -48,8 +44,6 @@ impl AppState {
             rate_limiter: Arc::new(RwLock::new(rate_limiter)),
             config_path,
             setup_complete: Arc::new(RwLock::new(setup_complete)),
-            #[cfg(feature = "local-llm")]
-            download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
             pi_pool: Arc::new(PiPool::new().with_terminal(pi_terminal.clone())),

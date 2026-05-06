@@ -209,13 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn test_local_model_free() {
-        let table = PricingTable::new();
-        let cost = table.calculate("local", 100_000, 50_000, 0, 0);
-        assert!(cost.abs() < 1e-10);
-    }
-
-    #[test]
     fn test_cache_costs() {
         let table = PricingTable::new();
         // Claude Opus 4.5: cache_write=$6.25, cache_read=$0.50

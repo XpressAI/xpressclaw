@@ -31,7 +31,6 @@ pub fn routes() -> Router<AppState> {
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
         .route("/add-agent", post(add_agent))
-        .route("/download-status", get(download_status))
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
@@ -261,12 +260,7 @@ struct LlmSetup {
     provider: String,
     api_key: Option<String>,
     base_url: Option<String>,
-    local_model: Option<String>,
     local_base_url: Option<String>,
-    /// If true, download the GGUF model and use embedded llama.cpp.
-    /// Set when Ollama is not available.
-    #[serde(default)]
-    use_embedded: bool,
 }
 
 #[derive(Deserialize)]
@@ -285,44 +279,14 @@ struct AgentSetup {
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
-/// Return current GGUF download progress.
-async fn download_status(State(state): State<AppState>) -> Json<Value> {
-    #[cfg(feature = "local-llm")]
-    {
-        let dp = state.download_progress.read().unwrap().clone();
-        Json(json!(dp))
-    }
-    #[cfg(not(feature = "local-llm"))]
-    {
-        let _ = state;
-        Json(json!({ "status": "Idle" }))
-    }
-}
+
 
 /// Save the setup configuration and mark setup as complete.
 async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
-    #[allow(unused_variables)]
-    let needs_download = is_local && req.llm.use_embedded;
-
-    // Resolve GGUF source if needed (for config, even before download completes)
-    #[cfg(feature = "local-llm")]
-    let (gguf_repo, gguf_file) = if needs_download {
-        let model_name = req
-            .llm
-            .local_model
-            .as_deref()
-            .unwrap_or(xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_FILE);
-        let (r, f) = resolve_gguf_source(model_name);
-        (r.to_string(), f.to_string())
-    } else {
-        (String::new(), String::new())
-    };
-
-    let llm = LlmConfig {
+   let llm = LlmConfig {
         default_provider: req.llm.provider.clone(),
         openai_api_key: if req.llm.provider == "openai" {
             req.llm.api_key.clone()
@@ -339,17 +303,7 @@ async fn complete_setup(
         } else {
             None
         },
-        local_model: if is_local {
-            req.llm
-                .local_model
-                .clone()
-                .or(Some("qwen3.5:latest".into()))
-        } else {
-            None
-        },
-        // Model path will be set after download completes
-        local_model_path: None,
-        local_base_url: if is_local {
+        local_base_url: if req.llm.provider == "ollama" {
             req.llm.local_base_url.clone().or_else(|| {
                 if req.llm.provider == "ollama" {
                     Some("http://localhost:11434".to_string())
@@ -507,103 +461,15 @@ async fn complete_setup(
         }
     }
 
-    // Build LLM router from the new config
+   // Build LLM router from the new config
     let llm_router = LlmRouter::build_from_config(&config.llm);
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
 
-    // Handle embedded model download if needed
-    #[cfg(feature = "local-llm")]
-    if needs_download {
-        use xpressclaw_core::llm::llamacpp::{
-            download_gguf_with_progress, is_gguf_cached, DownloadStatus,
-        };
-
-        // Check cache first — skip download entirely if model is already cached
-        if let Some(cached_path) = is_gguf_cached(&gguf_repo, &gguf_file) {
-            info!(path = %cached_path.display(), "GGUF model already cached");
-
-            // Update config with cached model path and rebuild router
-            let old_config = state.config();
-            let mut new_llm = old_config.llm.clone();
-            new_llm.local_model_path = Some(cached_path.to_string_lossy().to_string());
-
-            let new_config = Config {
-                llm: new_llm,
-                agents: old_config.agents.clone(),
-                mcp_servers: old_config.mcp_servers.clone(),
-                system: old_config.system.clone(),
-                pi: old_config.pi.clone(),
-                ..Default::default()
-            };
-            let _ = new_config.save(&state.config_path);
-
-            let new_config = Arc::new(new_config);
-            let router = LlmRouter::build_from_config(&new_config.llm);
-            state.apply_config(new_config, Some(Arc::new(router)));
-
-            return Ok(Json(json!({
-                "success": true,
-                "downloading": false,
-                "config_path": state.config_path.display().to_string()
-            })));
-        }
-
-        // Not cached — spawn background download with progress tracking
-        let progress = state.download_progress.clone();
-        let state_clone = state.clone();
-        let config_path = state.config_path.clone();
-
-        {
-            let mut dp = progress.write().unwrap();
-            dp.status = DownloadStatus::Downloading;
-            dp.filename = gguf_file.clone();
-        }
-
-        tokio::task::spawn_blocking(move || {
-            match download_gguf_with_progress(&gguf_repo, &gguf_file, progress.clone()) {
-                Ok(path) => {
-                    info!(path = %path.display(), "GGUF download complete");
-
-                    let old_config = state_clone.config();
-                    let mut new_llm = old_config.llm.clone();
-                    new_llm.local_model_path = Some(path.to_string_lossy().to_string());
-
-                    let new_config = Config {
-                        llm: new_llm,
-                        agents: old_config.agents.clone(),
-                        mcp_servers: old_config.mcp_servers.clone(),
-                        system: old_config.system.clone(),
-                        pi: old_config.pi.clone(),
-                        ..Default::default()
-                    };
-                    let _ = new_config.save(&config_path);
-
-                    let new_config = Arc::new(new_config);
-                    let router = LlmRouter::build_from_config(&new_config.llm);
-                    state_clone.apply_config(new_config, Some(Arc::new(router)));
-                }
-                Err(e) => {
-                    warn!(error = %e, "GGUF download failed");
-                    let mut dp = progress.write().unwrap();
-                    dp.status = DownloadStatus::Error;
-                    dp.error = Some(e.to_string());
-                }
-            }
-        });
-
-        return Ok(Json(json!({
-            "success": true,
-            "downloading": true,
-            "config_path": state.config_path.display().to_string()
-        })));
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "downloading": false,
+    return Ok(Json(json!({
+       "success": true,
         "config_path": state.config_path.display().to_string()
-    })))
+    })));
 }
 
 /// Add a new agent to the existing configuration without replacing other agents.
@@ -732,65 +598,9 @@ async fn add_agent(
     state.apply_config(new_config, state.llm_router());
 
     Ok(Json(json!({
-        "success": true,
-        "agent": agent_config.name,
-    })))
-}
-
-/// Map a model name from the setup UI to a HuggingFace GGUF repo and filename.
-///
-/// The setup wizard shows model names like "qwen3.5:4b" or "gemma4:e4b"
-/// (Ollama-style). This maps them to the corresponding HuggingFace GGUF repo/file.
-#[cfg(feature = "local-llm")]
-fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
-    let name = model_name.to_lowercase();
-    match name.as_str() {
-        // --- Gemma 4 ---
-        s if s.contains("gemma") && s.contains("e2b") => (
-            "unsloth/gemma-4-E2B-it-GGUF",
-            "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && s.contains("e4b") => (
-            "unsloth/gemma-4-E4B-it-GGUF",
-            "gemma-4-E4B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && (s.contains("26b") || s.contains("a4b")) => (
-            "unsloth/gemma-4-26B-A4B-it-GGUF",
-            "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && s.contains("31b") => (
-            "unsloth/gemma-4-31B-it-GGUF",
-            "gemma-4-31B-it-UD-Q4_K_XL.gguf",
-        ),
-        // --- Qwen 3.5 Dense ---
-        s if s.contains("0.8") => ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"),
-        s if s.contains("2b") && !s.contains("12") && !s.contains("122") => {
-            ("unsloth/Qwen3.5-2B-GGUF", "Qwen3.5-2B-UD-Q4_K_XL.gguf")
-        }
-        s if s.contains("4b") => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
-        s if s.contains("9b") => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-UD-Q4_K_XL.gguf"),
-        s if s.contains("27b") => ("unsloth/Qwen3.5-27B-GGUF", "Qwen3.5-27B-UD-Q4_K_XL.gguf"),
-        // Qwen 3.5 MoE
-        s if s.contains("35b") || s.contains("a3b") => (
-            "unsloth/Qwen3.5-35B-A3B-GGUF",
-            "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("122b") || s.contains("a10b") => (
-            "unsloth/Qwen3.5-122B-A10B-GGUF",
-            "Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("397b") || s.contains("a17b") => (
-            "unsloth/Qwen3.5-397B-A17B-GGUF",
-            "Qwen3.5-397B-A17B-UD-Q4_K_XL.gguf",
-        ),
-        // If it's already a .gguf filename, use the default repo
-        s if s.ends_with(".gguf") => (
-            xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_REPO,
-            model_name,
-        ),
-        // Default: Qwen 3.5 4B
-        _ => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
-    }
+         "success": true,
+         "agent": agent_config.name,
+     })))
 }
 
 // ---------------------------------------------------------------------------

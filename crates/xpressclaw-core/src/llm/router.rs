@@ -281,29 +281,6 @@ impl LlmRouter {
             router.register_provider("anthropic", Arc::new(provider));
         }
 
-        // "local" provider = embedded llama.cpp (GGUF model)
-        if let Some(ref path) = config.local_model_path {
-            #[cfg(feature = "local-llm")]
-            {
-                let model_name = config
-                    .local_model
-                    .clone()
-                    .unwrap_or_else(|| "local".to_string());
-                match super::llamacpp::LazyLlamaCppProvider::new(
-                    std::path::PathBuf::from(path),
-                    model_name,
-                ) {
-                    Ok(provider) => {
-                        tracing::info!(path = %path, "registered embedded llama.cpp provider");
-                        router.register_provider("local", Arc::new(provider));
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "GGUF model not found");
-                    }
-                }
-            }
-        }
-
         // "ollama" provider = HTTP proxy to Ollama/vLLM/llama-server
         if let Some(ref model) = config.local_model {
             let provider = super::local::LocalProvider::from_config(

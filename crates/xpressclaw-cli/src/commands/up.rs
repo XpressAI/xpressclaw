@@ -31,24 +31,10 @@ async fn run_foreground(port: u16, workdir: Option<String>) -> anyhow::Result<()
         println!("  API:    http://localhost:{port}/api");
         println!("  LLM:    http://localhost:{port}/v1");
 
-        // Check LLM availability
+       // Check LLM availability
         let config = state.config();
         if config.llm.openai_api_key.is_some() || config.llm.anthropic_api_key.is_some() {
             println!("  LLM:    cloud provider configured");
-        } else if config.llm.local_model.is_some() {
-            let model = config.llm.local_model.as_deref().unwrap_or("unknown");
-            match reqwest::get("http://localhost:11434/api/tags").await {
-                Ok(resp) if resp.status().is_success() => {
-                    println!("  LLM:    Ollama ({model})");
-                }
-                _ => {
-                    println!();
-                    println!("  Warning: Ollama is not running.");
-                    println!("  Chat and agent tasks need a local LLM.");
-                    println!("  Start Ollama: `ollama serve`");
-                    println!("  Pull model:   `ollama pull {model}`");
-                }
-            }
         } else {
             println!();
             println!("  Warning: No LLM provider configured.");

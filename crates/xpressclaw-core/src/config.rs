@@ -419,8 +419,9 @@ pub struct LlmConfig {
     pub openai_api_key: Option<String>,
     pub openai_base_url: Option<String>,
     pub anthropic_api_key: Option<String>,
+    /// Local LLM model name (e.g., "qwen3.5:latest", "llama3.1:8b").
+    /// Used by the "ollama" provider to connect to a local LLM server.
     pub local_model: Option<String>,
-    pub local_model_path: Option<String>,
     /// Base URL for the local LLM server (Ollama, llama.cpp, vLLM, etc.).
     /// Defaults to Ollama's address (http://localhost:11434) if not set.
     pub local_base_url: Option<String>,
@@ -435,12 +436,11 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            default_provider: "local".to_string(),
+            default_provider: "ollama".to_string(),
             openai_api_key: None,
             openai_base_url: None,
             anthropic_api_key: None,
-            local_model: Some("qwen3.5:latest".to_string()),
-            local_model_path: None,
+            local_model: None,
             local_base_url: None,
             context_length: 32768,
             custom_pricing: HashMap::new(),
@@ -676,7 +676,7 @@ memory:
 
 # LLM configuration
 llm:
-  default_provider: local
+  default_provider: ollama
   # local_model: qwen3.5:latest
   # openai_api_key: (set OPENAI_API_KEY env var)
   # anthropic_api_key: (set ANTHROPIC_API_KEY env var)

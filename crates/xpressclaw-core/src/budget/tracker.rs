@@ -162,16 +162,4 @@ mod tests {
         let usage = tracker.get_usage(Some("atlas"), 10).unwrap();
         assert_eq!(usage.len(), 1);
     }
-
-    #[test]
-    fn test_local_model_zero_cost() {
-        let db = Arc::new(Database::open_memory().unwrap());
-        let tracker = CostTracker::new(db);
-
-        let record = tracker
-            .record("atlas", "local", 10000, 5000, "chat", None)
-            .unwrap();
-
-        assert!(record.cost_usd.abs() < 1e-10);
-    }
 }
