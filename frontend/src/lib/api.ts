@@ -584,13 +584,28 @@ export interface AgentPreset {
 	recommended_llm: string;
 }
 
+/// Per-agent provider summary (no api_key — it's masked).
+export interface AgentProviderEntry {
+	agent: string;
+	provider: string | null;
+	model: string | null;
+	base_url: string | null;
+	has_api_key: boolean;
+}
+
+/// Full per-agent LLM config — used by the agent profile editor.
+export interface AgentLlmConfig {
+	provider: string | null;
+	model: string | null;
+	api_key: string | null;
+	base_url: string | null;
+}
+
 export interface LiveConfig {
 	llm: {
-		default_provider: string;
-		has_openai_key: boolean;
-		openai_base_url: string | null;
-		has_anthropic_key: boolean;
-		local_model: string | null;
+		// Per-agent provider summary. There is no global LLM config — each
+		// agent declares its own provider/model/key/base_url.
+		providers: AgentProviderEntry[];
 	};
 	agents: {
 		name: string;
@@ -601,7 +616,7 @@ export interface LiveConfig {
 		avatar?: string | null;
 		role: string;
 		model: string | null;
-		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
+		llm?: AgentLlmConfig;
 		tools: string[];
 		skills: string[];
 		volumes: string[];

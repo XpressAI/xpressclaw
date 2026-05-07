@@ -74,18 +74,31 @@ async fn reconcile_models(config: &Config) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
 
-    // Only pull from Ollama when explicitly configured as the provider.
-    // "local" = embedded llama.cpp (no Ollama needed).
-    // "ollama" = Ollama HTTP API.
-    if config.llm.default_provider != "ollama" {
+    // Group Ollama-using agents by their declared base_url, so we pull each
+    // model from the host that agent actually points at.
+    // "local" = embedded llama.cpp (no Ollama needed). Skipped here.
+    // "ollama" = HTTP API to Ollama/vLLM/llama-server.
+    let mut by_base_url: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for agent in &config.agents {
+        let Some(llm) = agent.llm.as_ref() else {
+            continue;
+        };
+        if llm.provider.as_deref() != Some("ollama") {
+            continue;
+        }
+        let Some(model) = llm.model.clone() else {
+            continue;
+        };
+        let base_url = llm
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:11434".into());
+        by_base_url.entry(base_url).or_default().insert(model);
+    }
+    if by_base_url.is_empty() {
         return;
     }
-
-    let base_url = config
-        .llm
-        .local_base_url
-        .as_deref()
-        .unwrap_or("http://localhost:11434");
 
     // Backoff: if Ollama failed recently, don't retry for 60 seconds
     let now = std::time::SystemTime::now()
@@ -97,40 +110,22 @@ async fn reconcile_models(config: &Config) {
         return;
     }
 
-    // Check if Ollama is reachable before trying to pull
-    if !crate::llm::local::ollama_is_reachable(base_url).await {
-        LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
-        debug!("Ollama not reachable at {base_url}, skipping model pull");
-        return;
-    }
-
-    // Collect models only from agents that actually use local/Ollama
-    let mut models = std::collections::HashSet::new();
-    if let Some(ref m) = config.llm.local_model {
-        models.insert(m.clone());
-    }
-    for agent in &config.agents {
-        let uses_ollama = agent
-            .llm
-            .as_ref()
-            .and_then(|l| l.provider.as_deref())
-            .unwrap_or(&config.llm.default_provider)
-            == "ollama";
-        if uses_ollama {
-            if let Some(ref m) = agent.model {
-                models.insert(m.clone());
-            }
+    for (base_url, models) in &by_base_url {
+        // Check reachability per host before trying to pull
+        if !crate::llm::local::ollama_is_reachable(base_url).await {
+            LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
+            debug!("Ollama not reachable at {base_url}, skipping model pull");
+            continue;
         }
-    }
-
-    for model in &models {
-        if !crate::llm::local::ollama_has_model(base_url, model).await {
-            info!(model, "pulling Ollama model");
-            if let Err(e) = crate::llm::local::ollama_pull(base_url, model).await {
-                warn!(model, error = %e, "failed to pull Ollama model");
-                LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
-            } else {
-                info!(model, "Ollama model pull complete");
+        for model in models {
+            if !crate::llm::local::ollama_has_model(base_url, model).await {
+                info!(model, base_url, "pulling Ollama model");
+                if let Err(e) = crate::llm::local::ollama_pull(base_url, model).await {
+                    warn!(model, base_url, error = %e, "failed to pull Ollama model");
+                    LAST_OLLAMA_FAIL.store(now, Ordering::Relaxed);
+                } else {
+                    info!(model, base_url, "Ollama model pull complete");
+                }
             }
         }
     }
@@ -301,14 +296,10 @@ async fn reconcile_agents(
                     "starting agent"
                 );
 
-                // Build container spec
-                let mut spec = build_container_spec(
-                    agent_config,
-                    server_port,
-                    config.llm.anthropic_api_key.as_deref(),
-                    config.llm.openai_api_key.as_deref(),
-                    config.llm.openai_base_url.as_deref(),
-                );
+                // Build container spec. Real API keys never leave the
+                // server — agents identify themselves to the /v1/ proxy
+                // via placeholder keys encoded with their agent_id.
+                let mut spec = build_container_spec(agent_config, server_port);
 
                 // Mount workspace if not already mounted by build_container_spec
                 let has_workspace = spec.volumes.iter().any(|v| v.target == "/workspace");

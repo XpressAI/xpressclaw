@@ -205,17 +205,25 @@ impl Default for HooksConfig {
     }
 }
 
-/// Per-agent LLM override. When set, the agent uses this provider/key/url
-/// instead of the global LLM config.
+/// Per-agent LLM configuration. Each agent declares the model, provider,
+/// API key, and base URL it uses. There is no global LLM config — the router
+/// is built from the union of agents' declared configs (deduplicated by
+/// provider/key/base_url).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentLlmConfig {
-    /// Provider name: "openai", "anthropic", or "local".
+    /// Provider name: "openai", "anthropic", "ollama", or "local".
+    /// "local" means the embedded llama.cpp provider (requires `model_path`).
+    /// "ollama" means an HTTP proxy to Ollama/vLLM/llama-server (requires `base_url`).
     pub provider: Option<String>,
-    /// API key for this agent (overrides global key for the chosen provider).
+    /// Real model name passed to the provider (e.g. "gpt-4o", "claude-sonnet-4-20250514", "qwen3.5:latest").
+    pub model: Option<String>,
+    /// API key for this agent.
     pub api_key: Option<String>,
-    /// Base URL for this agent (overrides global base URL).
+    /// Base URL for this agent (e.g. for Ollama or OpenAI-compatible proxies).
     pub base_url: Option<String>,
+    /// Path to a local GGUF model file (only used when provider == "local").
+    pub model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,8 +231,12 @@ pub struct AgentLlmConfig {
 pub struct AgentConfig {
     pub name: String,
     pub backend: String,
+    /// Legacy field — agents now store the model name in `llm.model`.
+    /// Kept for backward-compatible loading of old YAMLs; migrated into
+    /// `llm.model` on first load. Skipped on serialization once empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Per-agent LLM provider/key/url override.
+    /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
     /// Human-friendly display name (e.g. "Avery (PA)").
@@ -285,6 +297,30 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// The model this agent uses. Reads from `llm.model`, falling back to the
+    /// legacy top-level `model` field if `llm.model` is unset.
+    pub fn effective_model(&self) -> Option<&str> {
+        self.llm
+            .as_ref()
+            .and_then(|l| l.model.as_deref())
+            .or(self.model.as_deref())
+    }
+
+    /// Migrate the legacy top-level `model` field into `llm.model`.
+    /// No-op if `llm.model` is already set or if there's no legacy `model`.
+    /// Called after loading config from YAML so the rest of the code only
+    /// has to look at `llm.model`.
+    pub fn migrate_legacy_model(&mut self) {
+        let Some(legacy) = self.model.take() else {
+            return;
+        };
+        let llm = self.llm.get_or_insert_with(AgentLlmConfig::default);
+        if llm.model.is_none() {
+            llm.model = Some(legacy);
+        }
+        // self.model is now None — won't be re-serialized.
+    }
+
     /// Build the full system prompt by prepending profile fields
     /// (display_name, role_title, responsibilities) to the raw role.
     pub fn full_system_prompt(&self) -> String {
@@ -412,40 +448,17 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// System-wide LLM concerns shared across agents.
+///
+/// Per-agent provider/model/key/base_url live on each `AgentConfig.llm`. The
+/// only thing that's genuinely shared is custom pricing for proxy services.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    pub default_provider: String,
-    pub openai_api_key: Option<String>,
-    pub openai_base_url: Option<String>,
-    pub anthropic_api_key: Option<String>,
-    pub local_model: Option<String>,
-    pub local_model_path: Option<String>,
-    /// Base URL for the local LLM server (Ollama, llama.cpp, vLLM, etc.).
-    /// Defaults to Ollama's address (http://localhost:11434) if not set.
-    pub local_base_url: Option<String>,
-    pub context_length: u32,
     /// Custom per-model pricing (per 1M tokens). Overrides built-in pricing.
     /// Useful for proxy services (relay, OpenRouter) with different rates.
     /// Example: `{ "xpress-qwen-3.5-27b": { "input": 0.50, "output": 2.00 } }`
-    #[serde(default)]
     pub custom_pricing: HashMap<String, crate::llm::pricing::ModelPricing>,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            default_provider: "local".to_string(),
-            openai_api_key: None,
-            openai_base_url: None,
-            anthropic_api_key: None,
-            local_model: Some("qwen3.5:latest".to_string()),
-            local_model_path: None,
-            local_base_url: None,
-            context_length: 32768,
-            custom_pricing: HashMap::new(),
-        }
-    }
 }
 
 /// Root configuration for xpressclaw.
@@ -482,7 +495,8 @@ impl Config {
             .map_err(|e| Error::Config(format!("failed to read config: {e}")))?;
 
         match serde_yaml::from_str::<Config>(&contents) {
-            Ok(config) => {
+            Ok(mut config) => {
+                config.migrate_legacy_fields();
                 config.validate()?;
                 // Save a backup of the known-good config
                 let backup = path.with_extension("yaml.bak");
@@ -499,7 +513,8 @@ impl Config {
                     );
                     let backup_contents = std::fs::read_to_string(&backup)
                         .map_err(|e2| Error::Config(format!("failed to read backup: {e2}")))?;
-                    let config: Config = serde_yaml::from_str(&backup_contents)?;
+                    let mut config: Config = serde_yaml::from_str(&backup_contents)?;
+                    config.migrate_legacy_fields();
                     config.validate()?;
                     // Restore the good config
                     let _ = std::fs::copy(&backup, path);
@@ -508,6 +523,14 @@ impl Config {
                     Err(Error::Config(format!("failed to parse config: {e}")))
                 }
             }
+        }
+    }
+
+    /// Migrate legacy fields after loading. Currently this only moves the
+    /// per-agent `model` field into `llm.model`. Safe to call repeatedly.
+    pub fn migrate_legacy_fields(&mut self) {
+        for agent in &mut self.agents {
+            agent.migrate_legacy_model();
         }
     }
 
@@ -569,16 +592,39 @@ impl Config {
     }
 }
 
-/// Environment variable overrides for secrets.
+/// Apply environment variable overrides to per-agent LLM configs.
+///
+/// For each agent, if its api_key/base_url isn't set, fall back to the
+/// matching env var based on the agent's declared provider:
+///   - `anthropic` → `ANTHROPIC_API_KEY`
+///   - `openai`    → `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+///
+/// This lets operators set keys via env without editing the YAML.
 pub fn env_overrides(config: &mut Config) {
-    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-        config.llm.anthropic_api_key = Some(key);
-    }
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-        config.llm.openai_api_key = Some(key);
-    }
-    if let Ok(url) = std::env::var("OPENAI_BASE_URL") {
-        config.llm.openai_base_url = Some(url);
+    let anthropic_env = std::env::var("ANTHROPIC_API_KEY").ok();
+    let openai_env_key = std::env::var("OPENAI_API_KEY").ok();
+    let openai_env_url = std::env::var("OPENAI_BASE_URL").ok();
+
+    for agent in &mut config.agents {
+        let Some(llm) = agent.llm.as_mut() else {
+            continue;
+        };
+        match llm.provider.as_deref() {
+            Some("anthropic") => {
+                if llm.api_key.is_none() {
+                    llm.api_key = anthropic_env.clone();
+                }
+            }
+            Some("openai") => {
+                if llm.api_key.is_none() {
+                    llm.api_key = openai_env_key.clone();
+                }
+                if llm.base_url.is_none() {
+                    llm.base_url = openai_env_url.clone();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -608,6 +654,14 @@ system:
 agents:
   - name: atlas
     backend: claude-sdk
+    # Per-agent LLM configuration. Each agent picks its own model and provider.
+    # API keys can come from env vars: ANTHROPIC_API_KEY (provider: anthropic),
+    # OPENAI_API_KEY / OPENAI_BASE_URL (provider: openai).
+    llm:
+      provider: ollama
+      model: qwen3.5:latest
+      base_url: http://localhost:11434
+      # api_key: sk-...   # set explicitly, or leave blank to read from env
     role: |
       You are a helpful AI assistant.
 
@@ -628,12 +682,12 @@ memory:
   near_term_slots: 8
   eviction: least-recently-relevant
 
-# LLM configuration
-llm:
-  default_provider: local
-  # local_model: qwen3.5:latest
-  # openai_api_key: (set OPENAI_API_KEY env var)
-  # anthropic_api_key: (set ANTHROPIC_API_KEY env var)
+# Shared LLM concerns (per-agent settings live on each agent above).
+# llm:
+#   custom_pricing:
+#     my-proxied-model:
+#       input: 0.50
+#       output: 2.00
 
 # Tool policy rules (evaluated in order, first match wins)
 # tool_policies:
@@ -838,5 +892,68 @@ memory:
     fn test_unique_agent_id_japanese() {
         assert_eq!(unique_agent_id("エリ", &[]), "エリ");
         assert_eq!(unique_agent_id("エリ", &["エリ"]), "エリ-2");
+    }
+
+    #[test]
+    fn test_migrate_legacy_top_level_model() {
+        // Old YAML: model lives at the top level of the agent.
+        let yaml = r#"
+agents:
+  - name: legacy
+    backend: claude-sdk
+    model: gpt-4o
+    role: "test"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.migrate_legacy_fields();
+        let agent = &config.agents[0];
+        assert_eq!(agent.model, None, "legacy field should be cleared");
+        assert_eq!(
+            agent.llm.as_ref().and_then(|l| l.model.as_deref()),
+            Some("gpt-4o"),
+            "model should have moved into llm.model"
+        );
+    }
+
+    #[test]
+    fn test_migrate_does_not_overwrite_explicit_llm_model() {
+        // If both old and new fields are set, the new one wins.
+        let yaml = r#"
+agents:
+  - name: dual
+    backend: claude-sdk
+    model: legacy-model
+    llm:
+      provider: openai
+      model: explicit-model
+    role: "test"
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.migrate_legacy_fields();
+        let agent = &config.agents[0];
+        assert_eq!(
+            agent.llm.as_ref().and_then(|l| l.model.as_deref()),
+            Some("explicit-model")
+        );
+        assert_eq!(agent.model, None);
+    }
+
+    #[test]
+    fn test_effective_model() {
+        let mut a = AgentConfig {
+            llm: Some(AgentLlmConfig {
+                model: Some("from-llm".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(a.effective_model(), Some("from-llm"));
+
+        a.llm = None;
+        a.model = Some("from-top".into());
+        assert_eq!(a.effective_model(), Some("from-top"));
+
+        a.model = None;
+        assert_eq!(a.effective_model(), None);
     }
 }

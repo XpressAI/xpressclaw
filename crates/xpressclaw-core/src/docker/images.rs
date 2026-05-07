@@ -25,31 +25,16 @@ pub fn image_for_backend(backend: &str) -> &'static str {
 
 /// Build a container spec for an agent based on its configuration.
 ///
-/// Resolves the harness image, sets up environment variables (API keys, model,
-/// agent identity), and configures volume mounts from the agent's config.
-pub fn build_container_spec(
-    agent: &AgentConfig,
-    server_port: u16,
-    anthropic_api_key: Option<&str>,
-    openai_api_key: Option<&str>,
-    openai_base_url: Option<&str>,
-) -> ContainerSpec {
-    build_container_spec_with_mcp(
-        agent,
-        server_port,
-        anthropic_api_key,
-        openai_api_key,
-        openai_base_url,
-        None,
-    )
+/// The harness inside the container always calls back to the server's `/v1/`
+/// proxy. Real upstream API keys never leave the server — agent identity is
+/// encoded in placeholder keys so the proxy can resolve per-agent providers.
+pub fn build_container_spec(agent: &AgentConfig, server_port: u16) -> ContainerSpec {
+    build_container_spec_with_mcp(agent, server_port, None)
 }
 
 pub fn build_container_spec_with_mcp(
     agent: &AgentConfig,
     server_port: u16,
-    anthropic_api_key: Option<&str>,
-    openai_api_key: Option<&str>,
-    openai_base_url: Option<&str>,
     mcp_servers: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
 ) -> ContainerSpec {
     let image = image_for_backend(&agent.backend);
@@ -63,32 +48,10 @@ pub fn build_container_spec_with_mcp(
         "WORKSPACE_DIR=/workspace".to_string(),
     ];
 
-    // Per-agent LLM overrides take precedence over global config.
-    let agent_llm = agent.llm.as_ref();
-    let effective_base_url = agent_llm
-        .and_then(|l| l.base_url.as_deref())
-        .or(openai_base_url);
-    let effective_openai_key = agent_llm
-        .and_then(|l| l.api_key.as_deref())
-        .or(openai_api_key);
-    let effective_anthropic_key = agent_llm
-        .and_then(|l| {
-            // Only use agent key for anthropic if agent provider is anthropic
-            if l.provider.as_deref() == Some("anthropic") {
-                l.api_key.as_deref()
-            } else {
-                None
-            }
-        })
-        .or(anthropic_api_key);
-
-    // LLM routing — harnesses call back to the server's built-in /v1/ router by default.
-    // We set both the custom LLM_BASE_URL and the standard OPENAI_BASE_URL so that
-    // any OpenAI-compatible SDK inside the container works out of the box.
-    // Rewrite localhost URLs to host.docker.internal so they work inside containers.
-    let llm_base_url = effective_base_url
-        .map(rewrite_localhost_for_docker)
-        .unwrap_or_else(|| format!("http://host.docker.internal:{server_port}/v1"));
+    // The harness always calls back to the server's /v1/ proxy. The server
+    // holds per-agent provider config and dispatches to the right upstream.
+    // OPENAI_BASE_URL mirrors LLM_BASE_URL for OpenAI-SDK-flavored harnesses.
+    let llm_base_url = format!("http://host.docker.internal:{server_port}/v1");
     env.push(format!("LLM_BASE_URL={llm_base_url}"));
     env.push(format!("OPENAI_BASE_URL={llm_base_url}"));
 
@@ -97,27 +60,18 @@ pub fn build_container_spec_with_mcp(
     let anthropic_base_url = format!("http://host.docker.internal:{server_port}");
     env.push(format!("ANTHROPIC_BASE_URL={anthropic_base_url}"));
 
-    if let Some(model) = &agent.model {
-        env.push(format!("LLM_MODEL={model}"));
-    }
+    // The harness uses the agent's logical name as the model identifier.
+    // The server's LlmRouter resolves it to the real (provider, model) pair,
+    // so budget controls can re-point an agent at a cheaper model at runtime
+    // without touching env vars or restarting the container.
+    env.push(format!("LLM_MODEL={}", agent.name));
 
-    // API keys for harnesses that call cloud APIs directly.
-    // Set placeholder keys when none are provided — SDKs refuse to start without them.
-    if let Some(key) = effective_anthropic_key {
-        env.push(format!("ANTHROPIC_API_KEY={key}"));
-    } else {
-        // Encode agent name in the placeholder key so the proxy can identify the agent.
-        env.push(format!("ANTHROPIC_API_KEY=sk-ant-{}", agent.name));
-    }
-    if let Some(key) = effective_openai_key {
-        env.push(format!("OPENAI_API_KEY={key}"));
-        env.push(format!("LLM_API_KEY={key}"));
-    } else {
-        // Placeholder key — the server's /v1 endpoint doesn't require auth,
-        // but OpenAI SDKs refuse to start without an API key set.
-        env.push("OPENAI_API_KEY=sk-xpressclaw".to_string());
-        env.push("LLM_API_KEY=sk-xpressclaw".to_string());
-    }
+    // Placeholder API keys — the server's /v1 endpoint doesn't authenticate,
+    // but cloud SDKs refuse to start without something in these vars. We
+    // encode the agent_id so the proxy can route requests per-agent.
+    env.push(format!("ANTHROPIC_API_KEY=sk-ant-{}", agent.name));
+    env.push(format!("OPENAI_API_KEY=sk-xpressclaw-{}", agent.name));
+    env.push(format!("LLM_API_KEY=sk-xpressclaw-{}", agent.name));
 
     // Agent role as JSON config
     if !agent.role.is_empty() {
@@ -195,13 +149,6 @@ pub fn build_container_spec_with_mcp(
     }
 }
 
-/// Rewrite localhost/127.0.0.1 URLs to host.docker.internal so they
-/// work inside Docker containers.
-fn rewrite_localhost_for_docker(url: &str) -> String {
-    url.replace("://localhost", "://host.docker.internal")
-        .replace("://127.0.0.1", "://host.docker.internal")
-}
-
 /// Expand `~` at the start of a path to the user's home directory.
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -265,11 +212,15 @@ mod tests {
             name: "test-agent".to_string(),
             backend: "claude-sdk".to_string(),
             role: "Test role".to_string(),
-            model: Some("gpt-4o".to_string()),
+            llm: Some(crate::config::AgentLlmConfig {
+                provider: Some("openai".into()),
+                model: Some("gpt-4o".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
-        let spec = build_container_spec(&agent, 6969, None, None, None);
+        let spec = build_container_spec(&agent, 6969);
 
         assert_eq!(spec.image, HARNESS_CLAUDE_SDK);
         assert_eq!(spec.expose_port, Some(8080));
@@ -277,7 +228,9 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "AGENT_NAME=test-agent"));
-        assert!(spec.environment.iter().any(|e| e == "LLM_MODEL=gpt-4o"));
+        // The harness uses the agent's logical name as the model — the
+        // server's LlmRouter resolves to the real upstream model.
+        assert!(spec.environment.iter().any(|e| e == "LLM_MODEL=test-agent"));
         assert!(spec
             .environment
             .iter()
@@ -292,11 +245,11 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "ANTHROPIC_BASE_URL=http://host.docker.internal:6969"));
-        // Placeholder API keys when no real keys are provided
+        // Placeholder API keys encode the agent_id so the proxy can route per-agent.
         assert!(spec
             .environment
             .iter()
-            .any(|e| e == "OPENAI_API_KEY=sk-xpressclaw"));
+            .any(|e| e == "OPENAI_API_KEY=sk-xpressclaw-test-agent"));
         assert!(spec
             .environment
             .iter()
@@ -315,7 +268,7 @@ mod tests {
             ..Default::default()
         };
 
-        let spec = build_container_spec(&agent, 6969, Some("sk-ant-123"), None, None);
+        let spec = build_container_spec(&agent, 6969);
 
         assert_eq!(spec.image, HARNESS_CLAUDE_SDK);
         assert_eq!(spec.volumes.len(), 2);
@@ -325,40 +278,42 @@ mod tests {
         assert_eq!(spec.volumes[1].source, "/tmp/data");
         assert_eq!(spec.volumes[1].target, "/data");
         assert!(spec.volumes[1].read_only);
+        // Real API keys never leave the server — even when the agent has them
+        // configured. The container only sees agent-id-encoded placeholders.
         assert!(spec
             .environment
             .iter()
-            .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-123"));
+            .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-worker"));
     }
 
     #[test]
-    fn test_build_container_spec_with_api_keys() {
-        let agent = AgentConfig::default();
+    fn test_build_container_spec_no_real_keys_in_container() {
+        // Even if the agent's LLM config has a real API key, it must not be
+        // exposed to the container — the server is the single source of truth
+        // for upstream credentials.
+        let agent = AgentConfig {
+            name: "secured".to_string(),
+            backend: "claude-sdk".to_string(),
+            llm: Some(crate::config::AgentLlmConfig {
+                provider: Some("anthropic".into()),
+                model: Some("claude-sonnet-4-20250514".into()),
+                api_key: Some("sk-ant-REAL-SECRET".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
 
-        let spec = build_container_spec(
-            &agent,
-            6969,
-            Some("ant-key"),
-            Some("oai-key"),
-            Some("https://api.openai.com/v1"),
+        let spec = build_container_spec(&agent, 6969);
+
+        let key_line = spec
+            .environment
+            .iter()
+            .find(|e| e.starts_with("ANTHROPIC_API_KEY="))
+            .expect("ANTHROPIC_API_KEY should always be set");
+        assert!(
+            !key_line.contains("REAL-SECRET"),
+            "Real API key leaked into container env: {key_line}"
         );
-
-        assert!(spec
-            .environment
-            .iter()
-            .any(|e| e == "ANTHROPIC_API_KEY=ant-key"));
-        assert!(spec
-            .environment
-            .iter()
-            .any(|e| e == "OPENAI_API_KEY=oai-key"));
-        assert!(spec.environment.iter().any(|e| e == "LLM_API_KEY=oai-key"));
-        assert!(spec
-            .environment
-            .iter()
-            .any(|e| e == "LLM_BASE_URL=https://api.openai.com/v1"));
-        assert!(spec
-            .environment
-            .iter()
-            .any(|e| e == "OPENAI_BASE_URL=https://api.openai.com/v1"));
+        assert_eq!(key_line, "ANTHROPIC_API_KEY=sk-ant-secured");
     }
 }

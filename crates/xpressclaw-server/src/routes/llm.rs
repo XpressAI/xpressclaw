@@ -207,16 +207,37 @@ async fn anthropic_messages(
         }
     }
 
-    // For Claude models with an Anthropic API key: proxy directly to Anthropic API.
-    // This preserves tools, tool_use/tool_result blocks, and streaming without lossy conversion.
+    // Resolve the request to a per-agent provider+model.
+    //
+    // The harness sends `model = <agent_id>` (its logical name), so we look
+    // up that agent and use its declared LLM config. If we can also identify
+    // the agent from the placeholder x-api-key (`sk-ant-<agent_id>`) and the
+    // model field is something else, the API key wins — the harness might
+    // have been configured with a fixed model that doesn't match its
+    // logical name.
     let config = state.config();
-    if model.starts_with("claude") {
-        if let Some(ref api_key) = config.llm.anthropic_api_key {
-            return proxy_to_anthropic(api_key, &body_bytes, streaming, &headers).await;
+    let agent_from_model = config.agents.iter().find(|a| a.name == model);
+    let agent_from_key = api_key
+        .strip_prefix("sk-ant-")
+        .and_then(|id| config.agents.iter().find(|a| a.name == id));
+    let agent_cfg = agent_from_model.or(agent_from_key);
+
+    if let Some(agent) = agent_cfg {
+        if let Some(llm) = agent.llm.as_ref() {
+            if llm.provider.as_deref() == Some("anthropic") {
+                if let (Some(real_key), Some(real_model)) =
+                    (llm.api_key.as_deref(), llm.model.as_deref())
+                {
+                    // Rewrite the body so Anthropic sees the real model name.
+                    let rewritten = rewrite_request_model(&body_bytes, real_model);
+                    return proxy_to_anthropic(real_key, &rewritten, streaming, &headers).await;
+                }
+            }
         }
     }
 
-    // For non-Claude models: convert Anthropic→OpenAI→LLM router→Anthropic
+    // Non-Anthropic providers: convert Anthropic→OpenAI and route through
+    // the LlmRouter (which handles per-agent dispatch).
     let router = state.llm_router().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -260,6 +281,22 @@ async fn anthropic_messages(
         let body = serde_json::to_value(&anthropic_resp).unwrap_or(json!({}));
         Ok(Json(body).into_response())
     }
+}
+
+/// Replace the `model` field in a JSON body without re-serializing the rest.
+///
+/// The body comes from the agent's harness with `model = <agent_id>`. Before
+/// proxying upstream we need to swap that for the real model name. If the
+/// body isn't valid JSON or has no model field, we fall back to passing it
+/// through unchanged — the upstream will reject it cleanly.
+fn rewrite_request_model(body: &[u8], real_model: &str) -> Vec<u8> {
+    let Ok(mut parsed) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    if let Some(obj) = parsed.as_object_mut() {
+        obj.insert("model".into(), Value::String(real_model.into()));
+    }
+    serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
 }
 
 /// Proxy an Anthropic Messages API request directly to api.anthropic.com.
@@ -898,15 +935,31 @@ mod tests {
         }
 
         let db = Arc::new(Database::open_memory().unwrap());
+        let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+
+        // Build a minimal one-agent config — the test agent uses OpenAI.
         let mut config = Config::default();
-        config.llm.default_provider = "openai".into();
-        config.llm.openai_api_key = Some(api_key.clone());
-        config.llm.openai_base_url = Some(base_url.clone());
+        config.agents.push(xpressclaw_core::config::AgentConfig {
+            name: "test-agent".into(),
+            backend: "claude-sdk".into(),
+            llm: Some(xpressclaw_core::config::AgentLlmConfig {
+                provider: Some("openai".into()),
+                model: Some(model.clone()),
+                api_key: Some(api_key.clone()),
+                base_url: Some(base_url.clone()),
+                model_path: None,
+            }),
+            ..Default::default()
+        });
         let config = Arc::new(config);
 
-        let provider = OpenAiProvider::new(Some(api_key), Some(base_url));
-        let mut router = LlmRouter::new(&config.llm);
-        router.register_provider("openai", Arc::new(provider));
+        // Register a real provider with the right key so the test exercises
+        // the proxy end-to-end.
+        let mut router = LlmRouter::new();
+        let provider = OpenAiProvider::new(Some(api_key.clone()), Some(base_url.clone()));
+        let provider_key = format!("openai|{api_key}|{base_url}");
+        router.register_provider(&provider_key, Arc::new(provider));
+        router.bind_agent("test-agent", &provider_key, &model);
 
         let state = AppState::new(
             config,

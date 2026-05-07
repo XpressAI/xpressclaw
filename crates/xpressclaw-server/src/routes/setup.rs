@@ -46,14 +46,29 @@ pub fn routes() -> Router<AppState> {
 /// Return the current live configuration (sanitized — no API keys).
 async fn get_config(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
+    // Per-agent providers — collect a sanitized summary for the frontend.
+    // Each entry shows the agent's declared provider, real model, base_url,
+    // and whether an API key is set (never the key itself).
+    let providers: Vec<Value> = config
+        .agents
+        .iter()
+        .filter_map(|a| {
+            let l = a.llm.as_ref()?;
+            Some(json!({
+                "agent": a.name,
+                "provider": l.provider,
+                "model": l.model,
+                "base_url": l.base_url,
+                "has_api_key": l.api_key.is_some(),
+            }))
+        })
+        .collect();
     Json(json!({
         "llm": {
-            "default_provider": config.llm.default_provider,
-            "has_openai_key": config.llm.openai_api_key.is_some(),
-            "openai_base_url": config.llm.openai_base_url,
-            "has_anthropic_key": config.llm.anthropic_api_key.is_some(),
-            "local_model": config.llm.local_model,
-            "local_base_url": config.llm.local_base_url,
+            // No global LLM config anymore. We expose the per-agent breakdown
+            // so the settings page can render a summary without needing to
+            // re-fetch /agents.
+            "providers": providers,
         },
         "agents": config.agents.iter().map(|a| {
             let mut agent = json!({
@@ -64,9 +79,13 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "responsibilities": a.responsibilities,
                 "avatar": a.avatar,
                 "role": a.role,
-                "model": a.model,
+                "model": a.effective_model(),
+                // Full llm block (including api_key) — needed by the agent
+                // profile editor. /api/setup/config is a local-only endpoint
+                // that already exposed the api_key under the previous shape.
                 "llm": a.llm.as_ref().map(|l| json!({
                     "provider": l.provider,
+                    "model": l.model,
                     "api_key": l.api_key,
                     "base_url": l.base_url,
                 })),
@@ -348,46 +367,22 @@ async fn complete_setup(
         (String::new(), String::new())
     };
 
-    let llm = LlmConfig {
-        default_provider: req.llm.provider.clone(),
-        openai_api_key: if req.llm.provider == "openai" {
-            req.llm.api_key.clone()
-        } else {
-            None
-        },
-        openai_base_url: if req.llm.provider == "openai" {
-            req.llm.base_url.clone()
-        } else {
-            None
-        },
-        anthropic_api_key: if req.llm.provider == "anthropic" {
-            req.llm.api_key.clone()
-        } else {
-            None
-        },
-        local_model: if is_local {
-            req.llm
-                .local_model
-                .clone()
-                .or(Some("qwen3.5:latest".into()))
-        } else {
-            None
-        },
-        // Model path will be set after download completes
-        local_model_path: None,
-        local_base_url: if is_local {
-            req.llm.local_base_url.clone().or_else(|| {
-                if req.llm.provider == "ollama" {
-                    Some("http://localhost:11434".to_string())
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        },
-        ..Default::default()
+    // Global LLM config no longer holds provider/model/key — those moved
+    // onto each agent. Only `custom_pricing` lives here.
+    let llm = LlmConfig::default();
+
+    // Resolve the GGUF path now if the model is already cached, so we can
+    // bake it into each agent's llm.model_path immediately. If it isn't
+    // cached, the background download below updates each agent later.
+    #[cfg(feature = "local-llm")]
+    let cached_gguf_path: Option<String> = if needs_download {
+        use xpressclaw_core::llm::llamacpp::is_gguf_cached;
+        is_gguf_cached(&gguf_repo, &gguf_file).map(|p| p.to_string_lossy().to_string())
+    } else {
+        None
     };
+    #[cfg(not(feature = "local-llm"))]
+    let cached_gguf_path: Option<String> = None;
 
     // Agents
     let presets = builtin_presets();
@@ -420,19 +415,44 @@ async fn complete_setup(
                     }
                 }
 
-                // Populate per-agent LLM config from wizard settings
+                // Per-agent LLM config built from the wizard's selections.
+                // Each agent gets its own provider/model/key/base_url so it
+                // can later be edited independently.
                 let agent_llm = {
                     let provider = req.llm.provider.clone();
-                    let api_key = req.llm.api_key.clone();
-                    let base_url = req.llm.base_url.clone().or(req.llm.local_base_url.clone());
-                    if !provider.is_empty() {
-                        Some(crate::routes::setup::AgentLlmConfig {
-                            provider: Some(provider),
-                            api_key,
-                            base_url,
-                        })
-                    } else {
+                    if provider.is_empty() {
                         None
+                    } else {
+                        // Per-agent model: prefer the agent's own model from
+                        // the wizard, fall back to the wizard's local_model
+                        // (set when provider is local/ollama), then default.
+                        let model = a
+                            .model
+                            .clone()
+                            .or_else(|| req.llm.local_model.clone())
+                            .or_else(|| {
+                                if provider == "ollama" || provider == "local" {
+                                    Some("qwen3.5:latest".into())
+                                } else {
+                                    None
+                                }
+                            });
+                        let base_url = req.llm.base_url.clone().or_else(|| {
+                            req.llm.local_base_url.clone().or_else(|| {
+                                if provider == "ollama" {
+                                    Some("http://localhost:11434".to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+                        Some(AgentLlmConfig {
+                            provider: Some(provider),
+                            model,
+                            api_key: req.llm.api_key.clone(),
+                            base_url,
+                            model_path: cached_gguf_path.clone(),
+                        })
                     }
                 };
 
@@ -456,7 +476,6 @@ async fn complete_setup(
                         .clone()
                         .or(preset.map(|p| p.role.to_string()))
                         .unwrap_or_default(),
-                    model: a.model.clone(),
                     llm: agent_llm,
                     tools,
                     skills: vec![
@@ -534,45 +553,17 @@ async fn complete_setup(
     }
 
     // Build LLM router from the new config
-    let llm_router = LlmRouter::build_from_config(&config.llm);
+    let llm_router = LlmRouter::build_from_config(&config);
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
 
-    // Handle embedded model download if needed
+    // Handle embedded model download if needed.
+    // For provider=local agents, we need a `model_path` pointing at a GGUF
+    // file. If the model isn't cached, download it in the background and
+    // patch the path into every local agent's llm.model_path on completion.
     #[cfg(feature = "local-llm")]
-    if needs_download {
-        use xpressclaw_core::llm::llamacpp::{
-            download_gguf_with_progress, is_gguf_cached, DownloadStatus,
-        };
-
-        // Check cache first — skip download entirely if model is already cached
-        if let Some(cached_path) = is_gguf_cached(&gguf_repo, &gguf_file) {
-            info!(path = %cached_path.display(), "GGUF model already cached");
-
-            // Update config with cached model path and rebuild router
-            let old_config = state.config();
-            let mut new_llm = old_config.llm.clone();
-            new_llm.local_model_path = Some(cached_path.to_string_lossy().to_string());
-
-            let new_config = Config {
-                llm: new_llm,
-                agents: old_config.agents.clone(),
-                mcp_servers: old_config.mcp_servers.clone(),
-                system: old_config.system.clone(),
-                ..Default::default()
-            };
-            let _ = new_config.save(&state.config_path);
-
-            let new_config = Arc::new(new_config);
-            let router = LlmRouter::build_from_config(&new_config.llm);
-            state.apply_config(new_config, Some(Arc::new(router)));
-
-            return Ok(Json(json!({
-                "success": true,
-                "downloading": false,
-                "config_path": state.config_path.display().to_string()
-            })));
-        }
+    if needs_download && cached_gguf_path.is_none() {
+        use xpressclaw_core::llm::llamacpp::{download_gguf_with_progress, DownloadStatus};
 
         // Not cached — spawn background download with progress tracking
         let progress = state.download_progress.clone();
@@ -590,13 +581,21 @@ async fn complete_setup(
                 Ok(path) => {
                     info!(path = %path.display(), "GGUF download complete");
 
+                    // Patch the path into every agent that uses provider=local.
                     let old_config = state_clone.config();
-                    let mut new_llm = old_config.llm.clone();
-                    new_llm.local_model_path = Some(path.to_string_lossy().to_string());
+                    let path_str = path.to_string_lossy().to_string();
+                    let mut new_agents = old_config.agents.clone();
+                    for agent in &mut new_agents {
+                        if let Some(ref mut llm) = agent.llm {
+                            if llm.provider.as_deref() == Some("local") {
+                                llm.model_path = Some(path_str.clone());
+                            }
+                        }
+                    }
 
                     let new_config = Config {
-                        llm: new_llm,
-                        agents: old_config.agents.clone(),
+                        llm: old_config.llm.clone(),
+                        agents: new_agents,
                         mcp_servers: old_config.mcp_servers.clone(),
                         system: old_config.system.clone(),
                         ..Default::default()
@@ -604,7 +603,7 @@ async fn complete_setup(
                     let _ = new_config.save(&config_path);
 
                     let new_config = Arc::new(new_config);
-                    let router = LlmRouter::build_from_config(&new_config.llm);
+                    let router = LlmRouter::build_from_config(&new_config);
                     state_clone.apply_config(new_config, Some(Arc::new(router)));
                 }
                 Err(e) => {
@@ -653,17 +652,16 @@ async fn add_agent(
         }
     }
 
-    // LLM config: use global defaults (provider, key, base_url)
-    // The agent inherits these but can override later via the agent editor.
-    let old_config = state.config();
+    // New agents get a sensible default LLM config that points at local
+    // Ollama. The user edits the agent afterwards to switch provider/model
+    // or add an API key. We deliberately do NOT inherit any "global" provider
+    // or key from existing agents — that's the bug this rewrite fixes.
     let agent_llm = Some(AgentLlmConfig {
-        provider: Some(old_config.llm.default_provider.clone()),
-        api_key: old_config
-            .llm
-            .openai_api_key
-            .clone()
-            .or(old_config.llm.anthropic_api_key.clone()),
-        base_url: old_config.llm.openai_base_url.clone(),
+        provider: Some("ollama".into()),
+        model: req.model.clone().or_else(|| Some("qwen3.5:latest".into())),
+        api_key: None,
+        base_url: Some("http://localhost:11434".into()),
+        model_path: None,
     });
 
     // Default skills for new agents
@@ -674,6 +672,7 @@ async fn add_agent(
     ];
 
     // Slugify the name and ensure uniqueness
+    let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let agent_id = xpressclaw_core::config::unique_agent_id(&req.name, &existing_ids);
 
@@ -690,7 +689,6 @@ async fn add_agent(
             .clone()
             .or(preset.map(|p| p.role.to_string()))
             .unwrap_or_default(),
-        model: req.model.clone(),
         llm: agent_llm,
         tools,
         skills: default_skills,
@@ -750,9 +748,12 @@ async fn add_agent(
         &xpressclaw_core::agents::state::DesiredStatus::Running,
     );
 
-    // Reload config
+    // Rebuild the router so the new agent has a binding. The previous
+    // implementation reused the existing router, which silently meant the
+    // newly-added agent had no provider mapping until the server restarted.
     let new_config = std::sync::Arc::new(new_config);
-    state.apply_config(new_config, state.llm_router());
+    let new_router = Arc::new(LlmRouter::build_from_config(&new_config));
+    state.apply_config(new_config, Some(new_router));
 
     Ok(Json(json!({
         "success": true,
@@ -1088,8 +1089,16 @@ mod tests {
         let config_path = test_config_path();
         assert!(config_path.exists());
         let config = Config::load(&config_path).unwrap();
-        assert_eq!(config.llm.default_provider, "local");
         assert_eq!(config.agents[0].name, "atlas");
+        // The wizard's `provider: local` should land on each agent's
+        // per-agent llm config, not on a global field.
+        assert_eq!(
+            config.agents[0]
+                .llm
+                .as_ref()
+                .and_then(|l| l.provider.as_deref()),
+            Some("local")
+        );
 
         // Verify agent has default skills
         assert!(

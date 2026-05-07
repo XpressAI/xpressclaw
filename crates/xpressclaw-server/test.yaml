@@ -11,8 +11,8 @@ system:
     requests_per_minute: 60
     tokens_per_minute: 100000
     concurrent_requests: 5
-  data_dir: /home/egonzalez/.xpressclaw
-  workspace_dir: /home/egonzalez/Projects/xpressai/xpressclaw/crates/xpressclaw-server
+  data_dir: /Users/egonzalez/.xpressclaw
+  workspace_dir: /Users/egonzalez/Projects/xpressai/xpressclaw/crates/xpressclaw-server
 agents: []
 tools: {}
 mcp_servers: {}
@@ -24,12 +24,4 @@ memory:
   embedding_model: all-MiniLM-L6-v2
   embedding_dim: 384
 llm:
-  default_provider: local
-  openai_api_key: null
-  openai_base_url: null
-  anthropic_api_key: null
-  local_model: qwen3.5:latest
-  local_model_path: null
-  local_base_url: null
-  context_length: 32768
   custom_pricing: {}

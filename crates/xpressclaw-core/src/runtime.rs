@@ -105,13 +105,7 @@ impl Runtime {
         let agent_config = self.config.agents.iter().find(|a| a.name == agent_id);
 
         let mut spec = if let Some(ac) = agent_config {
-            build_container_spec(
-                ac,
-                8935, // default server port
-                self.config.llm.anthropic_api_key.as_deref(),
-                self.config.llm.openai_api_key.as_deref(),
-                self.config.llm.openai_base_url.as_deref(),
-            )
+            build_container_spec(ac, 8935)
         } else {
             // Fallback: minimal spec from registry data
             let mut spec = crate::docker::manager::ContainerSpec {
@@ -298,9 +292,10 @@ impl Runtime {
             format!("Task: {}", task.title)
         };
 
-        let model = agent_cfg
-            .and_then(|c| c.model.as_deref())
-            .unwrap_or("default");
+        // Pass the agent's logical name. The harness will eventually reach
+        // back to the server's /v1/ proxy which resolves the logical name
+        // to the real (provider, model) using the LlmRouter.
+        let model = agent_id;
 
         // Send to harness
         match harness.send_task(system_prompt, &task_prompt, model).await {
