@@ -1,0 +1,24 @@
+Why the design uses agent_id as the logical model name (and the rejected
+alternatives):
+
+The user's earlier diagnostic agent identified three real bugs (server
+LlmRouter was global-only; AgentLlmConfig had no model field; add_agent
+copied the global config). The user then asked for a model-name-as-
+indirection approach: harness uses {agent_id} as its model name; server
+resolves to real (provider, model). I considered three layouts:
+
+1. {agent_id}_model{num} (the user's literal suggestion. Reserves room
+   for multiple models per agent. Skipped — every code path has exactly
+   one current model per agent today; the {num} suffix would be dead
+   structure. Trivial to add later by changing one bind_agent() call.
+
+2. {agent_id}-real-model passthrough — set LLM_MODEL to a real model name
+   and have the router only resolve real names. Skipped because it
+   requires restarting the container to swap the model (e.g. budget
+   degradation), defeating the indirection's main reason to exist. The
+   existing budget code already intercepts request.model in the proxy,
+   but the indirection in the router lets us also serve callers that
+   don't go through the budget path.
+
+3. {agent_id} (chosen). Single hop: harness sends body.model=atlas, the
+   router has bind atlas->(openai
