@@ -947,7 +947,6 @@ mod tests {
                 model: Some(model.clone()),
                 api_key: Some(api_key.clone()),
                 base_url: Some(base_url.clone()),
-                model_path: None,
             }),
             ..Default::default()
         });

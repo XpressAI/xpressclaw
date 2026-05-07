@@ -9,8 +9,7 @@
 		SystemInfo,
 		OllamaInfo,
 		ModelRecommendation,
-		AgentPreset,
-		DownloadStatus
+		AgentPreset
 	} from '$lib/api';
 
 	// New flow: 0=agent, 1=llm, 2=connectors, 3=docker, 4=complete
@@ -32,7 +31,7 @@
 	let systemInfo = $state<SystemInfo | null>(null);
 	let ollamaInfo = $state<OllamaInfo | null>(null);
 	let modelRec = $state<ModelRecommendation | null>(null);
-	let llmProvider = $state('local');
+	let llmProvider = $state('ollama');
 	let isOpenRouter = $state(false);
 	let llmApiKey = $state('');
 	let llmBaseUrl = $state('');
@@ -74,9 +73,6 @@
 	// -- Step 4: Complete --
 	let saving = $state(false);
 	let saveError = $state('');
-	let downloading = $state(false);
-	let downloadProgress = $state<DownloadStatus | null>(null);
-	let downloadPollTimer: ReturnType<typeof setInterval> | null = null;
 	let startingAgents = $state(false);
 
 	const presetIcons: Record<string, string> = {
@@ -209,7 +205,7 @@
 	}
 
 	function canProceedLlm(): boolean {
-		if (llmProvider === 'local' || llmProvider === 'ollama') return !!llmLocalModel;
+		if (llmProvider === 'ollama') return !!llmLocalModel;
 		if (llmProvider === 'openai' || llmProvider === 'anthropic') return !!llmApiKey && keyValid === true && !!llmModel;
 		return false;
 	}
@@ -219,26 +215,6 @@
 		const units = ['B', 'KB', 'MB', 'GB'];
 		const i = Math.floor(Math.log(bytes) / Math.log(1024));
 		return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
-	}
-
-	function startDownloadPolling() {
-		downloading = true;
-		step = 4;
-		downloadPollTimer = setInterval(async () => {
-			try {
-				downloadProgress = await setup.downloadStatus();
-				if (downloadProgress.status === 'Complete') {
-					stopDownloadPolling(); downloading = false; autoStartAgents();
-				} else if (downloadProgress.status === 'Error') {
-					stopDownloadPolling(); downloading = false;
-					saveError = downloadProgress.error || 'Download failed';
-				}
-			} catch {}
-		}, 500);
-	}
-
-	function stopDownloadPolling() {
-		if (downloadPollTimer) { clearInterval(downloadPollTimer); downloadPollTimer = null; }
 	}
 
 	async function autoStartAgents() {
@@ -262,8 +238,6 @@
 		} catch {}
 		try {
 			const isOllama = llmProvider === 'ollama';
-			const isLocal = llmProvider === 'local' || isOllama;
-			const useEmbedded = llmProvider === 'local';
 
 			// Build MCP servers from tool toggles + any custom servers
 			const allMcpServers = { ...mcpServers };
@@ -295,13 +269,18 @@
 			if (gitEnabled) tools.push('git');
 			if (githubEnabled) tools.push('github');
 
+			// Cloud providers send a real model name; Ollama sends the tag.
+			const realModel = (llmProvider === 'openai' || llmProvider === 'anthropic')
+				? llmModel
+				: (isOllama ? llmLocalModel : undefined);
+
 			if (mode === 'add-agent') {
 				// Add agent to existing config without replacing other agents
 				await setup.addAgent({
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
-					model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (llmProvider === 'local' ? llmLocalModel : undefined),
+					model: realModel,
 					tools,
 					volumes: volumes.length > 0 ? volumes : undefined,
 					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
@@ -310,14 +289,13 @@
 				autoStartAgents();
 			} else {
 				// Full setup: replace entire config
-				const result = await setup.complete({
+				await setup.complete({
 					llm: {
 						provider: llmProvider,
 						api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
 						base_url: llmBaseUrl || undefined,
-						local_model: isLocal ? llmLocalModel : undefined,
-						local_base_url: isLocal && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
-						use_embedded: useEmbedded
+						local_model: isOllama ? llmLocalModel : undefined,
+						local_base_url: isOllama && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
 					},
 					agents: [{
 						name: agentName,
@@ -325,20 +303,15 @@
 						role: customRole || undefined,
 						role_title: agentRoleTitle || undefined,
 						responsibilities: agentResponsibilities || undefined,
-						model: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmModel : (isLocal ? llmLocalModel : undefined),
+						model: realModel,
 						tools,
 						volumes: volumes.length > 0 ? volumes : undefined,
 					}],
 					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
 					isolation: containerless ? 'none' : 'docker'
 				});
-
-				if (result.downloading) {
-					startDownloadPolling();
-				} else {
-					step = 4;
-					autoStartAgents();
-				}
+				step = 4;
+				autoStartAgents();
 			}
 		} catch (e) {
 			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
@@ -518,19 +491,6 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'local'; isOpenRouter = false; keyValid = null; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'local' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
-				>
-					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F4BB;</div>
-					<div class="flex-1">
-						<div class="text-sm font-medium text-foreground">Built-in</div>
-						<div class="text-xs text-muted-foreground">
-							Downloads and runs a model inside xpressclaw. No external dependencies.
-							{#if modelRec}Recommended: {modelRec.model}{/if}
-						</div>
-					</div>
-				</button>
-				<button
 					onclick={() => { llmProvider = 'openai'; isOpenRouter = false; keyValid = null; llmApiKey = ''; llmBaseUrl = ''; }}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'openai' && !isOpenRouter ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
@@ -569,36 +529,12 @@
 						<input id="ollama-model" type="text" bind:value={llmLocalModel} placeholder="qwen3:8b"
 							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
 						<p class="mt-1 text-xs text-muted-foreground">
-							Enter any Ollama model name. It will be pulled automatically if not already installed.
+							Any Ollama model name. xpressclaw pulls it in the background after setup if it isn't installed yet — your agent will start replying once the pull completes.
 						</p>
 					</div>
-					{#if ollamaInfo?.models && ollamaInfo.models.length > 0}
-						<div class="space-y-1">
-							<div class="text-xs font-medium text-muted-foreground">Installed models:</div>
-							<div class="flex flex-wrap gap-1">
-								{#each ollamaInfo.models as m}
-									<button onclick={() => llmLocalModel = m.name}
-										class="rounded px-2 py-1 text-xs transition-colors {llmLocalModel === m.name
-											? 'bg-primary/10 border border-primary text-foreground'
-											: 'border border-border hover:border-primary/40 text-foreground'}">
-										{m.name}{#if m.size} <span class="text-muted-foreground">({formatBytes(m.size)})</span>{/if}
-									</button>
-								{/each}
-							</div>
-						</div>
-					{/if}
-				</div>
-			{:else if llmProvider === 'local'}
-				<div class="space-y-3 rounded-lg border border-border p-4">
-					<div>
-						<label for="local-model" class="block text-xs font-medium text-foreground mb-1">Model</label>
-						<input id="local-model" type="text" bind:value={llmLocalModel} placeholder="qwen3.5:9b"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-					</div>
-					{#if modelRec}<p class="text-xs text-muted-foreground">{modelRec.reason}</p>{/if}
 					{#if modelRec?.all_options}
 						<div class="space-y-1">
-							<div class="text-xs font-medium text-muted-foreground">Available sizes:</div>
+							<div class="text-xs font-medium text-muted-foreground">Suggested sizes for this hardware:</div>
 							<div class="grid grid-cols-2 gap-1">
 								{#each modelRec.all_options as opt}
 									<button onclick={() => llmLocalModel = opt.model}
@@ -607,6 +543,21 @@
 											: 'border border-border hover:border-primary/40 text-foreground'}">
 										{opt.display_name} <span class="text-muted-foreground">({opt.ram_required_gb}GB)</span>
 										{#if !opt.suitable}<span class="text-amber-500/60">*</span>{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+					{/if}
+					{#if ollamaInfo?.models && ollamaInfo.models.length > 0}
+						<div class="space-y-1">
+							<div class="text-xs font-medium text-muted-foreground">Already installed:</div>
+							<div class="flex flex-wrap gap-1">
+								{#each ollamaInfo.models as m}
+									<button onclick={() => llmLocalModel = m.name}
+										class="rounded px-2 py-1 text-xs transition-colors {llmLocalModel === m.name
+											? 'bg-primary/10 border border-primary text-foreground'
+											: 'border border-border hover:border-primary/40 text-foreground'}">
+										{m.name}{#if m.size} <span class="text-muted-foreground">({formatBytes(m.size)})</span>{/if}
 									</button>
 								{/each}
 							</div>
@@ -876,35 +827,25 @@
 
 	<!-- Step 4: Complete -->
 	{:else if step === 4}
-		{#if downloading}
-			<div class="text-center py-8">
-				<h2 class="text-lg font-semibold text-foreground mb-2">Downloading Model</h2>
-				<p class="text-sm text-muted-foreground mb-4">{downloadProgress?.filename || 'Preparing...'}</p>
-				<div class="w-full max-w-md mx-auto bg-muted rounded-full h-3 mb-2">
-					<div class="bg-primary h-3 rounded-full transition-all duration-300"
-						style="width: {downloadProgress && downloadProgress.total_bytes > 0
-							? Math.min(100, downloadProgress.downloaded_bytes / downloadProgress.total_bytes * 100) : 0}%"></div>
-				</div>
-				<p class="text-xs text-muted-foreground">
-					{formatBytes(downloadProgress?.downloaded_bytes ?? 0)} / {formatBytes(downloadProgress?.total_bytes ?? 0)}
-				</p>
-				{#if saveError}<p class="mt-4 text-xs text-red-500">{saveError}</p>{/if}
-			</div>
-		{:else}
-			<div class="text-center py-8">
-				<div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500 text-3xl">&#10003;</div>
-				<h2 class="text-lg font-semibold text-foreground mb-2">
-					{mode === 'add-agent' ? 'Agent Added!' : 'Setup Complete!'}
-				</h2>
-				<p class="text-sm text-muted-foreground mb-6">
-					{#if startingAgents}Starting agents...
-					{:else}Your agent <strong>{agentName}</strong> is ready to go!{/if}
-				</p>
-				<button onclick={() => goto(mode === 'add-agent' ? '/agents' : '/')}
-					class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90">
-					{mode === 'add-agent' ? 'Back to Agents' : 'Start Chatting'}
-				</button>
-			</div>
-		{/if}
+		<div class="text-center py-8">
+			<div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500 text-3xl">&#10003;</div>
+			<h2 class="text-lg font-semibold text-foreground mb-2">
+				{mode === 'add-agent' ? 'Agent Added!' : 'Setup Complete!'}
+			</h2>
+			<p class="text-sm text-muted-foreground mb-6">
+				{#if startingAgents}
+					Starting agents...
+				{:else}
+					Your agent <strong>{agentName}</strong> is ready.
+					{#if llmProvider === 'ollama' && llmLocalModel}
+						<br />Ollama may still be pulling <code class="bg-muted px-1 rounded">{llmLocalModel}</code> in the background — the agent will start replying once the pull completes.
+					{/if}
+				{/if}
+			</p>
+			<button onclick={() => goto(mode === 'add-agent' ? '/agents' : '/')}
+				class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90">
+				{mode === 'add-agent' ? 'Back to Agents' : 'Start Chatting'}
+			</button>
+		</div>
 	{/if}
 </div>

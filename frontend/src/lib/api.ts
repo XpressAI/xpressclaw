@@ -630,14 +630,6 @@ export interface LiveConfig {
 	mcp_servers: string[];
 }
 
-export interface DownloadStatus {
-	status: 'Idle' | 'Downloading' | 'Complete' | 'Error';
-	filename: string;
-	downloaded_bytes: number;
-	total_bytes: number;
-	error: string | null;
-}
-
 export const setup = {
 	status: () => request<SetupStatus>('/api/setup/status'),
 	getConfig: () => request<LiveConfig>('/api/setup/config'),
@@ -652,16 +644,17 @@ export const setup = {
 		}),
 	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
-		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string; use_embedded?: boolean };
+		// `provider` is one of: openai, anthropic, ollama. Local inference goes
+		// through Ollama only — there is no embedded llama.cpp anymore.
+		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string };
 		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; tools?: string[]; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
-		request<{ success: boolean; downloading: boolean; config_path: string }>('/api/setup/complete', {
+		request<{ success: boolean; config_path: string }>('/api/setup/complete', {
 			method: 'POST',
 			body: JSON.stringify(data)
 		}),
-	downloadStatus: () => request<DownloadStatus>('/api/setup/download-status'),
 	addAgent: (data: {
 		name: string; preset?: string; role?: string; model?: string;
 		backend?: string; tools?: string[]; volumes?: string[];

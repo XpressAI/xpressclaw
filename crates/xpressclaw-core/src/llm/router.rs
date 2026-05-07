@@ -390,39 +390,10 @@ impl LlmRouter {
                     llm.base_url.clone(),
                 ))))
             }
-            "local" => {
-                // Embedded llama.cpp via GGUF file. Only available when the
-                // crate is built with the `local-llm` feature.
-                #[cfg(feature = "local-llm")]
-                {
-                    let Some(path) = llm.model_path.as_deref() else {
-                        tracing::warn!(
-                            "provider=local requires `model_path` pointing to a GGUF file"
-                        );
-                        return Ok(None);
-                    };
-                    let model_name = llm.model.clone().unwrap_or_else(|| "local".to_string());
-                    match super::llamacpp::LazyLlamaCppProvider::new(
-                        std::path::PathBuf::from(path),
-                        model_name,
-                    ) {
-                        Ok(provider) => Ok(Some(Arc::new(provider))),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "GGUF model not found");
-                            Ok(None)
-                        }
-                    }
-                }
-                #[cfg(not(feature = "local-llm"))]
-                {
-                    let _ = llm;
-                    tracing::warn!(
-                        "provider=local requires the `local-llm` feature; ignoring agent"
-                    );
-                    Ok(None)
-                }
-            }
-            other => Err(Error::Llm(format!("unknown provider type '{other}'"))),
+            other => Err(Error::Llm(format!(
+                "unknown provider type '{other}'. \
+                 Supported providers: openai, anthropic, ollama."
+            ))),
         }
     }
 
@@ -651,7 +622,6 @@ mod tests {
                         model: Some("gpt-4o".into()),
                         api_key: Some("k1".into()),
                         base_url: None,
-                        model_path: None,
                     }),
                     ..Default::default()
                 },
@@ -662,7 +632,6 @@ mod tests {
                         model: Some("gpt-4o-mini".into()),
                         api_key: Some("k1".into()),
                         base_url: None,
-                        model_path: None,
                     }),
                     ..Default::default()
                 },
@@ -673,7 +642,6 @@ mod tests {
                         model: Some("gpt-4o".into()),
                         api_key: Some("k2".into()), // different key
                         base_url: None,
-                        model_path: None,
                     }),
                     ..Default::default()
                 },

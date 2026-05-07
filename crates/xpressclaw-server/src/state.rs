@@ -6,8 +6,6 @@ use xpressclaw_core::config::Config;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
-#[cfg(feature = "local-llm")]
-use xpressclaw_core::llm::llamacpp::DownloadProgress;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 
@@ -25,9 +23,6 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Whether initial setup has been completed.
     pub setup_complete: Arc<RwLock<bool>>,
-    /// GGUF model download progress (for setup wizard progress bar).
-    #[cfg(feature = "local-llm")]
-    pub download_progress: Arc<RwLock<DownloadProgress>>,
     /// MCP tool server manager.
     pub mcp_manager: Arc<McpManager>,
     /// Per-conversation event broadcast channels (ADR-019).
@@ -53,8 +48,6 @@ impl AppState {
             rate_limiter: Arc::new(RwLock::new(rate_limiter)),
             config_path,
             setup_complete: Arc::new(RwLock::new(setup_complete)),
-            #[cfg(feature = "local-llm")]
-            download_progress: Arc::new(RwLock::new(DownloadProgress::default())),
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
             docker: Arc::new(RwLock::new(None)),

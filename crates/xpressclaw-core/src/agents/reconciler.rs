@@ -61,23 +61,15 @@ async fn reconcile_once(
     Ok(())
 }
 
-/// Ensure Ollama models are pulled for agents that explicitly use Ollama.
+/// Ensure Ollama models are pulled for agents that use Ollama.
 ///
-/// Only runs when:
-/// 1. No embedded GGUF path is set (local_model_path is None)
-/// 2. The default provider is "local" AND local_base_url points to Ollama
-///    (or an agent explicitly overrides to use Ollama)
-/// 3. Ollama is actually reachable
-///
-/// Skipped entirely when using the embedded llama.cpp provider.
+/// Walks the config, groups agents by their declared base_url, and pulls
+/// each model from the host that agent points at. Skips hosts that aren't
+/// reachable. Backs off on failure to avoid hammering an unreachable host.
 async fn reconcile_models(config: &Config) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_OLLAMA_FAIL: AtomicU64 = AtomicU64::new(0);
 
-    // Group Ollama-using agents by their declared base_url, so we pull each
-    // model from the host that agent actually points at.
-    // "local" = embedded llama.cpp (no Ollama needed). Skipped here.
-    // "ollama" = HTTP API to Ollama/vLLM/llama-server.
     let mut by_base_url: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     for agent in &config.agents {
