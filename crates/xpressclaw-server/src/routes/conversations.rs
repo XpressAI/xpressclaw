@@ -493,16 +493,8 @@ async fn stream_message(
             };
             let agent_cfg = config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent_cfg
-                .and_then(|c| c.model.as_deref())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    llm_router
-                        .models()
-                        .first()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_else(|| "local".to_string())
-                });
+            // Logical name — the router resolves to the agent's real model.
+            let model = agent_id.clone();
 
             let base_role = agent_cfg
                 .map(|c| c.role.as_str())

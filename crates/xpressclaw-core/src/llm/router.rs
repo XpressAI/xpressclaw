@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 
-use crate::config::LlmConfig;
+use crate::config::Config;
 use crate::error::{Error, Result};
 
 /// A boxed stream of chat completion chunks.
@@ -242,118 +242,311 @@ pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Routes LLM requests to the appropriate provider based on model name.
+/// Resolved binding: which provider instance handles a request, and what
+/// model name to pass to it.
+#[derive(Debug, Clone)]
+struct AgentBinding {
+    provider_key: String,
+    real_model: String,
+}
+
+/// Routes LLM requests using per-agent logical model names.
+///
+/// Each agent declares its own provider/model/api_key/base_url. The router
+/// builds one provider instance per unique `(provider_type, api_key, base_url)`
+/// combination — many agents can share an instance — and maps each agent's
+/// logical name (its `agent.name`) to the provider instance and the *real*
+/// model name that should be sent to that provider.
+///
+/// Harnesses inside agent containers use the agent's name as the model field
+/// in their requests (set via `LLM_MODEL=<agent_id>`). The router rewrites
+/// the request's `model` field to the real model name before dispatching.
+///
+/// Real model names are also registered as a fallback so direct callers
+/// (e.g. the Anthropic-direct proxy passing through `claude-sonnet-4`) can
+/// still resolve. Unknown names error — there is no random "first available
+/// provider" fallback.
 pub struct LlmRouter {
+    /// provider_key → provider instance. Keys are stable strings derived
+    /// from `(provider_type, api_key, base_url)`.
     providers: HashMap<String, Arc<dyn LlmProvider>>,
-    model_to_provider: HashMap<String, String>,
-    default_provider: String,
+    /// agent_id (logical model name) → binding. Wrapped in RwLock so the
+    /// budget manager can re-point an agent at a degraded model at runtime
+    /// without rebuilding the entire router.
+    agent_bindings: RwLock<HashMap<String, AgentBinding>>,
+    /// real model name → provider_key. Lets direct calls with explicit model
+    /// names resolve too. Populated alongside `agent_bindings`.
+    model_to_provider: RwLock<HashMap<String, String>>,
+}
+
+impl Default for LlmRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LlmRouter {
-    pub fn new(config: &LlmConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            model_to_provider: HashMap::new(),
-            default_provider: config.default_provider.clone(),
+            agent_bindings: RwLock::new(HashMap::new()),
+            model_to_provider: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Build a fully configured LLM router from config.
+    /// Stable key for deduplicating provider instances.
+    fn provider_key(provider: &str, api_key: Option<&str>, base_url: Option<&str>) -> String {
+        format!(
+            "{provider}|{}|{}",
+            api_key.unwrap_or(""),
+            base_url.unwrap_or("")
+        )
+    }
+
+    /// Build a fully configured LLM router from the full app config.
     ///
-    /// Registers all providers based on config:
-    /// - OpenAI if API key is set
-    /// - Anthropic if API key is set
-    /// - Local model: uses embedded llama.cpp (LlamaCppProvider) if `local_model_path`
-    ///   is set, otherwise falls back to HTTP proxy (LocalProvider for Ollama/vLLM/etc.)
-    pub fn build_from_config(config: &LlmConfig) -> Self {
-        let mut router = Self::new(config);
+    /// Walks every agent, materializes its provider instance (deduplicating
+    /// by `(provider_type, api_key, base_url)`), and registers a binding
+    /// from the agent's name to that instance + the agent's real model.
+    pub fn build_from_config(config: &Config) -> Self {
+        let mut router = Self::new();
 
-        if let Some(ref key) = config.openai_api_key {
-            let provider = super::openai::OpenAiProvider::new(
-                Some(key.clone()),
-                config.openai_base_url.clone(),
+        for agent in &config.agents {
+            let Some(llm) = agent.llm.as_ref() else {
+                continue;
+            };
+            let Some(provider_type) = llm.provider.as_deref() else {
+                continue;
+            };
+            let Some(real_model) = llm.model.as_deref() else {
+                continue;
+            };
+
+            let provider_key = Self::provider_key(
+                provider_type,
+                llm.api_key.as_deref(),
+                llm.base_url.as_deref(),
             );
-            router.register_provider("openai", Arc::new(provider));
-        }
 
-        if let Some(ref key) = config.anthropic_api_key {
-            let provider = super::anthropic::AnthropicProvider::new(key.clone());
-            router.register_provider("anthropic", Arc::new(provider));
-        }
-
-        // "local" provider = embedded llama.cpp (GGUF model)
-        if let Some(ref path) = config.local_model_path {
-            #[cfg(feature = "local-llm")]
-            {
-                let model_name = config
-                    .local_model
-                    .clone()
-                    .unwrap_or_else(|| "local".to_string());
-                match super::llamacpp::LazyLlamaCppProvider::new(
-                    std::path::PathBuf::from(path),
-                    model_name,
-                ) {
-                    Ok(provider) => {
-                        tracing::info!(path = %path, "registered embedded llama.cpp provider");
-                        router.register_provider("local", Arc::new(provider));
+            // Materialize the provider instance once per unique key.
+            if !router.providers.contains_key(&provider_key) {
+                match router.materialize_provider(provider_type, llm) {
+                    Ok(Some(instance)) => {
+                        router.providers.insert(provider_key.clone(), instance);
+                    }
+                    Ok(None) => {
+                        // Provider type known but couldn't be built (e.g. missing key).
+                        tracing::warn!(
+                            agent = %agent.name,
+                            provider = provider_type,
+                            "skipping agent — provider could not be constructed"
+                        );
+                        continue;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "GGUF model not found");
+                        tracing::warn!(
+                            agent = %agent.name,
+                            provider = provider_type,
+                            error = %e,
+                            "skipping agent — provider construction failed"
+                        );
+                        continue;
                     }
                 }
             }
-        }
 
-        // "ollama" provider = HTTP proxy to Ollama/vLLM/llama-server
-        if let Some(ref model) = config.local_model {
-            let provider = super::local::LocalProvider::from_config(
-                model.clone(),
-                config.local_base_url.clone(),
-            );
-            router.register_provider("ollama", Arc::new(provider));
+            router.bind_agent(&agent.name, &provider_key, real_model);
         }
 
         router
     }
 
-    pub fn register_provider(&mut self, name: &str, provider: Arc<dyn LlmProvider>) {
-        self.providers.insert(name.to_string(), provider);
+    /// Construct a provider instance for the given config.
+    ///
+    /// Returns `Ok(None)` if the provider type is recognized but can't be
+    /// built with the supplied config (e.g. anthropic without an API key).
+    /// Returns `Err` for unrecognized provider types.
+    fn materialize_provider(
+        &self,
+        provider_type: &str,
+        llm: &crate::config::AgentLlmConfig,
+    ) -> Result<Option<Arc<dyn LlmProvider>>> {
+        match provider_type {
+            "openai" => Ok(Some(Arc::new(super::openai::OpenAiProvider::new(
+                llm.api_key.clone(),
+                llm.base_url.clone(),
+            )))),
+            "anthropic" => match llm.api_key.as_ref() {
+                Some(key) => Ok(Some(Arc::new(super::anthropic::AnthropicProvider::new(
+                    key.clone(),
+                )))),
+                None => Ok(None),
+            },
+            "ollama" => {
+                // HTTP proxy to Ollama/vLLM/llama-server.
+                let model = llm.model.clone().unwrap_or_default();
+                Ok(Some(Arc::new(super::local::LocalProvider::from_config(
+                    model,
+                    llm.base_url.clone(),
+                ))))
+            }
+            "local" => {
+                // Embedded llama.cpp via GGUF file. Only available when the
+                // crate is built with the `local-llm` feature.
+                #[cfg(feature = "local-llm")]
+                {
+                    let Some(path) = llm.model_path.as_deref() else {
+                        tracing::warn!(
+                            "provider=local requires `model_path` pointing to a GGUF file"
+                        );
+                        return Ok(None);
+                    };
+                    let model_name = llm.model.clone().unwrap_or_else(|| "local".to_string());
+                    match super::llamacpp::LazyLlamaCppProvider::new(
+                        std::path::PathBuf::from(path),
+                        model_name,
+                    ) {
+                        Ok(provider) => Ok(Some(Arc::new(provider))),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "GGUF model not found");
+                            Ok(None)
+                        }
+                    }
+                }
+                #[cfg(not(feature = "local-llm"))]
+                {
+                    let _ = llm;
+                    tracing::warn!(
+                        "provider=local requires the `local-llm` feature; ignoring agent"
+                    );
+                    Ok(None)
+                }
+            }
+            other => Err(Error::Llm(format!("unknown provider type '{other}'"))),
+        }
     }
 
-    pub fn register_model(&mut self, model: &str, provider_name: &str) {
-        self.model_to_provider
-            .insert(model.to_string(), provider_name.to_string());
+    /// Register an existing provider under a stable key. Used by tests and
+    /// by callers that build providers themselves.
+    pub fn register_provider(&mut self, key: &str, provider: Arc<dyn LlmProvider>) {
+        self.providers.insert(key.to_string(), provider);
     }
 
-    fn resolve_provider(&self, model: &str) -> Result<&Arc<dyn LlmProvider>> {
-        // Check explicit model→provider mapping first
-        if let Some(provider_name) = self.model_to_provider.get(model) {
-            if let Some(provider) = self.providers.get(provider_name) {
-                return Ok(provider);
+    /// Bind an agent (logical name) to a provider key + real model name.
+    ///
+    /// Also registers `real_model → provider_key` so direct calls with the
+    /// real model name resolve to the same provider.
+    pub fn bind_agent(&self, agent_id: &str, provider_key: &str, real_model: &str) {
+        if let Ok(mut bindings) = self.agent_bindings.write() {
+            bindings.insert(
+                agent_id.to_string(),
+                AgentBinding {
+                    provider_key: provider_key.to_string(),
+                    real_model: real_model.to_string(),
+                },
+            );
+        }
+        if let Ok(mut models) = self.model_to_provider.write() {
+            models.insert(real_model.to_string(), provider_key.to_string());
+        }
+    }
+
+    /// Re-point an existing agent at a different real model. Returns true
+    /// if the agent had an existing binding. Used by budget-driven
+    /// degradation: a paused agent gets re-pointed at a cheaper model
+    /// without rebuilding the router.
+    pub fn set_agent_model(&self, agent_id: &str, real_model: &str) -> bool {
+        let provider_key = match self.agent_bindings.read() {
+            Ok(bindings) => bindings.get(agent_id).map(|b| b.provider_key.clone()),
+            Err(_) => None,
+        };
+        let Some(provider_key) = provider_key else {
+            return false;
+        };
+        if let Ok(mut bindings) = self.agent_bindings.write() {
+            bindings.insert(
+                agent_id.to_string(),
+                AgentBinding {
+                    provider_key: provider_key.clone(),
+                    real_model: real_model.to_string(),
+                },
+            );
+        }
+        if let Ok(mut models) = self.model_to_provider.write() {
+            models.insert(real_model.to_string(), provider_key);
+        }
+        true
+    }
+
+    /// Look up the real model name an agent currently resolves to. Returns
+    /// `None` if the agent has no binding.
+    pub fn resolve_agent_model(&self, agent_id: &str) -> Option<String> {
+        self.agent_bindings
+            .read()
+            .ok()?
+            .get(agent_id)
+            .map(|b| b.real_model.clone())
+    }
+
+    /// Resolve a model identifier (either an agent logical name or a real
+    /// model name) to the provider instance and the real model name to use.
+    fn resolve(&self, model: &str) -> Result<(Arc<dyn LlmProvider>, String)> {
+        // 1. Logical agent name?
+        if let Ok(bindings) = self.agent_bindings.read() {
+            if let Some(binding) = bindings.get(model) {
+                if let Some(p) = self.providers.get(&binding.provider_key) {
+                    return Ok((Arc::clone(p), binding.real_model.clone()));
+                }
             }
         }
 
-        // Use the default provider for everything
-        self.providers.get(&self.default_provider).ok_or_else(|| {
-            Error::Llm(format!(
-                "no provider registered for model '{model}' (default provider '{}')",
-                self.default_provider
-            ))
-        })
+        // 2. Real model name registered alongside an agent binding?
+        if let Ok(models) = self.model_to_provider.read() {
+            if let Some(provider_key) = models.get(model) {
+                if let Some(p) = self.providers.get(provider_key) {
+                    return Ok((Arc::clone(p), model.to_string()));
+                }
+            }
+        }
+
+        Err(Error::Llm(format!(
+            "no provider registered for model '{model}'. \
+             Register an agent or model name first."
+        )))
     }
 
     pub async fn chat(&self, request: &ChatCompletionRequest) -> Result<ChatCompletionResponse> {
-        let provider = self.resolve_provider(&request.model)?;
-        provider.chat(request).await
+        let (provider, real_model) = self.resolve(&request.model)?;
+        if real_model == request.model {
+            provider.chat(request).await
+        } else {
+            // Rewrite model name; harness sent the logical name, provider
+            // expects the real one.
+            let mut req = request.clone();
+            req.model = real_model;
+            provider.chat(&req).await
+        }
     }
 
     pub async fn chat_stream(&self, request: &ChatCompletionRequest) -> Result<ChatStream> {
-        let provider = self.resolve_provider(&request.model)?;
-        provider.chat_stream(request).await
+        let (provider, real_model) = self.resolve(&request.model)?;
+        if real_model == request.model {
+            provider.chat_stream(request).await
+        } else {
+            let mut req = request.clone();
+            req.model = real_model;
+            provider.chat_stream(&req).await
+        }
     }
 
     pub fn models(&self) -> Vec<ModelInfo> {
         self.providers.values().flat_map(|p| p.models()).collect()
+    }
+
+    /// Number of distinct provider instances currently registered.
+    /// Useful for logging/diagnostics.
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
     }
 }
 
@@ -401,71 +594,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_uses_default_provider() {
-        let config = LlmConfig {
-            default_provider: "openai".into(),
+    async fn test_router_resolves_logical_agent_name() {
+        let mut router = LlmRouter::new();
+        router.register_provider(
+            "openai|key-a|",
+            Arc::new(MockProvider {
+                name: "openai-a".into(),
+            }),
+        );
+        router.bind_agent("atlas", "openai|key-a|", "gpt-4o");
+
+        // Harness sent the agent's logical name as the model.
+        let req = ChatCompletionRequest {
+            model: "atlas".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
             ..Default::default()
         };
-        let mut router = LlmRouter::new(&config);
+        let resp = router.chat(&req).await.unwrap();
+        assert!(resp.choices[0].message.content.contains("openai-a"));
+        // The provider saw the *real* model name, not the logical one.
+        assert_eq!(resp.model, "gpt-4o");
+    }
 
+    #[tokio::test]
+    async fn test_router_resolves_real_model_name() {
+        let mut router = LlmRouter::new();
         router.register_provider(
-            "openai",
+            "openai|key-a|",
             Arc::new(MockProvider {
-                name: "openai".into(),
+                name: "openai-a".into(),
             }),
         );
-        router.register_provider(
-            "anthropic",
-            Arc::new(MockProvider {
-                name: "anthropic".into(),
-            }),
-        );
+        router.bind_agent("atlas", "openai|key-a|", "gpt-4o");
 
-        // All models go to default provider regardless of name
+        // Direct call with the real model name (e.g. /v1/messages passing claude-...)
         let req = ChatCompletionRequest {
             model: "gpt-4o".into(),
             messages: vec![ChatMessage::text("user", "hi")],
             ..Default::default()
         };
         let resp = router.chat(&req).await.unwrap();
-        assert!(resp.choices[0].message.content.contains("openai"));
+        assert!(resp.choices[0].message.content.contains("openai-a"));
+        assert_eq!(resp.model, "gpt-4o");
+    }
 
-        let req2 = ChatCompletionRequest {
-            model: "qwen3.5-27b".into(),
-            messages: vec![ChatMessage::text("user", "hi")],
+    #[tokio::test]
+    async fn test_router_two_agents_share_one_provider_instance() {
+        // Both agents declare provider=openai with the same key+url.
+        // Should result in one provider instance.
+        let config = Config {
+            agents: vec![
+                crate::config::AgentConfig {
+                    name: "atlas".into(),
+                    llm: Some(crate::config::AgentLlmConfig {
+                        provider: Some("openai".into()),
+                        model: Some("gpt-4o".into()),
+                        api_key: Some("k1".into()),
+                        base_url: None,
+                        model_path: None,
+                    }),
+                    ..Default::default()
+                },
+                crate::config::AgentConfig {
+                    name: "eri".into(),
+                    llm: Some(crate::config::AgentLlmConfig {
+                        provider: Some("openai".into()),
+                        model: Some("gpt-4o-mini".into()),
+                        api_key: Some("k1".into()),
+                        base_url: None,
+                        model_path: None,
+                    }),
+                    ..Default::default()
+                },
+                crate::config::AgentConfig {
+                    name: "other".into(),
+                    llm: Some(crate::config::AgentLlmConfig {
+                        provider: Some("openai".into()),
+                        model: Some("gpt-4o".into()),
+                        api_key: Some("k2".into()), // different key
+                        base_url: None,
+                        model_path: None,
+                    }),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
-        let resp2 = router.chat(&req2).await.unwrap();
-        assert!(resp2.choices[0].message.content.contains("openai"));
+        let router = LlmRouter::build_from_config(&config);
+        // Two unique (provider, key, base_url) tuples → 2 provider instances.
+        assert_eq!(router.provider_count(), 2);
+        assert_eq!(
+            router.resolve_agent_model("atlas").as_deref(),
+            Some("gpt-4o")
+        );
+        assert_eq!(
+            router.resolve_agent_model("eri").as_deref(),
+            Some("gpt-4o-mini")
+        );
     }
 
     #[tokio::test]
     async fn test_router_unknown_model_errors() {
-        let config = LlmConfig::default();
-        let router = LlmRouter::new(&config);
-
+        let router = LlmRouter::new();
         let req = ChatCompletionRequest {
             model: "nonexistent".into(),
             messages: vec![],
-            temperature: None,
-            max_tokens: None,
-            stream: None,
-            top_p: None,
-            stop: None,
             ..Default::default()
         };
-
         assert!(router.chat(&req).await.is_err());
     }
 
     #[test]
     fn test_router_models_aggregates() {
-        let config = LlmConfig::default();
-        let mut router = LlmRouter::new(&config);
+        let mut router = LlmRouter::new();
         router.register_provider("a", Arc::new(MockProvider { name: "a".into() }));
         router.register_provider("b", Arc::new(MockProvider { name: "b".into() }));
 
         let models = router.models();
         assert_eq!(models.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_set_agent_model_repoints_to_cheaper_model() {
+        // Budget degradation scenario: re-point an agent at a cheaper model
+        // without rebuilding the router.
+        let mut router = LlmRouter::new();
+        router.register_provider(
+            "openai|key|",
+            Arc::new(MockProvider {
+                name: "openai".into(),
+            }),
+        );
+        router.bind_agent("atlas", "openai|key|", "gpt-4o");
+
+        assert!(router.set_agent_model("atlas", "gpt-4o-mini"));
+        assert_eq!(
+            router.resolve_agent_model("atlas").as_deref(),
+            Some("gpt-4o-mini")
+        );
+
+        // set_agent_model on an unknown agent returns false (no binding).
+        assert!(!router.set_agent_model("ghost", "gpt-4o-mini"));
     }
 }

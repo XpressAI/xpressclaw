@@ -61,7 +61,9 @@ fn agent_json(
             "responsibilities": c.responsibilities,
             "avatar": c.avatar,
             "role": c.role,
-            "model": c.model,
+            // For backward compat with frontend code that reads `model` at
+            // the top level — same value as `llm.model`.
+            "model": c.effective_model(),
             "llm": c.llm,
             "tools": c.tools,
             "skills": c.skills,
@@ -290,11 +292,20 @@ async fn update_agent_config(
     if let Some(role) = req.role {
         agent.role = role;
     }
+    // Model lives on llm.model now. If the request supplies a top-level
+    // `model`, write it into llm.model — creating the AgentLlmConfig if
+    // missing, so the field never gets silently dropped.
     if let Some(model) = req.model {
-        agent.model = if model.is_empty() { None } else { Some(model) };
+        let normalized = if model.is_empty() { None } else { Some(model) };
+        let llm = agent.llm.get_or_insert_with(AgentLlmConfig::default);
+        llm.model = normalized;
+        // Drop the legacy top-level field if it was populated by an old YAML.
+        agent.model = None;
     }
     if let Some(llm) = req.llm {
-        // Empty provider means clear the override
+        // Empty provider means clear the per-agent config entirely (the agent
+        // will then have no binding and the router will return a clear error
+        // rather than silently routing somewhere).
         if llm.provider.as_deref().is_some_and(|p| !p.is_empty()) {
             agent.llm = Some(llm);
         } else {
@@ -352,9 +363,14 @@ async fn update_agent_config(
         .save(&state.config_path)
         .map_err(internal_error)?;
 
-    // Reload config into AppState (keep existing LLM router)
+    // Rebuild the LLM router so changes to the agent's llm config take
+    // effect immediately. Reusing the old router would silently keep the
+    // pre-edit binding live until the next server restart.
     let new_config = std::sync::Arc::new(new_config);
-    state.apply_config(new_config.clone(), state.llm_router());
+    let new_router = std::sync::Arc::new(
+        xpressclaw_core::llm::router::LlmRouter::build_from_config(&new_config),
+    );
+    state.apply_config(new_config.clone(), Some(new_router));
 
     // Find the updated agent config to return
     let updated = new_config
@@ -373,10 +389,11 @@ async fn update_agent_config(
             "responsibilities": updated.responsibilities,
             "avatar": updated.avatar,
             "role": updated.role,
-            "model": updated.model,
+            "model": updated.effective_model(),
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
-                "api_key": l.api_key,
+                "model": l.model,
+                "has_api_key": l.api_key.is_some(),
                 "base_url": l.base_url,
             })),
             "tools": updated.tools,

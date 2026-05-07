@@ -138,16 +138,12 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             }
             let agent_cfg = ctx.config.agents.iter().find(|a| a.name == *agent_id);
 
-            let model = agent_cfg
-                .and_then(|c| c.model.as_deref())
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    ctx.llm_router
-                        .models()
-                        .first()
-                        .map(|m| m.id.clone())
-                        .unwrap_or_else(|| "local".to_string())
-                });
+            // Use the agent's logical name (its agent_id) as the model. The
+            // LlmRouter resolves it to the real provider+model. Falling back
+            // to the agent_id if the agent has no llm config means the router
+            // will return a clear error rather than silently routing to some
+            // arbitrary provider.
+            let model = agent_id.clone();
 
             let role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
                 agent_cfg
