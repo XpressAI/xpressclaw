@@ -33,7 +33,6 @@ pub fn routes() -> Router<AppState> {
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
         .route("/add-agent", post(add_agent))
-        .route("/download-status", get(download_status))
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
@@ -306,12 +305,13 @@ struct LlmSetup {
     provider: String,
     api_key: Option<String>,
     base_url: Option<String>,
+    /// Ollama-tag-style model name (e.g. "qwen3.5:4b") used when
+    /// `provider == "ollama"`. The reconciler will pull it from the agent's
+    /// Ollama instance in the background after setup completes.
     local_model: Option<String>,
+    /// Base URL for the Ollama instance when `provider == "ollama"`.
+    /// Defaults to http://localhost:11434.
     local_base_url: Option<String>,
-    /// If true, download the GGUF model and use embedded llama.cpp.
-    /// Set when Ollama is not available.
-    #[serde(default)]
-    use_embedded: bool,
 }
 
 #[derive(Deserialize)]
@@ -330,59 +330,14 @@ struct AgentSetup {
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
-/// Return current GGUF download progress.
-async fn download_status(State(state): State<AppState>) -> Json<Value> {
-    #[cfg(feature = "local-llm")]
-    {
-        let dp = state.download_progress.read().unwrap().clone();
-        Json(json!(dp))
-    }
-    #[cfg(not(feature = "local-llm"))]
-    {
-        let _ = state;
-        Json(json!({ "status": "Idle" }))
-    }
-}
-
 /// Save the setup configuration and mark setup as complete.
 async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let is_local = req.llm.provider == "local" || req.llm.provider == "ollama";
-    #[allow(unused_variables)]
-    let needs_download = is_local && req.llm.use_embedded;
-
-    // Resolve GGUF source if needed (for config, even before download completes)
-    #[cfg(feature = "local-llm")]
-    let (gguf_repo, gguf_file) = if needs_download {
-        let model_name = req
-            .llm
-            .local_model
-            .as_deref()
-            .unwrap_or(xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_FILE);
-        let (r, f) = resolve_gguf_source(model_name);
-        (r.to_string(), f.to_string())
-    } else {
-        (String::new(), String::new())
-    };
-
     // Global LLM config no longer holds provider/model/key — those moved
     // onto each agent. Only `custom_pricing` lives here.
     let llm = LlmConfig::default();
-
-    // Resolve the GGUF path now if the model is already cached, so we can
-    // bake it into each agent's llm.model_path immediately. If it isn't
-    // cached, the background download below updates each agent later.
-    #[cfg(feature = "local-llm")]
-    let cached_gguf_path: Option<String> = if needs_download {
-        use xpressclaw_core::llm::llamacpp::is_gguf_cached;
-        is_gguf_cached(&gguf_repo, &gguf_file).map(|p| p.to_string_lossy().to_string())
-    } else {
-        None
-    };
-    #[cfg(not(feature = "local-llm"))]
-    let cached_gguf_path: Option<String> = None;
 
     // Agents
     let presets = builtin_presets();
@@ -451,7 +406,6 @@ async fn complete_setup(
                             model,
                             api_key: req.llm.api_key.clone(),
                             base_url,
-                            model_path: cached_gguf_path.clone(),
                         })
                     }
                 };
@@ -557,70 +511,9 @@ async fn complete_setup(
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
 
-    // Handle embedded model download if needed.
-    // For provider=local agents, we need a `model_path` pointing at a GGUF
-    // file. If the model isn't cached, download it in the background and
-    // patch the path into every local agent's llm.model_path on completion.
-    #[cfg(feature = "local-llm")]
-    if needs_download && cached_gguf_path.is_none() {
-        use xpressclaw_core::llm::llamacpp::{download_gguf_with_progress, DownloadStatus};
-
-        // Not cached — spawn background download with progress tracking
-        let progress = state.download_progress.clone();
-        let state_clone = state.clone();
-        let config_path = state.config_path.clone();
-
-        {
-            let mut dp = progress.write().unwrap();
-            dp.status = DownloadStatus::Downloading;
-            dp.filename = gguf_file.clone();
-        }
-
-        tokio::task::spawn_blocking(move || {
-            match download_gguf_with_progress(&gguf_repo, &gguf_file, progress.clone()) {
-                Ok(path) => {
-                    info!(path = %path.display(), "GGUF download complete");
-
-                    // Patch the path into every agent that uses provider=local.
-                    let old_config = state_clone.config();
-                    let path_str = path.to_string_lossy().to_string();
-                    let mut new_agents = old_config.agents.clone();
-                    for agent in &mut new_agents {
-                        if let Some(ref mut llm) = agent.llm {
-                            if llm.provider.as_deref() == Some("local") {
-                                llm.model_path = Some(path_str.clone());
-                            }
-                        }
-                    }
-
-                    let new_config = Config {
-                        llm: old_config.llm.clone(),
-                        agents: new_agents,
-                        mcp_servers: old_config.mcp_servers.clone(),
-                        system: old_config.system.clone(),
-                        ..Default::default()
-                    };
-                    let _ = new_config.save(&config_path);
-
-                    let new_config = Arc::new(new_config);
-                    let router = LlmRouter::build_from_config(&new_config);
-                    state_clone.apply_config(new_config, Some(Arc::new(router)));
-                }
-                Err(e) => {
-                    warn!(error = %e, "GGUF download failed");
-                    let mut dp = progress.write().unwrap();
-                    dp.status = DownloadStatus::Error;
-                    dp.error = Some(e.to_string());
-                }
-            }
-        });
-
-        return Ok(Json(json!({
-            "success": true,
-            "downloading": true,
-            "config_path": state.config_path.display().to_string()
-        })));
-    }
+    // Any agent using provider=ollama will have its model pulled by the
+    // background reconciler (see agents::reconciler::reconcile_models). No
+    // synchronous download here.
 
     Ok(Json(json!({
         "success": true,
@@ -661,7 +554,6 @@ async fn add_agent(
         model: req.model.clone().or_else(|| Some("qwen3.5:latest".into())),
         api_key: None,
         base_url: Some("http://localhost:11434".into()),
-        model_path: None,
     });
 
     // Default skills for new agents
@@ -759,62 +651,6 @@ async fn add_agent(
         "success": true,
         "agent": agent_config.name,
     })))
-}
-
-/// Map a model name from the setup UI to a HuggingFace GGUF repo and filename.
-///
-/// The setup wizard shows model names like "qwen3.5:4b" or "gemma4:e4b"
-/// (Ollama-style). This maps them to the corresponding HuggingFace GGUF repo/file.
-#[cfg(feature = "local-llm")]
-fn resolve_gguf_source(model_name: &str) -> (&str, &str) {
-    let name = model_name.to_lowercase();
-    match name.as_str() {
-        // --- Gemma 4 ---
-        s if s.contains("gemma") && s.contains("e2b") => (
-            "unsloth/gemma-4-E2B-it-GGUF",
-            "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && s.contains("e4b") => (
-            "unsloth/gemma-4-E4B-it-GGUF",
-            "gemma-4-E4B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && (s.contains("26b") || s.contains("a4b")) => (
-            "unsloth/gemma-4-26B-A4B-it-GGUF",
-            "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("gemma") && s.contains("31b") => (
-            "unsloth/gemma-4-31B-it-GGUF",
-            "gemma-4-31B-it-UD-Q4_K_XL.gguf",
-        ),
-        // --- Qwen 3.5 Dense ---
-        s if s.contains("0.8") => ("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-UD-Q4_K_XL.gguf"),
-        s if s.contains("2b") && !s.contains("12") && !s.contains("122") => {
-            ("unsloth/Qwen3.5-2B-GGUF", "Qwen3.5-2B-UD-Q4_K_XL.gguf")
-        }
-        s if s.contains("4b") => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
-        s if s.contains("9b") => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-UD-Q4_K_XL.gguf"),
-        s if s.contains("27b") => ("unsloth/Qwen3.5-27B-GGUF", "Qwen3.5-27B-UD-Q4_K_XL.gguf"),
-        // Qwen 3.5 MoE
-        s if s.contains("35b") || s.contains("a3b") => (
-            "unsloth/Qwen3.5-35B-A3B-GGUF",
-            "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("122b") || s.contains("a10b") => (
-            "unsloth/Qwen3.5-122B-A10B-GGUF",
-            "Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf",
-        ),
-        s if s.contains("397b") || s.contains("a17b") => (
-            "unsloth/Qwen3.5-397B-A17B-GGUF",
-            "Qwen3.5-397B-A17B-UD-Q4_K_XL.gguf",
-        ),
-        // If it's already a .gguf filename, use the default repo
-        s if s.ends_with(".gguf") => (
-            xpressclaw_core::llm::llamacpp::DEFAULT_GGUF_REPO,
-            model_name,
-        ),
-        // Default: Qwen 3.5 4B
-        _ => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
-    }
 }
 
 // ---------------------------------------------------------------------------

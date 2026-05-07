@@ -209,21 +209,22 @@ impl Default for HooksConfig {
 /// API key, and base URL it uses. There is no global LLM config — the router
 /// is built from the union of agents' declared configs (deduplicated by
 /// provider/key/base_url).
+///
+/// Supported providers: "openai", "anthropic", "ollama". For local inference
+/// run Ollama (or another OpenAI-compatible HTTP server like vLLM /
+/// llama-server) and set `provider: ollama` with the model tag and base_url.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentLlmConfig {
-    /// Provider name: "openai", "anthropic", "ollama", or "local".
-    /// "local" means the embedded llama.cpp provider (requires `model_path`).
-    /// "ollama" means an HTTP proxy to Ollama/vLLM/llama-server (requires `base_url`).
+    /// Provider name: "openai", "anthropic", or "ollama".
     pub provider: Option<String>,
-    /// Real model name passed to the provider (e.g. "gpt-4o", "claude-sonnet-4-20250514", "qwen3.5:latest").
+    /// Real model name passed to the provider (e.g. "gpt-4o",
+    /// "claude-sonnet-4-20250514", "qwen3.5:latest").
     pub model: Option<String>,
     /// API key for this agent.
     pub api_key: Option<String>,
     /// Base URL for this agent (e.g. for Ollama or OpenAI-compatible proxies).
     pub base_url: Option<String>,
-    /// Path to a local GGUF model file (only used when provider == "local").
-    pub model_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

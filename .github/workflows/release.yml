@@ -88,7 +88,6 @@ jobs:
             -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
           security list-keychain -d user -s $KEYCHAIN_PATH login.keychain-db
 
-      # Pre-warm cargo git cache for llama-cpp-rs submodule.
       - name: Fetch Cargo dependencies
         run: cargo fetch
 

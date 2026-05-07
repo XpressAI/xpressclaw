@@ -1,7 +1,16 @@
 # ADR-011: Default Local Model (Qwen3-8B)
 
 ## Status
-Accepted
+Superseded by ADR-023 (Ollama-only Local Inference)
+
+> **Note:** This ADR proposed two paths for local inference — Ollama and
+> embedded llama.cpp (with GGUF download, hardware-specific build flags
+> like `metal`/`cuda`, and the `local-llm` crate feature). ADR-023 retires
+> the embedded path entirely. Ollama is now the only supported local
+> backend; the `provider: local` agent option, the `local-llm`/`metal`/`cuda`
+> Cargo features, the `llama-cpp-2`/`hf-hub` dependencies, and the GGUF
+> download flow have been removed. The Qwen3-series default model choice
+> survives — it's now pulled by Ollama via `provider: ollama`.
 
 ## Context
 

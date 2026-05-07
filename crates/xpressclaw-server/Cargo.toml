@@ -6,14 +6,8 @@ license.workspace = true
 authors.workspace = true
 description = "Axum REST API server for xpressclaw"
 
-[features]
-default = ["local-llm"]
-local-llm = ["xpressclaw-core/local-llm"]
-cuda = ["xpressclaw-core/cuda"]
-metal = ["xpressclaw-core/metal"]
-
 [dependencies]
-xpressclaw-core = { path = "../xpressclaw-core", default-features = false }
+xpressclaw-core = { path = "../xpressclaw-core" }
 reqwest = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"

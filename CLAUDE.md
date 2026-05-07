@@ -84,7 +84,7 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 - LangChain
 - CrewAI
 - Xaibo (our framework)
-- Local models via Qwen3-8B (default for zero-config start)
+- Local models via Ollama (Qwen3 series by default for zero-config start)
 
 ### Key Subsystems
 
@@ -108,7 +108,7 @@ XpressAI is a runtime, not another agent framework. It runs agents built with:
 - **Web Framework**: Axum + SvelteKit (static SPA embedded via rust-embed)
 - **Desktop**: Tauri v2 with system tray
 - **Agent SDK**: claude-agent-sdk (via containers)
-- **Local Model**: Qwen3-8B via llama-cpp-2 or Ollama
+- **Local Model**: Qwen3-series via Ollama (the embedded llama.cpp path was removed — see ADR-023)
 
 ## Project Structure
 
@@ -152,7 +152,7 @@ See the top of this file. Read notes first, write notes after every commit. Non-
 ## Key Design Principles
 
 1. **Zero Config Start** - `xpressai init && xpressai up` should just work
-2. **Cloud Optional** - We default to the Claude Agent SDK but also allow local models (like Qwen3-8B by default) when needed for privacy/security.
+2. **Cloud Optional** - We default to the Claude Agent SDK but also allow local models via Ollama when needed for privacy/security.
 3. **Safety by Default** - Containers, budgets, tool permissions
 4. **Observable** - Always know what agents are doing
 5. **Framework Agnostic** - Run any agent backend through a common interface
