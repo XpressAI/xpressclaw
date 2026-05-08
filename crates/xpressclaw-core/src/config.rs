@@ -176,33 +176,16 @@ pub struct WakeOnConfig {
     pub condition: Option<String>,
 }
 
-/// Internal hook configuration. Always includes memory hooks.
-/// Deserialization is skipped so YAML values are ignored — the
-/// defaults always apply. Serialization is kept so the API can
-/// report which hooks are active.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-agent message hooks. Empty by default — memory recall/remember
+/// were force-enabled in earlier iterations but small models choked on
+/// the extra sub-agent calls (slow + confusing). Power users can still
+/// opt in via YAML by setting `before_message: [memory_recall]` and/or
+/// `after_message: [memory_remember]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HooksConfig {
-    #[serde(skip_deserializing, default = "default_before_hooks")]
     pub before_message: Vec<String>,
-    #[serde(skip_deserializing, default = "default_after_hooks")]
     pub after_message: Vec<String>,
-}
-
-fn default_before_hooks() -> Vec<String> {
-    vec!["memory_recall".to_string()]
-}
-
-fn default_after_hooks() -> Vec<String> {
-    vec!["memory_remember".to_string()]
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self {
-            before_message: vec!["memory_recall".to_string()],
-            after_message: vec!["memory_remember".to_string()],
-        }
-    }
 }
 
 /// Per-agent LLM configuration. Each agent declares the model, provider,
