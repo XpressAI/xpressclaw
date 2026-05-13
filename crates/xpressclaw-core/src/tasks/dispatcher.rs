@@ -23,11 +23,10 @@ use crate::activity::ActivityManager;
 use crate::agents::harness::HarnessClient;
 use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
-use crate::config::HooksConfig;
+
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::DockerManager;
-use crate::memory::hooks::{self, MemoryHooks};
 use crate::tasks::board::{Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
@@ -75,7 +74,6 @@ struct Context {
     current_prompt: String,
     last_response: String,
     subtasks: Vec<Task>,
-    hooks: HooksConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,8 +199,6 @@ async fn load_task(
         "loaded task for execution"
     );
 
-    let agent_hooks = agent_cfg.map(|a| a.hooks.clone()).unwrap_or_default();
-
     *ctx = Some(Context {
         task: board.get(task_id).unwrap_or(task),
         agent_id: agent_id.to_string(),
@@ -213,7 +209,6 @@ async fn load_task(
         current_prompt: String::new(),
         last_response: String::new(),
         subtasks,
-        hooks: agent_hooks,
     });
 
     State::BuildPrompt
@@ -345,7 +340,7 @@ fn build_prompt(db: &Arc<Database>, ctx: &mut Context) -> State {
     State::CallAgent
 }
 
-async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+async fn call_agent(db: &Arc<Database>, _config: &Config, ctx: &mut Context) -> State {
     use futures_util::StreamExt;
 
     let harness = HarnessClient::new(ctx.harness_port);
@@ -356,32 +351,6 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
         agent_id = ctx.agent_id,
         "calling agent harness"
     );
-
-    // Memory recall hook: first turn only, if agent has memories.
-    if ctx.turn == 0 && hooks::has_recall_hook(&ctx.hooks) {
-        let mem_hooks = MemoryHooks::new(db.clone(), &config.memory.eviction);
-        if let Some(recollection) = mem_hooks
-            .recall(
-                &ctx.agent_id,
-                ctx.task.description.as_deref().unwrap_or(&ctx.task.title),
-                ctx.harness_port,
-            )
-            .await
-        {
-            // Save recollection as a task message (visible in task UI)
-            let conv = TaskConversation::new(db.clone());
-            let _ = conv.add_message(
-                &ctx.task.id,
-                "system",
-                &format!("*Recollection:* {recollection}"),
-            );
-            // Prepend to the prompt so the agent sees it this turn
-            ctx.current_prompt = format!(
-                "Memory recollection:\n{recollection}\n\n{}",
-                ctx.current_prompt
-            );
-        }
-    }
 
     let conv_id = ctx.task.conversation_id.as_deref().unwrap_or(&ctx.task.id);
 
@@ -450,23 +419,11 @@ async fn call_agent(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> S
     }
 }
 
-fn process_response(db: &Arc<Database>, config: &Config, ctx: &mut Context) -> State {
+fn process_response(_db: &Arc<Database>, _config: &Config, ctx: &mut Context) -> State {
     // Message is already saved incrementally by call_agent's streaming loop.
     ctx.turn += 1;
 
-    // Async memory remember hook — runs in background, doesn't block
-    if hooks::has_remember_hook(&ctx.hooks) {
-        let db2 = db.clone();
-        let eviction = config.memory.eviction.clone();
-        let aid = ctx.agent_id.clone();
-        let prompt = ctx.current_prompt.clone();
-        let resp = ctx.last_response.clone();
-        let hp = ctx.harness_port;
-        tokio::spawn(async move {
-            let mem_hooks = MemoryHooks::new(db2, &eviction);
-            mem_hooks.remember(&aid, &prompt, &resp, hp).await;
-        });
-    }
+    // (Memory hooks removed — agents can use search_memory / save_memory tools directly)
 
     debug!(
         task_id = ctx.task.id,

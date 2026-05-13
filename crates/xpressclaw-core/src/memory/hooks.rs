@@ -20,7 +20,6 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::agents::harness::HarnessClient;
-use crate::config::HooksConfig;
 use crate::db::Database;
 use crate::memory::manager::MemoryManager;
 use crate::memory::zettelkasten::CreateMemory;
@@ -318,22 +317,6 @@ impl MemoryHooks {
             }
         }
     }
-}
-
-/// Check if the recall hook is configured.
-pub fn has_recall_hook(hooks: &HooksConfig) -> bool {
-    hooks
-        .before_message
-        .iter()
-        .any(|h| h == "memory_recall" || h == "memory:recall")
-}
-
-/// Check if the remember hook is configured.
-pub fn has_remember_hook(hooks: &HooksConfig) -> bool {
-    hooks
-        .after_message
-        .iter()
-        .any(|h| h == "memory_remember" || h == "memory:remember")
 }
 
 fn truncate(s: &str, max: usize) -> &str {
