@@ -176,11 +176,14 @@ pub struct WakeOnConfig {
     pub condition: Option<String>,
 }
 
-/// Internal hook configuration. Always includes memory hooks.
-/// Deserialization is skipped so YAML values are ignored — the
-/// defaults always apply. Serialization is kept so the API can
-/// report which hooks are active.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Hook configuration for pre/post message processing.
+///
+/// Hooks allow agents to configure custom processing steps that run
+/// before or after each message (e.g. linting, secret obfuscation,
+/// access checks). Deserialization is skipped so YAML values are
+/// ignored — defaults always apply. Serialization is kept so the
+/// API can report which hooks are active.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HooksConfig {
     #[serde(skip_deserializing, default = "default_before_hooks")]
     pub before_message: Vec<String>,
@@ -189,20 +192,11 @@ pub struct HooksConfig {
 }
 
 fn default_before_hooks() -> Vec<String> {
-    vec!["memory_recall".to_string()]
+    Vec::new()
 }
 
 fn default_after_hooks() -> Vec<String> {
-    vec!["memory_remember".to_string()]
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self {
-            before_message: vec!["memory_recall".to_string()],
-            after_message: vec!["memory_remember".to_string()],
-        }
-    }
+    Vec::new()
 }
 
 /// Per-agent LLM configuration. Each agent declares the model, provider,

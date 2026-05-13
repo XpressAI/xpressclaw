@@ -709,11 +709,7 @@ mod tests {
                             "wake_on": [
                                 {"schedule": "every 30 minutes", "event": null, "condition": null},
                                 {"schedule": null, "event": "user.message", "condition": null}
-                            ],
-                            "hooks": {
-                                "before_message": ["memory_recall"],
-                                "after_message": ["memory_remember"]
-                            }
+                            ]
                         })
                         .to_string(),
                     ))
@@ -730,15 +726,15 @@ mod tests {
         assert_eq!(wake_on[1]["event"], "user.message");
 
         let hooks = &body["agent"]["hooks"];
-        assert_eq!(hooks["before_message"][0], "memory_recall");
-        assert_eq!(hooks["after_message"][0], "memory_remember");
+        assert!(hooks["before_message"].as_array().unwrap().is_empty());
+        assert!(hooks["after_message"].as_array().unwrap().is_empty());
 
         // Verify YAML persistence
         let config = Config::load(&config_path).unwrap();
         let agent = config.agents.iter().find(|a| a.name == "atlas").unwrap();
         assert_eq!(agent.wake_on.len(), 2);
-        assert_eq!(agent.hooks.before_message, vec!["memory_recall"]);
-        assert_eq!(agent.hooks.after_message, vec!["memory_remember"]);
+        assert!(agent.hooks.before_message.is_empty());
+        assert!(agent.hooks.after_message.is_empty());
 
         let _ = std::fs::remove_file(&config_path);
     }
