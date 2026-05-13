@@ -1,0 +1,26 @@
+Why /api/health and not /api/agents:
+- /api/health is a stateless 200 OK (routes/health.rs) — no DB, no Docker
+- /api/agents is a real handler that calls AgentRegistry.list() and
+  observe_with(docker, ...) per agent. Under load it competes with the
+  same tokio runtime as streaming sessions, harness calls, reconciler
+- A liveness probe should not require backend state to answer
+
+Why two-failure threshold:
+- One 5s poll missing its 3s timeout is not a real outage signal
+- Two consecutive failures = ~10s of unresponsiveness, which is a
+  reasonable lower bound for "actually broken"
+- Kept the auto-reload-on-recover behavior unchanged — once we've
+  decided the server was gone, full reload is still right because
+  in-flight SSE/streams will be stale
+
+Why 8s timeout, not e.g. 15s:
+- 5s poll interval; a timeout >= 2x interval lets polls overlap, which
+  could mask state. 8s gives a real handler enough headroom for one
+  garbage-collection / contention spike without overlapping the next poll
+
+Rejected alternatives:
+- Move the health check to a Tauri command (rust-side fetch). Heavier;
+  doesn't help users running in browser; would still hit the same axum
+  endpoint. The frontend-only fix is enough.
+- Disable the modal entirely in Tauri. Tauri restarts happen too; users
+  still need the "server gone" signal.
