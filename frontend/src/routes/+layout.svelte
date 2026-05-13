@@ -97,15 +97,20 @@
 	}
 
 	// Connection health monitor — detect when server goes away and
-	// auto-reload when it comes back. Prevents the app from being
-	// stuck in a "loading" state forever after a server restart.
+	// auto-reload when it comes back. Requires two consecutive poll
+	// failures before showing the modal so a single hiccup doesn't
+	// flash it (Tauri's WebKitGTK webview is especially flaky here).
 	let serverConnected = $state(true);
 	let wasDisconnected = false;
+	let consecutiveFailures = 0;
+	const FAILURES_BEFORE_DISCONNECT = 2;
+	const HEALTH_TIMEOUT_MS = 8000;
 
 	async function checkConnection() {
 		try {
-			const resp = await fetch('/api/agents', { signal: AbortSignal.timeout(3000) });
+			const resp = await fetch('/api/health', { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
 			if (resp.ok) {
+				consecutiveFailures = 0;
 				if (wasDisconnected) {
 					// Server is back — reload the page to reset all state
 					wasDisconnected = false;
@@ -114,11 +119,13 @@
 					return;
 				}
 				serverConnected = true;
-			} else {
-				serverConnected = false;
-				wasDisconnected = true;
+				return;
 			}
 		} catch {
+			// fall through to failure handling
+		}
+		consecutiveFailures += 1;
+		if (consecutiveFailures >= FAILURES_BEFORE_DISCONNECT) {
 			serverConnected = false;
 			wasDisconnected = true;
 		}
