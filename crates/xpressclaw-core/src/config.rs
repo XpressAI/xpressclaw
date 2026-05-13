@@ -183,7 +183,7 @@ pub struct WakeOnConfig {
 /// access checks). Deserialization is skipped so YAML values are
 /// ignored — defaults always apply. Serialization is kept so the
 /// API can report which hooks are active.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HooksConfig {
     #[serde(skip_deserializing, default = "default_before_hooks")]
     pub before_message: Vec<String>,
@@ -197,15 +197,6 @@ fn default_before_hooks() -> Vec<String> {
 
 fn default_after_hooks() -> Vec<String> {
     Vec::new()
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self {
-            before_message: Vec::new(),
-            after_message: Vec::new(),
-        }
-    }
 }
 
 /// Per-agent LLM configuration. Each agent declares the model, provider,
