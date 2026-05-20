@@ -47,6 +47,10 @@ static BUILTIN_YAML: &[(&str, &str)] = &[
         "scheduler",
         include_str!("../../../../templates/agents/scheduler/agent.yaml"),
     ),
+    (
+        "android-pilot",
+        include_str!("../../../../templates/agents/android-pilot/agent.yaml"),
+    ),
 ];
 
 /// Load all built-in presets.

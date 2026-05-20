@@ -7,6 +7,8 @@ use crate::error::Result;
 /// Known harness images.
 pub const HARNESS_BASE: &str = "ghcr.io/xpressai/xpressclaw-harness-base:latest";
 pub const HARNESS_CLAUDE_SDK: &str = "ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest";
+pub const HARNESS_CLAUDE_SDK_ANDROID: &str =
+    "ghcr.io/xpressai/xpressclaw-harness-claude-sdk-android:latest";
 pub const HARNESS_XAIBO: &str = "ghcr.io/xpressai/xpressclaw-harness-xaibo:latest";
 pub const HARNESS_LANGCHAIN: &str = "ghcr.io/xpressai/xpressclaw-harness-langchain:latest";
 
@@ -23,6 +25,35 @@ pub fn image_for_backend(backend: &str) -> &'static str {
     }
 }
 
+/// Returns true if the MCP server config invokes scrcpy-mcp (Android control).
+fn uses_scrcpy_mcp(server: &crate::config::McpServerConfig) -> bool {
+    server.args.iter().any(|a| a.contains("scrcpy-mcp"))
+}
+
+/// Resolve the harness image for an agent. If any of the agent's MCP
+/// servers uses scrcpy-mcp, select the Android-enabled variant of the
+/// claude-sdk image (which has adb + scrcpy baked in). Otherwise fall
+/// back to the regular per-backend lookup.
+///
+/// This is the implicit opt-in mechanism: enabling the scrcpy MCP server
+/// in an agent's template (via the `android-pilot` preset) automatically
+/// routes that agent to the heavier image. Users who never enable Android
+/// pay zero size cost.
+pub fn image_for_agent(
+    backend: &str,
+    mcp_servers: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
+) -> &'static str {
+    let base = image_for_backend(backend);
+    if base == HARNESS_CLAUDE_SDK {
+        if let Some(servers) = mcp_servers {
+            if servers.values().any(uses_scrcpy_mcp) {
+                return HARNESS_CLAUDE_SDK_ANDROID;
+            }
+        }
+    }
+    base
+}
+
 /// Build a container spec for an agent based on its configuration.
 ///
 /// The harness inside the container always calls back to the server's `/v1/`
@@ -37,7 +68,7 @@ pub fn build_container_spec_with_mcp(
     server_port: u16,
     mcp_servers: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
 ) -> ContainerSpec {
-    let image = image_for_backend(&agent.backend);
+    let image = image_for_agent(&agent.backend, mcp_servers);
 
     let mut env = vec![
         format!("AGENT_ID={}", agent.name),
@@ -204,6 +235,56 @@ mod tests {
     fn test_image_for_backend_fallback() {
         assert_eq!(image_for_backend("anything-else"), HARNESS_CLAUDE_SDK);
         assert_eq!(image_for_backend(""), HARNESS_CLAUDE_SDK);
+    }
+
+    #[test]
+    fn test_image_for_agent_without_scrcpy_stays_default() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "shell".to_string(),
+            crate::config::McpServerConfig {
+                command: Some("npx".to_string()),
+                args: vec!["-y".into(), "@mako10k/mcp-shell-server".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            image_for_agent("claude-sdk", Some(&servers)),
+            HARNESS_CLAUDE_SDK
+        );
+    }
+
+    #[test]
+    fn test_image_for_agent_with_scrcpy_picks_android_variant() {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "scrcpy".to_string(),
+            crate::config::McpServerConfig {
+                command: Some("npx".to_string()),
+                args: vec!["-y".into(), "scrcpy-mcp".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            image_for_agent("claude-sdk", Some(&servers)),
+            HARNESS_CLAUDE_SDK_ANDROID
+        );
+    }
+
+    #[test]
+    fn test_image_for_agent_non_claude_backend_ignores_scrcpy() {
+        // The android variant is built on the claude-sdk harness; non-claude
+        // backends keep their own images even if they reference scrcpy-mcp.
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "scrcpy".to_string(),
+            crate::config::McpServerConfig {
+                command: Some("npx".to_string()),
+                args: vec!["-y".into(), "scrcpy-mcp".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(image_for_agent("xaibo", Some(&servers)), HARNESS_XAIBO);
     }
 
     #[test]

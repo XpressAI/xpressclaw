@@ -1,5 +1,6 @@
 use clap::Subcommand;
 
+mod android;
 mod budget;
 mod chat;
 mod client;
@@ -118,6 +119,12 @@ pub enum Command {
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
+
+    /// Android device control (install image, list devices, etc.)
+    Android {
+        #[command(subcommand)]
+        command: android::AndroidCommand,
+    },
 }
 
 pub async fn run(command: Command) -> anyhow::Result<()> {
@@ -136,5 +143,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
+        Command::Android { command } => android::run(command).await,
     }
 }

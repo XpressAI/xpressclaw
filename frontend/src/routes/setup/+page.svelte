@@ -79,7 +79,8 @@
 		brain: '&#x1f9e0;',
 		code: '&#x1f4bb;',
 		search: '&#x1f50d;',
-		calendar: '&#x1f4c5;'
+		calendar: '&#x1f4c5;',
+		smartphone: '&#x1f4f1;'
 	};
 
 	onMount(async () => {
