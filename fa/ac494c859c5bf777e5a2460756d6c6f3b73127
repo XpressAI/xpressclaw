@@ -1,0 +1,11 @@
+Phase 1+2 of agentic Android control. Why adb_client (pure Rust) over shelling adb or scrcpy-mcp: (1) no adb binary to install/bundle — Google's SDK license forbids redistributing adb/images, so bundling was off the table; (2) typed API; (3) it sidesteps scrcpy-mcp's vision-coordinate bug. We proved the bug live: eyeballing the Photos icon gave x~560, real center (via uiautomator) was 664 — element targeting via the accessibility tree is the fix, NOT model-emitted pixel coords. The android-pilot prompt that said 'coordinates come from what you see, never guess' IS the guess.
+
+Feature-gated (android, off by default) because adb_client drags in rustls/rsa/image — default ~12MB binary stays clean. Provider abstraction (ADR-024): managed emulator + BYO device share one control path (adb_client connects to emulator on :5555 or a real device); only provisioning differs.
+
+Branched fresh off main, NOT off fahreza/android-support, because the old scrcpy approach (commit ae5fbc5) was never merged to main — main had zero android code, so this branch carries only the new approach. ae5fbc5 stays on android-support as abandoned history.
+
+Spike artifacts (throwaway, outside repo): C:/Users/user/adb-spike (+ adb_client_ref clone). Dev/test was against an Android emulator (AVD xpressclaw_test) because the real test phone is Xiaomi/HyperOS, which blocks adb input injection unless 'USB debugging (Security settings)' is enabled (needs Mi account) — screencap works without it, tap does not.
+
+adb_client v3.2 API notes: ADBServer::default() -> get_device_by_name(serial); adb_client::tcp::ADBTcpDevice::new(SocketAddr) for direct/no-server; ADBDeviceExt::shell_command(&cmd, Some(&mut Vec<u8> as Write), None); framebuffer(&path) writes PNG.
+
+Next: Phase 3 = expose control to agents via our OWN MCP tool (find_element+tap), replacing scrcpy-mcp. Phase 5 = emulator lifecycle (android up/down/doctor via sdkmanager/avdmanager/emulator). NOT pushed yet.
