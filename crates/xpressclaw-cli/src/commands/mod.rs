@@ -1,5 +1,7 @@
 use clap::Subcommand;
 
+#[cfg(feature = "android")]
+mod android;
 mod budget;
 mod chat;
 mod client;
@@ -118,6 +120,22 @@ pub enum Command {
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
+
+    /// Control an Android device or emulator (over adb, no adb binary)
+    #[cfg(feature = "android")]
+    Android {
+        #[command(subcommand)]
+        command: android::AndroidCommand,
+
+        /// Device serial via the adb server
+        #[arg(long, global = true, default_value = "emulator-5554")]
+        serial: String,
+
+        /// Connect directly to a device's adbd over TCP (e.g. 127.0.0.1:5555),
+        /// bypassing the adb server
+        #[arg(long, global = true)]
+        tcp: Option<String>,
+    },
 }
 
 pub async fn run(command: Command) -> anyhow::Result<()> {
@@ -136,5 +154,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
+        #[cfg(feature = "android")]
+        Command::Android {
+            command,
+            serial,
+            tcp,
+        } => android::run(command, serial, tcp).await,
     }
 }

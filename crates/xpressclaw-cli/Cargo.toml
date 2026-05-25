@@ -23,3 +23,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = "2"
+
+[features]
+# `xpressclaw android ...` device-control commands. Enables the core android
+# module (adb_client). Off by default — see ADR-024.
+android = ["xpressclaw-core/android"]

@@ -37,6 +37,15 @@ async-native-tls = "0.5"
 async-std = { version = "1", features = ["default"] }
 base64 = "0.22"
 
+# Android device control — pure-Rust adb client. Optional: only pulled in
+# when the `android` feature is enabled (see ADR-024). Keeps the default
+# build free of its rustls/rsa/image dependency tree.
+adb_client = { version = "3.2", optional = true }
+
+[features]
+# Agentic Android device control (managed emulator or BYO device).
+android = ["dep:adb_client"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
