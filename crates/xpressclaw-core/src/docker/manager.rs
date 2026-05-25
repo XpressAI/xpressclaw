@@ -201,8 +201,12 @@ impl DockerManager {
             .volumes
             .iter()
             .map(|v| {
-                // Named volumes don't start with / or ~ (they're just names like "xpressclaw-workspace-dev")
-                let is_named_volume = !v.source.starts_with('/') && !v.source.starts_with('~');
+                // Docker volume names allow only [a-zA-Z0-9][a-zA-Z0-9_.-], so a separator,
+                // drive-letter colon (Windows C:\...), or leading ~ marks a host path → bind.
+                let is_named_volume = !v.source.contains('/')
+                    && !v.source.contains('\\')
+                    && !v.source.contains(':')
+                    && !v.source.starts_with('~');
                 Mount {
                     target: Some(v.target.clone()),
                     source: Some(v.source.clone()),
