@@ -166,6 +166,18 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
+    // Android device control — only when the runtime is built with the `android`
+    // feature. Proxies to the server's /v1/android/* endpoints (see ADR-024).
+    #[cfg(feature = "android")]
+    servers.insert(
+        "android".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("python3".to_string()),
+            args: vec!["-u".into(), "/app/mcp_android.py".into()],
+            ..Default::default()
+        },
+    );
     servers
 }
 

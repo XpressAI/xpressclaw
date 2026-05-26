@@ -12,6 +12,7 @@ COPY mcp_apps.py .
 COPY mcp_memory.py .
 COPY mcp_skills.py .
 COPY mcp_xpressclaw.py .
+COPY mcp_android.py .
 COPY run_mcp.sh .
 
 EXPOSE 8080
