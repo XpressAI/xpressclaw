@@ -303,6 +303,10 @@
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
 							<span>Workflows</span>
 						</a>
+						<a href="/android" class={linkClass(isActive('/android', $page.url.pathname))}>
+							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 10v6 M20 10v6 M7 9h10v8a1 1 0 0 1 -1 1h-8a1 1 0 0 1 -1 -1v-8a5 5 0 0 1 10 0 M8 3l1 2 M16 3l-1 2 M9 18v3 M15 18v3" /></svg>
+							<span>Android</span>
+						</a>
 					</div>
 
 				{:else if activeTab === 'settings'}

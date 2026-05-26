@@ -113,6 +113,25 @@ impl AndroidDevice {
         self.tap(x, y)?;
         Ok((x, y))
     }
+
+    /// Swipe from (x1,y1) to (x2,y2) over `ms` milliseconds.
+    pub fn swipe(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, ms: u32) -> Result<()> {
+        self.shell(&format!("input swipe {x1} {y1} {x2} {y2} {ms}"))?;
+        Ok(())
+    }
+
+    /// Type text. Spaces are sent as `%s` (the adb `input text` convention).
+    pub fn input_text(&mut self, text: &str) -> Result<()> {
+        let escaped = text.replace(' ', "%s");
+        self.shell(&format!("input text {escaped}"))?;
+        Ok(())
+    }
+
+    /// Send a key event — a keycode name (e.g. `KEYCODE_BACK`) or numeric code.
+    pub fn key_event(&mut self, key: &str) -> Result<()> {
+        self.shell(&format!("input keyevent {key}"))?;
+        Ok(())
+    }
 }
 
 /// Find the bounds of the first `<node>` whose `text` or `content-desc`

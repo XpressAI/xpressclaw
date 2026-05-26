@@ -11,11 +11,21 @@ use crate::state::AppState;
 
 /// Create the main Axum router with all routes.
 pub fn create_router(state: AppState) -> Router {
-    Router::new()
+    #[allow(unused_mut)]
+    let mut app = Router::new()
         .nest("/api", routes::api_routes())
         .nest("/v1", routes::llm::routes())
         .nest("/v1/tools", routes::tools_proxy_routes())
-        .nest("/apps", routes::app_proxy_routes())
+        .nest("/apps", routes::app_proxy_routes());
+
+    // Android device control (feature-gated): shared by the agent MCP shim and
+    // the human collaborative live view.
+    #[cfg(feature = "android")]
+    {
+        app = app.nest("/v1/android", routes::android_routes());
+    }
+
+    app
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())
