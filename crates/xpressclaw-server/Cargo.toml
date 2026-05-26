@@ -27,5 +27,10 @@ async-stream = "0.3"
 rust-embed = { workspace = true }
 open = { workspace = true }
 
+[features]
+# Android SDK preflight in the setup routes. Enables the core android module
+# (adb_client). Off by default — see ADR-024.
+android = ["xpressclaw-core/android"]
+
 [dev-dependencies]
 http-body-util = "0.1"

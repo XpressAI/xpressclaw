@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/start-docker", post(start_docker))
         .route("/system-info", get(system_info))
         .route("/check-ollama", get(check_ollama))
+        .route("/check-android-sdk", get(check_android_sdk))
         .route("/recommend-model", get(recommend_model))
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
@@ -184,6 +185,25 @@ async fn system_info() -> Json<Value> {
 async fn check_ollama() -> Json<Value> {
     let info = detect_ollama().await;
     Json(json!(info))
+}
+
+/// Check the Android SDK install for the managed-emulator path. Mirrors
+/// `check_docker` / `check_ollama`. Only meaningful when built with the
+/// `android` feature; otherwise reports `feature_enabled: false`.
+async fn check_android_sdk() -> Json<Value> {
+    #[cfg(feature = "android")]
+    {
+        let status = xpressclaw_core::android::sdk::detect();
+        Json(json!({
+            "feature_enabled": true,
+            "ready": status.ready(),
+            "sdk": status,
+        }))
+    }
+    #[cfg(not(feature = "android"))]
+    {
+        Json(json!({ "feature_enabled": false, "ready": false }))
+    }
 }
 
 /// Recommend a local model based on system hardware.
