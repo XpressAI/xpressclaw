@@ -34,6 +34,10 @@ pub enum AndroidCommand {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+
+    /// Check the Android SDK install (emulator, system images, AVDs) needed
+    /// for the managed-emulator path
+    Doctor,
 }
 
 pub async fn run(
@@ -41,6 +45,12 @@ pub async fn run(
     serial: String,
     tcp: Option<String>,
 ) -> anyhow::Result<()> {
+    // `doctor` inspects the local SDK install, not a device — no connection.
+    if let AndroidCommand::Doctor = command {
+        print_doctor();
+        return Ok(());
+    }
+
     // Connect: direct to adbd over TCP if --tcp was given (no adb server),
     // otherwise through the adb server by serial.
     let mut device = match tcp {
@@ -75,7 +85,63 @@ pub async fn run(
             let out = device.shell(&cmd)?;
             print!("{out}");
         }
+        AndroidCommand::Doctor => unreachable!("handled before connecting"),
     }
 
     Ok(())
+}
+
+/// Print an SDK preflight report for the managed-emulator path.
+fn print_doctor() {
+    let s = xpressclaw_core::android::sdk::detect();
+
+    println!("Android managed-emulator preflight\n");
+
+    let Some(root) = &s.sdk_root else {
+        println!("  [MISSING]  Android SDK not found");
+        println!("             Set ANDROID_HOME, or install via Android Studio / cmdline-tools.");
+        return;
+    };
+    println!("  [ok]       SDK root: {root}");
+
+    let mark = |b: bool| if b { "[ok]     " } else { "[MISSING]" };
+    println!("  {} emulator binary", mark(s.emulator));
+    println!(
+        "  {} cmdline-tools (sdkmanager/avdmanager)",
+        mark(s.cmdline_tools)
+    );
+    println!("  {} platform-tools (adb)", mark(s.platform_tools));
+
+    if s.system_images.is_empty() {
+        println!("  [MISSING]  system images");
+        println!("             e.g. sdkmanager \"system-images;android-36;google_apis;x86_64\"");
+    } else {
+        println!("  [ok]       system images ({}):", s.system_images.len());
+        for img in &s.system_images {
+            println!("                 {img}");
+        }
+    }
+
+    if s.avds.is_empty() {
+        println!("  [MISSING]  AVDs");
+        println!("             e.g. avdmanager create avd -n test \\");
+        println!("                    -k \"system-images;android-36;google_apis;x86_64\" -d pixel_6");
+    } else {
+        println!("  [ok]       AVDs ({}): {}", s.avds.len(), s.avds.join(", "));
+    }
+
+    match s.accel_ok {
+        Some(true) => println!("  [ok]       hardware acceleration available"),
+        Some(false) => {
+            println!("  [WARN]     hardware acceleration NOT available — emulator will be slow")
+        }
+        None => println!("  [?]        hardware acceleration: could not check"),
+    }
+
+    println!();
+    if s.ready() {
+        println!("Ready — a managed emulator can be booted.");
+    } else {
+        println!("Not ready — resolve the [MISSING] items above.");
+    }
 }

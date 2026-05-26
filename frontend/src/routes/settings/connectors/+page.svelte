@@ -29,7 +29,7 @@
 	let channelError = $state('');
 	let channelSaving = $state(false);
 
-	const connectorTypes = [
+	const connectorTypes: { id: string; label: string; icon: string; filled?: boolean; viewBox?: string }[] = [
 		{ id: 'webhook', label: 'Webhook', icon: 'M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418' },
 		{ id: 'telegram', label: 'Telegram', icon: 'M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5' },
 		{ id: 'file_watcher', label: 'File Watcher', icon: 'M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z' },
@@ -37,10 +37,19 @@
 		{ id: 'github', label: 'GitHub', icon: 'M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5' },
 		{ id: 'jira', label: 'Jira', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2' },
 		{ id: 'slack', label: 'Slack', icon: 'M5.25 8.25h15m-16.5 7.5h15m-1.8-13.5l-3.9 19.5m-2.1-19.5l-3.9 19.5' },
+		{ id: 'android', label: 'Android', filled: true, viewBox: '0 0 576 512', icon: 'M420.55,301.93a24,24,0,1,1,24-24,24,24,0,0,1-24,24m-265.1,0a24,24,0,1,1,24-24,24,24,0,0,1-24,24m273.7-144.48,47.94-83a10,10,0,1,0-17.27-10h0l-48.54,84.07a301.25,301.25,0,0,0-246.56,0L116.18,64.45a10,10,0,1,0-17.27,10h0l47.94,83C64.53,202.22,8.24,285.55,0,384H576c-8.24-98.45-64.54-181.78-146.85-226.55' },
 	];
 
 	function typeIcon(type: string): string {
 		return connectorTypes.find(t => t.id === type)?.icon ?? 'M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244';
+	}
+
+	function typeFilled(type: string): boolean {
+		return connectorTypes.find(t => t.id === type)?.filled ?? false;
+	}
+
+	function typeViewBox(type: string): string {
+		return connectorTypes.find(t => t.id === type)?.viewBox ?? '0 0 24 24';
 	}
 
 	function typeLabel(type: string): string {
@@ -242,7 +251,7 @@
 					<div class="flex items-center gap-3 p-4">
 						<!-- Type icon -->
 						<div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted">
-							<svg class="h-5 w-5 text-muted-foreground" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
+							<svg class="h-5 w-5 text-muted-foreground" fill={typeFilled(connector.connector_type) ? 'currentColor' : 'none'} stroke={typeFilled(connector.connector_type) ? 'none' : 'currentColor'} stroke-width="1.5" viewBox={typeViewBox(connector.connector_type)}>
 								<path stroke-linecap="round" stroke-linejoin="round" d={typeIcon(connector.connector_type)} />
 							</svg>
 						</div>
@@ -421,9 +430,11 @@
 							onclick={() => selectType(ct.id)}
 							class="flex flex-col items-center gap-2 rounded-lg border border-border p-4 hover:border-primary/50 hover:bg-accent/50 transition-colors text-center"
 						>
-							<svg class="h-6 w-6 text-muted-foreground" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24">
-								<path stroke-linecap="round" stroke-linejoin="round" d={ct.icon} />
-							</svg>
+							<div class="flex h-12 w-full justify-center {ct.filled ? 'items-end' : 'items-center'}">
+								<svg class={ct.filled ? 'h-10 w-10 text-muted-foreground' : 'h-6 w-6 text-muted-foreground'} fill={ct.filled ? 'currentColor' : 'none'} stroke={ct.filled ? 'none' : 'currentColor'} stroke-width="1.5" viewBox={ct.viewBox ?? '0 0 24 24'}>
+									<path stroke-linecap="round" stroke-linejoin="round" d={ct.icon} />
+								</svg>
+							</div>
 							<span class="text-xs font-medium">{ct.label}</span>
 						</button>
 					{/each}
@@ -510,6 +521,31 @@
 							/>
 							<span class="text-muted-foreground">Watch subdirectories recursively</span>
 						</label>
+					{:else if addForm.connector_type === 'android'}
+						<div class="space-y-3">
+							<div>
+								<label class="block text-xs font-medium text-muted-foreground mb-1.5">Device Serial</label>
+								<input
+									type="text"
+									placeholder="emulator-5554"
+									value={addForm.config.serial ?? ''}
+									oninput={(e) => { addForm.config = { ...addForm.config, serial: (e.target as HTMLInputElement).value }; }}
+									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring font-mono"
+								/>
+								<p class="text-xs text-muted-foreground mt-1">From <span class="font-mono">adb devices</span>. Leave blank for the default emulator (<span class="font-mono">emulator-5554</span>).</p>
+							</div>
+							<div>
+								<label class="block text-xs font-medium text-muted-foreground mb-1.5">Direct TCP Address (optional)</label>
+								<input
+									type="text"
+									placeholder="127.0.0.1:5555"
+									value={addForm.config.tcp ?? ''}
+									oninput={(e) => { addForm.config = { ...addForm.config, tcp: (e.target as HTMLInputElement).value }; }}
+									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring font-mono"
+								/>
+								<p class="text-xs text-muted-foreground mt-1">Connect straight to the device's adbd, bypassing the adb server. Overrides the serial; no adb binary required.</p>
+							</div>
+						</div>
 					{:else if addForm.connector_type === 'slack'}
 						<div>
 							<label class="block text-sm font-medium mb-1">Bot Token</label>

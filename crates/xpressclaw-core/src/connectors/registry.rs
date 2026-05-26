@@ -7,6 +7,8 @@ use tracing::{error, info, warn};
 use crate::db::Database;
 use crate::error::{Error, Result};
 
+#[cfg(feature = "android")]
+use super::android::AndroidConnector;
 use super::email::EmailConnector;
 use super::file_watcher::FileWatcherConnector;
 use super::github::GitHubConnector;
@@ -184,6 +186,8 @@ fn create_connector(connector_type: &str) -> Box<dyn Connector> {
         "github" => Box::new(GitHubConnector::new()),
         "jira" => Box::new(JiraConnector::new()),
         "slack" => Box::new(SlackConnector::new()),
+        #[cfg(feature = "android")]
+        "android" => Box::new(AndroidConnector::new()),
         _ => {
             warn!(
                 connector_type = connector_type,

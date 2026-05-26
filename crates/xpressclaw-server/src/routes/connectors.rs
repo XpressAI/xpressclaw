@@ -152,6 +152,9 @@ async fn test_connector(
                 && c.config.get("username").and_then(|v| v.as_str()).is_some()
                 && c.config.get("password").and_then(|v| v.as_str()).is_some()
         }
+        // Android config is optional (serial defaults to emulator-5554); the
+        // real device-reachability check happens in the connector's validate_config.
+        "android" => true,
         _ => true,
     };
 

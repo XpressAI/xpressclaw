@@ -1,3 +1,5 @@
+#[cfg(feature = "android")]
+pub mod android;
 pub mod deliver;
 pub mod email;
 pub mod file_watcher;

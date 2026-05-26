@@ -96,6 +96,17 @@ lack Google Play / Google login.
    surface initially; an embedded stream (scrcpy/noVNC) in the web UI is a
    follow-up. Logins persist via an AVD snapshot.
 
+6. **Surfaced in the Connectors grid as a "device-link" connector** (UX bend).
+   For discoverability the Android device appears as a tile in Settings →
+   Connectors alongside Telegram/Webhook/etc., even though control is *not* an
+   event source/sink. The `AndroidConnector` carries only the adb target
+   (serial/tcp); its `validate_config`/`health` probe device reachability via
+   `adb_client` (the analog of Telegram's `getMe`). It emits no events and
+   rejects `send` — tap/screenshot stay on the MCP/agent path. This bends the
+   connector-vs-control separation deliberately, for a familiar setup surface.
+   A CLI `xpressclaw android doctor` reports the managed-emulator SDK preflight
+   (emulator, system images, AVDs, accel) via `android::sdk::detect()`.
+
 ## Consequences
 
 ### Positive

@@ -10,6 +10,8 @@
 //! ([`AndroidDevice::find_element`]) rather than vision-derived pixel
 //! coordinates, which are unreliable (see ADR-024).
 
+pub mod sdk;
+
 use std::net::SocketAddr;
 
 use adb_client::{server::ADBServer, tcp::ADBTcpDevice, ADBDeviceExt};
