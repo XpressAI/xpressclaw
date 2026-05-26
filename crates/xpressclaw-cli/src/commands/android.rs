@@ -112,9 +112,10 @@ fn print_doctor() {
     );
     println!("  {} platform-tools (adb)", mark(s.platform_tools));
 
+    use xpressclaw_core::android::sdk::{DEFAULT_DEVICE_PROFILE, DEFAULT_SYSTEM_IMAGE};
     if s.system_images.is_empty() {
         println!("  [MISSING]  system images");
-        println!("             e.g. sdkmanager \"system-images;android-36;google_apis;x86_64\"");
+        println!("             e.g. sdkmanager \"{DEFAULT_SYSTEM_IMAGE}\"");
     } else {
         println!("  [ok]       system images ({}):", s.system_images.len());
         for img in &s.system_images {
@@ -124,8 +125,8 @@ fn print_doctor() {
 
     if s.avds.is_empty() {
         println!("  [MISSING]  AVDs");
-        println!("             e.g. avdmanager create avd -n test \\");
-        println!("                    -k \"system-images;android-36;google_apis;x86_64\" -d pixel_6");
+        println!("             e.g. avdmanager create avd -n android \\");
+        println!("                    -k \"{DEFAULT_SYSTEM_IMAGE}\" -d {DEFAULT_DEVICE_PROFILE}");
     } else {
         println!("  [ok]       AVDs ({}): {}", s.avds.len(), s.avds.join(", "));
     }

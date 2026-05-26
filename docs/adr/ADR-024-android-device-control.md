@@ -79,7 +79,13 @@ lack Google Play / Google login.
    - **Managed emulator**: the user installs the Android SDK; xpressclaw
      orchestrates `sdkmanager` (ensure system image) → `avdmanager` (ensure
      AVD) → `emulator` (boot) → `adb_client` (control). The user pulls Google's
-     images themselves, so no redistribution exposure.
+     images themselves, so no redistribution exposure. The **default image is
+     `google_apis_playstore`** (Play Store + Google sign-in) — chosen over
+     `google_apis` because end users need the Store and real Google login. The
+     cost is no `adb root` (production `user` build), which is fine: the control
+     path (tap/screenshot/uiautomator) needs no root. Defined once as
+     `android::sdk::DEFAULT_SYSTEM_IMAGE`. (Our own dev/test AVD stays on
+     `google_apis` for rootability; that's a separate choice.)
 
    The control layer is **provider-agnostic** — `adb_client` connects to
    whatever `adbd` is present (a phone, or the emulator on `:5555`), so the

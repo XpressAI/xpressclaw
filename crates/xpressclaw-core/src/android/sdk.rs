@@ -11,6 +11,16 @@ use std::process::Command;
 
 use serde::Serialize;
 
+/// Default system image for user-facing managed emulators: **Google Play**
+/// (Play Store + Google sign-in). It's a production (`user`) build, so it
+/// allows no `adb root` — but the control path (tap / screenshot / uiautomator)
+/// needs none. See ADR-024. Single source of truth for provisioning + the
+/// `doctor` hints.
+pub const DEFAULT_SYSTEM_IMAGE: &str = "system-images;android-36;google_apis_playstore;x86_64";
+
+/// Default device profile for managed emulators.
+pub const DEFAULT_DEVICE_PROFILE: &str = "pixel_6";
+
 /// Snapshot of the local Android SDK install relevant to managed emulators.
 #[derive(Debug, Clone, Serialize)]
 pub struct SdkStatus {
