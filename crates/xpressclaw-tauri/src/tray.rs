@@ -1,5 +1,5 @@
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconEvent;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::{App, Manager};
 use tracing::{info, warn};
 
@@ -55,7 +55,17 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
 
         let handle = app.handle().clone();
         tray.on_tray_icon_event(move |_tray, event| {
-            if let TrayIconEvent::Click { .. } = event {
+            // Only summon the window on a left-click release. Matching every
+            // `Click` (including right-click) stole focus from the context menu
+            // the OS opens on right-click, dismissing it instantly — so the only
+            // way to reach Quit was a fluke. Right/middle clicks now fall through
+            // and the native tray menu opens undisturbed.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
                 if let Some(window) = handle.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
