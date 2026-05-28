@@ -1,0 +1,85 @@
+Bug surfaced from user testing: typing a model in the Profile→Change modal
+silently wrote model: null back to xpressclaw.yaml, and a second Apply
+without retyping the API key wiped api_key too. Reproduced live by tailing
+~/.xpressclaw/xpressclaw.yaml with `tail -F` (capital F — xpressclaw rewrites
+the file, so lowercase -f misses it).
+
+Root cause (took two tries to land on):
+
+The per-agent LLM refactor 0b83c91 moved `model` from top-level AgentConfig
+into AgentLlmConfig.model — "model lives on llm.model now." The PATCH
+handler in routes/agents.rs grew a legacy migration bridge to keep
+pre-refactor API callers working (top-level `model` -> write into
+llm.model). That branch coexisted with an `llm` block branch that did a
+full agent.llm = req.llm replacement. Two branches, both correct in
+isolation, but the modal in ProfileTab.svelte was a NEW caller that used
+BOTH at once: it sent top-level `model` AND an `llm` block (without model
+inside it). The legacy branch wrote model; the next branch's full
+replacement clobbered it. The original code's comment literally said "so
+the field never gets silently dropped" — the author saw the risk and
+guarded against it but didn't notice the second block undoing the guard.
+
+My first fix attempt was a server-side partial merge with filter-on-empty
+semantics (req_llm.api_key.filter(|k| !k.is_empty()) etc). User correctly
+called it a hack — the server was contorting itself to compensate for the
+frontend sending a malformed payload. The cleaner answer is to align the
+modal with the data model: model lives inside the llm block, so the modal
+should send it that way. Then the dual-branch server handler becomes
+unnecessary, not "fixed."
+
+Final shape:
+- Modal applyModelConfig sends model INSIDE the llm block.
+- handleSave (Save Changes) drops top-level `model` entirely. Model is
+  the modal's responsibility. Both blocks had been writing it, which is
+  also why a Save Changes click after a modal edit could race.
+- Server: dropped `model: Option<String>` from UpdateAgentConfigRequest
+  AND the migration block. Handler is one block now — req.llm replaces
+  agent.llm wholesale, empty/null provider clears.
+- YAML migration for old configs with top-level agent.model is
+  unaffected — Config::migrate_legacy_fields() still handles it at file
+  load. Migration belongs at the file boundary, not in an API handler.
+- PATCH response returns "api_key": <value> instead of "has_api_key":
+  bool — matches the GET /api/setup/config shape. Frontend was using
+  has_api_key inconsistently anyway (only the AgentProviderEntry
+  summary type cared about it).
+
+Rejected alternatives:
+- Partial-merge with filter-on-empty (hack, server compensating for
+  frontend).
+- Keep dual-branch but reorder (still hacky, comment lies about modal
+  shape after frontend fix).
+- Use serde_with::double_option to distinguish None vs Some(None) on
+  request fields — overkill for one field; would have introduced a new
+  pattern that doesn't exist anywhere else in the codebase.
+- Force the api_key field to be opaque in the response (write-only) —
+  would have required reworking AgentLlmConfig and breaking GET symmetry.
+
+Tests: new test_update_config_llm_block_round_trips_model_and_key covers
+the modal's actual contract (model + api_key persist on a single round-
+trip; response carries api_key back). Dropped the migration-bridge test
+I'd added earlier — that path no longer exists in the API. 10/10 agent
+route tests pass.
+
+Verified by tailing the YAML during the actual UI flow against a freshly
+built installer (target/x86_64-pc-windows-msvc/release/bundle/nsis/
+xpressclaw_0.1.0_x64-setup.exe). The agent responded post-fix but the
+first message after a fresh install took ~3 min — cold-start tax from
+the relay (relay.public.cloud.xpress.ai), unrelated to this PR.
+
+Memory saved this session:
+- project_agent_llm_model_location.md: model lives in llm.model post
+  0b83c91; top-level PATCH model was a legacy bridge.
+- feedback_logoff_warning.md: never suggest Windows logoff casually —
+  user lost work to it during this session when I framed it as low-cost.
+- feedback_xpressclaw_yaml_secrets.md: xpressclaw.yaml holds plaintext
+  api_keys (same class as .env); ask for fields instead of reading.
+
+Branched fresh off origin/main (583e84c). The android-device-control
+worktree's uncommitted bits (PR.md, kill-port.sh, image.png, build logs,
+schemas) rode along into this branch but aren't part of this commit —
+only the three behavior files are staged. test.yaml has Eduardo's macOS
+paths overwritten on every test run; not staged for the same reason as
+prior fix PRs.
+
+PR body drafted at PR.md (project root scratch; gitmoji title).
+Not pushed yet.
