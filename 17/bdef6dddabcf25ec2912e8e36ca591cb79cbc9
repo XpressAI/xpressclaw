@@ -1,0 +1,58 @@
+Companion to 01776ef (the LLM modal save-wipe fix). User asked to
+mirror the first-time setup wizard's "verify key + fetch models" flow
+into the Profile → Change modal so they don't have to type model names
+blind.
+
+Implementation is a straight port from setup/+page.svelte:
+- Same state shape (keyValidating, keyValid, keyError, availableModels).
+- Same call: setup.validateKey(provider, key, baseUrl?). The endpoint
+  /api/setup/validate-key already returns { valid, error?, models }
+  via routes/setup.rs::fetch_provider_models, which calls upstream
+  /v1/models with the right header (x-api-key for anthropic,
+  Authorization for openai-compatible).
+- Validate button rendered only when provider is openai/anthropic
+  (matches setup; ollama validation isn't supported by that endpoint
+  and there's a separate detect_ollama path).
+
+One deviation from setup: when validate succeeds and returns models,
+setup conditionally renders either a <select> or a free-text <input>
+based on whether the model field was set. The modal here ALWAYS shows
+a model field (it's editing an existing agent), so I render a <select>
+post-validation but seed it with a "<model> (custom)" option at the
+top if the agent's stored model isn't in the fetched list. This
+preserves relay-specific or fine-tuned model names that the upstream's
+/v1/models doesn't expose. Without that, switching to the dropdown
+silently changes the bind:value to the first option in the list, which
+would have been a quieter version of the same data-loss class as the
+bug we just fixed.
+
+Reset semantics: keyValid/keyError/availableModels reset every time
+the modal opens AND every time the provider changes (onchange on the
+provider <select>). User explicitly asked for "reset on open" in
+scoping. Provider-change reset isn't a separate user ask but is
+necessary — a green "valid" status from openai shouldn't persist after
+the user switches to anthropic.
+
+Things I considered and rejected:
+- <datalist> autocomplete instead of a hard switch to <select>. Would
+  give free-text + suggestions in one widget. Rejected to match the
+  setup UX faithfully (user said "match setup", which uses <select>).
+- Auto-validate on modal open when api_key is populated. Setup doesn't,
+  and the user agreed "match setup". Avoids hitting upstream every
+  time someone opens the modal to glance at config.
+- A new backend route for validation scoped to existing agents. The
+  existing /api/setup/validate-key works for the use case (it's
+  stateless — doesn't depend on the agent record), so no reason to
+  duplicate. Slight smell that a "setup" endpoint is being used post-
+  setup; left a follow-up note in my head to move it to a neutral
+  namespace if the surface grows.
+
+Verified: cargo build of the desktop installer green (build.ps1
+--skip-test --skip-docker --skip-check), svelte-check 0 errors,
+manual test against the relay (relay.public.cloud.xpress.ai) — Validate
+button fires, status shows, models populate, custom model preserved
+across opens.
+
+Branch fahreza/fix-llm-model-reset-on-save now has two commits
+(01776ef fix + 17bdef6 feat). PR body in PR.md needs an updated
+section for this addition before opening.
