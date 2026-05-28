@@ -59,11 +59,13 @@
 
 	function applyModelConfig() {
 		showModelModal = false;
-		// Save immediately so model/provider changes persist
+		// Model lives inside the llm block (post-refactor 0b83c91). Sending
+		// it at the request top level alongside an llm block hits the legacy
+		// migration branch and races the llm replacement on the server.
 		onSave({
-			model: model.trim() || undefined,
 			llm: {
 				provider: llmProvider || null,
+				model: model.trim() || null,
 				api_key: llmApiKey || null,
 				base_url: llmBaseUrl || null,
 			},
@@ -71,11 +73,13 @@
 	}
 
 	function handleSave() {
+		// Model is owned by the modal's Apply path, not Save Changes.
+		// Including it here would clobber a fresh modal edit if Save fires
+		// before the modal's response merges back into local state.
 		onSave({
 			display_name: displayName.trim() || null,
 			role_title: roleTitle.trim() || null,
 			responsibilities: responsibilities.trim() || null,
-			model: model.trim() || undefined,
 		});
 	}
 
