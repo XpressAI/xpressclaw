@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { LiveConfig } from '$lib/api';
+	import { setup } from '$lib/api';
 	import { agentAvatar } from '$lib/utils';
 
 	interface Props {
@@ -19,6 +20,47 @@
 	let llmApiKey = $state('');
 	let llmBaseUrl = $state('');
 	let showModelModal = $state(false);
+
+	// Key validation + model fetch (mirrors the setup wizard's flow).
+	// Reset every time the modal opens so users don't see stale state.
+	let keyValidating = $state(false);
+	let keyValid = $state<boolean | null>(null);
+	let keyError = $state('');
+	let availableModels = $state<{ id: string }[]>([]);
+
+	function resetValidation() {
+		keyValid = null;
+		keyError = '';
+		availableModels = [];
+	}
+
+	$effect(() => {
+		if (showModelModal) resetValidation();
+	});
+
+	async function validateApiKey() {
+		if (!llmApiKey.trim()) return;
+		keyValidating = true;
+		keyValid = null;
+		keyError = '';
+		availableModels = [];
+		try {
+			const result = await setup.validateKey(llmProvider, llmApiKey, llmBaseUrl || undefined);
+			keyValid = result.valid;
+			if (!result.valid) {
+				keyError = result.error || 'Invalid API key';
+			} else if (result.models?.length) {
+				availableModels = result.models;
+				if (!model.trim() && availableModels.length > 0) {
+					model = availableModels[0].id;
+				}
+			}
+		} catch (e) {
+			keyValid = false;
+			keyError = e instanceof Error ? e.message : 'Validation failed';
+		}
+		keyValidating = false;
+	}
 
 	$effect(() => {
 		if (agentConfig) {
@@ -183,7 +225,7 @@
 			<div class="space-y-3">
 				<div>
 					<label class="block text-xs font-medium text-muted-foreground mb-1">Provider</label>
-					<select bind:value={llmProvider}
+					<select bind:value={llmProvider} onchange={resetValidation}
 						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
 						<option value="">Default (global)</option>
 						<option value="openai">OpenAI-compatible</option>
@@ -193,14 +235,34 @@
 				</div>
 				<div>
 					<label class="block text-xs font-medium text-muted-foreground mb-1">Model</label>
-					<input type="text" bind:value={model} placeholder="e.g. gpt-4o, claude-sonnet-4-5, qwen3.5:9b"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+					{#if keyValid === true && availableModels.length > 0}
+						<select bind:value={model}
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring">
+							{#if model && !availableModels.some(m => m.id === model)}
+								<option value={model}>{model} (custom)</option>
+							{/if}
+							{#each availableModels as m}
+								<option value={m.id}>{m.id}</option>
+							{/each}
+						</select>
+					{:else}
+						<input type="text" bind:value={model} placeholder="e.g. gpt-4o, claude-sonnet-4-5, qwen3.5:9b"
+							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+					{/if}
 				</div>
 				{#if llmProvider === 'openai' || llmProvider === 'anthropic'}
 					<div>
 						<label class="block text-xs font-medium text-muted-foreground mb-1">API Key</label>
-						<input type="password" bind:value={llmApiKey} placeholder={llmProvider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+						<div class="flex gap-2">
+							<input type="password" bind:value={llmApiKey} placeholder={llmProvider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
+								class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+							<button onclick={validateApiKey} disabled={!llmApiKey.trim() || keyValidating}
+								class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">
+								{keyValidating ? 'Checking...' : 'Validate'}
+							</button>
+						</div>
+						{#if keyValid === true}<p class="mt-1 text-xs text-emerald-500">API key is valid{availableModels.length > 0 ? ` — ${availableModels.length} model${availableModels.length === 1 ? '' : 's'} available` : ''}</p>{/if}
+						{#if keyValid === false}<p class="mt-1 text-xs text-red-500">{keyError}</p>{/if}
 					</div>
 					<div>
 						<label class="block text-xs font-medium text-muted-foreground mb-1">Base URL <span class="font-normal text-muted-foreground">(optional)</span></label>
