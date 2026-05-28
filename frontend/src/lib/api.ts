@@ -250,8 +250,7 @@ export const agents = {
 		responsibilities?: string | null;
 		avatar?: string | null;
 		role?: string;
-		model?: string;
-		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
+		llm?: { provider: string | null; model: string | null; api_key: string | null; base_url: string | null };
 		tools?: string[];
 		skills?: string[];
 		volumes?: string[];
