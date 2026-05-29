@@ -1,0 +1,12 @@
+Root cause of the agent 'session reset' crash: android_screenshot returned a full-res 1080x2400 frame = 1.8MB PNG / 2.4MB base64. The claude-agent-sdk spawns the claude CLI and pipes MCP/messages over stdio with a ~1MB buffer (default); a 2.4MB tool result overflows it -> 'maximum buffer size'/'exit code 1' -> harness.py:465 catches it, resets session, prints the friendly '>1MB' message. NOT a model/relay/xpressclaw cap — it's the SDK transport buffer.
+
+Three-pronged fix (researched common patterns first):
+1. screen_map (PRIMARY): AndroidDevice::screen_elements() parses uiautomator XML into compact JSON (text/desc/class/clickable/bounds/center) — a few KB. Agent perceives + targets via this, not via pixels off an image. Avoids the vision-coordinate scaling bug entirely (real device coords, no transform). New GET /v1/android/elements + android_screen_map MCP tool.
+2. screenshot_scaled(1568, q85): downscale longest side to 1568 (= what Anthropic's vision API downscales to anyway, so zero model-visible loss; their cap is ~1568px / ~1.15MP) + JPEG. ~200-400KB. /v1/android/screenshot now JPEG, tunable ?max=&q=. Uses  crate (already transitive via adb_client) added under android feature.
+3. max_buffer_size=10MB on ClaudeAgentOptions (harness.py) — confirmed real param in claude-agent-sdk python (docs: 'Maximum bytes when buffering CLI stdout', default None). Belt-and-suspenders so a large result can't crash the session even if a tool forgets to shrink.
+
+Considered but NOT used: MCP resource links / save-to-disk + file pointers (the user's idea). Valid for large NON-vision artifacts or human/UI out-of-band fetch (our live-view already does the latter over HTTP), but doesn't help when the MODEL must SEE the image — pixels still traverse the transport. screen_map already IS 'reference not pixels' for the navigation case.
+
+android-guide.md (user-provided, computer-use/vision approach w/ ScreenMap pixel-scaling) was reviewed: it validates our accessibility-tree choice (we skip its hard 3-way-mapping section). Useful unbuilt ideas from it: open_app (am start, more reliable than tapping icons), an android-pilot role/template (touchscreen framing, prefer screen_map, BACK/HOME), long_press, FLAG_SECURE black-frame detection.
+
+Commits: 7d21fa5 (connector Test real probe — the 'state issue' Bug A; Bug B = no live status refresh, still open), 2a68f71 (this). Verified in chat: agent drove emulator from screen map, no crash. Branch fahreza/android-device-control, NOT pushed.
