@@ -2671,6 +2671,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -8064,6 +8066,7 @@ dependencies = [
  "chrono",
  "croner",
  "futures-util",
+ "image",
  "lettre",
  "notify",
  "ready-agent-cog",

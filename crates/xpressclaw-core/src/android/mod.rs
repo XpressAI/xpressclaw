@@ -15,6 +15,7 @@ pub mod sdk;
 use std::net::SocketAddr;
 
 use adb_client::{server::ADBServer, tcp::ADBTcpDevice, ADBDeviceExt};
+use serde::Serialize;
 
 use crate::error::{Error, Result};
 
@@ -32,6 +33,22 @@ impl UiElement {
     pub fn center(&self) -> (i32, i32) {
         ((self.left + self.right) / 2, (self.top + self.bottom) / 2)
     }
+}
+
+/// A compact, agent-facing view of one interactable/labeled on-screen element.
+/// This is the **screen map** — the primary way an agent perceives the screen:
+/// a few KB of structured elements with their real device-pixel coordinates,
+/// instead of a multi-MB screenshot it would have to (unreliably) eyeball.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ScreenElement {
+    pub text: String,
+    pub content_desc: String,
+    pub class: String,
+    pub clickable: bool,
+    /// [left, top, right, bottom] in device pixels.
+    pub bounds: [i32; 4],
+    /// [x, y] center — the tap target.
+    pub center: [i32; 2],
 }
 
 /// A connected Android device, controlled over the adb wire protocol.
@@ -85,6 +102,24 @@ impl AndroidDevice {
             .map_err(|e| Error::Android(format!("screenshot failed: {e}")))
     }
 
+    /// Capture a screenshot, downscale so its longest side is `max_dim`, and
+    /// encode as JPEG at `quality` (0-100). A full 1080x2400 PNG is ~1.8MB
+    /// (~2.4MB base64) — over the agent tool-output limit; this brings it to
+    /// a couple hundred KB. The screen map ([`screen_elements`]) remains the
+    /// way to get tap coordinates; this is for *seeing* visual content.
+    pub fn screenshot_scaled(&mut self, max_dim: u32, quality: u8) -> Result<Vec<u8>> {
+        let png = self.screenshot_bytes()?;
+        let img = image::load_from_memory(&png)
+            .map_err(|e| Error::Android(format!("decode screenshot: {e}")))?
+            .resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
+        let rgb = img.to_rgb8();
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .map_err(|e| Error::Android(format!("encode jpeg: {e}")))?;
+        Ok(out)
+    }
+
     /// Dump the current UI accessibility tree as XML.
     pub fn ui_dump(&mut self) -> Result<String> {
         // uiautomator writes to a file on the device; dump then read it back.
@@ -96,6 +131,14 @@ impl AndroidDevice {
     pub fn find_element(&mut self, label: &str) -> Result<Option<UiElement>> {
         let xml = self.ui_dump()?;
         Ok(find_node_bounds(&xml, label))
+    }
+
+    /// The **screen map**: all interactable/labeled elements with their real
+    /// coordinates. Compact (a few KB) — the agent's primary way to see the
+    /// screen and pick tap targets, instead of a multi-MB screenshot.
+    pub fn screen_elements(&mut self) -> Result<Vec<ScreenElement>> {
+        let xml = self.ui_dump()?;
+        Ok(parse_screen_elements(&xml))
     }
 
     /// Tap absolute device coordinates.
@@ -171,6 +214,50 @@ fn parse_bounds(tag: &str) -> Option<UiElement> {
     })
 }
 
+/// Read a `name="value"` attribute from a node tag. The leading space avoids
+/// matching substrings of other attribute names (e.g. `clickable` inside
+/// `long-clickable`).
+fn attr(tag: &str, name: &str) -> Option<String> {
+    let key = format!(" {name}=\"");
+    let start = tag.find(&key)? + key.len();
+    let rest = &tag[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse the uiautomator XML into the compact screen map: every node that is
+/// clickable or carries text/content-desc, with non-zero bounds.
+fn parse_screen_elements(xml: &str) -> Vec<ScreenElement> {
+    let mut out = Vec::new();
+    for chunk in xml.split("<node").skip(1) {
+        let tag = match chunk.find('>') {
+            Some(end) => &chunk[..end],
+            None => chunk,
+        };
+        let text = attr(tag, "text").unwrap_or_default();
+        let content_desc = attr(tag, "content-desc").unwrap_or_default();
+        let clickable = attr(tag, "clickable").as_deref() == Some("true");
+        // Drop nodes with nothing useful for the agent to act on.
+        if !clickable && text.is_empty() && content_desc.is_empty() {
+            continue;
+        }
+        let Some(b) = parse_bounds(tag) else { continue };
+        if b.left == b.right || b.top == b.bottom {
+            continue; // zero-area, not tappable
+        }
+        let (cx, cy) = b.center();
+        out.push(ScreenElement {
+            text,
+            content_desc,
+            class: attr(tag, "class").unwrap_or_default(),
+            clickable,
+            bounds: [b.left, b.top, b.right, b.bottom],
+            center: [cx, cy],
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +297,24 @@ mod tests {
     fn handles_malformed_bounds_gracefully() {
         let xml = r#"<node text="Broken" bounds="[12,][34,56]"/>"#;
         assert!(find_node_bounds(xml, "Broken").is_none());
+    }
+
+    #[test]
+    fn screen_map_keeps_labeled_and_drops_noise() {
+        // Root FrameLayout has no text/desc and isn't clickable → dropped.
+        // Gmail + Photos are labeled → kept, with correct centers.
+        let els = parse_screen_elements(SAMPLE);
+        assert_eq!(els.len(), 2);
+        let photos = els.iter().find(|e| e.content_desc == "Photos").unwrap();
+        assert_eq!(photos.center, [663, 1549]);
+        assert_eq!(photos.bounds, [561, 1406, 766, 1692]);
+        let gmail = els.iter().find(|e| e.text == "Gmail").unwrap();
+        assert_eq!(gmail.center, [202, 1549]);
+    }
+
+    #[test]
+    fn attr_does_not_confuse_clickable_with_long_clickable() {
+        let tag = r#" index="0" clickable="false" long-clickable="true" "#;
+        assert_eq!(attr(tag, "clickable").as_deref(), Some("false"));
     }
 }

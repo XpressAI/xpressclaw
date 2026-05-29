@@ -41,10 +41,14 @@ base64 = "0.22"
 # when the `android` feature is enabled (see ADR-024). Keeps the default
 # build free of its rustls/rsa/image dependency tree.
 adb_client = { version = "3.2", optional = true }
+# Image resize/JPEG encode for screenshots (same version adb_client already
+# pulls in transitively, so no extra build cost). Used to downscale frames so
+# they fit under the agent tool-output size limit.
+image = { version = "0.25", optional = true, default-features = false, features = ["jpeg", "png"] }
 
 [features]
 # Agentic Android device control (managed emulator or BYO device).
-android = ["dep:adb_client"]
+android = ["dep:adb_client", "dep:image"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

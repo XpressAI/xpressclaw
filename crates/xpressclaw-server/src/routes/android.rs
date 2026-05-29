@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/status", get(status))
         .route("/screenshot", get(screenshot))
+        .route("/elements", get(elements))
         .route("/dump", get(dump))
         .route("/tap", post(tap))
         .route("/tap-text", post(tap_text))
@@ -114,11 +115,35 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "reachable": reachable }))
 }
 
-async fn screenshot(State(state): State<AppState>) -> Result<Response, (StatusCode, Json<Value>)> {
-    let png = with_device(state.db.clone(), |d| d.screenshot_bytes())
+#[derive(Deserialize)]
+struct ShotParams {
+    /// Longest-side cap in px. Default 1568 — the resolution vision APIs
+    /// (e.g. Anthropic) downscale to anyway, so no model-visible detail is
+    /// lost, while keeping the payload under the agent tool-output limit.
+    max: Option<u32>,
+    /// JPEG quality 0-100. Default 85 — visually near-lossless for UI screens.
+    q: Option<u8>,
+}
+
+async fn screenshot(
+    State(state): State<AppState>,
+    Query(p): Query<ShotParams>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let max = p.max.unwrap_or(1568);
+    let q = p.q.unwrap_or(85);
+    let jpeg = with_device(state.db.clone(), move |d| d.screenshot_scaled(max, q))
         .await
         .map_err(err)?;
-    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+    Ok(([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response())
+}
+
+/// The screen map: compact JSON list of interactable/labeled elements with
+/// their device-pixel coordinates. A few KB — the agent's primary perception.
+async fn elements(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let els = with_device(state.db.clone(), |d| d.screen_elements())
+        .await
+        .map_err(err)?;
+    Ok(Json(json!({ "elements": els })))
 }
 
 async fn dump(State(state): State<AppState>) -> Result<String, (StatusCode, Json<Value>)> {

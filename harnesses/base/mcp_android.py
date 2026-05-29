@@ -26,9 +26,22 @@ TOOLS = [
     {
         "name": "android_screenshot",
         "description": (
-            "Capture the current Android screen as an image. ALWAYS look at a "
-            "fresh screenshot before deciding what to do, and again after acting "
-            "to confirm the result."
+            "Capture the current Android screen as an image. Use this when you "
+            "need to SEE visual content (photos, icons, layout). To find WHERE "
+            "to tap, prefer android_screen_map — it gives exact coordinates; do "
+            "not read coordinates off this image."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "android_screen_map",
+        "description": (
+            "PRIMARY way to perceive the screen: returns a compact list of "
+            "interactable/labeled elements with their text, content-description, "
+            "and exact pixel bounds + center. Call this first to decide what to "
+            "tap, then act with android_tap_text or android_tap using the "
+            "coordinates it gives. Much smaller and more reliable than a "
+            "screenshot."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -120,7 +133,12 @@ def call_tool(name: str, args: dict):
     if name == "android_screenshot":
         resp = _call("GET", "/v1/android/screenshot")
         b64 = base64.b64encode(resp.content).decode("ascii")
-        return [{"type": "image", "data": b64, "mimeType": "image/png"}]
+        mime = resp.headers.get("content-type", "image/jpeg")
+        return [{"type": "image", "data": b64, "mimeType": mime}]
+    if name == "android_screen_map":
+        j = _call("GET", "/v1/android/elements").json()
+        els = j.get("elements", [])
+        return _text(json.dumps(els, separators=(",", ":")))
     if name == "android_tap_text":
         j = _call("POST", "/v1/android/tap-text", {"label": args["label"]}).json()
         return _text(f"tapped '{args['label']}' at ({j.get('x')}, {j.get('y')})")
