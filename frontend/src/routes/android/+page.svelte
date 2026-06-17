@@ -12,6 +12,12 @@
 	let status = $state('connecting…');
 	let lastAction = $state<string | null>(null);
 
+	// Emulator lifecycle (mirrors the Docker "installed? / running? / start it" flow)
+	let installed = $state(false);
+	let canStart = $state(false);
+	let avds = $state<string[]>([]);
+	let starting = $state(false);
+
 	function refresh() {
 		frameUrl = '/v1/android/screenshot?t=' + Date.now();
 	}
@@ -27,6 +33,38 @@
 			reachable = false;
 			status = 'android control unavailable';
 		}
+		if (!reachable) await checkLifecycle();
+	}
+
+	async function checkLifecycle() {
+		try {
+			const j = await (await fetch('/api/setup/check-android-sdk')).json();
+			installed = !!j.installed;
+			canStart = !!j.can_start;
+			avds = j.sdk?.avds ?? [];
+		} catch {
+			/* leave defaults */
+		}
+	}
+
+	async function startEmulator() {
+		starting = true;
+		status = 'starting emulator…';
+		try {
+			await fetch('/api/setup/start-android', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ avd: avds[0] ?? null })
+			});
+			// Cold boot can take ~60s; poll until it's reachable.
+			for (let i = 0; i < 60 && !reachable; i++) {
+				await new Promise((r) => setTimeout(r, 2000));
+				await checkStatus();
+			}
+		} catch (e) {
+			console.error('start emulator failed', e);
+		}
+		starting = false;
 	}
 
 	async function post(path: string, body: unknown) {
@@ -91,6 +129,34 @@
 		Watch the device live and click to take over — you and the agent share the same screen.
 	</p>
 
+	{#if !reachable}
+		<!-- Lifecycle gate — no device up. Mirrors the Docker "start it" prompt. -->
+		<div class="rounded-xl border border-border bg-muted/30 p-8 text-center">
+			{#if starting}
+				<p class="text-sm font-medium">Starting emulator…</p>
+				<p class="mt-1 text-xs text-muted-foreground">Cold boot can take up to a minute.</p>
+			{:else if installed && canStart}
+				<p class="text-sm font-medium">No emulator running</p>
+				<p class="mt-1 text-xs text-muted-foreground">
+					{avds.length ? `Will boot: ${avds[0]}` : 'A managed emulator is available.'}
+				</p>
+				<button
+					onclick={startEmulator}
+					class="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground hover:bg-primary/90"
+					>Start emulator</button
+				>
+			{:else if !installed}
+				<p class="text-sm font-medium">Android SDK not ready</p>
+				<p class="mt-1 text-xs text-muted-foreground">
+					Install the Android SDK + a system image and create an AVD, then refresh.
+					Run <code>xpressclaw android doctor</code> to see what's missing.
+				</p>
+			{:else}
+				<p class="text-sm font-medium">Connecting to a device…</p>
+				<p class="mt-1 text-xs text-muted-foreground">Or plug in a device with USB debugging.</p>
+			{/if}
+		</div>
+	{:else}
 	<div class="flex flex-col items-center gap-4">
 		<div class="overflow-hidden rounded-xl border border-border bg-black">
 			<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
@@ -133,4 +199,5 @@
 			<p class="text-xs text-muted-foreground">last: {lastAction}</p>
 		{/if}
 	</div>
+	{/if}
 </div>

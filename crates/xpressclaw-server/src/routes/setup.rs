@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/system-info", get(system_info))
         .route("/check-ollama", get(check_ollama))
         .route("/check-android-sdk", get(check_android_sdk))
+        .route("/start-android", post(start_android))
         .route("/recommend-model", get(recommend_model))
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
@@ -187,22 +188,75 @@ async fn check_ollama() -> Json<Value> {
     Json(json!(info))
 }
 
-/// Check the Android SDK install for the managed-emulator path. Mirrors
-/// `check_docker` / `check_ollama`. Only meaningful when built with the
-/// `android` feature; otherwise reports `feature_enabled: false`.
+/// Emulator lifecycle status for the managed-emulator path. Mirrors
+/// `check_docker`'s `{available, installed, can_start}` shape (here: a running
+/// emulator, an installed+AVD-ready SDK, and whether we can spawn one), plus
+/// the detailed SDK breakdown. Only meaningful when built with the `android`
+/// feature; otherwise reports `feature_enabled: false`.
 async fn check_android_sdk() -> Json<Value> {
     #[cfg(feature = "android")]
     {
-        let status = xpressclaw_core::android::sdk::detect();
+        use xpressclaw_core::android::{emulator, sdk};
+        let status = sdk::detect();
+        let installed = status.ready();
+        let available =
+            tokio::task::spawn_blocking(|| emulator::is_running(emulator::DEFAULT_SERIAL))
+                .await
+                .unwrap_or(false);
         Json(json!({
             "feature_enabled": true,
-            "ready": status.ready(),
+            "available": available,                  // an emulator is up & booted
+            "installed": installed,                  // SDK + emulator + image + AVD
+            "can_start": installed && !available,    // safe to spawn one
+            "ready": installed,                      // back-compat alias
             "sdk": status,
         }))
     }
     #[cfg(not(feature = "android"))]
     {
-        Json(json!({ "feature_enabled": false, "ready": false }))
+        Json(json!({ "feature_enabled": false, "available": false, "installed": false, "can_start": false }))
+    }
+}
+
+#[derive(Deserialize)]
+struct StartAndroidRequest {
+    /// AVD to boot; defaults to the first available AVD if omitted.
+    #[serde(default)]
+    avd: Option<String>,
+}
+
+/// Spawn a managed emulator. Mirrors `start_docker`. macOS/Windows/Linux all
+/// launch the SDK `emulator` binary detached.
+async fn start_android(
+    Json(req): Json<StartAndroidRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    #[cfg(feature = "android")]
+    {
+        use xpressclaw_core::android::{emulator, sdk};
+        let avd = match req.avd {
+            Some(a) if !a.trim().is_empty() => a,
+            _ => sdk::detect().avds.into_iter().next().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "no AVD available — create one first" })),
+                )
+            })?,
+        };
+        emulator::start(&avd).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?;
+        Ok(Json(json!({ "started": true, "avd": avd })))
+    }
+    #[cfg(not(feature = "android"))]
+    {
+        let _ = req;
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": "android feature not enabled" })),
+        ))
     }
 }
 

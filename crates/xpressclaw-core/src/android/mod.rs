@@ -10,6 +10,7 @@
 //! ([`AndroidDevice::find_element`]) rather than vision-derived pixel
 //! coordinates, which are unreliable (see ADR-024).
 
+pub mod emulator;
 pub mod sdk;
 
 use std::net::SocketAddr;
