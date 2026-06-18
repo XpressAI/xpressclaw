@@ -188,11 +188,10 @@ async fn check_ollama() -> Json<Value> {
     Json(json!(info))
 }
 
-/// Emulator lifecycle status for the managed-emulator path. Mirrors
-/// `check_docker`'s `{available, installed, can_start}` shape (here: a running
-/// emulator, an installed+AVD-ready SDK, and whether we can spawn one), plus
-/// the detailed SDK breakdown. Only meaningful when built with the `android`
-/// feature; otherwise reports `feature_enabled: false`.
+/// Emulator lifecycle status for the managed-emulator path. Same
+/// `{available, installed, can_start}` shape as `check_docker` (here: a running
+/// emulator, an installed+AVD-ready SDK, and whether we can spawn one), plus the
+/// detailed SDK breakdown the `/android` page uses to know which AVD to boot.
 async fn check_android_sdk() -> Json<Value> {
     #[cfg(feature = "android")]
     {
@@ -204,17 +203,15 @@ async fn check_android_sdk() -> Json<Value> {
                 .await
                 .unwrap_or(false);
         Json(json!({
-            "feature_enabled": true,
             "available": available,                  // an emulator is up & booted
             "installed": installed,                  // SDK + emulator + image + AVD
             "can_start": installed && !available,    // safe to spawn one
-            "ready": installed,                      // back-compat alias
             "sdk": status,
         }))
     }
     #[cfg(not(feature = "android"))]
     {
-        Json(json!({ "feature_enabled": false, "available": false, "installed": false, "can_start": false }))
+        Json(json!({ "available": false, "installed": false, "can_start": false }))
     }
 }
 

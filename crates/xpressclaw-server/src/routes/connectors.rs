@@ -113,44 +113,6 @@ async fn delete_connector(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Real reachability probe for an android device-link connector: connect via
-/// adb_client (off-thread, since it's sync) and run a trivial shell command.
-/// Resolves the target from config (tcp or serial), defaulting to emulator-5554.
-#[cfg(feature = "android")]
-async fn android_reachable(config: &Value) -> Result<(), String> {
-    use std::net::SocketAddr;
-    use xpressclaw_core::android::AndroidDevice;
-
-    let tcp = config
-        .get("tcp")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let serial = config
-        .get("serial")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("emulator-5554")
-        .to_string();
-
-    tokio::task::spawn_blocking(move || {
-        let mut dev = match tcp {
-            Some(t) => {
-                let addr: SocketAddr = t
-                    .parse()
-                    .map_err(|e| format!("invalid tcp address '{t}': {e}"))?;
-                AndroidDevice::via_tcp(addr).map_err(|e| e.to_string())?
-            }
-            None => AndroidDevice::via_server(&serial).map_err(|e| e.to_string())?,
-        };
-        dev.shell("echo ok").map(|_| ()).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| format!("probe task failed: {e}"))?
-}
-
 async fn test_connector(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -160,22 +122,6 @@ async fn test_connector(
         xpressclaw_core::error::Error::ConnectorNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
-
-    // Android: a real device-reachability probe, not a config shape check —
-    // status must reflect whether the device actually answers right now.
-    #[cfg(feature = "android")]
-    if c.connector_type == "android" {
-        return match android_reachable(&c.config).await {
-            Ok(()) => {
-                mgr.set_status(&id, "connected", None).map_err(internal_error)?;
-                Ok(Json(json!({ "ok": true })))
-            }
-            Err(e) => {
-                mgr.set_status(&id, "error", Some(&e)).map_err(internal_error)?;
-                Ok(Json(json!({ "ok": false, "error": e })))
-            }
-        };
-    }
 
     // Basic validation: check config is well-formed for the type
     let ok = match c.connector_type.as_str() {
