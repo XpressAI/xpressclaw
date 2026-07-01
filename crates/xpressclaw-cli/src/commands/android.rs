@@ -40,6 +40,32 @@ pub enum AndroidCommand {
         package: String,
     },
 
+    /// Swipe from (x1,y1) to (x2,y2)
+    Swipe {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        /// Duration in ms
+        #[arg(default_value_t = 300)]
+        ms: u32,
+    },
+
+    /// Type text into the focused field (tap it to focus first)
+    Type {
+        /// Text to type
+        text: String,
+    },
+
+    /// Send a key event, e.g. KEYCODE_BACK, KEYCODE_HOME, KEYCODE_ENTER
+    Key {
+        /// Keycode name or numeric code
+        key: String,
+    },
+
+    /// Print the compact screen map (labeled/clickable elements + tap centers) as JSON
+    ScreenMap,
+
     /// Dump the UI accessibility tree (uiautomator) as XML
     Dump,
 
@@ -98,6 +124,22 @@ pub async fn run(
         AndroidCommand::OpenApp { package } => {
             device.open_app(&package)?;
             println!("Launched {package}");
+        }
+        AndroidCommand::Swipe { x1, y1, x2, y2, ms } => {
+            device.swipe(x1, y1, x2, y2, ms)?;
+            println!("Swiped ({x1}, {y1}) → ({x2}, {y2}) over {ms}ms");
+        }
+        AndroidCommand::Type { text } => {
+            device.input_text(&text)?;
+            println!("Typed: {text}");
+        }
+        AndroidCommand::Key { key } => {
+            device.key_event(&key)?;
+            println!("Sent {key}");
+        }
+        AndroidCommand::ScreenMap => {
+            let elements = device.screen_elements()?;
+            println!("{}", serde_json::to_string_pretty(&elements)?);
         }
         AndroidCommand::Dump => {
             let xml = device.ui_dump()?;
