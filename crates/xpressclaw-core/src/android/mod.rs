@@ -176,6 +176,26 @@ impl AndroidDevice {
         self.shell(&format!("input keyevent {key}"))?;
         Ok(())
     }
+
+    /// Long-press at (x, y) for `ms` milliseconds (a zero-distance swipe).
+    pub fn long_press(&mut self, x: i32, y: i32, ms: u32) -> Result<()> {
+        self.shell(&format!("input swipe {x} {y} {x} {y} {ms}"))?;
+        Ok(())
+    }
+
+    /// Launch an app by package name via its launcher intent — far more reliable
+    /// than hunting for and tapping an icon.
+    pub fn open_app(&mut self, package: &str) -> Result<()> {
+        let out = self.shell(&format!(
+            "monkey -p {package} -c android.intent.category.LAUNCHER 1"
+        ))?;
+        if out.contains("No activities found") || out.contains("aborted") {
+            return Err(Error::Android(format!(
+                "could not launch '{package}' (no launchable activity)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Find the bounds of the first `<node>` whose `text` or `content-desc`

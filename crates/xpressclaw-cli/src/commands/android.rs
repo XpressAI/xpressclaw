@@ -25,6 +25,21 @@ pub enum AndroidCommand {
         label: String,
     },
 
+    /// Long-press (touch and hold) at coordinates
+    LongPress {
+        x: i32,
+        y: i32,
+        /// Hold duration in ms
+        #[arg(default_value_t = 600)]
+        ms: u32,
+    },
+
+    /// Launch an app by package name (e.g. com.android.settings)
+    OpenApp {
+        /// Package name
+        package: String,
+    },
+
     /// Dump the UI accessibility tree (uiautomator) as XML
     Dump,
 
@@ -75,6 +90,14 @@ pub async fn run(
         AndroidCommand::TapText { label } => {
             let (x, y) = device.tap_text(&label)?;
             println!("Tapped '{label}' at ({x}, {y})");
+        }
+        AndroidCommand::LongPress { x, y, ms } => {
+            device.long_press(x, y, ms)?;
+            println!("Long-pressed ({x}, {y}) for {ms}ms");
+        }
+        AndroidCommand::OpenApp { package } => {
+            device.open_app(&package)?;
+            println!("Launched {package}");
         }
         AndroidCommand::Dump => {
             let xml = device.ui_dump()?;

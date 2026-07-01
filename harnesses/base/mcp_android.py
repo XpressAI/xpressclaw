@@ -107,6 +107,31 @@ TOOLS = [
         },
     },
     {
+        "name": "android_long_press",
+        "description": "Long-press (touch and hold) at a coordinate — e.g. to open a context menu.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"},
+                "ms": {"type": "integer", "default": 600},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "android_open_app",
+        "description": (
+            "Launch an app by its package name (e.g. com.android.settings). PREFER "
+            "THIS over tapping a home-screen icon — it's far more reliable."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"package": {"type": "string"}},
+            "required": ["package"],
+        },
+    },
+    {
         "name": "android_dump",
         "description": "Dump the UI accessibility tree (uiautomator XML) to find element text and bounds.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -164,6 +189,16 @@ def call_tool(name: str, args: dict):
     if name == "android_key":
         _call("POST", "/v1/android/key", {"key": args["key"]})
         return _text(f"sent {args['key']}")
+    if name == "android_long_press":
+        _call(
+            "POST",
+            "/v1/android/long-press",
+            {"x": args["x"], "y": args["y"], "ms": args.get("ms", 600)},
+        )
+        return _text(f"long-pressed ({args['x']}, {args['y']})")
+    if name == "android_open_app":
+        _call("POST", "/v1/android/open-app", {"package": args["package"]})
+        return _text(f"launched {args['package']}")
     if name == "android_dump":
         return _text(_call("GET", "/v1/android/dump").text)
     raise ValueError(f"unknown tool: {name}")

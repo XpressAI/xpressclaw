@@ -31,6 +31,8 @@ pub fn routes() -> Router<AppState> {
         .route("/swipe", post(swipe))
         .route("/input-text", post(input_text))
         .route("/key", post(key))
+        .route("/long-press", post(long_press))
+        .route("/open-app", post(open_app))
 }
 
 /// Which adb endpoint to drive.
@@ -234,6 +236,43 @@ async fn key(
     Json(req): Json<KeyReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     with_device(state.db.clone(), move |d| d.key_event(&req.key))
+        .await
+        .map_err(err)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn default_long_press_ms() -> u32 {
+    600
+}
+
+#[derive(Deserialize)]
+struct LongPressReq {
+    x: i32,
+    y: i32,
+    #[serde(default = "default_long_press_ms")]
+    ms: u32,
+}
+
+async fn long_press(
+    State(state): State<AppState>,
+    Json(req): Json<LongPressReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    with_device(state.db.clone(), move |d| d.long_press(req.x, req.y, req.ms))
+        .await
+        .map_err(err)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct OpenAppReq {
+    package: String,
+}
+
+async fn open_app(
+    State(state): State<AppState>,
+    Json(req): Json<OpenAppReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    with_device(state.db.clone(), move |d| d.open_app(&req.package))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))
