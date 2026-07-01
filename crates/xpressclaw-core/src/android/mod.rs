@@ -202,14 +202,16 @@ impl AndroidDevice {
 /// attribute exactly equals `label`. Parses the uiautomator XML directly to
 /// avoid a regex dependency.
 fn find_node_bounds(xml: &str, label: &str) -> Option<UiElement> {
-    let text_attr = format!("text=\"{label}\"");
-    let desc_attr = format!("content-desc=\"{label}\"");
     for chunk in xml.split("<node").skip(1) {
         let tag = match chunk.find('>') {
             Some(end) => &chunk[..end],
             None => chunk,
         };
-        if tag.contains(&text_attr) || tag.contains(&desc_attr) {
+        // Compare against the decoded attribute value, not the raw XML: a label
+        // like "Network & internet" is stored as "Network &amp; internet".
+        let matches = attr(tag, "text").as_deref() == Some(label)
+            || attr(tag, "content-desc").as_deref() == Some(label);
+        if matches {
             if let Some(bounds) = parse_bounds(tag) {
                 return Some(bounds);
             }
@@ -237,13 +239,27 @@ fn parse_bounds(tag: &str) -> Option<UiElement> {
 
 /// Read a `name="value"` attribute from a node tag. The leading space avoids
 /// matching substrings of other attribute names (e.g. `clickable` inside
-/// `long-clickable`).
+/// `long-clickable`). The value is XML-entity-decoded, since uiautomator
+/// encodes `&`/`<`/`>`/`"`/`'` in text and content-desc.
 fn attr(tag: &str, name: &str) -> Option<String> {
     let key = format!(" {name}=\"");
     let start = tag.find(&key)? + key.len();
     let rest = &tag[start..];
     let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    Some(xml_decode(&rest[..end]))
+}
+
+/// Decode the five XML entities uiautomator emits. `&amp;` is replaced last so
+/// an encoded entity like `&amp;lt;` decodes to the literal `&lt;`, not `<`.
+fn xml_decode(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Parse the uiautomator XML into the compact screen map: every node that is
@@ -337,5 +353,17 @@ mod tests {
     fn attr_does_not_confuse_clickable_with_long_clickable() {
         let tag = r#" index="0" clickable="false" long-clickable="true" "#;
         assert_eq!(attr(tag, "clickable").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn matches_and_decodes_xml_entities() {
+        // uiautomator stores "Network & internet" as "Network &amp; internet".
+        let xml = r#"<node text="Network &amp; internet" bounds="[0,100][400,200]"/>"#;
+        // The caller types the real label with a literal ampersand.
+        let el = find_node_bounds(xml, "Network & internet").expect("decoded match");
+        assert_eq!(el.center(), (200, 150));
+        // And the screen map emits the decoded text, not the raw entity.
+        let els = parse_screen_elements(xml);
+        assert_eq!(els[0].text, "Network & internet");
     }
 }
