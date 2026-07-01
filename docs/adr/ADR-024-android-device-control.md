@@ -1,42 +1,39 @@
 # ADR-024: Android Device Control (Managed Emulator + adb_client)
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 
 Commit `ae5fbc5` ("agentic android control via opt-in claude-sdk-android
 harness") added a first cut of Android control: an `android-pilot` agent
-template wired to the off-the-shelf `scrcpy-mcp` MCP server, auto-routed to
-a heavier `claude-sdk-android` Docker image. It deferred this ADR ("ADR-024
-will land after the remaining implementation phases settle").
+template wired to the off-the-shelf `scrcpy-mcp` MCP server, auto-routed to a
+heavier `claude-sdk-android` Docker image. It deferred this ADR.
 
-Reviewing that approach surfaced several problems:
+Reviewing that approach surfaced three problems:
 
 - **Vision-coordinate targeting is unreliable.** The bundled prompt told the
   agent "coordinates come from what you see in the screenshot — never guess,"
   but that *is* the guess: vision LLMs resize the image internally and emit
-  coordinates at the displayed scale. The commit's own POC hit this (a tap at
-  `(252,296)` for a row at `y≈480`). We reproduced it independently: eyeballing
-  the Photos icon gave `x≈560`, but the real center (from `uiautomator`) was
-  `x=664` — a ~100px miss.
+  coordinates at the displayed scale. We reproduced the miss independently —
+  eyeballing the Photos icon gave `x≈560`, the real center (`uiautomator`) was
+  `x=664`, a ~100px miss.
 - **Implicit image swapping.** `image_for_agent()` string-sniffed an agent's
-  MCP args for `"scrcpy-mcp"` and silently substituted a 60 MB-heavier image —
-  hidden coupling between an arg substring and infra provisioning.
+  MCP args for `"scrcpy-mcp"` and silently substituted a 60 MB-heavier image.
 - **scrcpy version coupling.** scrcpy-mcp pins a v4.x server JAR; distro adb
   ships scrcpy 1.25, producing "server version 1.25 does not match client 4.0".
 
 The product use case also sharpened: **let a user log into an Android device
-and have an xpressclaw agent control it.** That makes the device part of the
-product, forcing two decisions the original commit never recorded — how we
-*talk to* the device, and where the device *comes from*.
+and have an xpressclaw agent control it.** That forces two decisions the
+original commit never recorded — how we *talk to* the device, and where the
+device *comes from*.
 
 ### Control transport options
 
 | Option | Notes |
 |--------|-------|
-| Shell out to `adb` | Matches codebase precedent (telegram/github hand-roll their interface; the existing `commands/android.rs` shells `docker`). Requires the `adb` binary present. |
-| `adb_client` crate (pure Rust) | No `adb` binary needed; typed API; can talk to an adb server *or* directly to a device over USB/TCP. |
+| Shell out to `adb` | Matches codebase precedent (telegram/github hand-roll their interface; `commands/android.rs` shells `docker`). Requires the `adb` binary present. |
+| `adb_client` crate (pure Rust) | No `adb` binary; typed API; talks to an adb server *or* directly to a device over USB/TCP. |
 | `scrcpy-mcp` (original) | Off-the-shelf, vision-coordinate based; carries the targeting bug above. |
 
 ### Device-provider options (and the licensing constraint)
@@ -55,69 +52,65 @@ lack Google Play / Google login.
 
 ## Decision
 
-1. **Control transport: the `adb_client` crate**, gated behind a new
-   `android` Cargo feature that is **off by default**. Default builds do not
-   pull `adb_client` (it drags in `rustls`/`rsa`/`image`/etc.), preserving the
-   ~12 MB single-binary story. This follows the opt-in-dependency precedent
-   set for Ollama in ADR-023.
+Replace the `scrcpy-mcp` approach with an **opt-in feature** built on
+`adb_client`, targeting elements through Android's built-in `uiautomator`
+accessibility tree (which we consume, not reimplement), over two device
+providers.
 
-   A spike validated the full screenshot → find-element → tap → verify loop in
-   pure Rust against an emulator, both via the adb server *and* via a direct
-   TCP connection to `adbd` with the adb server killed (no `adb` binary, no
-   server).
+**1. Control transport: the `adb_client` crate**, behind a new `android` Cargo
+feature that is **off by default**. Default builds don't pull `adb_client`'s
+`rustls`/`rsa`/`image` tree, preserving the ~12 MB single-binary story
+(opt-in-dependency precedent: ADR-023). A spike validated the full
+screenshot → find-element → tap → verify loop in pure Rust against an emulator,
+both via the adb server *and* via a direct TCP connection to `adbd` with the
+adb server killed (no `adb` binary, no server).
 
-2. **Element targeting via the accessibility tree, not vision coordinates.**
-   Resolve targets through `uiautomator dump` bounds (`tap_text`/`find_element`)
-   rather than model-emitted pixel coordinates. This is the documented fix for
-   the targeting bug and is what the agent-facing tool will expose.
+**2. Element targeting via the accessibility tree, not vision coordinates.**
+Resolve targets through `uiautomator dump` bounds (`tap_text`/`find_element`) —
+the fix for the targeting bug above. A spike (`android-vision-spike/`) confirmed
+the choice against `uiautomator` ground truth: vision-coord tapping scored ~4/5
+on frontier models but 0–1/5 on the in-house models this deployment prioritizes
+(one is text-only), and downscaling the image made it worse (coords scale back
+up, amplifying error). Accessibility bounds are exact on *any* model. Vision is
+deferred as a fallback for canvas/game screens the tree can't read.
 
-3. **Two first-class device providers behind one abstraction: BYO device and
-   managed local emulator.** Both are required.
-   - **BYO**: the user connects a real phone (USB or wireless debugging) or
-     their own already-running emulator. xpressclaw discovers it and controls
-     it. Ships nothing but `adb_client`.
-   - **Managed emulator**: the user installs the Android SDK; xpressclaw
-     orchestrates `sdkmanager` (ensure system image) → `avdmanager` (ensure
-     AVD) → `emulator` (boot) → `adb_client` (control). The user pulls Google's
-     images themselves, so no redistribution exposure. The **default image is
-     `google_apis_playstore`** (Play Store + Google sign-in) — chosen over
-     `google_apis` because end users need the Store and real Google login. The
-     cost is no `adb root` (production `user` build), which is fine: the control
-     path (tap/screenshot/uiautomator) needs no root. Defined once as
-     `android::sdk::DEFAULT_SYSTEM_IMAGE`. (Our own dev/test AVD stays on
-     `google_apis` for rootability; that's a separate choice.)
+**3. Two device providers behind one provider-agnostic control layer.** Both
+required; `adb_client` connects to whatever `adbd` is present, so providers
+differ only in provisioning/discovery, not control.
+- **BYO** — the user connects a real phone (USB/wireless debugging) or their
+  own running emulator; xpressclaw discovers and controls it. Ships nothing but
+  `adb_client`.
+- **Managed emulator** — the user installs the SDK; xpressclaw orchestrates
+  `sdkmanager` → `avdmanager` → `emulator` → `adb_client`, so the user pulls
+  Google's images themselves (no redistribution exposure). Default image is
+  `google_apis_playstore` (Store + Google login), defined once as
+  `android::sdk::DEFAULT_SYSTEM_IMAGE`; the cost is no `adb root`, fine since
+  tap/screenshot/uiautomator need none.
 
-   The control layer is **provider-agnostic** — `adb_client` connects to
-   whatever `adbd` is present (a phone, or the emulator on `:5555`), so the
-   provider abstraction only differs in *provisioning/discovery*, not control.
-   `redroid` is recorded as a future third provider (Linux server). We never
-   bundle Google's emulator or images.
+`redroid` (AOSP, Linux) is recorded as a future third provider. We never bundle
+Google's emulator or images.
 
-4. **Agent-facing layer: our own MCP tool** exposing `screenshot`,
-   `find_element`/`tap_text`, `tap`, `swipe`, `input_text`, `key_event`,
-   superseding `scrcpy-mcp` and removing the implicit image-swap. (MCP remains
-   the universal tool interface per ADR-005.)
+**4. Agent-facing layer: our own MCP tool** — `screenshot`,
+`find_element`/`tap_text`, `tap`, `swipe`, `input_text`, `key_event` —
+superseding `scrcpy-mcp` and its implicit image-swap (MCP per ADR-005).
 
-5. **Human login view.** On desktop the emulator's own window is the login
-   surface initially; an embedded stream (scrcpy/noVNC) in the web UI is a
-   follow-up. Logins persist via an AVD snapshot.
+**5. Human login view.** The emulator's own window is the login surface
+initially; an embedded stream (scrcpy/noVNC) in the web UI is a follow-up.
+Logins persist via an AVD snapshot.
 
-6. **Surfaced in the Connectors grid as a "device-link" connector** (UX bend).
-   For discoverability the Android device appears as a tile in Settings →
-   Connectors alongside Telegram/Webhook/etc., even though control is *not* an
-   event source/sink. The `AndroidConnector` carries only the adb target
-   (serial/tcp); its `validate_config`/`health` probe device reachability via
-   `adb_client` (the analog of Telegram's `getMe`). It emits no events and
-   rejects `send` — tap/screenshot stay on the MCP/agent path. This bends the
-   connector-vs-control separation deliberately, for a familiar setup surface.
-   A CLI `xpressclaw android doctor` reports the managed-emulator SDK preflight
-   (emulator, system images, AVDs, accel) via `android::sdk::detect()`.
+**6. Surfaced as a "device-link" connector** in the Connectors grid for
+discoverability, even though control is *not* an event source/sink. The
+`AndroidConnector` carries only the adb target (serial/tcp); its
+`validate_config`/`health` probe reachability via `adb_client` (the analog of
+Telegram's `getMe`), emit no events, and reject `send`. A CLI
+`xpressclaw android doctor` reports the managed-emulator SDK preflight
+(emulator, images, AVDs, accel) via `android::sdk::detect()`.
 
 ## Consequences
 
 ### Positive
-- No redistribution/licensing exposure; the only added binary footprint is the
-  `adb_client` crate, and only when `--features android` is set.
+- No redistribution/licensing exposure; the only added binary footprint is
+  `adb_client`, and only under `--features android`.
 - Cross-platform (Windows/macOS/Linux) via the local emulator.
 - Reliable element targeting (accessibility tree) instead of vision guesses.
 - Removes the implicit image-swap and scrcpy version coupling.
@@ -125,11 +118,11 @@ lack Google Play / Google login.
 ### Negative
 - Users must install the Android SDK separately (a few GB) — same trade-off
   ADR-023 accepted for Ollama.
-- **Google-login integrity risk:** emulators can trip Google's Play Integrity
-  checks; AOSP/`redroid` fail certification outright. Fine for non-Google app
-  logins; a real risk if the accounts are Google.
-- We still shell out to the `emulator` binary to *launch* a device (adb_client
-  cannot start an emulator) — but that binary is user-installed, not shipped.
+- **Google-login integrity risk:** emulators can trip Play Integrity checks;
+  AOSP/`redroid` fail certification outright. Fine for non-Google app logins; a
+  real risk if the accounts are Google.
+- We still shell out to the `emulator` binary to *launch* a device (`adb_client`
+  cannot start one) — but that binary is user-installed, not shipped.
 
 ### Risks
 - Emulator hardware acceleration (WHPX/KVM/HAXM) must be present on the host.
