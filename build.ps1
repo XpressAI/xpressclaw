@@ -6,6 +6,7 @@ $SkipTest = $false
 $SkipTauri = $false
 $SkipDocker = $false
 $SkipCheck = $false
+$Android = $false
 $TargetOverride = ""
 
 foreach ($arg in $args) {
@@ -21,13 +22,21 @@ foreach ($arg in $args) {
         "^--skip-tauri$"  { $SkipTauri = $true }
         "^--skip-docker$" { $SkipDocker = $true }
         "^--skip-check$"  { $SkipCheck = $true }
+        "^--android$"     { $Android = $true }
         "^--target=(.+)$" { $TargetOverride = $Matches[1] }
     }
 }
 
-# Build CLI with Cargo (build.rs auto-builds frontend if needed)
-Write-Host "==> Building CLI..."
-cargo build --release -p xpressclaw-cli
+# Build CLI with Cargo (build.rs auto-builds frontend if needed).
+# --android bundles the opt-in Android device-control feature (adb_client) into
+# the sidecar CLI, so the desktop app can serve /v1/android/* (see ADR-024).
+if ($Android) {
+    Write-Host "==> Building CLI (with android feature)..."
+    cargo build --release -p xpressclaw-cli --features android
+} else {
+    Write-Host "==> Building CLI..."
+    cargo build --release -p xpressclaw-cli
+}
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Copy CLI as Tauri sidecar
