@@ -196,6 +196,27 @@ impl AndroidDevice {
         }
         Ok(())
     }
+
+    /// Device screen resolution in pixels, via `wm size`. Callers that map a
+    /// scaled screenshot back to real coordinates need this (the tap endpoint
+    /// takes device pixels, not image pixels).
+    pub fn screen_size(&mut self) -> Result<(i32, i32)> {
+        let out = self.shell("wm size")?;
+        parse_wm_size(&out)
+            .ok_or_else(|| Error::Android(format!("could not parse `wm size`: {out:?}")))
+    }
+}
+
+/// Parse `wm size` output, e.g. `Physical size: 1080x2400`. Prefers an
+/// `Override size:` line when present (that's the effective/captured resolution).
+fn parse_wm_size(out: &str) -> Option<(i32, i32)> {
+    let line = out
+        .lines()
+        .find(|l| l.contains("Override size"))
+        .or_else(|| out.lines().find(|l| l.contains("Physical size")))?;
+    let dims = line.split(':').nth(1)?.trim();
+    let (w, h) = dims.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
 /// Find the bounds of the first `<node>` whose `text` or `content-desc`
@@ -353,6 +374,17 @@ mod tests {
     fn attr_does_not_confuse_clickable_with_long_clickable() {
         let tag = r#" index="0" clickable="false" long-clickable="true" "#;
         assert_eq!(attr(tag, "clickable").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn parses_wm_size() {
+        assert_eq!(parse_wm_size("Physical size: 1080x2400"), Some((1080, 2400)));
+        // Override wins when present (the effective/captured resolution).
+        assert_eq!(
+            parse_wm_size("Physical size: 1080x2400\nOverride size: 720x1280"),
+            Some((720, 1280))
+        );
+        assert_eq!(parse_wm_size("garbage"), None);
     }
 
     #[test]

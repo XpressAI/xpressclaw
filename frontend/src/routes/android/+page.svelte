@@ -11,6 +11,10 @@
 	let textInput = $state('');
 	let status = $state('connecting…');
 	let lastAction = $state<string | null>(null);
+	// Real device resolution (from /v1/android/status). The frame is downscaled,
+	// so we map clicks to these, not to the image's own pixel size.
+	let deviceW = $state(0);
+	let deviceH = $state(0);
 
 	// Emulator lifecycle (mirrors the Docker "installed? / running? / start it" flow)
 	let installed = $state(false);
@@ -18,8 +22,29 @@
 	let avds = $state<string[]>([]);
 	let starting = $state(false);
 
+	// Each device frame takes ~1s to produce. We must NOT poll on a fixed interval
+	// faster than that: pointing <img src> at a new frame before the previous one
+	// finishes cancels the in-flight load, so the image never updates (it looked
+	// "frozen" until a re-navigate). Instead, gate on load — fetch the next frame
+	// only after the current finishes (img onload/onerror), following a short pause.
+	// This adapts to latency, never overlaps requests, and idles when hidden.
+	const FRAME_GAP_MS = 400; // pause after each frame loads before fetching the next
+	let frameTimer: ReturnType<typeof setTimeout> | undefined;
+
 	function refresh() {
 		frameUrl = '/v1/android/screenshot?t=' + Date.now();
+	}
+
+	function scheduleNextFrame() {
+		clearTimeout(frameTimer);
+		frameTimer = setTimeout(() => {
+			if (!reachable) return; // device gone; the <img> remounts & re-kicks later
+			if (typeof document !== 'undefined' && document.hidden) {
+				scheduleNextFrame(); // window hidden — idle without hammering the device
+				return;
+			}
+			refresh();
+		}, FRAME_GAP_MS);
 	}
 
 	async function checkStatus() {
@@ -28,6 +53,10 @@
 			if (!r.ok) throw new Error();
 			const j = await r.json();
 			reachable = !!j.reachable;
+			if (j.width && j.height) {
+				deviceW = j.width;
+				deviceH = j.height;
+			}
 			status = reachable ? 'connected' : 'no device reachable';
 		} catch {
 			reachable = false;
@@ -82,10 +111,13 @@
 	}
 
 	function handleClick(e: MouseEvent) {
-		if (!imgEl || !imgEl.naturalWidth) return;
+		if (!imgEl || !deviceW || !deviceH) return;
 		const rect = imgEl.getBoundingClientRect();
-		const x = Math.round(((e.clientX - rect.left) / rect.width) * imgEl.naturalWidth);
-		const y = Math.round(((e.clientY - rect.top) / rect.height) * imgEl.naturalHeight);
+		// Map the click fraction to real DEVICE pixels. The fraction is
+		// resolution-independent; the frame is downscaled, so imgEl.naturalWidth
+		// would be the JPEG size (wrong) — /tap wants device pixels.
+		const x = Math.round(((e.clientX - rect.left) / rect.width) * deviceW);
+		const y = Math.round(((e.clientY - rect.top) / rect.height) * deviceH);
 		lastAction = `tap (${x}, ${y})`;
 		post('/v1/android/tap', { x, y });
 	}
@@ -104,12 +136,12 @@
 
 	onMount(() => {
 		checkStatus();
-		refresh();
-		const frameTimer = setInterval(refresh, 700);
+		// The frame loop is self-driving: the <img> mounts once reachable, and each
+		// onload/onerror schedules the next frame. We only poll status here.
 		const statusTimer = setInterval(checkStatus, 5000);
 		return () => {
-			clearInterval(frameTimer);
 			clearInterval(statusTimer);
+			clearTimeout(frameTimer);
 		};
 	});
 </script>
@@ -165,6 +197,8 @@
 				src={frameUrl}
 				alt="Android device screen"
 				onclick={handleClick}
+				onload={scheduleNextFrame}
+				onerror={scheduleNextFrame}
 				class="block max-h-[78vh] w-auto cursor-crosshair"
 			/>
 		</div>

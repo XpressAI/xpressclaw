@@ -111,10 +111,13 @@ fn err(e: String) -> (StatusCode, Json<Value>) {
 }
 
 async fn status(State(state): State<AppState>) -> Json<Value> {
-    let reachable = with_device(state.db.clone(), |d| d.shell("echo ok").map(|_| ()))
-        .await
-        .is_ok();
-    Json(json!({ "reachable": reachable }))
+    // Probe reachability and fetch the device resolution in one connection.
+    // The live-view uses width/height to map clicks (on a downscaled frame) back
+    // to real device pixels for /tap.
+    match with_device(state.db.clone(), |d| d.screen_size()).await {
+        Ok((width, height)) => Json(json!({ "reachable": true, "width": width, "height": height })),
+        Err(_) => Json(json!({ "reachable": false })),
+    }
 }
 
 #[derive(Deserialize)]
