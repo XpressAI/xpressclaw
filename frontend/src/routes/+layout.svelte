@@ -5,6 +5,7 @@
 	import { conversations, agents, apps as appsApi } from '$lib/api';
 	import type { Conversation, Agent, App } from '$lib/api';
 	import { agentAvatar } from '$lib/utils';
+	import AndroidLiveView from '$lib/AndroidLiveView.svelte';
 
 	// Bottom tabs per ADR-016
 	const tabs = [
@@ -57,6 +58,35 @@
 
 	function toggleSidebar() {
 		sidebarCollapsed = !sidebarCollapsed;
+	}
+
+	// Right rail — the Android live view. The rail only appears when Android
+	// support is compiled into the server (probe /v1/android/status; 404 = absent).
+	// Clicking its icon spawns the live-view panel beside the chat. State persists.
+	let androidAvailable = $state(false);
+	let androidPanelOpen = $state(false);
+	let androidProbed = $state(false); // got a definitive answer from the server
+
+	async function detectAndroid() {
+		try {
+			const r = await fetch('/v1/android/status');
+			// 200 = feature present (even with no device); 404 = not compiled in.
+			// Either is definitive, so stop retrying. A thrown error (server not up
+			// yet) leaves androidProbed false so the interval retries.
+			androidAvailable = r.ok;
+			androidProbed = true;
+		} catch {
+			/* server unreachable — retry on the next tick */
+		}
+	}
+
+	function toggleAndroidPanel() {
+		androidPanelOpen = !androidPanelOpen;
+		try {
+			localStorage.setItem('androidPanelOpen', androidPanelOpen ? '1' : '0');
+		} catch {
+			/* ignore */
+		}
 	}
 
 	async function loadSidebar() {
@@ -135,10 +165,17 @@
 		if (isSetupRoute) return;
 		loadSidebar();
 		checkDocker();
+		detectAndroid();
+		try {
+			androidPanelOpen = localStorage.getItem('androidPanelOpen') === '1';
+		} catch {
+			/* ignore */
+		}
 		const interval = setInterval(() => {
 			loadSidebar();
 			checkConnection();
 			if (!dockerAvailable) checkDocker();
+			if (!androidProbed) detectAndroid(); // retry only until we get a definitive answer
 		}, 5000);
 		return () => clearInterval(interval);
 	});
@@ -303,10 +340,6 @@
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
 							<span>Workflows</span>
 						</a>
-						<a href="/android" class={linkClass(isActive('/android', $page.url.pathname))}>
-							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 10v6 M20 10v6 M7 9h10v8a1 1 0 0 1 -1 1h-8a1 1 0 0 1 -1 -1v-8a5 5 0 0 1 10 0 M8 3l1 2 M16 3l-1 2 M9 18v3 M15 18v3" /></svg>
-							<span>Android</span>
-						</a>
 					</div>
 
 				{:else if activeTab === 'settings'}
@@ -371,6 +404,40 @@
 				{@render children()}
 			</div>
 		</main>
+
+		<!-- Android live-view panel — spawns from the right rail, beside the chat -->
+		{#if androidAvailable && androidPanelOpen}
+			<aside
+				class="w-80 flex-shrink-0 border-l border-border"
+				style="background: hsl(var(--sidebar))"
+			>
+				<AndroidLiveView />
+			</aside>
+		{/if}
+
+		<!-- Right rail — only present when Android support is installed -->
+		{#if androidAvailable}
+			<nav
+				class="flex w-12 flex-shrink-0 flex-col items-center gap-1 border-l border-border py-2"
+				style="background: hsl(var(--sidebar))"
+			>
+				<button
+					onclick={toggleAndroidPanel}
+					title="Android device"
+					class="flex h-9 w-9 items-center justify-center rounded-lg transition-colors {androidPanelOpen
+						? 'bg-[hsl(var(--sidebar-active))] text-foreground'
+						: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
+				>
+					<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+						><path
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							d="M4 10v6 M20 10v6 M7 9h10v8a1 1 0 0 1 -1 1h-8a1 1 0 0 1 -1 -1v-8a5 5 0 0 1 10 0 M8 3l1 2 M16 3l-1 2 M9 18v3 M15 18v3"
+						/></svg
+					>
+				</button>
+			</nav>
+		{/if}
 	</div>
 
 	<!-- Server disconnected overlay -->
