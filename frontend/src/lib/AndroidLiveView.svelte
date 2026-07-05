@@ -107,15 +107,46 @@
 		setTimeout(refresh, 350);
 	}
 
-	function handleClick(e: MouseEvent) {
-		if (!imgEl || !deviceW || !deviceH) return;
+	// Press-drag-release: a short press is a tap, a drag is a swipe. Coordinates
+	// map to real DEVICE pixels (the frame is downscaled, so imgEl.naturalWidth
+	// would be the JPEG size — wrong; /tap and /swipe want device px).
+	const SWIPE_THRESHOLD = 12; // device px of travel before it counts as a swipe
+	let pressStart: { x: number; y: number; t: number } | null = null;
+
+	function toDevice(e: PointerEvent): { x: number; y: number } | null {
+		if (!imgEl || !deviceW || !deviceH) return null;
 		const rect = imgEl.getBoundingClientRect();
-		// Map the click fraction to real DEVICE pixels — the frame is downscaled,
-		// so imgEl.naturalWidth would be the JPEG size (wrong); /tap wants device px.
-		const x = Math.round(((e.clientX - rect.left) / rect.width) * deviceW);
-		const y = Math.round(((e.clientY - rect.top) / rect.height) * deviceH);
-		lastAction = `tap (${x}, ${y})`;
-		post('/v1/android/tap', { x, y });
+		return {
+			x: Math.round(((e.clientX - rect.left) / rect.width) * deviceW),
+			y: Math.round(((e.clientY - rect.top) / rect.height) * deviceH)
+		};
+	}
+
+	function handlePointerDown(e: PointerEvent) {
+		const p = toDevice(e);
+		if (!p) return;
+		e.preventDefault(); // stop the browser's native image drag (the "drags the image" bug)
+		pressStart = { ...p, t: Date.now() };
+		// Capture so we still get pointerup if the drag ends outside the image.
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+	}
+
+	function handlePointerUp(e: PointerEvent) {
+		const start = pressStart;
+		pressStart = null;
+		const end = toDevice(e);
+		if (!start || !end) return;
+		const dist = Math.hypot(end.x - start.x, end.y - start.y);
+		if (dist < SWIPE_THRESHOLD) {
+			lastAction = `tap (${end.x}, ${end.y})`;
+			post('/v1/android/tap', { x: end.x, y: end.y });
+		} else {
+			// Swipe duration follows the actual drag time — a flick is fast, a
+			// deliberate drag is slow — clamped to a sane range.
+			const ms = Math.min(800, Math.max(50, Date.now() - start.t));
+			lastAction = `swipe (${start.x},${start.y})→(${end.x},${end.y})`;
+			post('/v1/android/swipe', { x1: start.x, y1: start.y, x2: end.x, y2: end.y, ms });
+		}
 	}
 
 	function sendKey(key: string, label: string) {
@@ -195,10 +226,12 @@
 						bind:this={imgEl}
 						src={frameUrl}
 						alt="Android device screen"
-						onclick={handleClick}
+						draggable="false"
+						onpointerdown={handlePointerDown}
+						onpointerup={handlePointerUp}
 						onload={scheduleNextFrame}
 						onerror={scheduleNextFrame}
-						class="block max-h-full w-auto max-w-full cursor-crosshair rounded-[1.25rem]"
+						class="block max-h-full w-auto max-w-full cursor-crosshair select-none rounded-[1.25rem] touch-none"
 					/>
 				</div>
 			</div>
