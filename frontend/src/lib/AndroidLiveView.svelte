@@ -129,8 +129,11 @@
 			console.error('android action failed', e);
 			lastAction = 'error: device unreachable';
 		}
-		// Pull a fresh frame shortly after acting so the change shows up.
-		setTimeout(refresh, 350);
+		// Pull a fresh frame shortly after acting so the change shows up. Route it
+		// through frameTimer (clearing any pending tick first) so this one-off
+		// refresh replaces — rather than races — the self-driving frame loop.
+		clearTimeout(frameTimer);
+		frameTimer = setTimeout(refresh, 350);
 	}
 
 	// Press-drag-release: a short press is a tap, a drag is a swipe. Coordinates

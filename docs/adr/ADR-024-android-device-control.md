@@ -90,9 +90,10 @@ differ only in provisioning/discovery, not control.
 `redroid` (AOSP, Linux) is recorded as a future third provider. We never bundle
 Google's emulator or images.
 
-**4. Agent-facing layer: our own MCP tool** — `screenshot`,
-`find_element`/`tap_text`, `tap`, `swipe`, `input_text`, `key_event` —
-superseding `scrcpy-mcp` and its implicit image-swap (MCP per ADR-005).
+**4. Agent-facing layer: our own MCP tools** — ten, proxying to `/v1/android/*`:
+`screenshot`, `screen_map` (the primary accessibility-tree perception),
+`tap_text`, `tap`, `swipe`, `long_press`, `type`, `key`, `open_app`, and `dump`
+— superseding `scrcpy-mcp` and its implicit image-swap (MCP per ADR-005).
 
 **5. Human login view.** The emulator's own window is the login surface
 initially; an embedded stream (scrcpy/noVNC) in the web UI is a follow-up.

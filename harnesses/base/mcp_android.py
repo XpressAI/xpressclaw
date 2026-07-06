@@ -139,14 +139,19 @@ TOOLS = [
 ]
 
 
+# One client for the process lifetime: it keeps the HTTP connection pool warm
+# across tool calls instead of opening (and tearing down) a fresh TCP connection
+# every time. This stdio server is long-lived, so the client is never closed.
+_client = httpx.Client(timeout=30.0)
+
+
 def _call(method: str, path: str, payload=None) -> httpx.Response:
-    with httpx.Client(timeout=30.0) as client:
-        if method == "GET":
-            resp = client.get(f"{BASE_URL}{path}")
-        else:
-            resp = client.post(f"{BASE_URL}{path}", json=payload or {})
-        resp.raise_for_status()
-        return resp
+    if method == "GET":
+        resp = _client.get(f"{BASE_URL}{path}")
+    else:
+        resp = _client.post(f"{BASE_URL}{path}", json=payload or {})
+    resp.raise_for_status()
+    return resp
 
 
 def _text(s: str):

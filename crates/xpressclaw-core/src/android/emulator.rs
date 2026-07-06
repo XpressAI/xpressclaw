@@ -86,6 +86,13 @@ pub fn start(avd: &str) -> Result<()> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group so the emulator doesn't catch SIGINT/SIGHUP aimed at
+        // the server's controlling terminal (the analog of the Windows detach).
+        cmd.process_group(0);
+    }
 
     cmd.spawn()
         .map_err(|e| Error::Android(format!("failed to launch emulator '{avd}': {e}")))?;
