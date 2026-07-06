@@ -4,6 +4,9 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-create",
+    "core:window:allow-set-focus",
     "shell:allow-open",
     {
       "identifier": "shell:allow-spawn",

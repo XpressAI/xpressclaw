@@ -2,8 +2,15 @@
 	import { onMount } from 'svelte';
 
 	// Collaborative live view of the device, shared with the agent through the same
-	// /v1/android/* endpoints. Rendered inside the right-rail panel (see +layout).
-	// The human can step in any time — you and the agent drive the same screen.
+	// /v1/android/* endpoints. Rendered both in the right-rail panel (see +layout)
+	// and standalone in a detached window (/android) — the same self-contained
+	// component either way. The human can step in any time — you and the agent
+	// drive the same screen.
+
+	// `detachable` shows the "pop out" control (rail only); the detached window
+	// renders without it. `ondetach` is invoked when that control is clicked.
+	let { detachable = false, ondetach }: { detachable?: boolean; ondetach?: () => void } =
+		$props();
 
 	let frameUrl = $state('/v1/android/screenshot?t=0');
 	let reachable = $state(false);
@@ -204,6 +211,22 @@
 				? 'bg-emerald-500/15 text-emerald-400'
 				: 'bg-muted text-muted-foreground'}">{status}</span
 		>
+		{#if detachable}
+			<button
+				onclick={ondetach}
+				title="Open in a separate window"
+				aria-label="Open in a separate window"
+				class="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+			>
+				<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+					><path
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+					/></svg
+				>
+			</button>
+		{/if}
 	</div>
 
 	{#if !reachable}

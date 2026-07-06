@@ -39,7 +39,11 @@
 		return pathname === `/agents/${id}`;
 	}
 
-	let isSetupRoute = $derived($page.url.pathname.startsWith('/setup'));
+	// Routes that render bare, without the app chrome (sidebar / rail / modals):
+	// the setup wizard and the detached Android window (/android).
+	let isChromeless = $derived(
+		$page.url.pathname.startsWith('/setup') || $page.url.pathname.startsWith('/android')
+	);
 
 	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
@@ -89,6 +93,32 @@
 		androidPanelOpen = !androidPanelOpen;
 		try {
 			localStorage.setItem('androidPanelOpen', androidPanelOpen ? '1' : '0');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	// Pop the live view out into its own window: a native OS window in the desktop
+	// app (drag to another monitor, resize freely), a browser popup on the web.
+	// Both load the standalone /android route — the same AndroidLiveView component.
+	// Detaching moves the view out, so collapse the in-app panel.
+	async function detachAndroid() {
+		const label = 'android-live';
+		const url = new URL('/android', window.location.href).href;
+		if ('__TAURI_INTERNALS__' in window) {
+			const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+			const existing = await WebviewWindow.getByLabel(label);
+			if (existing) {
+				await existing.setFocus();
+			} else {
+				new WebviewWindow(label, { url, title: 'Android — xpressclaw', width: 420, height: 900 });
+			}
+		} else {
+			window.open(url, label, 'popup,width=420,height=900');
+		}
+		androidPanelOpen = false;
+		try {
+			localStorage.setItem('androidPanelOpen', '0');
 		} catch {
 			/* ignore */
 		}
@@ -167,7 +197,7 @@
 	}
 
 	onMount(() => {
-		if (isSetupRoute) return;
+		if (isChromeless) return;
 		loadSidebar();
 		checkDocker();
 		detectAndroid();
@@ -210,7 +240,7 @@
 	const plusButton = 'flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] text-sm transition-colors';
 </script>
 
-{#if isSetupRoute}
+{#if isChromeless}
 	{@render children()}
 {:else}
 	<div class="flex h-screen">
@@ -416,7 +446,7 @@
 				class="w-80 flex-shrink-0 border-l border-border"
 				style="background: hsl(var(--sidebar))"
 			>
-				<AndroidLiveView />
+				<AndroidLiveView detachable ondetach={detachAndroid} />
 			</aside>
 		{/if}
 
@@ -461,7 +491,7 @@
 	{/if}
 
 	<!-- Docker unavailable modal -->
-	{#if !dockerAvailable && !isSetupRoute}
+	{#if !dockerAvailable && !isChromeless}
 		<div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
 			<div class="mx-4 w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
 				<div class="flex items-center gap-3">
