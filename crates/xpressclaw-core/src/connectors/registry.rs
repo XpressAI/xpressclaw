@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
@@ -16,7 +17,7 @@ use super::jira::JiraConnector;
 use super::manager::ConnectorManager;
 use super::slack::SlackConnector;
 use super::telegram::TelegramConnector;
-use super::traits::{ChannelConfig, Connector, ConnectorEvent};
+use super::traits::{ChannelConfig, Connector, ConnectorEvent, ValidationResult};
 use super::webhook::WebhookConnector;
 
 /// Manages live connector instances and their lifecycle.
@@ -174,6 +175,16 @@ impl ConnectorRegistry {
 
         Ok(())
     }
+}
+
+/// Validate a connector's config by type *without* starting it — the live check
+/// behind the `/connectors/{id}/test` route. For connectors whose dependency is
+/// external (e.g. an Android device's adb reachability) this actually probes it,
+/// mirroring what `start_connector_inner` does before a real start.
+pub async fn validate_connector_config(connector_type: &str, config: &Value) -> ValidationResult {
+    create_connector(connector_type)
+        .validate_config(config)
+        .await
 }
 
 /// Create a connector instance by type name.

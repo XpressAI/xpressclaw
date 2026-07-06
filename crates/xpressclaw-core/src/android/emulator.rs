@@ -8,7 +8,7 @@
 //! - **start**     → [`start`] (spawn the emulator, detached).
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::android::sdk;
 use crate::error::{Error, Result};
@@ -59,22 +59,36 @@ pub fn start(avd: &str) -> Result<()> {
     let emu = emulator_binary().ok_or_else(|| {
         Error::Android("emulator binary not found — install the Android SDK".to_string())
     })?;
-    let emu_str = emu.to_string_lossy().to_string();
 
-    // Detach so the emulator outlives this process (same intent as
-    // start_docker_desktop launching Docker Desktop independently).
+    // Capture the emulator's own diagnostics (bad AVD, missing WHPX/KVM
+    // acceleration) to a log file instead of discarding them. Booting is async so
+    // we can't await a failure that happens seconds after spawn — but with the
+    // output on disk the reason is at least recoverable. Best-effort: fall back to
+    // null if the log can't be opened.
+    let log_path = std::env::temp_dir().join("xpressclaw-emulator.log");
+    let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+
+    // Spawn the emulator binary directly (no `cmd /c start` shell layer) so a
+    // launch failure surfaces as a real spawn error, and detach it so it outlives
+    // this process. On Windows CREATE_NO_WINDOW detaches without a console window
+    // (the same approach as the Tauri sidecar launch); the emulator draws its own
+    // GUI window.
+    let mut cmd = Command::new(&emu);
+    cmd.args(["-avd", avd, "-no-boot-anim"])
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
     #[cfg(target_os = "windows")]
-    let spawned = Command::new("cmd")
-        .args(["/c", "start", "", &emu_str, "-avd", avd, "-no-boot-anim"])
-        .spawn();
-    #[cfg(not(target_os = "windows"))]
-    let spawned = Command::new(&emu)
-        .args(["-avd", avd, "-no-boot-anim"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
 
-    spawned
-        .map(|_| ())
-        .map_err(|e| Error::Android(format!("failed to launch emulator '{avd}': {e}")))
+    cmd.spawn()
+        .map_err(|e| Error::Android(format!("failed to launch emulator '{avd}': {e}")))?;
+    tracing::info!(avd, log = %log_path.display(), "launched android emulator");
+    Ok(())
 }

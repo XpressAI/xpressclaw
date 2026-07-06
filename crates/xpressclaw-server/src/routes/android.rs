@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::android::AndroidDevice;
+use xpressclaw_core::android::{emulator, AndroidDevice};
 use xpressclaw_core::connectors::manager::ConnectorManager;
 use xpressclaw_core::db::Database;
 
@@ -36,7 +36,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Which adb endpoint to drive.
-enum DeviceTarget {
+pub(crate) enum DeviceTarget {
     Server(String),
     Tcp(SocketAddr),
 }
@@ -48,11 +48,29 @@ impl DeviceTarget {
             DeviceTarget::Tcp(a) => AndroidDevice::via_tcp(a),
         }
     }
+
+    /// The managed emulator (default serial) is the only target we can `start`;
+    /// a BYO serial/tcp device is provisioned out-of-band.
+    pub(crate) fn is_managed_emulator(&self) -> bool {
+        matches!(self, DeviceTarget::Server(s) if s == emulator::DEFAULT_SERIAL)
+    }
+
+    /// Blocking reachability probe (adb_client is synchronous) — true when the
+    /// device is up and finished booting. Call inside `spawn_blocking`.
+    pub(crate) fn booted(self) -> bool {
+        match self.connect() {
+            Ok(mut d) => d
+                .shell("getprop sys.boot_completed")
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
 }
 
 /// Resolve the device from the configured `android` connector, else default to
 /// the standard emulator serial.
-fn resolve_target(db: Arc<Database>) -> DeviceTarget {
+pub(crate) fn resolve_target(db: Arc<Database>) -> DeviceTarget {
     let mgr = ConnectorManager::new(db);
     if let Ok(list) = mgr.list() {
         if let Some(rec) = list
@@ -81,7 +99,7 @@ fn resolve_target(db: Arc<Database>) -> DeviceTarget {
             }
         }
     }
-    DeviceTarget::Server("emulator-5554".to_string())
+    DeviceTarget::Server(emulator::DEFAULT_SERIAL.to_string())
 }
 
 /// Connect (blocking adb_client) and run `f` against the device, off-thread.

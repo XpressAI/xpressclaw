@@ -192,25 +192,35 @@ async fn check_ollama() -> Json<Value> {
 /// `{available, installed, can_start}` shape as `check_docker` (here: a running
 /// emulator, an installed+AVD-ready SDK, and whether we can spawn one), plus the
 /// detailed SDK breakdown the `/android` page uses to know which AVD to boot.
-async fn check_android_sdk() -> Json<Value> {
+async fn check_android_sdk(State(state): State<AppState>) -> Json<Value> {
     #[cfg(feature = "android")]
     {
-        use xpressclaw_core::android::{emulator, sdk};
+        use xpressclaw_core::android::sdk;
         let status = sdk::detect();
         let installed = status.ready();
-        let available =
-            tokio::task::spawn_blocking(|| emulator::is_running(emulator::DEFAULT_SERIAL))
-                .await
-                .unwrap_or(false);
+        // Probe the SAME device the control plane drives (resolve_target), not a
+        // hardcoded emulator-5554 — otherwise this lifecycle check and
+        // /v1/android/status can disagree about which device they manage, e.g.
+        // offering "Start emulator" for a BYO tcp device that's merely offline.
+        // Only the managed emulator can actually be spawned.
+        let db = state.db.clone();
+        let (available, is_managed) = tokio::task::spawn_blocking(move || {
+            let target = crate::routes::android::resolve_target(db);
+            let managed = target.is_managed_emulator();
+            (target.booted(), managed)
+        })
+        .await
+        .unwrap_or((false, true));
         Json(json!({
-            "available": available,                  // an emulator is up & booted
-            "installed": installed,                  // SDK + emulator + image + AVD
-            "can_start": installed && !available,    // safe to spawn one
+            "available": available,                              // the target device is up & booted
+            "installed": installed,                              // SDK + emulator + image + AVD
+            "can_start": installed && !available && is_managed,  // safe to spawn the managed emulator
             "sdk": status,
         }))
     }
     #[cfg(not(feature = "android"))]
     {
+        let _ = state;
         Json(json!({ "available": false, "installed": false, "can_start": false }))
     }
 }

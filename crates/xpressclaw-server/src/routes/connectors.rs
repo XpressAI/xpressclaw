@@ -123,6 +123,29 @@ async fn test_connector(
         _ => internal_error(e),
     })?;
 
+    // Android's "test" is a live device probe, not just a config-shape check:
+    // run the connector's real validate_config (adb reachability) so an offline
+    // device or wrong serial reports failure instead of unconditional success.
+    #[cfg(feature = "android")]
+    if c.connector_type == "android" {
+        let v = xpressclaw_core::connectors::registry::validate_connector_config(
+            "android", &c.config,
+        )
+        .await;
+        return if v.valid {
+            mgr.set_status(&id, "connected", None)
+                .map_err(internal_error)?;
+            Ok(Json(json!({ "ok": true })))
+        } else {
+            let err = v
+                .error
+                .unwrap_or_else(|| "device not reachable".to_string());
+            mgr.set_status(&id, "error", Some(&err))
+                .map_err(internal_error)?;
+            Ok(Json(json!({ "ok": false, "error": err })))
+        };
+    }
+
     // Basic validation: check config is well-formed for the type
     let ok = match c.connector_type.as_str() {
         "telegram" => c.config.get("bot_token").and_then(|v| v.as_str()).is_some(),
@@ -152,9 +175,9 @@ async fn test_connector(
                 && c.config.get("username").and_then(|v| v.as_str()).is_some()
                 && c.config.get("password").and_then(|v| v.as_str()).is_some()
         }
-        // Android config is optional (serial defaults to emulator-5554); the
-        // real device-reachability check happens in the connector's validate_config.
-        "android" => true,
+        // "android" is handled above (live probe). When the android feature is
+        // compiled out, a stale android record falls through here and, like any
+        // unknown type, passes the config-shape check (there's nothing to probe).
         _ => true,
     };
 

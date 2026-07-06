@@ -77,31 +77,50 @@
 		starting = true;
 		status = 'starting emulator…';
 		try {
-			await fetch('/api/setup/start-android', {
+			const r = await fetch('/api/setup/start-android', {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ avd: avds[0] ?? null })
 			});
+			if (!r.ok) {
+				const detail = await r.json().catch(() => null);
+				status = `start failed: ${detail?.error ?? r.status}`;
+				starting = false;
+				return;
+			}
 			// Cold boot can take ~60s; poll until it's reachable.
 			for (let i = 0; i < 60 && !reachable; i++) {
 				await new Promise((r) => setTimeout(r, 2000));
 				await checkStatus();
 			}
+			// Fell through the poll without connecting — the emulator likely failed
+			// to boot (bad AVD, no acceleration); the reason is in the server's
+			// emulator log. Don't leave the panel silently back on "no device".
+			if (!reachable) status = 'emulator did not become reachable — check the server log';
 		} catch (e) {
 			console.error('start emulator failed', e);
+			status = 'start failed: server unreachable';
 		}
 		starting = false;
 	}
 
 	async function post(path: string, body: unknown) {
 		try {
-			await fetch(path, {
+			const r = await fetch(path, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify(body)
 			});
+			// fetch only rejects on network errors, so a 4xx/5xx (device dropped,
+			// bad coordinates) would otherwise pass silently while lastAction still
+			// claims the action succeeded. Surface the server's error instead.
+			if (!r.ok) {
+				const detail = await r.json().catch(() => null);
+				lastAction = `error: ${detail?.error ?? r.status}`;
+			}
 		} catch (e) {
 			console.error('android action failed', e);
+			lastAction = 'error: device unreachable';
 		}
 		// Pull a fresh frame shortly after acting so the change shows up.
 		setTimeout(refresh, 350);
