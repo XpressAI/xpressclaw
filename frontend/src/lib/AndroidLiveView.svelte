@@ -135,9 +135,13 @@
 	function toDevice(e: PointerEvent): { x: number; y: number } | null {
 		if (!imgEl || !deviceW || !deviceH) return null;
 		const rect = imgEl.getBoundingClientRect();
+		// Clamp to the screen: with setPointerCapture a drag can end past the
+		// letterboxed frame edge, which would otherwise post negative or
+		// beyond-screen coordinates that `input tap`/`swipe` reject or misplace.
+		const clamp = (v: number, max: number) => Math.max(0, Math.min(max, Math.round(v)));
 		return {
-			x: Math.round(((e.clientX - rect.left) / rect.width) * deviceW),
-			y: Math.round(((e.clientY - rect.top) / rect.height) * deviceH)
+			x: clamp(((e.clientX - rect.left) / rect.width) * deviceW, deviceW - 1),
+			y: clamp(((e.clientY - rect.top) / rect.height) * deviceH, deviceH - 1)
 		};
 	}
 

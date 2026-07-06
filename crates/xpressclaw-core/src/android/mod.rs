@@ -111,8 +111,15 @@ impl AndroidDevice {
     pub fn screenshot_scaled(&mut self, max_dim: u32, quality: u8) -> Result<Vec<u8>> {
         let png = self.screenshot_bytes()?;
         let img = image::load_from_memory(&png)
-            .map_err(|e| Error::Android(format!("decode screenshot: {e}")))?
-            .resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
+            .map_err(|e| Error::Android(format!("decode screenshot: {e}")))?;
+        // Only ever shrink. `resize` scales to fit the bounds in BOTH directions,
+        // so it would enlarge a frame already smaller than max_dim — bigger,
+        // blurrier payload for no gain, the opposite of this function's purpose.
+        let img = if img.width().max(img.height()) > max_dim {
+            img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
         let rgb = img.to_rgb8();
         let mut out = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
