@@ -61,8 +61,8 @@
 	}
 
 	// Right rail — the Android live view. The rail only appears when Android
-	// support is compiled into the server (probe /v1/android/status; 404 = absent).
-	// Clicking its icon spawns the live-view panel beside the chat. State persists.
+	// support is compiled into the server (probe /v1/android/status). Clicking
+	// its icon spawns the live-view panel beside the chat. State persists.
 	let androidAvailable = $state(false);
 	let androidPanelOpen = $state(false);
 	let androidProbed = $state(false); // got a definitive answer from the server
@@ -70,10 +70,15 @@
 	async function detectAndroid() {
 		try {
 			const r = await fetch('/v1/android/status');
-			// 200 = feature present (even with no device); 404 = not compiled in.
-			// Either is definitive, so stop retrying. A thrown error (server not up
-			// yet) leaves androidProbed false so the interval retries.
-			androidAvailable = r.ok;
+			// The feature is present only when the android route actually answers.
+			// When it's NOT compiled in, the route is absent and the request falls
+			// through to the SPA fallback, which serves index.html with a 200 — so
+			// `r.ok` alone is always true. The real handler returns JSON; require an
+			// application/json content-type to tell the two apart. Either outcome is
+			// definitive, so stop retrying. A thrown error (server not up yet) leaves
+			// androidProbed false so the interval retries.
+			const contentType = r.headers.get('content-type') || '';
+			androidAvailable = r.ok && contentType.includes('application/json');
 			androidProbed = true;
 		} catch {
 			/* server unreachable — retry on the next tick */

@@ -41,6 +41,21 @@ pub fn emulator_binary() -> Option<PathBuf> {
 /// `start_docker_desktop`. Returns once the launch is issued; booting is async
 /// (poll [`is_running`] afterward).
 pub fn start(avd: &str) -> Result<()> {
+    // Validate before this string reaches a shell. On Windows it is handed to
+    // `cmd /c start`, and cmd.exe re-parses the command line with its own quoting
+    // rules (a documented std caveat) — so metacharacters like `&`, `|`, or `"`
+    // in the AVD name could otherwise break out of the argument and run arbitrary
+    // commands on the HOST. AVD names are `[A-Za-z0-9._-]`; reject anything else.
+    if avd.is_empty()
+        || !avd
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(Error::Android(format!(
+            "invalid AVD name {avd:?} (expected characters in [A-Za-z0-9._-])"
+        )));
+    }
+
     let emu = emulator_binary().ok_or_else(|| {
         Error::Android("emulator binary not found — install the Android SDK".to_string())
     })?;

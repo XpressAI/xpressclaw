@@ -164,10 +164,12 @@ impl AndroidDevice {
         Ok(())
     }
 
-    /// Type text. Spaces are sent as `%s` (the adb `input text` convention).
+    /// Type text. Spaces are sent as `%s` (the adb `input text` convention); the
+    /// whole argument is single-quoted so quotes, `;`, `$`, backticks, etc. in
+    /// the text are treated as literal input, not device-shell metacharacters.
     pub fn input_text(&mut self, text: &str) -> Result<()> {
         let escaped = text.replace(' ', "%s");
-        self.shell(&format!("input text {escaped}"))?;
+        self.shell(&format!("input text {}", sh_quote(&escaped)))?;
         Ok(())
     }
 
@@ -186,6 +188,19 @@ impl AndroidDevice {
     /// Launch an app by package name via its launcher intent — far more reliable
     /// than hunting for and tapping an icon.
     pub fn open_app(&mut self, package: &str) -> Result<()> {
+        // Reject anything that isn't a valid Android package name before it
+        // reaches the device shell — otherwise metacharacters (`;`, `$(...)`,
+        // `&&`) would run arbitrary commands on the device and could spoof the
+        // launch-failure check below. Package names are `[A-Za-z0-9._]`.
+        if package.is_empty()
+            || !package
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
+        {
+            return Err(Error::Android(format!(
+                "invalid package name {package:?} (expected characters in [A-Za-z0-9._])"
+            )));
+        }
         let out = self.shell(&format!(
             "monkey -p {package} -c android.intent.category.LAUNCHER 1"
         ))?;
@@ -205,6 +220,13 @@ impl AndroidDevice {
         parse_wm_size(&out)
             .ok_or_else(|| Error::Android(format!("could not parse `wm size`: {out:?}")))
     }
+}
+
+/// POSIX single-quote a string for safe interpolation into a device shell
+/// command. Wraps in `'…'` and rewrites each embedded `'` as `'\''` (close the
+/// quote, an escaped literal quote, reopen) so no metacharacter can escape.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Parse `wm size` output, e.g. `Physical size: 1080x2400`. Prefers an
@@ -374,6 +396,16 @@ mod tests {
     fn attr_does_not_confuse_clickable_with_long_clickable() {
         let tag = r#" index="0" clickable="false" long-clickable="true" "#;
         assert_eq!(attr(tag, "clickable").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn sh_quote_neutralizes_metacharacters() {
+        assert_eq!(sh_quote("hello"), "'hello'");
+        // An embedded single quote is closed, escaped, and reopened.
+        assert_eq!(sh_quote("what's"), r"'what'\''s'");
+        // Shell metacharacters stay inside the quotes → literal, not executable.
+        assert_eq!(sh_quote("a; rm -rf /"), "'a; rm -rf /'");
+        assert_eq!(sh_quote("$(reboot)"), "'$(reboot)'");
     }
 
     #[test]
