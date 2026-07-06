@@ -1,0 +1,16 @@
+The five minor review findings that never made the top 10, batched.
+
+1. AndroidLiveView.svelte post(): the post-action 'setTimeout(refresh,350)' was untracked, so a tap during the ~400ms frame gap could schedule a refresh that overlaps the self-driving frame loop (which is otherwise coordinated only via frameTimer/scheduleNextFrame). Now clearTimeout(frameTimer)+frameTimer=setTimeout(refresh,350) so the one-off refresh replaces rather than races the loop.
+
+2. setup.rs check_android_sdk: sdk::detect() was called inline in the async handler, and it shells out to xpressclaw_play
+xpressclaw_test /  (blocking the executor). My earlier #6 fix wrapped only the device probe in spawn_blocking. Moved detect() into the SAME spawn_blocking (returns (status, booted, is_managed)); switched from unwrap_or((false,true)) to a match so a JoinError -> not-ready JSON (avoids needing SdkStatus: Default).
+
+3. emulator::start unix branch: added cmd.process_group(0) via std::os::unix::process::CommandExt so the emulator gets its own process group and doesn't catch SIGINT/SIGHUP aimed at the server's controlling terminal — the unix analog of the Windows CREATE_NO_WINDOW detach. Chose process_group(0) (stable, safe) over a pre_exec setsid (unsafe); good enough for the foreground-server edge case, and the desktop app has no controlling terminal anyway.
+
+4. mcp_android.py: _call() opened  per call -> new TCP connect + pool teardown every tool call. Replaced with a module-level _client reused for the process lifetime (long-lived stdio server; never explicitly closed).
+
+5. ADR-024 decision #4 listed 6 MCP tools; the server ships 10. Updated to list all ten (screenshot, screen_map, tap_text, tap, swipe, long_press, type, key, open_app, dump).
+
+Verified: 9 core tests pass, cargo check --workspace --features android clean, frontend npm run check 0 errors. Python not on local PATH; mcp change is a trivial dedent, container build py_compiles it.
+
+Deferred to a SEPARATE PR (per fahreza): real-device discovery UX — the control layer already supports BYO devices end-to-end (via_server/via_tcp, CLI --serial/--tcp, connector serial+tcp fields, resolve_target) per ADR-024 #3, but the live-view 'not reachable' panel is emulator-first and has no device picker / no adb-devices discovery. Plan for that PR: add /v1/android/devices (ADBServer enumerate) + rework the panel to present detected devices as peers to 'boot the managed emulator'.
