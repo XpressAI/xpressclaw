@@ -63,12 +63,19 @@ fn main() {
 
     builder
         .manage(SidecarState(Mutex::new(None)))
-        // Window close (Cmd-W / red X) → hide to tray instead of quitting.
+        // Window close (Cmd-W / red X) → hide to tray instead of quitting —
+        // but ONLY for the main window. Secondary windows (the detached
+        // android-live view) must close for real: hiding them keeps the label
+        // registered, so `tauri://destroyed` never fires (the rail panel can't
+        // reattach) and the next detach focuses an invisible window instead of
+        // spawning one.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                info!("window hidden to tray");
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    info!("window hidden to tray");
+                }
             }
         })
         // Handle our custom "quit" menu item (Cmd-Q on macOS)

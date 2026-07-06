@@ -98,6 +98,49 @@
 		}
 	}
 
+	// Reattach: bring the live view back into the rail. Triggered when the
+	// detached window goes away — the user closed it, or clicked its reattach
+	// control (which just window.close()es itself; wry maps window.close() to
+	// destroying the native window, no IPC needed).
+	function reattachAndroid() {
+		androidPanelOpen = true;
+		try {
+			localStorage.setItem('androidPanelOpen', '1');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	// Desktop: watch the detached native window and reattach when it's destroyed.
+	// `once` here is IPC (plugin:event|listen / |unlisten), so the remote-webview
+	// capability must grant core:event:allow-listen + core:event:allow-unlisten.
+	// The listener is keyed by window LABEL, not instance, so it survives the
+	// window being recreated; the flag only prevents stacking duplicates.
+	let detachedDestroyHooked = false;
+	function hookDetachedClose(w: import('@tauri-apps/api/webviewWindow').WebviewWindow) {
+		if (detachedDestroyHooked) return;
+		detachedDestroyHooked = true;
+		w.once('tauri://destroyed', () => {
+			detachedDestroyHooked = false;
+			reattachAndroid();
+		}).catch((e: unknown) => {
+			detachedDestroyHooked = false;
+			console.error('failed to watch detached window', e);
+		});
+	}
+
+	// Browser: the popup handle is all we have — poll for it closing.
+	let popupPoll: ReturnType<typeof setInterval> | undefined;
+	function watchPopupClose(popup: Window) {
+		clearInterval(popupPoll);
+		popupPoll = setInterval(() => {
+			if (popup.closed) {
+				clearInterval(popupPoll);
+				reattachAndroid();
+			}
+		}, 1000);
+	}
+
 	// Pop the live view out into its own window: a native OS window in the desktop
 	// app (drag to another monitor, resize freely), a browser popup on the web.
 	// Both load the standalone /android route — the same AndroidLiveView component.
@@ -105,16 +148,37 @@
 	async function detachAndroid() {
 		const label = 'android-live';
 		const url = new URL('/android', window.location.href).href;
-		if ('__TAURI_INTERNALS__' in window) {
-			const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
-			const existing = await WebviewWindow.getByLabel(label);
-			if (existing) {
-				await existing.setFocus();
+		try {
+			// In the desktop app the frontend is served from http://localhost (remote
+			// content to Tauri), where every IPC call is denied unless the capability
+			// grants this origin (capabilities/remote-webview.json). The grant must
+			// include get-all-windows: getByLabel() invokes plugin:window|get_all_windows
+			// before anything else, so a missing grant rejects right here and the catch
+			// below swallows the detach. __TAURI_INTERNALS__ is always injected (even
+			// for remote content), so the window.open branch only runs in a real browser.
+			if ('__TAURI_INTERNALS__' in window) {
+				const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+				const existing = await WebviewWindow.getByLabel(label);
+				if (existing) {
+					await existing.setFocus();
+					hookDetachedClose(existing);
+				} else {
+					const w = new WebviewWindow(label, {
+						url,
+						title: 'Android — xpressclaw',
+						width: 420,
+						height: 900
+					});
+					w.once('tauri://error', (e) => console.error('detach window failed', e));
+					hookDetachedClose(w);
+				}
 			} else {
-				new WebviewWindow(label, { url, title: 'Android — xpressclaw', width: 420, height: 900 });
+				const popup = window.open(url, label, 'popup,width=420,height=900');
+				if (popup) watchPopupClose(popup);
 			}
-		} else {
-			window.open(url, label, 'popup,width=420,height=900');
+		} catch (e) {
+			console.error('detach failed', e);
+			return; // leave the in-app panel open so the view isn't lost
 		}
 		androidPanelOpen = false;
 		try {
@@ -206,13 +270,28 @@
 		} catch {
 			/* ignore */
 		}
+		// Desktop: if the main window (re)loaded while a detached live view is
+		// open, re-hook its close watcher so closing it still reattaches.
+		if ('__TAURI_INTERNALS__' in window) {
+			import('@tauri-apps/api/webviewWindow')
+				.then(({ WebviewWindow }) => WebviewWindow.getByLabel('android-live'))
+				.then((w) => {
+					if (w) hookDetachedClose(w);
+				})
+				.catch(() => {
+					/* no IPC grant or lookup failed — reattach-on-close just won't auto-fire */
+				});
+		}
 		const interval = setInterval(() => {
 			loadSidebar();
 			checkConnection();
 			if (!dockerAvailable) checkDocker();
 			if (!androidProbed) detectAndroid(); // retry only until we get a definitive answer
 		}, 5000);
-		return () => clearInterval(interval);
+		return () => {
+			clearInterval(interval);
+			clearInterval(popupPoll);
+		};
 	});
 
 	function convIcon(conv: Conversation): string {

@@ -1,12 +1,9 @@
 {
   "identifier": "default",
-  "description": "Default permissions for xpressclaw desktop app",
+  "description": "Default permissions for xpressclaw desktop app. No `remote` grant: these permissions (fs, shell, dialog, clipboard) are NOT exposed to the frontend served over http://localhost — only the minimal window-creation grant in remote-webview.json is.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "core:webview:allow-create-webview-window",
-    "core:window:allow-create",
-    "core:window:allow-set-focus",
     "shell:allow-open",
     {
       "identifier": "shell:allow-spawn",

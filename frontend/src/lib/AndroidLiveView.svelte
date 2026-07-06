@@ -9,8 +9,13 @@
 
 	// `detachable` shows the "pop out" control (rail only); the detached window
 	// renders without it. `ondetach` is invoked when that control is clicked.
-	let { detachable = false, ondetach }: { detachable?: boolean; ondetach?: () => void } =
-		$props();
+	// `onreattach` (detached window only) shows the mirror control that returns
+	// the view to the app.
+	let {
+		detachable = false,
+		ondetach,
+		onreattach
+	}: { detachable?: boolean; ondetach?: () => void; onreattach?: () => void } = $props();
 
 	let frameUrl = $state('/v1/android/screenshot?t=0');
 	let reachable = $state(false);
@@ -230,6 +235,22 @@
 				>
 			</button>
 		{/if}
+		{#if onreattach}
+			<button
+				onclick={onreattach}
+				title="Return to the app"
+				aria-label="Return to the app"
+				class="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+			>
+				<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+					><path
+						stroke-linecap="round"
+						stroke-linejoin="round"
+						d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25"
+					/></svg
+				>
+			</button>
+		{/if}
 	</div>
 
 	{#if !reachable}
@@ -262,13 +283,19 @@
 		</div>
 	{:else}
 		<div class="flex min-h-0 flex-1 flex-col gap-3 p-3">
-			<!-- Phone screen — fit the whole device within the available height so
-			     it's never cut off; letterboxed on the black background if narrower. -->
-			<!-- Draw the device: a bezel that hugs the screen, so the panel
-			     background shows around a phone shape instead of black bars. -->
-			<div class="flex min-h-0 flex-1 items-center justify-center p-2">
+			<!-- Phone: the OUTLINE is sized from the real device dimensions
+			     (deviceW×deviceH from /status), not from whatever frame is loaded —
+			     so it stays a correct device shape even when the screen is black,
+			     asleep, or still loading. The wrapper is a size container and the
+			     bezel width is min(fit-to-width, fit-to-height × ratio) in cq units:
+			     a true contain-fit that tracks BOTH axes on resize. (A plain
+			     `height: 100%` breaks here — percentage heights don't reliably
+			     resolve through flex items, so vertical resizes were ignored.) -->
+			<div class="flex min-h-0 flex-1 items-center justify-center p-2 [container-type:size]">
 				<div
-					class="flex max-h-full max-w-full rounded-[1.75rem] bg-neutral-900 p-1.5 shadow-lg ring-1 ring-white/10"
+					class="rounded-[1.75rem] bg-neutral-900 p-1.5 shadow-lg ring-1 ring-white/10"
+					style="aspect-ratio: {deviceW || 1080} / {deviceH || 2400}; width: min(100cqw, calc(100cqh * {(deviceW ||
+						1080) / (deviceH || 2400)}));"
 				>
 					<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
 					<img
@@ -280,7 +307,7 @@
 						onpointerup={handlePointerUp}
 						onload={scheduleNextFrame}
 						onerror={scheduleNextFrame}
-						class="block max-h-full w-auto max-w-full cursor-crosshair select-none rounded-[1.25rem] touch-none"
+						class="block h-full w-full rounded-[1.25rem] object-contain cursor-crosshair select-none touch-none"
 					/>
 				</div>
 			</div>
