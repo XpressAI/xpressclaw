@@ -36,9 +36,69 @@
 
 	// Each device frame takes ~1s to produce. Gate on load — fetch the next frame
 	// only after the current finishes (img onload/onerror) plus a short pause — so
-	// requests never overlap. Idles while the window is hidden.
-	const FRAME_GAP_MS = 400;
+	// requests never overlap. Idles while the window is hidden. The gap is
+	// user-tunable from the gear panel and persisted locally.
+	const FRAME_GAP_DEFAULT = 400;
+	let frameGapMs = $state(FRAME_GAP_DEFAULT);
 	let frameTimer: ReturnType<typeof setTimeout> | undefined;
+
+	// Gear panel: view settings + the device target (android section in config).
+	let showConfig = $state(false);
+	let targetSerial = $state('');
+	let targetTcp = $state('');
+	let targetMsg = $state('');
+	let targetSaving = $state(false);
+
+	async function loadTarget() {
+		try {
+			const j = await (await fetch('/api/setup/android-target')).json();
+			targetSerial = j.serial ?? '';
+			targetTcp = j.tcp ?? '';
+		} catch {
+			/* leave the fields as-is */
+		}
+	}
+
+	async function saveTarget() {
+		targetSaving = true;
+		targetMsg = '';
+		try {
+			const r = await fetch('/api/setup/android-target', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ serial: targetSerial, tcp: targetTcp })
+			});
+			if (r.ok) {
+				targetMsg = 'saved';
+				// Re-probe: the loop should now be looking at the new device.
+				await checkStatus();
+			} else {
+				const detail = await r.json().catch(() => null);
+				targetMsg = `error: ${detail?.error ?? r.status}`;
+			}
+		} catch {
+			targetMsg = 'error: server unreachable';
+		}
+		targetSaving = false;
+	}
+
+	function toggleConfig() {
+		showConfig = !showConfig;
+		if (showConfig) {
+			targetMsg = '';
+			loadTarget();
+		}
+	}
+
+	function setFrameGap(ms: number) {
+		if (!Number.isFinite(ms) || ms <= 0) return;
+		frameGapMs = ms;
+		try {
+			localStorage.setItem('androidFrameGapMs', String(ms));
+		} catch {
+			/* private mode etc. — setting just won't persist */
+		}
+	}
 
 	function refresh() {
 		frameUrl = '/v1/android/screenshot?t=' + Date.now();
@@ -53,7 +113,7 @@
 				return;
 			}
 			refresh();
-		}, FRAME_GAP_MS);
+		}, frameGapMs);
 	}
 
 	async function checkStatus() {
@@ -200,6 +260,12 @@
 	}
 
 	onMount(() => {
+		try {
+			const saved = parseInt(localStorage.getItem('androidFrameGapMs') ?? '', 10);
+			if (Number.isFinite(saved) && saved > 0) frameGapMs = saved;
+		} catch {
+			/* keep default */
+		}
 		checkStatus();
 		// The frame loop is self-driving: the <img> mounts once reachable and each
 		// onload/onerror schedules the next frame. We only poll status here.
@@ -219,39 +285,97 @@
 				? 'bg-emerald-500/15 text-emerald-400'
 				: 'bg-muted text-muted-foreground'}">{status}</span
 		>
-		{#if detachable}
+		<div class="ml-auto flex items-center gap-1">
 			<button
-				onclick={ondetach}
-				title="Open in a separate window"
-				aria-label="Open in a separate window"
-				class="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+				onclick={toggleConfig}
+				title="Android settings"
+				aria-label="Android settings"
+				class="flex h-7 w-7 items-center justify-center rounded-md hover:bg-accent hover:text-foreground {showConfig
+					? 'bg-accent text-foreground'
+					: 'text-muted-foreground'}"
 			>
 				<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
 					><path
 						stroke-linecap="round"
 						stroke-linejoin="round"
-						d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
-					/></svg
+						d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z"
+					/><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg
 				>
 			</button>
-		{/if}
-		{#if onreattach}
-			<button
-				onclick={onreattach}
-				title="Return to the app"
-				aria-label="Return to the app"
-				class="ml-auto flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-			>
-				<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
-					><path
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25"
-					/></svg
+			{#if detachable}
+				<button
+					onclick={ondetach}
+					title="Open in a separate window"
+					aria-label="Open in a separate window"
+					class="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
 				>
-			</button>
-		{/if}
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+						><path
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+						/></svg
+					>
+				</button>
+			{/if}
+			{#if onreattach}
+				<button
+					onclick={onreattach}
+					title="Return to the app"
+					aria-label="Return to the app"
+					class="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+				>
+					<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+						><path
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							d="M9 9V4.5M9 9H4.5M9 9L3.75 3.75M9 15v4.5M9 15H4.5M9 15l-5.25 5.25M15 9h4.5M15 9V4.5M15 9l5.25-5.25M15 15h4.5M15 15v4.5m0-4.5l5.25 5.25"
+						/></svg
+					>
+				</button>
+			{/if}
+		</div>
 	</div>
+
+	{#if showConfig}
+		<div class="flex-shrink-0 space-y-2 border-b border-border bg-muted/20 px-3 py-2.5">
+			<div class="flex items-center justify-between gap-2">
+				<span class="text-xs text-muted-foreground">Refresh rate</span>
+				<select
+					value={String(frameGapMs)}
+					onchange={(e) => setFrameGap(parseInt((e.currentTarget as HTMLSelectElement).value, 10))}
+					class="rounded-md border border-input bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+				>
+					<option value="400">Fast (0.4s)</option>
+					<option value="1000">Normal (1s)</option>
+					<option value="3000">Slow (3s)</option>
+					<option value="10000">Battery saver (10s)</option>
+				</select>
+			</div>
+			<div class="space-y-1.5">
+				<span class="text-xs text-muted-foreground">Device target</span>
+				<input
+					bind:value={targetSerial}
+					placeholder="serial (default: emulator-5554)"
+					class="w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<input
+					bind:value={targetTcp}
+					placeholder="tcp, e.g. 127.0.0.1:5555 (overrides serial)"
+					class="w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<div class="flex items-center justify-between gap-2">
+					<span class="text-[10px] text-muted-foreground">{targetMsg}</span>
+					<button
+						onclick={saveTarget}
+						disabled={targetSaving}
+						class="rounded-md bg-primary px-2.5 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+						>{targetSaving ? 'Saving…' : 'Save'}</button
+					>
+				</div>
+			</div>
+		</div>
+	{/if}
 
 	{#if !reachable}
 		<div class="flex flex-1 items-center justify-center p-4">
