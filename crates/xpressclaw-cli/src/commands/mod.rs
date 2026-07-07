@@ -1,6 +1,5 @@
 use clap::Subcommand;
 
-#[cfg(feature = "android")]
 mod android;
 mod budget;
 mod chat;
@@ -122,7 +121,6 @@ pub enum Command {
     },
 
     /// Control an Android device or emulator (over adb, no adb binary)
-    #[cfg(feature = "android")]
     Android {
         #[command(subcommand)]
         command: android::AndroidCommand,
@@ -155,7 +153,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Budget { agent, port } => budget::run(agent, port).await,
         Command::Sop { command, port } => sop::run(command, port).await,
         Command::Logs { agent, limit, port } => logs::run(agent, limit, port).await,
-        #[cfg(feature = "android")]
         Command::Android {
             command,
             serial,

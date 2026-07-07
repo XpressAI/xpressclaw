@@ -140,7 +140,7 @@ pub enum Error {
     #[error("LLM provider not found: {name}")]
     LlmProviderNotFound { name: String },
 
-    // Android device control (feature = "android")
+    // Android device control
     #[error("android error: {0}")]
     Android(String),
 }

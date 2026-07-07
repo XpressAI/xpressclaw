@@ -166,9 +166,9 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
-    // Android device control — only when the runtime is built with the `android`
-    // feature. Proxies to the server's /v1/android/* endpoints (see ADR-024).
-    #[cfg(feature = "android")]
+    // Android device control — proxies to the server's /v1/android/* endpoints
+    // (see ADR-024). Like shell/filesystem, always present; the tools report a
+    // clear error at call time if no device/SDK is reachable.
     servers.insert(
         "android".to_string(),
         McpServerConfig {

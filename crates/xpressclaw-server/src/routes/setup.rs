@@ -195,41 +195,33 @@ async fn check_ollama() -> Json<Value> {
 /// emulator, an installed+AVD-ready SDK, and whether we can spawn one), plus the
 /// detailed SDK breakdown the `/android` page uses to know which AVD to boot.
 async fn check_android_sdk(State(state): State<AppState>) -> Json<Value> {
-    #[cfg(feature = "android")]
+    use xpressclaw_core::android::sdk;
+    // Both sdk::detect() (it shells out to `emulator -list-avds`/`-accel-check`)
+    // and the device probe block, so run them off the async runtime. Probe the
+    // SAME device the control plane drives (resolve_target), not a hardcoded
+    // emulator-5554 — otherwise this lifecycle check and /v1/android/status can
+    // disagree about which device they manage, e.g. offering "Start emulator"
+    // for a BYO tcp device that's merely offline. Only the managed emulator can
+    // actually be spawned.
+    let config = state.config();
+    match tokio::task::spawn_blocking(move || {
+        let status = sdk::detect();
+        let target = crate::routes::android::resolve_target(&config);
+        let is_managed = target.is_managed_emulator();
+        (status, target.booted(), is_managed)
+    })
+    .await
     {
-        use xpressclaw_core::android::sdk;
-        // Both sdk::detect() (it shells out to `emulator -list-avds`/`-accel-check`)
-        // and the device probe block, so run them off the async runtime. Probe the
-        // SAME device the control plane drives (resolve_target), not a hardcoded
-        // emulator-5554 — otherwise this lifecycle check and /v1/android/status can
-        // disagree about which device they manage, e.g. offering "Start emulator"
-        // for a BYO tcp device that's merely offline. Only the managed emulator can
-        // actually be spawned.
-        let config = state.config();
-        match tokio::task::spawn_blocking(move || {
-            let status = sdk::detect();
-            let target = crate::routes::android::resolve_target(&config);
-            let is_managed = target.is_managed_emulator();
-            (status, target.booted(), is_managed)
-        })
-        .await
-        {
-            Ok((status, available, is_managed)) => {
-                let installed = status.ready();
-                Json(json!({
-                    "available": available,                              // the target device is up & booted
-                    "installed": installed,                              // SDK + emulator + image + AVD
-                    "can_start": installed && !available && is_managed,  // safe to spawn the managed emulator
-                    "sdk": status,
-                }))
-            }
-            Err(_) => Json(json!({ "available": false, "installed": false, "can_start": false })),
+        Ok((status, available, is_managed)) => {
+            let installed = status.ready();
+            Json(json!({
+                "available": available,                              // the target device is up & booted
+                "installed": installed,                              // SDK + emulator + image + AVD
+                "can_start": installed && !available && is_managed,  // safe to spawn the managed emulator
+                "sdk": status,
+            }))
         }
-    }
-    #[cfg(not(feature = "android"))]
-    {
-        let _ = state;
-        Json(json!({ "available": false, "installed": false, "can_start": false }))
+        Err(_) => Json(json!({ "available": false, "installed": false, "can_start": false })),
     }
 }
 
@@ -245,34 +237,23 @@ struct StartAndroidRequest {
 async fn start_android(
     Json(req): Json<StartAndroidRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    #[cfg(feature = "android")]
-    {
-        use xpressclaw_core::android::{emulator, sdk};
-        let avd = match req.avd {
-            Some(a) if !a.trim().is_empty() => a,
-            _ => sdk::detect().avds.into_iter().next().ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "no AVD available — create one first" })),
-                )
-            })?,
-        };
-        emulator::start(&avd).map_err(|e| {
+    use xpressclaw_core::android::{emulator, sdk};
+    let avd = match req.avd {
+        Some(a) if !a.trim().is_empty() => a,
+        _ => sdk::detect().avds.into_iter().next().ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "no AVD available — create one first" })),
             )
-        })?;
-        Ok(Json(json!({ "started": true, "avd": avd })))
-    }
-    #[cfg(not(feature = "android"))]
-    {
-        let _ = req;
-        Err((
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({ "error": "android feature not enabled" })),
-        ))
-    }
+        })?,
+    };
+    emulator::start(&avd).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok(Json(json!({ "started": true, "avd": avd })))
 }
 
 /// The configured android device target (top-level `android` config section).

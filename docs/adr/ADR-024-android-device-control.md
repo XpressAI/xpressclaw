@@ -52,15 +52,23 @@ lack Google Play / Google login.
 
 ## Decision
 
-Replace the `scrcpy-mcp` approach with an **opt-in feature** built on
-`adb_client`, targeting elements through Android's built-in `uiautomator`
-accessibility tree (which we consume, not reimplement), over two device
-providers.
+Replace the `scrcpy-mcp` approach with a control layer built on `adb_client`,
+targeting elements through Android's built-in `uiautomator` accessibility tree
+(which we consume, not reimplement), over two device providers.
 
-**1. Control transport: the `adb_client` crate**, behind a new `android` Cargo
-feature that is **off by default**. Default builds don't pull `adb_client`'s
-`rustls`/`rsa`/`image` tree, preserving the ~12 MB single-binary story
-(opt-in-dependency precedent: ADR-023). A spike validated the full
+**1. Control transport: the `adb_client` crate, always compiled in.** The
+SDK/device is detected at *runtime* — the same pattern as Docker (bollard is
+always compiled, Docker detected) and Ollama (ADR-023, which removed this
+repo's previous build-time feature matrix for exactly this reason). An earlier
+revision gated the crate behind an `android` Cargo feature, off by default;
+that was reversed: it was the only feature in the workspace, `/v1/android/*`
+silently 404'd in featureless builds (the feature's own author asked "is it
+not implemented yet?"), the harness image and server needed *matching* builds
+to work, and the non-Windows build scripts never gained the flag — terminal
+feature drift. "Compiled in" ≠ "works out of the box": the Android page and
+`xpressclaw android doctor` own the runtime expectation. The cost is
+`adb_client`'s `rustls`/`rsa`/`image` tree in every build (binary size /
+build time only — all pure Rust). A spike validated the full
 screenshot → find-element → tap → verify loop in pure Rust against an emulator,
 both via the adb server *and* via a direct TCP connection to `adbd` with the
 adb server killed (no `adb` binary, no server).
@@ -121,7 +129,7 @@ later as a true event source (SMS-received → agent) — a separate design.
 
 ### Positive
 - No redistribution/licensing exposure; the only added binary footprint is
-  `adb_client`, and only under `--features android`.
+  `adb_client` and its pure-Rust dependency tree.
 - Cross-platform (Windows/macOS/Linux) via the local emulator.
 - Reliable element targeting (accessibility tree) instead of vision guesses.
 - Removes the implicit image-swap and scrcpy version coupling.
@@ -137,8 +145,6 @@ later as a true event source (SMS-received → agent) — a separate design.
 
 ### Risks
 - Emulator hardware acceleration (WHPX/KVM/HAXM) must be present on the host.
-- The `android` feature must be plumbed consistently across `core`, `cli`,
-  `server`, and `tauri` (comprehensive-changes rule).
 
 ## Related ADRs
 - ADR-003: Container Isolation (redroid would slot in as a provider here)

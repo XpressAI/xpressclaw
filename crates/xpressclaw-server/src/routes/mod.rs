@@ -5,7 +5,6 @@ use crate::state::AppState;
 
 mod activity;
 mod agents;
-#[cfg(feature = "android")]
 pub mod android;
 mod apps;
 mod browser;
@@ -30,7 +29,6 @@ pub fn tools_proxy_routes() -> Router<AppState> {
     tools_proxy::routes()
 }
 
-#[cfg(feature = "android")]
 pub fn android_routes() -> Router<AppState> {
     android::routes()
 }

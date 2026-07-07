@@ -6,7 +6,6 @@ pub mod system;
 
 pub mod activity;
 pub mod agents;
-#[cfg(feature = "android")]
 pub mod android;
 pub mod budget;
 pub mod connectors;

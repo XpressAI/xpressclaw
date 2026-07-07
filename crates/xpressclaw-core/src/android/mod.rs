@@ -1,5 +1,6 @@
 //! Android device control via the `adb_client` crate — pure Rust, no `adb`
-//! binary required. Gated behind the `android` Cargo feature (off by default).
+//! binary required. Always compiled in; the SDK/device is detected at runtime
+//! (same pattern as Docker and Ollama — ADR-023).
 //!
 //! The control layer is **provider-agnostic**: it speaks the adb wire protocol
 //! to whatever `adbd` is reachable, whether that's a managed emulator

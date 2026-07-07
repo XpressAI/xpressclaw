@@ -1,6 +1,5 @@
 //! `xpressclaw android` — drive an Android device/emulator directly over adb
-//! (pure Rust via `adb_client`, no `adb` binary). Feature-gated behind
-//! `android`; see ADR-024.
+//! (pure Rust via `adb_client`, no `adb` binary). See ADR-024.
 
 use std::net::SocketAddr;
 use std::path::Path;

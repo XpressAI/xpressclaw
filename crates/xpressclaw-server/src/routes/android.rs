@@ -1,7 +1,7 @@
 //! `/v1/android/*` — host-side device control over adb_client. The shared
 //! foundation for BOTH the agent (via the MCP shim) and the human collaborative
 //! live view: an agent tool call and a human's click hit the same endpoints,
-//! driving the same device. Feature-gated behind `android`. See ADR-024.
+//! driving the same device. See ADR-024.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
