@@ -1,21 +1,14 @@
-//! Android SDK / emulator install detection — the preflight for the **managed
-//! emulator** provider.
-//!
-//! The device-link connector needs no external binary (adb_client is pure
-//! Rust), but booting a *managed* emulator relies on the user's Android SDK:
-//! the `emulator` binary, at least one system image, and an AVD. This module
-//! reports what's present so the CLI / UI can guide setup. See ADR-024.
+//! Android SDK / emulator install detection — the preflight for the managed
+//! emulator (device control itself needs no SDK; adb_client is pure Rust).
+//! Reports what's present so the CLI / UI can guide setup. See ADR-024.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
 
-/// Default system image for user-facing managed emulators: **Google Play**
-/// (Play Store + Google sign-in). It's a production (`user`) build, so it
-/// allows no `adb root` — but the control path (tap / screenshot / uiautomator)
-/// needs none. See ADR-024. Single source of truth for provisioning + the
-/// `doctor` hints.
+/// Default system image for managed emulators: Google Play (Store + sign-in).
+/// A production build, so no `adb root` — the control path needs none (ADR-024).
 pub const DEFAULT_SYSTEM_IMAGE: &str = "system-images;android-36;google_apis_playstore;x86_64";
 
 /// Default device profile for managed emulators.

@@ -1,11 +1,6 @@
-//! Managed-emulator lifecycle — the Android analog of `DockerManager`'s
-//! "installed? / running? / if not, spawn it". The setup routes surface this
-//! the same way `check_docker` / `start_docker` do. See ADR-024.
-//!
-//! - **installed** → [`crate::android::sdk::detect`]`().ready()` (SDK + emulator
-//!   binary + a system image + an AVD).
-//! - **running**   → [`is_running`] (a device is up and finished booting).
-//! - **start**     → [`start`] (spawn the emulator, detached).
+//! Managed-emulator lifecycle: installed? ([`crate::android::sdk::detect`]),
+//! running? ([`is_running`]), spawn it ([`start`]) — the Android analog of the
+//! Docker check/start flow. See ADR-024.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -16,9 +11,8 @@ use crate::error::{Error, Result};
 /// Standard serial for a single managed emulator.
 pub const DEFAULT_SERIAL: &str = "emulator-5554";
 
-/// Whether an emulator/device is up and finished booting — the analog of
-/// `DockerManager::connect().is_ok()`. Uses `adb_client`, which is synchronous,
-/// so call this inside `spawn_blocking`.
+/// Whether an emulator/device is up and finished booting. Blocking
+/// (adb_client is synchronous) — call inside `spawn_blocking`.
 pub fn is_running(serial: &str) -> bool {
     match crate::android::AndroidDevice::via_server(serial) {
         Ok(mut d) => d
@@ -37,15 +31,11 @@ pub fn emulator_binary() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Launch the emulator for `avd`, detached — the analog of
-/// `start_docker_desktop`. Returns once the launch is issued; booting is async
-/// (poll [`is_running`] afterward).
+/// Launch the emulator for `avd`, detached. Returns once the launch is issued;
+/// booting is async — poll [`is_running`] afterward.
 pub fn start(avd: &str) -> Result<()> {
-    // Validate before this string reaches a shell. On Windows it is handed to
-    // `cmd /c start`, and cmd.exe re-parses the command line with its own quoting
-    // rules (a documented std caveat) — so metacharacters like `&`, `|`, or `"`
-    // in the AVD name could otherwise break out of the argument and run arbitrary
-    // commands on the HOST. AVD names are `[A-Za-z0-9._-]`; reject anything else.
+    // AVD names are [A-Za-z0-9._-]; reject shell metacharacters before the name
+    // reaches any command line (defense in depth — every start path funnels here).
     if avd.is_empty()
         || !avd
             .chars()
@@ -60,22 +50,16 @@ pub fn start(avd: &str) -> Result<()> {
         Error::Android("emulator binary not found — install the Android SDK".to_string())
     })?;
 
-    // Capture the emulator's own diagnostics (bad AVD, missing WHPX/KVM
-    // acceleration) to a log file instead of discarding them. Booting is async so
-    // we can't await a failure that happens seconds after spawn — but with the
-    // output on disk the reason is at least recoverable. Best-effort: fall back to
-    // null if the log can't be opened.
+    // Keep the emulator's diagnostics on disk: booting is async, so this log is
+    // the only record of a failure that happens seconds after spawn.
     let log_path = std::env::temp_dir().join("xpressclaw-emulator.log");
     let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
         Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
         Err(_) => (Stdio::null(), Stdio::null()),
     };
 
-    // Spawn the emulator binary directly (no `cmd /c start` shell layer) so a
-    // launch failure surfaces as a real spawn error, and detach it so it outlives
-    // this process. On Windows CREATE_NO_WINDOW detaches without a console window
-    // (the same approach as the Tauri sidecar launch); the emulator draws its own
-    // GUI window.
+    // Spawn the binary directly (no shell layer) so a launch failure is a real
+    // spawn error; detach so the emulator outlives this process.
     let mut cmd = Command::new(&emu);
     cmd.args(["-avd", avd, "-no-boot-anim"])
         .stdin(Stdio::null())
@@ -89,8 +73,7 @@ pub fn start(avd: &str) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Own process group so the emulator doesn't catch SIGINT/SIGHUP aimed at
-        // the server's controlling terminal (the analog of the Windows detach).
+        // Own process group: don't catch SIGINT/SIGHUP aimed at the server's terminal.
         cmd.process_group(0);
     }
 

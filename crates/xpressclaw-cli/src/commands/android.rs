@@ -93,10 +93,8 @@ pub async fn run(
         return Ok(());
     }
 
-    // Connect: explicit --tcp wins (direct to adbd, no adb server), then
-    // --serial (via the adb server). With neither flag, fall back to the
-    // workspace config's `android` section — the SAME target the server and
-    // agents drive — and finally the managed emulator's default serial.
+    // Target precedence: --tcp > --serial > workspace config's android section
+    // (the same target the server and agents drive) > default emulator serial.
     let mut device = if let Some(addr) = tcp {
         let socket: SocketAddr = addr
             .parse()

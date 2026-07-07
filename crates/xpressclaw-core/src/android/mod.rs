@@ -1,15 +1,7 @@
-//! Android device control via the `adb_client` crate — pure Rust, no `adb`
-//! binary required. Always compiled in; the SDK/device is detected at runtime
-//! (same pattern as Docker and Ollama — ADR-023).
-//!
-//! The control layer is **provider-agnostic**: it speaks the adb wire protocol
-//! to whatever `adbd` is reachable, whether that's a managed emulator
-//! (`via_server` / `via_tcp`) or a BYO real device. Only provisioning differs
-//! between providers — control is shared. See ADR-024.
-//!
-//! Element targeting uses the `uiautomator` accessibility tree
-//! ([`AndroidDevice::find_element`]) rather than vision-derived pixel
-//! coordinates, which are unreliable (see ADR-024).
+//! Android device control over the adb wire protocol (`adb_client`, pure Rust,
+//! no `adb` binary). Provider-agnostic: drives whatever `adbd` is reachable —
+//! managed emulator or BYO device. Element targeting uses the `uiautomator`
+//! accessibility tree, not vision-derived coordinates. See ADR-024.
 
 pub mod emulator;
 pub mod sdk;
@@ -37,10 +29,8 @@ impl UiElement {
     }
 }
 
-/// A compact, agent-facing view of one interactable/labeled on-screen element.
-/// This is the **screen map** — the primary way an agent perceives the screen:
-/// a few KB of structured elements with their real device-pixel coordinates,
-/// instead of a multi-MB screenshot it would have to (unreliably) eyeball.
+/// One screen-map entry: an interactable/labeled element with its real
+/// device-pixel coordinates — the agent's primary perception of the screen.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ScreenElement {
     pub text: String,
@@ -104,18 +94,14 @@ impl AndroidDevice {
             .map_err(|e| Error::Android(format!("screenshot failed: {e}")))
     }
 
-    /// Capture a screenshot, downscale so its longest side is `max_dim`, and
-    /// encode as JPEG at `quality` (0-100). A full 1080x2400 PNG is ~1.8MB
-    /// (~2.4MB base64) — over the agent tool-output limit; this brings it to
-    /// a couple hundred KB. The screen map ([`screen_elements`]) remains the
-    /// way to get tap coordinates; this is for *seeing* visual content.
+    /// Screenshot downscaled to `max_dim` on the longest side, JPEG-encoded at
+    /// `quality` — a full frame overflows the agent tool-output limit.
     pub fn screenshot_scaled(&mut self, max_dim: u32, quality: u8) -> Result<Vec<u8>> {
         let png = self.screenshot_bytes()?;
         let img = image::load_from_memory(&png)
             .map_err(|e| Error::Android(format!("decode screenshot: {e}")))?;
-        // Only ever shrink. `resize` scales to fit the bounds in BOTH directions,
-        // so it would enlarge a frame already smaller than max_dim — bigger,
-        // blurrier payload for no gain, the opposite of this function's purpose.
+        // Only shrink — `resize` fits bounds in both directions and would
+        // upscale a frame already smaller than max_dim.
         let img = if img.width().max(img.height()) > max_dim {
             img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
         } else {
@@ -142,9 +128,7 @@ impl AndroidDevice {
         Ok(find_node_bounds(&xml, label))
     }
 
-    /// The **screen map**: all interactable/labeled elements with their real
-    /// coordinates. Compact (a few KB) — the agent's primary way to see the
-    /// screen and pick tap targets, instead of a multi-MB screenshot.
+    /// The screen map: all interactable/labeled elements with real coordinates.
     pub fn screen_elements(&mut self) -> Result<Vec<ScreenElement>> {
         let xml = self.ui_dump()?;
         Ok(parse_screen_elements(&xml))
@@ -196,10 +180,8 @@ impl AndroidDevice {
     /// Launch an app by package name via its launcher intent — far more reliable
     /// than hunting for and tapping an icon.
     pub fn open_app(&mut self, package: &str) -> Result<()> {
-        // Reject anything that isn't a valid Android package name before it
-        // reaches the device shell — otherwise metacharacters (`;`, `$(...)`,
-        // `&&`) would run arbitrary commands on the device and could spoof the
-        // launch-failure check below. Package names are `[A-Za-z0-9._]`.
+        // Package names are [A-Za-z0-9._]; anything else could inject device-shell
+        // commands or spoof the launch-failure check below.
         if package.is_empty()
             || !package
                 .chars()
@@ -220,9 +202,8 @@ impl AndroidDevice {
         Ok(())
     }
 
-    /// Device screen resolution in pixels, via `wm size`. Callers that map a
-    /// scaled screenshot back to real coordinates need this (the tap endpoint
-    /// takes device pixels, not image pixels).
+    /// Device screen resolution in pixels, via `wm size` — tap coordinates are
+    /// device pixels, not (downscaled) image pixels.
     pub fn screen_size(&mut self) -> Result<(i32, i32)> {
         let out = self.shell("wm size")?;
         parse_wm_size(&out)
@@ -230,9 +211,8 @@ impl AndroidDevice {
     }
 }
 
-/// POSIX single-quote a string for safe interpolation into a device shell
-/// command. Wraps in `'…'` and rewrites each embedded `'` as `'\''` (close the
-/// quote, an escaped literal quote, reopen) so no metacharacter can escape.
+/// POSIX single-quote for the device shell: wrap in `'…'`, rewrite each
+/// embedded `'` as `'\''` so no metacharacter can escape.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -258,8 +238,7 @@ fn find_node_bounds(xml: &str, label: &str) -> Option<UiElement> {
             Some(end) => &chunk[..end],
             None => chunk,
         };
-        // Compare against the decoded attribute value, not the raw XML: a label
-        // like "Network & internet" is stored as "Network &amp; internet".
+        // Compare decoded values: "Network & internet" is stored as "&amp;".
         let matches = attr(tag, "text").as_deref() == Some(label)
             || attr(tag, "content-desc").as_deref() == Some(label);
         if matches {
@@ -288,10 +267,8 @@ fn parse_bounds(tag: &str) -> Option<UiElement> {
     })
 }
 
-/// Read a `name="value"` attribute from a node tag. The leading space avoids
-/// matching substrings of other attribute names (e.g. `clickable` inside
-/// `long-clickable`). The value is XML-entity-decoded, since uiautomator
-/// encodes `&`/`<`/`>`/`"`/`'` in text and content-desc.
+/// Read a `name="value"` attribute from a node tag, entity-decoded. The leading
+/// space stops `clickable` matching inside `long-clickable`.
 fn attr(tag: &str, name: &str) -> Option<String> {
     let key = format!(" {name}=\"");
     let start = tag.find(&key)? + key.len();

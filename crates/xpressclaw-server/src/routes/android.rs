@@ -126,9 +126,8 @@ fn err(e: String) -> (StatusCode, Json<Value>) {
 }
 
 async fn status(State(state): State<AppState>) -> Json<Value> {
-    // Probe reachability and fetch the device resolution in one connection.
-    // The live-view uses width/height to map clicks (on a downscaled frame) back
-    // to real device pixels for /tap.
+    // Reachability + device resolution in one connection; the live view needs
+    // width/height to map clicks on the downscaled frame to device pixels.
     match with_device(state.config(), |d| d.screen_size()).await {
         Ok((width, height)) => Json(json!({ "reachable": true, "width": width, "height": height })),
         Err(_) => Json(json!({ "reachable": false })),
@@ -137,11 +136,10 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
 
 #[derive(Deserialize)]
 struct ShotParams {
-    /// Longest-side cap in px. Default 1568 — the resolution vision APIs
-    /// (e.g. Anthropic) downscale to anyway, so no model-visible detail is
-    /// lost, while keeping the payload under the agent tool-output limit.
+    /// Longest-side cap in px. Default 1568 — what vision APIs downscale to
+    /// anyway, so nothing model-visible is lost.
     max: Option<u32>,
-    /// JPEG quality 0-100. Default 85 — visually near-lossless for UI screens.
+    /// JPEG quality 0-100. Default 85.
     q: Option<u8>,
 }
 
