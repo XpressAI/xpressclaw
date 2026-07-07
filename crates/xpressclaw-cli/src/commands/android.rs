@@ -3,9 +3,11 @@
 //! `android`; see ADR-024.
 
 use std::net::SocketAddr;
+use std::path::Path;
 
 use clap::Subcommand;
-use xpressclaw_core::android::AndroidDevice;
+use xpressclaw_core::android::{emulator, AndroidDevice};
+use xpressclaw_core::config::Config;
 
 #[derive(Subcommand)]
 pub enum AndroidCommand {
@@ -83,7 +85,7 @@ pub enum AndroidCommand {
 
 pub async fn run(
     command: AndroidCommand,
-    serial: String,
+    serial: Option<String>,
     tcp: Option<String>,
 ) -> anyhow::Result<()> {
     // `doctor` inspects the local SDK install, not a device — no connection.
@@ -92,16 +94,36 @@ pub async fn run(
         return Ok(());
     }
 
-    // Connect: direct to adbd over TCP if --tcp was given (no adb server),
-    // otherwise through the adb server by serial.
-    let mut device = match tcp {
-        Some(addr) => {
-            let socket: SocketAddr = addr
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid --tcp address '{addr}': {e}"))?;
+    // Connect: explicit --tcp wins (direct to adbd, no adb server), then
+    // --serial (via the adb server). With neither flag, fall back to the
+    // workspace config's `android` section — the SAME target the server and
+    // agents drive — and finally the managed emulator's default serial.
+    let mut device = if let Some(addr) = tcp {
+        let socket: SocketAddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --tcp address '{addr}': {e}"))?;
+        AndroidDevice::via_tcp(socket)?
+    } else if let Some(serial) = serial {
+        AndroidDevice::via_server(&serial)?
+    } else {
+        let android = Config::load(Path::new("xpressclaw.yaml"))
+            .map(|c| c.android)
+            .unwrap_or_default();
+        if let Some(addr) = android.tcp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let socket: SocketAddr = addr.parse().map_err(|e| {
+                anyhow::anyhow!("invalid android.tcp '{addr}' in xpressclaw.yaml: {e}")
+            })?;
             AndroidDevice::via_tcp(socket)?
+        } else if let Some(s) = android
+            .serial
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            AndroidDevice::via_server(s)?
+        } else {
+            AndroidDevice::via_server(emulator::DEFAULT_SERIAL)?
         }
-        None => AndroidDevice::via_server(&serial)?,
     };
 
     match command {

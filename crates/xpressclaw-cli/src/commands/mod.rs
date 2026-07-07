@@ -127,9 +127,10 @@ pub enum Command {
         #[command(subcommand)]
         command: android::AndroidCommand,
 
-        /// Device serial via the adb server
-        #[arg(long, global = true, default_value = "emulator-5554")]
-        serial: String,
+        /// Device serial via the adb server. Defaults to the workspace
+        /// config's `android.serial`, else the managed emulator's serial.
+        #[arg(long, global = true)]
+        serial: Option<String>,
 
         /// Connect directly to a device's adbd over TCP (e.g. 127.0.0.1:5555),
         /// bypassing the adb server

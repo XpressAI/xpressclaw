@@ -15,8 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::android::{emulator, AndroidDevice};
-use xpressclaw_core::connectors::manager::ConnectorManager;
-use xpressclaw_core::db::Database;
+use xpressclaw_core::config::Config;
 
 use crate::state::AppState;
 
@@ -68,47 +67,45 @@ impl DeviceTarget {
     }
 }
 
-/// Resolve the device from the configured `android` connector, else default to
-/// the standard emulator serial.
-pub(crate) fn resolve_target(db: Arc<Database>) -> DeviceTarget {
-    let mgr = ConnectorManager::new(db);
-    if let Ok(list) = mgr.list() {
-        if let Some(rec) = list
-            .iter()
-            .find(|c| c.connector_type == "android" && c.enabled)
-        {
-            if let Some(tcp) = rec
-                .config
-                .get("tcp")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                if let Ok(addr) = tcp.parse::<SocketAddr>() {
-                    return DeviceTarget::Tcp(addr);
-                }
-            }
-            if let Some(serial) = rec
-                .config
-                .get("serial")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                return DeviceTarget::Server(serial.to_string());
+/// Resolve the device from the top-level `android` config section, else
+/// default to the standard emulator serial. `tcp` overrides `serial`.
+pub(crate) fn resolve_target(config: &Config) -> DeviceTarget {
+    let android = &config.android;
+    if let Some(tcp) = android
+        .tcp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match tcp.parse::<SocketAddr>() {
+            Ok(addr) => return DeviceTarget::Tcp(addr),
+            Err(e) => {
+                tracing::warn!(tcp, error = %e, "android.tcp in config is not a valid address, ignoring it")
             }
         }
     }
+    if let Some(serial) = android
+        .serial
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return DeviceTarget::Server(serial.to_string());
+    }
+    tracing::debug!(
+        serial = emulator::DEFAULT_SERIAL,
+        "no android target configured, falling back to the default emulator serial"
+    );
     DeviceTarget::Server(emulator::DEFAULT_SERIAL.to_string())
 }
 
 /// Connect (blocking adb_client) and run `f` against the device, off-thread.
-async fn with_device<T, F>(db: Arc<Database>, f: F) -> Result<T, String>
+async fn with_device<T, F>(config: Arc<Config>, f: F) -> Result<T, String>
 where
     F: FnOnce(&mut AndroidDevice) -> xpressclaw_core::error::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let target = resolve_target(db);
+    let target = resolve_target(&config);
     match tokio::task::spawn_blocking(move || {
         let mut device = target.connect()?;
         f(&mut device)
@@ -132,7 +129,7 @@ async fn status(State(state): State<AppState>) -> Json<Value> {
     // Probe reachability and fetch the device resolution in one connection.
     // The live-view uses width/height to map clicks (on a downscaled frame) back
     // to real device pixels for /tap.
-    match with_device(state.db.clone(), |d| d.screen_size()).await {
+    match with_device(state.config(), |d| d.screen_size()).await {
         Ok((width, height)) => Json(json!({ "reachable": true, "width": width, "height": height })),
         Err(_) => Json(json!({ "reachable": false })),
     }
@@ -154,7 +151,7 @@ async fn screenshot(
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let max = p.max.unwrap_or(1568);
     let q = p.q.unwrap_or(85);
-    let jpeg = with_device(state.db.clone(), move |d| d.screenshot_scaled(max, q))
+    let jpeg = with_device(state.config(), move |d| d.screenshot_scaled(max, q))
         .await
         .map_err(err)?;
     Ok(([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response())
@@ -163,14 +160,14 @@ async fn screenshot(
 /// The screen map: compact JSON list of interactable/labeled elements with
 /// their device-pixel coordinates. A few KB — the agent's primary perception.
 async fn elements(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let els = with_device(state.db.clone(), |d| d.screen_elements())
+    let els = with_device(state.config(), |d| d.screen_elements())
         .await
         .map_err(err)?;
     Ok(Json(json!({ "elements": els })))
 }
 
 async fn dump(State(state): State<AppState>) -> Result<String, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), |d| d.ui_dump())
+    with_device(state.config(), |d| d.ui_dump())
         .await
         .map_err(err)
 }
@@ -185,7 +182,7 @@ async fn tap(
     State(state): State<AppState>,
     Json(req): Json<TapReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| d.tap(req.x, req.y))
+    with_device(state.config(), move |d| d.tap(req.x, req.y))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))
@@ -200,7 +197,7 @@ async fn tap_text(
     State(state): State<AppState>,
     Json(req): Json<TapTextReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (x, y) = with_device(state.db.clone(), move |d| d.tap_text(&req.label))
+    let (x, y) = with_device(state.config(), move |d| d.tap_text(&req.label))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "x": x, "y": y })))
@@ -224,7 +221,7 @@ async fn swipe(
     State(state): State<AppState>,
     Json(req): Json<SwipeReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| {
+    with_device(state.config(), move |d| {
         d.swipe(req.x1, req.y1, req.x2, req.y2, req.ms)
     })
     .await
@@ -241,7 +238,7 @@ async fn input_text(
     State(state): State<AppState>,
     Json(req): Json<TextReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| d.input_text(&req.text))
+    with_device(state.config(), move |d| d.input_text(&req.text))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))
@@ -256,7 +253,7 @@ async fn key(
     State(state): State<AppState>,
     Json(req): Json<KeyReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| d.key_event(&req.key))
+    with_device(state.config(), move |d| d.key_event(&req.key))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))
@@ -278,7 +275,7 @@ async fn long_press(
     State(state): State<AppState>,
     Json(req): Json<LongPressReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| d.long_press(req.x, req.y, req.ms))
+    with_device(state.config(), move |d| d.long_press(req.x, req.y, req.ms))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))
@@ -293,7 +290,7 @@ async fn open_app(
     State(state): State<AppState>,
     Json(req): Json<OpenAppReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    with_device(state.db.clone(), move |d| d.open_app(&req.package))
+    with_device(state.config(), move |d| d.open_app(&req.package))
         .await
         .map_err(err)?;
     Ok(Json(json!({ "ok": true })))

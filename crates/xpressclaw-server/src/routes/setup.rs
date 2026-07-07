@@ -30,6 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/check-ollama", get(check_ollama))
         .route("/check-android-sdk", get(check_android_sdk))
         .route("/start-android", post(start_android))
+        .route("/android-target", get(get_android_target))
+        .route("/android-target", post(set_android_target))
         .route("/recommend-model", get(recommend_model))
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
@@ -203,10 +205,10 @@ async fn check_android_sdk(State(state): State<AppState>) -> Json<Value> {
         // disagree about which device they manage, e.g. offering "Start emulator"
         // for a BYO tcp device that's merely offline. Only the managed emulator can
         // actually be spawned.
-        let db = state.db.clone();
+        let config = state.config();
         match tokio::task::spawn_blocking(move || {
             let status = sdk::detect();
-            let target = crate::routes::android::resolve_target(db);
+            let target = crate::routes::android::resolve_target(&config);
             let is_managed = target.is_managed_emulator();
             (status, target.booted(), is_managed)
         })
@@ -271,6 +273,49 @@ async fn start_android(
             Json(json!({ "error": "android feature not enabled" })),
         ))
     }
+}
+
+/// The configured android device target (top-level `android` config section).
+async fn get_android_target(State(state): State<AppState>) -> Json<Value> {
+    let android = &state.config().android;
+    Json(json!({ "serial": android.serial, "tcp": android.tcp }))
+}
+
+#[derive(Deserialize)]
+struct AndroidTargetRequest {
+    serial: Option<String>,
+    tcp: Option<String>,
+}
+
+/// Persist the android device target. Empty strings clear a field; `tcp`
+/// overrides `serial` at resolve time (see routes::android::resolve_target).
+async fn set_android_target(
+    State(state): State<AppState>,
+    Json(req): Json<AndroidTargetRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let normalize = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let tcp = normalize(req.tcp);
+    if let Some(addr) = &tcp {
+        if addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("'{addr}' is not a valid host:port address") })),
+            ));
+        }
+    }
+
+    let mut new_config = (*state.config()).clone();
+    new_config.android = xpressclaw_core::config::AndroidConfig {
+        serial: normalize(req.serial),
+        tcp,
+    };
+    new_config
+        .save(&state.config_path)
+        .map_err(internal_error)?;
+
+    let android = new_config.android.clone();
+    state.apply_config(std::sync::Arc::new(new_config), state.llm_router());
+    Ok(Json(json!({ "success": true, "serial": android.serial, "tcp": android.tcp })))
 }
 
 /// Recommend a local model based on system hardware.
@@ -812,6 +857,7 @@ async fn upsert_mcp_server(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        android: old_config.android.clone(),
     };
     new_config
         .save(&state.config_path)
@@ -846,6 +892,7 @@ async fn delete_mcp_server(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        android: old_config.android.clone(),
     };
     new_config
         .save(&state.config_path)
