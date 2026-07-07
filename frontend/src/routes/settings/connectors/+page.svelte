@@ -37,7 +37,6 @@
 		{ id: 'github', label: 'GitHub', icon: 'M17.25 6.75L22.5 12l-5.25 5.25m-10.5 0L1.5 12l5.25-5.25m7.5-3l-4.5 16.5' },
 		{ id: 'jira', label: 'Jira', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2' },
 		{ id: 'slack', label: 'Slack', icon: 'M5.25 8.25h15m-16.5 7.5h15m-1.8-13.5l-3.9 19.5m-2.1-19.5l-3.9 19.5' },
-		{ id: 'android', label: 'Android', filled: true, viewBox: '0 0 576 512', icon: 'M420.55,301.93a24,24,0,1,1,24-24,24,24,0,0,1-24,24m-265.1,0a24,24,0,1,1,24-24,24,24,0,0,1-24,24m273.7-144.48,47.94-83a10,10,0,1,0-17.27-10h0l-48.54,84.07a301.25,301.25,0,0,0-246.56,0L116.18,64.45a10,10,0,1,0-17.27,10h0l47.94,83C64.53,202.22,8.24,285.55,0,384H576c-8.24-98.45-64.54-181.78-146.85-226.55' },
 	];
 
 	function typeIcon(type: string): string {
@@ -521,31 +520,6 @@
 							/>
 							<span class="text-muted-foreground">Watch subdirectories recursively</span>
 						</label>
-					{:else if addForm.connector_type === 'android'}
-						<div class="space-y-3">
-							<div>
-								<label class="block text-xs font-medium text-muted-foreground mb-1.5">Device Serial</label>
-								<input
-									type="text"
-									placeholder="emulator-5554"
-									value={addForm.config.serial ?? ''}
-									oninput={(e) => { addForm.config = { ...addForm.config, serial: (e.target as HTMLInputElement).value }; }}
-									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring font-mono"
-								/>
-								<p class="text-xs text-muted-foreground mt-1">From <span class="font-mono">adb devices</span>. Leave blank for the default emulator (<span class="font-mono">emulator-5554</span>).</p>
-							</div>
-							<div>
-								<label class="block text-xs font-medium text-muted-foreground mb-1.5">Direct TCP Address (optional)</label>
-								<input
-									type="text"
-									placeholder="127.0.0.1:5555"
-									value={addForm.config.tcp ?? ''}
-									oninput={(e) => { addForm.config = { ...addForm.config, tcp: (e.target as HTMLInputElement).value }; }}
-									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring font-mono"
-								/>
-								<p class="text-xs text-muted-foreground mt-1">Connect straight to the device's adbd, bypassing the adb server. Overrides the serial; no adb binary required.</p>
-							</div>
-						</div>
 					{:else if addForm.connector_type === 'slack'}
 						<div>
 							<label class="block text-sm font-medium mb-1">Bot Token</label>

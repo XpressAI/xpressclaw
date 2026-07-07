@@ -1,15 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use serde_json::Value;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::error::{Error, Result};
 
-#[cfg(feature = "android")]
-use super::android::AndroidConnector;
 use super::email::EmailConnector;
 use super::file_watcher::FileWatcherConnector;
 use super::github::GitHubConnector;
@@ -17,7 +14,7 @@ use super::jira::JiraConnector;
 use super::manager::ConnectorManager;
 use super::slack::SlackConnector;
 use super::telegram::TelegramConnector;
-use super::traits::{ChannelConfig, Connector, ConnectorEvent, ValidationResult};
+use super::traits::{ChannelConfig, Connector, ConnectorEvent};
 use super::webhook::WebhookConnector;
 
 /// Manages live connector instances and their lifecycle.
@@ -177,16 +174,6 @@ impl ConnectorRegistry {
     }
 }
 
-/// Validate a connector's config by type *without* starting it — the live check
-/// behind the `/connectors/{id}/test` route. For connectors whose dependency is
-/// external (e.g. an Android device's adb reachability) this actually probes it,
-/// mirroring what `start_connector_inner` does before a real start.
-pub async fn validate_connector_config(connector_type: &str, config: &Value) -> ValidationResult {
-    create_connector(connector_type)
-        .validate_config(config)
-        .await
-}
-
 /// Create a connector instance by type name.
 fn create_connector(connector_type: &str) -> Box<dyn Connector> {
     match connector_type {
@@ -197,8 +184,6 @@ fn create_connector(connector_type: &str) -> Box<dyn Connector> {
         "github" => Box::new(GitHubConnector::new()),
         "jira" => Box::new(JiraConnector::new()),
         "slack" => Box::new(SlackConnector::new()),
-        #[cfg(feature = "android")]
-        "android" => Box::new(AndroidConnector::new()),
         _ => {
             warn!(
                 connector_type = connector_type,

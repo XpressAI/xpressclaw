@@ -94,18 +94,28 @@ Google's emulator or images.
 `screenshot`, `screen_map` (the primary accessibility-tree perception),
 `tap_text`, `tap`, `swipe`, `long_press`, `type`, `key`, `open_app`, and `dump`
 — superseding `scrcpy-mcp` and its implicit image-swap (MCP per ADR-005).
+Android is a **tool available to any agent, not a dedicated agent**: the early
+`android-pilot` preset was removed, and its operating guidance (screen-map
+first, `open_app` > `tap_text` > `tap`, FLAG_SECURE screens) lives in the MCP
+tool descriptions where every agent receives it.
 
 **5. Human login view.** The emulator's own window is the login surface
 initially; an embedded stream (scrcpy/noVNC) in the web UI is a follow-up.
 Logins persist via an AVD snapshot.
 
-**6. Surfaced as a "device-link" connector** in the Connectors grid for
-discoverability, even though control is *not* an event source/sink. The
-`AndroidConnector` carries only the adb target (serial/tcp); its
-`validate_config`/`health` probe reachability via `adb_client` (the analog of
-Telegram's `getMe`), emit no events, and reject `send`. A CLI
-`xpressclaw android doctor` reports the managed-emulator SDK preflight
-(emulator, images, AVDs, accel) via `android::sdk::detect()`.
+**6. Device identity is top-level config** — `android.serial` / `android.tcp`
+in `xpressclaw.yaml`, one source of truth shared by `/v1/android/*`
+(`resolve_target`), the emulator-lifecycle preflight, the agents' MCP tools,
+and the CLI's flag defaults (fallback to the managed emulator's serial is
+logged, not silent). *Reversal:* an earlier revision surfaced this as a
+"device-link" `AndroidConnector` in the Connectors grid; that was removed —
+it emitted no events and rejected `send` (violating ADR-022's source/sink
+contract), and it routed every tool call's device resolution through a
+connectors-table row, i.e. hidden global configuration. The `/android` page
+and setup wizard own the discovery UX; `xpressclaw android doctor` reports
+the managed-emulator SDK preflight (emulator, images, AVDs, accel) via
+`android::sdk::detect()`. An android *connector* may legitimately return
+later as a true event source (SMS-received → agent) — a separate design.
 
 ## Consequences
 
