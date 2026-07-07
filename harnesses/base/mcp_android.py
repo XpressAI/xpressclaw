@@ -29,7 +29,9 @@ TOOLS = [
             "Capture the current Android screen as an image. Use this when you "
             "need to SEE visual content (photos, icons, layout). To find WHERE "
             "to tap, prefer android_screen_map — it gives exact coordinates; do "
-            "not read coordinates off this image."
+            "not read coordinates off this image. Apps that set FLAG_SECURE "
+            "(e.g. authenticators, banking) return a black image — use "
+            "android_screen_map instead, it can still read them."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
@@ -41,7 +43,9 @@ TOOLS = [
             "and exact pixel bounds + center. Call this first to decide what to "
             "tap, then act with android_tap_text or android_tap using the "
             "coordinates it gives. Much smaller and more reliable than a "
-            "screenshot."
+            "screenshot. After acting, call this again to confirm the result — "
+            "apps animate and dialogs appear, so never assume the screen state "
+            "from a prior step."
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
