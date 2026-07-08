@@ -152,6 +152,8 @@ async fn test_connector(
                 && c.config.get("username").and_then(|v| v.as_str()).is_some()
                 && c.config.get("password").and_then(|v| v.as_str()).is_some()
         }
+        // Unknown types (including stale "android" records from before the
+        // device target moved into config) pass the shape check — nothing to probe.
         _ => true,
     };
 

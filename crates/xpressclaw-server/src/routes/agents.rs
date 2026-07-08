@@ -155,6 +155,7 @@ async fn delete_agent(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        android: old_config.android.clone(),
     };
     let _ = new_config.save(&state.config_path);
     let new_config = std::sync::Arc::new(new_config);
@@ -236,7 +237,6 @@ struct UpdateAgentConfigRequest {
     responsibilities: Option<String>,
     avatar: Option<String>,
     role: Option<String>,
-    model: Option<String>,
     llm: Option<AgentLlmConfig>,
     tools: Option<Vec<String>>,
     skills: Option<Vec<String>>,
@@ -292,22 +292,12 @@ async fn update_agent_config(
     if let Some(role) = req.role {
         agent.role = role;
     }
-    // Model lives on llm.model now. If the request supplies a top-level
-    // `model`, write it into llm.model — creating the AgentLlmConfig if
-    // missing, so the field never gets silently dropped.
-    if let Some(model) = req.model {
-        let normalized = if model.is_empty() { None } else { Some(model) };
-        let llm = agent.llm.get_or_insert_with(AgentLlmConfig::default);
-        llm.model = normalized;
-        // Drop the legacy top-level field if it was populated by an old YAML.
-        agent.model = None;
-    }
-    if let Some(llm) = req.llm {
-        // Empty provider means clear the per-agent config entirely (the agent
-        // will then have no binding and the router will return a clear error
-        // rather than silently routing somewhere).
-        if llm.provider.as_deref().is_some_and(|p| !p.is_empty()) {
-            agent.llm = Some(llm);
+    // `llm` replaces the per-agent LLM config wholesale (provider, model,
+    // api_key, base_url). Empty / null provider clears the binding so the
+    // router returns a clear error rather than silently routing somewhere.
+    if let Some(req_llm) = req.llm {
+        if req_llm.provider.as_deref().is_some_and(|p| !p.is_empty()) {
+            agent.llm = Some(req_llm);
         } else {
             agent.llm = None;
         }
@@ -358,6 +348,7 @@ async fn update_agent_config(
         tools: old_config.tools.clone(),
         tool_policies: old_config.tool_policies.clone(),
         memory: old_config.memory.clone(),
+        android: old_config.android.clone(),
     };
     new_config
         .save(&state.config_path)
@@ -393,7 +384,7 @@ async fn update_agent_config(
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
                 "model": l.model,
-                "has_api_key": l.api_key.is_some(),
+                "api_key": l.api_key,
                 "base_url": l.base_url,
             })),
             "tools": updated.tools,
@@ -785,6 +776,59 @@ mod tests {
         assert_eq!(body["agent"]["role"], "Updated role.");
         // Budget should still be there
         assert_eq!(body["agent"]["budget"]["daily"], "$5.00");
+
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    /// Modal's Apply path: sends the whole `llm` block (model inside) as a
+    /// single unit. Response must echo api_key so the frontend's local state
+    /// stays in sync across saves.
+    #[tokio::test]
+    async fn test_update_config_llm_block_round_trips_model_and_key() {
+        let (app, config_path) = test_app_with_config();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/agents/atlas/config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "llm": {
+                                "provider": "openai",
+                                "model": "gpt-4o",
+                                "api_key": "sk-test",
+                                "base_url": "https://api.example.com",
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["agent"]["llm"]["model"], "gpt-4o");
+        assert_eq!(
+            body["agent"]["llm"]["api_key"], "sk-test",
+            "response must include api_key so the modal doesn't lose it on round-trip"
+        );
+
+        let config = Config::load(&config_path).unwrap();
+        let llm = config
+            .agents
+            .iter()
+            .find(|a| a.name == "atlas")
+            .unwrap()
+            .llm
+            .as_ref()
+            .expect("llm should be set");
+        assert_eq!(llm.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(llm.api_key.as_deref(), Some("sk-test"));
 
         let _ = std::fs::remove_file(&config_path);
     }

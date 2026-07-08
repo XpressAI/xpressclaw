@@ -6,6 +6,7 @@ pub mod system;
 
 pub mod activity;
 pub mod agents;
+pub mod android;
 pub mod budget;
 pub mod connectors;
 pub mod conversations;

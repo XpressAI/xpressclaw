@@ -478,6 +478,22 @@ impl DockerManager {
         }
     }
 
+    /// Read one environment variable from a container's config.
+    /// Returns None if the container or the variable doesn't exist.
+    pub async fn container_env_var(&self, container_name: &str, key: &str) -> Option<String> {
+        let env = self
+            .docker
+            .inspect_container(container_name, None)
+            .await
+            .ok()?
+            .config?
+            .env?;
+        let prefix = format!("{key}=");
+        env.into_iter()
+            .find(|e| e.starts_with(&prefix))
+            .map(|e| e[prefix.len()..].to_string())
+    }
+
     /// Check if a named container is running.
     pub async fn is_container_running(&self, container_name: &str) -> bool {
         match self.docker.inspect_container(container_name, None).await {

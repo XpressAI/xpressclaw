@@ -5,6 +5,7 @@ use crate::state::AppState;
 
 mod activity;
 mod agents;
+pub mod android;
 mod apps;
 mod browser;
 mod budget;
@@ -26,6 +27,10 @@ mod workflows;
 
 pub fn tools_proxy_routes() -> Router<AppState> {
     tools_proxy::routes()
+}
+
+pub fn android_routes() -> Router<AppState> {
+    android::routes()
 }
 
 pub fn app_proxy_routes() -> Router<AppState> {

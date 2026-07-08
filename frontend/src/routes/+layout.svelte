@@ -5,6 +5,7 @@
 	import { conversations, agents, apps as appsApi } from '$lib/api';
 	import type { Conversation, Agent, App } from '$lib/api';
 	import { agentAvatar } from '$lib/utils';
+	import AndroidLiveView from '$lib/AndroidLiveView.svelte';
 
 	// Bottom tabs per ADR-016
 	const tabs = [
@@ -38,7 +39,11 @@
 		return pathname === `/agents/${id}`;
 	}
 
-	let isSetupRoute = $derived($page.url.pathname.startsWith('/setup'));
+	// Routes that render bare, without the app chrome (sidebar / rail / modals):
+	// the setup wizard and the detached Android window (/android).
+	let isChromeless = $derived(
+		$page.url.pathname.startsWith('/setup') || $page.url.pathname.startsWith('/android')
+	);
 
 	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
@@ -57,6 +62,130 @@
 
 	function toggleSidebar() {
 		sidebarCollapsed = !sidebarCollapsed;
+	}
+
+	// Right rail — the Android live view. The rail only appears when Android
+	// support is compiled into the server (probe /v1/android/status). Clicking
+	// its icon spawns the live-view panel beside the chat. State persists.
+	let androidAvailable = $state(false);
+	let androidPanelOpen = $state(false);
+	let androidProbed = $state(false); // got a definitive answer from the server
+
+	async function detectAndroid() {
+		try {
+			const r = await fetch('/v1/android/status');
+			// The feature is present only when the android route actually answers.
+			// When it's NOT compiled in, the route is absent and the request falls
+			// through to the SPA fallback, which serves index.html with a 200 — so
+			// `r.ok` alone is always true. The real handler returns JSON; require an
+			// application/json content-type to tell the two apart. Either outcome is
+			// definitive, so stop retrying. A thrown error (server not up yet) leaves
+			// androidProbed false so the interval retries.
+			const contentType = r.headers.get('content-type') || '';
+			androidAvailable = r.ok && contentType.includes('application/json');
+			androidProbed = true;
+		} catch {
+			/* server unreachable — retry on the next tick */
+		}
+	}
+
+	function toggleAndroidPanel() {
+		androidPanelOpen = !androidPanelOpen;
+		try {
+			localStorage.setItem('androidPanelOpen', androidPanelOpen ? '1' : '0');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	// Reattach: bring the live view back into the rail. Triggered when the
+	// detached window goes away — the user closed it, or clicked its reattach
+	// control (which just window.close()es itself; wry maps window.close() to
+	// destroying the native window, no IPC needed).
+	function reattachAndroid() {
+		androidPanelOpen = true;
+		try {
+			localStorage.setItem('androidPanelOpen', '1');
+		} catch {
+			/* ignore */
+		}
+	}
+
+	// Desktop: watch the detached native window and reattach when it's destroyed.
+	// `once` here is IPC (plugin:event|listen / |unlisten), so the remote-webview
+	// capability must grant core:event:allow-listen + core:event:allow-unlisten.
+	// The listener is keyed by window LABEL, not instance, so it survives the
+	// window being recreated; the flag only prevents stacking duplicates.
+	let detachedDestroyHooked = false;
+	function hookDetachedClose(w: import('@tauri-apps/api/webviewWindow').WebviewWindow) {
+		if (detachedDestroyHooked) return;
+		detachedDestroyHooked = true;
+		w.once('tauri://destroyed', () => {
+			detachedDestroyHooked = false;
+			reattachAndroid();
+		}).catch((e: unknown) => {
+			detachedDestroyHooked = false;
+			console.error('failed to watch detached window', e);
+		});
+	}
+
+	// Browser: the popup handle is all we have — poll for it closing.
+	let popupPoll: ReturnType<typeof setInterval> | undefined;
+	function watchPopupClose(popup: Window) {
+		clearInterval(popupPoll);
+		popupPoll = setInterval(() => {
+			if (popup.closed) {
+				clearInterval(popupPoll);
+				reattachAndroid();
+			}
+		}, 1000);
+	}
+
+	// Pop the live view out into its own window: a native OS window in the desktop
+	// app (drag to another monitor, resize freely), a browser popup on the web.
+	// Both load the standalone /android route — the same AndroidLiveView component.
+	// Detaching moves the view out, so collapse the in-app panel.
+	async function detachAndroid() {
+		const label = 'android-live';
+		const url = new URL('/android', window.location.href).href;
+		try {
+			// In the desktop app the frontend is served from http://localhost (remote
+			// content to Tauri), where every IPC call is denied unless the capability
+			// grants this origin (capabilities/remote-webview.json). The grant must
+			// include get-all-windows: getByLabel() invokes plugin:window|get_all_windows
+			// before anything else, so a missing grant rejects right here and the catch
+			// below swallows the detach. __TAURI_INTERNALS__ is always injected (even
+			// for remote content), so the window.open branch only runs in a real browser.
+			if ('__TAURI_INTERNALS__' in window) {
+				const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+				const existing = await WebviewWindow.getByLabel(label);
+				if (existing) {
+					await existing.setFocus();
+					hookDetachedClose(existing);
+				} else {
+					const w = new WebviewWindow(label, {
+						url,
+						title: 'Android — xpressclaw',
+						width: 420,
+						height: 900
+					});
+					w.once('tauri://error', (e) => console.error('detach window failed', e));
+					hookDetachedClose(w);
+				}
+			} else {
+				const popup = window.open(url, label, 'popup,width=420,height=900');
+				if (popup) watchPopupClose(popup);
+			}
+		} catch (e) {
+			console.error('detach failed', e);
+			return; // leave the in-app panel open so the view isn't lost
+		}
+		androidPanelOpen = false;
+		try {
+			localStorage.setItem('androidPanelOpen', '0');
+		} catch {
+			/* ignore */
+		}
 	}
 
 	async function loadSidebar() {
@@ -132,15 +261,37 @@
 	}
 
 	onMount(() => {
-		if (isSetupRoute) return;
+		if (isChromeless) return;
 		loadSidebar();
 		checkDocker();
+		detectAndroid();
+		try {
+			androidPanelOpen = localStorage.getItem('androidPanelOpen') === '1';
+		} catch {
+			/* ignore */
+		}
+		// Desktop: if the main window (re)loaded while a detached live view is
+		// open, re-hook its close watcher so closing it still reattaches.
+		if ('__TAURI_INTERNALS__' in window) {
+			import('@tauri-apps/api/webviewWindow')
+				.then(({ WebviewWindow }) => WebviewWindow.getByLabel('android-live'))
+				.then((w) => {
+					if (w) hookDetachedClose(w);
+				})
+				.catch(() => {
+					/* no IPC grant or lookup failed — reattach-on-close just won't auto-fire */
+				});
+		}
 		const interval = setInterval(() => {
 			loadSidebar();
 			checkConnection();
 			if (!dockerAvailable) checkDocker();
+			if (!androidProbed) detectAndroid(); // retry only until we get a definitive answer
 		}, 5000);
-		return () => clearInterval(interval);
+		return () => {
+			clearInterval(interval);
+			clearInterval(popupPoll);
+		};
 	});
 
 	function convIcon(conv: Conversation): string {
@@ -168,7 +319,7 @@
 	const plusButton = 'flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] text-sm transition-colors';
 </script>
 
-{#if isSetupRoute}
+{#if isChromeless}
 	{@render children()}
 {:else}
 	<div class="flex h-screen">
@@ -367,6 +518,40 @@
 				{@render children()}
 			</div>
 		</main>
+
+		<!-- Android live-view panel — spawns from the right rail, beside the chat -->
+		{#if androidAvailable && androidPanelOpen}
+			<aside
+				class="w-80 flex-shrink-0 border-l border-border"
+				style="background: hsl(var(--sidebar))"
+			>
+				<AndroidLiveView detachable ondetach={detachAndroid} />
+			</aside>
+		{/if}
+
+		<!-- Right rail — only present when Android support is installed -->
+		{#if androidAvailable}
+			<nav
+				class="flex w-12 flex-shrink-0 flex-col items-center gap-1 border-l border-border py-2"
+				style="background: hsl(var(--sidebar))"
+			>
+				<button
+					onclick={toggleAndroidPanel}
+					title="Android device"
+					class="flex h-9 w-9 items-center justify-center rounded-lg transition-colors {androidPanelOpen
+						? 'bg-[hsl(var(--sidebar-active))] text-foreground'
+						: 'text-muted-foreground hover:bg-[hsl(var(--sidebar-active)/.5)] hover:text-foreground'}"
+				>
+					<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"
+						><path
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							d="M4 10v6 M20 10v6 M7 9h10v8a1 1 0 0 1 -1 1h-8a1 1 0 0 1 -1 -1v-8a5 5 0 0 1 10 0 M8 3l1 2 M16 3l-1 2 M9 18v3 M15 18v3"
+						/></svg
+					>
+				</button>
+			</nav>
+		{/if}
 	</div>
 
 	<!-- Server disconnected overlay -->
@@ -385,7 +570,7 @@
 	{/if}
 
 	<!-- Docker unavailable modal -->
-	{#if !dockerAvailable && !isSetupRoute}
+	{#if !dockerAvailable && !isChromeless}
 		<div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm">
 			<div class="mx-4 w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-2xl space-y-4">
 				<div class="flex items-center gap-3">

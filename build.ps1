@@ -25,7 +25,8 @@ foreach ($arg in $args) {
     }
 }
 
-# Build CLI with Cargo (build.rs auto-builds frontend if needed)
+# Build CLI with Cargo (build.rs auto-builds frontend if needed). Android
+# device control is always compiled in (see ADR-024).
 Write-Host "==> Building CLI..."
 cargo build --release -p xpressclaw-cli
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -61,6 +61,7 @@
 	let gitSshKeyPath = $state('');
 	let githubEnabled = $state(false);
 	let githubPat = $state('');
+	let androidEnabled = $state(false);
 
 	// Legacy preset list for custom MCP servers only
 	const mcpPresets: { name: string; id: string; command: string; args: string; envKey: string }[] = [];
@@ -106,6 +107,7 @@
 		const servers = preset.default_mcp_servers || {};
 		gitEnabled = tools.includes('git') || 'git' in servers;
 		githubEnabled = tools.includes('github') || 'github' in servers;
+		androidEnabled = tools.includes('android');
 
 		// Keep non-default MCP servers (custom ones)
 		const defaultKeys = new Set(['shell', 'filesystem', 'git', 'github']);
@@ -268,6 +270,7 @@
 			const tools = ['filesystem', 'shell', 'memory'];
 			if (gitEnabled) tools.push('git');
 			if (githubEnabled) tools.push('github');
+			if (androidEnabled) tools.push('android');
 
 			// Cloud providers send a real model name; Ollama sends the tag.
 			const realModel = (llmProvider === 'openai' || llmProvider === 'anthropic')
@@ -715,6 +718,17 @@
 							</p>
 						</div>
 					{/if}
+				</div>
+
+				<!-- Android -->
+				<div class="rounded-lg border {androidEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
+					<label class="flex items-center gap-3 cursor-pointer">
+						<input type="checkbox" bind:checked={androidEnabled} class="rounded border-border" />
+						<div>
+							<div class="text-sm font-medium text-foreground">Android Device Control</div>
+							<div class="text-xs text-muted-foreground">Drive an Android device or emulator (needs the Android SDK on this machine)</div>
+						</div>
+					</label>
 				</div>
 			</div>
 		</div>

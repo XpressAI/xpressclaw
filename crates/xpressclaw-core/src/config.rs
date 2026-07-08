@@ -166,6 +166,18 @@ pub fn default_mcp_servers() -> HashMap<String, McpServerConfig> {
             ..Default::default()
         },
     );
+    // Android device control — proxies to the server's /v1/android/* endpoints
+    // (see ADR-024). Like shell/filesystem, always present; the tools report a
+    // clear error at call time if no device/SDK is reachable.
+    servers.insert(
+        "android".to_string(),
+        McpServerConfig {
+            server_type: "stdio".to_string(),
+            command: Some("python3".to_string()),
+            args: vec!["-u".into(), "/app/mcp_android.py".into()],
+            ..Default::default()
+        },
+    );
     servers
 }
 
@@ -456,6 +468,22 @@ pub struct LlmConfig {
     pub custom_pricing: HashMap<String, crate::llm::pricing::ModelPricing>,
 }
 
+/// Android device-control settings (ADR-024): which `adbd` the runtime drives.
+/// The same target is used by the control plane (`/v1/android/*`), the emulator
+/// lifecycle (setup preflight), and the agents' MCP tools — one source of truth,
+/// not hidden per-subsystem state. Absent → the managed emulator's default
+/// serial.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AndroidConfig {
+    /// Device serial as shown by `adb devices` (e.g. "emulator-5554"),
+    /// resolved through the local adb server.
+    pub serial: Option<String>,
+    /// Direct `adbd` TCP address (e.g. "127.0.0.1:5555"). Overrides `serial`;
+    /// needs no adb binary or server.
+    pub tcp: Option<String>,
+}
+
 /// Root configuration for xpressclaw.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -473,6 +501,8 @@ pub struct Config {
     pub tool_policies: Vec<ToolPolicyRule>,
     pub memory: MemoryConfig,
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub android: AndroidConfig,
 }
 
 impl Config {

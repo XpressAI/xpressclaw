@@ -139,6 +139,10 @@ pub enum Error {
 
     #[error("LLM provider not found: {name}")]
     LlmProviderNotFound { name: String },
+
+    // Android device control
+    #[error("android error: {0}")]
+    Android(String),
 }
 
 impl From<rusqlite::Error> for Error {

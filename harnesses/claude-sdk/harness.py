@@ -92,6 +92,11 @@ def _build_options(model: str, system_prompt: str, mcp_servers: dict,
         disallowed_tools=["AskUserQuestion"],
         setting_sources=["project", "user"],
         include_partial_messages=True,
+        # Raise the CLI stdout buffer above the 1MB default so a large tool
+        # result (e.g. a screenshot) doesn't overflow it and crash+reset the
+        # session. Belt-and-suspenders: tools should still keep results small
+        # (e.g. android screenshots are downscaled JPEGs). See ADR-024.
+        max_buffer_size=10 * 1024 * 1024,
     )
     if mcp_servers:
         options.mcp_servers = mcp_servers
