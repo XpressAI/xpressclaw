@@ -23,6 +23,30 @@ pub fn image_for_backend(backend: &str) -> &'static str {
     }
 }
 
+/// Default MCP servers an agent gets only when its `tools` list opts in.
+/// Core servers (shell, filesystem, xpressclaw) are always present.
+const OPTIONAL_MCP_SERVERS: &[&str] = &["android"];
+
+/// The MCP servers an agent's container gets: defaults + extras, minus
+/// optional servers not named in `agent.tools`.
+pub fn agent_mcp_servers(
+    agent: &AgentConfig,
+    extra: Option<&std::collections::HashMap<String, crate::config::McpServerConfig>>,
+) -> std::collections::HashMap<String, crate::config::McpServerConfig> {
+    let mut servers = crate::config::default_mcp_servers();
+    if let Some(extra) = extra {
+        for (name, cfg) in extra {
+            servers.insert(name.clone(), cfg.clone());
+        }
+    }
+    for name in OPTIONAL_MCP_SERVERS {
+        if !agent.tools.iter().any(|t| t == name) {
+            servers.remove(*name);
+        }
+    }
+    servers
+}
+
 /// Build a container spec for an agent based on its configuration.
 ///
 /// The harness inside the container always calls back to the server's `/v1/`
@@ -83,22 +107,10 @@ pub fn build_container_spec_with_mcp(
         }
     }
 
-    // MCP servers — merge defaults with config-provided servers and inject as JSON env var.
-    // Agents need these to call tasks, apps, memory, etc.
-    if let Some(servers) = mcp_servers {
-        let mut all_servers = crate::config::default_mcp_servers();
-        for (name, cfg) in servers {
-            all_servers.insert(name.clone(), cfg.clone());
-        }
-        if let Ok(json) = serde_json::to_string(&all_servers) {
-            env.push(format!("MCP_SERVERS={json}"));
-        }
-    } else {
-        // No servers provided — still inject defaults
-        let defaults = crate::config::default_mcp_servers();
-        if let Ok(json) = serde_json::to_string(&defaults) {
-            env.push(format!("MCP_SERVERS={json}"));
-        }
+    // MCP servers — defaults + extras, gated per agent.
+    let all_servers = agent_mcp_servers(agent, mcp_servers);
+    if let Ok(json) = serde_json::to_string(&all_servers) {
+        env.push(format!("MCP_SERVERS={json}"));
     }
 
     // Volume mounts from agent config (format: "host_path:container_path" or "host_path:container_path:ro")
@@ -254,6 +266,37 @@ mod tests {
             .environment
             .iter()
             .any(|e| e == "ANTHROPIC_API_KEY=sk-ant-test-agent"));
+    }
+
+    #[test]
+    fn test_android_mcp_server_is_per_agent() {
+        let agent = AgentConfig {
+            name: "plain".to_string(),
+            tools: vec!["filesystem".into(), "shell".into(), "memory".into()],
+            ..Default::default()
+        };
+        let servers = agent_mcp_servers(&agent, None);
+        assert!(servers.contains_key("shell"));
+        assert!(servers.contains_key("filesystem"));
+        assert!(servers.contains_key("xpressclaw"));
+        assert!(!servers.contains_key("android"));
+
+        let agent = AgentConfig {
+            name: "pilot".to_string(),
+            tools: vec!["filesystem".into(), "android".into()],
+            ..Default::default()
+        };
+        let servers = agent_mcp_servers(&agent, None);
+        assert!(servers.contains_key("android"));
+
+        // The gating shows up in the container env too.
+        let spec = build_container_spec(&agent, 6969);
+        let mcp = spec
+            .environment
+            .iter()
+            .find(|e| e.starts_with("MCP_SERVERS="))
+            .expect("MCP_SERVERS env");
+        assert!(mcp.contains("mcp_android.py"));
     }
 
     #[test]

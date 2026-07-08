@@ -16,6 +16,7 @@
 	let gitEnabled = $state(false);
 	let githubEnabled = $state(false);
 	let websearchEnabled = $state(false);
+	let androidEnabled = $state(false);
 
 	// MCP servers
 	interface McpServer {
@@ -31,7 +32,7 @@
 
 	// Modal state
 	let showConfigModal = $state(false);
-	let configTarget = $state<'fetch' | 'git' | 'github' | 'websearch' | 'mcp' | null>(null);
+	let configTarget = $state<'fetch' | 'git' | 'github' | 'websearch' | 'android' | 'mcp' | null>(null);
 	let configTitle = $state('');
 
 	// Tool-specific config (stored as env vars or notes for now)
@@ -62,6 +63,7 @@
 		git: { label: 'Git', desc: 'Configure SSH key for repository access' },
 		github: { label: 'GitHub', desc: 'Configure personal access token' },
 		websearch: { label: 'Web Search', desc: 'Search the web via DuckDuckGo' },
+		android: { label: 'Android Device Control', desc: 'Drive an Android device or emulator' },
 	};
 
 	$effect(() => {
@@ -70,6 +72,7 @@
 			gitEnabled = agentConfig.tools.includes('git');
 			githubEnabled = agentConfig.tools.includes('github');
 			websearchEnabled = agentConfig.tools.includes('websearch');
+			androidEnabled = agentConfig.tools.includes('android');
 		}
 	});
 
@@ -89,6 +92,7 @@
 			case 'git': return gitEnabled;
 			case 'github': return githubEnabled;
 			case 'websearch': return websearchEnabled;
+			case 'android': return androidEnabled;
 			default: return false;
 		}
 	}
@@ -99,6 +103,7 @@
 			case 'git': gitEnabled = val; break;
 			case 'github': githubEnabled = val; break;
 			case 'websearch': websearchEnabled = val; break;
+			case 'android': androidEnabled = val; break;
 		}
 	}
 
@@ -234,10 +239,15 @@
 		if (gitEnabled) tools.push('git');
 		if (githubEnabled) tools.push('github');
 		if (websearchEnabled) tools.push('websearch');
+		if (androidEnabled) tools.push('android');
 		onSave({ tools });
 	}
 
 	const builtinMcpNames = ['shell', 'filesystem', 'xpressclaw'];
+
+	// android lives in the Optional Tools toggle only; its config entry is
+	// display-only (containers compose from code defaults, host spawn skips /app/).
+	const visibleMcpServers = $derived(mcpServers.filter((s) => s.name !== 'android'));
 </script>
 
 <div class="space-y-6">
@@ -255,7 +265,7 @@
 	<div class="rounded-lg border border-border bg-card p-4 space-y-3">
 		<h2 class="text-sm font-semibold">Optional Tools</h2>
 		<div class="space-y-2">
-			{#each ['fetch', 'git', 'github', 'websearch'] as key}
+			{#each ['fetch', 'git', 'github', 'websearch', 'android'] as key}
 				{@const checked = getToggle(key)}
 				{@const cfg = toolConfigs[key]}
 				<div class="flex items-center gap-3 rounded-md border border-border p-3 {checked ? 'border-primary/30 bg-primary/5' : ''}">
@@ -294,9 +304,9 @@
 			</div>
 		</div>
 
-		{#if mcpServers.length > 0}
+		{#if visibleMcpServers.length > 0}
 			<div class="space-y-1">
-				{#each mcpServers as server}
+				{#each visibleMcpServers as server}
 					<div class="flex items-center gap-2 rounded-md border border-border px-3 py-2">
 						<span class="w-2 h-2 rounded-full bg-emerald-500 shrink-0"></span>
 						<span class="text-sm font-mono flex-1 truncate">{server.name}</span>
@@ -367,6 +377,11 @@
 			{:else if configTarget === 'websearch'}
 				<div>
 					<p class="text-sm text-muted-foreground">Web Search uses DuckDuckGo and requires no configuration.</p>
+				</div>
+
+			{:else if configTarget === 'android'}
+				<div>
+					<p class="text-sm text-muted-foreground">Lets this agent see and control the Android device — read the screen, tap, type, and launch apps. The agent restarts to pick up the change. The device it drives (serial / TCP) is configured in the Android panel's gear menu and is shared by all agents.</p>
 				</div>
 
 			{:else if configTarget === 'mcp'}

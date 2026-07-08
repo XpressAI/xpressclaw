@@ -105,7 +105,18 @@ Google's emulator or images.
 Android is a **tool available to any agent, not a dedicated agent**: the early
 `android-pilot` preset was removed, and its operating guidance (screen-map
 first, `open_app` > `tap_text` > `tap`, FLAG_SECURE screens) lives in the MCP
-tool descriptions where every agent receives it.
+tool descriptions. The server is **per-agent opt-in** (off by default): it is
+injected only when `"android"` appears in the agent's `tools` list (toggle in
+the agent's Tools tab / setup wizard); the reconciler recreates a running
+container when the toggle flips. The toggle is the tool's *only* UI
+representation: android never appears in the MCP-server lists (the wizard
+already hides shell/filesystem/git/github from its list), and the copy of the
+android server definition that setup seeds into `Config.mcp_servers` is dead
+config — containers compose from the code defaults, and the host-side server
+spawner skips `/app/` paths. This gates the agent's toolbox, not the
+network — `/v1/android/*` is as reachable from a shell-capable container as
+every other host endpoint (the host API carries no per-agent authorization;
+a known, android-independent boundary).
 
 **5. Human login view.** The emulator's own window is the login surface
 initially; an embedded stream (scrcpy/noVNC) in the web UI is a follow-up.

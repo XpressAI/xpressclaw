@@ -250,6 +250,40 @@ async fn reconcile_agents(
                     continue;
                 }
 
+                // MCP_SERVERS is baked in at container start; recreate when the
+                // agent's toolset changed (same pattern as the image check above).
+                let desired: std::collections::BTreeSet<String> =
+                    crate::docker::images::agent_mcp_servers(agent_config, None)
+                        .into_keys()
+                        .collect();
+                let actual = docker
+                    .container_env_var(&container_name, "MCP_SERVERS")
+                    .await
+                    .and_then(|v| {
+                        serde_json::from_str::<
+                            std::collections::HashMap<String, serde_json::Value>,
+                        >(&v)
+                        .ok()
+                    })
+                    .map(|m| m.into_keys().collect::<std::collections::BTreeSet<_>>());
+                if let Some(actual) = actual {
+                    if actual != desired {
+                        info!(
+                            agent = agent.id,
+                            ?desired,
+                            ?actual,
+                            "agent toolset changed, recreating container"
+                        );
+                        let _ = docker.stop(&agent.id).await;
+                        let _ = registry.update_status(
+                            &agent.id,
+                            &crate::agents::state::AgentStatus::Stopped,
+                            None,
+                        );
+                        continue;
+                    }
+                }
+
                 if agent.restart_count > 0 {
                     let uptime = docker.container_uptime_secs(&container_name).await;
                     if uptime >= STABLE_THRESHOLD_SECS {
