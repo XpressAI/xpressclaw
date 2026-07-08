@@ -296,7 +296,9 @@ async fn set_android_target(
 
     let android = new_config.android.clone();
     state.apply_config(std::sync::Arc::new(new_config), state.llm_router());
-    Ok(Json(json!({ "success": true, "serial": android.serial, "tcp": android.tcp })))
+    Ok(Json(
+        json!({ "success": true, "serial": android.serial, "tcp": android.tcp }),
+    ))
 }
 
 /// Recommend a local model based on system hardware.

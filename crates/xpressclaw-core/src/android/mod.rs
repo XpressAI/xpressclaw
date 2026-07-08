@@ -53,9 +53,9 @@ impl AndroidDevice {
     /// device by serial, e.g. `"emulator-5554"`.
     pub fn via_server(serial: &str) -> Result<Self> {
         let mut server = ADBServer::default();
-        let device = server.get_device_by_name(serial).map_err(|e| {
-            Error::Android(format!("adb server connect to '{serial}' failed: {e}"))
-        })?;
+        let device = server
+            .get_device_by_name(serial)
+            .map_err(|e| Error::Android(format!("adb server connect to '{serial}' failed: {e}")))?;
         Ok(Self {
             inner: Box::new(device),
         })
@@ -110,7 +110,12 @@ impl AndroidDevice {
         let rgb = img.to_rgb8();
         let mut out = Vec::new();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
-            .encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
             .map_err(|e| Error::Android(format!("encode jpeg: {e}")))?;
         Ok(out)
     }
@@ -395,7 +400,10 @@ mod tests {
 
     #[test]
     fn parses_wm_size() {
-        assert_eq!(parse_wm_size("Physical size: 1080x2400"), Some((1080, 2400)));
+        assert_eq!(
+            parse_wm_size("Physical size: 1080x2400"),
+            Some((1080, 2400))
+        );
         // Override wins when present (the effective/captured resolution).
         assert_eq!(
             parse_wm_size("Physical size: 1080x2400\nOverride size: 720x1280"),

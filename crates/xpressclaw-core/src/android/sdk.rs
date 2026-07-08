@@ -77,9 +77,12 @@ pub fn find_sdk_root() -> Option<PathBuf> {
     }
     let home = home_dir()?;
     [
-        home.join("AppData").join("Local").join("Android").join("Sdk"), // Windows
-        home.join("Library").join("Android").join("sdk"),               // macOS
-        home.join("Android").join("Sdk"),                               // Linux
+        home.join("AppData")
+            .join("Local")
+            .join("Android")
+            .join("Sdk"), // Windows
+        home.join("Library").join("Android").join("sdk"), // macOS
+        home.join("Android").join("Sdk"),                 // Linux
     ]
     .into_iter()
     .find(|p| p.is_dir())

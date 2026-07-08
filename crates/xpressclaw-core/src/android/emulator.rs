@@ -26,7 +26,11 @@ pub fn is_running(serial: &str) -> bool {
 /// Path to the SDK's `emulator` binary, if installed.
 pub fn emulator_binary() -> Option<PathBuf> {
     let root = sdk::find_sdk_root()?;
-    let name = if cfg!(windows) { "emulator.exe" } else { "emulator" };
+    let name = if cfg!(windows) {
+        "emulator.exe"
+    } else {
+        "emulator"
+    };
     let p = root.join("emulator").join(name);
     p.exists().then_some(p)
 }

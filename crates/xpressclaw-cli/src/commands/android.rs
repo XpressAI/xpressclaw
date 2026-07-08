@@ -106,7 +106,12 @@ pub async fn run(
         let android = Config::load(Path::new("xpressclaw.yaml"))
             .map(|c| c.android)
             .unwrap_or_default();
-        if let Some(addr) = android.tcp.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(addr) = android
+            .tcp
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let socket: SocketAddr = addr.parse().map_err(|e| {
                 anyhow::anyhow!("invalid android.tcp '{addr}' in xpressclaw.yaml: {e}")
             })?;
@@ -212,7 +217,11 @@ fn print_doctor() {
         println!("             e.g. avdmanager create avd -n android \\");
         println!("                    -k \"{DEFAULT_SYSTEM_IMAGE}\" -d {DEFAULT_DEVICE_PROFILE}");
     } else {
-        println!("  [ok]       AVDs ({}): {}", s.avds.len(), s.avds.join(", "));
+        println!(
+            "  [ok]       AVDs ({}): {}",
+            s.avds.len(),
+            s.avds.join(", ")
+        );
     }
 
     match s.accel_ok {
