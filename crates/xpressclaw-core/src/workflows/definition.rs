@@ -443,6 +443,16 @@ flows:
     }
 
     #[test]
+    fn test_native_code_review_example_is_valid() {
+        let yaml = include_str!("../../../../examples/workflows/codex-claude-review-loop.yaml");
+        let definition = WorkflowDefinition::parse(yaml).unwrap();
+        definition.validate().unwrap();
+        let main = definition.flows.get("main").unwrap();
+        assert_eq!(main.steps[0].agent.as_deref(), Some("codex-builder"));
+        assert_eq!(main.steps[1].agent.as_deref(), Some("claude-reviewer"));
+    }
+
+    #[test]
     fn test_validate_valid_definition() {
         let def = WorkflowDefinition::parse(SAMPLE_YAML).unwrap();
         assert!(def.validate().is_ok());

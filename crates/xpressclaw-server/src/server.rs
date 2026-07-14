@@ -62,13 +62,70 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Start the task dispatcher background loop.
+    // Ensure every configured profile has a durable logical session.
+    {
+        let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+        for agent in &config.agents {
+            let title = agent.display_name.as_deref().unwrap_or(&agent.name);
+            if let Err(error) = sessions.ensure(&agent.name, Some(title)) {
+                warn!(agent_id = agent.name, error = %error, "failed to initialize session");
+            }
+        }
+    }
+
+    // A process restart severs ownership of in-flight worker containers.
+    // Remove any leftovers, restore their durable queue records, and let the
+    // normal dispatcher retry them from a known state.
+    let dispatcher_docker = state.docker().await;
+    if let Some(docker) = dispatcher_docker.as_ref() {
+        match docker.list().await {
+            Ok(containers) => {
+                for container in containers {
+                    let is_attempt = container.agent_id.starts_with("attempt-");
+                    let is_legacy_profile = config
+                        .agents
+                        .iter()
+                        .any(|agent| agent.name == container.agent_id);
+                    if is_attempt || is_legacy_profile {
+                        let _ = docker.stop(&container.agent_id).await;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to inspect interrupted worker containers")
+            }
+        }
+    }
+    match xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone()).recover_in_progress() {
+        Ok(count) if count > 0 => info!(count, "requeued interrupted work attempts"),
+        Err(error) => warn!(error = %error, "failed to recover interrupted work attempts"),
+        _ => {}
+    }
+
+    // Recover workflow bookkeeping before workers can claim recovered tasks.
+    {
+        let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());
+        match engine.recover() {
+            Ok(()) => info!("workflow engine recovery complete"),
+            Err(e) => warn!(error = %e, "workflow engine recovery failed"),
+        }
+    }
+
+    // Consume tasks with short-lived native CLI workers. The former harness
+    // dispatcher and desired-state agent reconciler are intentionally not
+    // started: profiles are durable sessions, not long-running agent loops.
     let dispatcher_db = state.db.clone();
-    let dispatcher_config = state.config();
+    let dispatcher_config = state.config.clone();
+    let dispatcher_event_bus = state.event_bus.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
-            _ = xpressclaw_core::tasks::dispatcher::start_dispatcher(dispatcher_db, dispatcher_config) => {}
+            _ = xpressclaw_core::workers::native::start_dispatcher(
+                dispatcher_db,
+                dispatcher_config,
+                dispatcher_docker,
+                dispatcher_event_bus,
+            ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }
     });
@@ -83,29 +140,8 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    // Start the desired-state reconciler (ADR-018).
-    let reconciler_db = state.db.clone();
-    let reconciler_config = state.config.clone();
-    let reconciler_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = xpressclaw_core::agents::reconciler::start(reconciler_db, reconciler_config, port) => {}
-            _ = reconciler_shutdown.cancelled() => { info!("reconciler stopped"); }
-        }
-    });
-
-    // Recover any running workflow instances after restart.
-    {
-        let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());
-        match engine.recover() {
-            Ok(()) => info!("workflow engine recovery complete"),
-            Err(e) => warn!(error = %e, "workflow engine recovery failed"),
-        }
-    }
-
     // Start connector runtime: launch all enabled connectors and route their events.
     let connector_db = state.db.clone();
-    let connector_state = state.clone();
     let connector_shutdown = shutdown.clone();
     tokio::spawn(async move {
         use xpressclaw_core::connectors::registry::ConnectorRegistry;
@@ -128,27 +164,50 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             tokio::select! {
                 Some(event) = event_rx.recv() => {
                     // Route event: direct agent binding → conversation, or → workflow engine
-                    if let Some((conv_id, _agent_id)) = router::route_event(&connector_db, &event) {
-                        // Message was injected into a conversation — spawn the processor
-                        let mgr = xpressclaw_core::conversations::ConversationManager::new(connector_db.clone());
-                        if !mgr.is_processing(&conv_id) {
-                            if let Some(llm_router) = connector_state.llm_router() {
-                                let config = connector_state.config();
-                                let agent_roles = config.agents.iter()
-                                    .map(|a| (a.name.clone(), a.full_system_prompt()))
-                                    .collect();
-                                xpressclaw_core::conversations::processor::spawn(
-                                    conv_id,
-                                    xpressclaw_core::conversations::processor::ProcessorContext {
-                                        db: connector_db.clone(),
-                                        config,
-                                        llm_router,
-                                        event_bus: connector_state.event_bus.clone(),
-                                        rate_limiter: connector_state.rate_limiter(),
-                                        agent_roles,
-                                        docker: connector_state.docker().await,
-                                    },
-                                );
+                    if let Some((conv_id, agent_id)) = router::route_event(&connector_db, &event) {
+                        // Direct connector messages are session events that queue
+                        // native work, just like UI messages and schedules.
+                        let sessions = xpressclaw_core::sessions::SessionManager::new(connector_db.clone());
+                        let _ = sessions.ensure(&agent_id, Some(&agent_id));
+                        let summary = event.payload.get("text")
+                            .or_else(|| event.payload.get("message"))
+                            .or_else(|| event.payload.get("content"))
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| event.payload.to_string());
+                        let source_id = format!("{}:{}", event.connector_id, event.channel_id);
+                        let _ = sessions.append_event(
+                            &agent_id,
+                            xpressclaw_core::sessions::NewEvent {
+                                attempt_id: None,
+                                task_id: None,
+                                source_type: "connector",
+                                source_id: Some(&source_id),
+                                event_type: &event.event_type,
+                                summary: &summary,
+                                payload: event.payload.clone(),
+                            },
+                        );
+                        let board = xpressclaw_core::tasks::board::TaskBoard::new(connector_db.clone());
+                        if let Ok(task) = board.create(&xpressclaw_core::tasks::board::CreateTask {
+                            title: format!("{} message", event.connector_id),
+                            description: Some(summary),
+                            agent_id: Some(agent_id.clone()),
+                            parent_task_id: None,
+                            sop_id: None,
+                            conversation_id: Some(conv_id),
+                            priority: None,
+                            context: Some(serde_json::json!({
+                                "origin": "connector",
+                                "kind": "interactive",
+                                "source_id": source_id,
+                                "connector_id": event.connector_id,
+                                "channel_id": event.channel_id,
+                            })),
+                        }) {
+                            let queue = xpressclaw_core::tasks::queue::TaskQueue::new(connector_db.clone());
+                            if let Err(error) = queue.enqueue(&task.id, &agent_id) {
+                                warn!(task_id = task.id, error = %error, "failed to queue connector work");
                             }
                         }
                     }
@@ -196,24 +255,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     let shutdown_task = async {
         if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-            let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-            if let Ok(agents) = registry.list() {
-                for agent in &agents {
-                    let _ = docker.stop(&agent.id).await;
-                }
-            }
-            let apps: Vec<String> = {
-                let conn = state.db.conn();
-                conn.prepare("SELECT id FROM apps WHERE status IN ('running', 'starting')")
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| row.get::<_, String>(0))
-                            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                    })
-                    .unwrap_or_default()
-            };
-            for app_id in &apps {
-                let _ = docker.stop(&format!("app-{app_id}")).await;
-            }
+            let _ = docker.stop_all().await;
             info!("all containers stopped");
         }
     };

@@ -275,7 +275,7 @@
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
 			<div class="flex gap-3">
 				<div class="flex-1">
-					<div class="text-xs text-muted-foreground mb-1">Assign to Agent</div>
+					<div class="text-xs text-muted-foreground mb-1">Assign to Session</div>
 					<select bind:value={editAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value="">Unassigned</option>
@@ -403,7 +403,7 @@
 					{#if task.status === 'in_progress'}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
 							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
-							Agent is working on this task...
+							A native worker is handling this task...
 						</div>
 					{:else if task.status === 'waiting_for_input'}
 						<div class="flex items-center gap-2 text-xs text-orange-400">
@@ -464,7 +464,7 @@
 						</div>
 						{#if task.agent_id}
 							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Agent</dt>
+								<dt class="text-muted-foreground">Session</dt>
 								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{task.agent_id}</a></dd>
 							</div>
 						{/if}

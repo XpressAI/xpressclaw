@@ -245,7 +245,13 @@ impl WorkflowEngine {
             sop_id: step.procedure.clone(),
             conversation_id: None,
             priority: None,
-            context: None,
+            context: Some(serde_json::json!({
+                "origin": "workflow",
+                "kind": "workflow",
+                "source_id": instance_id,
+                "flow": flow_name,
+                "step": step.id,
+            })),
         })?;
 
         // Enqueue for the dispatcher

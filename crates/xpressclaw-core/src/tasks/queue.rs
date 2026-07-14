@@ -5,8 +5,9 @@ use tracing::debug;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::sessions::SessionManager;
 
-/// A queued task item for harness dispatch.
+/// A queued task item for native attempt dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
     pub id: i64,
@@ -17,6 +18,7 @@ pub struct QueueItem {
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
     pub harness_response: Option<String>,
+    pub attempt_id: Option<String>,
 }
 
 /// SQLite-backed task queue for dispatching work to harness containers.
@@ -38,6 +40,60 @@ impl TaskQueue {
             )?;
             Ok::<_, Error>(conn.last_insert_rowid())
         })?;
+
+        let (title, description, kind, source_type, source_id) = self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT title, description, context FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| {
+                    let title: String = row.get(0)?;
+                    let description: Option<String> = row.get(1)?;
+                    let context: Option<String> = row.get(2)?;
+                    let context = context
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                    let kind = context
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("task")
+                        .to_string();
+                    let source_type = context
+                        .as_ref()
+                        .and_then(|value| value.get("origin"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("task")
+                        .to_string();
+                    let source_id = context
+                        .as_ref()
+                        .and_then(|value| value.get("source_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned);
+                    Ok((title, description, kind, source_type, source_id))
+                },
+            )
+            .map_err(Error::from)
+        })?;
+        let prompt = match description {
+            Some(description) if !description.trim().is_empty() => {
+                format!("{title}\n\n{description}")
+            }
+            _ => title,
+        };
+        if let Err(error) = SessionManager::new(self.db.clone()).create_attempt(
+            agent_id,
+            task_id,
+            id,
+            "auto",
+            &kind,
+            &source_type,
+            source_id.as_deref(),
+            &prompt,
+        ) {
+            self.db
+                .with_conn(|conn| conn.execute("DELETE FROM task_queue WHERE id = ?1", [id]))?;
+            return Err(error);
+        }
 
         debug!(task_id, agent_id, queue_id = id, "enqueued task");
         self.get(id)
@@ -81,6 +137,125 @@ impl TaskQueue {
                 None => Ok(None),
             }
         })
+    }
+
+    /// Claim the oldest queued item across all logical sessions.
+    ///
+    /// Native runners are short-lived workers, so dispatch is no longer tied
+    /// to a long-running per-agent harness process.
+    pub fn claim_next(&self) -> Result<Option<QueueItem>> {
+        self.db
+            .with_conn(|conn| {
+                let id: Option<i64> = conn
+                    .query_row(
+                        "SELECT q.id FROM task_queue q
+                         JOIN tasks t ON t.id = q.task_id
+                         JOIN work_attempts candidate ON candidate.id = q.attempt_id
+                         WHERE q.status = 'queued'
+                           AND candidate.status = 'queued'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_dependencies d
+                               JOIN tasks dependency ON dependency.id = d.depends_on_id
+                               WHERE d.task_id = q.task_id AND dependency.status != 'completed'
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM work_attempts active
+                               WHERE active.session_id = candidate.session_id
+                                 AND active.id != candidate.id
+                                 AND active.status IN ('preparing', 'running', 'review')
+                           )
+                         ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(id) = id {
+                    let changed = conn.execute(
+                        "UPDATE task_queue SET status = 'running', started_at = CURRENT_TIMESTAMP
+                         WHERE id = ?1 AND status = 'queued'",
+                        [id],
+                    )?;
+                    if changed == 1 {
+                        return Ok(Some(id));
+                    }
+                }
+                Ok(None)
+            })
+            .and_then(|id| id.map(|id| self.get(id)).transpose())
+    }
+
+    /// Requeue work that was in flight when the control plane stopped. Any
+    /// corresponding containers are cleaned up by the server before dispatch
+    /// begins, so the same logical attempt can be safely resumed from queued
+    /// state without leaving a task permanently stuck as in-progress.
+    pub fn recover_in_progress(&self) -> Result<usize> {
+        let orphaned: Vec<(i64, String, String, String)> = self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT q.id, a.id, a.session_id, q.task_id
+                 FROM task_queue q
+                 JOIN work_attempts a ON a.id = q.attempt_id
+                 WHERE q.status = 'running'
+                   AND a.status IN ('queued', 'preparing', 'running', 'review')",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .filter_map(|row| row.ok())
+                .collect();
+            Ok::<_, Error>(rows)
+        })?;
+
+        if orphaned.is_empty() {
+            return Ok(0);
+        }
+
+        self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            for (queue_id, attempt_id, session_id, task_id) in &orphaned {
+                tx.execute(
+                    "UPDATE task_queue SET status = 'queued', started_at = NULL,
+                        completed_at = NULL WHERE id = ?1",
+                    [queue_id],
+                )?;
+                tx.execute(
+                    "UPDATE work_attempts SET status = 'queued', container_id = NULL,
+                        started_at = NULL, completed_at = NULL, error_message = NULL
+                     WHERE id = ?1",
+                    [attempt_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET status = 'pending', completed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [task_id],
+                )?;
+                tx.execute(
+                    "UPDATE logical_sessions SET status = 'queued',
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [session_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok::<_, Error>(())
+        })?;
+
+        let sessions = SessionManager::new(self.db.clone());
+        for (_, attempt_id, session_id, task_id) in &orphaned {
+            let _ = sessions.append_event(
+                session_id,
+                crate::sessions::NewEvent {
+                    attempt_id: Some(attempt_id),
+                    task_id: Some(task_id),
+                    source_type: "system",
+                    source_id: Some("startup-recovery"),
+                    event_type: "attempt_requeued",
+                    summary: "Interrupted work requeued after restart",
+                    payload: serde_json::json!({}),
+                },
+            );
+        }
+
+        Ok(orphaned.len())
     }
 
     /// Mark a queue item as completed with the harness response.
@@ -165,6 +340,7 @@ fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
         started_at: row.get("started_at")?,
         completed_at: row.get("completed_at")?,
         harness_response: row.get("harness_response")?,
+        attempt_id: row.get("attempt_id").unwrap_or(None),
     })
 }
 
@@ -211,6 +387,44 @@ mod tests {
 
         // No more items to claim
         assert!(queue.claim("atlas").unwrap().is_none());
+    }
+
+    #[test]
+    fn recovers_interrupted_native_attempts() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Interrupted task".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        assert_eq!(claimed.id, queued.id);
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+        board
+            .update_status(&task.id, "in_progress", Some("atlas"))
+            .unwrap();
+
+        assert_eq!(queue.recover_in_progress().unwrap(), 1);
+        assert_eq!(queue.get(queued.id).unwrap().status, "queued");
+        assert_eq!(board.get(&task.id).unwrap().status.as_str(), "pending");
+        let overview = SessionManager::new(db).overview("atlas").unwrap();
+        assert_eq!(overview.session.status, "queued");
+        assert!(overview
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "attempt_requeued"));
     }
 
     #[test]

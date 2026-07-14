@@ -342,7 +342,7 @@
 										<tr class="text-xs text-muted-foreground border-b border-border/50">
 											<th class="text-left font-medium pb-2 pr-4">Channel</th>
 											<th class="text-left font-medium pb-2 pr-4">Type</th>
-											<th class="text-left font-medium pb-2 pr-4">Agent</th>
+											<th class="text-left font-medium pb-2 pr-4">Session</th>
 											<th class="text-left font-medium pb-2 pr-4">Config</th>
 											<th class="text-right font-medium pb-2"></th>
 										</tr>
@@ -675,7 +675,7 @@
 
 				<!-- Agent Binding -->
 				<div>
-					<label for="ch-agent" class="block text-xs font-medium text-muted-foreground mb-1.5">Bind to Agent</label>
+					<label for="ch-agent" class="block text-xs font-medium text-muted-foreground mb-1.5">Bind to Session</label>
 					<select
 						id="ch-agent"
 						bind:value={channelForm.agent_id}

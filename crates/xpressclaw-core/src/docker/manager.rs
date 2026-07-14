@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bollard::container::{
     Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
-    RemoveContainerOptions, StopContainerOptions,
+    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
@@ -62,6 +62,13 @@ pub struct ContainerInfo {
     pub agent_id: String,
     pub status: String,
     pub host_port: Option<u16>,
+}
+
+/// Captured result of a short-lived native worker container.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerOutput {
+    pub status_code: i64,
+    pub output: String,
 }
 
 /// Manages Docker/Podman containers for agent isolation.
@@ -413,6 +420,28 @@ impl DockerManager {
         }
 
         Ok(output)
+    }
+
+    /// Wait for a short-lived workload container, capture its output, then
+    /// remove it. The output is consumed by semantic adapters and never shown
+    /// as an interactive terminal.
+    pub async fn wait_for_exit(&self, workload_id: &str) -> Result<ContainerOutput> {
+        let container_name = format!("xpressclaw-{workload_id}");
+        let options = WaitContainerOptions {
+            condition: "not-running",
+        };
+        let mut stream = self.docker.wait_container(&container_name, Some(options));
+        let response = stream
+            .next()
+            .await
+            .ok_or_else(|| Error::Container("container wait ended without a result".to_string()))?
+            .map_err(|e| Error::Container(format!("container wait failed: {e}")))?;
+        let output = self.logs(workload_id, 100_000).await.unwrap_or_default();
+        let _ = self.remove(&container_name).await;
+        Ok(ContainerOutput {
+            status_code: response.status_code,
+            output,
+        })
     }
 
     /// Check if a container is running.

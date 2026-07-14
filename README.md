@@ -2,10 +2,10 @@
   <img src="https://github.com/XpressAI/xpressclaw/blob/7a455d7bf77caf6dafdead4d37c79c7e3f6be809/docs/assets/xpressclaw-banner.jpeg" alt="xpressclaw" width="600">
 </p>
 
-<h3 align="center">Collaborative Local Agent Workspace</h3>
+<h3 align="center">Control Plane for Native Agent Work</h3>
 
 <p align="center">
-A single binary that gives you a complete AI agent runtime — chat with your agents, give them tasks, and let them work autonomously. Built-in memory, budget controls, scheduling, and a polished web UI.
+Run Codex, Claude Code, OpenCode, and other native agents as isolated workers. Queue tasks, schedule recurring work, coordinate multi-agent workflows, and follow everything through one structured session UI.
 </p>
 
 <div align="center">
@@ -32,49 +32,55 @@ xpressclaw init
 xpressclaw up
 ```
 
-That's it. Open `http://localhost:8935` and start chatting with your agents.
+Build the native worker image, open `http://localhost:8935`, and send work to a session:
+
+```bash
+docker build -t xpressclaw-native-runner:latest harnesses/native
+```
 
 ## Why xpressclaw?
 
-Most agent frameworks give you a library. xpressclaw gives you a **running system** — a ~12MB binary with everything included: server, web UI, LLM router, and agent management. No Python environment to configure, no Docker Compose sprawl, no YAML templating engines.
+Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
-- **Chat-first interface** — Talk to your agents in a messaging UI, not a terminal. `@mention` agents in conversations, just like Slack.
-- **Single binary, zero dependencies** — Download one file, run it. The server, API, and web frontend are all embedded.
+- **One logical session** — People, schedules, connectors, workflows, and native workers contribute to one event history.
+- **Native workers** — The selected CLI owns reasoning and tools; xpressclaw does not put another agent framework in front of it.
+- **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri-based `.app` / `.dmg` with system tray. Runs in the background, always available.
-- **Production-tested architecture** — Built on the same agent orchestration patterns that power Xpress AI's enterprise platform, deployed at regulated financial institutions.
-- **Local-first, cloud-optional** — Works with Ollama out of the box. Add OpenAI or Anthropic keys when you need them.
-- **Secure by default** — Agents run in Docker containers. Budget controls prevent runaway costs. No exceptions.
+- **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
+- **Isolated by default** — Every native invocation runs in a short-lived Docker/Podman container.
 
 ## Features
 
-### Chat with Your Agents
+### Persistent Sessions
 
-The primary interface is a **messaging UI**. Create conversations, add agents, and talk to them — individually or in groups. Agents respond via the configured LLM (local or cloud).
+The primary interface is a durable event timeline. It accepts a new message while work is running, records where every event came from, and keeps native execution contexts separate from the user-facing identity.
 
 ### Autonomous Task Execution
 
-Agents pick up tasks from a queue and work through them. Schedule recurring work with cron expressions. Define SOPs (Standard Operating Procedures) so agents perform consistently.
+Native workers pick up tasks from a queue and publish structured progress and artifacts. Schedule recurring work with cron expressions. Workflows coordinate different products—for example, Codex implementing and Claude reviewing in a loop.
 
 ### Persistent Memory
 
 Zettelkasten-style knowledge base with vector search (sqlite-vec). Agents remember context across sessions and retrieve relevant information automatically.
 
-### Multiple LLM Backends
+### Multiple Native Runners
 
-- **Local:** Qwen 3.5, Llama 3, Mistral, and more via Ollama
-- **Cloud:** Claude (Anthropic), GPT-4o (OpenAI), and 100+ models via OpenRouter
-- **Framework agnostic:** Agent harnesses for Claude SDK, LangChain, Xaibo, and generic
+- **Codex:** reuses an eligible host ChatGPT/Codex login
+- **Claude Code:** reuses an eligible host Claude subscription login
+- **OpenCode:** JSON event adapter with configurable authentication
+- **Custom:** one-argument-per-line command templates for other native CLIs
 
 ### Privacy & Safety
 
-- **Container isolation** — each agent runs in its own Docker container
-- **Budget controls** — daily/monthly spending limits per agent and globally
-- **Tool permissions** — explicit allow-list; agents only access what you grant
-- **Everything local** — your data never leaves your machine unless you choose a cloud LLM
+- **Container isolation** — each work attempt runs in its own short-lived container
+- **Explicit resources** — workers receive the configured workspace and volume mounts
+- **Visible provenance** — every queued request records whether it came from a person, schedule, connector, task, or workflow
+- **Local control data** — timelines and task state remain local; native CLI traffic follows the selected provider's terms
+- **Credential boundary** — subscription auth is mounted only into short-lived workers built from an image you trust
 
 ### Full Observability
 
-Activity logs, budget dashboards, agent status monitoring. Know what your agents did at 3am.
+Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know what ran at 3am and why.
 
 ## Quick Start
 
@@ -98,15 +104,15 @@ See [Building](#building) below.
 
 ### Requirements
 
-- Docker or Podman (required for agent container isolation)
-- Ollama (optional, for local LLM — `ollama pull qwen3.5:latest`)
-- Or an API key for Claude / OpenAI / OpenRouter
+- Docker or Podman (required for worker isolation)
+- At least one supported native CLI login on the host
+- The included native worker image, or your own compatible image
 
 ## What Can It Do?
 
-**Chat with agents from the web UI:**
+**Send work from the session UI:**
 
-Create a conversation, add an agent, and start talking. Use `@atlas` to mention a specific agent in a multi-agent conversation.
+Open a persistent session and describe the outcome. The request becomes a task and native work attempt while the UI remains available.
 
 **Schedule recurring tasks:**
 ```bash
@@ -141,25 +147,23 @@ xpressclaw chat atlas
 
 ```yaml
 system:
-  budget:
-    daily: $20.00
-    on_exceeded: pause
   isolation: docker
 
 agents:
   - name: atlas
-    backend: generic
+    backend: codex
+    runner:
+      kind: codex
+      image: xpressclaw-native-runner:latest
+      subscription_auth: true
+      max_turns: 100
     role: |
-      You are a helpful assistant.
+      You own implementation work in this repository.
 
 memory:
   near_term_slots: 8
   eviction: least-recently-relevant
 
-llm:
-  default_provider: local
-  # local_model: qwen3.5:latest
-  # Set OPENAI_API_KEY or ANTHROPIC_API_KEY env vars for cloud providers
 ```
 
 ## Building
@@ -171,7 +175,7 @@ llm:
 - [LLVM](https://releases.llvm.org/) (provides `libclang`, required by llama.cpp bindings)
 - [CMake](https://cmake.org/) (required by llama.cpp build)
 - [Node.js](https://nodejs.org/) 18+ (for the frontend)
-- Docker (for running agents)
+- Docker (for native workers)
 
 ### Build Everything
 
@@ -211,20 +215,13 @@ bazel build //crates/xpressclaw-server:xpressclaw-server
 ./build-signed.sh
 ```
 
-### Build Agent Harness Images
+### Build the Native Worker Image
 
-Agent harnesses are Docker images that run your agents in isolation:
+The default image contains Codex and Claude Code. OpenCode or another CLI can
+be supplied in a custom image:
 
 ```bash
-cd harnesses
-
-# Build all harness images
-docker buildx bake
-
-# Or build individually
-docker build -t xpressclaw-harness-base ./base
-docker build -t xpressclaw-harness-generic ./generic
-docker build -t xpressclaw-harness-claude-sdk ./claude-sdk
+docker build -t xpressclaw-native-runner:latest harnesses/native
 ```
 
 ### Run Tests
@@ -259,34 +256,34 @@ xpressclaw is a Cargo workspace with four crates:
 
 | Crate | Purpose |
 |-------|---------|
-| `xpressclaw-core` | Business logic: config, SQLite + sqlite-vec, agents, memory, tasks, budget, LLM router, Docker management, MCP tools |
+| `xpressclaw-core` | Business logic: sessions, attempts, events, artifacts, tasks, workflows, SQLite, and worker isolation |
 | `xpressclaw-server` | Axum REST API, SSE streaming, embedded SvelteKit frontend (rust-embed) |
-| `xpressclaw-cli` | 10 CLI commands via clap: init, up, down, status, chat, tasks, memory, budget, sop, logs |
+| `xpressclaw-cli` | Local control commands for setup, sessions, tasks, workflows, and compatibility features |
 | `xpressclaw-tauri` | Native desktop app with system tray (Tauri v2) |
 
 ```
 xpressclaw (single ~12MB binary)
 +-- Axum server (REST API + embedded SvelteKit frontend)
-+-- LLM Router (Ollama / OpenAI / Anthropic)
-+-- SQLite + sqlite-vec (tasks, memory, conversations, budget)
-+-- Docker Manager (agent container lifecycle)
-+-- Agent Harnesses (isolated Python containers per backend)
++-- Session event log (messages, attempts, provenance, artifacts)
++-- SQLite + sqlite-vec (tasks, workflows, schedules, memory)
++-- Native worker dispatcher (Codex / Claude Code / OpenCode / custom)
++-- Docker Manager (short-lived attempt containers)
 ```
 
 **Key design decisions:**
 - **Single binary** — server, API, frontend, and CLI in one executable
-- **Docker required** — agent isolation is not optional
+- **Docker required** — worker isolation is not optional
 - **SQLite for everything** — tasks, memory, embeddings, conversations, budget
-- **OpenAI-compatible protocol** — harnesses expose `/v1/chat/completions`
+- **Native agent ownership** — agent products own their reasoning loop and tool protocol
 
 ## CLI Reference
 
 ```
 xpressclaw init              Initialize workspace with config + data dir
-xpressclaw up [--detach]     Start the server and agents
-xpressclaw down              Stop all running agents
-xpressclaw status            Show agent status and budget summary
-xpressclaw chat <agent>      Interactive chat in the terminal
+xpressclaw up [--detach]     Start the control plane and worker dispatcher
+xpressclaw down              Stop the control plane and active workers
+xpressclaw status            Show logical session status
+xpressclaw chat <session>    Send messages through a logical session
 xpressclaw tasks             Task management (list, create, update, delete)
 xpressclaw memory            Memory inspection (list, search, add)
 xpressclaw budget            Budget report and usage history

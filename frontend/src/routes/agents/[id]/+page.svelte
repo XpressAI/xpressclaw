@@ -3,26 +3,22 @@
 	import { page } from '$app/stores';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
-	import { statusColor, timeAgo } from '$lib/utils';
+	import { statusColor } from '$lib/utils';
 
+	import SessionTab from './SessionTab.svelte';
+	import RunnerTab from './RunnerTab.svelte';
 	import ProfileTab from './ProfileTab.svelte';
 	import PromptsTab from './PromptsTab.svelte';
 	import WorkspaceTab from './WorkspaceTab.svelte';
-	import ToolsTab from './ToolsTab.svelte';
-	import SkillsTab from './SkillsTab.svelte';
 	import ProceduresTab from './ProceduresTab.svelte';
-	import BudgetTab from './BudgetTab.svelte';
-	import MemoryTab from './MemoryTab.svelte';
 	import TasksTab from './TasksTab.svelte';
 	import SchedulesTab from './SchedulesTab.svelte';
 	import ChannelsTab from './ChannelsTab.svelte';
-	import LogsTab from './LogsTab.svelte';
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
 	let agentConfig = $state<LiveConfig['agents'][0] | null>(null);
-	let activeTab = $state('profile');
-	let needsRestart = $state(false);
+	let activeTab = $state('session');
 	let saveMessage = $state('');
 	let showDeleteConfirm = $state(false);
 	let deleting = $state(false);
@@ -35,18 +31,15 @@
 	let unsubPage: (() => void) | null = null;
 
 	const tabs = [
+		{ id: 'session', label: 'Session' },
+		{ id: 'runner', label: 'Runner' },
 		{ id: 'profile', label: 'Profile' },
-		{ id: 'prompts', label: 'Prompts' },
+		{ id: 'prompts', label: 'Instructions' },
 		{ id: 'workspace', label: 'Workspace' },
-		{ id: 'tools', label: 'Tools' },
-		{ id: 'skills', label: 'Skills' },
 		{ id: 'procedures', label: 'Procedures' },
-		{ id: 'budget', label: 'Budget' },
-		{ id: 'memory', label: 'Memory' },
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Schedules' },
 		{ id: 'channels', label: 'Channels' },
-		{ id: 'logs', label: 'Logs' },
 	];
 
 	onMount(() => {
@@ -96,25 +89,6 @@
 		}, 5000);
 	}
 
-	async function handleStart() {
-		if (!agent) return;
-		try { agent = await agents.start(agent.id); needsRestart = false; } catch (e) { alert(String(e)); }
-	}
-
-	async function handleStop() {
-		if (!agent) return;
-		try { agent = await agents.stop(agent.id); } catch (e) { alert(String(e)); }
-	}
-
-	async function handleRestart() {
-		if (!agent) return;
-		try {
-			await agents.stop(agent.id);
-			agent = await agents.start(agent.id);
-			needsRestart = false;
-		} catch (e) { alert(String(e)); }
-	}
-
 	async function handleDelete() {
 		if (!agent || deleting) return;
 		deleting = true;
@@ -144,12 +118,7 @@
 		saveMessage = '';
 		try {
 			const result = await agents.updateConfig(agent.id, data);
-			if (result.needs_restart) {
-				needsRestart = true;
-				saveMessage = 'Saved. Restart for changes to take effect.';
-			} else {
-				saveMessage = 'Saved.';
-			}
+			saveMessage = 'Saved. New attempts will use this configuration.';
 			if (agentConfig) {
 				agentConfig = { ...agentConfig, ...result.agent };
 			}
@@ -165,7 +134,7 @@
 	<!-- Header -->
 	<div class="shrink-0 px-6 py-4 space-y-3 border-b border-border">
 		<div class="flex items-center gap-2 text-sm text-muted-foreground">
-			<a href="/agents" class="hover:text-foreground">Agents</a>
+			<a href="/agents" class="hover:text-foreground">Sessions</a>
 			<span>/</span>
 			<span class="text-foreground">{agentDisplayName()}</span>
 		</div>
@@ -183,9 +152,6 @@
 						<h1 class="text-xl font-bold">{agentDisplayName()}</h1>
 						<p class="text-sm text-muted-foreground">
 							<span class="{statusColor(agent.status)}">{agent.status}</span>
-							{#if agent.restart_count > 0 && agent.desired_status === 'running' && agent.status !== 'running'}
-								<span class="text-amber-500">(restarting, attempt {agent.restart_count})</span>
-							{/if}
 							&middot; {agent.backend}
 							{#if agentConfig?.role_title}
 								&middot; {agentConfig.role_title}
@@ -197,33 +163,12 @@
 					{#if saveMessage}
 						<span class="text-xs {saveMessage.startsWith('Error') ? 'text-destructive' : 'text-emerald-500'}">{saveMessage}</span>
 					{/if}
-					{#if needsRestart}
-						<button onclick={handleRestart}
-							class="rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 transition-colors">
-							Restart
-						</button>
-					{/if}
-					{#if agent.desired_status === 'running'}
-						<button onclick={handleStop}
-							class="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm font-medium hover:bg-accent transition-colors">
-							Stop
-						</button>
-					{:else}
-						<button onclick={handleStart}
-							class="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
-							Start
-						</button>
-					{/if}
 					<button onclick={() => { showDeleteConfirm = true; }}
 						class="rounded-md border border-destructive/50 px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors">
 						Delete
 					</button>
 				</div>
 			</div>
-
-			{#if needsRestart && saveMessage}
-				<div class="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-xs text-amber-600">{saveMessage}</div>
-			{/if}
 
 			{#if agent.error_message}
 				<div class="rounded-lg border border-destructive/50 bg-destructive/5 p-2 text-xs text-destructive">{agent.error_message}</div>
@@ -249,35 +194,29 @@
 
 		<!-- Tab content -->
 		<div class="flex-1 overflow-y-auto px-6 py-4">
-			{#if activeTab === 'profile'}
+			{#if activeTab === 'session'}
+				<SessionTab agentId={agent.id} />
+			{:else if activeTab === 'runner'}
+				<RunnerTab {agentConfig} onSave={handleSave} {saveSignal} />
+			{:else if activeTab === 'profile'}
 				<ProfileTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
 			{:else if activeTab === 'prompts'}
-				<PromptsTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
+				<PromptsTab {agentConfig} onSave={handleSave} {saveSignal} />
 			{:else if activeTab === 'workspace'}
 				<WorkspaceTab {agentConfig} agentId={agent.id} onSave={handleSave} />
-			{:else if activeTab === 'tools'}
-				<ToolsTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
-			{:else if activeTab === 'skills'}
-				<SkillsTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
 			{:else if activeTab === 'procedures'}
 				<ProceduresTab agentId={agent.id} />
-			{:else if activeTab === 'budget'}
-				<BudgetTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
-			{:else if activeTab === 'memory'}
-				<MemoryTab agentId={agent.id} />
 			{:else if activeTab === 'tasks'}
 				<TasksTab agentId={agent.id} />
 			{:else if activeTab === 'schedules'}
 				<SchedulesTab agentId={agent.id} />
 			{:else if activeTab === 'channels'}
 				<ChannelsTab />
-			{:else if activeTab === 'logs'}
-				<LogsTab agentId={agent.id} />
 			{/if}
 		</div>
 
 		<!-- Persistent save bar for config tabs -->
-		{#if ['profile', 'prompts', 'tools', 'skills', 'budget', 'workspace'].includes(activeTab)}
+		{#if ['runner', 'profile', 'prompts', 'workspace'].includes(activeTab)}
 			<div class="shrink-0 border-t border-border bg-background px-6 py-3 flex items-center justify-end gap-3">
 				{#if saveMessage}
 					<span class="text-xs {saveMessage.startsWith('Error') ? 'text-destructive' : 'text-emerald-500'}">{saveMessage}</span>
@@ -298,7 +237,7 @@
 		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4">
 			<h2 class="text-lg font-semibold">Delete {agentDisplayName()}?</h2>
 			<p class="text-sm text-muted-foreground">
-				This will stop the agent, remove its configuration, and delete all associated data. This action cannot be undone.
+				This removes the session profile and its configuration. Existing task history may still reference it. This action cannot be undone.
 			</p>
 			<div class="flex justify-end gap-2">
 				<button onclick={() => { showDeleteConfirm = false; }}

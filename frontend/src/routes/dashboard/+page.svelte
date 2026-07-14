@@ -53,10 +53,10 @@
 	<!-- Stats cards -->
 	<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
 		<div class="rounded-lg border border-border bg-card p-4">
-			<div class="text-sm text-muted-foreground">Agents</div>
+			<div class="text-sm text-muted-foreground">Sessions</div>
 			<div class="mt-1 text-2xl font-bold">{agentList.length}</div>
 			<div class="mt-1 text-xs text-muted-foreground">
-				{agentList.filter(a => a.status === 'running').length} running
+				{agentList.filter(a => a.status === 'running').length} working
 			</div>
 		</div>
 
@@ -87,16 +87,16 @@
 
 	<!-- Two columns: Agents + Recent Activity -->
 	<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-		<!-- Agents -->
+		<!-- Sessions -->
 		<div class="rounded-lg border border-border bg-card">
 			<div class="flex items-center justify-between border-b border-border px-4 py-3">
-				<h2 class="text-sm font-semibold">Agents</h2>
+				<h2 class="text-sm font-semibold">Sessions</h2>
 				<a href="/agents" class="text-xs text-muted-foreground hover:text-foreground">View all</a>
 			</div>
 			<div class="divide-y divide-border">
 				{#each agentList.slice(0, 5) as agent}
 					<a href="/agents/{agent.id}" class="flex items-center gap-3 px-4 py-3 hover:bg-accent/50 transition-colors">
-						<div class="h-2 w-2 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></div>
+						<div class="h-2 w-2 rounded-full {agent.status === 'running' ? 'bg-blue-400 animate-pulse' : agent.status === 'error' ? 'bg-red-400' : 'bg-emerald-400'}"></div>
 						<div class="flex-1 min-w-0">
 							<div class="text-sm font-medium truncate">{agent.name}</div>
 							<div class="text-xs text-muted-foreground">{agent.backend}</div>
@@ -104,7 +104,7 @@
 						<span class="text-xs {statusColor(agent.status)}">{agent.status}</span>
 					</a>
 				{:else}
-					<div class="px-4 py-6 text-center text-sm text-muted-foreground">No agents configured</div>
+					<div class="px-4 py-6 text-center text-sm text-muted-foreground">No sessions configured</div>
 				{/each}
 			</div>
 		</div>
@@ -117,7 +117,7 @@
 			<div class="divide-y divide-border">
 				{#each recentActivity.slice(0, 8) as event}
 					{@const data = typeof event.event_data === 'string' ? (() => { try { return JSON.parse(event.event_data); } catch { return event.event_data; } })() : event.event_data}
-					<a href={event.agent_id ? `/agents/${event.agent_id}?tab=logs` : '#'}
+					<a href={event.agent_id ? `/agents/${event.agent_id}?tab=session` : '#'}
 						class="block px-4 py-2.5 hover:bg-accent/50 transition-colors">
 						<div class="flex items-center justify-between">
 							<span class="text-xs font-medium {event.event_type === 'task_completed' ? 'text-emerald-400' : event.event_type === 'agent_response' ? 'text-blue-400' : 'text-muted-foreground'}">

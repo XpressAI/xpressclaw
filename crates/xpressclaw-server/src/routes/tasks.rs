@@ -224,6 +224,22 @@ async fn add_message(
     if req.role == "user" {
         let board = TaskBoard::new(state.db.clone());
         if let Ok(task) = board.get(&id) {
+            if let Some(ref agent_id) = task.agent_id {
+                let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+                let _ = sessions.ensure(agent_id, Some(agent_id));
+                let _ = sessions.append_event(
+                    agent_id,
+                    xpressclaw_core::sessions::NewEvent {
+                        attempt_id: None,
+                        task_id: Some(&id),
+                        source_type: "user",
+                        source_id: Some("local-user"),
+                        event_type: "task_message_received",
+                        summary: &req.content,
+                        payload: json!({ "role": req.role, "content": req.content }),
+                    },
+                );
+            }
             if task.status == xpressclaw_core::tasks::board::TaskStatus::WaitingForInput {
                 if let Some(ref agent_id) = task.agent_id {
                     let _ = board.update_status(&id, "in_progress", Some(agent_id));

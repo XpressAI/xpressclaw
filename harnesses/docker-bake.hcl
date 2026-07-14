@@ -10,7 +10,13 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["base", "generic", "claude-sdk", "xaibo", "langchain"]
+  targets = ["native", "base", "generic", "claude-sdk", "xaibo", "langchain"]
+}
+
+target "native" {
+  context    = "./native"
+  dockerfile = "Dockerfile"
+  tags       = ["xpressclaw-native-runner:${TAG}", "${REGISTRY}/xpressclaw-native-runner:${TAG}"]
 }
 
 target "base" {

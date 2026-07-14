@@ -226,6 +226,7 @@ export interface Agent {
 		avatar?: string | null;
 		role?: string;
 		model?: string | null;
+		runner?: NativeRunnerConfig;
 		tools?: string[];
 		skills?: string[];
 		volumes?: string[];
@@ -252,6 +253,7 @@ export const agents = {
 		role?: string;
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
+		runner?: NativeRunnerConfig;
 		tools?: string[];
 		skills?: string[];
 		volumes?: string[];
@@ -276,6 +278,100 @@ export const agents = {
 	),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
+};
+
+// -- Logical sessions and native work attempts --
+
+export interface NativeRunnerConfig {
+	kind: string;
+	image: string;
+	command: string[];
+	subscription_auth: boolean;
+	max_turns: number;
+}
+
+export interface LogicalSession {
+	id: string;
+	agent_id: string;
+	title: string | null;
+	status: string;
+	latest_summary: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WorkAttempt {
+	id: string;
+	session_id: string;
+	task_id: string | null;
+	queue_id: number | null;
+	kind: string;
+	runner: string;
+	status: string;
+	prompt: string;
+	native_session_id: string | null;
+	container_id: string | null;
+	result: string | null;
+	error_message: string | null;
+	created_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+export interface SessionEvent {
+	id: number;
+	session_id: string;
+	attempt_id: string | null;
+	task_id: string | null;
+	source_type: string;
+	source_id: string | null;
+	event_type: string;
+	summary: string;
+	payload: Record<string, unknown>;
+	created_at: string;
+}
+
+export interface AttemptArtifact {
+	id: string;
+	attempt_id: string;
+	session_id: string;
+	artifact_type: string;
+	title: string;
+	content: string | null;
+	uri: string | null;
+	metadata: Record<string, unknown>;
+	created_at: string;
+}
+
+export interface SessionOverview {
+	session: LogicalSession;
+	active_attempts: WorkAttempt[];
+	queued_attempts: WorkAttempt[];
+	recent_attempts: WorkAttempt[];
+	recent_events: SessionEvent[];
+	artifacts: AttemptArtifact[];
+}
+
+export const sessions = {
+	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
+	events: (id: string, after?: number) => {
+		const query = after ? `?after=${after}` : '';
+		return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
+	},
+	attempts: (id: string, status?: string) => {
+		const query = status ? `?status=${encodeURIComponent(status)}` : '';
+		return request<WorkAttempt[]>(`/api/sessions/${id}/attempts${query}`);
+	},
+	sendMessage: (id: string, content: string, priority?: number) =>
+		request<{ event: SessionEvent; task: Task; attempt_id: string; queued: boolean }>(
+			`/api/sessions/${id}/messages`,
+			{ method: 'POST', body: JSON.stringify({ content, priority }) }
+		),
+	cancelAttempt: (sessionId: string, attemptId: string) =>
+		request<WorkAttempt>(`/api/sessions/${sessionId}/attempts/${attemptId}/cancel`, {
+			method: 'POST',
+			body: '{}'
+		})
 };
 
 // -- Tasks --
@@ -617,6 +713,7 @@ export interface LiveConfig {
 		role: string;
 		model: string | null;
 		llm?: AgentLlmConfig;
+		runner: NativeRunnerConfig;
 		tools: string[];
 		skills: string[];
 		volumes: string[];
@@ -647,7 +744,7 @@ export const setup = {
 		// `provider` is one of: openai, anthropic, ollama. Local inference goes
 		// through Ollama only — there is no embedded llama.cpp anymore.
 		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string };
-		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; tools?: string[]; volumes?: string[] }[];
+		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; backend?: string; runner_kind?: string; runner_image?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -657,7 +754,7 @@ export const setup = {
 		}),
 	addAgent: (data: {
 		name: string; preset?: string; role?: string; model?: string;
-		backend?: string; tools?: string[]; volumes?: string[];
+		backend?: string; runner_kind?: string; runner_image?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[];
 		mcp_servers?: Record<string, unknown>;
 	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
 		method: 'POST',

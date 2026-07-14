@@ -1,0 +1,75 @@
+name: codex-claude-review-loop
+description: Codex implements, Claude reviews, and the loop continues until approval.
+version: 1
+
+variables:
+  goal: "Describe the requested code change here"
+
+flows:
+  main:
+    color: "#4A90D9"
+    steps:
+      - id: implement
+        type: step
+        label: Codex implementation
+        agent: codex-builder
+        prompt: |
+          Implement this goal in the current repository:
+
+          @variables.goal
+
+          Address any feedback from the previous review if present:
+
+          @review.feedback
+
+          Run the relevant checks and leave the working tree ready for review.
+        outputs:
+          summary:
+            type: string
+            description: What changed and how it was verified.
+
+      - id: review
+        type: step
+        label: Claude review
+        agent: claude-reviewer
+        prompt: |
+          Review the implementation for this goal:
+
+          @variables.goal
+
+          Inspect the actual diff and test results. Approve only when it is
+          correct, complete, maintainable, and adequately tested. Return a
+          verdict of exactly "approved" or "changes_requested".
+        outputs:
+          verdict:
+            type: string
+            description: Either approved or changes_requested.
+          feedback:
+            type: string
+            description: Specific actionable feedback for Codex.
+
+      - id: review_gate
+        type: when
+        label: Review decision
+        switch: "@review.verdict"
+        arms:
+          - match: approved
+            continue: true
+          - match: changes_requested
+            goto: step implement
+
+      - id: mark_ready
+        type: step
+        label: Mark PR ready
+        agent: codex-builder
+        prompt: |
+          The independent review approved the implementation. Verify the final
+          checks, push the current branch if needed, and mark its GitHub pull
+          request ready for review. Report the PR URL and final check status.
+        outputs:
+          pull_request_url:
+            type: string
+            description: URL of the ready pull request.
+          checks:
+            type: string
+            description: Final verification summary.

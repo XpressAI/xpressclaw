@@ -1,0 +1,747 @@
+//! Event-driven logical sessions and their isolated native work attempts.
+//!
+//! A session is the durable, user-facing identity. Native coding agents are
+//! workers: every invocation is represented by a work attempt and contributes
+//! structured events and artifacts to the session timeline.
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::db::Database;
+use crate::error::{Error, Result};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogicalSession {
+    pub id: String,
+    pub agent_id: String,
+    pub title: Option<String>,
+    pub status: String,
+    pub latest_summary: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkAttempt {
+    pub id: String,
+    pub session_id: String,
+    pub task_id: Option<String>,
+    pub queue_id: Option<i64>,
+    pub kind: String,
+    pub runner: String,
+    pub status: String,
+    pub prompt: String,
+    pub native_session_id: Option<String>,
+    pub container_id: Option<String>,
+    pub result: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub id: i64,
+    pub session_id: String,
+    pub attempt_id: Option<String>,
+    pub task_id: Option<String>,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub event_type: String,
+    pub summary: String,
+    pub payload: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptArtifact {
+    pub id: String,
+    pub attempt_id: String,
+    pub session_id: String,
+    pub artifact_type: String,
+    pub title: String,
+    pub content: Option<String>,
+    pub uri: Option<String>,
+    pub metadata: Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionOverview {
+    pub session: LogicalSession,
+    pub active_attempts: Vec<WorkAttempt>,
+    pub queued_attempts: Vec<WorkAttempt>,
+    pub recent_attempts: Vec<WorkAttempt>,
+    pub recent_events: Vec<SessionEvent>,
+    pub artifacts: Vec<AttemptArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewEvent<'a> {
+    pub attempt_id: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub source_type: &'a str,
+    pub source_id: Option<&'a str>,
+    pub event_type: &'a str,
+    pub summary: &'a str,
+    pub payload: Value,
+}
+
+pub struct SessionManager {
+    db: Arc<Database>,
+}
+
+impl SessionManager {
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+
+    /// Ensure that the durable user-facing session exists for a configured
+    /// agent profile. Session IDs intentionally match profile IDs during the
+    /// migration so existing task and workflow references remain valid.
+    pub fn ensure(&self, agent_id: &str, title: Option<&str>) -> Result<LogicalSession> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title) VALUES (?1, ?1, ?2)",
+                rusqlite::params![agent_id, title],
+            )?;
+            if title.is_some() {
+                conn.execute(
+                    "UPDATE logical_sessions SET title = COALESCE(title, ?1) WHERE id = ?2",
+                    rusqlite::params![title, agent_id],
+                )?;
+            }
+            Ok::<_, Error>(())
+        })?;
+        self.get(agent_id)
+    }
+
+    pub fn get(&self, session_id: &str) -> Result<LogicalSession> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, agent_id, title, status, latest_summary, created_at, updated_at
+                 FROM logical_sessions WHERE id = ?1",
+                [session_id],
+                row_to_session,
+            )
+            .map_err(|_| Error::AgentNotFound {
+                name: session_id.to_string(),
+            })
+        })
+    }
+
+    pub fn overview(&self, session_id: &str) -> Result<SessionOverview> {
+        let session = self.get(session_id)?;
+        Ok(SessionOverview {
+            active_attempts: self.list_attempts(session_id, Some("running"), 20)?,
+            queued_attempts: self.list_attempts(session_id, Some("queued"), 20)?,
+            recent_attempts: self.list_attempts(session_id, None, 30)?,
+            recent_events: self.list_events(session_id, None, 100)?,
+            artifacts: self.list_artifacts(session_id, 50)?,
+            session,
+        })
+    }
+
+    pub fn append_event(&self, session_id: &str, event: NewEvent<'_>) -> Result<SessionEvent> {
+        let payload = serde_json::to_string(&event.payload)?;
+        let id = self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO session_events
+                 (session_id, attempt_id, task_id, source_type, source_id, event_type, summary, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    session_id,
+                    event.attempt_id,
+                    event.task_id,
+                    event.source_type,
+                    event.source_id,
+                    event.event_type,
+                    event.summary,
+                    payload,
+                ],
+            )?;
+            conn.execute(
+                "UPDATE logical_sessions
+                 SET latest_summary = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                rusqlite::params![event.summary, session_id],
+            )?;
+            Ok::<_, Error>(conn.last_insert_rowid())
+        })?;
+        self.get_event(id)
+    }
+
+    pub fn get_event(&self, id: i64) -> Result<SessionEvent> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                        event_type, summary, payload, created_at
+                 FROM session_events WHERE id = ?1",
+                [id],
+                row_to_event,
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })
+    }
+
+    pub fn list_events(
+        &self,
+        session_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<SessionEvent>> {
+        self.db.with_conn(|conn| {
+            let (sql, pivot) = if let Some(after_id) = after {
+                (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2
+                     ORDER BY id ASC LIMIT ?3",
+                    after_id,
+                )
+            } else {
+                (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE session_id = ?1 AND id > ?2
+                     ORDER BY id DESC LIMIT ?3",
+                    -1,
+                )
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let mut events: Vec<_> = stmt
+                .query_map(rusqlite::params![session_id, pivot, limit], row_to_event)?
+                .filter_map(|row| row.ok())
+                .collect();
+            if after.is_none() {
+                events.reverse();
+            }
+            Ok(events)
+        })
+    }
+
+    pub fn create_attempt(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        queue_id: i64,
+        runner: &str,
+        kind: &str,
+        source_type: &str,
+        source_id: Option<&str>,
+        prompt: &str,
+    ) -> Result<WorkAttempt> {
+        self.ensure(session_id, None)?;
+        let id = Uuid::new_v4().to_string();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO work_attempts
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                rusqlite::params![id, session_id, task_id, queue_id, kind, runner, prompt],
+            )?;
+            conn.execute(
+                "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+                rusqlite::params![id, queue_id],
+            )?;
+            conn.execute(
+                "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![session_id, id, task_id],
+            )?;
+            conn.execute(
+                "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'running'",
+                [session_id],
+            )?;
+            Ok::<_, Error>(())
+        })?;
+        self.append_event(
+            session_id,
+            NewEvent {
+                attempt_id: Some(&id),
+                task_id: Some(task_id),
+                source_type,
+                source_id: source_id.or(Some(task_id)),
+                event_type: "attempt_queued",
+                summary: "Work queued",
+                payload: json!({ "runner": runner, "kind": kind, "queue_id": queue_id }),
+            },
+        )?;
+        self.get_attempt(&id)
+    }
+
+    pub fn get_attempt(&self, attempt_id: &str) -> Result<WorkAttempt> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at
+                 FROM work_attempts WHERE id = ?1",
+                [attempt_id],
+                row_to_attempt,
+            )
+            .map_err(|e| Error::Task(format!("attempt {attempt_id} not found: {e}")))
+        })
+    }
+
+    pub fn list_attempts(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<WorkAttempt>> {
+        self.db.with_conn(|conn| {
+            let mut sql = String::from(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at
+                 FROM work_attempts WHERE session_id = ?1",
+            );
+            let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
+                vec![Box::new(session_id.to_string())];
+            if let Some(value) = status {
+                sql.push_str(" AND status = ?2");
+                values.push(Box::new(value.to_string()));
+            }
+            sql.push_str(if status.is_some() {
+                " ORDER BY created_at DESC LIMIT ?3"
+            } else {
+                " ORDER BY created_at DESC LIMIT ?2"
+            });
+            values.push(Box::new(limit));
+            let refs: Vec<&dyn rusqlite::types::ToSql> =
+                values.iter().map(|value| value.as_ref()).collect();
+            let mut stmt = conn.prepare(&sql)?;
+            let attempts = stmt
+                .query_map(refs.as_slice(), row_to_attempt)?
+                .filter_map(|row| row.ok())
+                .collect();
+            Ok(attempts)
+        })
+    }
+
+    pub fn transition_attempt(
+        &self,
+        attempt_id: &str,
+        status: &str,
+        summary: &str,
+        result: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<WorkAttempt> {
+        const VALID: &[&str] = &[
+            "queued",
+            "preparing",
+            "running",
+            "waiting_for_input",
+            "review",
+            "completed",
+            "failed",
+            "cancelled",
+        ];
+        if !VALID.contains(&status) {
+            return Err(Error::Task(format!("invalid attempt status: {status}")));
+        }
+        let attempt = self.get_attempt(attempt_id)?;
+        let is_terminal = matches!(status, "completed" | "failed" | "cancelled");
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET status = ?1,
+                    started_at = CASE WHEN ?1 IN ('preparing', 'running')
+                        THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END,
+                    completed_at = CASE WHEN ?2 = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
+                    result = COALESCE(?3, result), error_message = ?4
+                 WHERE id = ?5",
+                rusqlite::params![
+                    status,
+                    is_terminal as i32,
+                    result,
+                    error_message,
+                    attempt_id
+                ],
+            )?;
+            let session_status = self.derive_status_with_conn(conn, &attempt.session_id)?;
+            conn.execute(
+                "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![session_status, summary, attempt.session_id],
+            )?;
+            if is_terminal {
+                conn.execute(
+                    "UPDATE tasks SET active_attempt_id = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1 AND active_attempt_id = ?2",
+                    rusqlite::params![attempt.task_id, attempt_id],
+                )?;
+            }
+            Ok::<_, Error>(())
+        })?;
+        self.append_event(
+            &attempt.session_id,
+            NewEvent {
+                attempt_id: Some(attempt_id),
+                task_id: attempt.task_id.as_deref(),
+                source_type: "runner",
+                source_id: Some(&attempt.runner),
+                event_type: &format!("attempt_{status}"),
+                summary,
+                payload: json!({ "status": status, "error": error_message }),
+            },
+        )?;
+        self.get_attempt(attempt_id)
+    }
+
+    pub fn set_container(&self, attempt_id: &str, container_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET container_id = ?1 WHERE id = ?2",
+                rusqlite::params![container_id, attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn set_native_session(&self, attempt_id: &str, native_session_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET native_session_id = ?1 WHERE id = ?2",
+                rusqlite::params![native_session_id, attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn add_artifact(
+        &self,
+        attempt_id: &str,
+        artifact_type: &str,
+        title: &str,
+        content: Option<&str>,
+        uri: Option<&str>,
+        metadata: Value,
+    ) -> Result<AttemptArtifact> {
+        let attempt = self.get_attempt(attempt_id)?;
+        let id = Uuid::new_v4().to_string();
+        let metadata_json = serde_json::to_string(&metadata)?;
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO attempt_artifacts
+                 (id, attempt_id, session_id, artifact_type, title, content, uri, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    id,
+                    attempt_id,
+                    attempt.session_id,
+                    artifact_type,
+                    title,
+                    content,
+                    uri,
+                    metadata_json,
+                ],
+            )?;
+            Ok::<_, Error>(())
+        })?;
+        self.append_event(
+            &attempt.session_id,
+            NewEvent {
+                attempt_id: Some(attempt_id),
+                task_id: attempt.task_id.as_deref(),
+                source_type: "runner",
+                source_id: Some(&attempt.runner),
+                event_type: "artifact_created",
+                summary: title,
+                payload: json!({ "artifact_id": id, "artifact_type": artifact_type, "uri": uri }),
+            },
+        )?;
+        self.get_artifact(&id)
+    }
+
+    pub fn list_artifacts(&self, session_id: &str, limit: i64) -> Result<Vec<AttemptArtifact>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, attempt_id, session_id, artifact_type, title, content, uri,
+                        metadata, created_at
+                 FROM attempt_artifacts WHERE session_id = ?1
+                 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let artifacts = stmt
+                .query_map(rusqlite::params![session_id, limit], row_to_artifact)?
+                .filter_map(|row| row.ok())
+                .collect();
+            Ok(artifacts)
+        })
+    }
+
+    /// Remove a logical session and its attempt/event/artifact history.
+    /// Task and queue records are retained, but their session pointers are
+    /// cleared before the cascading delete.
+    pub fn delete(&self, session_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE tasks SET session_id = NULL, active_attempt_id = NULL
+                 WHERE session_id = ?1",
+                [session_id],
+            )?;
+            tx.execute(
+                "UPDATE task_queue SET attempt_id = NULL WHERE agent_id = ?1",
+                [session_id],
+            )?;
+            tx.execute("DELETE FROM logical_sessions WHERE id = ?1", [session_id])?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    fn get_artifact(&self, id: &str) -> Result<AttemptArtifact> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT id, attempt_id, session_id, artifact_type, title, content, uri,
+                        metadata, created_at FROM attempt_artifacts WHERE id = ?1",
+                [id],
+                row_to_artifact,
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })
+    }
+
+    fn derive_status_with_conn(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<String> {
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_attempts
+             WHERE session_id = ?1 AND status IN ('preparing', 'running', 'review')",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            return Ok("running".to_string());
+        }
+        let waiting: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_attempts
+             WHERE session_id = ?1 AND status = 'waiting_for_input'",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if waiting > 0 {
+            return Ok("waiting_for_input".to_string());
+        }
+        let queued: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM work_attempts
+             WHERE session_id = ?1 AND status = 'queued'",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(if queued > 0 { "queued" } else { "idle" }.to_string())
+    }
+}
+
+fn parse_json(value: String) -> Value {
+    serde_json::from_str(&value).unwrap_or_else(|_| json!({ "raw": value }))
+}
+
+fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogicalSession> {
+    Ok(LogicalSession {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        latest_summary: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkAttempt> {
+    Ok(WorkAttempt {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        task_id: row.get(2)?,
+        queue_id: row.get(3)?,
+        kind: row.get(4)?,
+        runner: row.get(5)?,
+        status: row.get(6)?,
+        prompt: row.get(7)?,
+        native_session_id: row.get(8)?,
+        container_id: row.get(9)?,
+        result: row.get(10)?,
+        error_message: row.get(11)?,
+        created_at: row.get(12)?,
+        started_at: row.get(13)?,
+        completed_at: row.get(14)?,
+    })
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
+    Ok(SessionEvent {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        attempt_id: row.get(2)?,
+        task_id: row.get(3)?,
+        source_type: row.get(4)?,
+        source_id: row.get(5)?,
+        event_type: row.get(6)?,
+        summary: row.get(7)?,
+        payload: parse_json(row.get(8)?),
+        created_at: row.get(9)?,
+    })
+}
+
+fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptArtifact> {
+    Ok(AttemptArtifact {
+        id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        session_id: row.get(2)?,
+        artifact_type: row.get(3)?,
+        title: row.get(4)?,
+        content: row.get(5)?,
+        uri: row.get(6)?,
+        metadata: parse_json(row.get(7)?),
+        created_at: row.get(8)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_timeline_and_attempt_lifecycle() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("Builder")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('task-1', 'Build it')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status) VALUES (1, 'task-1', 'builder', 'queued')",
+                [],
+            )
+            .unwrap();
+        });
+
+        let attempt = manager
+            .create_attempt(
+                "builder",
+                "task-1",
+                1,
+                "codex",
+                "task",
+                "task",
+                Some("task-1"),
+                "Build it",
+            )
+            .unwrap();
+        assert_eq!(attempt.status, "queued");
+
+        manager
+            .transition_attempt(&attempt.id, "running", "Codex is working", None, None)
+            .unwrap();
+        manager
+            .add_artifact(
+                &attempt.id,
+                "summary",
+                "Implementation summary",
+                Some("Done"),
+                None,
+                json!({}),
+            )
+            .unwrap();
+        manager
+            .transition_attempt(
+                &attempt.id,
+                "completed",
+                "Implementation completed",
+                Some("Done"),
+                None,
+            )
+            .unwrap();
+
+        let overview = manager.overview("builder").unwrap();
+        assert_eq!(overview.session.status, "idle");
+        assert!(overview.active_attempts.is_empty());
+        assert_eq!(overview.artifacts.len(), 1);
+        assert!(overview
+            .recent_events
+            .iter()
+            .any(|event| event.event_type == "attempt_completed"));
+    }
+
+    #[test]
+    fn event_provenance_is_preserved() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db);
+        manager.ensure("seo", None).unwrap();
+        let event = manager
+            .append_event(
+                "seo",
+                NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "schedule",
+                    source_id: Some("weekly-seo"),
+                    event_type: "message_received",
+                    summary: "Run the weekly SEO review",
+                    payload: json!({ "cron": "0 9 * * 1" }),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(event.source_type, "schedule");
+        assert_eq!(event.source_id.as_deref(), Some("weekly-seo"));
+        assert_eq!(event.payload["cron"], "0 9 * * 1");
+    }
+
+    #[test]
+    fn deleting_a_session_clears_task_and_queue_pointers() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("Builder")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO tasks (id, title) VALUES ('task-1', 'Build it')", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status) VALUES (1, 'task-1', 'builder', 'queued')",
+                [],
+            )
+            .unwrap();
+        });
+        manager
+            .create_attempt(
+                "builder",
+                "task-1",
+                1,
+                "codex",
+                "task",
+                "task",
+                Some("task-1"),
+                "Build it",
+            )
+            .unwrap();
+
+        manager.delete("builder").unwrap();
+        assert!(manager.get("builder").is_err());
+        db.with_conn(|conn| {
+            let pointers: (Option<String>, Option<String>) = conn
+                .query_row(
+                    "SELECT session_id, active_attempt_id FROM tasks WHERE id = 'task-1'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pointers, (None, None));
+            let queue_attempt: Option<String> = conn
+                .query_row(
+                    "SELECT attempt_id FROM task_queue WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(queue_attempt, None);
+        });
+    }
+}

@@ -5,6 +5,7 @@ use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
@@ -189,25 +190,29 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
-    // Sync agents from YAML config into DB runtime state table.
-    // Config (role, model, tools, llm, etc.) always comes from the YAML.
-    // The DB only tracks runtime state (status, container_id, timestamps).
+    // Sync configured profiles and their durable logical sessions. Native
+    // workers are launched later for individual queued attempts.
     let registry = AgentRegistry::new(db.clone());
+    let sessions = SessionManager::new(db.clone());
     let valid_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
+    for existing in registry.list().unwrap_or_default() {
+        if !valid_names.contains(&existing.name.as_str()) {
+            let _ = sessions.delete(&existing.id);
+        }
+    }
     registry.remove_stale(&valid_names).unwrap_or_default();
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => {
-                // Agents in the config should be running — set desired state.
-                // This ensures agents auto-start on boot without manual intervention.
-                let _ = registry.set_desired_status(
-                    &record.id,
-                    &xpressclaw_core::agents::state::DesiredStatus::Running,
-                );
+                let title = agent_config
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&agent_config.name);
+                sessions.ensure(&record.id, Some(title))?;
                 info!(
                     name = record.name,
                     backend = record.backend,
-                    "synced agent (desired=running)"
+                    "synced native session"
                 );
             }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
@@ -225,10 +230,8 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
 
     let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
 
-    // No agent startup here — the reconciler (ADR-018) handles all container
-    // lifecycle: pulling images, starting agents with desired_status='running',
-    // restarting crashed containers, and re-queuing orphaned tasks.
-    // It runs as a background task started in server::serve().
+    // No worker startup here. The server dispatches queued work into isolated,
+    // short-lived native CLI containers (ADR-025).
 
     Ok(state)
 }

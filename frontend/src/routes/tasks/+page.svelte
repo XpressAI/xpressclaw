@@ -136,7 +136,7 @@
 			></textarea>
 			<div class="flex gap-3">
 				<div class="flex-1">
-					<label class="block text-xs text-muted-foreground mb-1">Assign to Agent</label>
+					<label class="block text-xs text-muted-foreground mb-1">Assign to Session</label>
 					<select
 						bind:value={newAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"

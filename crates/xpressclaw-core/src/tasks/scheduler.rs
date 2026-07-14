@@ -183,7 +183,11 @@ impl ScheduleManager {
             sop_id: None,
             conversation_id: None,
             priority: None,
-            context: None,
+            context: Some(serde_json::json!({
+                "origin": "schedule",
+                "kind": "scheduled",
+                "source_id": id,
+            })),
         })?;
 
         // Enqueue for the dispatcher

@@ -144,6 +144,7 @@ impl Database {
             (21, MIGRATION_V21),
             (22, MIGRATION_V22),
             (23, MIGRATION_V23),
+            (24, MIGRATION_V24),
         ];
 
         for &(target, sql) in migrations {
@@ -705,6 +706,110 @@ CREATE INDEX IF NOT EXISTS idx_wf_step_exec_instance ON workflow_step_executions
 CREATE INDEX IF NOT EXISTS idx_wf_step_exec_task ON workflow_step_executions(task_id);
 ";
 
+const MIGRATION_V24: &str = "
+-- ADR-025: one logical session with isolated native work attempts.
+CREATE TABLE logical_sessions (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL UNIQUE,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'idle',
+    latest_summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE work_attempts (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES logical_sessions(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    queue_id INTEGER,
+    kind TEXT NOT NULL DEFAULT 'task',
+    runner TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    prompt TEXT NOT NULL DEFAULT '',
+    native_session_id TEXT,
+    container_id TEXT,
+    result TEXT,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX idx_work_attempts_session ON work_attempts(session_id, created_at DESC);
+CREATE INDEX idx_work_attempts_status ON work_attempts(status, created_at);
+CREATE INDEX idx_work_attempts_task ON work_attempts(task_id, created_at DESC);
+CREATE UNIQUE INDEX idx_work_attempts_queue ON work_attempts(queue_id) WHERE queue_id IS NOT NULL;
+
+CREATE TABLE session_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES logical_sessions(id) ON DELETE CASCADE,
+    attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_type TEXT NOT NULL,
+    source_id TEXT,
+    event_type TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_session_events_session ON session_events(session_id, id);
+CREATE INDEX idx_session_events_attempt ON session_events(attempt_id, id);
+CREATE INDEX idx_session_events_task ON session_events(task_id, id);
+
+CREATE TABLE attempt_artifacts (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL REFERENCES work_attempts(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES logical_sessions(id) ON DELETE CASCADE,
+    artifact_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT,
+    uri TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_attempt_artifacts_session ON attempt_artifacts(session_id, created_at DESC);
+CREATE INDEX idx_attempt_artifacts_attempt ON attempt_artifacts(attempt_id, created_at);
+
+ALTER TABLE tasks ADD COLUMN session_id TEXT;
+ALTER TABLE tasks ADD COLUMN active_attempt_id TEXT;
+ALTER TABLE task_queue ADD COLUMN attempt_id TEXT;
+
+-- Existing configured agents become logical sessions. Their old long-running
+-- container state is deliberately not carried forward.
+INSERT OR IGNORE INTO logical_sessions (id, agent_id, title)
+SELECT id, id, name FROM agents;
+UPDATE tasks SET session_id = agent_id WHERE session_id IS NULL AND agent_id IS NOT NULL;
+
+-- Preserve work that was queued before the pivot as native attempts.
+INSERT OR IGNORE INTO work_attempts
+    (id, session_id, task_id, queue_id, runner, status, prompt, created_at, started_at)
+SELECT
+    'migrated-' || q.id,
+    q.agent_id,
+    q.task_id,
+    q.id,
+    COALESCE((SELECT backend FROM agents WHERE id = q.agent_id), 'native'),
+    q.status,
+    COALESCE(t.description, t.title, ''),
+    q.queued_at,
+    q.started_at
+FROM task_queue q
+JOIN tasks t ON t.id = q.task_id
+JOIN logical_sessions s ON s.id = q.agent_id
+WHERE q.status IN ('queued', 'running');
+
+UPDATE task_queue
+SET attempt_id = 'migrated-' || id
+WHERE status IN ('queued', 'running') AND attempt_id IS NULL;
+UPDATE tasks
+SET active_attempt_id = (
+    SELECT q.attempt_id FROM task_queue q
+    WHERE q.task_id = tasks.id AND q.status IN ('queued', 'running')
+    ORDER BY q.id DESC LIMIT 1
+)
+WHERE active_attempt_id IS NULL;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,7 +827,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "23");
+        assert_eq!(version, "24");
     }
 
     #[test]
@@ -747,5 +852,9 @@ mod tests {
         assert!(tables.contains(&"conversations".to_string()));
         assert!(tables.contains(&"conversation_participants".to_string()));
         assert!(tables.contains(&"conversation_messages".to_string()));
+        assert!(tables.contains(&"logical_sessions".to_string()));
+        assert!(tables.contains(&"session_events".to_string()));
+        assert!(tables.contains(&"work_attempts".to_string()));
+        assert!(tables.contains(&"attempt_artifacts".to_string()));
     }
 }

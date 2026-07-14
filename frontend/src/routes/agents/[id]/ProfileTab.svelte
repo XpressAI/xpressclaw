@@ -14,21 +14,12 @@
 	let displayName = $state('');
 	let roleTitle = $state('');
 	let responsibilities = $state('');
-	let model = $state('');
-	let llmProvider = $state('');
-	let llmApiKey = $state('');
-	let llmBaseUrl = $state('');
-	let showModelModal = $state(false);
 
 	$effect(() => {
 		if (agentConfig) {
 			displayName = agentConfig.display_name ?? (agentConfig.name.charAt(0).toUpperCase() + agentConfig.name.slice(1));
 			roleTitle = agentConfig.role_title ?? '';
 			responsibilities = agentConfig.responsibilities ?? '';
-			model = agentConfig.model ?? '';
-			llmProvider = agentConfig.llm?.provider ?? '';
-			llmApiKey = agentConfig.llm?.api_key ?? '';
-			llmBaseUrl = agentConfig.llm?.base_url ?? '';
 		}
 	});
 
@@ -57,25 +48,11 @@
 		input.value = '';
 	}
 
-	function applyModelConfig() {
-		showModelModal = false;
-		// Save immediately so model/provider changes persist
-		onSave({
-			model: model.trim() || undefined,
-			llm: {
-				provider: llmProvider || null,
-				api_key: llmApiKey || null,
-				base_url: llmBaseUrl || null,
-			},
-		});
-	}
-
 	function handleSave() {
 		onSave({
 			display_name: displayName.trim() || null,
 			role_title: roleTitle.trim() || null,
 			responsibilities: responsibilities.trim() || null,
-			model: model.trim() || undefined,
 		});
 	}
 
@@ -116,7 +93,7 @@
 		<!-- Right: Fields -->
 		<div class="flex-1 space-y-4">
 			<div>
-				<label class="block text-xs text-muted-foreground mb-1">Agent Name</label>
+				<label class="block text-xs text-muted-foreground mb-1">Session ID</label>
 				<input
 					type="text"
 					value={agentConfig?.name ?? ''}
@@ -150,69 +127,12 @@
 				<textarea
 					bind:value={responsibilities}
 					rows={3}
-					placeholder="What is this agent responsible for?"
+					placeholder="What is this session's native runner responsible for?"
 					class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 				></textarea>
-			</div>
-
-			<div>
-				<label class="block text-xs text-muted-foreground mb-1">Model</label>
-				<div class="flex items-center gap-2">
-					<span class="flex-1 rounded-md border border-border bg-muted/50 px-3 py-2 text-sm font-mono">{model || 'default'}</span>
-					<button onclick={() => showModelModal = true}
-						class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent transition-colors">
-						Change
-					</button>
-				</div>
 			</div>
 
 		</div>
 	</div>
 
 </div>
-
-<!-- Model / LLM Provider Modal -->
-{#if showModelModal}
-	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onclick={() => showModelModal = false}>
-		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4 w-full" onclick={(e) => e.stopPropagation()}>
-			<h2 class="text-lg font-semibold">Model & LLM Provider</h2>
-			<div class="space-y-3">
-				<div>
-					<label class="block text-xs font-medium text-muted-foreground mb-1">Provider</label>
-					<select bind:value={llmProvider}
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
-						<option value="">Default (global)</option>
-						<option value="openai">OpenAI-compatible</option>
-						<option value="anthropic">Anthropic</option>
-						<option value="local">Local</option>
-					</select>
-				</div>
-				<div>
-					<label class="block text-xs font-medium text-muted-foreground mb-1">Model</label>
-					<input type="text" bind:value={model} placeholder="e.g. gpt-4o, claude-sonnet-4-5, qwen3.5:9b"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
-				</div>
-				{#if llmProvider === 'openai' || llmProvider === 'anthropic'}
-					<div>
-						<label class="block text-xs font-medium text-muted-foreground mb-1">API Key</label>
-						<input type="password" bind:value={llmApiKey} placeholder={llmProvider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
-					</div>
-					<div>
-						<label class="block text-xs font-medium text-muted-foreground mb-1">Base URL <span class="font-normal text-muted-foreground">(optional)</span></label>
-						<input type="text" bind:value={llmBaseUrl} placeholder={llmProvider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com'}
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
-					</div>
-				{/if}
-			</div>
-			<div class="flex justify-end gap-2">
-				<button onclick={() => showModelModal = false}
-					class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
-				<button onclick={applyModelConfig}
-					class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
-					Apply
-				</button>
-			</div>
-		</div>
-	</div>
-{/if}

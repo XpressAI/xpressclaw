@@ -12,6 +12,7 @@ use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     default_mcp_servers, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
+    NativeRunnerConfig,
 };
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -88,6 +89,7 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                     "api_key": l.api_key,
                     "base_url": l.base_url,
                 })),
+                "runner": a.runner,
                 "tools": a.tools,
                 "skills": a.skills,
                 "volumes": a.volumes,
@@ -291,7 +293,7 @@ struct CompleteSetupRequest {
     agents: Vec<AgentSetup>,
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
-    /// Isolation mode: "docker" (default) or "none" (containerless).
+    /// Isolation mode. Native workers currently require "docker".
     #[serde(default = "default_isolation")]
     isolation: String,
 }
@@ -305,9 +307,8 @@ struct LlmSetup {
     provider: String,
     api_key: Option<String>,
     base_url: Option<String>,
-    /// Ollama-tag-style model name (e.g. "qwen3.5:4b") used when
-    /// `provider == "ollama"`. The reconciler will pull it from the agent's
-    /// Ollama instance in the background after setup completes.
+    /// Legacy Ollama-tag-style model name (e.g. "qwen3.5:4b") used when
+    /// importing a pre-native-runner setup request.
     local_model: Option<String>,
     /// Base URL for the Ollama instance when `provider == "ollama"`.
     /// Defaults to http://localhost:11434.
@@ -322,6 +323,9 @@ struct AgentSetup {
     role_title: Option<String>,
     responsibilities: Option<String>,
     backend: Option<String>,
+    runner_kind: Option<String>,
+    runner_image: Option<String>,
+    subscription_auth: Option<bool>,
     model: Option<String>,
     tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
@@ -330,11 +334,32 @@ struct AgentSetup {
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
+fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
+    NativeRunnerConfig {
+        kind: setup
+            .runner_kind
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
+        image: setup
+            .runner_image
+            .clone()
+            .unwrap_or_else(|| "xpressclaw-native-runner:latest".to_string()),
+        subscription_auth: setup.subscription_auth.unwrap_or(true),
+        ..Default::default()
+    }
+}
+
 /// Save the setup configuration and mark setup as complete.
 async fn complete_setup(
     State(state): State<AppState>,
     Json(req): Json<CompleteSetupRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.isolation != "docker" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "native workers require Docker or Podman isolation" })),
+        ));
+    }
     // Global LLM config no longer holds provider/model/key — those moved
     // onto each agent. Only `custom_pricing` lives here.
     let llm = LlmConfig::default();
@@ -344,7 +369,11 @@ async fn complete_setup(
     let agents = if req.agents.is_empty() {
         vec![AgentConfig {
             name: "atlas".to_string(),
-            backend: "claude-sdk".to_string(),
+            backend: "codex".to_string(),
+            runner: NativeRunnerConfig {
+                kind: "codex".to_string(),
+                ..Default::default()
+            },
             role: "You are a helpful AI assistant.".to_string(),
             ..Default::default()
         }]
@@ -421,16 +450,17 @@ async fn complete_setup(
                     role_title: a.role_title.clone(),
                     responsibilities: a.responsibilities.clone(),
                     backend: a
-                        .backend
+                        .runner_kind
                         .clone()
-                        .or(preset.map(|p| p.backend.to_string()))
-                        .unwrap_or("claude-sdk".to_string()),
+                        .or(a.backend.clone().or(preset.map(|p| p.backend.to_string())))
+                        .unwrap_or("codex".to_string()),
                     role: a
                         .role
                         .clone()
                         .or(preset.map(|p| p.role.to_string()))
                         .unwrap_or_default(),
                     llm: agent_llm,
+                    runner: runner_from_setup(a),
                     tools,
                     skills: vec![
                         "memory-system".to_string(),
@@ -483,6 +513,7 @@ async fn complete_setup(
     // Sync agents in the database to match the new config.
     // Remove any agents not in the new config, then register the new ones.
     let registry = AgentRegistry::new(state.db.clone());
+    let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
     let existing_agents = registry.list().unwrap_or_default();
     let new_agent_names: std::collections::HashSet<&str> =
         config.agents.iter().map(|a| a.name.as_str()).collect();
@@ -490,17 +521,25 @@ async fn complete_setup(
         if !new_agent_names.contains(existing.name.as_str()) {
             info!(name = existing.name, "removing agent not in new config");
             let _ = registry.delete(&existing.id);
+            let _ = sessions.delete(&existing.id);
         }
     }
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => {
-                info!(name = record.name, backend = record.backend, "synced agent");
-                // Auto-start all agents after setup
-                let _ = registry.set_desired_status(
-                    &record.id,
-                    &xpressclaw_core::agents::state::DesiredStatus::Running,
-                );
+                let title = agent_config
+                    .display_name
+                    .as_deref()
+                    .unwrap_or(&agent_config.name);
+                if let Err(error) = sessions.ensure(&record.id, Some(title)) {
+                    warn!(name = record.name, error = %error, "failed to sync session");
+                } else {
+                    info!(
+                        name = record.name,
+                        backend = record.backend,
+                        "synced native session"
+                    );
+                }
             }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
         }
@@ -510,10 +549,6 @@ async fn complete_setup(
     let llm_router = LlmRouter::build_from_config(&config);
     state.apply_config(config, Some(Arc::new(llm_router)));
     info!("configuration applied — setup complete");
-
-    // Any agent using provider=ollama will have its model pulled by the
-    // background reconciler (see agents::reconciler::reconcile_models). No
-    // synchronous download here.
 
     Ok(Json(json!({
         "success": true,
@@ -545,16 +580,9 @@ async fn add_agent(
         }
     }
 
-    // New agents get a sensible default LLM config that points at local
-    // Ollama. The user edits the agent afterwards to switch provider/model
-    // or add an API key. We deliberately do NOT inherit any "global" provider
-    // or key from existing agents — that's the bug this rewrite fixes.
-    let agent_llm = Some(AgentLlmConfig {
-        provider: Some("ollama".into()),
-        model: req.model.clone().or_else(|| Some("qwen3.5:latest".into())),
-        api_key: None,
-        base_url: Some("http://localhost:11434".into()),
-    });
+    // Native products own model selection and authentication. Keep the old
+    // per-agent LLM block empty for newly-created sessions.
+    let agent_llm = None;
 
     // Default skills for new agents
     let default_skills = vec![
@@ -572,16 +600,20 @@ async fn add_agent(
         name: agent_id.clone(),
         display_name: Some(req.name.clone()),
         backend: req
-            .backend
+            .runner_kind
             .clone()
-            .or(preset.map(|p| p.backend.to_string()))
-            .unwrap_or("claude-sdk".to_string()),
+            .or(req
+                .backend
+                .clone()
+                .or(preset.map(|p| p.backend.to_string())))
+            .unwrap_or("codex".to_string()),
         role: req
             .role
             .clone()
             .or(preset.map(|p| p.role.to_string()))
             .unwrap_or_default(),
         llm: agent_llm,
+        runner: runner_from_setup(&req),
         tools,
         skills: default_skills,
         volumes: req.volumes.clone().unwrap_or_default(),
@@ -630,15 +662,15 @@ async fn add_agent(
         .map_err(internal_error)?;
     info!(name = agent_config.name, "added agent to configuration");
 
-    // Register in DB and auto-start
+    // Register the durable profile/session. Native workers are started per
+    // attempt, so there is no long-running agent to auto-start.
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry
         .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
-    let _ = registry.set_desired_status(
-        &record.id,
-        &xpressclaw_core::agents::state::DesiredStatus::Running,
-    );
+    xpressclaw_core::sessions::SessionManager::new(state.db.clone())
+        .ensure(&record.id, agent_config.display_name.as_deref())
+        .map_err(internal_error)?;
 
     // Rebuild the router so the new agent has a binding. The previous
     // implementation reused the existing router, which silently meant the

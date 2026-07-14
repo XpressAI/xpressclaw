@@ -208,9 +208,9 @@ async fn get_messages(
     Ok(Json(json!(msgs)))
 }
 
-/// Fire-and-forget message send (ADR-019).
-/// Stores the user message, spawns a background task for agent response,
-/// and returns immediately with the stored user message.
+/// Store the message and queue one native work attempt for each addressed
+/// logical session. Results return through conversation history/SSE, but task
+/// execution uses the same durable path as schedules and workflows.
 async fn send_message(
     State(state): State<AppState>,
     Path(conv_id): Path<String>,
@@ -218,9 +218,10 @@ async fn send_message(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ConversationManager::new(state.db.clone());
 
-    // Store user message as unprocessed
+    // The queue is now the processing source of truth, so the legacy
+    // conversation `processed` flag is not used for new messages.
     let user_msg = mgr
-        .send_user_message(
+        .send_message(
             &conv_id,
             &SendMessage {
                 sender_type: "user".into(),
@@ -240,37 +241,58 @@ async fn send_message(
         },
     );
 
-    // Spawn background processor if not already running
-    if !mgr.is_processing(&conv_id) {
-        if let Some(llm_router) = state.llm_router() {
-            let config = state.config();
-            let agent_skills_map = config
-                .agents
-                .iter()
-                .map(|a| {
-                    let role =
-                        append_skills(&a.full_system_prompt(), &a.skills, &state.config_path);
-                    (a.name.clone(), role)
-                })
-                .collect();
-
-            xpressclaw_core::conversations::processor::spawn(
-                conv_id.clone(),
-                xpressclaw_core::conversations::processor::ProcessorContext {
-                    db: state.db.clone(),
-                    config,
-                    llm_router,
-                    event_bus: state.event_bus.clone(),
-                    rate_limiter: state.rate_limiter(),
-                    agent_roles: agent_skills_map,
-                    docker: state.docker().await,
+    let target_agents = mgr
+        .resolve_target_agents(&conv_id, &req.content)
+        .map_err(internal_error)?;
+    for agent_id in target_agents {
+        let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+        sessions
+            .ensure(&agent_id, Some(&agent_id))
+            .map_err(internal_error)?;
+        let source_event = sessions
+            .append_event(
+                &agent_id,
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: None,
+                    source_type: "conversation",
+                    source_id: Some(&conv_id),
+                    event_type: "message_received",
+                    summary: &req.content,
+                    payload: json!({
+                        "conversation_id": conv_id,
+                        "message_id": user_msg.id,
+                        "content": req.content,
+                    }),
                 },
-            );
-        }
+            )
+            .map_err(internal_error)?;
+        let title: String = req.content.chars().take(72).collect();
+        let task = TaskBoard::new(state.db.clone())
+            .create(&CreateTask {
+                title,
+                description: Some(req.content.clone()),
+                agent_id: Some(agent_id.clone()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: Some(conv_id.clone()),
+                priority: None,
+                context: Some(json!({
+                    "origin": "conversation",
+                    "kind": "interactive",
+                    "source_id": conv_id,
+                    "source_event_id": source_event.id,
+                    "message_id": user_msg.id,
+                })),
+            })
+            .map_err(internal_error)?;
+        TaskQueue::new(state.db.clone())
+            .enqueue(&task.id, &agent_id)
+            .map_err(internal_error)?;
     }
 
-    // Return immediately with the user message — agent response
-    // will be processed in the background and delivered via SSE events.
+    // Return immediately. Native attempt results are persisted and delivered
+    // through the existing SSE channel when they complete.
     Ok((StatusCode::CREATED, Json(json!([user_msg]))))
 }
 
@@ -287,34 +309,72 @@ async fn stop_processing(
     Path(conv_id): Path<String>,
     Query(params): Query<StopParams>,
 ) -> StatusCode {
-    let mgr = ConversationManager::new(state.db.clone());
-    let _ = mgr.set_processing_status(&conv_id, "idle");
-    let _ = mgr.mark_processed(&conv_id);
-
-    // Send cancel to the specific agent (or all if none specified).
-    let registry = xpressclaw_core::agents::registry::AgentRegistry::new(state.db.clone());
-    let target_agents = if let Some(ref aid) = params.agent_id {
-        vec![aid.clone()]
-    } else {
-        mgr.resolve_target_agents(&conv_id, "").unwrap_or_default()
-    };
-
-    for agent_id in &target_agents {
-        if let Ok(agent) = registry.get(agent_id) {
-            if let Some(ref cid) = agent.container_id {
-                if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await
-                {
-                    if let Some(port) = docker.get_container_port(cid).await {
-                        let client = xpressclaw_core::agents::harness::HarnessClient::new(port);
-                        let _ = client.cancel().await;
-                        tracing::info!(agent_id, "sent cancel to harness");
-                    }
-                }
+    let attempts: Vec<(String, Option<i64>, Option<String>)> = state
+        .db
+        .with_conn(|conn| {
+            let mut sql = String::from(
+                "SELECT a.id, a.queue_id, a.task_id
+                 FROM work_attempts a JOIN tasks t ON t.id = a.task_id
+                 WHERE t.conversation_id = ?1
+                   AND a.status IN ('queued', 'preparing', 'running', 'review')",
+            );
+            if params.agent_id.is_some() {
+                sql.push_str(" AND a.session_id = ?2");
             }
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = if let Some(agent_id) = params.agent_id.as_deref() {
+                stmt.query_map([conv_id.as_str(), agent_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|row| row.ok())
+                .collect()
+            } else {
+                stmt.query_map([&conv_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|row| row.ok())
+                .collect()
+            };
+            Ok::<_, xpressclaw_core::error::Error>(rows)
+        })
+        .unwrap_or_default();
+
+    let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+    let docker = state.docker().await;
+    for (attempt_id, queue_id, task_id) in attempts {
+        let _ = sessions.transition_attempt(
+            &attempt_id,
+            "cancelled",
+            "Conversation work cancelled by user",
+            None,
+            None,
+        );
+        state
+            .db
+            .with_conn(|conn| {
+                if let Some(queue_id) = queue_id {
+                    conn.execute(
+                        "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                            harness_response = 'cancelled by user' WHERE id = ?1",
+                        [queue_id],
+                    )?;
+                }
+                if let Some(task_id) = task_id {
+                    conn.execute(
+                        "UPDATE tasks SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                        [task_id],
+                    )?;
+                }
+                Ok::<_, xpressclaw_core::error::Error>(())
+            })
+            .ok();
+        if let Some(docker) = docker.as_ref() {
+            let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
         }
     }
 
-    tracing::info!(conv_id, "processing stopped by user");
+    tracing::info!(conv_id, "conversation attempts cancelled by user");
     StatusCode::OK
 }
 
@@ -825,7 +885,7 @@ mod tests {
 
     use super::*;
 
-    fn test_app() -> Router {
+    fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         // Register a test agent
         db.with_conn(|conn| {
@@ -838,15 +898,22 @@ mod tests {
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
-            db,
+            db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
             true,
         );
 
-        Router::new()
-            .nest("/conversations", routes())
-            .with_state(state)
+        (
+            Router::new()
+                .nest("/conversations", routes())
+                .with_state(state),
+            db,
+        )
+    }
+
+    fn test_app() -> Router {
+        test_app_with_db().0
     }
 
     async fn body_json(body: Body) -> Value {
@@ -901,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_and_get_messages() {
-        let app = test_app();
+        let (app, db) = test_app_with_db();
 
         // Create conversation
         let resp = app
@@ -921,7 +988,8 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         let conv_id = body["id"].as_str().unwrap().to_string();
 
-        // Send message (no LLM router → only user message returned)
+        // Send message. Native work is queued and the user message returns
+        // immediately even though no worker is running in this route test.
         let resp = app
             .clone()
             .oneshot(
@@ -943,6 +1011,17 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["content"], "Hello atlas!");
         assert_eq!(msgs[0]["sender_name"], "Eduardo");
+
+        let queued = TaskQueue::new(db.clone())
+            .list(Some("atlas"), Some("queued"), 10)
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let events = xpressclaw_core::sessions::SessionManager::new(db)
+            .list_events("atlas", None, 20)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.source_type == "conversation" && event.source_id.as_deref() == Some(&conv_id)
+        }));
 
         // Get messages
         let resp = app

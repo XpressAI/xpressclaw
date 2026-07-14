@@ -21,9 +21,6 @@
 	let thinkingAgent = $state<string | null>(null);
 	let streamingContent = $state('');
 	let cancelStream = $state<(() => void) | null>(null);
-	let stoppedAgents = $state<Agent[]>([]);
-	let showStartDialog = $state(false);
-	let startingAgents = $state(false);
 	let userProfile = $state(getCachedProfile());
 	let pendingMsgHandled = false;
 	let composing = $state(false);
@@ -85,22 +82,6 @@
 			messages = msgs;
 			agentList = a;
 			error = null;
-
-			const participantIds = c.participants
-				.filter(p => p.participant_type === 'agent')
-				.map(p => p.participant_id);
-			// Only prompt for agents the user hasn't already requested to run.
-			// When Docker is slow/unavailable, status may show "starting" even
-			// though the agent is running fine. Check desired_status to avoid
-			// repeatedly prompting on every page navigation. (XCLAW-55)
-			stoppedAgents = a.filter(ag =>
-				participantIds.includes(ag.id) &&
-				ag.status !== 'running' &&
-				ag.desired_status !== 'running'
-			);
-			if (stoppedAgents.length > 0) {
-				showStartDialog = true;
-			}
 
 			await tick();
 			scrollToBottom();
@@ -303,20 +284,6 @@
 		editingTitle = false;
 	}
 
-	async function startStoppedAgents() {
-		startingAgents = true;
-		try {
-			await Promise.all(stoppedAgents.map(a => agents.start(a.id)));
-			agentList = await agents.list().catch(() => agentList);
-			stoppedAgents = [];
-			showStartDialog = false;
-		} catch (e) {
-			error = `Failed to start agents: ${e instanceof Error ? e.message : String(e)}`;
-			showStartDialog = false;
-		}
-		startingAgents = false;
-	}
-
 	async function deleteConversation() {
 		if (!conv) return;
 		if (!confirm('Delete this conversation?')) return;
@@ -428,36 +395,6 @@
 		Loading...
 	</div>
 {:else}
-	<!-- Start agents dialog -->
-	{#if showStartDialog}
-		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-			<div class="mx-4 w-full max-w-sm rounded-xl border border-border bg-card p-5 shadow-2xl space-y-4">
-				<h3 class="text-sm font-semibold">Agents are stopped</h3>
-				<p class="text-sm text-muted-foreground">
-					{#if stoppedAgents.length === 1}
-						<span class="font-medium text-foreground">{stoppedAgents[0].name}</span> is not running. Start it to chat?
-					{:else}
-						The following agents are not running:
-						<span class="font-medium text-foreground">{stoppedAgents.map(a => a.name).join(', ')}</span>. Start them to chat?
-					{/if}
-				</p>
-				<div class="flex justify-end gap-2">
-					<button
-						onclick={() => (showStartDialog = false)}
-						class="rounded-lg border border-border px-3 py-1.5 text-xs hover:bg-secondary transition-colors"
-					>Not now</button>
-					<button
-						onclick={startStoppedAgents}
-						disabled={startingAgents}
-						class="rounded-lg bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
-					>
-						{#if startingAgents}Starting...{:else}Start {stoppedAgents.length === 1 ? stoppedAgents[0].name : 'all'}{/if}
-					</button>
-				</div>
-			</div>
-		</div>
-	{/if}
-
 	<div class="flex h-full flex-col">
 		<!-- Conversation Header -->
 		<div class="flex items-center gap-3 border-b border-border px-5 py-3">
@@ -485,7 +422,7 @@
 					{#each participantAgents as agentId}
 						{@const agent = agentList.find(a => a.id === agentId)}
 						<span class="inline-flex items-center gap-1.5">
-							<span class="h-2 w-2 rounded-full {agent?.status === 'running' ? 'bg-emerald-400' : 'bg-muted-foreground/30'}"></span>
+							<span class="h-2 w-2 rounded-full {agent?.status === 'running' ? 'bg-blue-400 animate-pulse' : agent?.status === 'error' ? 'bg-red-400' : 'bg-emerald-400'}"></span>
 							{agentId}
 						</span>
 					{/each}

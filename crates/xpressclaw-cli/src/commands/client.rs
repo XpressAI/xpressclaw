@@ -63,24 +63,6 @@ impl ApiClient {
         resp.json().await.context("failed to parse API response")
     }
 
-    pub async fn post_empty(&self, path: &str) -> Result<serde_json::Value> {
-        let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .send()
-            .await
-            .with_context(|| format!("failed to connect to xpressclaw at {url}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("API error {status}: {body}");
-        }
-
-        resp.json().await.context("failed to parse API response")
-    }
-
     pub async fn patch<T: DeserializeOwned>(
         &self,
         path: &str,

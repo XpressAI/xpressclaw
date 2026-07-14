@@ -221,6 +221,37 @@ pub struct AgentLlmConfig {
     pub base_url: Option<String>,
 }
 
+/// Configuration for a native coding-agent worker.
+///
+/// The runner owns its reasoning loop and model authentication. XpressClaw
+/// only supplies a task, an isolated workspace, and a place to publish events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeRunnerConfig {
+    /// Native CLI to invoke: auto, codex, claude, opencode, or custom.
+    pub kind: String,
+    /// Image containing the native CLIs. Built from harnesses/native by default.
+    pub image: String,
+    /// Optional argv override. `{prompt}` and `{workspace}` are expanded.
+    pub command: Vec<String>,
+    /// Reuse the host CLI login from its standard config directory.
+    pub subscription_auth: bool,
+    /// Maximum autonomous turns for CLIs that support a turn limit.
+    pub max_turns: u32,
+}
+
+impl Default for NativeRunnerConfig {
+    fn default() -> Self {
+        Self {
+            kind: "auto".to_string(),
+            image: "xpressclaw-native-runner:latest".to_string(),
+            command: Vec::new(),
+            subscription_auth: true,
+            max_turns: 100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -234,6 +265,10 @@ pub struct AgentConfig {
     /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
+    /// Short-lived native worker configuration. This supersedes the old
+    /// in-house harness for task execution.
+    #[serde(default)]
+    pub runner: NativeRunnerConfig,
     /// Human-friendly display name (e.g. "Avery (PA)").
     pub display_name: Option<String>,
     /// Short role title (e.g. "Personal Assistant").
@@ -273,6 +308,7 @@ impl Default for AgentConfig {
             backend: "claude-sdk".to_string(),
             model: None,
             llm: None,
+            runner: NativeRunnerConfig::default(),
             display_name: None,
             role_title: None,
             responsibilities: None,

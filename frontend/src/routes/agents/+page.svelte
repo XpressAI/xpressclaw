@@ -21,34 +21,17 @@
 		if (pollTimer) clearInterval(pollTimer);
 	});
 
-	async function handleStart(id: string) {
-		try {
-			await agents.start(id);
-			agentList = await agents.list();
-		} catch (e) {
-			alert(String(e));
-		}
-	}
-
-	async function handleStop(id: string) {
-		try {
-			await agents.stop(id);
-			agentList = await agents.list();
-		} catch (e) {
-			alert(String(e));
-		}
-	}
 </script>
 
 <div class="p-6 space-y-6">
 	<div class="flex items-center justify-between">
 		<div>
-			<h1 class="text-2xl font-bold">Agents</h1>
-			<p class="text-sm text-muted-foreground mt-1">{agentList.length} configured</p>
+			<h1 class="text-2xl font-bold">Sessions</h1>
+			<p class="text-sm text-muted-foreground mt-1">{agentList.length} persistent workspaces</p>
 		</div>
 		<a href="/setup?mode=add-agent"
 			class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">
-			+ Add Agent
+			+ Add Session
 		</a>
 	</div>
 
@@ -56,8 +39,8 @@
 		<div class="text-sm text-muted-foreground">Loading...</div>
 	{:else if agentList.length === 0}
 		<div class="rounded-lg border border-border bg-card p-8 text-center">
-			<p class="text-muted-foreground">No agents configured.</p>
-			<p class="text-sm text-muted-foreground mt-2">Complete the <a href="/setup" class="text-primary hover:underline">setup wizard</a> to add agents.</p>
+			<p class="text-muted-foreground">No sessions configured.</p>
+			<p class="text-sm text-muted-foreground mt-2">Create a profile to connect a native coding agent.</p>
 		</div>
 	{:else}
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -72,11 +55,8 @@
 							</div>
 						</div>
 						<span class="inline-flex items-center gap-1.5 text-xs {statusColor(agent.status)}">
-							<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-emerald-400' : agent.status === 'starting' || agent.status === 'stopping' ? 'bg-amber-400 animate-pulse' : agent.status === 'error' ? 'bg-red-400' : 'bg-muted-foreground/30'}"></span>
+							<span class="h-1.5 w-1.5 rounded-full {agent.status === 'running' ? 'bg-blue-400 animate-pulse' : agent.status === 'queued' ? 'bg-amber-400' : agent.status === 'error' ? 'bg-red-400' : 'bg-emerald-400'}"></span>
 							{agent.status}
-							{#if agent.restart_count > 0 && agent.desired_status === 'running' && agent.status !== 'running'}
-								<span class="text-muted-foreground">(attempt {agent.restart_count})</span>
-							{/if}
 						</span>
 					</div>
 
@@ -85,33 +65,15 @@
 					{/if}
 
 					<div class="text-xs text-muted-foreground">
-						Created {timeAgo(agent.created_at)}
-						{#if agent.started_at}
-							&middot; Started {timeAgo(agent.started_at)}
-						{/if}
+						Available continuously &middot; created {timeAgo(agent.created_at)}
 					</div>
 
 					<div class="flex gap-2">
-						{#if agent.desired_status === 'running'}
-							<button
-								onclick={() => handleStop(agent.id)}
-								class="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent transition-colors"
-							>
-								Stop
-							</button>
-						{:else}
-							<button
-								onclick={() => handleStart(agent.id)}
-								class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
-							>
-								Start
-							</button>
-						{/if}
 						<a
 							href="/agents/{agent.id}"
-							class="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent transition-colors"
+							class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
 						>
-							Details
+							Open session
 						</a>
 					</div>
 				</div>
