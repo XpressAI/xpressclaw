@@ -230,7 +230,8 @@ pub struct AgentLlmConfig {
 pub struct NativeRunnerConfig {
     /// Native CLI to invoke: auto, codex, claude, opencode, or custom.
     pub kind: String,
-    /// Image containing the native CLIs. Built from harnesses/native by default.
+    /// Image containing exactly one native CLI. When empty, the runner kind
+    /// selects the matching xpressclaw-runner-* image.
     pub image: String,
     /// Optional argv override. `{prompt}` and `{workspace}` are expanded.
     pub command: Vec<String>,
@@ -244,11 +245,23 @@ impl Default for NativeRunnerConfig {
     fn default() -> Self {
         Self {
             kind: "auto".to_string(),
-            image: "xpressclaw-native-runner:latest".to_string(),
+            image: String::new(),
             command: Vec::new(),
             subscription_auth: true,
             max_turns: 100,
         }
+    }
+}
+
+/// Built-in image for a resolved native runner kind. Keeping this mapping in
+/// the control plane lets each image contain only its own CLI while custom
+/// runners continue to require an explicit image.
+pub fn default_native_runner_image(kind: &str) -> Option<&'static str> {
+    match kind {
+        "codex" => Some("xpressclaw-runner-codex:latest"),
+        "claude" => Some("xpressclaw-runner-claude:latest"),
+        "opencode" => Some("xpressclaw-runner-opencode:latest"),
+        _ => None,
     }
 }
 

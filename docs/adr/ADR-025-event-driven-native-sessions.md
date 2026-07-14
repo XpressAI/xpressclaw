@@ -63,10 +63,35 @@ and records outcomes. It does not implement model turns, tool selection, or
 context compaction. The old Python harness dispatcher and per-agent
 desired-state reconciler are no longer started by the server.
 
+Each native product has its own minimal image. Codex, Claude Code, and
+OpenCode are not bundled together. This makes the selected product and its
+credential boundary explicit, keeps downloads smaller, and allows each image
+to be versioned independently.
+
 Attempts for the same logical session are serialized initially because they
 share a mounted workspace. The API still accepts messages immediately and
 shows them as queued. Isolated Git worktrees or remote sandboxes can later
 allow safe parallel attempts without changing the session model.
+
+### Agent runners and development environments are separate resources
+
+The native runner image contains the selected agent product and only the
+small set of utilities needed to operate it. Java, .NET, Ruby, databases,
+browsers, and other project dependencies do not define the agent and should
+not accumulate in that image.
+
+A richer development environment is instead a control-plane-managed resource
+that can be created, leased to an attempt, and destroyed independently. The
+runner receives a scoped way to edit the shared workspace and execute tools in
+that environment. It does not receive the host Docker socket or unrestricted
+container-daemon credentials. The same resource model can later cover Android
+devices, desktops, browsers, and remote machines.
+
+The first implementation still bind-mounts the configured workspace directly
+into a runner. Custom runner images remain supported as an escape hatch until
+the scoped development-environment gateway is implemented. We explicitly do
+not use a Docker-socket mount as an interim solution because it would turn a
+worker compromise into control over every host container and mount.
 
 ### Subscription authentication
 
@@ -120,7 +145,7 @@ MCP harness.
 
 ### Negative
 
-- The native runner image must be built or supplied before work can execute.
+- The selected native runner image must be built or supplied before work can execute.
 - Mounting host OAuth state into a container is a meaningful trust boundary.
 - The first implementation serializes attempts per session, so an interactive
   message can be queued behind current work even though the session UI remains
@@ -142,10 +167,12 @@ Existing backends map as follows unless `runner.kind` is set explicitly:
 - names containing `opencode` -> OpenCode;
 - other names require `runner.command`.
 
-Build the default image with:
+Build the runner images you use with:
 
 ```bash
-docker build -t xpressclaw-native-runner:latest harnesses/native
+docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker build -t xpressclaw-runner-claude:latest harnesses/native/claude
+docker build -t xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router

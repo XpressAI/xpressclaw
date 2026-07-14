@@ -11,8 +11,8 @@ use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
-    default_mcp_servers, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
-    NativeRunnerConfig,
+    default_mcp_servers, default_native_runner_image, AgentConfig, AgentLlmConfig, Config,
+    LlmConfig, McpServerConfig, NativeRunnerConfig,
 };
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -335,15 +335,21 @@ struct AgentSetup {
 }
 
 fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
+    let kind = setup
+        .runner_kind
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let image = setup
+        .runner_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|image| !image.is_empty())
+        .map(str::to_owned)
+        .or_else(|| default_native_runner_image(&kind).map(str::to_owned))
+        .unwrap_or_default();
     NativeRunnerConfig {
-        kind: setup
-            .runner_kind
-            .clone()
-            .unwrap_or_else(|| "auto".to_string()),
-        image: setup
-            .runner_image
-            .clone()
-            .unwrap_or_else(|| "xpressclaw-native-runner:latest".to_string()),
+        kind,
+        image,
         subscription_auth: setup.subscription_auth.unwrap_or(true),
         ..Default::default()
     }
@@ -838,6 +844,18 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn setup_selects_the_image_for_the_native_product() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "name": "reviewer",
+            "runner_kind": "claude"
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert_eq!(runner.kind, "claude");
+        assert_eq!(runner.image, "xpressclaw-runner-claude:latest");
     }
 
     #[tokio::test]

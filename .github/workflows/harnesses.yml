@@ -15,11 +15,14 @@ env:
   REGISTRY: ghcr.io/xpressai
 
 jobs:
-  build-native-runner:
+  build-native-runners:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    strategy:
+      matrix:
+        runner: [codex, claude, opencode]
     steps:
       - uses: actions/checkout@v4
 
@@ -36,10 +39,10 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: harnesses/native
+          context: harnesses/native/${{ matrix.runner }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/xpressclaw-native-runner:latest
+          tags: ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -32,10 +32,10 @@ xpressclaw init
 xpressclaw up
 ```
 
-Build the native worker image, open `http://localhost:8935`, and send work to a session:
+Build the runner you want, open `http://localhost:8935`, and send work to a session:
 
 ```bash
-docker build -t xpressclaw-native-runner:latest harnesses/native
+docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
 ```
 
 ## Why xpressclaw?
@@ -69,6 +69,10 @@ Zettelkasten-style knowledge base with vector search (sqlite-vec). Agents rememb
 - **Claude Code:** reuses an eligible host Claude subscription login
 - **OpenCode:** JSON event adapter with configurable authentication
 - **Custom:** one-argument-per-line command templates for other native CLIs
+
+Each built-in runner image contains one agent product. Language SDKs and
+project services belong in a separate development environment rather than in
+the agent identity image.
 
 ### Privacy & Safety
 
@@ -154,7 +158,7 @@ agents:
     backend: codex
     runner:
       kind: codex
-      image: xpressclaw-native-runner:latest
+      image: xpressclaw-runner-codex:latest
       subscription_auth: true
       max_turns: 100
     role: |
@@ -215,14 +219,19 @@ bazel build //crates/xpressclaw-server:xpressclaw-server
 ./build-signed.sh
 ```
 
-### Build the Native Worker Image
+### Build Native Worker Images
 
-The default image contains Codex and Claude Code. OpenCode or another CLI can
-be supplied in a custom image:
+Build only the product you use. Each image is deliberately independent so it
+can be versioned or extended without pulling in the other agent CLIs:
 
 ```bash
-docker build -t xpressclaw-native-runner:latest harnesses/native
+docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker build -t xpressclaw-runner-claude:latest harnesses/native/claude
+docker build -t xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
+
+See `harnesses/native/README.md` for customization guidance and the planned
+separation between agent runners and development environments.
 
 ### Run Tests
 

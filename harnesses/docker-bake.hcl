@@ -10,13 +10,25 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["native", "base", "generic", "claude-sdk", "xaibo", "langchain"]
+  targets = ["native-codex", "native-claude", "native-opencode", "base", "generic", "claude-sdk", "xaibo", "langchain"]
 }
 
-target "native" {
-  context    = "./native"
+target "native-codex" {
+  context    = "./native/codex"
   dockerfile = "Dockerfile"
-  tags       = ["xpressclaw-native-runner:${TAG}", "${REGISTRY}/xpressclaw-native-runner:${TAG}"]
+  tags       = ["xpressclaw-runner-codex:${TAG}", "${REGISTRY}/xpressclaw-runner-codex:${TAG}"]
+}
+
+target "native-claude" {
+  context    = "./native/claude"
+  dockerfile = "Dockerfile"
+  tags       = ["xpressclaw-runner-claude:${TAG}", "${REGISTRY}/xpressclaw-runner-claude:${TAG}"]
+}
+
+target "native-opencode" {
+  context    = "./native/opencode"
+  dockerfile = "Dockerfile"
+  tags       = ["xpressclaw-runner-opencode:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode:${TAG}"]
 }
 
 target "base" {

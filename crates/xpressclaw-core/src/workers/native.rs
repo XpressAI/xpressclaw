@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-use crate::config::{AgentConfig, Config, NativeRunnerConfig};
+use crate::config::{default_native_runner_image, AgentConfig, Config, NativeRunnerConfig};
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
@@ -404,6 +404,15 @@ fn build_spec(
     prompt: &str,
 ) -> Result<ContainerSpec> {
     let command = command_for(&agent.runner, kind, prompt)?;
+    let image = if agent.runner.image.trim().is_empty() {
+        default_native_runner_image(kind).ok_or_else(|| {
+            Error::Backend(format!(
+                "runner '{kind}' requires an explicit container image"
+            ))
+        })?
+    } else {
+        agent.runner.image.trim()
+    };
     let workspace = canonical_or_original(&config.system.workspace_dir);
     let mut volumes = vec![VolumeMount {
         source: workspace.display().to_string(),
@@ -420,7 +429,7 @@ fn build_spec(
     }
 
     Ok(ContainerSpec {
-        image: agent.runner.image.clone(),
+        image: image.to_string(),
         memory_limit: Some(4 * 1024 * 1024 * 1024),
         cpu_limit: None,
         environment: vec![
@@ -710,6 +719,23 @@ mod tests {
             command_for(&config, "custom", "do work").unwrap(),
             vec!["runner", "--cwd=/workspace", "do work"]
         );
+    }
+
+    #[test]
+    fn selects_a_minimal_image_for_each_native_runner() {
+        assert_eq!(
+            default_native_runner_image("codex"),
+            Some("xpressclaw-runner-codex:latest")
+        );
+        assert_eq!(
+            default_native_runner_image("claude"),
+            Some("xpressclaw-runner-claude:latest")
+        );
+        assert_eq!(
+            default_native_runner_image("opencode"),
+            Some("xpressclaw-runner-opencode:latest")
+        );
+        assert_eq!(default_native_runner_image("custom"), None);
     }
 
     #[test]

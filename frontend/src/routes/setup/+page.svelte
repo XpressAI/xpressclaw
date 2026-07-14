@@ -23,8 +23,14 @@
 
 	// -- Step 1: Native runner --
 	let llmProvider = $state('codex');
-	let runnerImage = $state('xpressclaw-native-runner:latest');
+	let runnerImage = $state('xpressclaw-runner-codex:latest');
 	let subscriptionAuth = $state(true);
+	const runnerImages: Record<string, string> = {
+		codex: 'xpressclaw-runner-codex:latest',
+		claude: 'xpressclaw-runner-claude:latest',
+		opencode: 'xpressclaw-runner-opencode:latest',
+		custom: ''
+	};
 
 	// -- Step 2: Workspace resources --
 	// Workspace folders to mount into /workspace/{basename}
@@ -64,7 +70,12 @@
 		if (!agentName) agentName = preset.id;
 		customRole = preset.role;
 
-		if (preset.backend.includes('claude')) llmProvider = 'claude';
+		if (preset.backend.includes('claude')) selectRunner('claude');
+	}
+
+	function selectRunner(kind: string) {
+		llmProvider = kind;
+		runnerImage = runnerImages[kind] ?? '';
 	}
 
 
@@ -263,7 +274,7 @@
 
 		<div class="space-y-2 mb-4">
 				<button
-					onclick={() => { llmProvider = 'codex'; }}
+					onclick={() => selectRunner('codex')}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'codex' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">C</div>
@@ -273,7 +284,7 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'claude'; }}
+					onclick={() => selectRunner('claude')}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'claude' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">A</div>
@@ -283,7 +294,7 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'opencode'; }}
+					onclick={() => selectRunner('opencode')}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'opencode' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">O</div>
@@ -293,7 +304,7 @@
 					</div>
 				</button>
 				<button
-					onclick={() => { llmProvider = 'custom'; }}
+					onclick={() => selectRunner('custom')}
 					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'custom' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
 				>
 					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">+</div>
@@ -309,7 +320,7 @@
 				<label for="runner-image" class="block text-xs font-medium text-foreground mb-1">Worker image</label>
 				<input id="runner-image" type="text" bind:value={runnerImage}
 					class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
-				<p class="mt-1 text-xs text-muted-foreground">The image must contain the selected native CLI.</p>
+				<p class="mt-1 text-xs text-muted-foreground">Each built-in image contains only the selected native CLI. Extend it when the runner itself needs additional tools.</p>
 			</div>
 			<label class="flex items-start gap-3 cursor-pointer">
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />

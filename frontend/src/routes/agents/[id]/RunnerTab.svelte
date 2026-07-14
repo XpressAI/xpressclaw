@@ -9,10 +9,19 @@
 
 	let { agentConfig, saveSignal, onSave }: Props = $props();
 	let kind = $state('auto');
-	let image = $state('xpressclaw-native-runner:latest');
+	let image = $state('');
 	let subscriptionAuth = $state(true);
 	let maxTurns = $state(100);
 	let commandText = $state('');
+	const defaultImages: Record<string, string> = {
+		codex: 'xpressclaw-runner-codex:latest',
+		claude: 'xpressclaw-runner-claude:latest',
+		opencode: 'xpressclaw-runner-opencode:latest'
+	};
+
+	function selectDefaultImage() {
+		image = defaultImages[kind] ?? '';
+	}
 
 	$effect(() => {
 		if (agentConfig?.runner) {
@@ -31,7 +40,7 @@
 			onSave({
 				runner: {
 					kind,
-					image: image.trim() || 'xpressclaw-native-runner:latest',
+					image: image.trim() || defaultImages[kind] || '',
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
 					max_turns: Math.max(1, maxTurns || 100)
@@ -51,7 +60,7 @@
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">
 			<div>
 				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">CLI</label>
-				<select id="runner-kind" bind:value={kind} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 					<option value="auto">Auto from profile backend</option>
 					<option value="codex">Codex</option>
 					<option value="claude">Claude Code</option>
@@ -68,7 +77,7 @@
 		<div class="mt-4">
 			<label for="runner-image" class="mb-1 block text-xs font-medium text-muted-foreground">Container image</label>
 			<input id="runner-image" bind:value={image} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
-			<p class="mt-1 text-[11px] text-muted-foreground">Build the included <code>harnesses/native/Dockerfile</code>, or provide an image containing your chosen CLI.</p>
+			<p class="mt-1 text-[11px] text-muted-foreground">Use the matching image below <code>harnesses/native/</code>, extend it, or provide a custom image containing only your chosen CLI.</p>
 		</div>
 	</div>
 
