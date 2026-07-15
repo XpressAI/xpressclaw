@@ -13,9 +13,6 @@ use crate::state::AppState;
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .nest("/api", routes::api_routes())
-        .nest("/v1", routes::llm::routes())
-        .nest("/v1/tools", routes::tools_proxy_routes())
-        .nest("/apps", routes::app_proxy_routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
         .layer(CorsLayer::permissive())
@@ -28,36 +25,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Log frontend embed status (debug diagnostic)
     crate::frontend::log_frontend_status();
 
-    // Extract built-in skills to the data directory
-    if let Some(data_dir) = state.config_path.parent() {
-        crate::skills::extract_skills(data_dir);
-    }
-
-    // Start host-side MCP servers in background.
-    // Skip servers with container-only paths — those only run inside Docker.
     let config = state.config();
-    let host_servers: std::collections::HashMap<String, _> = config
-        .mcp_servers
-        .iter()
-        .filter(|(_, cfg)| {
-            // Skip servers whose command or args reference container paths
-            !cfg.args
-                .iter()
-                .any(|a| a.starts_with("/app/") || a.starts_with("/workspace"))
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    if !host_servers.is_empty() {
-        let mcp_mgr = state.mcp_manager.clone();
-        info!(
-            count = host_servers.len(),
-            servers = ?host_servers.keys().collect::<Vec<_>>(),
-            "starting host MCP tool servers in background"
-        );
-        tokio::spawn(async move {
-            mcp_mgr.start_servers(&host_servers).await;
-        });
-    }
 
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();

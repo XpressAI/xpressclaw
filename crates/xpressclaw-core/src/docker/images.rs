@@ -146,6 +146,7 @@ pub fn build_container_spec_with_mcp(
         expose_port: Some(8080),
         cmd: None,
         working_dir: None,
+        run_as_host_user: false,
     }
 }
 

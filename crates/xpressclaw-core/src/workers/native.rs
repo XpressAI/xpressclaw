@@ -462,6 +462,7 @@ fn build_spec(
         expose_port: None,
         cmd: Some(command),
         working_dir: Some("/workspace".to_string()),
+        run_as_host_user: true,
     })
 }
 

@@ -30,6 +30,10 @@ pub struct ContainerSpec {
     pub cmd: Option<Vec<String>>,
     /// Working directory inside the container.
     pub working_dir: Option<String>,
+    /// Run with the host user's effective filesystem identity. Rootless
+    /// runtimes use container root because it maps back to the invoking user.
+    #[serde(default)]
+    pub run_as_host_user: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +55,7 @@ impl Default for ContainerSpec {
             expose_port: Some(8080),
             cmd: None,
             working_dir: None,
+            run_as_host_user: false,
         }
     }
 }
@@ -74,6 +79,7 @@ pub struct ContainerOutput {
 /// Manages Docker/Podman containers for agent isolation.
 pub struct DockerManager {
     docker: Docker,
+    rootless: bool,
 }
 
 impl DockerManager {
@@ -122,8 +128,14 @@ impl DockerManager {
             .ping()
             .await
             .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed: {e}")))?;
-        info!("connected to container runtime");
-        Ok(Self { docker })
+        let rootless = docker
+            .info()
+            .await
+            .ok()
+            .and_then(|info| info.security_options)
+            .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
+        info!(rootless, "connected to container runtime");
+        Ok(Self { docker, rootless })
     }
 
     #[cfg(target_os = "macos")]
@@ -134,11 +146,17 @@ impl DockerManager {
             .ping()
             .await
             .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed on {path}: {e}")))?;
+        let rootless = docker
+            .info()
+            .await
+            .ok()
+            .and_then(|info| info.security_options)
+            .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
         info!(
             socket = path,
-            "connected to container runtime via custom socket"
+            rootless, "connected to container runtime via custom socket"
         );
-        Ok(Self { docker })
+        Ok(Self { docker, rootless })
     }
 
     /// Check if Docker Desktop is installed (macOS/Windows).
@@ -266,6 +284,7 @@ impl DockerManager {
 
         let config = ContainerConfig {
             image: Some(spec.image.clone()),
+            user: container_user(spec.run_as_host_user, self.rootless),
             env: Some(env),
             host_config: Some(host_config),
             exposed_ports: if exposed_ports.is_empty() {
@@ -625,6 +644,26 @@ impl DockerManager {
     }
 }
 
+fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
+    if !run_as_host_user {
+        return None;
+    }
+    if rootless {
+        return Some("0:0".to_string());
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid/getgid have no preconditions and only read process
+        // credentials.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        Some(format!("{uid}:{gid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,5 +686,12 @@ mod tests {
         let spec = ContainerSpec::default();
         assert_eq!(spec.expose_port, Some(8080));
         assert!(spec.image.contains("claude-sdk"));
+        assert!(!spec.run_as_host_user);
+    }
+
+    #[test]
+    fn rootless_native_workers_use_container_root_mapping() {
+        assert_eq!(container_user(true, true).as_deref(), Some("0:0"));
+        assert_eq!(container_user(false, true), None);
     }
 }

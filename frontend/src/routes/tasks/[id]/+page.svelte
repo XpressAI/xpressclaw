@@ -516,17 +516,11 @@
 					</div>
 				{/if}
 
-				<!-- Conversation link -->
-				{#if task.context}
-					{@const ctx = typeof task.context === 'string' ? (() => { try { return JSON.parse(task.context); } catch { return null; } })() : task.context}
-					{#if ctx?.conversation_id}
-						<div class="space-y-2">
-							<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Linked Conversation</h3>
-							<a href="/conversations/{ctx.conversation_id}" class="text-sm underline hover:text-foreground">
-								Open conversation
-							</a>
-						</div>
-					{/if}
+				{#if task.agent_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Session</h3>
+						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open session timeline</a>
+					</div>
 				{/if}
 			</div>
 		</div>

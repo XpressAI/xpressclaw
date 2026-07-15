@@ -358,15 +358,75 @@ impl AgentConfig {
     /// No-op if `llm.model` is already set or if there's no legacy `model`.
     /// Called after loading config from YAML so the rest of the code only
     /// has to look at `llm.model`.
-    pub fn migrate_legacy_model(&mut self) {
+    pub fn migrate_legacy_model(&mut self) -> bool {
         let Some(legacy) = self.model.take() else {
-            return;
+            return false;
         };
         let llm = self.llm.get_or_insert_with(AgentLlmConfig::default);
         if llm.model.is_none() {
             llm.model = Some(legacy);
         }
         // self.model is now None — won't be re-serialized.
+        true
+    }
+
+    /// Replace the retired all-in-one native runner with the image for the
+    /// configured product. Exact matches only so custom images are untouched.
+    pub fn migrate_legacy_runner_image(&mut self) -> bool {
+        if !matches!(
+            self.runner.image.as_str(),
+            "xpressclaw-native-runner:latest" | "ghcr.io/xpressai/xpressclaw-native-runner:latest"
+        ) {
+            return false;
+        }
+
+        let configured_kind = self.runner.kind.trim().to_lowercase();
+        let kind = if configured_kind.is_empty() || configured_kind == "auto" {
+            let backend = self.backend.to_lowercase();
+            if backend.contains("codex") {
+                "codex"
+            } else if backend.contains("claude") {
+                "claude"
+            } else if backend.contains("opencode") {
+                "opencode"
+            } else {
+                return false;
+            }
+        } else {
+            configured_kind.as_str()
+        };
+
+        if let Some(image) = default_native_runner_image(kind) {
+            self.runner.kind = kind.to_string();
+            self.runner.image = image.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove the exact tool/skill bundle injected by the old profile wizard.
+    /// Custom profiles are left alone; this marker requires the complete
+    /// retired developer bundle.
+    pub fn migrate_legacy_agent_layer(&mut self) -> bool {
+        let legacy_tools = ["filesystem", "shell", "memory"];
+        let legacy_skills = ["memory-system", "task-management", "build-app"];
+        let is_injected_profile = legacy_tools
+            .iter()
+            .all(|tool| self.tools.iter().any(|configured| configured == tool))
+            && legacy_skills
+                .iter()
+                .all(|skill| self.skills.iter().any(|configured| configured == skill));
+        if !is_injected_profile {
+            return false;
+        }
+
+        self.role.clear();
+        self.role_title = None;
+        self.responsibilities = None;
+        self.tools.clear();
+        self.skills.clear();
+        true
     }
 
     /// Build the full system prompt by prepending profile fields
@@ -544,11 +604,14 @@ impl Config {
 
         match serde_yaml::from_str::<Config>(&contents) {
             Ok(mut config) => {
-                config.migrate_legacy_fields();
+                let migrated = config.migrate_legacy_fields();
                 config.validate()?;
                 // Save a backup of the known-good config
                 let backup = path.with_extension("yaml.bak");
                 let _ = std::fs::copy(path, backup);
+                if migrated {
+                    config.save(path)?;
+                }
                 Ok(config)
             }
             Err(e) => {
@@ -562,10 +625,14 @@ impl Config {
                     let backup_contents = std::fs::read_to_string(&backup)
                         .map_err(|e2| Error::Config(format!("failed to read backup: {e2}")))?;
                     let mut config: Config = serde_yaml::from_str(&backup_contents)?;
-                    config.migrate_legacy_fields();
+                    let migrated = config.migrate_legacy_fields();
                     config.validate()?;
-                    // Restore the good config
-                    let _ = std::fs::copy(&backup, path);
+                    if migrated {
+                        config.save(path)?;
+                    } else {
+                        // Restore the good config
+                        let _ = std::fs::copy(&backup, path);
+                    }
                     Ok(config)
                 } else {
                     Err(Error::Config(format!("failed to parse config: {e}")))
@@ -575,10 +642,20 @@ impl Config {
     }
 
     /// Migrate legacy fields after loading. Safe to call repeatedly.
-    pub fn migrate_legacy_fields(&mut self) {
+    pub fn migrate_legacy_fields(&mut self) -> bool {
+        let mut migrated = false;
+        let mut removed_agent_layer = false;
         for agent in &mut self.agents {
-            agent.migrate_legacy_model();
+            migrated |= agent.migrate_legacy_model();
+            migrated |= agent.migrate_legacy_runner_image();
+            removed_agent_layer |= agent.migrate_legacy_agent_layer();
         }
+        if removed_agent_layer {
+            for name in ["xpressclaw", "shell", "filesystem"] {
+                migrated |= self.mcp_servers.remove(name).is_some();
+            }
+        }
+        migrated || removed_agent_layer
     }
 
     /// Load config from the default location (./xpressclaw.yaml).
@@ -691,21 +768,9 @@ system:
   isolation: docker
   workspace_dir: .
 
-# Each profile is a durable logical session. Its native CLI is launched in a
-# short-lived container for each queued message, task, or workflow step.
-agents:
-  - name: atlas
-    display_name: Atlas
-    backend: codex
-    runner:
-      kind: codex
-      image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
-      workspace: .
-      subscription_auth: true
-      max_turns: 100
-    role: |
-      Work autonomously in the configured project. Report outcomes, changed
-      files, verification, and blockers clearly.
+# Sessions are created in the web UI. Each one selects its own native runner
+# image and project workspace.
+agents: []
 "#;
 
 #[cfg(test)]
@@ -936,11 +1001,84 @@ agents:
     }
 
     #[test]
-    fn default_template_creates_a_native_session() {
+    fn default_template_defers_session_creation_to_the_ui() {
         let config: Config = serde_yaml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
-        assert_eq!(config.agents.len(), 1);
+        assert!(config.agents.is_empty());
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn retired_shared_runner_image_migrates_to_the_selected_product() {
+        let yaml = r#"
+agents:
+  - name: developer
+    backend: codex
+    runner:
+      kind: codex
+      image: xpressclaw-native-runner:latest
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.migrate_legacy_fields();
         assert_eq!(config.agents[0].runner.kind, "codex");
-        assert_eq!(config.agents[0].runner.workspace.as_deref(), Some("."));
+        assert_eq!(
+            config.agents[0].runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+        );
+    }
+
+    #[test]
+    fn loading_persists_the_product_runner_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("xpressclaw.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - name: reviewer
+    backend: claude
+    runner:
+      kind: auto
+      image: xpressclaw-native-runner:latest
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agents[0].runner.kind, "claude");
+        assert_eq!(
+            loaded.agents[0].runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+        );
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("xpressclaw-runner-claude:latest"));
+        assert!(!saved.contains("xpressclaw-native-runner:latest"));
+    }
+
+    #[test]
+    fn injected_agent_layer_bundle_is_removed_during_migration() {
+        let yaml = r#"
+agents:
+  - name: developer
+    role: Always search memory before starting.
+    tools: [filesystem, shell, memory]
+    skills: [memory-system, task-management, build-app]
+mcp_servers:
+  xpressclaw:
+    type: stdio
+    command: python3
+  shell:
+    type: stdio
+    command: npx
+  filesystem:
+    type: stdio
+    command: npx
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.migrate_legacy_fields());
+        let session = &config.agents[0];
+        assert!(session.role.is_empty());
+        assert!(session.tools.is_empty());
+        assert!(session.skills.is_empty());
         assert!(config.mcp_servers.is_empty());
     }
 

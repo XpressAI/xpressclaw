@@ -7733,6 +7733,7 @@ dependencies = [
  "croner",
  "futures-util",
  "lettre",
+ "libc",
  "notify",
  "ready-agent-cog",
  "reqwest 0.12.28",

@@ -1,137 +1,40 @@
-# Scheduling Tasks
+# Scheduling Work
 
-xpressclaw supports cron-style scheduling for recurring tasks. Agents automatically pick up scheduled tasks when they trigger.
+Schedules create ordinary queued work at the configured time. They do not run
+a second agent loop: the selected session launches its native product worker
+and records the result in the same timeline as human messages and tasks.
 
-## Quick Start
+## Create a schedule
 
-```bash
-# Schedule a task to run every day at 9am
-xpressclaw tasks create --agent atlas --description "Check for updates"
+1. Open **Work → Schedules**.
+2. Choose the destination session.
+3. Enter the instruction to send.
+4. Set a cron expression and timezone.
+5. Save and enable the schedule.
 
-# Use cron for recurring tasks
-xpressclaw tasks schedule "Check for updates" --agent atlas --cron "0 9 * * *"
+The session must be runner-ready before scheduled attempts can execute. If it
+is not, the queued attempt remains visible with its readiness error.
 
-# List schedules
-xpressclaw tasks list --agent atlas
+## Common cron expressions
 
-# Remove a schedule (via xpressclaw tasks complete or edit)
-```
+| Expression | Runs |
+|---|---|
+| `0 9 * * *` | Every day at 09:00 |
+| `0 9 * * 1-5` | Weekdays at 09:00 |
+| `0 10 * * 1` | Mondays at 10:00 |
+| `0 */6 * * *` | Every six hours |
+| `0 17 * * 5` | Fridays at 17:00 |
 
-## Cron Syntax
+## Choosing tasks versus workflows
 
-xpressclaw uses standard 5-field cron syntax:
+Use a schedule with a single session for recurring work such as SEO analysis,
+dependency checks, or weekly metrics review. Schedule a workflow when the job
+needs multiple products—for example, Codex implementing changes and Claude
+Code reviewing until approval.
 
-```
-┌───────────── minute (0-59)
-│ ┌───────────── hour (0-23)
-│ │ ┌───────────── day of month (1-31)
-│ │ │ ┌───────────── month (1-12)
-│ │ │ │ ┌───────────── day of week (0-6, 0=Sunday)
-│ │ │ │ │
-* * * * *
-```
+## Operational behavior
 
-### Common Patterns
-
-| Pattern | Description |
-|---------|-------------|
-| `0 9 * * *` | Every day at 9:00 AM |
-| `0 9 * * 1-5` | Weekdays at 9:00 AM |
-| `0 */2 * * *` | Every 2 hours |
-| `30 8 * * 1` | Every Monday at 8:30 AM |
-| `0 0 1 * *` | First day of every month at midnight |
-| `0 17 * * 5` | Every Friday at 5:00 PM |
-| `*/15 * * * *` | Every 15 minutes |
-| `0 9,12,17 * * *` | At 9am, 12pm, and 5pm daily |
-
-### Special Characters
-
-| Character | Meaning | Example |
-|-----------|---------|---------|
-| `*` | Any value | `* * * * *` (every minute) |
-| `,` | List | `0 9,17 * * *` (9am and 5pm) |
-| `-` | Range | `0 9 * * 1-5` (Mon-Fri) |
-| `/` | Step | `*/15 * * * *` (every 15 min) |
-
-## Template Variables
-
-Use placeholders in task descriptions that get replaced when the task is created:
-
-| Variable | Description | Example Output |
-|----------|-------------|----------------|
-| `{date}` | Current date | `2025-01-15` |
-| `{time}` | Current time | `09:00` |
-
-**Example:**
-
-```bash
-xpressclaw tasks schedule "Daily report for {date}" --agent atlas --cron "0 17 * * *"
-```
-
-Creates tasks like:
-- "Daily report for 2025-01-15"
-- "Daily report for 2025-01-16"
-
-## Named Schedules
-
-Give schedules memorable names:
-
-```bash
-xpressclaw tasks schedule "Summarize HN" --agent atlas --cron "0 9 * * *" --name daily-hn
-```
-
-## How Scheduling Works
-
-1. **Run xpressclaw** - Schedules trigger while xpressclaw is running
-2. **Persistence** - Schedules are saved and survive restarts
-3. **Task creation** - When a schedule triggers, it creates a task
-4. **Agent execution** - The agent picks up the task like any other
-5. **Budget applies** - Scheduled tasks count against your budget
-
-## Examples
-
-### Daily Code Review
-
-```bash
-xpressclaw tasks schedule "Review open PRs" --agent coder --cron "0 10 * * 1-5"
-```
-
-### Weekly Summary
-
-```bash
-xpressclaw tasks schedule "Create weekly report for {date}" --agent atlas --cron "0 17 * * 5"
-```
-
-### Hourly Monitoring
-
-```bash
-xpressclaw tasks schedule "Check system health" --agent monitor --cron "0 * * * *"
-```
-
-### Monthly Cleanup
-
-```bash
-xpressclaw tasks schedule "Archive old logs" --agent atlas --cron "0 2 1 * *"
-```
-
-## Timezone
-
-Schedules use the system timezone. To check:
-
-```bash
-date +%Z
-```
-
-## Troubleshooting
-
-### Schedule not triggering
-
-1. Make sure xpressclaw is running:
-   ```bash
-   xpressclaw status
-   ```
-
-2. Check the task exists:
-   ```bash
-   xpressclaw tasks list --agent atlas
-   ```
+- Schedules survive control-plane restarts.
+- Every run records schedule provenance in the session timeline.
+- Missed or failed work remains inspectable instead of disappearing into a log.
+- Disabling a schedule prevents future dispatches without deleting history.

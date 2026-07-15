@@ -117,51 +117,33 @@ See [Building](#building) below.
 Open a persistent session and describe the outcome. The request becomes a task and native work attempt while the UI remains available.
 
 **Schedule recurring tasks:**
-```bash
-xpressclaw tasks create "Summarize top 10 HN stories" --agent atlas
-```
+
+Create a task in **Work → Tasks**, select its session, then add a cron schedule
+in **Work → Schedules**. Scheduled work enters the same queue and timeline as a
+message sent by a person.
 
 **Review what happened while you were away:**
-```bash
-xpressclaw logs
-xpressclaw status
-xpressclaw budget
-```
 
-**Define SOPs for consistent behavior:**
-```yaml
-name: weekly-report
-steps:
-  - Check JIRA for completed tickets this week
-  - Summarize key accomplishments
-  - Identify blockers and risks
-  - Draft report and send to team channel
-```
+Open the session timeline for attempt status, results, artifacts, provenance,
+and errors. `xpressclaw status` remains available as a small health check for
+the local control plane.
 
-**Interactive CLI chat:**
-```bash
-xpressclaw chat atlas
-```
+**Coordinate multiple products:**
+
+Use **Workflows** for implementation/review loops and other work that moves
+between sessions. The CLI deliberately does not duplicate these product
+surfaces.
 
 ## Configuration
 
-`xpressclaw init` creates a `xpressclaw.yaml` in your project:
+`xpressclaw init` creates a minimal `xpressclaw.yaml`. Sessions are added in the
+web UI, which records the selected product image and workspace:
 
 ```yaml
 system:
   isolation: docker
 
-agents:
-  - name: atlas
-    backend: codex
-    runner:
-      kind: codex
-      image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
-      workspace: /home/me/projects/my-app
-      subscription_auth: true
-      max_turns: 100
-    role: |
-      You own implementation work in this repository.
+agents: []
 
 ```
 
@@ -262,7 +244,7 @@ xpressclaw is a Cargo workspace with four crates:
 |-------|---------|
 | `xpressclaw-core` | Business logic: sessions, attempts, events, artifacts, tasks, workflows, SQLite, and worker isolation |
 | `xpressclaw-server` | Axum REST API, SSE streaming, embedded SvelteKit frontend (rust-embed) |
-| `xpressclaw-cli` | Local control commands for setup, sessions, tasks, workflows, and compatibility features |
+| `xpressclaw-cli` | Local control-plane lifecycle and health commands |
 | `xpressclaw-tauri` | Native desktop app with system tray (Tauri v2) |
 
 ```
@@ -283,16 +265,16 @@ xpressclaw (single ~12MB binary)
 ## CLI Reference
 
 ```
-xpressclaw init              Initialize workspace with config + data dir
+xpressclaw init              Create an empty workspace configuration
 xpressclaw up [--detach]     Start the control plane and worker dispatcher
 xpressclaw down              Stop the control plane and active workers
 xpressclaw status            Show logical session status
-xpressclaw chat <session>    Send messages through a logical session
-xpressclaw tasks             Task management (list, create, update, delete)
-xpressclaw logs              Activity log viewer
 ```
 
 Default port: `8935` (override with `--port`).
+
+Messages, tasks, schedules, workflows, results, and configuration live in the
+web UI rather than a second CLI interface.
 
 ## From Open Source to Enterprise
 
