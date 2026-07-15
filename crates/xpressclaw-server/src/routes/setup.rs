@@ -8,11 +8,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
-    default_native_runner_image, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
-    NativeRunnerConfig,
+    context_label, default_native_runner_image, unique_session_id, AgentConfig, Config, LlmConfig,
+    McpServerConfig, NativeRunnerConfig,
 };
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -31,11 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/check-ollama", get(check_ollama))
         .route("/recommend-model", get(recommend_model))
         .route("/validate-key", post(validate_key))
-        .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
         .route("/add-session", post(add_session))
-        // Compatibility alias for clients from before the native-session UI.
-        .route("/add-agent", post(add_session))
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
@@ -75,16 +71,10 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
         "agents": config.agents.iter().map(|a| {
             let mut agent = json!({
                 "name": a.name,
+                "title": a.context_label(),
                 "backend": a.backend,
-                "display_name": a.display_name,
-                "role_title": a.role_title,
-                "responsibilities": a.responsibilities,
-                "avatar": a.avatar,
-                "role": a.role,
                 "model": a.effective_model(),
-                // Full llm block (including api_key) — needed by the agent
-                // profile editor. /api/setup/config is a local-only endpoint
-                // that already exposed the api_key under the previous shape.
+                // Full llm block is retained only for legacy configurations.
                 "llm": a.llm.as_ref().map(|l| json!({
                     "provider": l.provider,
                     "model": l.model,
@@ -287,14 +277,8 @@ async fn fetch_provider_models(
     }
 }
 
-/// Return available agent presets.
-async fn get_presets() -> Json<Value> {
-    Json(json!(builtin_presets()))
-}
-
 #[derive(Deserialize)]
 struct CompleteSetupRequest {
-    llm: LlmSetup,
     #[serde(default)]
     agents: Vec<AgentSetup>,
     #[serde(default)]
@@ -309,43 +293,37 @@ fn default_isolation() -> String {
 }
 
 #[derive(Deserialize)]
-struct LlmSetup {
-    provider: String,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    /// Legacy Ollama-tag-style model name (e.g. "qwen3.5:4b") used when
-    /// importing a pre-native-runner setup request.
-    local_model: Option<String>,
-    /// Base URL for the Ollama instance when `provider == "ollama"`.
-    /// Defaults to http://localhost:11434.
-    local_base_url: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct AgentSetup {
-    name: String,
-    preset: Option<String>,
-    role: Option<String>,
-    role_title: Option<String>,
-    responsibilities: Option<String>,
     backend: Option<String>,
     runner_kind: Option<String>,
     runner_image: Option<String>,
     runner_workspace: Option<String>,
     subscription_auth: Option<bool>,
-    model: Option<String>,
-    tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
-    /// Legacy connector overrides accepted by the compatibility endpoint.
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
 
-fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
-    let kind = setup
+fn runner_kind_from_setup(setup: &AgentSetup) -> String {
+    let configured = setup
         .runner_kind
-        .clone()
-        .unwrap_or_else(|| "auto".to_string());
+        .as_deref()
+        .or(setup.backend.as_deref())
+        .unwrap_or("codex")
+        .to_lowercase();
+    if configured.contains("claude") {
+        "claude".to_string()
+    } else if configured.contains("opencode") {
+        "opencode".to_string()
+    } else if configured.contains("codex") || configured == "auto" {
+        "codex".to_string()
+    } else {
+        configured
+    }
+}
+
+fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
+    let kind = runner_kind_from_setup(setup);
     let image = setup
         .runner_image
         .as_deref()
@@ -379,109 +357,29 @@ async fn complete_setup(
             Json(json!({ "error": "native workers require Docker or Podman isolation" })),
         ));
     }
-    // Global LLM config no longer holds provider/model/key — those moved
-    // onto each agent. Only `custom_pricing` lives here.
+    // Native products own model selection, credentials, instructions, and
+    // subagents. The control plane stores only session runtime context.
     let llm = LlmConfig::default();
 
-    // Agents
-    let presets = builtin_presets();
-    let agents = if req.agents.is_empty() {
-        vec![AgentConfig {
-            name: "atlas".to_string(),
-            backend: "codex".to_string(),
-            runner: NativeRunnerConfig {
-                kind: "codex".to_string(),
+    let mut used_ids: Vec<String> = Vec::new();
+    let agents = req
+        .agents
+        .iter()
+        .map(|session| {
+            let runner = runner_from_setup(session);
+            let context = context_label(runner.workspace.as_deref(), &runner.kind);
+            let id_refs: Vec<&str> = used_ids.iter().map(String::as_str).collect();
+            let session_id = unique_session_id(&context, &runner.kind, &id_refs);
+            used_ids.push(session_id.clone());
+            AgentConfig {
+                name: session_id,
+                backend: runner.kind.clone(),
+                runner,
+                volumes: session.volumes.clone().unwrap_or_default(),
                 ..Default::default()
-            },
-            role: "You are a helpful AI assistant.".to_string(),
-            ..Default::default()
-        }]
-    } else {
-        let mut used_ids: Vec<String> = Vec::new();
-        req.agents
-            .iter()
-            .map(|a| {
-                let preset = a
-                    .preset
-                    .as_deref()
-                    .and_then(|id| presets.iter().find(|p| p.id == id));
-
-                let tools = a
-                    .tools
-                    .clone()
-                    .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
-                    .unwrap_or_default();
-
-                // Per-agent LLM config built from the wizard's selections.
-                // Each agent gets its own provider/model/key/base_url so it
-                // can later be edited independently.
-                let agent_llm = {
-                    let provider = req.llm.provider.clone();
-                    if provider.is_empty() {
-                        None
-                    } else {
-                        // Per-agent model: prefer the agent's own model from
-                        // the wizard, fall back to the wizard's local_model
-                        // (set when provider is local/ollama), then default.
-                        let model = a
-                            .model
-                            .clone()
-                            .or_else(|| req.llm.local_model.clone())
-                            .or_else(|| {
-                                if provider == "ollama" || provider == "local" {
-                                    Some("qwen3.5:latest".into())
-                                } else {
-                                    None
-                                }
-                            });
-                        let base_url = req.llm.base_url.clone().or_else(|| {
-                            req.llm.local_base_url.clone().or_else(|| {
-                                if provider == "ollama" {
-                                    Some("http://localhost:11434".to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                        Some(AgentLlmConfig {
-                            provider: Some(provider),
-                            model,
-                            api_key: req.llm.api_key.clone(),
-                            base_url,
-                        })
-                    }
-                };
-
-                // Slugify the name for use as an ID, keep original as display_name
-                let id_refs: Vec<&str> = used_ids.iter().map(|s| s.as_str()).collect();
-                let agent_id = xpressclaw_core::config::unique_agent_id(&a.name, &id_refs);
-                used_ids.push(agent_id.clone());
-
-                AgentConfig {
-                    name: agent_id,
-                    display_name: Some(a.name.clone()),
-                    role_title: a.role_title.clone(),
-                    responsibilities: a.responsibilities.clone(),
-                    backend: a
-                        .runner_kind
-                        .clone()
-                        .or(a.backend.clone().or(preset.map(|p| p.backend.to_string())))
-                        .unwrap_or("codex".to_string()),
-                    role: a
-                        .role
-                        .clone()
-                        .or(preset.map(|p| p.role.to_string()))
-                        .unwrap_or_default(),
-                    llm: agent_llm,
-                    runner: runner_from_setup(a),
-                    tools,
-                    skills: Vec::new(),
-                    volumes: a.volumes.clone().unwrap_or_default(),
-                    ..Default::default()
-                }
-            })
-            .collect()
-    };
+            }
+        })
+        .collect();
 
     let mut config = Config {
         llm,
@@ -517,11 +415,8 @@ async fn complete_setup(
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => {
-                let title = agent_config
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(&agent_config.name);
-                if let Err(error) = sessions.ensure(&record.id, Some(title)) {
+                let title = agent_config.context_label();
+                if let Err(error) = sessions.ensure(&record.id, Some(&title)) {
                     warn!(name = record.name, error = %error, "failed to sync session");
                 } else {
                     info!(
@@ -552,49 +447,16 @@ async fn add_session(
     State(state): State<AppState>,
     Json(req): Json<AgentSetup>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let presets = builtin_presets();
-    let preset = req
-        .preset
-        .as_deref()
-        .and_then(|id| presets.iter().find(|p| p.id == id));
-
-    let tools = req
-        .tools
-        .clone()
-        .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
-        .unwrap_or_default();
-
-    // Native products own model selection and authentication. Keep the old
-    // per-agent LLM block empty for newly-created sessions.
-    let agent_llm = None;
-
-    // Slugify the name and ensure uniqueness
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
-    let agent_id = xpressclaw_core::config::unique_agent_id(&req.name, &existing_ids);
+    let runner = runner_from_setup(&req);
+    let title = context_label(runner.workspace.as_deref(), &runner.kind);
+    let session_id = unique_session_id(&title, &runner.kind, &existing_ids);
 
     let agent_config = AgentConfig {
-        name: agent_id.clone(),
-        display_name: Some(req.name.clone()),
-        role_title: req.role_title.clone(),
-        responsibilities: req.responsibilities.clone(),
-        backend: req
-            .runner_kind
-            .clone()
-            .or(req
-                .backend
-                .clone()
-                .or(preset.map(|p| p.backend.to_string())))
-            .unwrap_or("codex".to_string()),
-        role: req
-            .role
-            .clone()
-            .or(preset.map(|p| p.role.to_string()))
-            .unwrap_or_default(),
-        llm: agent_llm,
-        runner: runner_from_setup(&req),
-        tools,
-        skills: Vec::new(),
+        name: session_id,
+        backend: runner.kind.clone(),
+        runner,
         volumes: req.volumes.clone().unwrap_or_default(),
         ..Default::default()
     };
@@ -603,12 +465,7 @@ async fn add_session(
     let old_config = state.config();
     let mut new_agents = old_config.agents.clone();
 
-    // Replace if agent with same name exists, otherwise append
-    if let Some(idx) = new_agents.iter().position(|a| a.name == agent_config.name) {
-        new_agents[idx] = agent_config.clone();
-    } else {
-        new_agents.push(agent_config.clone());
-    }
+    new_agents.push(agent_config.clone());
 
     // Preserve existing explicit connectors and merge only new explicit
     // overrides. Native CLIs do not consume the old built-in agent MCP layer.
@@ -632,14 +489,14 @@ async fn add_session(
         "added native session to configuration"
     );
 
-    // Register the durable profile/session. Native workers are started per
+    // Register the durable session. Native workers are started per
     // attempt, so there is no long-running agent to auto-start.
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry
         .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
     xpressclaw_core::sessions::SessionManager::new(state.db.clone())
-        .ensure(&record.id, agent_config.display_name.as_deref())
+        .ensure(&record.id, Some(&title))
         .map_err(internal_error)?;
 
     // Rebuild the router so the new agent has a binding. The previous
@@ -653,8 +510,7 @@ async fn add_session(
         "success": true,
         "session": agent_config.name,
         "session_id": record.id,
-        // Retained for older clients using /add-agent.
-        "agent": agent_config.name,
+        "title": title,
     })))
 }
 
@@ -846,9 +702,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "name": "Website maintainer",
                             "runner_kind": "codex",
-                            "runner_workspace": "/tmp"
+                            "runner_workspace": "/tmp/website"
                         })
                         .to_string(),
                     ))
@@ -859,12 +714,16 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response.into_body()).await;
-        assert_eq!(body["session"], "website-maintainer");
+        assert_eq!(body["session"], "website-codex");
+        assert_eq!(body["title"], "website");
         assert!(body["session_id"].as_str().is_some_and(|id| !id.is_empty()));
 
         let saved = Config::load(&config_path).unwrap();
         assert_eq!(saved.agents.len(), 1);
-        assert_eq!(saved.agents[0].runner.workspace.as_deref(), Some("/tmp"));
+        assert_eq!(
+            saved.agents[0].runner.workspace.as_deref(),
+            Some("/tmp/website")
+        );
         let _ = std::fs::remove_file(&config_path);
     }
 
@@ -929,26 +788,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_presets() {
-        let app = test_app();
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/setup/presets")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp.into_body()).await;
-        let presets = body.as_array().unwrap();
-        assert!(presets.len() >= 3);
-    }
-
-    #[tokio::test]
     async fn test_complete_setup() {
         let app = test_app();
 
@@ -960,14 +799,10 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "llm": {
-                                "provider": "local",
-                                "local_model": "qwen3.5:8b"
-                            },
                             "agents": [
                                 {
-                                    "name": "atlas",
-                                    "preset": "assistant"
+                                    "runner_kind": "codex",
+                                    "runner_workspace": "/tmp/website"
                                 }
                             ]
                         })
@@ -986,16 +821,9 @@ mod tests {
         let config_path = test_config_path();
         assert!(config_path.exists());
         let config = Config::load(&config_path).unwrap();
-        assert_eq!(config.agents[0].name, "atlas");
-        // The wizard's `provider: local` should land on each agent's
-        // per-agent llm config, not on a global field.
-        assert_eq!(
-            config.agents[0]
-                .llm
-                .as_ref()
-                .and_then(|l| l.provider.as_deref()),
-            Some("local")
-        );
+        assert_eq!(config.agents[0].name, "website-codex");
+        assert_eq!(config.agents[0].context_label(), "website");
+        assert!(config.agents[0].llm.is_none());
 
         // Native products own their agent/tool loop; setup must not inject
         // the retired xpressclaw agent-layer skills or MCP servers.
@@ -1006,9 +834,7 @@ mod tests {
         let _ = std::fs::remove_file(config_path);
     }
 
-    /// Verify the wizard writes a valid YAML config that round-trips through
-    /// Config::load and that native setup does not revive preset agent-layer
-    /// MCP servers when adding another session.
+    /// Verify native session configuration round-trips without profiles.
     #[tokio::test]
     async fn test_wizard_writes_valid_config_with_mcp_servers() {
         // Use a unique temp path to avoid collisions with other tests.
@@ -1022,7 +848,7 @@ mod tests {
             .nest("/setup", routes())
             .with_state(state.clone());
 
-        // ── Step 1: full setup with researcher preset ──
+        // ── Step 1: full setup for one project context ──
         let resp = app
             .clone()
             .oneshot(
@@ -1032,15 +858,10 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "llm": {
-                                "provider": "openai",
-                                "api_key": "sk-test"
-                            },
                             "agents": [
                                 {
-                                    "name": "researcher",
-                                    "preset": "researcher",
-                                    "tools": ["filesystem", "shell", "memory", "websearch"]
+                                    "runner_kind": "codex",
+                                    "runner_workspace": "/tmp/research"
                                 }
                             ]
                         })
@@ -1056,18 +877,15 @@ mod tests {
         // Load and validate the written config
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 1);
-        assert_eq!(config.agents[0].name, "researcher");
-        assert!(
-            config.agents[0].tools.contains(&"websearch".to_string()),
-            "agent should have websearch tool"
-        );
+        assert_eq!(config.agents[0].name, "research-codex");
+        assert!(config.agents[0].tools.is_empty());
         assert!(config.mcp_servers.is_empty());
 
         // Verify the YAML round-trips: save it again, reload, still valid
         let roundtrip_path = std::env::temp_dir().join("test-xpressclaw-wizard-roundtrip.yaml");
         config.save(&roundtrip_path).unwrap();
         let reloaded = Config::load(&roundtrip_path).unwrap();
-        assert_eq!(reloaded.agents[0].name, "researcher");
+        assert_eq!(reloaded.agents[0].name, "research-codex");
         assert!(reloaded.mcp_servers.is_empty());
         let _ = std::fs::remove_file(&roundtrip_path);
 
@@ -1081,9 +899,8 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "name": "developer",
-                            "preset": "developer",
-                            "tools": ["filesystem", "shell", "git", "memory"]
+                            "runner_kind": "claude",
+                            "runner_workspace": "/tmp/developer"
                         })
                         .to_string(),
                     ))
@@ -1098,8 +915,8 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
         let agent_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
-        assert!(agent_names.contains(&"researcher"));
-        assert!(agent_names.contains(&"developer"));
+        assert!(agent_names.contains(&"research-codex"));
+        assert!(agent_names.contains(&"developer-claude"));
 
         assert!(config.mcp_servers.is_empty());
 
@@ -1109,7 +926,7 @@ mod tests {
 
     /// Explicit connector configuration is still preserved.
     #[tokio::test]
-    async fn test_frontend_mcp_servers_override_preset_defaults() {
+    async fn test_explicit_mcp_servers_are_preserved() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-override.yaml");
         let _ = std::fs::remove_file(&config_path);
 
@@ -1118,7 +935,6 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
-        // Frontend sends custom websearch config that should override preset default
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1127,11 +943,9 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "llm": { "provider": "local" },
                             "agents": [{
-                                "name": "researcher",
-                                "preset": "researcher",
-                                "tools": ["filesystem", "shell", "memory", "websearch"]
+                                "runner_kind": "opencode",
+                                "runner_workspace": "/tmp/research"
                             }],
                             "mcp_servers": {
                                 "websearch": {
@@ -1165,9 +979,8 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// The legacy add-agent alias should not inject preset MCP servers.
     #[tokio::test]
-    async fn test_add_agent_frontend_mcp_overrides() {
+    async fn duplicate_project_contexts_get_unique_session_ids() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");
         let _ = std::fs::remove_file(&config_path);
 
@@ -1176,7 +989,6 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
-        // Initial setup with assistant (no extra MCP servers)
         let resp = app
             .clone()
             .oneshot(
@@ -1186,8 +998,10 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "llm": { "provider": "local" },
-                            "agents": [{ "name": "assistant", "preset": "assistant" }]
+                            "agents": [{
+                                "runner_kind": "codex",
+                                "runner_workspace": "/tmp/website"
+                            }]
                         })
                         .to_string(),
                     ))
@@ -1197,19 +1011,16 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Add researcher without explicit connectors.
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/setup/add-agent")
+                    .uri("/setup/add-session")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "name": "researcher",
-                            "preset": "researcher",
-                            "tools": ["filesystem", "shell", "memory", "websearch"],
-                            "mcp_servers": {}
+                            "runner_kind": "codex",
+                            "runner_workspace": "/tmp/website"
                         })
                         .to_string(),
                     ))
@@ -1221,8 +1032,8 @@ mod tests {
 
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
-
-        assert!(config.mcp_servers.is_empty());
+        assert_eq!(config.agents[0].name, "website-codex");
+        assert_eq!(config.agents[1].name, "website-codex-2");
 
         let _ = std::fs::remove_file(&config_path);
     }

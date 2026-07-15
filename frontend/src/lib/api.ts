@@ -214,17 +214,13 @@ export const conversations = {
 export interface Agent {
 	id: string;
 	name: string;
+	title: string;
 	backend: string;
 	status: string;
 	desired_status: string;
 	observed_status: string;
 	container_id: string | null;
 	config?: {
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role?: string;
 		model?: string | null;
 		runner?: NativeRunnerConfig;
 		tools?: string[];
@@ -246,11 +242,6 @@ export const agents = {
 	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST', body: '{}' }),
 	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' }),
 	updateConfig: (id: string, data: {
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role?: string;
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
 		runner?: NativeRunnerConfig;
@@ -690,18 +681,6 @@ export interface ModelRecommendation {
 	all_options: ModelOption[];
 }
 
-export interface AgentPreset {
-	id: string;
-	name: string;
-	description: string;
-	icon: string;
-	role: string;
-	backend: string;
-	default_tools: string[];
-	default_mcp_servers: Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>;
-	recommended_llm: string;
-}
-
 /// Per-agent provider summary (no api_key — it's masked).
 export interface AgentProviderEntry {
 	agent: string;
@@ -711,7 +690,7 @@ export interface AgentProviderEntry {
 	has_api_key: boolean;
 }
 
-/// Full per-agent LLM config — used by the agent profile editor.
+/// Legacy per-session LLM config retained for old configurations.
 export interface AgentLlmConfig {
 	provider: string | null;
 	model: string | null;
@@ -727,12 +706,8 @@ export interface LiveConfig {
 	};
 	agents: {
 		name: string;
+		title: string;
 		backend: string;
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role: string;
 		model: string | null;
 		llm?: AgentLlmConfig;
 		runner: NativeRunnerConfig;
@@ -761,12 +736,8 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
-	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
-		// `provider` is one of: openai, anthropic, ollama. Local inference goes
-		// through Ollama only — there is no embedded llama.cpp anymore.
-		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string };
-		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -775,9 +746,8 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		name: string;
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[];
-	}) => request<{ success: boolean; session: string; session_id: string }>('/api/setup/add-session', {
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; volumes?: string[];
+	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})

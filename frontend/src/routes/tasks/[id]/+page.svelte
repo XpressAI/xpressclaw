@@ -205,6 +205,11 @@
 		if (p >= 1) return 'Normal';
 		return 'Low';
 	}
+
+	function sessionLabel(id: string): string {
+		const session = agentList.find(agent => agent.id === id);
+		return session?.title || session?.name || id;
+	}
 </script>
 
 <div class="flex h-full flex-col">
@@ -233,7 +238,7 @@
 							<span class="{statusColor(task.status)}">{task.status.replace('_', ' ')}</span>
 						</span>
 						{#if task.agent_id}
-							<span class="text-muted-foreground">{task.agent_id}</span>
+							<span class="text-muted-foreground">{sessionLabel(task.agent_id)}</span>
 						{/if}
 						<span class="text-muted-foreground">{priorityLabel(task.priority)}</span>
 						<span class="text-xs text-muted-foreground">{timeAgo(task.created_at)}</span>
@@ -280,7 +285,7 @@
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value="">Unassigned</option>
 						{#each agentList as agent}
-							<option value={agent.id}>{agent.name}</option>
+							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
 				</div>
@@ -417,7 +422,7 @@
 				{#if task.status === 'in_progress' || task.status === 'waiting_for_input'}
 					<div class="border-t border-border p-4">
 						{#if task.status === 'waiting_for_input'}
-							<div class="text-xs text-orange-400 mb-2">The agent needs your input to continue</div>
+							<div class="text-xs text-orange-400 mb-2">The native worker needs additional input</div>
 						{/if}
 						<div class="flex items-end gap-3">
 							<div class="flex-1 rounded-xl border border-border bg-secondary/50 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/30 transition-all">
@@ -426,7 +431,7 @@
 									onkeydown={handleMessageKeydown}
 									oncompositionstart={() => (composing = true)}
 									oncompositionend={() => setTimeout(() => (composing = false), 0)}
-									placeholder="Send a message to the agent..."
+									placeholder="Send additional context..."
 									rows={1}
 									class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"
 									disabled={messageSending}
@@ -465,7 +470,7 @@
 						{#if task.agent_id}
 							<div class="flex justify-between">
 								<dt class="text-muted-foreground">Session</dt>
-								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{task.agent_id}</a></dd>
+								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{sessionLabel(task.agent_id)}</a></dd>
 							</div>
 						{/if}
 						<div class="flex justify-between">

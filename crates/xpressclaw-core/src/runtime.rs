@@ -281,10 +281,7 @@ impl Runtime {
         }
 
         // Build prompt from task — config comes from YAML, not DB
-        let agent_cfg = self.config.agents.iter().find(|a| a.name == agent_id);
-        let system_prompt = agent_cfg
-            .map(|c| c.role.as_str())
-            .unwrap_or("You are a helpful assistant.");
+        let system_prompt = "";
 
         let task_prompt = if let Some(desc) = &task.description {
             format!("Task: {}\n\nDescription: {}", task.title, desc)

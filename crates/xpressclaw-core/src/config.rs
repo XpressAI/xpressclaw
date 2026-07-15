@@ -272,6 +272,8 @@ pub fn default_native_runner_image(kind: &str) -> Option<&'static str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
+    /// Stable internal identifier for the session. The UI derives this from
+    /// project context and runner kind; it is not a persona or agent name.
     pub name: String,
     pub backend: String,
     /// Legacy field — agents now store the model name in `llm.model`.
@@ -286,17 +288,6 @@ pub struct AgentConfig {
     /// in-house harness for task execution.
     #[serde(default)]
     pub runner: NativeRunnerConfig,
-    /// Human-friendly display name (e.g. "Avery (PA)").
-    pub display_name: Option<String>,
-    /// Short role title (e.g. "Personal Assistant").
-    pub role_title: Option<String>,
-    /// Longer description of what this agent does.
-    pub responsibilities: Option<String>,
-    /// Path or URL to avatar image.
-    pub avatar: Option<String>,
-    /// Raw system prompt. display_name, role_title, and responsibilities
-    /// are prepended automatically when building the LLM messages.
-    pub role: String,
     #[serde(default)]
     pub tools: Vec<String>,
     /// Skills available to this agent (names matching templates/skills/{name}/).
@@ -326,11 +317,6 @@ impl Default for AgentConfig {
             model: None,
             llm: None,
             runner: NativeRunnerConfig::default(),
-            display_name: None,
-            role_title: None,
-            responsibilities: None,
-            avatar: None,
-            role: String::new(),
             tools: Vec::new(),
             skills: Vec::new(),
             budget: None,
@@ -405,54 +391,54 @@ impl AgentConfig {
         }
     }
 
-    /// Remove the exact tool/skill bundle injected by the old profile wizard.
-    /// Custom profiles are left alone; this marker requires the complete
+    /// Remove the exact tool/skill bundle injected by the old setup wizard.
+    /// Custom configurations are left alone; this marker requires the complete
     /// retired developer bundle.
-    pub fn migrate_legacy_agent_layer(&mut self) -> bool {
+    pub fn migrate_legacy_tool_bundle(&mut self) -> bool {
         let legacy_tools = ["filesystem", "shell", "memory"];
         let legacy_skills = ["memory-system", "task-management", "build-app"];
-        let is_injected_profile = legacy_tools
+        let is_injected_bundle = legacy_tools
             .iter()
             .all(|tool| self.tools.iter().any(|configured| configured == tool))
             && legacy_skills
                 .iter()
                 .all(|skill| self.skills.iter().any(|configured| configured == skill));
-        if !is_injected_profile {
+        if !is_injected_bundle {
             return false;
         }
 
-        self.role.clear();
-        self.role_title = None;
-        self.responsibilities = None;
         self.tools.clear();
         self.skills.clear();
         true
     }
 
-    /// Build the full system prompt by prepending profile fields
-    /// (display_name, role_title, responsibilities) to the raw role.
-    pub fn full_system_prompt(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(ref name) = self.display_name {
-            parts.push(format!("Your name is {name}."));
-        }
-        if let Some(ref title) = self.role_title {
-            parts.push(format!("Your role is: {title}."));
-        }
-        if let Some(ref resp) = self.responsibilities {
-            parts.push(format!("Your responsibilities: {resp}"));
-        }
-        if parts.is_empty() {
-            self.role.clone()
-        } else {
-            parts.push(String::new()); // blank line separator
-            parts.push(self.role.clone());
-            parts.join("\n")
-        }
+    /// User-facing context label. Native harnesses own identity and any
+    /// subagents; XpressClaw labels a session by its project instead.
+    pub fn context_label(&self) -> String {
+        context_label(self.runner.workspace.as_deref(), &self.runner.kind)
     }
 }
 
-/// Generate a URL-safe slug from a display name.
+/// Derive a user-facing session label from project context.
+pub fn context_label(workspace: Option<&str>, runner_kind: &str) -> String {
+    workspace
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let kind = runner_kind.trim();
+            if kind.is_empty() || kind == "auto" {
+                "session".to_string()
+            } else {
+                kind.to_string()
+            }
+        })
+}
+
+/// Generate a URL-safe slug from a project context label.
 ///
 /// Handles Unicode (including Japanese) by:
 /// 1. Lowercasing ASCII characters
@@ -461,7 +447,7 @@ impl AgentConfig {
 /// 4. Collapsing multiple hyphens
 /// 5. Trimming leading/trailing hyphens
 ///
-/// If the result is empty (e.g. all emoji), falls back to "agent".
+/// If the result is empty (e.g. all emoji), falls back to "session".
 pub fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     let mut last_was_hyphen = true; // prevent leading hyphen
@@ -486,16 +472,16 @@ pub fn slugify(name: &str) -> String {
     }
 
     if slug.is_empty() {
-        "agent".to_string()
+        "session".to_string()
     } else {
         slug
     }
 }
 
-/// Generate a unique agent ID from a display name, given existing IDs.
+/// Generate a unique internal session ID from project context and harness.
 /// Appends a numeric suffix if the slug already exists.
-pub fn unique_agent_id(display_name: &str, existing_ids: &[&str]) -> String {
-    let base = slugify(display_name);
+pub fn unique_session_id(context: &str, runner_kind: &str, existing_ids: &[&str]) -> String {
+    let base = slugify(&format!("{context}-{runner_kind}"));
 
     if !existing_ids.contains(&base.as_str()) {
         return base;
@@ -604,7 +590,11 @@ impl Config {
 
         match serde_yaml::from_str::<Config>(&contents) {
             Ok(mut config) => {
-                let migrated = config.migrate_legacy_fields();
+                // Profile fields are intentionally no longer represented by
+                // AgentConfig. Detect them in the source document so the
+                // normal migration save removes them from disk as well.
+                let migrated =
+                    contains_legacy_profile_fields(&contents) || config.migrate_legacy_fields();
                 config.validate()?;
                 // Save a backup of the known-good config
                 let backup = path.with_extension("yaml.bak");
@@ -625,7 +615,8 @@ impl Config {
                     let backup_contents = std::fs::read_to_string(&backup)
                         .map_err(|e2| Error::Config(format!("failed to read backup: {e2}")))?;
                     let mut config: Config = serde_yaml::from_str(&backup_contents)?;
-                    let migrated = config.migrate_legacy_fields();
+                    let migrated = contains_legacy_profile_fields(&backup_contents)
+                        || config.migrate_legacy_fields();
                     config.validate()?;
                     if migrated {
                         config.save(path)?;
@@ -644,18 +635,18 @@ impl Config {
     /// Migrate legacy fields after loading. Safe to call repeatedly.
     pub fn migrate_legacy_fields(&mut self) -> bool {
         let mut migrated = false;
-        let mut removed_agent_layer = false;
+        let mut removed_legacy_bundle = false;
         for agent in &mut self.agents {
             migrated |= agent.migrate_legacy_model();
             migrated |= agent.migrate_legacy_runner_image();
-            removed_agent_layer |= agent.migrate_legacy_agent_layer();
+            removed_legacy_bundle |= agent.migrate_legacy_tool_bundle();
         }
-        if removed_agent_layer {
+        if removed_legacy_bundle {
             for name in ["xpressclaw", "shell", "filesystem"] {
                 migrated |= self.mcp_servers.remove(name).is_some();
             }
         }
-        migrated || removed_agent_layer
+        migrated || removed_legacy_bundle
     }
 
     /// Load config from the default location (./xpressclaw.yaml).
@@ -714,6 +705,32 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn contains_legacy_profile_fields(contents: &str) -> bool {
+    const PROFILE_KEYS: [&str; 5] = [
+        "display_name",
+        "role_title",
+        "responsibilities",
+        "avatar",
+        "role",
+    ];
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(contents) else {
+        return false;
+    };
+    value
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("agents".to_string())))
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|agents| {
+            agents.iter().any(|agent| {
+                agent.as_mapping().is_some_and(|mapping| {
+                    PROFILE_KEYS.iter().any(|key| {
+                        mapping.contains_key(serde_yaml::Value::String((*key).to_string()))
+                    })
+                })
+            })
+        })
 }
 
 /// Apply environment variable overrides to per-agent LLM configs.
@@ -803,7 +820,6 @@ system:
 agents:
   - name: test-agent
     backend: claude-sdk
-    role: "Test role"
 memory:
   near_term_slots: 4
 "#;
@@ -828,100 +844,6 @@ memory:
     }
 
     #[test]
-    fn test_japanese_prompt_round_trip() {
-        let role = "あなたは日本語のアシスタントです。\n\n## 責任\n- タスクの管理\n- メールの返信\n- スケジュールの確認";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        eprintln!("=== YAML ===\n{yaml}");
-
-        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(
-            parsed.agents[0].role, role,
-            "Japanese role round-trip failed"
-        );
-    }
-
-    #[test]
-    fn test_markdown_list_prompt_round_trip() {
-        let role = "You are a helpful assistant.\n\n## Guidelines\n- Write clean code\n- Ask clarifying questions\n* Use bullet points\n  - Nested items too";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "test".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(
-            parsed.agents[0].role, role,
-            "Markdown list round-trip failed"
-        );
-    }
-
-    #[test]
-    fn test_prompt_save_load_file() {
-        let role = "パーソナルファイナンスアシスタント\n\n## 責任\n- 予算管理\n- 投資アドバイス";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let path = std::env::temp_dir().join("xpressclaw-test-jp.yaml");
-        config.save(&path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        eprintln!("=== FILE ===\n{contents}");
-
-        let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.agents[0].role, role, "File round-trip failed");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_xclaw59_exact_prompt() {
-        // Exact prompt from XCLAW-59 bug report
-        let role = "あなたは徹底的に調査を行うリサーチアシスタントです。\n\n\
-            あなたの仕事は、ユーザーが求めるトピックに関する情報を見つけ、統合し、整理することです。\n\
-            また、調査結果が会話をまたいでも保持されるよう、メモリシステムを使って詳細なメモを記録します。\n\
-            ガイドライン\n\n\
-            - まず広く調査し、その後有望な情報について深掘りする\n\
-            - 常に情報源を明示する\n\
-            - 重要な発見はすぐにメモリに保存する\n\
-            - 情報は構造化され、読みやすい形式で提示する\n\
-            - 情報が古い、または信頼性に疑問がある場合はその旨を明示する";
-
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let path = std::env::temp_dir().join("xpressclaw-test-xclaw59.yaml");
-        config.save(&path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        eprintln!("=== XCLAW-59 YAML ===\n{contents}");
-
-        let loaded = Config::load(&path).unwrap();
-        assert_eq!(
-            loaded.agents[0].role, role,
-            "XCLAW-59 prompt round-trip failed"
-        );
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("yaml.bak"));
-    }
-
-    #[test]
     fn test_slugify_ascii() {
         assert_eq!(slugify("My Agent"), "my-agent");
         assert_eq!(slugify("Code Reviewer"), "code-reviewer");
@@ -938,22 +860,27 @@ memory:
 
     #[test]
     fn test_slugify_empty() {
-        assert_eq!(slugify(""), "agent");
-        assert_eq!(slugify("!!!"), "agent");
-        assert_eq!(slugify("   "), "agent");
+        assert_eq!(slugify(""), "session");
+        assert_eq!(slugify("!!!"), "session");
+        assert_eq!(slugify("   "), "session");
     }
 
     #[test]
-    fn test_unique_agent_id() {
-        assert_eq!(unique_agent_id("Atlas", &[]), "atlas");
-        assert_eq!(unique_agent_id("Atlas", &["atlas"]), "atlas-2");
-        assert_eq!(unique_agent_id("Atlas", &["atlas", "atlas-2"]), "atlas-3");
+    fn test_unique_session_id() {
+        assert_eq!(unique_session_id("Website", "codex", &[]), "website-codex");
+        assert_eq!(
+            unique_session_id("Website", "codex", &["website-codex"]),
+            "website-codex-2"
+        );
     }
 
     #[test]
-    fn test_unique_agent_id_japanese() {
-        assert_eq!(unique_agent_id("エリ", &[]), "エリ");
-        assert_eq!(unique_agent_id("エリ", &["エリ"]), "エリ-2");
+    fn context_label_uses_the_project_folder() {
+        assert_eq!(
+            context_label(Some("/home/me/projects/website"), "codex"),
+            "website"
+        );
+        assert_eq!(context_label(None, "claude"), "claude");
     }
 
     #[test]
@@ -1076,10 +1003,48 @@ mcp_servers:
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(config.migrate_legacy_fields());
         let session = &config.agents[0];
-        assert!(session.role.is_empty());
         assert!(session.tools.is_empty());
         assert!(session.skills.is_empty());
         assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn loading_removes_legacy_profile_fields_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("xpressclaw.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - name: website-codex
+    backend: codex
+    display_name: Avery
+    role_title: Developer
+    responsibilities: Maintain the website
+    avatar: /tmp/avery.png
+    role: Always act as Avery.
+    runner:
+      kind: codex
+      workspace: /home/me/projects/website
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agents[0].context_label(), "website");
+        let saved = std::fs::read_to_string(path).unwrap();
+        for retired in [
+            "display_name:",
+            "role_title:",
+            "responsibilities:",
+            "avatar:",
+            "role:",
+        ] {
+            assert!(
+                !saved.contains(retired),
+                "retired field remained: {retired}"
+            );
+        }
     }
 
     #[test]

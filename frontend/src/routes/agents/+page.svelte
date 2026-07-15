@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
-	import { statusColor, timeAgo, agentAvatar } from '$lib/utils';
+	import { harnessMark, statusColor, timeAgo } from '$lib/utils';
 
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
@@ -49,9 +49,9 @@
 				<div class="rounded-lg border border-border bg-card p-4 space-y-3">
 					<div class="flex items-start justify-between">
 						<div class="flex items-center gap-3">
-							<img src={agentAvatar(agent)} alt="" class="h-9 w-9 rounded-full object-cover flex-shrink-0" />
+							<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-sm font-semibold">{harnessMark(agent.backend)}</span>
 							<div>
-								<a href="/agents/{agent.id}" class="text-sm font-semibold hover:underline">{agent.config?.display_name || agent.name}</a>
+								<a href="/agents/{agent.id}" class="text-sm font-semibold hover:underline">{agent.title || agent.name}</a>
 								<div class="text-xs text-muted-foreground mt-0.5">{agent.backend}</div>
 							</div>
 						</div>

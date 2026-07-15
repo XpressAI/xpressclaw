@@ -29,7 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/logs", get(raw_logs_removed))
 }
 
-/// Build a compatibility profile response backed by the logical session.
+/// Build the legacy `/agents` compatibility response from a logical session.
 fn agent_json(
     record: &AgentRecord,
     config: &xpressclaw_core::config::Config,
@@ -40,6 +40,7 @@ fn agent_json(
     json!({
         "id": record.id,
         "name": record.name,
+        "title": agent_cfg.map(|config| config.context_label()).unwrap_or_else(|| record.name.clone()),
         "backend": record.backend,
         "status": status,
         "desired_status": "available",
@@ -51,11 +52,6 @@ fn agent_json(
         "error_message": record.error_message,
         "restart_count": record.restart_count,
         "config": agent_cfg.map(|c| json!({
-            "display_name": c.display_name,
-            "role_title": c.role_title,
-            "responsibilities": c.responsibilities,
-            "avatar": c.avatar,
-            "role": c.role,
             // For backward compat with frontend code that reads `model` at
             // the top level — same value as `llm.model`.
             "model": c.effective_model(),
@@ -86,9 +82,9 @@ async fn list_agents(
             .agents
             .iter()
             .find(|cfg| cfg.name == a.name)
-            .and_then(|cfg| cfg.display_name.as_deref())
-            .unwrap_or(&a.name);
-        let session = sessions.ensure(&a.id, Some(title)).ok();
+            .map(|cfg| cfg.context_label())
+            .unwrap_or_else(|| a.name.clone());
+        let session = sessions.ensure(&a.id, Some(&title)).ok();
         result.push(agent_json(a, &config, session.as_ref()));
     }
     Ok(Json(json!(result)))
@@ -204,11 +200,6 @@ async fn stop_agent(
 
 #[derive(Debug, Deserialize)]
 struct UpdateAgentConfigRequest {
-    display_name: Option<String>,
-    role_title: Option<String>,
-    responsibilities: Option<String>,
-    avatar: Option<String>,
-    role: Option<String>,
     model: Option<String>,
     llm: Option<AgentLlmConfig>,
     runner: Option<NativeRunnerConfig>,
@@ -250,22 +241,6 @@ async fn update_agent_config(
         new_agents.last_mut().unwrap()
     };
 
-    // Apply partial updates — profile fields
-    if let Some(dn) = req.display_name {
-        agent.display_name = if dn.is_empty() { None } else { Some(dn) };
-    }
-    if let Some(rt) = req.role_title {
-        agent.role_title = if rt.is_empty() { None } else { Some(rt) };
-    }
-    if let Some(resp) = req.responsibilities {
-        agent.responsibilities = if resp.is_empty() { None } else { Some(resp) };
-    }
-    if let Some(av) = req.avatar {
-        agent.avatar = if av.is_empty() { None } else { Some(av) };
-    }
-    if let Some(role) = req.role {
-        agent.role = role;
-    }
     // Model lives on llm.model now. If the request supplies a top-level
     // `model`, write it into llm.model — creating the AgentLlmConfig if
     // missing, so the field never gets silently dropped.
@@ -360,12 +335,8 @@ async fn update_agent_config(
     Ok(Json(json!({
         "agent": {
             "name": updated.name,
+            "title": updated.context_label(),
             "backend": updated.backend,
-            "display_name": updated.display_name,
-            "role_title": updated.role_title,
-            "responsibilities": updated.responsibilities,
-            "avatar": updated.avatar,
-            "role": updated.role,
             "model": updated.effective_model(),
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
@@ -559,12 +530,11 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let db = Arc::new(Database::open_memory().unwrap());
-        // Create a config with a test agent
+        // Create a config with a test session
         let mut config = Config::load_default().unwrap();
         config.agents.push(AgentConfig {
             name: "atlas".to_string(),
             backend: "generic".to_string(),
-            role: "You are a test agent.".to_string(),
             ..Default::default()
         });
         config.save(&config_path).unwrap();
@@ -734,7 +704,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Second: update only role — budget should be preserved
+        // Second: update only mounts — budget should be preserved
         let resp = app
             .clone()
             .oneshot(
@@ -742,7 +712,9 @@ mod tests {
                     .method("PATCH")
                     .uri("/agents/atlas/config")
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({ "role": "Updated role." }).to_string()))
+                    .body(Body::from(
+                        json!({ "volumes": ["/tmp:/tmp:ro"] }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -750,7 +722,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
-        assert_eq!(body["agent"]["role"], "Updated role.");
+        assert_eq!(body["agent"]["volumes"][0], "/tmp:/tmp:ro");
         // Budget should still be there
         assert_eq!(body["agent"]["budget"]["daily"], "$5.00");
 

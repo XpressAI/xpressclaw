@@ -3,7 +3,7 @@
 	import { page } from '$app/stores';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
-	import { statusColor } from '$lib/utils';
+	import { harnessMark, statusColor } from '$lib/utils';
 
 	import SessionTab from './SessionTab.svelte';
 	import RunnerTab from './RunnerTab.svelte';
@@ -96,10 +96,8 @@
 		}
 	}
 
-	function agentDisplayName(): string {
-		if (agentConfig?.display_name) return agentConfig.display_name;
-		const name = agent?.name ?? '';
-		return name.charAt(0).toUpperCase() + name.slice(1);
+	function sessionTitle(): string {
+		return agent?.title || agent?.name || '';
 	}
 
 	function saveCurrentTab() {
@@ -130,7 +128,7 @@
 		<div class="flex items-center gap-2 text-sm text-muted-foreground">
 			<a href="/agents" class="hover:text-foreground">Sessions</a>
 			<span>/</span>
-			<span class="text-foreground">{agentDisplayName()}</span>
+			<span class="text-foreground">{sessionTitle()}</span>
 		</div>
 
 		{#if error}
@@ -138,18 +136,14 @@
 		{:else if agent}
 			<div class="flex items-start justify-between">
 				<div class="flex items-center gap-3">
-					<!-- Avatar -->
 					<div class="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-sm font-semibold text-primary">
-						{(agentConfig?.display_name || agent.name).charAt(0).toUpperCase()}
+						{harnessMark(agent.backend)}
 					</div>
 					<div>
-						<h1 class="text-xl font-bold">{agentDisplayName()}</h1>
+						<h1 class="text-xl font-bold">{sessionTitle()}</h1>
 						<p class="text-sm text-muted-foreground">
 							<span class="{statusColor(agent.status)}">{agent.status}</span>
 							&middot; {agent.backend}
-							{#if agentConfig?.role_title}
-								&middot; {agentConfig.role_title}
-							{/if}
 						</p>
 					</div>
 				</div>
@@ -223,7 +217,7 @@
 {#if showDeleteConfirm && agent}
 	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
 		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4">
-			<h2 class="text-lg font-semibold">Delete {agentDisplayName()}?</h2>
+			<h2 class="text-lg font-semibold">Delete {sessionTitle()}?</h2>
 			<p class="text-sm text-muted-foreground">
 				This removes the session and its configuration. Existing task history may still reference it. This action cannot be undone.
 			</p>

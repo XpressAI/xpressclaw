@@ -151,7 +151,7 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
-    // Sync configured profiles and their durable logical sessions. Native
+    // Sync configured runtime contexts and their durable logical sessions. Native
     // workers are launched later for individual queued attempts.
     let registry = AgentRegistry::new(db.clone());
     let sessions = SessionManager::new(db.clone());
@@ -165,11 +165,8 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => {
-                let title = agent_config
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(&agent_config.name);
-                sessions.ensure(&record.id, Some(title))?;
+                let title = agent_config.context_label();
+                sessions.ensure(&record.id, Some(&title))?;
                 info!(
                     name = record.name,
                     backend = record.backend,

@@ -26,7 +26,7 @@ pub fn image_for_backend(backend: &str) -> &'static str {
 /// Build a container spec for an agent based on its configuration.
 ///
 /// The harness inside the container always calls back to the server's `/v1/`
-/// proxy. Real upstream API keys never leave the server — agent identity is
+/// proxy. Real upstream API keys never leave the server — session routing is
 /// encoded in placeholder keys so the proxy can resolve per-agent providers.
 pub fn build_container_spec(agent: &AgentConfig, server_port: u16) -> ContainerSpec {
     build_container_spec_with_mcp(agent, server_port, None)
@@ -72,16 +72,6 @@ pub fn build_container_spec_with_mcp(
     env.push(format!("ANTHROPIC_API_KEY=sk-ant-{}", agent.name));
     env.push(format!("OPENAI_API_KEY=sk-xpressclaw-{}", agent.name));
     env.push(format!("LLM_API_KEY=sk-xpressclaw-{}", agent.name));
-
-    // Agent role as JSON config
-    if !agent.role.is_empty() {
-        if let Ok(json) = serde_json::to_string(&serde_json::json!({
-            "role": agent.role,
-            "tools": agent.tools,
-        })) {
-            env.push(format!("AGENT_CONFIG={json}"));
-        }
-    }
 
     // MCP servers — merge defaults with config-provided servers and inject as JSON env var.
     // Agents need these to call tasks, apps, memory, etc.
@@ -212,7 +202,6 @@ mod tests {
         let agent = AgentConfig {
             name: "test-agent".to_string(),
             backend: "claude-sdk".to_string(),
-            role: "Test role".to_string(),
             llm: Some(crate::config::AgentLlmConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),

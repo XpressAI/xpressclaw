@@ -4,7 +4,7 @@
 	import { onMount } from 'svelte';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
-	import { agentAvatar } from '$lib/utils';
+	import { harnessMark } from '$lib/utils';
 
 	// Bottom tabs per ADR-016
 	const tabs = [
@@ -181,8 +181,8 @@
 						{#each agentList as agent}
 							{@const active = isAgentActive(agent.id, $page.url.pathname)}
 							<a href="/agents/{agent.id}" class={linkClass(active)}>
-								<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover ring-2 {agent.status === 'running' ? 'ring-blue-400' : agent.status === 'queued' ? 'ring-amber-400' : agent.status === 'error' ? 'ring-red-400' : 'ring-emerald-400'}" />
-								<span class="truncate">{agent.config?.display_name || agent.name}</span>
+								<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
+								<span class="truncate">{agent.title || agent.name}</span>
 							</a>
 						{:else}
 							<a href="/setup?mode=add-session" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first session</a>

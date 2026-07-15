@@ -1,7 +1,7 @@
 //! Background conversation processor (ADR-019, ADR-021).
 //!
 //! Routes conversation messages through agent harness sessions.
-//! The harness has the real MCP tools, correct personality, and
+//! The harness owns its tools, instructions, and
 //! maintains context across messages via persistent sessions.
 //!
 //! Falls back to LLM router streaming when no harness is available.
@@ -135,8 +135,6 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             if registry.get(agent_id).is_err() {
                 continue;
             }
-            let agent_cfg = ctx.config.agents.iter().find(|a| a.name == *agent_id);
-
             // Use the agent's logical name (its agent_id) as the model. The
             // LlmRouter resolves it to the real provider+model. Falling back
             // to the agent_id if the agent has no llm config means the router
@@ -144,11 +142,7 @@ async fn process_loop(conv_id: &str, ctx: &ProcessorContext) {
             // arbitrary provider.
             let model = agent_id.clone();
 
-            let role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_else(|| {
-                agent_cfg
-                    .map(|c| c.full_system_prompt())
-                    .unwrap_or_else(|| "You are a helpful AI assistant.".to_string())
-            });
+            let role = ctx.agent_roles.get(agent_id).cloned().unwrap_or_default();
 
             // Get conversation history so the harness can restore context
             // after a container restart. We send the full history — the harness

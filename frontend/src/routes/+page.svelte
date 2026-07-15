@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { setup, sessions, agents as agentsApi } from '$lib/api';
 	import type { Agent } from '$lib/api';
-	import { agentAvatar } from '$lib/utils';
+	import { harnessMark } from '$lib/utils';
 
 	let status_text = $state('Connecting to server...');
 	let loading = $state(true);
@@ -114,7 +114,7 @@
 					<div class="flex items-center gap-3">
 						<div class="flex items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
 								{#if selectedAgentObj}
-									<img src={agentAvatar(selectedAgentObj)} alt="" class="h-5 w-5 rounded-full object-cover" />
+									<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(selectedAgentObj.backend)}</span>
 								{/if}
 								<select
 									bind:value={selectedAgent}
@@ -122,7 +122,7 @@
 								>
 									{#each agentList as agent}
 										<option value={agent.id}>
-											{agent.config?.display_name || agent.name}
+											{agent.title || agent.name}
 										</option>
 									{/each}
 								</select>

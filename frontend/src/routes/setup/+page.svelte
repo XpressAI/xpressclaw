@@ -33,7 +33,6 @@
 	let isAddSession = $derived(
 		['add-session', 'add-agent'].includes($page.url.searchParams.get('mode') ?? '')
 	);
-	let sessionName = $state('');
 	let runnerKind = $state('codex');
 	let runnerImage = $state(runnerOptions[0].image as string);
 	let subscriptionAuth = $state(true);
@@ -44,6 +43,9 @@
 	let dockerLoading = $state(true);
 	let saving = $state(false);
 	let saveError = $state('');
+	let contextLabel = $derived(
+		workspacePath.split('/').filter(Boolean).pop() || runnerKind
+	);
 
 	onMount(async () => {
 		// Keep old bookmarks working while making the native-session URL canonical.
@@ -92,12 +94,11 @@
 	}
 
 	async function createSession() {
-		if (!sessionName.trim() || !workspacePath.trim() || !runnerImage.trim() || saving) return;
+		if (!workspacePath.trim() || !runnerImage.trim() || saving) return;
 		saving = true;
 		saveError = '';
 
 		const session = {
-			name: sessionName.trim(),
 			backend: runnerKind,
 			runner_kind: runnerKind,
 			runner_image: runnerImage.trim(),
@@ -112,7 +113,6 @@
 				await goto(`/agents/${created.session_id}`);
 			} else {
 				await setup.complete({
-					llm: { provider: '' },
 					agents: [session],
 					isolation: 'docker'
 				});
@@ -149,19 +149,6 @@
 
 	<form class="space-y-7 p-6" onsubmit={(event) => { event.preventDefault(); createSession(); }}>
 		<section>
-			<label for="session-name" class="mb-1.5 block text-sm font-medium text-foreground">Session name</label>
-			<input
-				id="session-name"
-				type="text"
-				bind:value={sessionName}
-				placeholder="Website maintainer"
-				autocomplete="off"
-				class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-			/>
-			<p class="mt-1.5 text-xs text-muted-foreground">This is the durable timeline where messages, scheduled work, and results meet.</p>
-		</section>
-
-		<section>
 			<div class="mb-3">
 				<h3 class="text-sm font-medium text-foreground">Harness</h3>
 				<p class="mt-0.5 text-xs text-muted-foreground">The selected product owns its reasoning and tool loop.</p>
@@ -192,7 +179,9 @@
 				placeholder="/home/me/projects/my-app"
 				class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 			/>
-			<p class="mt-1.5 text-xs text-muted-foreground">The folder must exist on this machine. It is mounted at <code>/workspace</code>.</p>
+			<p class="mt-1.5 text-xs text-muted-foreground">
+				The folder must exist on this machine. It is mounted at <code>/workspace</code> and appears as <strong>{contextLabel}</strong> in the UI.
+			</p>
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
@@ -300,7 +289,7 @@
 			{/if}
 			<button
 				type="submit"
-				disabled={saving || !sessionName.trim() || !workspacePath.trim() || !runnerImage.trim()}
+				disabled={saving || !workspacePath.trim() || !runnerImage.trim()}
 				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
 			>
 				{saving ? 'Creating...' : (isAddSession ? 'Create session' : 'Finish setup')}

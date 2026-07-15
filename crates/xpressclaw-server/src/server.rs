@@ -30,12 +30,12 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     // Shutdown token: cancels all background tasks on Ctrl+C.
     let shutdown = tokio_util::sync::CancellationToken::new();
 
-    // Ensure every configured profile has a durable logical session.
+    // Ensure every configured runtime context has a durable logical session.
     {
         let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
         for agent in &config.agents {
-            let title = agent.display_name.as_deref().unwrap_or(&agent.name);
-            if let Err(error) = sessions.ensure(&agent.name, Some(title)) {
+            let title = agent.context_label();
+            if let Err(error) = sessions.ensure(&agent.name, Some(&title)) {
                 warn!(agent_id = agent.name, error = %error, "failed to initialize session");
             }
         }
@@ -50,11 +50,11 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
             Ok(containers) => {
                 for container in containers {
                     let is_attempt = container.agent_id.starts_with("attempt-");
-                    let is_legacy_profile = config
+                    let is_legacy_session = config
                         .agents
                         .iter()
                         .any(|agent| agent.name == container.agent_id);
-                    if is_attempt || is_legacy_profile {
+                    if is_attempt || is_legacy_session {
                         let _ = docker.stop(&container.agent_id).await;
                     }
                 }
@@ -81,7 +81,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     // Consume tasks with short-lived native CLI workers. The former harness
     // dispatcher and desired-state agent reconciler are intentionally not
-    // started: profiles are durable sessions, not long-running agent loops.
+    // started: runtime contexts are durable sessions, not long-running loops.
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config.clone();
     let dispatcher_event_bus = state.event_bus.clone();

@@ -64,7 +64,7 @@
 			<div>
 				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">CLI</label>
 				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
-					<option value="auto">Auto from profile backend</option>
+					<option value="auto">Auto from configured harness</option>
 					<option value="codex">Codex</option>
 					<option value="claude">Claude Code</option>
 					<option value="opencode">OpenCode</option>

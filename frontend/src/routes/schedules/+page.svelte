@@ -57,7 +57,7 @@
 
 	function agentName(id: string): string {
 		const agent = agentList.find((candidate) => candidate.id === id);
-		return agent?.config?.display_name || agent?.name || id;
+		return agent?.title || agent?.name || id;
 	}
 
 	async function toggle(s: Schedule) {
@@ -115,7 +115,7 @@
 				<input type="text" placeholder="Name" bind:value={form.name} class="rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
 				<input type="text" placeholder="Cron (e.g. 0 9 * * *)" bind:value={form.cron} class="rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
 				<select bind:value={form.agent_id} class="rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
-					{#each agentList as agent}<option value={agent.id}>{agent.config?.display_name || agent.name}</option>{/each}
+					{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
 				</select>
 				<input type="text" placeholder={"Task title (use {date}, {time})"} bind:value={form.title} class="rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
 			</div>

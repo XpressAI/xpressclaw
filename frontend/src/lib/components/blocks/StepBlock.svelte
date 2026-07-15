@@ -49,11 +49,11 @@
 						class="w-full rounded border border-input bg-background px-2 py-1.5 text-xs" />
 				</div>
 				<div>
-					<label class="block text-[10px] font-medium text-muted-foreground mb-1">AGENT</label>
+					<label class="block text-[10px] font-medium text-muted-foreground mb-1">SESSION</label>
 					<select value={agent} onchange={(e) => onupdate({ agent: e.currentTarget.value })}
 						class="w-full rounded border border-input bg-background px-2 py-1.5 text-xs">
 						<option value="">Select agent...</option>
-						{#each agentList as a}<option value={a.name}>{a.config?.display_name || a.name}</option>{/each}
+						{#each agentList as a}<option value={a.name}>{a.title || a.name}</option>{/each}
 					</select>
 				</div>
 			</div>

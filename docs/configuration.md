@@ -1,8 +1,9 @@
 # Configuration Reference
 
 Xpressclaw stores local control-plane configuration in `xpressclaw.yaml`.
-Create and edit sessions through the web UI; it validates and applies changes
-without requiring users to hand-author the legacy agent-layer fields.
+Create and edit project-context sessions through the web UI. Xpressclaw does
+not define identities, personas, system prompts, tools, or subagents for native
+harnesses.
 
 `xpressclaw init` writes an empty starting point:
 
@@ -21,8 +22,7 @@ compatibility. New entries use only the native runner fields:
 
 ```yaml
 agents:
-  - name: website-maintainer
-    display_name: Website maintainer
+  - name: site-codex # internal ID derived from project + harness
     backend: codex
     runner:
       kind: codex
@@ -45,6 +45,12 @@ agents:
 | `command` | Argument list for a custom adapter; supports `{prompt}` and `{workspace}` |
 
 Additional `volumes` use `host:container` or `host:container:ro` syntax.
+
+The UI label is derived from the workspace folder (`site` above). The `name`
+field is only a stable internal reference used by tasks, schedules, and
+workflows. Codex and Claude receive no Xpressclaw profile or identity prompt;
+they retain ownership of their own instructions, tools, and subagents. Older
+profile fields are removed automatically when a configuration is loaded.
 
 ## Built-in images
 

@@ -37,7 +37,7 @@
 	}
 
 	function displayName(agent: Agent): string {
-		return agent.config?.display_name || agent.name;
+		return agent.title || agent.name;
 	}
 
 	function chooseTemplate(value: 'blank' | 'code-review') {

@@ -73,7 +73,7 @@
 	function agentName(id: string | null): string {
 		if (!id) return 'Unbound';
 		const agent = agentList.find(a => a.id === id);
-		return agent?.config?.display_name || agent?.name || id;
+		return agent?.title || agent?.name || id;
 	}
 
 	onMount(() => load());
@@ -683,7 +683,7 @@
 					>
 						<option value="">None</option>
 						{#each agentList as agent}
-							<option value={agent.id}>{agent.config?.display_name || agent.name}</option>
+							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
 				</div>

@@ -35,7 +35,7 @@ pub struct AgentRecord {
 
 /// Manages agent runtime state in the database.
 ///
-/// Agent configuration (role, model, tools, llm, etc.) lives in the YAML
+/// Session runtime configuration (runner, workspace, mounts, etc.) lives in the YAML
 /// config file and is accessed via `AppState::config()`. This registry only
 /// tracks runtime state: whether an agent is running, its container ID, and
 /// timestamps.

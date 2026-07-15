@@ -55,7 +55,7 @@ Codex, Claude Code, and OpenCode already supply excellent agent loops. xpresscla
 
 ### Persistent Sessions
 
-The primary interface is a durable event timeline. It accepts a new message while work is running, records where every event came from, and keeps native execution contexts separate from the user-facing identity.
+The primary interface is a durable event timeline labeled by project context. It accepts a new message while work is running and records where every event came from. Xpressclaw does not invent an agent identity or persona.
 
 ### Autonomous Task Execution
 
@@ -68,9 +68,9 @@ Native workers pick up tasks from a queue and publish structured progress and ar
 - **OpenCode:** JSON event adapter with configurable authentication
 - **Custom:** one-argument-per-line command templates for other native CLIs
 
-Each built-in runner image contains one agent product. Language SDKs and
+Each built-in runner image contains one native harness. Language SDKs and
 project services belong in a separate development environment rather than in
-the agent identity image.
+the runner image.
 
 ### Privacy & Safety
 
@@ -260,7 +260,7 @@ xpressclaw (single ~12MB binary)
 - **Single binary** — server, API, frontend, and CLI in one executable
 - **Docker required** — worker isolation is not optional
 - **Durable local state** — sessions, task queues, schedules, and workflow runs survive restarts
-- **Native agent ownership** — agent products own their reasoning loop and tool protocol
+- **Native harness ownership** — Codex and Claude own their instructions, tools, reasoning loop, and subagents
 
 ## CLI Reference
 

@@ -35,22 +35,13 @@ export async function openExternal(url: string): Promise<void> {
 	}
 }
 
-const AVATAR_COUNT = 32;
-
-/** Get the avatar for an agent — custom upload if set, deterministic default otherwise. */
-export function agentAvatar(agent: { name: string; id: string; config?: { avatar?: string | null } }): string {
-	// Use custom avatar if the agent has one configured
-	if (agent.config?.avatar) {
-		return agent.config.avatar;
-	}
-	// Fall back to deterministic hash-based default
-	let hash = 0;
-	const key = agent.name || agent.id;
-	for (let i = 0; i < key.length; i++) {
-		hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
-	}
-	const idx = ((hash % AVATAR_COUNT) + AVATAR_COUNT) % AVATAR_COUNT;
-	return `/avatars/${idx.toString().padStart(2, '0')}.jpg`;
+/** Compact product mark for a native session. */
+export function harnessMark(backend: string): string {
+	const normalized = backend.toLowerCase();
+	if (normalized.includes('claude')) return 'A';
+	if (normalized.includes('opencode')) return 'O';
+	if (normalized.includes('codex')) return 'C';
+	return 'R';
 }
 
 /** Get cached user profile (loaded from server, cached in memory). */

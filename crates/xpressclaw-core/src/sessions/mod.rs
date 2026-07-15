@@ -1,8 +1,8 @@
 //! Event-driven logical sessions and their isolated native work attempts.
 //!
-//! A session is the durable, user-facing identity. Native coding agents are
-//! workers: every invocation is represented by a work attempt and contributes
-//! structured events and artifacts to the session timeline.
+//! A session is the durable, user-facing project context. Native harnesses own
+//! their instructions and subagents; every invocation is represented by a work
+//! attempt that contributes structured events and artifacts to the timeline.
 
 use std::sync::Arc;
 
@@ -100,24 +100,24 @@ impl SessionManager {
         Self { db }
     }
 
-    /// Ensure that the durable user-facing session exists for a configured
-    /// agent profile. Session IDs intentionally match profile IDs during the
-    /// migration so existing task and workflow references remain valid.
-    pub fn ensure(&self, agent_id: &str, title: Option<&str>) -> Result<LogicalSession> {
+    /// Ensure that the durable project-context session exists. IDs retain the
+    /// legacy registry key shape so existing task and workflow references stay
+    /// valid, but titles are always refreshed from the current project path.
+    pub fn ensure(&self, session_id: &str, title: Option<&str>) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title) VALUES (?1, ?1, ?2)",
-                rusqlite::params![agent_id, title],
+                rusqlite::params![session_id, title],
             )?;
             if title.is_some() {
                 conn.execute(
-                    "UPDATE logical_sessions SET title = COALESCE(title, ?1) WHERE id = ?2",
-                    rusqlite::params![title, agent_id],
+                    "UPDATE logical_sessions SET title = ?1 WHERE id = ?2",
+                    rusqlite::params![title, session_id],
                 )?;
             }
             Ok::<_, Error>(())
         })?;
-        self.get(agent_id)
+        self.get(session_id)
     }
 
     pub fn get(&self, session_id: &str) -> Result<LogicalSession> {

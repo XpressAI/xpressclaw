@@ -341,9 +341,8 @@ fn ensure_session(state: &AppState, id: &str) -> Result<(), (StatusCode, Json<Va
         .agents
         .iter()
         .find(|agent| agent.name == id)
-        .and_then(|agent| agent.display_name.as_deref())
-        .unwrap_or(&record.name)
-        .to_string();
+        .map(|agent| agent.context_label())
+        .unwrap_or(record.name);
     SessionManager::new(state.db.clone())
         .ensure(id, Some(&title))
         .map_err(internal_error)?;
@@ -402,7 +401,6 @@ mod tests {
         config.agents.push(AgentConfig {
             name: "builder".to_string(),
             backend: "codex".to_string(),
-            display_name: Some("Builder".to_string()),
             ..Default::default()
         });
         let state = AppState::new(

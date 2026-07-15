@@ -115,7 +115,7 @@ async fn execute_item(
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let prompt = build_prompt(&db, agent, &item, attempt_id)?;
+    let prompt = build_prompt(&db, &item, attempt_id)?;
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE work_attempts SET runner = ?1, prompt = ?2 WHERE id = ?3",
@@ -236,7 +236,7 @@ async fn execute_item(
         &db,
         &event_bus,
         &item,
-        agent.display_name.as_deref().unwrap_or(&agent.name),
+        &agent.context_label(),
         &parsed.summary,
     );
     advance_workflow(&db, &item.task_id, "completed", &parsed.summary);
@@ -350,18 +350,13 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
         Ok("custom".to_string())
     } else {
         Err(Error::Backend(format!(
-            "profile '{}' needs runner.kind or runner.command (backend was '{}')",
+            "session '{}' needs runner.kind or runner.command (backend was '{}')",
             agent.name, agent.backend
         )))
     }
 }
 
-fn build_prompt(
-    db: &Arc<Database>,
-    agent: &AgentConfig,
-    item: &QueueItem,
-    attempt_id: &str,
-) -> Result<String> {
+fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<String> {
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let sessions = SessionManager::new(db.clone());
     let events = sessions.list_events(&item.agent_id, None, 30)?;
@@ -377,12 +372,6 @@ fn build_prompt(
     })?;
 
     let mut prompt = String::new();
-    let role = agent.full_system_prompt();
-    if !role.trim().is_empty() {
-        prompt.push_str("Profile instructions:\n");
-        prompt.push_str(&role);
-        prompt.push_str("\n\n");
-    }
     prompt.push_str(&format!(
         "You are executing work attempt {attempt_id} inside logical session {}.\n",
         item.agent_id

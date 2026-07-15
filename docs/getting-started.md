@@ -17,7 +17,6 @@ Use `xpressclaw up --detach` to keep the server in the background.
 
 The session creator asks for:
 
-- a display name;
 - Codex, Claude Code, or OpenCode;
 - the host project folder mounted at `/workspace`;
 - whether to reuse the native CLI's host subscription login;
@@ -33,6 +32,9 @@ image, project folder, command adapter, and subscription credentials. Use
 **Prepare runner** to pull a missing published image. A locally built
 `xpressclaw-runner-<product>:latest` image is accepted as a development
 fallback.
+
+The project folder name becomes the session's context label. There is no agent
+name, persona, role, or Xpressclaw-authored system prompt.
 
 ## 4. Send work
 

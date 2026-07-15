@@ -115,7 +115,7 @@
 	function agentName(agentId: string | null): string | null {
 		if (!agentId) return null;
 		const agent = agentList.find((a) => a.id === agentId);
-		return agent?.config?.display_name || agent?.name || agentId;
+		return agent?.title || agent?.name || agentId;
 	}
 </script>
 
@@ -166,7 +166,7 @@
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
 						{#each agentList as agent}
-							<option value={agent.id}>{agent.config?.display_name || agent.name}</option>
+							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
 				</div>
