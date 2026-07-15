@@ -33,7 +33,9 @@ pub fn routes() -> Router<AppState> {
         .route("/validate-key", post(validate_key))
         .route("/presets", get(get_presets))
         .route("/complete", post(complete_setup))
-        .route("/add-agent", post(add_agent))
+        .route("/add-session", post(add_session))
+        // Compatibility alias for clients from before the native-session UI.
+        .route("/add-agent", post(add_session))
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
@@ -334,7 +336,7 @@ struct AgentSetup {
     model: Option<String>,
     tools: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
-    /// MCP servers to merge into global config (used by add-agent flow).
+    /// Legacy connector overrides accepted by the compatibility endpoint.
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
@@ -545,9 +547,8 @@ async fn complete_setup(
     })))
 }
 
-/// Add a new agent to the existing configuration without replacing other agents.
-/// Used by the "+ Add Agent" flow (mode=add-agent) in the wizard.
-async fn add_agent(
+/// Add a durable native session without replacing existing sessions.
+async fn add_session(
     State(state): State<AppState>,
     Json(req): Json<AgentSetup>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -626,7 +627,10 @@ async fn add_agent(
     new_config
         .save(&state.config_path)
         .map_err(internal_error)?;
-    info!(name = agent_config.name, "added agent to configuration");
+    info!(
+        name = agent_config.name,
+        "added native session to configuration"
+    );
 
     // Register the durable profile/session. Native workers are started per
     // attempt, so there is no long-running agent to auto-start.
@@ -647,6 +651,9 @@ async fn add_agent(
 
     Ok(Json(json!({
         "success": true,
+        "session": agent_config.name,
+        "session_id": record.id,
+        // Retained for older clients using /add-agent.
         "agent": agent_config.name,
     })))
 }
@@ -819,6 +826,46 @@ mod tests {
             runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
         );
+    }
+
+    #[tokio::test]
+    async fn add_session_returns_the_logical_session_id() {
+        let config_path = std::env::temp_dir().join("test-xpressclaw-add-session.yaml");
+        let _ = std::fs::remove_file(&config_path);
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Website maintainer",
+                            "runner_kind": "codex",
+                            "runner_workspace": "/tmp"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["session"], "website-maintainer");
+        assert!(body["session_id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.agents.len(), 1);
+        assert_eq!(saved.agents[0].runner.workspace.as_deref(), Some("/tmp"));
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[tokio::test]
@@ -1024,13 +1071,13 @@ mod tests {
         assert!(reloaded.mcp_servers.is_empty());
         let _ = std::fs::remove_file(&roundtrip_path);
 
-        // ── Step 2: add developer agent via add-agent ──
+        // ── Step 2: add another native session ──
         let resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/setup/add-agent")
+                    .uri("/setup/add-session")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
@@ -1118,7 +1165,7 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// add-agent should not inject a preset's legacy MCP servers.
+    /// The legacy add-agent alias should not inject preset MCP servers.
     #[tokio::test]
     async fn test_add_agent_frontend_mcp_overrides() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");

@@ -774,11 +774,10 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify(data)
 		}),
-	addAgent: (data: {
-		name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string;
+	addSession: (data: {
+		name: string;
 		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[];
-		mcp_servers?: Record<string, unknown>;
-	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
+	}) => request<{ success: boolean; session: string; session_id: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})

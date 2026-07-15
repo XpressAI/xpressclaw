@@ -94,7 +94,7 @@
 				<div class="rounded-2xl border border-dashed border-border bg-card p-8 text-center">
 					<h2 class="text-base font-semibold">Create a native session first</h2>
 					<p class="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Choose Codex, Claude Code, OpenCode, or a custom runner and connect it to a project workspace.</p>
-					<a href="/setup?mode=add-agent" class="mt-5 inline-flex rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create session</a>
+					<a href="/setup?mode=add-session" class="mt-5 inline-flex rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create session</a>
 				</div>
 			{:else}
 			<!-- Queue work directly into the selected logical session. -->

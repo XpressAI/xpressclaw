@@ -105,7 +105,7 @@
 
 	{#if agentList.length === 0}
 		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
-			Schedules send tasks to a session. <a href="/setup?mode=add-agent" class="font-medium text-primary hover:underline">Create a session</a> first.
+			Schedules send tasks to a session. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create a session</a> first.
 		</div>
 	{/if}
 

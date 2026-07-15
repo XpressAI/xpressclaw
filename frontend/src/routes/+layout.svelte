@@ -170,7 +170,7 @@
 					<div class="px-3 pt-1">
 						<div class="flex items-center justify-between px-1 pb-1.5">
 							<span class={sectionHeader}>Sessions</span>
-							<a href="/setup?mode=add-agent" class={plusButton} title="Add session">+</a>
+							<a href="/setup?mode=add-session" class={plusButton} title="Add session">+</a>
 						</div>
 					</div>
 					<div class="px-2 space-y-0.5">
@@ -185,7 +185,7 @@
 								<span class="truncate">{agent.config?.display_name || agent.name}</span>
 							</a>
 						{:else}
-							<a href="/setup?mode=add-agent" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first session</a>
+							<a href="/setup?mode=add-session" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first session</a>
 						{/each}
 					</div>
 

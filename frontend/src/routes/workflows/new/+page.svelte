@@ -181,7 +181,7 @@ flows:
 		<div class="rounded-xl border border-dashed border-border bg-card p-8 text-center">
 			<h2 class="text-base font-semibold">Workflows need at least one session</h2>
 			<p class="mt-2 text-sm text-muted-foreground">Create the native sessions that will perform each step.</p>
-			<a href="/setup?mode=add-agent" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create session</a>
+			<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create session</a>
 		</div>
 	{:else}
 		<div class="grid gap-3 sm:grid-cols-2">

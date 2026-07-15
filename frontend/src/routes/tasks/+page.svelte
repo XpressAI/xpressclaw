@@ -140,7 +140,7 @@
 
 	{#if agentList.length === 0}
 		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
-			Tasks need a session so they can run. <a href="/setup?mode=add-agent" class="font-medium text-primary hover:underline">Create a session</a> first.
+			Tasks need a session so they can run. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create a session</a> first.
 		</div>
 	{/if}
 
