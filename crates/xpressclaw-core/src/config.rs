@@ -257,26 +257,6 @@ impl Default for NativeRunnerConfig {
     }
 }
 
-impl NativeRunnerConfig {
-    /// Replace the local-only image names used by the first native-session
-    /// prototype with the published images. Exact matches only: customized
-    /// image names remain untouched.
-    fn migrate_legacy_image(&mut self) {
-        self.image = match self.image.as_str() {
-            "xpressclaw-runner-codex:latest" => {
-                "ghcr.io/xpressai/xpressclaw-runner-codex:latest".to_string()
-            }
-            "xpressclaw-runner-claude:latest" => {
-                "ghcr.io/xpressai/xpressclaw-runner-claude:latest".to_string()
-            }
-            "xpressclaw-runner-opencode:latest" => {
-                "ghcr.io/xpressai/xpressclaw-runner-opencode:latest".to_string()
-            }
-            _ => return,
-        };
-    }
-}
-
 /// Built-in image for a resolved native runner kind. Keeping this mapping in
 /// the control plane lets each image contain only its own CLI while custom
 /// runners continue to require an explicit image.
@@ -598,7 +578,6 @@ impl Config {
     pub fn migrate_legacy_fields(&mut self) {
         for agent in &mut self.agents {
             agent.migrate_legacy_model();
-            agent.runner.migrate_legacy_image();
         }
     }
 
@@ -954,24 +933,6 @@ agents:
             Some("explicit-model")
         );
         assert_eq!(agent.model, None);
-    }
-
-    #[test]
-    fn test_migrate_legacy_native_runner_image() {
-        let yaml = r#"
-agents:
-  - name: legacy
-    backend: codex
-    runner:
-      kind: codex
-      image: xpressclaw-runner-codex:latest
-"#;
-        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
-        config.migrate_legacy_fields();
-        assert_eq!(
-            config.agents[0].runner.image,
-            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
-        );
     }
 
     #[test]

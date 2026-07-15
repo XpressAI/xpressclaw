@@ -7,11 +7,13 @@ use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::AgentConfig;
+use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::sessions::{NewEvent, SessionManager};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    resolve_runner_kind, resolved_runner_image, subscription_auth_available,
+    local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    subscription_auth_available,
 };
 
 use crate::state::AppState;
@@ -106,7 +108,7 @@ async fn prepare_runner(
             Json(json!({ "error": "Docker or Podman is not available" })),
         )
     })?;
-    if !docker.has_image(&image).await {
+    if available_runner_image(&docker, &image).await.is_none() {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
     Ok(Json(readiness(&state, &agent).await?))
@@ -126,10 +128,11 @@ async fn readiness(
     let auth_present = !auth_required || subscription_auth_available(&kind);
     let docker = state.docker().await;
     let docker_available = docker.is_some();
-    let image_present = match docker {
-        Some(docker) => docker.has_image(&image).await,
-        None => false,
+    let runtime_image = match docker.as_ref() {
+        Some(docker) => available_runner_image(docker, &image).await,
+        None => None,
     };
+    let image_present = runtime_image.is_some();
     let mut issues = Vec::new();
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
@@ -156,6 +159,7 @@ async fn readiness(
         "docker_available": docker_available,
         "kind": kind,
         "image": image,
+        "runtime_image": runtime_image,
         "image_present": image_present,
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
@@ -164,6 +168,18 @@ async fn readiness(
         "auth_present": auth_present,
         "issues": issues,
     }))
+}
+
+async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
+    if docker.has_image(image).await {
+        return Some(image.to_string());
+    }
+    if let Some(local_image) = local_runner_image_alias(image) {
+        if docker.has_image(local_image).await {
+            return Some(local_image.to_string());
+        }
+    }
+    None
 }
 
 fn session_config(state: &AppState, id: &str) -> Result<AgentConfig, (StatusCode, Json<Value>)> {

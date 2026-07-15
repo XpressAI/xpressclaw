@@ -358,6 +358,7 @@ export interface RunnerReadiness {
 	docker_available: boolean;
 	kind: string;
 	image: string;
+	runtime_image: string | null;
 	image_present: boolean;
 	workspace: string;
 	workspace_present: boolean;

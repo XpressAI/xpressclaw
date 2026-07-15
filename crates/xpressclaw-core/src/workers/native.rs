@@ -142,16 +142,24 @@ async fn execute_item(
     let board = TaskBoard::new(db.clone());
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
-    let spec = build_spec(&config, agent, &kind, &prompt)?;
+    let mut spec = build_spec(&config, agent, &kind, &prompt)?;
     if !docker.has_image(&spec.image).await {
-        sessions.transition_attempt(
-            attempt_id,
-            "preparing",
-            &format!("Pulling {kind} runner image"),
-            None,
-            None,
-        )?;
-        docker.pull_image(&spec.image).await?;
+        let local_fallback = match local_runner_image_alias(&spec.image) {
+            Some(image) if docker.has_image(image).await => Some(image),
+            _ => None,
+        };
+        if let Some(local_image) = local_fallback {
+            spec.image = local_image.to_string();
+        } else {
+            sessions.transition_attempt(
+                attempt_id,
+                "preparing",
+                &format!("Pulling {kind} runner image"),
+                None,
+                None,
+            )?;
+            docker.pull_image(&spec.image).await?;
+        }
     }
     let workload_id = format!("attempt-{attempt_id}");
     let container = docker.launch(&workload_id, &spec).await?;
@@ -470,6 +478,22 @@ pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<
     Ok(config.image.trim().to_string())
 }
 
+/// Local tags used by the native-session prototype. A published image is the
+/// default, but retaining these aliases lets existing developer builds run
+/// without a forced retag or registry pull.
+pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
+    match image {
+        "ghcr.io/xpressai/xpressclaw-runner-codex:latest" => Some("xpressclaw-runner-codex:latest"),
+        "ghcr.io/xpressai/xpressclaw-runner-claude:latest" => {
+            Some("xpressclaw-runner-claude:latest")
+        }
+        "ghcr.io/xpressai/xpressclaw-runner-opencode:latest" => {
+            Some("xpressclaw-runner-opencode:latest")
+        }
+        _ => None,
+    }
+}
+
 fn command_for(config: &NativeRunnerConfig, kind: &str, prompt: &str) -> Result<Vec<String>> {
     if !config.command.is_empty() {
         return Ok(config
@@ -786,6 +810,15 @@ mod tests {
         assert_eq!(read_write.source, "/tmp/project");
         assert_eq!(read_write.target, "/workspace/project");
         assert!(!read_write.read_only);
+    }
+
+    #[test]
+    fn published_images_keep_the_prototype_local_aliases() {
+        assert_eq!(
+            local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
+            Some("xpressclaw-runner-codex:latest")
+        );
+        assert_eq!(local_runner_image_alias("example/custom:latest"), None);
     }
 
     #[test]
