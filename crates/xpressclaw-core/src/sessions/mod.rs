@@ -223,6 +223,7 @@ impl SessionManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_attempt(
         &self,
         session_id: &str,

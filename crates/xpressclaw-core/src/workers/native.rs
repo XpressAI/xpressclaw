@@ -583,13 +583,9 @@ fn host_home() -> Option<PathBuf> {
 }
 
 fn parse_volume(raw: &str) -> Option<VolumeMount> {
-    let mut parts = raw.rsplitn(2, ':');
-    let target_or_mode = parts.next()?;
-    let source_or_target = parts.next()?;
+    let (source_or_target, target_or_mode) = raw.rsplit_once(':')?;
     if target_or_mode == "ro" || target_or_mode == "rw" {
-        let mut remaining = source_or_target.rsplitn(2, ':');
-        let target = remaining.next()?;
-        let source = remaining.next()?;
+        let (source, target) = source_or_target.rsplit_once(':')?;
         return Some(VolumeMount {
             source: expand_home(source),
             target: target.to_string(),
@@ -777,6 +773,19 @@ mod tests {
             Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
         );
         assert_eq!(default_native_runner_image("custom"), None);
+    }
+
+    #[test]
+    fn parses_read_only_and_read_write_volume_mounts() {
+        let read_only = parse_volume("/tmp/reference:/workspace/reference:ro").unwrap();
+        assert_eq!(read_only.source, "/tmp/reference");
+        assert_eq!(read_only.target, "/workspace/reference");
+        assert!(read_only.read_only);
+
+        let read_write = parse_volume("/tmp/project:/workspace/project").unwrap();
+        assert_eq!(read_write.source, "/tmp/project");
+        assert_eq!(read_write.target, "/workspace/project");
+        assert!(!read_write.read_only);
     }
 
     #[test]
