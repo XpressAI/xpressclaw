@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { sessions } from '$lib/api';
 	import type { SessionOverview, SessionEvent, WorkAttempt, RunnerReadiness } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
@@ -63,10 +64,9 @@
 		if (!content || sending) return;
 		sending = true;
 		try {
-			await sessions.sendMessage(agentId, content);
+			const queued = await sessions.sendMessage(agentId, content);
 			message = '';
-			await load();
-			await loadReadiness();
+			await goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {

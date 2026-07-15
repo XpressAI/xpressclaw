@@ -59,8 +59,8 @@
 		sendError = '';
 
 		try {
-			await sessions.sendMessage(selectedAgent, message.trim());
-			goto(`/agents/${selectedAgent}`);
+			const queued = await sessions.sendMessage(selectedAgent, message.trim());
+			goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
 			sendError = e instanceof Error ? e.message : String(e);
 		} finally {
