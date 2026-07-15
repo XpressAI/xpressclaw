@@ -27,7 +27,7 @@
 	<div class="flex items-center justify-between">
 		<div>
 			<h1 class="text-2xl font-bold">Sessions</h1>
-			<p class="text-sm text-muted-foreground mt-1">{agentList.length} native agent session{agentList.length === 1 ? '' : 's'}</p>
+			<p class="text-sm text-muted-foreground mt-1">{agentList.length} native session{agentList.length === 1 ? '' : 's'}</p>
 		</div>
 		<a href="/setup?mode=add-session"
 			class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">

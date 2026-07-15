@@ -10,7 +10,7 @@
 		<div class="mb-8 text-center">
 			<img src="/icon.png" alt="xpressclaw" class="mx-auto mb-4 h-12 w-12 rounded-xl" />
 			<h1 class="text-2xl font-bold text-foreground">Set up xpressclaw</h1>
-			<p class="mt-1 text-sm text-muted-foreground">Give a native agent harness a project and a durable place to work</p>
+			<p class="mt-1 text-sm text-muted-foreground">Give a native CLI a project and a durable place to work</p>
 		</div>
 
 		{@render children()}

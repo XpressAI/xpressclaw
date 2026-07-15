@@ -134,7 +134,7 @@
 				{isAddSession ? 'Create a session' : 'Create your first session'}
 			</h2>
 			<p class="mt-1 text-sm text-muted-foreground">
-				Connect an agent harness to a project. Work stays queued here while each attempt runs in an isolated container.
+				Connect a native CLI to a project. Work stays queued here while each attempt runs in an isolated container.
 			</p>
 		</div>
 		{#if isAddSession}
