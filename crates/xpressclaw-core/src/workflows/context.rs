@@ -15,6 +15,14 @@ pub fn build_context(
     for (k, v) in global_vars {
         ctx.insert(k.clone(), v.clone());
     }
+    // Manual runs and connector triggers can override declared defaults with
+    // top-level input fields while the original payload remains available at
+    // `trigger.payload` for explicit event-oriented workflows.
+    if let Some(inputs) = trigger_data.as_object() {
+        for (key, value) in inputs {
+            ctx.insert(key.clone(), value.clone());
+        }
+    }
     for (k, v) in step_outputs {
         ctx.insert(k.clone(), v.clone());
     }
@@ -183,6 +191,17 @@ mod tests {
 
         let ctx = build_context(&trigger_data, &global_vars, &HashMap::new());
         assert_eq!(ctx["default_agent"], "atlas");
+    }
+
+    #[test]
+    fn test_trigger_inputs_override_global_defaults() {
+        let trigger_data = serde_json::json!({"goal": "Fix the real bug"});
+        let mut global_vars = HashMap::new();
+        global_vars.insert("goal".to_string(), serde_json::json!("Describe the goal"));
+
+        let ctx = build_context(&trigger_data, &global_vars, &HashMap::new());
+        assert_eq!(ctx["goal"], "Fix the real bug");
+        assert_eq!(ctx["trigger"]["payload"]["goal"], "Fix the real bug");
     }
 
     #[test]

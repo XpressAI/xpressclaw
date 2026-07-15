@@ -23,17 +23,17 @@
 
 	// -- Step 1: Native runner --
 	let llmProvider = $state('codex');
-	let runnerImage = $state('xpressclaw-runner-codex:latest');
+	let runnerImage = $state('ghcr.io/xpressai/xpressclaw-runner-codex:latest');
 	let subscriptionAuth = $state(true);
 	const runnerImages: Record<string, string> = {
-		codex: 'xpressclaw-runner-codex:latest',
-		claude: 'xpressclaw-runner-claude:latest',
-		opencode: 'xpressclaw-runner-opencode:latest',
+		codex: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
+		claude: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest',
+		opencode: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest',
 		custom: ''
 	};
 
-	// -- Step 2: Workspace resources --
-	// Workspace folders to mount into /workspace/{basename}
+	// -- Step 2: Primary workspace and optional resources --
+	let workspacePath = $state('');
 	let workspaceFolders = $state<string[]>([]);
 	let newFolderPath = $state('');
 	let composingFolder = $state(false);
@@ -54,8 +54,15 @@
 	};
 
 	onMount(async () => {
-		// Load presets immediately (first step)
-		try { presets = await setup.presets(); } catch {}
+		// Load profile choices and suggest the directory xpressclaw was
+		// launched from as the first session's project workspace.
+		try {
+			const [loadedPresets, info] = await Promise.all([setup.presets(), setup.systemInfo()]);
+			presets = loadedPresets;
+			workspacePath = info.working_directory ?? '';
+		} catch {
+			try { presets = await setup.presets(); } catch {}
+		}
 
 		// Check Docker in background
 		try { dockerStatus = await setup.checkDocker(); } catch {
@@ -114,9 +121,12 @@
 					name: agentName,
 					preset: selectedPreset?.id,
 					role: customRole || undefined,
+					role_title: agentRoleTitle || undefined,
+					responsibilities: agentResponsibilities || undefined,
 					backend: llmProvider,
 					runner_kind: llmProvider,
 					runner_image: runnerImage,
+					runner_workspace: workspacePath.trim(),
 					subscription_auth: subscriptionAuth,
 					volumes: volumes.length > 0 ? volumes : undefined,
 				});
@@ -136,6 +146,7 @@
 						backend: llmProvider,
 						runner_kind: llmProvider,
 						runner_image: runnerImage,
+						runner_workspace: workspacePath.trim(),
 						subscription_auth: subscriptionAuth,
 						volumes: volumes.length > 0 ? volumes : undefined,
 					}],
@@ -320,7 +331,7 @@
 				<label for="runner-image" class="block text-xs font-medium text-foreground mb-1">Worker image</label>
 				<input id="runner-image" type="text" bind:value={runnerImage}
 					class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
-				<p class="mt-1 text-xs text-muted-foreground">Each built-in image contains only the selected native CLI. Extend it when the runner itself needs additional tools.</p>
+				<p class="mt-1 text-xs text-muted-foreground">The published image contains only this native CLI and is pulled on demand. You can replace it with your own compatible image.</p>
 			</div>
 			<label class="flex items-start gap-3 cursor-pointer">
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
@@ -341,18 +352,25 @@
 				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
 		</div>
 
-	<!-- Step 2: Workspace & Tools -->
+	<!-- Step 2: Workspace -->
 	{:else if step === 2}
-		<h2 class="text-lg font-semibold text-foreground mb-1">Workspace Resources</h2>
+		<h2 class="text-lg font-semibold text-foreground mb-1">Project Workspace</h2>
 		<p class="text-sm text-muted-foreground mb-6">
-			Choose the folders that short-lived workers may read and write.
+			Choose the project this session can read and change. It is mounted at <code>/workspace</code> for every attempt.
 		</p>
 
-		<!-- Workspace Folders -->
 		<div class="mb-6">
-			<h3 class="text-sm font-medium text-foreground mb-2">Workspace Folders</h3>
+			<label for="workspace-path" class="mb-1 block text-sm font-medium text-foreground">Primary project folder</label>
+			<input id="workspace-path" type="text" bind:value={workspacePath} placeholder="~/projects/my-app"
+				class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+			<p class="mt-1 text-xs text-muted-foreground">This folder must already exist on the machine running xpressclaw.</p>
+		</div>
+
+		<!-- Optional resource folders -->
+		<div class="mb-6">
+			<h3 class="text-sm font-medium text-foreground mb-2">Additional folders <span class="font-normal text-muted-foreground">(optional)</span></h3>
 			<p class="text-xs text-muted-foreground mb-3">
-				Each folder is mounted below <code class="bg-muted px-1 rounded">/workspace/</code> in addition to the main project workspace.
+				Add shared references or sibling repositories below <code class="bg-muted px-1 rounded">/workspace/</code>.
 			</p>
 			{#if workspaceFolders.length > 0}
 				<div class="space-y-2 mb-3">
@@ -388,8 +406,8 @@
 			{:else}
 				<button onclick={() => goToStep(1)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
 			{/if}
-			<button onclick={() => goToStep(3)}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
+			<button onclick={() => goToStep(3)} disabled={!workspacePath.trim()}
+				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50">Continue</button>
 		</div>
 
 	<!-- Step 3: Docker / Environment -->
@@ -458,7 +476,7 @@
 				{mode === 'add-agent' ? 'Session Added!' : 'Setup Complete!'}
 			</h2>
 			<p class="text-sm text-muted-foreground mb-6">
-				Your session <strong>{agentName}</strong> is ready to queue native work.
+				Your session <strong>{agentName}</strong> is configured. Open it to check authentication and prepare its runner image.
 			</p>
 			<button onclick={() => goto('/agents')}
 				class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90">

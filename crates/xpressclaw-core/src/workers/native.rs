@@ -114,7 +114,7 @@ async fn execute_item(
         .ok_or_else(|| Error::AgentNotFound {
             name: item.agent_id.clone(),
         })?;
-    let kind = resolve_kind(agent)?;
+    let kind = resolve_runner_kind(agent)?;
     let prompt = build_prompt(&db, agent, &item, attempt_id)?;
     db.with_conn(|conn| {
         conn.execute(
@@ -143,6 +143,16 @@ async fn execute_item(
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
     let spec = build_spec(&config, agent, &kind, &prompt)?;
+    if !docker.has_image(&spec.image).await {
+        sessions.transition_attempt(
+            attempt_id,
+            "preparing",
+            &format!("Pulling {kind} runner image"),
+            None,
+            None,
+        )?;
+        docker.pull_image(&spec.image).await?;
+    }
     let workload_id = format!("attempt-{attempt_id}");
     let container = docker.launch(&workload_id, &spec).await?;
     sessions.set_container(attempt_id, &container.container_id)?;
@@ -204,10 +214,11 @@ async fn execute_item(
         None,
         json!({ "runner": kind }),
     )?;
+    let completion_summary = truncate(&parsed.summary, 2_000);
     sessions.transition_attempt(
         attempt_id,
         "completed",
-        "Work completed",
+        &completion_summary,
         Some(&parsed.summary),
         None,
     )?;
@@ -316,7 +327,7 @@ fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str, output: &st
     }
 }
 
-fn resolve_kind(agent: &AgentConfig) -> Result<String> {
+pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
     if agent.runner.kind != "auto" {
         return Ok(agent.runner.kind.to_lowercase());
     }
@@ -404,16 +415,17 @@ fn build_spec(
     prompt: &str,
 ) -> Result<ContainerSpec> {
     let command = command_for(&agent.runner, kind, prompt)?;
-    let image = if agent.runner.image.trim().is_empty() {
-        default_native_runner_image(kind).ok_or_else(|| {
-            Error::Backend(format!(
-                "runner '{kind}' requires an explicit container image"
-            ))
-        })?
-    } else {
-        agent.runner.image.trim()
-    };
-    let workspace = canonical_or_original(&config.system.workspace_dir);
+    let image = resolved_runner_image(&agent.runner, kind)?;
+    let workspace = agent
+        .runner
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(expand_home)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.system.workspace_dir.clone());
+    let workspace = canonical_or_original(&workspace);
     let mut volumes = vec![VolumeMount {
         source: workspace.display().to_string(),
         target: "/workspace".to_string(),
@@ -429,7 +441,7 @@ fn build_spec(
     }
 
     Ok(ContainerSpec {
-        image: image.to_string(),
+        image,
         memory_limit: Some(4 * 1024 * 1024 * 1024),
         cpu_limit: None,
         environment: vec![
@@ -443,6 +455,19 @@ fn build_spec(
         cmd: Some(command),
         working_dir: Some("/workspace".to_string()),
     })
+}
+
+pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
+    if config.image.trim().is_empty() {
+        return default_native_runner_image(kind)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "runner '{kind}' requires an explicit container image"
+                ))
+            });
+    }
+    Ok(config.image.trim().to_string())
 }
 
 fn command_for(config: &NativeRunnerConfig, kind: &str, prompt: &str) -> Result<Vec<String>> {
@@ -491,11 +516,11 @@ fn command_for(config: &NativeRunnerConfig, kind: &str, prompt: &str) -> Result<
     }
 }
 
-fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
+fn auth_candidates(kind: &str) -> Vec<(PathBuf, &'static str, bool)> {
     let Some(home) = host_home() else {
         return Vec::new();
     };
-    let mut candidates: Vec<(PathBuf, &str, bool)> = match kind {
+    match kind {
         "codex" => vec![(home.join(".codex"), "/home/node/.codex", false)],
         "claude" => vec![
             (home.join(".claude"), "/home/node/.claude", false),
@@ -514,7 +539,23 @@ fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
             ),
         ],
         _ => Vec::new(),
+    }
+}
+
+/// Whether the host has a standard login location that can be mounted for the
+/// selected native product. This intentionally reports only presence, never
+/// credential contents.
+pub fn subscription_auth_available(kind: &str) -> bool {
+    auth_candidates(kind)
+        .iter()
+        .any(|(source, _, _)| source.exists())
+}
+
+fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
+    let Some(home) = host_home() else {
+        return Vec::new();
     };
+    let mut candidates = auth_candidates(kind);
     // Git identity and `gh` authentication let coding workflows push or mark
     // a PR ready without copying credentials into the image. SSH keys are not
     // mounted implicitly; users can opt in with an explicit volume.
@@ -685,7 +726,7 @@ mod tests {
             backend: "claude-sdk".to_string(),
             ..Default::default()
         };
-        assert_eq!(resolve_kind(&agent).unwrap(), "claude");
+        assert_eq!(resolve_runner_kind(&agent).unwrap(), "claude");
     }
 
     #[test]
@@ -725,15 +766,15 @@ mod tests {
     fn selects_a_minimal_image_for_each_native_runner() {
         assert_eq!(
             default_native_runner_image("codex"),
-            Some("xpressclaw-runner-codex:latest")
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
         );
         assert_eq!(
             default_native_runner_image("claude"),
-            Some("xpressclaw-runner-claude:latest")
+            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
         );
         assert_eq!(
             default_native_runner_image("opencode"),
-            Some("xpressclaw-runner-opencode:latest")
+            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
         );
         assert_eq!(default_native_runner_image("custom"), None);
     }

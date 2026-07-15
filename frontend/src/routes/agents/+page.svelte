@@ -27,7 +27,7 @@
 	<div class="flex items-center justify-between">
 		<div>
 			<h1 class="text-2xl font-bold">Sessions</h1>
-			<p class="text-sm text-muted-foreground mt-1">{agentList.length} persistent workspaces</p>
+			<p class="text-sm text-muted-foreground mt-1">{agentList.length} native agent session{agentList.length === 1 ? '' : 's'}</p>
 		</div>
 		<a href="/setup?mode=add-agent"
 			class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">
@@ -40,7 +40,8 @@
 	{:else if agentList.length === 0}
 		<div class="rounded-lg border border-border bg-card p-8 text-center">
 			<p class="text-muted-foreground">No sessions configured.</p>
-			<p class="text-sm text-muted-foreground mt-2">Create a profile to connect a native coding agent.</p>
+			<p class="text-sm text-muted-foreground mt-2">Create one to connect a native CLI to a project workspace.</p>
+			<a href="/setup?mode=add-agent" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create session</a>
 		</div>
 	{:else}
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -64,9 +65,7 @@
 						<div class="text-xs text-destructive bg-destructive/10 rounded px-2 py-1">{agent.error_message}</div>
 					{/if}
 
-					<div class="text-xs text-muted-foreground">
-						Available continuously &middot; created {timeAgo(agent.created_at)}
-					</div>
+					<div class="text-xs text-muted-foreground">Accepts queued work continuously &middot; created {timeAgo(agent.created_at)}</div>
 
 					<div class="flex gap-2">
 						<a

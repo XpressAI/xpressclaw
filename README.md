@@ -32,10 +32,12 @@ xpressclaw init
 xpressclaw up
 ```
 
-Build the runner you want, open `http://localhost:8935`, and send work to a session:
+Open `http://localhost:8935`, create a session, choose a project workspace,
+and send it work. The matching runner image is pulled automatically. To build
+the Codex runner locally instead:
 
 ```bash
-docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
 ```
 
 ## Why xpressclaw?
@@ -58,10 +60,6 @@ The primary interface is a durable event timeline. It accepts a new message whil
 ### Autonomous Task Execution
 
 Native workers pick up tasks from a queue and publish structured progress and artifacts. Schedule recurring work with cron expressions. Workflows coordinate different products—for example, Codex implementing and Claude reviewing in a loop.
-
-### Persistent Memory
-
-Zettelkasten-style knowledge base with vector search (sqlite-vec). Agents remember context across sessions and retrieve relevant information automatically.
 
 ### Multiple Native Runners
 
@@ -158,15 +156,12 @@ agents:
     backend: codex
     runner:
       kind: codex
-      image: xpressclaw-runner-codex:latest
+      image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
+      workspace: /home/me/projects/my-app
       subscription_auth: true
       max_turns: 100
     role: |
       You own implementation work in this repository.
-
-memory:
-  near_term_slots: 8
-  eviction: least-recently-relevant
 
 ```
 
@@ -225,9 +220,9 @@ Build only the product you use. Each image is deliberately independent so it
 can be versioned or extended without pulling in the other agent CLIs:
 
 ```bash
-docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
-docker build -t xpressclaw-runner-claude:latest harnesses/native/claude
-docker build -t xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
+docker build -t ghcr.io/xpressai/xpressclaw-runner-claude:latest harnesses/native/claude
+docker build -t ghcr.io/xpressai/xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
 
 See `harnesses/native/README.md` for customization guidance and the planned
@@ -274,7 +269,7 @@ xpressclaw is a Cargo workspace with four crates:
 xpressclaw (single ~12MB binary)
 +-- Axum server (REST API + embedded SvelteKit frontend)
 +-- Session event log (messages, attempts, provenance, artifacts)
-+-- SQLite + sqlite-vec (tasks, workflows, schedules, memory)
++-- SQLite (sessions, events, tasks, workflows, and schedules)
 +-- Native worker dispatcher (Codex / Claude Code / OpenCode / custom)
 +-- Docker Manager (short-lived attempt containers)
 ```
@@ -282,7 +277,7 @@ xpressclaw (single ~12MB binary)
 **Key design decisions:**
 - **Single binary** — server, API, frontend, and CLI in one executable
 - **Docker required** — worker isolation is not optional
-- **SQLite for everything** — tasks, memory, embeddings, conversations, budget
+- **Durable local state** — sessions, task queues, schedules, and workflow runs survive restarts
 - **Native agent ownership** — agent products own their reasoning loop and tool protocol
 
 ## CLI Reference
@@ -294,9 +289,6 @@ xpressclaw down              Stop the control plane and active workers
 xpressclaw status            Show logical session status
 xpressclaw chat <session>    Send messages through a logical session
 xpressclaw tasks             Task management (list, create, update, delete)
-xpressclaw memory            Memory inspection (list, search, add)
-xpressclaw budget            Budget report and usage history
-xpressclaw sop               SOP management (list, create, run)
 xpressclaw logs              Activity log viewer
 ```
 

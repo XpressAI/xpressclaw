@@ -285,6 +285,7 @@ export const agents = {
 export interface NativeRunnerConfig {
 	kind: string;
 	image: string;
+	workspace: string | null;
 	command: string[];
 	subscription_auth: boolean;
 	max_turns: number;
@@ -352,8 +353,27 @@ export interface SessionOverview {
 	artifacts: AttemptArtifact[];
 }
 
+export interface RunnerReadiness {
+	ready: boolean;
+	docker_available: boolean;
+	kind: string;
+	image: string;
+	image_present: boolean;
+	workspace: string;
+	workspace_present: boolean;
+	command_present: boolean;
+	subscription_auth: boolean;
+	auth_present: boolean;
+	issues: string[];
+}
+
 export const sessions = {
 	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
+	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
+	prepare: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`, {
+		method: 'POST',
+		body: '{}'
+	}),
 	events: (id: string, after?: number) => {
 		const query = after ? `?after=${after}` : '';
 		return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
@@ -433,7 +453,7 @@ export const tasks = {
 			body: JSON.stringify({ role, content })
 		}),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
-	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; depends_on?: string[] }[]; parent_task_id?: string }) =>
+	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; depends_on?: string[] }[]; parent_task_id?: string }) =>
 		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
 	addDependency: (taskId: string, dependsOn: string) =>
 		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {
@@ -646,6 +666,7 @@ export interface SystemInfo {
 	};
 	os: string;
 	arch: string;
+	working_directory: string | null;
 }
 
 export interface OllamaInfo {
@@ -744,7 +765,7 @@ export const setup = {
 		// `provider` is one of: openai, anthropic, ollama. Local inference goes
 		// through Ollama only — there is no embedded llama.cpp anymore.
 		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string };
-		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; backend?: string; runner_kind?: string; runner_image?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[] }[];
+		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -753,8 +774,8 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addAgent: (data: {
-		name: string; preset?: string; role?: string; model?: string;
-		backend?: string; runner_kind?: string; runner_image?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[];
+		name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string;
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; tools?: string[]; volumes?: string[];
 		mcp_servers?: Record<string, unknown>;
 	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
 		method: 'POST',

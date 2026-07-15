@@ -11,8 +11,8 @@ use tracing::{info, warn};
 use xpressclaw_core::agents::presets::builtin_presets;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
-    default_mcp_servers, default_native_runner_image, AgentConfig, AgentLlmConfig, Config,
-    LlmConfig, McpServerConfig, NativeRunnerConfig,
+    default_native_runner_image, AgentConfig, AgentLlmConfig, Config, LlmConfig, McpServerConfig,
+    NativeRunnerConfig,
 };
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -179,7 +179,11 @@ async fn start_docker() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 /// Detect system hardware (RAM, CPU, GPU).
 async fn system_info() -> Json<Value> {
     let info = system::detect();
-    Json(json!(info))
+    let mut value = json!(info);
+    value["working_directory"] = json!(std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string()));
+    Json(value)
 }
 
 /// Check if Ollama is running and list models.
@@ -325,6 +329,7 @@ struct AgentSetup {
     backend: Option<String>,
     runner_kind: Option<String>,
     runner_image: Option<String>,
+    runner_workspace: Option<String>,
     subscription_auth: Option<bool>,
     model: Option<String>,
     tools: Option<Vec<String>>,
@@ -350,6 +355,12 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
     NativeRunnerConfig {
         kind,
         image,
+        workspace: setup
+            .runner_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .map(str::to_owned),
         subscription_auth: setup.subscription_auth.unwrap_or(true),
         ..Default::default()
     }
@@ -393,17 +404,11 @@ async fn complete_setup(
                     .as_deref()
                     .and_then(|id| presets.iter().find(|p| p.id == id));
 
-                let mut tools = a
+                let tools = a
                     .tools
                     .clone()
                     .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
                     .unwrap_or_default();
-                // Shell + filesystem are always included
-                for default_tool in ["filesystem", "shell"] {
-                    if !tools.iter().any(|t| t == default_tool) {
-                        tools.insert(0, default_tool.to_string());
-                    }
-                }
 
                 // Per-agent LLM config built from the wizard's selections.
                 // Each agent gets its own provider/model/key/base_url so it
@@ -468,11 +473,7 @@ async fn complete_setup(
                     llm: agent_llm,
                     runner: runner_from_setup(a),
                     tools,
-                    skills: vec![
-                        "memory-system".to_string(),
-                        "task-management".to_string(),
-                        "build-app".to_string(),
-                    ],
+                    skills: Vec::new(),
                     volumes: a.volumes.clone().unwrap_or_default(),
                     ..Default::default()
                 }
@@ -480,31 +481,12 @@ async fn complete_setup(
             .collect()
     };
 
-    // Merge MCP servers: built-in defaults + preset + frontend overrides.
-    let mut mcp_servers = req.mcp_servers;
-    // Built-in defaults (tasks, memory, skills, apps, shell, filesystem)
-    for (name, server) in default_mcp_servers() {
-        mcp_servers.entry(name).or_insert(server);
-    }
-    // Preset-specific servers
-    for agent_setup in &req.agents {
-        if let Some(preset) = agent_setup
-            .preset
-            .as_deref()
-            .and_then(|id| presets.iter().find(|p| p.id == id))
-        {
-            for (name, server) in &preset.default_mcp_servers {
-                if !mcp_servers.contains_key(name) {
-                    mcp_servers.insert(name.clone(), server.clone());
-                }
-            }
-        }
-    }
-
     let mut config = Config {
         llm,
         agents,
-        mcp_servers,
+        // Native CLIs own their tool loop. Only keep connectors the user
+        // explicitly configured; do not inject the retired agent-layer MCPs.
+        mcp_servers: req.mcp_servers,
         ..Default::default()
     };
     config.system.isolation = req.isolation.clone();
@@ -575,27 +557,15 @@ async fn add_agent(
         .as_deref()
         .and_then(|id| presets.iter().find(|p| p.id == id));
 
-    let mut tools = req
+    let tools = req
         .tools
         .clone()
         .or(preset.map(|p| p.default_tools.iter().map(|s| s.to_string()).collect()))
         .unwrap_or_default();
-    for default_tool in ["filesystem", "shell"] {
-        if !tools.iter().any(|t| t == default_tool) {
-            tools.insert(0, default_tool.to_string());
-        }
-    }
 
     // Native products own model selection and authentication. Keep the old
     // per-agent LLM block empty for newly-created sessions.
     let agent_llm = None;
-
-    // Default skills for new agents
-    let default_skills = vec![
-        "memory-system".to_string(),
-        "task-management".to_string(),
-        "build-app".to_string(),
-    ];
 
     // Slugify the name and ensure uniqueness
     let old_config = state.config();
@@ -605,6 +575,8 @@ async fn add_agent(
     let agent_config = AgentConfig {
         name: agent_id.clone(),
         display_name: Some(req.name.clone()),
+        role_title: req.role_title.clone(),
+        responsibilities: req.responsibilities.clone(),
         backend: req
             .runner_kind
             .clone()
@@ -621,7 +593,7 @@ async fn add_agent(
         llm: agent_llm,
         runner: runner_from_setup(&req),
         tools,
-        skills: default_skills,
+        skills: Vec::new(),
         volumes: req.volumes.clone().unwrap_or_default(),
         ..Default::default()
     };
@@ -637,21 +609,9 @@ async fn add_agent(
         new_agents.push(agent_config.clone());
     }
 
-    // Merge MCP servers: built-in defaults + preset + existing + frontend overrides.
+    // Preserve existing explicit connectors and merge only new explicit
+    // overrides. Native CLIs do not consume the old built-in agent MCP layer.
     let mut new_mcp = old_config.mcp_servers.clone();
-    // Add built-in defaults (tasks, memory, apps, skills, shell, filesystem)
-    for (name, server) in default_mcp_servers() {
-        new_mcp.entry(name).or_insert(server);
-    }
-    // Add preset-specific MCP servers
-    if let Some(preset) = preset {
-        for (name, server) in &preset.default_mcp_servers {
-            if !new_mcp.contains_key(name) {
-                new_mcp.insert(name.clone(), server.clone());
-            }
-        }
-    }
-    // Frontend-provided MCP servers override defaults.
     for (name, server) in req.mcp_servers {
         new_mcp.insert(name, server);
     }
@@ -855,7 +815,10 @@ mod tests {
         .unwrap();
         let runner = runner_from_setup(&setup);
         assert_eq!(runner.kind, "claude");
-        assert_eq!(runner.image, "xpressclaw-runner-claude:latest");
+        assert_eq!(
+            runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+        );
     }
 
     #[tokio::test]
@@ -895,6 +858,7 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert!(body["total_memory_gb"].as_f64().unwrap() > 0.0);
         assert!(body["cpu_count"].as_u64().unwrap() > 0);
+        assert!(body["working_directory"].as_str().is_some());
     }
 
     #[tokio::test]
@@ -986,47 +950,18 @@ mod tests {
             Some("local")
         );
 
-        // Verify agent has default skills
-        assert!(
-            config.agents[0]
-                .skills
-                .contains(&"memory-system".to_string()),
-            "agent should have memory-system skill, got: {:?}",
-            config.agents[0].skills
-        );
-        assert!(
-            config.agents[0]
-                .skills
-                .contains(&"task-management".to_string()),
-            "agent should have task-management skill"
-        );
-        assert!(
-            config.agents[0].skills.contains(&"build-app".to_string()),
-            "agent should have build-app skill"
-        );
-
-        // Verify default MCP servers are present
-        assert!(
-            config.mcp_servers.contains_key("xpressclaw"),
-            "should have xpressclaw MCP server (unified tasks/memory/skills/apps), got: {:?}",
-            config.mcp_servers.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            config.mcp_servers.contains_key("shell"),
-            "should have shell MCP server"
-        );
-        assert!(
-            config.mcp_servers.contains_key("filesystem"),
-            "should have filesystem MCP server"
-        );
+        // Native products own their agent/tool loop; setup must not inject
+        // the retired xpressclaw agent-layer skills or MCP servers.
+        assert!(config.agents[0].skills.is_empty());
+        assert!(config.mcp_servers.is_empty());
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);
     }
 
     /// Verify the wizard writes a valid YAML config that round-trips through
-    /// Config::load, that preset MCP servers are merged, and that add-agent
-    /// also merges its preset's MCP servers.
+    /// Config::load and that native setup does not revive preset agent-layer
+    /// MCP servers when adding another session.
     #[tokio::test]
     async fn test_wizard_writes_valid_config_with_mcp_servers() {
         // Use a unique temp path to avoid collisions with other tests.
@@ -1079,21 +1014,14 @@ mod tests {
             config.agents[0].tools.contains(&"websearch".to_string()),
             "agent should have websearch tool"
         );
-        // Preset default_mcp_servers should have been merged
-        assert!(
-            config.mcp_servers.contains_key("websearch"),
-            "websearch MCP server should be configured from preset"
-        );
-        let ws_cfg = &config.mcp_servers["websearch"];
-        assert_eq!(ws_cfg.server_type, "stdio");
-        assert_eq!(ws_cfg.command.as_deref(), Some("npx"));
+        assert!(config.mcp_servers.is_empty());
 
         // Verify the YAML round-trips: save it again, reload, still valid
         let roundtrip_path = std::env::temp_dir().join("test-xpressclaw-wizard-roundtrip.yaml");
         config.save(&roundtrip_path).unwrap();
         let reloaded = Config::load(&roundtrip_path).unwrap();
         assert_eq!(reloaded.agents[0].name, "researcher");
-        assert!(reloaded.mcp_servers.contains_key("websearch"));
+        assert!(reloaded.mcp_servers.is_empty());
         let _ = std::fs::remove_file(&roundtrip_path);
 
         // ── Step 2: add developer agent via add-agent ──
@@ -1119,25 +1047,20 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Reload config — should now have both agents and their MCP servers
+        // Reload config — both native sessions should be preserved.
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
         let agent_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
         assert!(agent_names.contains(&"researcher"));
         assert!(agent_names.contains(&"developer"));
 
-        // Researcher's websearch should still be there
-        assert!(
-            config.mcp_servers.contains_key("websearch"),
-            "websearch MCP server should be preserved"
-        );
+        assert!(config.mcp_servers.is_empty());
 
         // Cleanup
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// Frontend-provided MCP servers should override preset defaults,
-    /// and explicit env vars (like URL filters) should be preserved.
+    /// Explicit connector configuration is still preserved.
     #[tokio::test]
     async fn test_frontend_mcp_servers_override_preset_defaults() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-override.yaml");
@@ -1186,7 +1109,6 @@ mod tests {
             .mcp_servers
             .get("websearch")
             .expect("websearch MCP server missing");
-        // Frontend's explicit config should win over preset default
         assert_eq!(
             ws_cfg.env.get("SEARCH_LANG").map(|s| s.as_str()),
             Some("en"),
@@ -1196,7 +1118,7 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// add-agent with researcher preset should merge its MCP servers.
+    /// add-agent should not inject a preset's legacy MCP servers.
     #[tokio::test]
     async fn test_add_agent_frontend_mcp_overrides() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-add-override.yaml");
@@ -1228,7 +1150,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Add researcher — preset's websearch MCP server should be merged
+        // Add researcher without explicit connectors.
         let resp = app
             .oneshot(
                 Request::builder()
@@ -1253,12 +1175,7 @@ mod tests {
         let config = Config::load(&config_path).unwrap();
         assert_eq!(config.agents.len(), 2);
 
-        // Researcher preset's websearch MCP server should be present
-        let ws_cfg = config
-            .mcp_servers
-            .get("websearch")
-            .expect("websearch MCP server missing from researcher preset");
-        assert_eq!(ws_cfg.command.as_deref(), Some("npx"),);
+        assert!(config.mcp_servers.is_empty());
 
         let _ = std::fs::remove_file(&config_path);
     }

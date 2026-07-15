@@ -1,15 +1,17 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { sessions } from '$lib/api';
-	import type { SessionOverview, SessionEvent, WorkAttempt } from '$lib/api';
+	import type { SessionOverview, SessionEvent, WorkAttempt, RunnerReadiness } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 
 	let { agentId }: { agentId: string } = $props();
 	let overview = $state<SessionOverview | null>(null);
+	let readiness = $state<RunnerReadiness | null>(null);
 	let error = $state<string | null>(null);
 	let message = $state('');
 	let sending = $state(false);
 	let cancelling = $state<string | null>(null);
+	let preparing = $state(false);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 	let visibleArtifacts = $derived(
@@ -18,6 +20,7 @@
 
 	onMount(() => {
 		load();
+		loadReadiness();
 		pollTimer = setInterval(load, 2000);
 	});
 
@@ -34,6 +37,27 @@
 		}
 	}
 
+	async function loadReadiness() {
+		try {
+			readiness = await sessions.readiness(agentId);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function prepareRunner() {
+		if (preparing) return;
+		preparing = true;
+		try {
+			readiness = await sessions.prepare(agentId);
+			error = null;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		} finally {
+			preparing = false;
+		}
+	}
+
 	async function send() {
 		const content = message.trim();
 		if (!content || sending) return;
@@ -42,6 +66,7 @@
 			await sessions.sendMessage(agentId, content);
 			message = '';
 			await load();
+			await loadReadiness();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -94,6 +119,33 @@
 <div class="mx-auto max-w-7xl space-y-5 pb-8">
 	{#if error}
 		<div class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
+	{/if}
+
+	{#if readiness && !readiness.ready}
+		<div class="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+				<div>
+					<h2 class="text-sm font-semibold text-amber-600">Runner needs attention</h2>
+					<ul class="mt-2 space-y-1 text-xs text-muted-foreground">
+						{#each readiness.issues as issue}<li>• {issue}</li>{/each}
+					</ul>
+					{#if !readiness.auth_present}
+						<p class="mt-2 text-xs text-foreground">Run <code>{readiness.kind} login</code> on the host, then refresh this page.</p>
+					{/if}
+				</div>
+				{#if readiness.docker_available && !readiness.image_present}
+					<button onclick={prepareRunner} disabled={preparing}
+						class="shrink-0 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+						{preparing ? 'Pulling image…' : 'Prepare runner'}
+					</button>
+				{/if}
+			</div>
+		</div>
+	{:else if readiness?.ready}
+		<div class="flex items-center justify-between rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-2.5 text-xs">
+			<span class="font-medium text-emerald-600">{readiness.kind} runner ready</span>
+			<span class="truncate pl-4 font-mono text-muted-foreground">{readiness.workspace}</span>
+		</div>
 	{/if}
 
 	{#if overview}

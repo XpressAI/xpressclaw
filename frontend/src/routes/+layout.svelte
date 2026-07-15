@@ -2,8 +2,8 @@
 	import '../app.css';
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
-	import { conversations, agents, apps as appsApi } from '$lib/api';
-	import type { Conversation, Agent, App } from '$lib/api';
+	import { agents } from '$lib/api';
+	import type { Agent } from '$lib/api';
 	import { agentAvatar } from '$lib/utils';
 
 	// Bottom tabs per ADR-016
@@ -19,9 +19,9 @@
 		(() => {
 			const p = $page.url.pathname;
 			if (p.startsWith('/tasks') || p.startsWith('/schedules')) return 'tasks';
-			if (p.startsWith('/procedures') || p.startsWith('/workflows') || p.startsWith('/skills')) return 'workflows';
+			if (p.startsWith('/workflows')) return 'workflows';
 			if (p.startsWith('/settings') || p.startsWith('/budget')) return 'settings';
-			return 'agents'; // default: /, /dashboard, /conversations/*, /agents/*, /memory
+			return 'agents';
 		})()
 	);
 
@@ -30,19 +30,13 @@
 		return pathname.startsWith(href);
 	}
 
-	function isConvActive(id: string, pathname: string): boolean {
-		return pathname === `/conversations/${id}`;
-	}
-
 	function isAgentActive(id: string, pathname: string): boolean {
 		return pathname === `/agents/${id}`;
 	}
 
 	let isSetupRoute = $derived($page.url.pathname.startsWith('/setup'));
 
-	let convList = $state<Conversation[]>([]);
 	let agentList = $state<Agent[]>([]);
-	let appList = $state<App[]>([]);
 
 	// Docker status — checked periodically
 	let dockerAvailable = $state(true);
@@ -60,14 +54,7 @@
 	}
 
 	async function loadSidebar() {
-		const [c, a, ap] = await Promise.all([
-			conversations.list().catch(() => []),
-			agents.list().catch(() => []),
-			appsApi.list().catch(() => [])
-		]);
-		convList = c;
-		agentList = a;
-		appList = ap;
+		agentList = await agents.list().catch(() => []);
 	}
 
 	async function checkDocker() {
@@ -143,20 +130,6 @@
 		return () => clearInterval(interval);
 	});
 
-	function convIcon(conv: Conversation): string {
-		if (conv.icon) return conv.icon;
-		const agentCount = conv.participants.filter(p => p.participant_type === 'agent').length;
-		return agentCount > 1 ? '👥' : '💬';
-	}
-
-	function convLabel(conv: Conversation): string {
-		if (conv.title) return conv.title;
-		const agentNames = conv.participants
-			.filter(p => p.participant_type === 'agent')
-			.map(p => p.participant_id);
-		return agentNames.length > 0 ? agentNames.join(', ') : 'New Chat';
-	}
-
 	// Sidebar link helper
 	const linkClass = (active: boolean) =>
 		`flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors ${active
@@ -193,74 +166,27 @@
 			<div class="flex-1 overflow-y-auto {sidebarCollapsed ? 'hidden' : ''}">
 
 				{#if activeTab === 'agents'}
-					<!-- AGENTS TAB: Apps, Conversations, Agents, Knowledge -->
-
-					<!-- Apps -->
-					<div class="px-3 pb-1">
-						<div class="flex items-center justify-between px-1 pb-1.5">
-							<span class={sectionHeader}>Apps</span>
-						</div>
-						<a href="/dashboard" class={linkClass(isActive('/dashboard', $page.url.pathname))}>
-							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6A2.25 2.25 0 016 3.75h2.25A2.25 2.25 0 0110.5 6v2.25a2.25 2.25 0 01-2.25 2.25H6a2.25 2.25 0 01-2.25-2.25V6zm9.75 0A2.25 2.25 0 0115.75 3.75H18A2.25 2.25 0 0120.25 6v2.25A2.25 2.25 0 0118 10.5h-2.25a2.25 2.25 0 01-2.25-2.25V6zM3.75 15.75A2.25 2.25 0 016 13.5h2.25a2.25 2.25 0 012.25 2.25V18a2.25 2.25 0 01-2.25 2.25H6A2.25 2.25 0 013.75 18v-2.25zm9.75 0A2.25 2.25 0 0115.75 13.5H18a2.25 2.25 0 012.25 2.25V18A2.25 2.25 0 0118 20.25h-2.25A2.25 2.25 0 0113.5 18v-2.25z" /></svg>
-							<span>Dashboard</span>
-						</a>
-						{#each appList as app}
-							<a href="/apps/{app.id}" class={linkClass($page.url.pathname === `/apps/${app.id}`)}>
-								<span class="text-sm flex-shrink-0">{app.icon ?? '📦'}</span>
-								<span class="truncate">{app.title}</span>
-							</a>
-						{/each}
-					</div>
-
-					<!-- Conversations -->
-					<div class="px-3 pt-2">
-						<div class="flex items-center justify-between px-1 pb-1.5">
-							<span class={sectionHeader}>Conversations</span>
-							<a href="/" class={plusButton} title="New conversation">+</a>
-						</div>
-					</div>
-					<div class="px-2 space-y-0.5">
-						{#each convList as conv}
-							{@const active = isConvActive(conv.id, $page.url.pathname)}
-							<a href="/conversations/{conv.id}" class={linkClass(active)}>
-								<span class="text-xs flex-shrink-0">{convIcon(conv)}</span>
-								<span class="truncate">{convLabel(conv)}</span>
-							</a>
-						{:else}
-							<div class="px-2 py-3 text-center text-xs text-muted-foreground">
-								No conversations yet
-							</div>
-						{/each}
-					</div>
-
-					<!-- Agents -->
-					<div class="px-3 pt-3">
+					<!-- Native sessions -->
+					<div class="px-3 pt-1">
 						<div class="flex items-center justify-between px-1 pb-1.5">
 							<span class={sectionHeader}>Sessions</span>
 							<a href="/setup?mode=add-agent" class={plusButton} title="Add session">+</a>
 						</div>
 					</div>
 					<div class="px-2 space-y-0.5">
+						<a href="/agents" class={linkClass($page.url.pathname === '/agents')}>
+							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772M15 6.75a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+							<span>All sessions</span>
+						</a>
 						{#each agentList as agent}
 							{@const active = isAgentActive(agent.id, $page.url.pathname)}
 							<a href="/agents/{agent.id}" class={linkClass(active)}>
 								<img src={agentAvatar(agent)} alt="" class="h-5 w-5 rounded-full flex-shrink-0 object-cover ring-2 {agent.status === 'running' ? 'ring-blue-400' : agent.status === 'queued' ? 'ring-amber-400' : agent.status === 'error' ? 'ring-red-400' : 'ring-emerald-400'}" />
 								<span class="truncate">{agent.config?.display_name || agent.name}</span>
 							</a>
+						{:else}
+							<a href="/setup?mode=add-agent" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first session</a>
 						{/each}
-					</div>
-
-					<!-- Knowledge -->
-					<div class="px-3 pt-3">
-						<div class="px-1 pb-1.5">
-							<span class={sectionHeader}>Knowledge</span>
-						</div>
-					</div>
-					<div class="px-2">
-						<a href="/memory" class={linkClass(isActive('/memory', $page.url.pathname))}>
-							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>
-							<span>Memory</span>
-						</a>
 					</div>
 
 				{:else if activeTab === 'tasks'}
@@ -283,7 +209,7 @@
 					</div>
 
 				{:else if activeTab === 'workflows'}
-					<!-- WORKFLOWS TAB: Procedures, Workflows -->
+					<!-- Multi-session workflows -->
 
 					<div class="px-3 pt-1">
 						<div class="px-1 pb-1.5">
@@ -291,14 +217,6 @@
 						</div>
 					</div>
 					<div class="px-2 space-y-0.5">
-						<a href="/procedures" class={linkClass(isActive('/procedures', $page.url.pathname))}>
-							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 010 3.75H5.625a1.875 1.875 0 010-3.75z" /></svg>
-							<span>Procedures</span>
-						</a>
-						<a href="/skills" class={linkClass(isActive('/skills', $page.url.pathname))}>
-							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4.26 10.147a60.438 60.438 0 00-.491 6.347A48.62 48.62 0 0112 20.904a48.62 48.62 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.636 50.636 0 00-2.658-.813A59.906 59.906 0 0112 3.493a59.903 59.903 0 0110.399 5.84c-.896.248-1.783.52-2.658.814m-15.482 0A50.717 50.717 0 0112 13.489a50.702 50.702 0 017.74-3.342M6.75 15a.75.75 0 100-1.5.75.75 0 000 1.5zm0 0v-3.675A55.378 55.378 0 0112 8.443m-7.007 11.55A5.981 5.981 0 006.75 15.75v-1.5" /></svg>
-							<span>Skills</span>
-						</a>
 						<a href="/workflows" class={linkClass(isActive('/workflows', $page.url.pathname))}>
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21L3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5" /></svg>
 							<span>Workflows</span>
@@ -337,7 +255,7 @@
 					{#each tabs as tab}
 						{@const active = activeTab === tab.id}
 						<a
-							href={tab.id === 'agents' ? '/' : tab.id === 'tasks' ? '/tasks' : tab.id === 'workflows' ? '/procedures' : '/settings'}
+							href={tab.id === 'agents' ? '/' : tab.id === 'tasks' ? '/tasks' : tab.id === 'workflows' ? '/workflows' : '/settings'}
 							class="flex flex-col items-center gap-1 rounded-lg px-3 py-1.5 text-[10px] transition-colors {active
 								? 'text-primary'
 								: 'text-muted-foreground hover:text-foreground'}"

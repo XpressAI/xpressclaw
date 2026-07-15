@@ -51,6 +51,8 @@
 	let connectorList = $state<Connector[]>([]);
 	let instances = $state<WorkflowInstance[]>([]);
 	let showInstances = $state(false);
+	let showRunDialog = $state(false);
+	let runInputs = $state<Record<string, string>>({});
 	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
 	let compactView = $state(false);
 
@@ -143,6 +145,7 @@
 			workflow = wf; workflowName = wf.name; yamlContent = wf.yaml_content; agentList = al; connectorList = cl;
 			const parsed = yamlToFlows(wf.yaml_content);
 			flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
+			runInputs = Object.fromEntries(Object.entries(parsed.variables).map(([key, value]) => [key, String(value ?? '')]));
 			if (!flows.main) { flows = { main: { color: '#22c55e', blocks: [] }, ...flows }; }
 			instances = await workflows.instances(id).catch(() => []);
 		} catch (e) { showToast(`Failed to load: ${e}`, 'error'); }
@@ -173,12 +176,22 @@
 		catch (e) { showToast(String(e), 'error'); }
 	}
 
-	async function runWorkflow() {
+	function requestRun() {
+		if (Object.keys(globalVars).length === 0) {
+			runWorkflow({});
+			return;
+		}
+		runInputs = Object.fromEntries(Object.entries(globalVars).map(([key, value]) => [key, String(value ?? '')]));
+		showRunDialog = true;
+	}
+
+	async function runWorkflow(inputs: Record<string, string>) {
 		if (!workflow) return;
 		running = true;
 		try {
-			await workflows.run(workflow.id);
+			await workflows.run(workflow.id, inputs);
 			showToast('Instance started', 'success');
+			showRunDialog = false;
 			showInstances = true; await loadInstances();
 		} catch (e) { showToast(`Run failed: ${e}`, 'error'); }
 		running = false;
@@ -486,7 +499,7 @@
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {showYaml ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">YAML</button>
 		<button onclick={() => (compactView = !compactView)}
 			class="rounded-md border border-border px-3 py-1.5 text-xs font-medium {compactView ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'}">{compactView ? 'Full' : 'Compact'}</button>
-		<button onclick={runWorkflow} disabled={running}
+		<button onclick={requestRun} disabled={running}
 			class="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 flex items-center gap-1.5">
 			<svg class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
 			{running ? 'Running...' : 'Run'}
@@ -823,6 +836,27 @@
 					</tbody>
 				</table>
 			{/if}
+		</div>
+	{/if}
+
+	{#if showRunDialog}
+		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+			<div class="w-full max-w-lg rounded-xl border border-border bg-card p-5 shadow-2xl">
+				<h2 class="text-base font-semibold">Run {workflowName}</h2>
+				<p class="mt-1 text-xs text-muted-foreground">Set this run's inputs. They override the workflow defaults without changing the saved definition.</p>
+				<div class="mt-4 space-y-3">
+					{#each Object.keys(globalVars) as key}
+						<div>
+							<label for="run-input-{key}" class="mb-1 block text-xs font-medium capitalize text-muted-foreground">{key.replaceAll('_', ' ')}</label>
+							<textarea id="run-input-{key}" rows={key === 'goal' ? 3 : 2} value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"></textarea>
+						</div>
+					{/each}
+				</div>
+				<div class="mt-5 flex justify-end gap-2">
+					<button onclick={() => (showRunDialog = false)} disabled={running} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent disabled:opacity-50">Cancel</button>
+					<button onclick={() => runWorkflow(runInputs)} disabled={running || Object.values(runInputs).some((value) => !value.trim())} class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">{running ? 'Starting…' : 'Start workflow'}</button>
+				</div>
+			</div>
 		</div>
 	{/if}
 

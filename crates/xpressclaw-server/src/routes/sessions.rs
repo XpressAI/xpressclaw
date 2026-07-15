@@ -6,9 +6,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
+use xpressclaw_core::config::AgentConfig;
 use xpressclaw_core::sessions::{NewEvent, SessionManager};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::workers::native::{
+    resolve_runner_kind, resolved_runner_image, subscription_auth_available,
+};
 
 use crate::state::AppState;
 
@@ -35,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}", get(get_session))
         .route("/{id}/events", get(get_events))
         .route("/{id}/attempts", get(get_attempts))
+        .route("/{id}/readiness", get(get_readiness).post(prepare_runner))
         .route("/{id}/messages", post(post_message))
         .route("/{id}/attempts/{attempt_id}/cancel", post(cancel_attempt))
 }
@@ -76,6 +81,122 @@ async fn get_attempts(
         )
         .map_err(internal_error)?;
     Ok(Json(json!(attempts)))
+}
+
+async fn get_readiness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    ensure_session(&state, &id)?;
+    let agent = session_config(&state, &id)?;
+    Ok(Json(readiness(&state, &agent).await?))
+}
+
+async fn prepare_runner(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    ensure_session(&state, &id)?;
+    let agent = session_config(&state, &id)?;
+    let kind = resolve_runner_kind(&agent).map_err(bad_request)?;
+    let image = resolved_runner_image(&agent.runner, &kind).map_err(bad_request)?;
+    let docker = state.docker().await.ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Docker or Podman is not available" })),
+        )
+    })?;
+    if !docker.has_image(&image).await {
+        docker.pull_image(&image).await.map_err(internal_error)?;
+    }
+    Ok(Json(readiness(&state, &agent).await?))
+}
+
+async fn readiness(
+    state: &AppState,
+    agent: &AgentConfig,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let kind = resolve_runner_kind(agent).map_err(bad_request)?;
+    let image = resolved_runner_image(&agent.runner, &kind).map_err(bad_request)?;
+    let workspace = session_workspace(state, agent);
+    let workspace_present = workspace.is_dir();
+    let command_present = kind != "custom" || !agent.runner.command.is_empty();
+    let auth_required =
+        agent.runner.subscription_auth && matches!(kind.as_str(), "codex" | "claude" | "opencode");
+    let auth_present = !auth_required || subscription_auth_available(&kind);
+    let docker = state.docker().await;
+    let docker_available = docker.is_some();
+    let image_present = match docker {
+        Some(docker) => docker.has_image(&image).await,
+        None => false,
+    };
+    let mut issues = Vec::new();
+    if !docker_available {
+        issues.push("Docker or Podman is not available".to_string());
+    } else if !image_present {
+        issues.push(format!("Runner image {image} has not been pulled"));
+    }
+    if !workspace_present {
+        issues.push(format!(
+            "Workspace {} does not exist or is not a directory",
+            workspace.display()
+        ));
+    }
+    if !command_present {
+        issues
+            .push("Custom runner command is not configured; add it in the Runner tab".to_string());
+    }
+    if !auth_present {
+        issues.push(format!(
+            "No host {kind} login was found; authenticate with {kind} on the host first"
+        ));
+    }
+    Ok(json!({
+        "ready": docker_available && image_present && workspace_present && auth_present && command_present,
+        "docker_available": docker_available,
+        "kind": kind,
+        "image": image,
+        "image_present": image_present,
+        "workspace": workspace.display().to_string(),
+        "workspace_present": workspace_present,
+        "command_present": command_present,
+        "subscription_auth": agent.runner.subscription_auth,
+        "auth_present": auth_present,
+        "issues": issues,
+    }))
+}
+
+fn session_config(state: &AppState, id: &str) -> Result<AgentConfig, (StatusCode, Json<Value>)> {
+    state
+        .config()
+        .agents
+        .iter()
+        .find(|agent| agent.name == id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("session configuration not found: {id}") })),
+            )
+        })
+}
+
+fn session_workspace(state: &AppState, agent: &AgentConfig) -> std::path::PathBuf {
+    let configured = agent
+        .runner
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let Some(configured) = configured else {
+        return state.config().system.workspace_dir.clone();
+    };
+    if let Some(rest) = configured.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(configured)
 }
 
 async fn post_message(
@@ -228,6 +349,13 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn bad_request(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": error.to_string() })),
+    )
+}
+
 fn not_found(error: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -291,5 +419,28 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["queued"], true);
         assert!(value["attempt_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn readiness_describes_the_resolved_native_runner() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions/builder/readiness")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["kind"], "codex");
+        assert_eq!(
+            value["image"],
+            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+        );
+        assert!(value["workspace_present"].as_bool().is_some());
+        assert!(value["issues"].is_array());
     }
 }

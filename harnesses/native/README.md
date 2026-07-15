@@ -3,9 +3,9 @@
 Each directory builds one native agent product:
 
 ```bash
-docker build -t xpressclaw-runner-codex:latest codex
-docker build -t xpressclaw-runner-claude:latest claude
-docker build -t xpressclaw-runner-opencode:latest opencode
+docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest codex
+docker build -t ghcr.io/xpressai/xpressclaw-runner-claude:latest claude
+docker build -t ghcr.io/xpressai/xpressclaw-runner-opencode:latest opencode
 ```
 
 Run these commands from `harnesses/native`, or use the paths documented in the
@@ -17,7 +17,7 @@ Runner images are intentionally product-specific. You can extend one while
 the control-plane-managed development-environment interface is being built:
 
 ```dockerfile
-FROM xpressclaw-runner-codex:latest
+FROM ghcr.io/xpressai/xpressclaw-runner-codex:latest
 
 USER root
 RUN apt-get update \

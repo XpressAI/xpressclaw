@@ -14,6 +14,8 @@
 	let newAgentId = $state('');
 	let newPriority = $state(0);
 	let newDependsOn = $state<string[]>([]);
+	let formError = $state('');
+	let creating = $state(false);
 
 	const columns: { key: keyof TaskCounts; label: string; color: string }[] = [
 		{ key: 'pending', label: 'Pending', color: 'text-yellow-400' },
@@ -29,6 +31,7 @@
 
 	async function loadAgents() {
 		agentList = await agents.list().catch(() => []);
+		if (!newAgentId && agentList.length > 0) newAgentId = agentList[0].id;
 	}
 
 	async function load() {
@@ -64,24 +67,38 @@
 	}
 
 	async function createTask() {
-		if (!newTitle.trim()) return;
-		const task = await tasks.create({
-			title: newTitle,
-			description: newDesc || undefined,
-			agent_id: newAgentId || undefined,
-			priority: newPriority || undefined
-		});
-		// Add dependencies after creation
-		for (const depId of newDependsOn) {
-			await tasks.addDependency(task.id, depId).catch(() => {});
+		if (!newTitle.trim() || !newAgentId || creating) return;
+		creating = true;
+		formError = '';
+		try {
+			// Batch creation records dependencies before the dispatcher can
+			// claim the task, even when the batch contains only one item.
+			await tasks.createBatch({ tasks: [{
+				ref: 'task',
+				title: newTitle.trim(),
+				description: newDesc.trim() || undefined,
+				agent_id: newAgentId,
+				priority: newPriority || undefined,
+				depends_on: newDependsOn.length > 0 ? newDependsOn : undefined
+			}] });
+			newTitle = '';
+			newDesc = '';
+			newPriority = 0;
+			newDependsOn = [];
+			showCreate = false;
+			await load();
+		} catch (e) {
+			formError = e instanceof Error ? e.message : String(e);
+		} finally {
+			creating = false;
 		}
-		newTitle = '';
-		newDesc = '';
-		newAgentId = '';
-		newPriority = 0;
-		newDependsOn = [];
-		showCreate = false;
-		await load();
+	}
+
+	function openCreate() {
+		if (agentList.length === 0) return;
+		formError = '';
+		if (!newAgentId) newAgentId = agentList[0].id;
+		showCreate = !showCreate;
 	}
 
 	async function cancelTask(id: string) {
@@ -98,7 +115,7 @@
 	function agentName(agentId: string | null): string | null {
 		if (!agentId) return null;
 		const agent = agentList.find((a) => a.id === agentId);
-		return agent?.name ?? agentId;
+		return agent?.config?.display_name || agent?.name || agentId;
 	}
 </script>
 
@@ -113,12 +130,19 @@
 			{/if}
 		</div>
 		<button
-			onclick={() => (showCreate = !showCreate)}
-			class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+			onclick={openCreate}
+			disabled={agentList.length === 0}
+			class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
 		>
 			New Task
 		</button>
 	</div>
+
+	{#if agentList.length === 0}
+		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
+			Tasks need a session so they can run. <a href="/setup?mode=add-agent" class="font-medium text-primary hover:underline">Create a session</a> first.
+		</div>
+	{/if}
 
 	{#if showCreate}
 		<div class="rounded-lg border border-border bg-card p-4 space-y-3">
@@ -141,9 +165,8 @@
 						bind:value={newAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
-						<option value="">Unassigned</option>
 						{#each agentList as agent}
-							<option value={agent.id}>{agent.name}</option>
+							<option value={agent.id}>{agent.config?.display_name || agent.name}</option>
 						{/each}
 					</select>
 				</div>
@@ -183,12 +206,14 @@
 					{/if}
 				</div>
 			{/if}
+			{#if formError}<p class="text-xs text-destructive">{formError}</p>{/if}
 			<div class="flex gap-2">
 				<button
 					onclick={createTask}
-					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+					disabled={!newTitle.trim() || !newAgentId || creating}
+					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
 				>
-					Create
+					{creating ? 'Queuing…' : 'Create and queue'}
 				</button>
 				<button
 					onclick={() => (showCreate = false)}
@@ -217,7 +242,7 @@
 							<div class="flex items-start justify-between gap-2">
 								<span class="text-sm font-medium">{task.title}</span>
 								<button
-									onclick={() => deleteTask(task.id)}
+									onclick={(event) => { event.preventDefault(); event.stopPropagation(); deleteTask(task.id); }}
 									class="text-xs text-muted-foreground hover:text-destructive shrink-0"
 									title="Delete"
 								>&times;</button>
@@ -246,7 +271,7 @@
 								<div class="flex gap-1">
 									{#if col.key !== 'completed' && col.key !== 'cancelled'}
 										<button
-											onclick={() => cancelTask(task.id)}
+											onclick={(event) => { event.preventDefault(); event.stopPropagation(); cancelTask(task.id); }}
 											class="text-xs text-muted-foreground hover:text-red-400"
 											title="Cancel task"
 										>Cancel</button>

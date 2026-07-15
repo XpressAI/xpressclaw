@@ -170,9 +170,9 @@ Existing backends map as follows unless `runner.kind` is set explicitly:
 Build the runner images you use with:
 
 ```bash
-docker build -t xpressclaw-runner-codex:latest harnesses/native/codex
-docker build -t xpressclaw-runner-claude:latest harnesses/native/claude
-docker build -t xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
+docker build -t ghcr.io/xpressai/xpressclaw-runner-claude:latest harnesses/native/claude
+docker build -t ghcr.io/xpressai/xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router

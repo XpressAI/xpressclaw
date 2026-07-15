@@ -10,7 +10,6 @@
 	import ProfileTab from './ProfileTab.svelte';
 	import PromptsTab from './PromptsTab.svelte';
 	import WorkspaceTab from './WorkspaceTab.svelte';
-	import ProceduresTab from './ProceduresTab.svelte';
 	import TasksTab from './TasksTab.svelte';
 	import SchedulesTab from './SchedulesTab.svelte';
 	import ChannelsTab from './ChannelsTab.svelte';
@@ -36,7 +35,6 @@
 		{ id: 'profile', label: 'Profile' },
 		{ id: 'prompts', label: 'Instructions' },
 		{ id: 'workspace', label: 'Workspace' },
-		{ id: 'procedures', label: 'Procedures' },
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Schedules' },
 		{ id: 'channels', label: 'Channels' },
@@ -203,9 +201,7 @@
 			{:else if activeTab === 'prompts'}
 				<PromptsTab {agentConfig} onSave={handleSave} {saveSignal} />
 			{:else if activeTab === 'workspace'}
-				<WorkspaceTab {agentConfig} agentId={agent.id} onSave={handleSave} />
-			{:else if activeTab === 'procedures'}
-				<ProceduresTab agentId={agent.id} />
+				<WorkspaceTab {agentConfig} onSave={handleSave} />
 			{:else if activeTab === 'tasks'}
 				<TasksTab agentId={agent.id} />
 			{:else if activeTab === 'schedules'}
@@ -216,7 +212,7 @@
 		</div>
 
 		<!-- Persistent save bar for config tabs -->
-		{#if ['runner', 'profile', 'prompts', 'workspace'].includes(activeTab)}
+		{#if ['runner', 'profile', 'prompts'].includes(activeTab)}
 			<div class="shrink-0 border-t border-border bg-background px-6 py-3 flex items-center justify-end gap-3">
 				{#if saveMessage}
 					<span class="text-xs {saveMessage.startsWith('Error') ? 'text-destructive' : 'text-emerald-500'}">{saveMessage}</span>

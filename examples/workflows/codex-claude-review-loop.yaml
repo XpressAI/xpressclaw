@@ -16,7 +16,7 @@ flows:
         prompt: |
           Implement this goal in the current repository:
 
-          @variables.goal
+          @goal
 
           Address any feedback from the previous review if present:
 
@@ -35,7 +35,7 @@ flows:
         prompt: |
           Review the implementation for this goal:
 
-          @variables.goal
+          @goal
 
           Inspect the actual diff and test results. Approve only when it is
           correct, complete, maintainable, and adequately tested. Return a
