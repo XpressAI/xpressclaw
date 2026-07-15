@@ -219,10 +219,14 @@ bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_
 # Frontend type check
 cd frontend && npm run check
 
-# Formatting and linting (still via Cargo)
-cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
+# Formatting and linting
+./scripts/rustfmt.sh --check
 cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
 ```
+
+Use the formatting script instead of `cargo fmt --all`: Cargo's `--all` mode
+also formats local path dependencies and would modify the
+`external/ready-agent-cog` submodule.
 
 ### Development Mode
 
