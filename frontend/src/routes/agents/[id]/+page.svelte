@@ -225,7 +225,7 @@
 		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4">
 			<h2 class="text-lg font-semibold">Delete {agentDisplayName()}?</h2>
 			<p class="text-sm text-muted-foreground">
-				This removes the session profile and its configuration. Existing task history may still reference it. This action cannot be undone.
+				This removes the session and its configuration. Existing task history may still reference it. This action cannot be undone.
 			</p>
 			<div class="flex justify-end gap-2">
 				<button onclick={() => { showDeleteConfirm = false; }}
