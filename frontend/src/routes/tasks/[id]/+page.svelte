@@ -466,11 +466,11 @@
 					{/if}
 
 					{#if technicalActivityEvents.length > 0}
-						<details class="rounded-lg border border-border/60 bg-card/30" open={task.status === 'in_progress'}>
-							<summary class="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground hover:text-foreground">
+						<section class="rounded-lg border border-border/60 bg-card/30">
+							<div class="border-b border-border/60 px-3 py-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 								Technical steps ({technicalActivityEvents.length})
-							</summary>
-							<div class="max-h-80 space-y-2 overflow-y-auto border-t border-border/60 p-3">
+							</div>
+							<div class="space-y-2 p-3">
 								{#each technicalActivityEvents as event (event.id)}
 									<div class="flex gap-2 text-xs">
 										<span class="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-blue-400"></span>
@@ -479,7 +479,7 @@
 									</div>
 								{/each}
 							</div>
-						</details>
+						</section>
 					{/if}
 
 					{#if latestResult}
