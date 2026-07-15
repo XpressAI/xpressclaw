@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 
@@ -30,6 +31,12 @@ pub struct MessageInput {
     pub content: String,
 }
 
+#[derive(Deserialize)]
+pub struct ActivityParams {
+    pub after: Option<i64>,
+    pub limit: Option<i64>,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
@@ -41,6 +48,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/status", patch(update_task_status))
         .route("/{id}/messages", get(get_messages).post(add_message))
+        .route("/{id}/activity", get(get_activity))
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
 }
 
@@ -208,6 +216,31 @@ async fn get_messages(
     let conv = TaskConversation::new(state.db.clone());
     let messages = conv.get_messages(&id).map_err(internal_error)?;
     Ok(Json(json!(messages)))
+}
+
+async fn get_activity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ActivityParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    TaskBoard::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            _ => internal_error(error),
+        })?;
+    let activity = SessionManager::new(state.db.clone())
+        .task_activity(
+            &id,
+            params.after,
+            params.limit.unwrap_or(250).clamp(1, 500),
+            20,
+        )
+        .map_err(internal_error)?;
+    Ok(Json(json!(activity)))
 }
 
 async fn add_message(
@@ -606,5 +639,49 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_activity_includes_native_attempt_events() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": "Visible native work",
+                            "agent_id": "website-codex"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{task_id}/activity"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 1);
+        assert!(body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "attempt_queued"));
     }
 }

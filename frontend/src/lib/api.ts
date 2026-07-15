@@ -416,6 +416,11 @@ export interface TaskCounts {
 	cancelled: number;
 }
 
+export interface TaskActivity {
+	attempts: WorkAttempt[];
+	events: SessionEvent[];
+}
+
 export const tasks = {
 	list: (status?: string, agentId?: string) => {
 		const params = new URLSearchParams();
@@ -439,6 +444,10 @@ export const tasks = {
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
 	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	activity: (id: string, after?: number) => {
+		const query = after ? `?after=${after}` : '';
+		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
+	},
 	addMessage: (id: string, role: string, content: string) =>
 		request<TaskMessage>(`/api/tasks/${id}/messages`, {
 			method: 'POST',

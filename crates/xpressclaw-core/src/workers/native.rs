@@ -19,12 +19,24 @@ use crate::tasks::board::TaskBoard;
 use crate::tasks::queue::{QueueItem, TaskQueue};
 
 const MAX_CAPTURED_OUTPUT: usize = 200_000;
+const MAX_PROGRESS_EVENTS: usize = 250;
 
 #[derive(Debug)]
 struct NativeResult {
     summary: String,
     native_session_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct NativeStreamUpdate {
+    native_session_id: Option<String>,
     progress: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Default)]
+struct NativeProgressDecoder {
+    buffer: String,
+    emitted: usize,
 }
 
 /// Consume the durable task queue with native CLIs instead of a bespoke agent
@@ -172,7 +184,34 @@ async fn execute_item(
         None,
     )?;
 
-    let output = docker.wait_for_exit(&workload_id).await?;
+    let attempt = sessions.get_attempt(attempt_id)?;
+    let mut decoder = NativeProgressDecoder::default();
+    let output = docker
+        .wait_for_exit_streaming(&workload_id, |chunk| {
+            let update = decoder.push(&kind, chunk);
+            if let Err(error) = record_stream_update(
+                &sessions,
+                &attempt.session_id,
+                attempt_id,
+                &item.task_id,
+                &kind,
+                update,
+            ) {
+                warn!(%error, attempt_id, "failed to persist native progress");
+            }
+        })
+        .await?;
+    let final_update = decoder.finish(&kind);
+    if let Err(error) = record_stream_update(
+        &sessions,
+        &attempt.session_id,
+        attempt_id,
+        &item.task_id,
+        &kind,
+        final_update,
+    ) {
+        warn!(%error, attempt_id, "failed to persist final native progress");
+    }
     let current = sessions.get_attempt(attempt_id)?;
     if current.status == "cancelled" {
         return Ok(());
@@ -198,21 +237,6 @@ async fn execute_item(
     let parsed = parse_output(&kind, &output);
     if let Some(native_session_id) = parsed.native_session_id.as_deref() {
         sessions.set_native_session(attempt_id, native_session_id)?;
-    }
-    let attempt = sessions.get_attempt(attempt_id)?;
-    for (summary, payload) in parsed.progress.into_iter().take(50) {
-        sessions.append_event(
-            &attempt.session_id,
-            NewEvent {
-                attempt_id: Some(attempt_id),
-                task_id: Some(&item.task_id),
-                source_type: "runner",
-                source_id: Some(&kind),
-                event_type: "runner_progress",
-                summary: &summary,
-                payload,
-            },
-        )?;
     }
     sessions.add_artifact(
         attempt_id,
@@ -626,10 +650,195 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+impl NativeProgressDecoder {
+    fn push(&mut self, kind: &str, chunk: &str) -> NativeStreamUpdate {
+        self.buffer.push_str(chunk);
+        let mut update = NativeStreamUpdate::default();
+        while let Some(newline) = self.buffer.find('\n') {
+            let line = self.buffer[..newline].to_string();
+            self.buffer.drain(..=newline);
+            self.consume_line(kind, &line, &mut update);
+        }
+        update
+    }
+
+    fn finish(&mut self, kind: &str) -> NativeStreamUpdate {
+        let mut update = NativeStreamUpdate::default();
+        let line = std::mem::take(&mut self.buffer);
+        if !line.trim().is_empty() {
+            self.consume_line(kind, &line, &mut update);
+        }
+        update
+    }
+
+    fn consume_line(&mut self, kind: &str, line: &str, update: &mut NativeStreamUpdate) {
+        let parsed = parse_progress_line(kind, line);
+        if parsed.native_session_id.is_some() {
+            update.native_session_id = parsed.native_session_id;
+        }
+        for progress in parsed.progress {
+            if self.emitted >= MAX_PROGRESS_EVENTS {
+                break;
+            }
+            update.progress.push(progress);
+            self.emitted += 1;
+        }
+    }
+}
+
+fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
+    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+        return NativeStreamUpdate::default();
+    };
+    let mut update = NativeStreamUpdate::default();
+    match kind {
+        "codex" => match value.get("type").and_then(Value::as_str) {
+            Some("thread.started") => {
+                update.native_session_id = value
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("item.completed") => {
+                if let Some(item) = value.get("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("item");
+                    let summary = match item_type {
+                        "agent_message" => item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.trim().is_empty())
+                            .map(|text| truncate(text, 1_000)),
+                        "command_execution" => {
+                            let command = item
+                                .get("command")
+                                .and_then(Value::as_str)
+                                .unwrap_or("command");
+                            Some(format!("Ran {}", truncate(command, 160)))
+                        }
+                        "todo_list" => item.get("items").and_then(Value::as_array).map(|items| {
+                            let completed = items
+                                .iter()
+                                .filter(|item| {
+                                    item.get("completed").and_then(Value::as_bool) == Some(true)
+                                })
+                                .count();
+                            format!("Updated plan: {completed}/{} complete", items.len())
+                        }),
+                        "file_change" => Some("Updated project files".to_string()),
+                        _ => None,
+                    };
+                    if let Some(summary) = summary {
+                        update
+                            .progress
+                            .push((summary, json!({ "item_type": item_type })));
+                    }
+                }
+            }
+            _ => {}
+        },
+        "claude" => match value.get("type").and_then(Value::as_str) {
+            Some("system") | Some("result") => {
+                update.native_session_id = value
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Some("assistant") => {
+                if let Some(content) = value
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_array)
+                {
+                    for item in content {
+                        match item.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) = item
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.trim().is_empty())
+                                {
+                                    update.progress.push((
+                                        truncate(text, 1_000),
+                                        json!({ "item_type": "agent_message" }),
+                                    ));
+                                }
+                            }
+                            Some("tool_use") => {
+                                let name =
+                                    item.get("name").and_then(Value::as_str).unwrap_or("tool");
+                                update.progress.push((
+                                    format!("Used {name}"),
+                                    json!({ "item_type": "tool_use", "tool": name }),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        _ => match value.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = value
+                    .get("text")
+                    .or_else(|| value.get("part").and_then(|part| part.get("text")))
+                    .and_then(Value::as_str);
+                if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                    update.progress.push((
+                        truncate(text, 1_000),
+                        json!({ "item_type": "agent_message" }),
+                    ));
+                }
+            }
+            Some("tool_use") => {
+                let name = value
+                    .get("name")
+                    .or_else(|| value.get("part").and_then(|part| part.get("tool")))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool");
+                update.progress.push((
+                    format!("Used {name}"),
+                    json!({ "item_type": "tool_use", "tool": name }),
+                ));
+            }
+            _ => {}
+        },
+    }
+    update
+}
+
+fn record_stream_update(
+    sessions: &SessionManager,
+    session_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    kind: &str,
+    update: NativeStreamUpdate,
+) -> Result<()> {
+    if let Some(native_session_id) = update.native_session_id.as_deref() {
+        sessions.set_native_session(attempt_id, native_session_id)?;
+    }
+    for (summary, payload) in update.progress {
+        sessions.append_event(
+            session_id,
+            NewEvent {
+                attempt_id: Some(attempt_id),
+                task_id: Some(task_id),
+                source_type: "runner",
+                source_id: Some(kind),
+                event_type: "runner_progress",
+                summary: &summary,
+                payload,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
     let mut summary = String::new();
     let mut native_session_id = None;
-    let mut progress = Vec::new();
 
     for line in output.output.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
@@ -645,23 +854,10 @@ fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
                 }
                 Some("item.completed") => {
                     if let Some(item) = value.get("item") {
-                        match item.get("type").and_then(Value::as_str) {
-                            Some("agent_message") => {
-                                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                    summary = text.to_string();
-                                }
+                        if item.get("type").and_then(Value::as_str) == Some("agent_message") {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                summary = text.to_string();
                             }
-                            Some("command_execution") => {
-                                let command = item
-                                    .get("command")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("command");
-                                progress.push((
-                                    format!("Ran {}", truncate(command, 160)),
-                                    json!({ "item_type": "command_execution" }),
-                                ));
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -704,7 +900,6 @@ fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
     NativeResult {
         summary,
         native_session_id,
-        progress,
     }
 }
 
@@ -753,7 +948,45 @@ mod tests {
         let result = parse_output("codex", &output);
         assert_eq!(result.native_session_id.as_deref(), Some("thread-1"));
         assert_eq!(result.summary, "Implemented and tested.");
-        assert_eq!(result.progress[0].0, "Ran cargo test");
+
+        let mut decoder = NativeProgressDecoder::default();
+        let first = decoder.push(
+            "codex",
+            concat!(
+                "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_"
+            ),
+        );
+        assert_eq!(first.native_session_id.as_deref(), Some("thread-1"));
+        assert!(first.progress.is_empty());
+
+        let second = decoder.push(
+            "codex",
+            concat!(
+                "execution\",\"command\":\"cargo test\"}}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Implemented and tested.\"}}\n"
+            ),
+        );
+        assert_eq!(second.progress[0].0, "Ran cargo test");
+        assert_eq!(second.progress[1].0, "Implemented and tested.");
+    }
+
+    #[test]
+    fn parses_claude_semantic_progress() {
+        let mut decoder = NativeProgressDecoder::default();
+        let update = decoder.push(
+            "claude",
+            concat!(
+                "{\"type\":\"system\",\"session_id\":\"session-1\"}\n",
+                "{\"type\":\"assistant\",\"message\":{\"content\":[",
+                "{\"type\":\"text\",\"text\":\"Inspecting the project\"},",
+                "{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n"
+            ),
+        );
+
+        assert_eq!(update.native_session_id.as_deref(), Some("session-1"));
+        assert_eq!(update.progress[0].0, "Inspecting the project");
+        assert_eq!(update.progress[1].0, "Used Bash");
     }
 
     #[test]

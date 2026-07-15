@@ -2,12 +2,14 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { tasks, agents } from '$lib/api';
-	import type { Task, TaskMessage, Agent } from '$lib/api';
+	import type { Task, TaskMessage, Agent, WorkAttempt, SessionEvent } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { renderContent } from '$lib/formatMessage';
 
 	let task = $state<Task | null>(null);
 	let messages = $state<TaskMessage[]>([]);
+	let attempts = $state<WorkAttempt[]>([]);
+	let activityEvents = $state<SessionEvent[]>([]);
 	let subtaskList = $state<Task[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let allTasks = $state<Task[]>([]);
@@ -25,11 +27,25 @@
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl: HTMLDivElement;
 	let prevMessageCount = 0;
+	let lastActivityEventId = 0;
 	let initialLoad = true;
 
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
+	let primaryActivityEvents = $derived(
+		activityEvents.filter(event =>
+			!['artifact_created', 'attempt_completed'].includes(event.event_type) &&
+			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message')
+		)
+	);
+	let technicalActivityEvents = $derived(
+		activityEvents.filter(event =>
+			event.event_type === 'runner_progress' && event.payload?.item_type !== 'agent_message'
+		)
+	);
+	let latestResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
+	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
 
 	onMount(async () => {
 		await load();
@@ -49,12 +65,19 @@
 	async function load() {
 		try {
 			const id = $page.params.id!;
-			[task, agentList] = await Promise.all([
+			const [loadedTask, loadedAgents, loadedMessages, activity] = await Promise.all([
 				tasks.get(id),
 				agents.list().catch(() => []),
+				tasks.messages(id),
+				tasks.activity(id),
 			]);
-			messages = await tasks.messages(id);
+			task = loadedTask;
+			agentList = loadedAgents;
+			messages = loadedMessages;
+			attempts = activity.attempts;
+			activityEvents = activity.events;
 			prevMessageCount = messages.length;
+			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
 			try {
 				const sub = await tasks.subtasks(id);
 				subtaskList = sub.tasks;
@@ -72,22 +95,35 @@
 		}
 	}
 
-	/** Poll for updates without resetting scroll. Only scroll if new messages arrived. */
+	/** Poll semantic task activity without exposing the runner's terminal. */
 	async function poll() {
 		try {
 			const id = $page.params.id!;
-			const [newTask, newMessages] = await Promise.all([
+			const [newTask, newMessages, newActivity] = await Promise.all([
 				tasks.get(id),
 				tasks.messages(id),
+				tasks.activity(id, lastActivityEventId || undefined),
 			]);
 			// Update task status/details in-place
 			task = newTask;
+			attempts = newActivity.attempts;
+			let shouldScroll = false;
 			// Only update messages and scroll if count changed
 			if (newMessages.length !== prevMessageCount) {
 				messages = newMessages;
 				prevMessageCount = newMessages.length;
-				scrollToBottom();
+				shouldScroll = true;
 			}
+			if (newActivity.events.length > 0) {
+				const known = new Set(activityEvents.map(event => event.id));
+				activityEvents = [
+					...activityEvents,
+					...newActivity.events.filter(event => !known.has(event.id)),
+				];
+				lastActivityEventId = activityEvents.at(-1)?.id ?? lastActivityEventId;
+				shouldScroll = true;
+			}
+			if (shouldScroll) scrollToBottom();
 			try {
 				const sub = await tasks.subtasks(id);
 				subtaskList = sub.tasks;
@@ -209,6 +245,14 @@
 	function sessionLabel(id: string): string {
 		const session = agentList.find(agent => agent.id === id);
 		return session?.title || session?.name || id;
+	}
+
+	function activityDot(eventType: string): string {
+		if (eventType === 'attempt_failed') return 'bg-red-400';
+		if (eventType === 'attempt_cancelled') return 'bg-muted-foreground';
+		if (eventType === 'runner_progress') return 'bg-blue-400';
+		if (eventType === 'attempt_running') return 'bg-emerald-400';
+		return 'bg-amber-400';
 	}
 </script>
 
@@ -393,16 +437,74 @@
 								</div>
 							</div>
 						</div>
-					{:else}
-						{#if !task.description}
-							<div class="flex h-full items-center justify-center text-muted-foreground text-sm">
-								<div class="text-center space-y-1">
-									<div class="text-3xl">&#x1f4cb;</div>
-									<div>No activity yet</div>
-								</div>
-							</div>
-						{/if}
 					{/each}
+
+					<!-- Native attempt activity -->
+					{#if primaryActivityEvents.length > 0}
+						<section class="space-y-2">
+							<div class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Activity</div>
+							{#each primaryActivityEvents as event (event.id)}
+								{@const itemType = String(event.payload?.item_type ?? '')}
+								<div class="flex gap-3 rounded-lg border border-border/60 bg-card/40 p-3">
+									<div class="mt-1.5 h-2 w-2 flex-shrink-0 rounded-full {activityDot(event.event_type)}"></div>
+									<div class="min-w-0 flex-1">
+										<div class="mb-1 flex items-center justify-between gap-3">
+											<span class="text-xs font-medium text-muted-foreground">
+												{itemType === 'agent_message' ? 'Worker update' : event.event_type.replaceAll('_', ' ')}
+											</span>
+											<span class="flex-shrink-0 text-xs text-muted-foreground">{timeAgo(event.created_at)}</span>
+										</div>
+										{#if itemType === 'agent_message'}
+											<div class="prose prose-invert prose-sm max-w-none text-sm">{@html renderContent(event.summary)}</div>
+										{:else}
+											<div class="break-words font-mono text-xs text-foreground/90">{event.summary}</div>
+										{/if}
+									</div>
+								</div>
+							{/each}
+						</section>
+					{/if}
+
+					{#if technicalActivityEvents.length > 0}
+						<details class="rounded-lg border border-border/60 bg-card/30" open={task.status === 'in_progress'}>
+							<summary class="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground hover:text-foreground">
+								Technical steps ({technicalActivityEvents.length})
+							</summary>
+							<div class="max-h-80 space-y-2 overflow-y-auto border-t border-border/60 p-3">
+								{#each technicalActivityEvents as event (event.id)}
+									<div class="flex gap-2 text-xs">
+										<span class="mt-1 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-blue-400"></span>
+										<span class="min-w-0 flex-1 break-words font-mono text-foreground/80">{event.summary}</span>
+										<span class="flex-shrink-0 text-muted-foreground">{timeAgo(event.created_at)}</span>
+									</div>
+								{/each}
+							</div>
+						</details>
+					{/if}
+
+					{#if latestResult}
+						<section class="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
+							<div class="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-emerald-400">
+								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
+								Result
+							</div>
+							<div class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult)}</div>
+						</section>
+					{:else if latestError}
+						<section class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
+							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
+							<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>
+						</section>
+					{/if}
+
+					{#if messages.length === 0 && primaryActivityEvents.length === 0 && technicalActivityEvents.length === 0 && !latestResult && !latestError && !task.description}
+						<div class="flex h-full items-center justify-center text-sm text-muted-foreground">
+							<div class="space-y-1 text-center">
+								<div class="text-3xl">&#x1f4cb;</div>
+								<div>No activity yet</div>
+							</div>
+						</div>
+					{/if}
 
 					<!-- Live indicator -->
 					{#if task.status === 'in_progress'}

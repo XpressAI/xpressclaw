@@ -80,6 +80,14 @@ pub struct SessionOverview {
     pub artifacts: Vec<AttemptArtifact>,
 }
 
+/// Native work history scoped to one task. This is the task page's semantic
+/// activity feed: attempts and structured events, never raw terminal output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskActivity {
+    pub attempts: Vec<WorkAttempt>,
+    pub events: Vec<SessionEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewEvent<'a> {
     pub attempt_id: Option<&'a str>,
@@ -322,6 +330,56 @@ impl SessionManager {
                 .filter_map(|row| row.ok())
                 .collect();
             Ok(attempts)
+        })
+    }
+
+    pub fn task_activity(
+        &self,
+        task_id: &str,
+        after: Option<i64>,
+        event_limit: i64,
+        attempt_limit: i64,
+    ) -> Result<TaskActivity> {
+        self.db.with_conn(|conn| {
+            let mut attempt_stmt = conn.prepare(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at
+                 FROM work_attempts WHERE task_id = ?1
+                 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let attempts = attempt_stmt
+                .query_map(rusqlite::params![task_id, attempt_limit], row_to_attempt)?
+                .filter_map(|row| row.ok())
+                .collect();
+
+            let (event_sql, pivot) = if let Some(after_id) = after {
+                (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE task_id = ?1 AND id > ?2
+                     ORDER BY id ASC LIMIT ?3",
+                    after_id,
+                )
+            } else {
+                (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE task_id = ?1 AND id > ?2
+                     ORDER BY id DESC LIMIT ?3",
+                    -1,
+                )
+            };
+            let mut event_stmt = conn.prepare(event_sql)?;
+            let mut events: Vec<_> = event_stmt
+                .query_map(rusqlite::params![task_id, pivot, event_limit], row_to_event)?
+                .filter_map(|row| row.ok())
+                .collect();
+            if after.is_none() {
+                events.reverse();
+            }
+
+            Ok(TaskActivity { attempts, events })
         })
     }
 
@@ -695,6 +753,68 @@ mod tests {
         assert_eq!(event.source_type, "schedule");
         assert_eq!(event.source_id.as_deref(), Some("weekly-seo"));
         assert_eq!(event.payload["cron"], "0 9 * * 1");
+    }
+
+    #[test]
+    fn task_activity_is_scoped_and_incremental() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("website")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title) VALUES ('task-1', 'First'), ('task-2', 'Second')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status) VALUES
+                    (1, 'task-1', 'builder', 'queued'),
+                    (2, 'task-2', 'builder', 'queued')",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        let first = manager
+            .create_attempt(
+                "builder", "task-1", 1, "codex", "task", "task", None, "First",
+            )
+            .unwrap();
+        manager
+            .create_attempt(
+                "builder", "task-2", 2, "codex", "task", "task", None, "Second",
+            )
+            .unwrap();
+        manager
+            .transition_attempt(&first.id, "running", "Inspecting files", None, None)
+            .unwrap();
+
+        let initial = manager.task_activity("task-1", None, 100, 20).unwrap();
+        assert_eq!(initial.attempts.len(), 1);
+        assert!(initial
+            .events
+            .iter()
+            .all(|event| event.task_id.as_deref() == Some("task-1")));
+        let last_id = initial.events.last().unwrap().id;
+
+        manager
+            .append_event(
+                "builder",
+                NewEvent {
+                    attempt_id: Some(&first.id),
+                    task_id: Some("task-1"),
+                    source_type: "runner",
+                    source_id: Some("codex"),
+                    event_type: "runner_progress",
+                    summary: "Ran tests",
+                    payload: json!({}),
+                },
+            )
+            .unwrap();
+        let incremental = manager
+            .task_activity("task-1", Some(last_id), 100, 20)
+            .unwrap();
+        assert_eq!(incremental.events.len(), 1);
+        assert_eq!(incremental.events[0].summary, "Ran tests");
     }
 
     #[test]

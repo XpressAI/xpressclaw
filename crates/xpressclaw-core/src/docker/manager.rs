@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bollard::container::{
     Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
@@ -445,17 +446,84 @@ impl DockerManager {
     /// remove it. The output is consumed by semantic adapters and never shown
     /// as an interactive terminal.
     pub async fn wait_for_exit(&self, workload_id: &str) -> Result<ContainerOutput> {
+        self.wait_for_exit_streaming(workload_id, |_| {}).await
+    }
+
+    /// Follow a short-lived workload's output while it runs. Callers receive
+    /// chunks for semantic parsing; the complete output is still returned for
+    /// the final result adapter and artifact.
+    pub async fn wait_for_exit_streaming<F>(
+        &self,
+        workload_id: &str,
+        mut on_output: F,
+    ) -> Result<ContainerOutput>
+    where
+        F: FnMut(&str),
+    {
         let container_name = format!("xpressclaw-{workload_id}");
         let options = WaitContainerOptions {
             condition: "not-running",
         };
-        let mut stream = self.docker.wait_container(&container_name, Some(options));
-        let response = stream
-            .next()
+        let mut wait_stream = self.docker.wait_container(&container_name, Some(options));
+        let log_options = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            follow: true,
+            ..Default::default()
+        };
+        let mut log_stream = self.docker.logs(&container_name, Some(log_options));
+        let mut streamed_output = String::new();
+        let mut logs_done = false;
+
+        let response = loop {
+            tokio::select! {
+                response = wait_stream.next() => {
+                    break response
+                        .ok_or_else(|| Error::Container("container wait ended without a result".to_string()))?
+                        .map_err(|e| Error::Container(format!("container wait failed: {e}")))?;
+                }
+                chunk = log_stream.next(), if !logs_done => {
+                    match chunk {
+                        Some(Ok(log)) => {
+                            let text = log.to_string();
+                            streamed_output.push_str(&text);
+                            on_output(&text);
+                        }
+                        Some(Err(error)) => {
+                            debug!(%error, "error following workload output");
+                            logs_done = true;
+                        }
+                        None => logs_done = true,
+                    }
+                }
+            }
+        };
+
+        // Docker may report the exit before the final log frames are delivered.
+        // Give the follow stream a short opportunity to drain those frames.
+        if !logs_done {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(1), log_stream.next()).await {
+                    Ok(Some(Ok(log))) => {
+                        let text = log.to_string();
+                        streamed_output.push_str(&text);
+                        on_output(&text);
+                    }
+                    Ok(Some(Err(error))) => {
+                        debug!(%error, "error draining workload output");
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+
+        // Re-read the exited container for an authoritative final result. The
+        // live stream above exists for activity, not as the durable artifact.
+        let output = self
+            .logs(workload_id, 100_000)
             .await
-            .ok_or_else(|| Error::Container("container wait ended without a result".to_string()))?
-            .map_err(|e| Error::Container(format!("container wait failed: {e}")))?;
-        let output = self.logs(workload_id, 100_000).await.unwrap_or_default();
+            .unwrap_or(streamed_output);
         let _ = self.remove(&container_name).await;
         Ok(ContainerOutput {
             status_code: response.status_code,
