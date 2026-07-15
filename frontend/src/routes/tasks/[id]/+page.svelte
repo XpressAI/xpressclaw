@@ -34,18 +34,44 @@
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
 	let primaryActivityEvents = $derived(
-		activityEvents.filter(event =>
-			!['artifact_created', 'attempt_completed'].includes(event.event_type) &&
-			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message')
-		)
+		activityEvents.filter(event => {
+			const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
+				message.role === 'assistant' && (
+					message.content === event.summary ||
+					(event.summary.length >= 200 && message.content.startsWith(event.summary.slice(0, 180)))
+				)
+			);
+			return !['artifact_created', 'attempt_completed'].includes(event.event_type) &&
+				(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
+				!mirrorsTaskReply;
+		})
 	);
 	let technicalActivityEvents = $derived(
 		activityEvents.filter(event =>
 			event.event_type === 'runner_progress' && event.payload?.item_type !== 'agent_message'
 		)
 	);
-	let latestResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
+	let activeAttempt = $derived(
+		attempts.find(attempt => ['queued', 'preparing', 'running', 'review'].includes(attempt.status)) ?? null
+	);
+	let latestAttemptResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
+	let latestResult = $derived(
+		latestAttemptResult && !messages.some(message =>
+			message.role === 'assistant' && message.content === latestAttemptResult
+		)
+			? latestAttemptResult
+			: null
+	);
 	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
+	let messagePlaceholder = $derived(
+		!task?.agent_id
+			? 'Assign a session to chat about this task'
+			: task.status === 'waiting_for_input'
+				? 'Reply to the worker...'
+				: ['completed', 'blocked', 'cancelled'].includes(task.status)
+					? 'Ask a follow-up or request a correction...'
+					: 'Send additional context...'
+	);
 
 	onMount(async () => {
 		await load();
@@ -507,48 +533,59 @@
 					{/if}
 
 					<!-- Live indicator -->
-					{#if task.status === 'in_progress'}
+					{#if activeAttempt?.status === 'running' || activeAttempt?.status === 'preparing' || activeAttempt?.status === 'review'}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
 							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
 							A native worker is handling this task...
+						</div>
+					{:else if activeAttempt?.status === 'queued'}
+						<div class="flex items-center gap-2 text-xs text-muted-foreground">
+							<span class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
+							The next worker turn is queued...
 						</div>
 					{:else if task.status === 'waiting_for_input'}
 						<div class="flex items-center gap-2 text-xs text-orange-400">
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
 							Waiting for your response...
 						</div>
+					{:else if task.status === 'in_progress' && subtaskList.some(subtask => subtask.status !== 'completed')}
+						<div class="flex items-center gap-2 text-xs text-amber-400">
+							<span class="h-2 w-2 rounded-full bg-amber-400"></span>
+							This task still has unfinished steps.
+						</div>
 					{/if}
 				</div>
 
 				<!-- Message input -->
-				{#if task.status === 'in_progress' || task.status === 'waiting_for_input'}
-					<div class="border-t border-border p-4">
-						{#if task.status === 'waiting_for_input'}
-							<div class="text-xs text-orange-400 mb-2">The native worker needs additional input</div>
-						{/if}
-						<div class="flex items-end gap-3">
+				<div class="border-t border-border p-4">
+					{#if task.status === 'waiting_for_input'}
+						<div class="text-xs text-orange-400 mb-2">The native worker needs additional input</div>
+					{:else if !task.agent_id}
+						<div class="text-xs text-muted-foreground mb-2">Assign a session before sending a message</div>
+					{/if}
+					<div class="flex items-end gap-3">
 							<div class="flex-1 rounded-xl border border-border bg-secondary/50 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/30 transition-all">
 								<textarea
 									bind:value={messageInput}
 									onkeydown={handleMessageKeydown}
 									oncompositionstart={() => (composing = true)}
 									oncompositionend={() => setTimeout(() => (composing = false), 0)}
-									placeholder="Send additional context..."
+									placeholder={messagePlaceholder}
 									rows={1}
 									class="w-full resize-none rounded-xl bg-transparent px-4 py-3 text-sm text-foreground focus:outline-none placeholder:text-muted-foreground max-h-32"
-									disabled={messageSending}
+									disabled={messageSending || !task.agent_id}
 								></textarea>
 							</div>
 							<button
 								onclick={sendTaskMessage}
-								disabled={!messageInput.trim() || messageSending}
+								aria-label="Send message"
+								disabled={!messageInput.trim() || messageSending || !task.agent_id}
 								class="flex h-11 w-11 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex-shrink-0 shadow-lg shadow-primary/20"
 							>
 								<svg class="h-5 w-5" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
 							</button>
-						</div>
 					</div>
-				{/if}
+				</div>
 			</div>
 
 			<!-- Right: details sidebar -->

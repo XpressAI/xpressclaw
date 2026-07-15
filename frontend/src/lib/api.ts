@@ -449,7 +449,7 @@ export const tasks = {
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
 	addMessage: (id: string, role: string, content: string) =>
-		request<TaskMessage>(`/api/tasks/${id}/messages`, {
+		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
 			body: JSON.stringify({ role, content })
 		}),
@@ -469,6 +469,12 @@ export interface TaskMessage {
 	role: string;
 	content: string;
 	timestamp: string;
+}
+
+export interface TaskMessageResponse {
+	message: TaskMessage;
+	continuation_queued: boolean;
+	attempt_id: string | null;
 }
 
 // -- Memory --

@@ -15,7 +15,8 @@ use crate::db::Database;
 use crate::docker::manager::{ContainerOutput, ContainerSpec, DockerManager, VolumeMount};
 use crate::error::{Error, Result};
 use crate::sessions::{NewEvent, SessionManager};
-use crate::tasks::board::TaskBoard;
+use crate::tasks::board::{ReportedSubtask, TaskBoard, TaskStatus};
+use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::{QueueItem, TaskQueue};
 
 const MAX_CAPTURED_OUTPUT: usize = 200_000;
@@ -31,6 +32,7 @@ struct NativeResult {
 struct NativeStreamUpdate {
     native_session_id: Option<String>,
     progress: Vec<(String, Value)>,
+    plans: Vec<Vec<ReportedSubtask>>,
 }
 
 #[derive(Debug, Default)]
@@ -190,6 +192,7 @@ async fn execute_item(
         .wait_for_exit_streaming(&workload_id, |chunk| {
             let update = decoder.push(&kind, chunk);
             if let Err(error) = record_stream_update(
+                &db,
                 &sessions,
                 &attempt.session_id,
                 attempt_id,
@@ -203,6 +206,7 @@ async fn execute_item(
         .await?;
     let final_update = decoder.finish(&kind);
     if let Err(error) = record_stream_update(
+        &db,
         &sessions,
         &attempt.session_id,
         attempt_id,
@@ -254,8 +258,28 @@ async fn execute_item(
         Some(&parsed.summary),
         None,
     )?;
-    TaskQueue::new(db.clone()).complete(item.id, &parsed.summary)?;
-    board.update_status(&item.task_id, "completed", Some(&item.agent_id))?;
+    let queue = TaskQueue::new(db.clone());
+    queue.complete(item.id, &parsed.summary)?;
+    if let Err(error) =
+        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &parsed.summary)
+    {
+        warn!(%error, task_id = item.task_id, "failed to persist native task reply");
+    }
+
+    let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
+    let waiting_for_user = needs_user_input(&parsed.summary);
+    let completed_tasks = if continuation_queued {
+        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
+        Vec::new()
+    } else if waiting_for_user {
+        board.update_status(&item.task_id, "waiting_for_input", Some(&item.agent_id))?;
+        Vec::new()
+    } else if board.subtasks_complete(&item.task_id)? {
+        board.complete_and_roll_up(&item.task_id, Some(&item.agent_id))?
+    } else {
+        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
+        Vec::new()
+    };
     publish_conversation_result(
         &db,
         &event_bus,
@@ -263,7 +287,9 @@ async fn execute_item(
         &agent.context_label(),
         &parsed.summary,
     );
-    advance_workflow(&db, &item.task_id, "completed", &parsed.summary);
+    for completed in completed_tasks {
+        advance_workflow(&db, &completed.id, "completed", &parsed.summary);
+    }
     Ok(())
 }
 
@@ -291,9 +317,28 @@ fn fail_item(
             );
         }
     }
-    TaskQueue::new(db.clone()).fail(item.id, message)?;
+    let queue = TaskQueue::new(db.clone());
+    queue.fail(item.id, message)?;
+    let chat_message = format!(
+        "The worker could not complete this turn.\n\n{}",
+        truncate(message, 2_000)
+    );
+    if let Err(error) =
+        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &chat_message)
+    {
+        warn!(%error, task_id = item.task_id, "failed to persist native task failure");
+    }
     let board = TaskBoard::new(db.clone());
-    let _ = board.update_status(&item.task_id, "blocked", Some(&item.agent_id));
+    let continuation_queued = queue.has_queued_for_task(&item.task_id).unwrap_or(false);
+    let _ = board.update_status(
+        &item.task_id,
+        if continuation_queued {
+            "in_progress"
+        } else {
+            "blocked"
+        },
+        Some(&item.agent_id),
+    );
     if let Some(conversation_id) = conversation_id(db, &item.task_id) {
         event_bus.send(
             &conversation_id,
@@ -304,7 +349,9 @@ fn fail_item(
         );
         event_bus.send(&conversation_id, ConversationEvent::Done);
     }
-    advance_workflow(db, &item.task_id, "failed", message);
+    if !continuation_queued {
+        advance_workflow(db, &item.task_id, "failed", message);
+    }
     Ok(())
 }
 
@@ -400,7 +447,7 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
         "You are executing work attempt {attempt_id} inside logical session {}.\n",
         item.agent_id
     ));
-    prompt.push_str("Work autonomously in /workspace. Return a concise result describing outcomes, changed files, verification, and any blocker. Do not ask the user to watch a terminal.\n\n");
+    prompt.push_str("Work autonomously in /workspace. Keep your native plan/todo list current so its steps can be shown in the task. Return a concise result describing outcomes, changed files, verification, and any blocker. If you cannot continue without a user decision or missing information, end with `NEEDS_USER_INPUT: <your specific question>`. Do not ask the user to watch a terminal.\n\n");
     prompt.push_str("Task:\n");
     prompt.push_str(&task.title);
     if let Some(description) = task.description.as_deref() {
@@ -676,6 +723,7 @@ impl NativeProgressDecoder {
         if parsed.native_session_id.is_some() {
             update.native_session_id = parsed.native_session_id;
         }
+        update.plans.extend(parsed.plans);
         for progress in parsed.progress {
             if self.emitted >= MAX_PROGRESS_EVENTS {
                 break;
@@ -699,16 +747,21 @@ fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
-            Some("item.completed") => {
+            Some(event_type)
+                if matches!(
+                    event_type,
+                    "item.started" | "item.updated" | "item.completed"
+                ) =>
+            {
                 if let Some(item) = value.get("item") {
                     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("item");
                     let summary = match item_type {
-                        "agent_message" => item
+                        "agent_message" if event_type == "item.completed" => item
                             .get("text")
                             .and_then(Value::as_str)
                             .filter(|text| !text.trim().is_empty())
                             .map(|text| truncate(text, 1_000)),
-                        "command_execution" => {
+                        "command_execution" if event_type == "item.completed" => {
                             let command = item
                                 .get("command")
                                 .and_then(Value::as_str)
@@ -716,21 +769,26 @@ fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
                             Some(format!("Ran {}", truncate(command, 160)))
                         }
                         "todo_list" => item.get("items").and_then(Value::as_array).map(|items| {
-                            let completed = items
+                            let plan = plan_from_items(items, "text");
+                            let completed = plan
                                 .iter()
-                                .filter(|item| {
-                                    item.get("completed").and_then(Value::as_bool) == Some(true)
-                                })
+                                .filter(|item| item.status == TaskStatus::Completed)
                                 .count();
+                            update.plans.push(plan);
                             format!("Updated plan: {completed}/{} complete", items.len())
                         }),
-                        "file_change" => Some("Updated project files".to_string()),
+                        "file_change" if event_type == "item.completed" => {
+                            Some("Updated project files".to_string())
+                        }
                         _ => None,
                     };
                     if let Some(summary) = summary {
-                        update
-                            .progress
-                            .push((summary, json!({ "item_type": item_type })));
+                        let payload = if item_type == "todo_list" {
+                            json!({ "item_type": item_type, "items": item.get("items") })
+                        } else {
+                            json!({ "item_type": item_type })
+                        };
+                        update.progress.push((summary, payload));
                     }
                 }
             }
@@ -766,10 +824,36 @@ fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
                             Some("tool_use") => {
                                 let name =
                                     item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                                update.progress.push((
-                                    format!("Used {name}"),
-                                    json!({ "item_type": "tool_use", "tool": name }),
-                                ));
+                                if name.eq_ignore_ascii_case("TodoWrite") {
+                                    if let Some(todos) = item
+                                        .get("input")
+                                        .and_then(|input| input.get("todos"))
+                                        .and_then(Value::as_array)
+                                    {
+                                        let plan = plan_from_items(todos, "content");
+                                        let completed = plan
+                                            .iter()
+                                            .filter(|item| item.status == TaskStatus::Completed)
+                                            .count();
+                                        update.plans.push(plan);
+                                        update.progress.push((
+                                            format!(
+                                                "Updated plan: {completed}/{} complete",
+                                                todos.len()
+                                            ),
+                                            json!({
+                                                "item_type": "todo_list",
+                                                "tool": name,
+                                                "items": todos,
+                                            }),
+                                        ));
+                                    }
+                                } else {
+                                    update.progress.push((
+                                        format!("Used {name}"),
+                                        json!({ "item_type": "tool_use", "tool": name }),
+                                    ));
+                                }
                             }
                             _ => {}
                         }
@@ -808,7 +892,51 @@ fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
     update
 }
 
+fn plan_from_items(items: &[Value], title_key: &str) -> Vec<ReportedSubtask> {
+    let has_explicit_active = items
+        .iter()
+        .any(|item| item.get("status").and_then(Value::as_str) == Some("in_progress"));
+    let first_incomplete = items.iter().position(|item| {
+        item.get("completed").and_then(Value::as_bool) != Some(true)
+            && item.get("status").and_then(Value::as_str) != Some("completed")
+    });
+
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let title = item
+                .get(title_key)
+                .or_else(|| item.get("text"))
+                .or_else(|| item.get("content"))
+                .or_else(|| item.get("subject"))
+                .and_then(Value::as_str)?
+                .trim();
+            if title.is_empty() {
+                return None;
+            }
+            let status = match item.get("status").and_then(Value::as_str) {
+                Some("completed") => TaskStatus::Completed,
+                Some("in_progress") => TaskStatus::InProgress,
+                Some("cancelled") => TaskStatus::Cancelled,
+                _ if item.get("completed").and_then(Value::as_bool) == Some(true) => {
+                    TaskStatus::Completed
+                }
+                _ if !has_explicit_active && first_incomplete == Some(index) => {
+                    TaskStatus::InProgress
+                }
+                _ => TaskStatus::Pending,
+            };
+            Some(ReportedSubtask {
+                title: title.to_string(),
+                status,
+            })
+        })
+        .collect()
+}
+
 fn record_stream_update(
+    db: &Arc<Database>,
     sessions: &SessionManager,
     session_id: &str,
     attempt_id: &str,
@@ -818,6 +946,9 @@ fn record_stream_update(
 ) -> Result<()> {
     if let Some(native_session_id) = update.native_session_id.as_deref() {
         sessions.set_native_session(attempt_id, native_session_id)?;
+    }
+    for plan in update.plans {
+        TaskBoard::new(db.clone()).sync_reported_subtasks(task_id, attempt_id, &plan)?;
     }
     for (summary, payload) in update.progress {
         sessions.append_event(
@@ -903,6 +1034,14 @@ fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
     }
 }
 
+fn needs_user_input(summary: &str) -> bool {
+    summary.lines().any(|line| {
+        line.trim_start()
+            .trim_start_matches(['`', '*', '-', '#', ' '])
+            .starts_with("NEEDS_USER_INPUT:")
+    })
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -972,6 +1111,37 @@ mod tests {
     }
 
     #[test]
+    fn extracts_codex_todo_snapshots_as_subtasks() {
+        let mut decoder = NativeProgressDecoder::default();
+        let started = decoder.push(
+            "codex",
+            concat!(
+                "{\"type\":\"item.started\",\"item\":{\"id\":\"item_1\",",
+                "\"type\":\"todo_list\",\"items\":[",
+                "{\"text\":\"Inspect code\",\"completed\":false},",
+                "{\"text\":\"Run tests\",\"completed\":false}]}}\n"
+            ),
+        );
+        assert_eq!(started.plans.len(), 1);
+        assert_eq!(started.plans[0][0].title, "Inspect code");
+        assert_eq!(started.plans[0][0].status, TaskStatus::InProgress);
+        assert_eq!(started.plans[0][1].status, TaskStatus::Pending);
+        assert_eq!(started.progress[0].0, "Updated plan: 0/2 complete");
+
+        let updated = decoder.push(
+            "codex",
+            concat!(
+                "{\"type\":\"item.updated\",\"item\":{\"id\":\"item_1\",",
+                "\"type\":\"todo_list\",\"items\":[",
+                "{\"text\":\"Inspect code\",\"completed\":true},",
+                "{\"text\":\"Run tests\",\"completed\":false}]}}\n"
+            ),
+        );
+        assert_eq!(updated.plans[0][0].status, TaskStatus::Completed);
+        assert_eq!(updated.plans[0][1].status, TaskStatus::InProgress);
+    }
+
+    #[test]
     fn parses_claude_semantic_progress() {
         let mut decoder = NativeProgressDecoder::default();
         let update = decoder.push(
@@ -987,6 +1157,39 @@ mod tests {
         assert_eq!(update.native_session_id.as_deref(), Some("session-1"));
         assert_eq!(update.progress[0].0, "Inspecting the project");
         assert_eq!(update.progress[1].0, "Used Bash");
+    }
+
+    #[test]
+    fn extracts_claude_todo_write_snapshots_as_subtasks() {
+        let mut decoder = NativeProgressDecoder::default();
+        let update = decoder.push(
+            "claude",
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[",
+                "{\"type\":\"tool_use\",\"name\":\"TodoWrite\",\"input\":{\"todos\":[",
+                "{\"content\":\"Inspect code\",\"status\":\"completed\"},",
+                "{\"content\":\"Fix bug\",\"status\":\"in_progress\"},",
+                "{\"content\":\"Run tests\",\"status\":\"pending\"}]}}]}}\n"
+            ),
+        );
+
+        assert_eq!(update.plans.len(), 1);
+        assert_eq!(update.plans[0].len(), 3);
+        assert_eq!(update.plans[0][0].status, TaskStatus::Completed);
+        assert_eq!(update.plans[0][1].status, TaskStatus::InProgress);
+        assert_eq!(update.plans[0][2].status, TaskStatus::Pending);
+        assert_eq!(update.progress[0].0, "Updated plan: 1/3 complete");
+    }
+
+    #[test]
+    fn recognizes_explicit_native_questions() {
+        assert!(needs_user_input(
+            "I need one decision.\n\nNEEDS_USER_INPUT: Which database should I use?"
+        ));
+        assert!(needs_user_input(
+            "**NEEDS_USER_INPUT: Which database should I use?**"
+        ));
+        assert!(!needs_user_input("Implemented and tested. No blockers."));
     }
 
     #[test]

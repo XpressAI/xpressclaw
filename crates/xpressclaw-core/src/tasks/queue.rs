@@ -41,6 +41,30 @@ impl TaskQueue {
             Ok::<_, Error>(conn.last_insert_rowid())
         })?;
 
+        self.create_attempt_for_item(id, task_id, agent_id)
+    }
+
+    /// Enqueue one continuation turn unless the task already has a queued
+    /// turn. A running turn is intentionally not considered a duplicate: the
+    /// continuation waits behind it and receives any messages sent meanwhile.
+    pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
+        let id = self.db.with_conn(|conn| {
+            let changed = conn.execute(
+                "INSERT INTO task_queue (task_id, agent_id, status)
+                 SELECT ?1, ?2, 'queued'
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
+                 )",
+                rusqlite::params![task_id, agent_id],
+            )?;
+            Ok::<_, Error>((changed == 1).then(|| conn.last_insert_rowid()))
+        })?;
+
+        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
+            .transpose()
+    }
+
+    fn create_attempt_for_item(&self, id: i64, task_id: &str, agent_id: &str) -> Result<QueueItem> {
         let (title, description, kind, source_type, source_id) = self.db.with_conn(|conn| {
             conn.query_row(
                 "SELECT title, description, context FROM tasks WHERE id = ?1",
@@ -97,6 +121,20 @@ impl TaskQueue {
 
         debug!(task_id, agent_id, queue_id = id, "enqueued task");
         self.get(id)
+    }
+
+    /// Whether a continuation is waiting behind the current turn.
+    pub fn has_queued_for_task(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
+                )",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
     }
 
     /// Get a queue item by ID.
@@ -489,6 +527,44 @@ mod tests {
         assert_eq!(queue.pending_count("atlas").unwrap(), 2);
 
         queue.claim("atlas").unwrap();
+        assert_eq!(queue.pending_count("atlas").unwrap(), 1);
+    }
+
+    #[test]
+    fn coalesces_messages_into_one_queued_continuation() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db);
+        let task = board
+            .create(&CreateTask {
+                title: "Conversation".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let first = queue.enqueue(&task.id, "atlas").unwrap();
+        assert!(queue
+            .enqueue_continuation(&task.id, "atlas")
+            .unwrap()
+            .is_none());
+        let running = queue.claim("atlas").unwrap().unwrap();
+        assert_eq!(running.id, first.id);
+
+        let continuation = queue
+            .enqueue_continuation(&task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        assert_ne!(continuation.id, first.id);
+        assert!(queue.has_queued_for_task(&task.id).unwrap());
+        assert!(queue
+            .enqueue_continuation(&task.id, "atlas")
+            .unwrap()
+            .is_none());
         assert_eq!(queue.pending_count("atlas").unwrap(), 1);
     }
 }
