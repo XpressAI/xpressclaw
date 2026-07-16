@@ -100,15 +100,15 @@ not accumulate in that image.
 A richer development environment is instead a control-plane-managed resource
 that can be created, leased to an attempt, and destroyed independently. The
 runner receives a scoped way to edit the shared workspace and execute tools in
-that environment. It does not receive the host Docker socket or unrestricted
-container-daemon credentials. The same resource model can later cover Android
-devices, desktops, browsers, and remote machines.
+that environment. The same resource model can later cover Android devices,
+desktops, browsers, and remote machines.
 
 The first implementation still bind-mounts the configured workspace directly
 into a runner. Custom runner images remain supported as an escape hatch until
-the scoped development-environment gateway is implemented. We explicitly do
-not use a Docker-socket mount as an interim solution because it would turn a
-worker compromise into control over every host container and mount.
+the scoped development-environment gateway is implemented. ADR-027 later adds
+an explicit trusted host-engine mode for projects whose existing build and test
+workflows depend on Docker Compose or image builds; the default remains the
+minimal runner without daemon access.
 
 ### Subscription authentication
 

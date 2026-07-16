@@ -12,28 +12,32 @@
 			name: 'Codex',
 			mark: 'C',
 			description: 'Codex through its ACP adapter, using an eligible ChatGPT login.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest'
+			image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest'
 		},
 		{
 			kind: 'claude',
 			name: 'Claude Code',
 			mark: 'A',
 			description: 'Claude Code through its ACP adapter, using an eligible Claude login.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest'
+			image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest'
 		},
 		{
 			kind: 'opencode',
 			name: 'OpenCode',
 			mark: 'O',
 			description: 'OpenCode through its built-in ACP server.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest'
+			image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest'
 		},
 		{
 			kind: 'custom',
 			name: 'Other ACP agent',
 			mark: '+',
 			description: 'Any containerized agent that speaks ACP over stdio.',
-			image: ''
+			image: '',
+			hostImage: ''
 		}
 	] as const;
 
@@ -45,7 +49,9 @@
 	let runnerModel = $state('');
 	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
+	let containerEngine = $state<'none' | 'host'>('none');
 	let workspacePath = $state('');
+	let hostOs = $state('');
 	let workspaceFolders = $state<string[]>([]);
 	let newFolderPath = $state('');
 	let dockerStatus = $state<DockerStatus | null>(null);
@@ -65,6 +71,7 @@
 		try {
 			const info = await setup.systemInfo();
 			workspacePath = info.working_directory ?? '';
+			hostOs = info.os;
 		} catch {
 			workspacePath = '';
 		}
@@ -75,10 +82,28 @@
 		const runner = runnerOptions.find((option) => option.kind === kind);
 		if (!runner) return;
 		runnerKind = runner.kind;
-		runnerImage = runner.image;
+		runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
 		runnerCommand = '';
 		runnerModel = '';
 		subscriptionAuth = runner.kind !== 'custom';
+	}
+
+	function setContainerEngine(enabled: boolean) {
+		const defaults = new Set<string>([
+			...runnerOptions.flatMap((runner) => [runner.image, runner.hostImage]),
+			'xpressclaw-runner-codex:latest',
+			'xpressclaw-runner-codex-docker:latest',
+			'xpressclaw-runner-claude:latest',
+			'xpressclaw-runner-claude-docker:latest',
+			'xpressclaw-runner-opencode:latest',
+			'xpressclaw-runner-opencode-docker:latest'
+		]);
+		const replaceImage = !runnerImage.trim() || defaults.has(runnerImage.trim());
+		containerEngine = enabled ? 'host' : 'none';
+		const runner = runnerOptions.find((option) => option.kind === runnerKind);
+		if (runner && runner.kind !== 'custom' && replaceImage) {
+			runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
+		}
 	}
 
 	function addFolder() {
@@ -100,6 +125,7 @@
 
 	function additionalVolumes(): string[] {
 		return workspaceFolders.map((folder) => {
+			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}`;
 			const basename = folder.split('/').filter(Boolean).pop() || 'shared';
 			return `${folder}:/workspace/${basename}`;
 		});
@@ -118,6 +144,7 @@
 			runner_model: runnerModel.trim() || undefined,
 			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
 			subscription_auth: subscriptionAuth,
+			runner_container_engine: containerEngine,
 			volumes: additionalVolumes()
 		};
 
@@ -194,8 +221,32 @@
 				class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 			/>
 			<p class="mt-1.5 text-xs text-muted-foreground">
-				The folder must exist on this machine. It is mounted at <code>/workspace</code> and appears as <strong>{contextLabel}</strong> in the UI.
+				The folder must exist on this machine.
+				{containerEngine === 'host'
+					? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
+					: ' It is mounted at /workspace.'}
+				It appears as <strong>{contextLabel}</strong> in the UI.
 			</p>
+		</section>
+
+		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			<label class="flex cursor-pointer items-start gap-3">
+				<input
+					type="checkbox"
+					checked={containerEngine === 'host'}
+					onchange={(event) => setContainerEngine(event.currentTarget.checked)}
+					class="mt-0.5 rounded border-border"
+				/>
+				<span>
+					<span class="block text-sm font-medium text-foreground">Give the agent host Docker or Podman access</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Use Docker Compose, Buildx, and the host engine's image cache from inside the runner.</span>
+				</span>
+			</label>
+			{#if containerEngine === 'host'}
+				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+					The agent can control host containers, images, volumes, and any paths the engine can mount. Enable this only for agents and images you trust.
+				</p>
+			{/if}
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
@@ -231,7 +282,7 @@
 						bind:value={runnerImage}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
-					<p class="mt-1 text-xs text-muted-foreground">Use the minimal agent image or a compatible derivative. Richer development environments can be attached separately.</p>
+					<p class="mt-1 text-xs text-muted-foreground">{containerEngine === 'host' ? 'The built-in Docker variant adds Docker CLI, Compose, and Buildx.' : 'Use the minimal agent image or a compatible derivative.'}</p>
 				</div>
 
 				<div>

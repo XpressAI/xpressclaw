@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
-    context_label, default_native_runner_image, unique_session_id, AgentConfig, Config, LlmConfig,
-    McpServerConfig, NativeRunnerConfig,
+    context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
+    ContainerEngineAccess, LlmConfig, McpServerConfig, NativeRunnerConfig,
 };
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
@@ -301,6 +301,7 @@ struct AgentSetup {
     runner_model: Option<String>,
     runner_command: Option<Vec<String>>,
     subscription_auth: Option<bool>,
+    runner_container_engine: Option<ContainerEngineAccess>,
     volumes: Option<Vec<String>>,
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
@@ -326,14 +327,25 @@ fn runner_kind_from_setup(setup: &AgentSetup) -> String {
 
 fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
     let kind = runner_kind_from_setup(setup);
-    let image = setup
+    let container_engine = setup.runner_container_engine.unwrap_or_default();
+    let configured_image = setup
         .runner_image
         .as_deref()
         .map(str::trim)
         .filter(|image| !image.is_empty())
-        .map(str::to_owned)
-        .or_else(|| default_native_runner_image(&kind).map(str::to_owned))
         .unwrap_or_default();
+    let minimal_image = default_native_runner_image(&kind, ContainerEngineAccess::None);
+    let host_image = default_native_runner_image(&kind, ContainerEngineAccess::Host);
+    let image = if configured_image.is_empty()
+        || minimal_image == Some(configured_image)
+        || host_image == Some(configured_image)
+    {
+        default_native_runner_image(&kind, container_engine)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        configured_image.to_string()
+    };
     NativeRunnerConfig {
         kind,
         image,
@@ -358,6 +370,7 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .filter(|argument| !argument.is_empty())
             .collect(),
         subscription_auth: setup.subscription_auth.unwrap_or(true),
+        container_engine,
     }
 }
 
@@ -717,6 +730,22 @@ mod tests {
         assert_eq!(
             runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+        );
+    }
+
+    #[test]
+    fn setup_selects_the_docker_cli_variant_for_host_engine_access() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "runner_image": "ghcr.io/xpressai/xpressclaw-runner-codex:latest",
+            "runner_container_engine": "host"
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert_eq!(runner.container_engine, ContainerEngineAccess::Host);
+        assert_eq!(
+            runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
         );
     }
 

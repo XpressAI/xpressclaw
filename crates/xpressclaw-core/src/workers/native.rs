@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
-use crate::config::{default_native_runner_image, AgentConfig, Config, NativeRunnerConfig};
+use crate::config::{
+    default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, NativeRunnerConfig,
+};
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
@@ -140,21 +142,17 @@ async fn execute_item(
     if let Some(native_session_id) = resume_session_id.as_deref() {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
-    let mut spec = build_spec(&config, agent, &kind)?;
-    let built_in_image = default_native_runner_image(&kind) == Some(spec.image.as_str());
-    let image_ready = docker.has_image(&spec.image).await
-        && (!built_in_image
-            || docker
-                .image_has_label(&spec.image, "io.xpressclaw.protocol", "acp")
-                .await);
+    let mut spec = build_spec(&config, agent, &kind, &docker)?;
+    let container_workspace = spec
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| "/workspace".to_string());
+    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
+        == Some(spec.image.as_str());
+    let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
     if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
-            Some(image)
-                if docker.has_image(image).await
-                    && docker
-                        .image_has_label(image, "io.xpressclaw.protocol", "acp")
-                        .await =>
-            {
+            Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
                 Some(image)
             }
             _ => None,
@@ -170,13 +168,9 @@ async fn execute_item(
                 None,
             )?;
             docker.pull_image(&spec.image).await?;
-            if built_in_image
-                && !docker
-                    .image_has_label(&spec.image, "io.xpressclaw.protocol", "acp")
-                    .await
-            {
+            if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
                 return Err(Error::Backend(format!(
-                    "runner image {} predates the ACP integration; rebuild it from the current Dockerfile",
+                    "runner image {} is incompatible with the configured ACP or container-engine mode; rebuild it from the current Dockerfile",
                     spec.image
                 )));
             }
@@ -205,7 +199,7 @@ async fn execute_item(
         attached,
         recorder,
         resume_session_id.as_deref(),
-        Path::new("/workspace"),
+        Path::new(&container_workspace),
         &prompt,
         agent.runner.model.as_deref(),
     )
@@ -525,8 +519,35 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
     })
 }
 
-fn build_spec(config: &Config, agent: &AgentConfig, kind: &str) -> Result<ContainerSpec> {
-    let command = acp_command_for(&agent.runner, kind)?;
+async fn runner_image_ready(
+    docker: &DockerManager,
+    image: &str,
+    built_in_image: bool,
+    agent: &AgentConfig,
+) -> bool {
+    if !docker.has_image(image).await {
+        return false;
+    }
+    if built_in_image
+        && !docker
+            .image_has_label(image, "io.xpressclaw.protocol", "acp")
+            .await
+    {
+        return false;
+    }
+    agent.runner.container_engine != ContainerEngineAccess::Host
+        || !built_in_image
+        || docker
+            .image_has_label(image, "io.xpressclaw.container-engine", "host")
+            .await
+}
+
+fn build_spec(
+    config: &Config,
+    agent: &AgentConfig,
+    kind: &str,
+    docker: &DockerManager,
+) -> Result<ContainerSpec> {
     let image = resolved_runner_image(&agent.runner, kind)?;
     let workspace = agent
         .runner
@@ -538,9 +559,11 @@ fn build_spec(config: &Config, agent: &AgentConfig, kind: &str) -> Result<Contai
         .map(PathBuf::from)
         .unwrap_or_else(|| config.system.workspace_dir.clone());
     let workspace = canonical_or_original(&workspace);
+    let container_workspace = container_workspace_path(&workspace, agent.runner.container_engine);
+    let command = acp_command_for(&agent.runner, kind, &container_workspace)?;
     let mut volumes = vec![VolumeMount {
         source: workspace.display().to_string(),
-        target: "/workspace".to_string(),
+        target: container_workspace.clone(),
         read_only: false,
     }];
     for volume in &agent.volumes {
@@ -551,36 +574,70 @@ fn build_spec(config: &Config, agent: &AgentConfig, kind: &str) -> Result<Contai
     if agent.runner.subscription_auth {
         volumes.extend(auth_mounts(kind));
     }
+    let mut environment = vec![
+        "HOME=/home/node".to_string(),
+        "CI=1".to_string(),
+        "NO_COLOR=1".to_string(),
+    ];
+    if agent.runner.container_engine == ContainerEngineAccess::Host {
+        let socket = docker.host_engine_socket().ok_or_else(|| {
+            Error::DockerNotAvailable(
+                "host container-engine access requires a local Docker-compatible Unix socket"
+                    .to_string(),
+            )
+        })?;
+        volumes.push(VolumeMount {
+            source: socket.display().to_string(),
+            target: "/var/run/docker.sock".to_string(),
+            read_only: false,
+        });
+        environment.push("DOCKER_HOST=unix:///var/run/docker.sock".to_string());
+    }
 
     Ok(ContainerSpec {
         image,
         memory_limit: Some(4 * 1024 * 1024 * 1024),
         cpu_limit: None,
-        environment: vec![
-            "HOME=/home/node".to_string(),
-            "CI=1".to_string(),
-            "NO_COLOR=1".to_string(),
-        ],
+        environment,
         volumes,
         network_mode: Some("bridge".to_string()),
         expose_port: None,
         cmd: Some(command),
-        working_dir: Some("/workspace".to_string()),
+        working_dir: Some(container_workspace),
         run_as_host_user: true,
     })
 }
 
-pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
-    if config.image.trim().is_empty() {
-        return default_native_runner_image(kind)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                Error::Backend(format!(
-                    "runner '{kind}' requires an explicit container image"
-                ))
-            });
+fn container_workspace_path(workspace: &Path, container_engine: ContainerEngineAccess) -> String {
+    if container_engine == ContainerEngineAccess::Host && cfg!(unix) {
+        workspace.display().to_string()
+    } else {
+        "/workspace".to_string()
     }
-    Ok(config.image.trim().to_string())
+}
+
+pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
+    let desired_default = default_native_runner_image(kind, config.container_engine);
+    let alternate_mode = match config.container_engine {
+        ContainerEngineAccess::None => ContainerEngineAccess::Host,
+        ContainerEngineAccess::Host => ContainerEngineAccess::None,
+    };
+    let alternate_default = default_native_runner_image(kind, alternate_mode);
+    let configured_image = config.image.trim();
+    let built_in_image = [desired_default, alternate_default]
+        .into_iter()
+        .flatten()
+        .any(|image| {
+            configured_image == image || local_runner_image_alias(image) == Some(configured_image)
+        });
+    if configured_image.is_empty() || built_in_image {
+        return desired_default.map(str::to_owned).ok_or_else(|| {
+            Error::Backend(format!(
+                "runner '{kind}' requires an explicit container image"
+            ))
+        });
+    }
+    Ok(configured_image.to_string())
 }
 
 /// Local tags used by the ACP runner images. A published image is the
@@ -595,16 +652,29 @@ pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
         "ghcr.io/xpressai/xpressclaw-runner-opencode:latest" => {
             Some("xpressclaw-runner-opencode:latest")
         }
+        "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest" => {
+            Some("xpressclaw-runner-codex-docker:latest")
+        }
+        "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest" => {
+            Some("xpressclaw-runner-claude-docker:latest")
+        }
+        "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest" => {
+            Some("xpressclaw-runner-opencode-docker:latest")
+        }
         _ => None,
     }
 }
 
-fn acp_command_for(config: &NativeRunnerConfig, kind: &str) -> Result<Vec<String>> {
+fn acp_command_for(
+    config: &NativeRunnerConfig,
+    kind: &str,
+    container_workspace: &str,
+) -> Result<Vec<String>> {
     if !config.command.is_empty() {
         return Ok(config
             .command
             .iter()
-            .map(|part| part.replace("{workspace}", "/workspace"))
+            .map(|part| part.replace("{workspace}", container_workspace))
             .collect());
     }
     match kind {
@@ -801,7 +871,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            acp_command_for(&config, "custom").unwrap(),
+            acp_command_for(&config, "custom", "/workspace").unwrap(),
             vec!["runner", "--cwd=/workspace"]
         );
     }
@@ -810,15 +880,15 @@ mod tests {
     fn starts_the_builtin_acp_servers() {
         let config = NativeRunnerConfig::default();
         assert_eq!(
-            acp_command_for(&config, "codex").unwrap(),
+            acp_command_for(&config, "codex", "/workspace").unwrap(),
             vec!["codex-acp"]
         );
         assert_eq!(
-            acp_command_for(&config, "claude").unwrap(),
+            acp_command_for(&config, "claude", "/workspace").unwrap(),
             vec!["claude-agent-acp"]
         );
         assert_eq!(
-            acp_command_for(&config, "opencode").unwrap(),
+            acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
         );
     }
@@ -897,18 +967,58 @@ mod tests {
     #[test]
     fn selects_a_minimal_image_for_each_native_runner() {
         assert_eq!(
-            default_native_runner_image("codex"),
+            default_native_runner_image("codex", ContainerEngineAccess::None),
             Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
         );
         assert_eq!(
-            default_native_runner_image("claude"),
+            default_native_runner_image("claude", ContainerEngineAccess::None),
             Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
         );
         assert_eq!(
-            default_native_runner_image("opencode"),
+            default_native_runner_image("opencode", ContainerEngineAccess::None),
             Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
         );
-        assert_eq!(default_native_runner_image("custom"), None);
+        assert_eq!(
+            default_native_runner_image("custom", ContainerEngineAccess::None),
+            None
+        );
+    }
+
+    #[test]
+    fn host_engine_mode_selects_a_docker_cli_image_and_same_path_workspace() {
+        let config = NativeRunnerConfig {
+            kind: "codex".into(),
+            image: "ghcr.io/xpressai/xpressclaw-runner-codex:latest".into(),
+            container_engine: ContainerEngineAccess::Host,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_runner_image(&config, "codex").unwrap(),
+            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+        );
+        let workspace = Path::new("/home/me/project");
+        assert_eq!(
+            container_workspace_path(workspace, ContainerEngineAccess::Host),
+            if cfg!(unix) {
+                "/home/me/project"
+            } else {
+                "/workspace"
+            }
+        );
+    }
+
+    #[test]
+    fn host_engine_mode_migrates_a_local_minimal_alias() {
+        let config = NativeRunnerConfig {
+            kind: "codex".into(),
+            image: "xpressclaw-runner-codex:latest".into(),
+            container_engine: ContainerEngineAccess::Host,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved_runner_image(&config, "codex").unwrap(),
+            "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+        );
     }
 
     #[test]
@@ -929,6 +1039,10 @@ mod tests {
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
             Some("xpressclaw-runner-codex:latest")
+        );
+        assert_eq!(
+            local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"),
+            Some("xpressclaw-runner-codex-docker:latest")
         );
         assert_eq!(local_runner_image_alias("example/custom:latest"), None);
     }

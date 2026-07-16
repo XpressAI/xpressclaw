@@ -29,6 +29,7 @@ agents:
       image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
       workspace: /home/me/projects/site
       subscription_auth: true
+      container_engine: none
     volumes: []
 ```
 
@@ -38,9 +39,10 @@ agents:
 |---|---|
 | `kind` | `codex`, `claude`, `opencode`, or `custom` |
 | `image` | Product-specific ACP server image or compatible derivative |
-| `workspace` | Host project mounted read-write at `/workspace` |
+| `workspace` | Host project mounted read-write at `/workspace`, or at the same absolute path in host-engine mode |
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
+| `container_engine` | `none` (default) or trusted `host` Docker/Podman socket access |
 | `command` | ACP server argument list; required for custom agents and supports `{workspace}` |
 
 Additional `volumes` use `host:container` or `host:container:ro` syntax.
@@ -60,11 +62,23 @@ their host directory conventions.
 
 ## Built-in images
 
-| Product | Default image |
-|---|---|
-| Codex | `ghcr.io/xpressai/xpressclaw-runner-codex:latest` |
-| Claude Code | `ghcr.io/xpressai/xpressclaw-runner-claude:latest` |
-| OpenCode | `ghcr.io/xpressai/xpressclaw-runner-opencode:latest` |
+| Product | Minimal image | Host-engine image |
+|---|---|---|
+| Codex | `ghcr.io/xpressai/xpressclaw-runner-codex:latest` | `ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest` |
+| Claude Code | `ghcr.io/xpressai/xpressclaw-runner-claude:latest` | `ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest` |
+| OpenCode | `ghcr.io/xpressai/xpressclaw-runner-opencode:latest` | `ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest` |
+
+The host-engine variants add Docker CLI, Compose, and Buildx. When
+`container_engine: host` is enabled, Xpressclaw discovers the local Unix
+socket used by the control plane, mounts it at `/var/run/docker.sock`, and
+selects the matching host-engine image for a built-in runner. The project and
+additional folders are mounted at their absolute host paths so Compose bind
+mounts resolve against the same paths in the host engine.
+
+This mode gives the runner the authority of the host Docker or Podman daemon:
+it can manage containers, images, networks, and volumes and ask the daemon to
+mount host paths. It is intentionally opt-in and is suitable only when the
+agent and runner image are trusted. It is not a security boundary.
 
 The retired `xpressclaw-native-runner:latest` tag is migrated to the image for
 the configured product when an older file is loaded.

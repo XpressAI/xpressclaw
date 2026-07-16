@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bollard::container::{
@@ -94,6 +95,7 @@ pub struct ContainerOutput {
 pub struct DockerManager {
     docker: Docker,
     rootless: bool,
+    socket_path: Option<PathBuf>,
 }
 
 impl DockerManager {
@@ -116,14 +118,15 @@ impl DockerManager {
             return Ok(mgr);
         }
 
-        // Try Docker Desktop's user-level socket (macOS with default socket disabled)
-        #[cfg(target_os = "macos")]
+        // Try user-level Docker Desktop and rootless Podman sockets when the
+        // conventional endpoint is unavailable.
+        #[cfg(unix)]
         {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let user_socket = format!("{home}/.docker/run/docker.sock");
-            if std::path::Path::new(&user_socket).exists() {
-                if let Ok(mgr) = Self::connect_to_socket(&user_socket).await {
-                    return Ok(mgr);
+            for user_socket in fallback_unix_sockets() {
+                if user_socket.exists() {
+                    if let Ok(mgr) = Self::connect_to_socket(&user_socket).await {
+                        return Ok(mgr);
+                    }
                 }
             }
         }
@@ -138,6 +141,10 @@ impl DockerManager {
     async fn connect_default() -> Result<Self> {
         let docker = Docker::connect_with_defaults()
             .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
+        Self::connected(docker, configured_unix_socket()).await
+    }
+
+    async fn connected(docker: Docker, socket_path: Option<PathBuf>) -> Result<Self> {
         docker
             .ping()
             .await
@@ -148,29 +155,36 @@ impl DockerManager {
             .ok()
             .and_then(|info| info.security_options)
             .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
-        info!(rootless, "connected to container runtime");
-        Ok(Self { docker, rootless })
+        info!(
+            socket = socket_path.as_ref().map(|path| path.display().to_string()),
+            rootless, "connected to container runtime"
+        );
+        Ok(Self {
+            docker,
+            rootless,
+            socket_path,
+        })
     }
 
-    #[cfg(target_os = "macos")]
-    async fn connect_to_socket(path: &str) -> Result<Self> {
-        let docker = Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
+    #[cfg(unix)]
+    async fn connect_to_socket(path: &Path) -> Result<Self> {
+        let path_string = path.to_string_lossy();
+        let docker = Docker::connect_with_unix(&path_string, 120, bollard::API_DEFAULT_VERSION)
             .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
-        docker
-            .ping()
+        Self::connected(docker, Some(path.to_path_buf()))
             .await
-            .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed on {path}: {e}")))?;
-        let rootless = docker
-            .info()
-            .await
-            .ok()
-            .and_then(|info| info.security_options)
-            .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
-        info!(
-            socket = path,
-            rootless, "connected to container runtime via custom socket"
-        );
-        Ok(Self { docker, rootless })
+            .map_err(|error| {
+                Error::DockerNotAvailable(format!(
+                    "Docker ping failed on {}: {error}",
+                    path.display()
+                ))
+            })
+    }
+
+    /// Unix socket that can be mounted into a trusted worker so its Docker
+    /// CLI talks to the same engine as the control plane.
+    pub fn host_engine_socket(&self) -> Option<&Path> {
+        self.socket_path.as_deref()
     }
 
     /// Check if Docker Desktop is installed (macOS/Windows).
@@ -282,6 +296,7 @@ impl DockerManager {
         let host_config = HostConfig {
             memory: spec.memory_limit,
             nano_cpus: spec.cpu_limit,
+            group_add: socket_mount_groups(spec),
             mounts: if mounts.is_empty() {
                 None
             } else {
@@ -777,6 +792,63 @@ impl DockerManager {
     }
 }
 
+fn configured_unix_socket() -> Option<PathBuf> {
+    if let Some(host) = std::env::var_os("DOCKER_HOST") {
+        return unix_socket_from_host(&host.to_string_lossy());
+    }
+    #[cfg(unix)]
+    {
+        let conventional = PathBuf::from("/var/run/docker.sock");
+        if conventional.exists() {
+            return Some(conventional);
+        }
+    }
+    None
+}
+
+fn unix_socket_from_host(host: &str) -> Option<PathBuf> {
+    host.strip_prefix("unix://")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn fallback_unix_sockets() -> Vec<PathBuf> {
+    let mut sockets = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        sockets.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        sockets.push(PathBuf::from(runtime).join("podman/podman.sock"));
+    } else {
+        // SAFETY: getuid has no preconditions and only reads process credentials.
+        let uid = unsafe { libc::getuid() };
+        sockets.push(PathBuf::from(format!("/run/user/{uid}/podman/podman.sock")));
+    }
+    sockets
+}
+
+fn socket_mount_groups(spec: &ContainerSpec) -> Option<Vec<String>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut groups: Vec<String> = spec
+            .volumes
+            .iter()
+            .filter(|volume| volume.target == "/var/run/docker.sock")
+            .filter_map(|volume| std::fs::metadata(&volume.source).ok())
+            .map(|metadata| metadata.gid().to_string())
+            .collect();
+        groups.sort();
+        groups.dedup();
+        if !groups.is_empty() {
+            return Some(groups);
+        }
+    }
+    None
+}
+
 fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
     if !run_as_host_user {
         return None;
@@ -826,5 +898,36 @@ mod tests {
     fn rootless_native_workers_use_container_root_mapping() {
         assert_eq!(container_user(true, true).as_deref(), Some("0:0"));
         assert_eq!(container_user(false, true), None);
+    }
+
+    #[test]
+    fn docker_host_only_exposes_local_unix_sockets() {
+        assert_eq!(
+            unix_socket_from_host("unix:///run/user/1000/podman/podman.sock"),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+        assert_eq!(unix_socket_from_host("tcp://docker.example:2376"), None);
+        assert_eq!(
+            unix_socket_from_host("npipe:////./pipe/docker_engine"),
+            None
+        );
+    }
+
+    #[test]
+    fn socket_mounts_add_the_host_socket_group() {
+        let source = std::env::temp_dir().join(format!(
+            "xpressclaw-socket-group-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(&source, []).unwrap();
+        let mut spec = ContainerSpec::default();
+        spec.volumes.push(VolumeMount {
+            source: source.display().to_string(),
+            target: "/var/run/docker.sock".to_string(),
+            read_only: false,
+        });
+        #[cfg(unix)]
+        assert!(socket_mount_groups(&spec).is_some());
+        std::fs::remove_file(source).unwrap();
     }
 }

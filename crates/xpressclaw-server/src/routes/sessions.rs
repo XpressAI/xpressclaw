@@ -6,8 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
-use xpressclaw_core::config::default_native_runner_image;
-use xpressclaw_core::config::AgentConfig;
+use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::sessions::{NewEvent, SessionManager};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
@@ -116,6 +115,13 @@ async fn prepare_runner(
             Json(json!({ "error": "Docker or Podman is not available" })),
         )
     })?;
+    if agent.runner.container_engine == ContainerEngineAccess::Host
+        && docker.host_engine_socket().is_none()
+    {
+        return Err(bad_request(
+            "host container-engine access requires a local Docker-compatible Unix socket",
+        ));
+    }
     if available_runner_image(&docker, &image).await.is_none() {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
@@ -136,6 +142,10 @@ async fn readiness(
     let auth_present = !auth_required || subscription_auth_available(&kind);
     let docker = state.docker().await;
     let docker_available = docker.is_some();
+    let container_engine_available = agent.runner.container_engine != ContainerEngineAccess::Host
+        || docker
+            .as_ref()
+            .is_some_and(|docker| docker.host_engine_socket().is_some());
     let runtime_image = match docker.as_ref() {
         Some(docker) => available_runner_image(docker, &image).await,
         None => None,
@@ -145,8 +155,10 @@ async fn readiness(
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
     } else if !image_present {
-        let detail = if default_native_runner_image(&kind) == Some(image.as_str()) {
-            "has not been pulled or is an older pre-ACP build"
+        let detail = if default_native_runner_image(&kind, agent.runner.container_engine)
+            == Some(image.as_str())
+        {
+            "has not been pulled or is missing the required ACP/container-engine compatibility labels"
         } else {
             "has not been pulled"
         };
@@ -157,6 +169,11 @@ async fn readiness(
             "Workspace {} does not exist or is not a directory",
             workspace.display()
         ));
+    }
+    if !container_engine_available {
+        issues.push(
+            "Host container-engine access needs a local Docker or Podman Unix socket".to_string(),
+        );
     }
     if !command_present {
         issues.push(
@@ -170,7 +187,7 @@ async fn readiness(
     }
     Ok(json!({
         "protocol": "acp",
-        "ready": docker_available && image_present && workspace_present && auth_present && command_present,
+        "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available,
         "docker_available": docker_available,
         "kind": kind,
         "image": image,
@@ -179,6 +196,9 @@ async fn readiness(
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
         "model": agent.runner.model,
+        "container_engine": agent.runner.container_engine,
+        "container_engine_available": container_engine_available,
+        "container_engine_socket": docker.as_ref().and_then(|docker| docker.host_engine_socket()).map(|path| path.display().to_string()),
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
@@ -187,30 +207,47 @@ async fn readiness(
 }
 
 async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
+    let host_engine_image = matches!(
+        image,
+        "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest"
+    );
     let built_in = matches!(
         image,
         "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
             | "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
             | "ghcr.io/xpressai/xpressclaw-runner-opencode:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest"
     );
-    if docker.has_image(image).await
-        && (!built_in
-            || docker
-                .image_has_label(image, "io.xpressclaw.protocol", "acp")
-                .await)
-    {
+    if runner_image_compatible(docker, image, built_in, host_engine_image).await {
         return Some(image.to_string());
     }
     if let Some(local_image) = local_runner_image_alias(image) {
-        if docker.has_image(local_image).await
-            && docker
-                .image_has_label(local_image, "io.xpressclaw.protocol", "acp")
-                .await
-        {
+        if runner_image_compatible(docker, local_image, built_in, host_engine_image).await {
             return Some(local_image.to_string());
         }
     }
     None
+}
+
+async fn runner_image_compatible(
+    docker: &DockerManager,
+    image: &str,
+    built_in: bool,
+    host_engine_image: bool,
+) -> bool {
+    docker.has_image(image).await
+        && (!built_in
+            || docker
+                .image_has_label(image, "io.xpressclaw.protocol", "acp")
+                .await)
+        && (!host_engine_image
+            || docker
+                .image_has_label(image, "io.xpressclaw.container-engine", "host")
+                .await)
 }
 
 fn session_config(state: &AppState, id: &str) -> Result<AgentConfig, (StatusCode, Json<Value>)> {

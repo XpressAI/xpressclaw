@@ -22,7 +22,25 @@ jobs:
       packages: write
     strategy:
       matrix:
-        runner: [codex, claude, opencode]
+        include:
+          - runner: codex
+            target: runner
+            suffix: ''
+          - runner: claude
+            target: runner
+            suffix: ''
+          - runner: opencode
+            target: runner
+            suffix: ''
+          - runner: codex
+            target: runner-host
+            suffix: '-docker'
+          - runner: claude
+            target: runner-host
+            suffix: '-docker'
+          - runner: opencode
+            target: runner-host
+            suffix: '-docker'
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +58,10 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: harnesses/native/${{ matrix.runner }}
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}:latest
+          tags: ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}${{ matrix.suffix }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -1,4 +1,6 @@
-FROM node:22-bookworm-slim
+FROM docker:29.6.1-cli AS docker-cli
+
+FROM node:22-bookworm-slim AS runner-base
 
 ARG CLAUDE_ACP_VERSION=0.59.0
 LABEL io.xpressclaw.protocol="acp" \
@@ -18,3 +20,17 @@ ENV HOME=/home/node \
     NO_COLOR=1
 WORKDIR /workspace
 ENTRYPOINT []
+
+# Opt-in image for trusted projects that need the host Docker-compatible
+# engine. The default final stage below remains the smaller runner image.
+FROM runner-base AS runner-host
+USER root
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
+LABEL io.xpressclaw.container-engine="host"
+RUN docker --version \
+    && docker compose version \
+    && docker buildx version
+USER node
+
+FROM runner-base AS runner

@@ -51,6 +51,7 @@ Codex, Claude Code, and OpenCode already supply excellent agent loops. xpresscla
 - **Native desktop app** — Tauri-based `.app` / `.dmg` with system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
 - **Isolated by default** — Every agent turn runs in a short-lived Docker/Podman container.
+- **Container-aware projects** — Opt trusted projects into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
 
 ## Features
 
@@ -72,7 +73,8 @@ ACP agents pick up tasks from a queue and publish standard progress, plans, tool
 Codex and Claude use ACP Registry adapters. Each built-in runner image contains
 one agent product and its ACP server. Language SDKs and
 project services belong in a separate development environment rather than in
-the runner image.
+the runner image. Projects that need existing Compose-based development and
+test workflows can explicitly enable trusted host-engine access.
 
 ### Privacy & Safety
 
@@ -209,12 +211,18 @@ docker buildx build --load -t xpressclaw-runner-claude:latest harnesses/native/c
 docker buildx build --load -t xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
 
+The default images stay minimal. Add `--target runner-host` and use the
+corresponding `xpressclaw-runner-<product>-docker:latest` tag to build an
+opt-in image containing Docker CLI, Compose, and Buildx. Enabling host-engine
+access mounts the control plane's Docker or rootless Podman socket; this gives
+the runner control over that engine and is intended only for trusted agents.
+
 Use `podman build` with the same tags when Podman is your runtime. The ACP
 compatibility label on current images prevents an older pre-ACP local tag from
 being selected silently.
 
-See `harnesses/native/README.md` for customization guidance and the planned
-separation between agent runners and development environments.
+See `harnesses/native/README.md` for build commands, customization guidance,
+and the separation between agent runners and development environments.
 
 ### Run Tests
 

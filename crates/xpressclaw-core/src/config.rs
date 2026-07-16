@@ -226,6 +226,18 @@ pub struct AgentLlmConfig {
 /// The ACP agent owns its reasoning loop, tools, subagents, and model
 /// authentication. XpressClaw acts as the client: it supplies a task and an
 /// isolated workspace, then records the agent's standard protocol events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerEngineAccess {
+    /// Do not expose the host container engine to the worker.
+    #[default]
+    None,
+    /// Mount the control plane's Docker-compatible Unix socket. This is a
+    /// trusted mode: the worker can control host containers, images, volumes,
+    /// and any host paths the engine is allowed to mount.
+    Host,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NativeRunnerConfig {
@@ -244,6 +256,9 @@ pub struct NativeRunnerConfig {
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
     pub subscription_auth: bool,
+    /// Optional access to the same Docker-compatible engine used by the
+    /// control plane. Built-in agents select a separate CLI-enabled image.
+    pub container_engine: ContainerEngineAccess,
 }
 
 impl Default for NativeRunnerConfig {
@@ -255,6 +270,7 @@ impl Default for NativeRunnerConfig {
             model: None,
             command: Vec::new(),
             subscription_auth: true,
+            container_engine: ContainerEngineAccess::None,
         }
     }
 }
@@ -262,11 +278,29 @@ impl Default for NativeRunnerConfig {
 /// Built-in image for a resolved ACP agent. Keeping this mapping in the
 /// control plane lets each image contain only its own server while custom ACP
 /// agents continue to require an explicit image.
-pub fn default_native_runner_image(kind: &str) -> Option<&'static str> {
-    match kind {
-        "codex" => Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
-        "claude" => Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest"),
-        "opencode" => Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest"),
+pub fn default_native_runner_image(
+    kind: &str,
+    container_engine: ContainerEngineAccess,
+) -> Option<&'static str> {
+    match (kind, container_engine) {
+        ("codex", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
+        }
+        ("claude", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
+        }
+        ("opencode", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
+        }
+        ("codex", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest")
+        }
+        ("claude", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest")
+        }
+        ("opencode", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest")
+        }
         _ => None,
     }
 }
@@ -384,7 +418,7 @@ impl AgentConfig {
             configured_kind.as_str()
         };
 
-        if let Some(image) = default_native_runner_image(kind) {
+        if let Some(image) = default_native_runner_image(kind, ContainerEngineAccess::None) {
             self.runner.kind = kind.to_string();
             self.runner.image = image.to_string();
             true
