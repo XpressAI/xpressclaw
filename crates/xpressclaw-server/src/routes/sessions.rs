@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::AgentRegistry;
+use xpressclaw_core::config::default_native_runner_image;
 use xpressclaw_core::config::AgentConfig;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::sessions::{NewEvent, SessionManager};
@@ -103,6 +104,11 @@ async fn prepare_runner(
     ensure_session(&state, &id)?;
     let agent = session_config(&state, &id)?;
     let kind = resolve_runner_kind(&agent).map_err(bad_request)?;
+    if kind == "custom" && agent.runner.command.is_empty() {
+        return Err(bad_request(
+            "custom ACP agents require a server command in the Runner tab",
+        ));
+    }
     let image = resolved_runner_image(&agent.runner, &kind).map_err(bad_request)?;
     let docker = state.docker().await.ok_or_else(|| {
         (
@@ -139,7 +145,12 @@ async fn readiness(
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
     } else if !image_present {
-        issues.push(format!("Runner image {image} has not been pulled"));
+        let detail = if default_native_runner_image(&kind) == Some(image.as_str()) {
+            "has not been pulled or is an older pre-ACP build"
+        } else {
+            "has not been pulled"
+        };
+        issues.push(format!("Runner image {image} {detail}"));
     }
     if !workspace_present {
         issues.push(format!(
@@ -148,8 +159,9 @@ async fn readiness(
         ));
     }
     if !command_present {
-        issues
-            .push("Custom runner command is not configured; add it in the Runner tab".to_string());
+        issues.push(
+            "Custom ACP server command is not configured; add it in the Runner tab".to_string(),
+        );
     }
     if !auth_present {
         issues.push(format!(
@@ -157,6 +169,7 @@ async fn readiness(
         ));
     }
     Ok(json!({
+        "protocol": "acp",
         "ready": docker_available && image_present && workspace_present && auth_present && command_present,
         "docker_available": docker_available,
         "kind": kind,
@@ -165,6 +178,7 @@ async fn readiness(
         "image_present": image_present,
         "workspace": workspace.display().to_string(),
         "workspace_present": workspace_present,
+        "model": agent.runner.model,
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
@@ -173,11 +187,26 @@ async fn readiness(
 }
 
 async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
-    if docker.has_image(image).await {
+    let built_in = matches!(
+        image,
+        "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+            | "ghcr.io/xpressai/xpressclaw-runner-opencode:latest"
+    );
+    if docker.has_image(image).await
+        && (!built_in
+            || docker
+                .image_has_label(image, "io.xpressclaw.protocol", "acp")
+                .await)
+    {
         return Some(image.to_string());
     }
     if let Some(local_image) = local_runner_image_alias(image) {
-        if docker.has_image(local_image).await {
+        if docker.has_image(local_image).await
+            && docker
+                .image_has_label(local_image, "io.xpressclaw.protocol", "acp")
+                .await
+        {
             return Some(local_image.to_string());
         }
     }
@@ -462,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_describes_the_resolved_native_runner() {
+    async fn readiness_describes_the_resolved_acp_agent() {
         let response = test_app()
             .oneshot(
                 Request::builder()
@@ -475,6 +504,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["protocol"], "acp");
         assert_eq!(value["kind"], "codex");
         assert_eq!(
             value["image"],

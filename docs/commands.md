@@ -20,7 +20,7 @@ first-session setup flow automatically.
 
 ## `xpressclaw up`
 
-Start the control plane, web UI, scheduler, workflow engine, and native worker
+Start the control plane, web UI, scheduler, workflow engine, and ACP task
 dispatcher.
 
 ```bash

@@ -7,7 +7,7 @@
 	import { harnessMark } from '$lib/utils';
 
 	// Primary product areas. "Projects" are the stable user-facing contexts;
-	// native harness sessions remain an implementation detail.
+	// ACP session IDs and work attempts remain implementation details.
 	const tabs = [
 		{ id: 'agents', label: 'Projects', icon: 'M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z' },
 		{ id: 'tasks', label: 'Tasks', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
@@ -394,7 +394,7 @@
 						<h3 class="text-sm font-semibold">Docker is not running</h3>
 						<p class="text-xs text-muted-foreground">
 							{#if !dockerInstalled}
-								Docker Desktop is not installed. Native workers need Docker to run.
+								Docker Desktop is not installed. ACP agents need Docker to run.
 							{:else}
 								Docker Desktop is installed but not running. Start it to run queued work.
 							{/if}

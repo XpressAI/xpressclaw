@@ -283,7 +283,7 @@ struct CompleteSetupRequest {
     agents: Vec<AgentSetup>,
     #[serde(default)]
     mcp_servers: std::collections::HashMap<String, McpServerConfig>,
-    /// Isolation mode. Native workers currently require "docker".
+    /// Isolation mode. ACP workers currently require "docker".
     #[serde(default = "default_isolation")]
     isolation: String,
 }
@@ -298,6 +298,8 @@ struct AgentSetup {
     runner_kind: Option<String>,
     runner_image: Option<String>,
     runner_workspace: Option<String>,
+    runner_model: Option<String>,
+    runner_command: Option<Vec<String>>,
     subscription_auth: Option<bool>,
     volumes: Option<Vec<String>>,
     #[serde(default)]
@@ -341,9 +343,32 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .map(str::trim)
             .filter(|workspace| !workspace.is_empty())
             .map(str::to_owned),
+        model: setup
+            .runner_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned),
+        command: setup
+            .runner_command
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|argument| argument.trim().to_string())
+            .filter(|argument| !argument.is_empty())
+            .collect(),
         subscription_auth: setup.subscription_auth.unwrap_or(true),
-        ..Default::default()
     }
+}
+
+fn validate_runner(runner: &NativeRunnerConfig) -> Result<(), String> {
+    if runner.kind == "custom" && runner.image.is_empty() {
+        return Err("custom ACP agents require a container image".to_string());
+    }
+    if runner.kind == "custom" && runner.command.is_empty() {
+        return Err("custom ACP agents require a server command".to_string());
+    }
+    Ok(())
 }
 
 /// Save the setup configuration and mark setup as complete.
@@ -354,7 +379,7 @@ async fn complete_setup(
     if req.isolation != "docker" {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "native workers require Docker or Podman isolation" })),
+            Json(json!({ "error": "ACP agents require Docker or Podman isolation" })),
         ));
     }
     // Native products own model selection, credentials, instructions, and
@@ -362,7 +387,7 @@ async fn complete_setup(
     let llm = LlmConfig::default();
 
     let mut used_ids: Vec<String> = Vec::new();
-    let agents = req
+    let agents: Vec<AgentConfig> = req
         .agents
         .iter()
         .map(|session| {
@@ -380,11 +405,14 @@ async fn complete_setup(
             }
         })
         .collect();
+    for agent in &agents {
+        validate_runner(&agent.runner).map_err(bad_request)?;
+    }
 
     let mut config = Config {
         llm,
         agents,
-        // Native CLIs own their tool loop. Only keep connectors the user
+        // ACP agents own their tool loop. Only keep connectors the user
         // explicitly configured; do not inject the retired agent-layer MCPs.
         mcp_servers: req.mcp_servers,
         ..Default::default()
@@ -422,7 +450,7 @@ async fn complete_setup(
                     info!(
                         name = record.name,
                         backend = record.backend,
-                        "synced native session"
+                        "synced ACP project"
                     );
                 }
             }
@@ -442,7 +470,7 @@ async fn complete_setup(
     })))
 }
 
-/// Add a durable native session without replacing existing sessions.
+/// Add a durable ACP project without replacing existing projects.
 async fn add_session(
     State(state): State<AppState>,
     Json(req): Json<AgentSetup>,
@@ -450,6 +478,7 @@ async fn add_session(
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let runner = runner_from_setup(&req);
+    validate_runner(&runner).map_err(bad_request)?;
     let title = context_label(runner.workspace.as_deref(), &runner.kind);
     let session_id = unique_session_id(&title, &runner.kind, &existing_ids);
 
@@ -486,10 +515,10 @@ async fn add_session(
         .map_err(internal_error)?;
     info!(
         name = agent_config.name,
-        "added native session to configuration"
+        "added ACP project to configuration"
     );
 
-    // Register the durable session. Native workers are started per
+    // Register the durable project. ACP workers are started per
     // attempt, so there is no long-running agent to auto-start.
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry
@@ -638,6 +667,13 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -670,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_selects_the_image_for_the_native_product() {
+    fn setup_selects_the_image_for_the_builtin_acp_agent() {
         let setup: AgentSetup = serde_json::from_value(json!({
             "name": "reviewer",
             "runner_kind": "claude"
@@ -682,6 +718,22 @@ mod tests {
             runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
         );
+    }
+
+    #[test]
+    fn setup_preserves_a_custom_acp_server_command() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "custom",
+            "runner_image": "example/acp-agent:latest",
+            "runner_model": "  opus  ",
+            "runner_command": ["example-agent", "  acp  ", ""]
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert_eq!(runner.kind, "custom");
+        assert_eq!(runner.model.as_deref(), Some("opus"));
+        assert_eq!(runner.command, vec!["example-agent", "acp"]);
+        assert!(validate_runner(&runner).is_ok());
     }
 
     #[tokio::test]

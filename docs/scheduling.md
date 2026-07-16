@@ -1,9 +1,9 @@
 # Scheduling Work
 
 Schedules create ordinary queued work at the configured time. Xpressclaw does
-not add an agent loop: the selected session launches its native product worker
-and records the result in the same timeline as human messages and tasks. Codex
-or Claude may use their own subagents internally.
+not add an agent loop: the selected project launches its ACP agent and records
+standard activity and the result in the same timeline as human messages and
+tasks. Codex or Claude may use their own subagents internally.
 
 ## Create a schedule
 

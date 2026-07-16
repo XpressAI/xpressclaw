@@ -4,7 +4,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     // Sessions have no persistent processes to stop. A graceful server
     // shutdown cancels and removes any active short-lived worker containers.
     if client::connect(port).await.is_ok() {
-        println!("Stopping the control plane and active native workers...");
+        println!("Stopping the control plane and active ACP workers...");
     }
 
     // Kill background server process if running

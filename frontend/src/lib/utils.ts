@@ -35,7 +35,7 @@ export async function openExternal(url: string): Promise<void> {
 	}
 }
 
-/** Compact product mark for a native session. */
+/** Compact product mark for an ACP-backed project. */
 export function harnessMark(backend: string): string {
 	const normalized = backend.toLowerCase();
 	if (normalized.includes('claude')) return 'A';

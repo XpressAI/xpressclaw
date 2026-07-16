@@ -221,27 +221,29 @@ pub struct AgentLlmConfig {
     pub base_url: Option<String>,
 }
 
-/// Configuration for a native coding-agent worker.
+/// Configuration for an Agent Client Protocol worker.
 ///
-/// The runner owns its reasoning loop and model authentication. XpressClaw
-/// only supplies a task, an isolated workspace, and a place to publish events.
+/// The ACP agent owns its reasoning loop, tools, subagents, and model
+/// authentication. XpressClaw acts as the client: it supplies a task and an
+/// isolated workspace, then records the agent's standard protocol events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NativeRunnerConfig {
-    /// Native CLI to invoke: auto, codex, claude, opencode, or custom.
+    /// ACP agent to invoke: auto, codex, claude, opencode, or custom.
     pub kind: String,
-    /// Image containing exactly one native CLI. When empty, the runner kind
-    /// selects the matching xpressclaw-runner-* image.
+    /// Image containing one ACP-compatible agent server. When empty, the
+    /// runner kind selects the matching xpressclaw-runner-* image.
     pub image: String,
     /// Host project directory mounted at /workspace for this session. Falls
     /// back to system.workspace_dir for existing configurations.
     pub workspace: Option<String>,
-    /// Optional argv override. `{prompt}` and `{workspace}` are expanded.
+    /// Preferred ACP model value ID. When unset, the agent chooses its own
+    /// default. The value is applied through `session/set_config_option`.
+    pub model: Option<String>,
+    /// Optional ACP server argv override. `{workspace}` is expanded.
     pub command: Vec<String>,
-    /// Reuse the host CLI login from its standard config directory.
+    /// Reuse the host agent login from its standard config directory.
     pub subscription_auth: bool,
-    /// Maximum autonomous turns for CLIs that support a turn limit.
-    pub max_turns: u32,
 }
 
 impl Default for NativeRunnerConfig {
@@ -250,16 +252,16 @@ impl Default for NativeRunnerConfig {
             kind: "auto".to_string(),
             image: String::new(),
             workspace: None,
+            model: None,
             command: Vec::new(),
             subscription_auth: true,
-            max_turns: 100,
         }
     }
 }
 
-/// Built-in image for a resolved native runner kind. Keeping this mapping in
-/// the control plane lets each image contain only its own CLI while custom
-/// runners continue to require an explicit image.
+/// Built-in image for a resolved ACP agent. Keeping this mapping in the
+/// control plane lets each image contain only its own server while custom ACP
+/// agents continue to require an explicit image.
 pub fn default_native_runner_image(kind: &str) -> Option<&'static str> {
     match kind {
         "codex" => Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
@@ -284,8 +286,8 @@ pub struct AgentConfig {
     /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
-    /// Short-lived native worker configuration. This supersedes the old
-    /// in-house harness for task execution.
+    /// Short-lived ACP worker configuration. This supersedes the old in-house
+    /// harness for task execution.
     #[serde(default)]
     pub runner: NativeRunnerConfig,
     #[serde(default)]

@@ -2,8 +2,8 @@
 
 Xpressclaw stores local control-plane configuration in `xpressclaw.yaml`.
 Create and edit project-context sessions through the web UI. Xpressclaw does
-not define identities, personas, system prompts, tools, or subagents for native
-harnesses.
+not define identities, personas, system prompts, tools, or subagents for ACP
+agents.
 
 `xpressclaw init` writes an empty starting point:
 
@@ -15,10 +15,10 @@ system:
 agents: []
 ```
 
-## Native session representation
+## ACP project representation
 
 Internally, durable sessions remain in the `agents` array for file and API
-compatibility. New entries use only the native runner fields:
+compatibility. New entries use only the ACP runner fields:
 
 ```yaml
 agents:
@@ -29,7 +29,6 @@ agents:
       image: ghcr.io/xpressai/xpressclaw-runner-codex:latest
       workspace: /home/me/projects/site
       subscription_auth: true
-      max_turns: 100
     volumes: []
 ```
 
@@ -38,19 +37,26 @@ agents:
 | Field | Description |
 |---|---|
 | `kind` | `codex`, `claude`, `opencode`, or `custom` |
-| `image` | Product-specific worker image or compatible derivative |
+| `image` | Product-specific ACP server image or compatible derivative |
 | `workspace` | Host project mounted read-write at `/workspace` |
-| `subscription_auth` | Reuse the product CLI's host login directory |
-| `max_turns` | Product turn limit where supported |
-| `command` | Argument list for a custom adapter; supports `{prompt}` and `{workspace}` |
+| `model` | Optional model value ID applied through ACP session configuration |
+| `subscription_auth` | Reuse the built-in product's host login directory |
+| `command` | ACP server argument list; required for custom agents and supports `{workspace}` |
 
 Additional `volumes` use `host:container` or `host:container:ro` syntax.
 
 The UI label is derived from the workspace folder (`site` above). The `name`
 field is only a stable internal reference used by tasks, schedules, and
 workflows. Codex and Claude receive no Xpressclaw profile or identity prompt;
-they retain ownership of their own instructions, tools, and subagents. Older
-profile fields are removed automatically when a configuration is loaded.
+they retain ownership of their own instructions, tools, and subagents. The
+control plane sends task text as an ACP `session/prompt` and records standard
+ACP updates. Older profile fields are removed automatically when a
+configuration is loaded.
+
+For another agent, set `kind: custom`, provide an image, and enter the command
+that starts its ACP server over stdin/stdout. Authentication and credential
+mounts for custom agents are explicit volumes because Xpressclaw does not know
+their host directory conventions.
 
 ## Built-in images
 

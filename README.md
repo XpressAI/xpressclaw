@@ -37,19 +37,20 @@ and send it work. The matching runner image is pulled automatically. To build
 the Codex runner locally instead:
 
 ```bash
-docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
+docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
+# Or: podman build -t xpressclaw-runner-codex:latest harnesses/native/codex
 ```
 
 ## Why xpressclaw?
 
 Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
-- **One logical session** — People, schedules, connectors, workflows, and native workers contribute to one event history.
-- **Native workers** — The selected CLI owns reasoning and tools; xpressclaw does not put another agent framework in front of it.
+- **One logical session** — People, schedules, connectors, workflows, and ACP agents contribute to one event history.
+- **Agent-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri-based `.app` / `.dmg` with system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
-- **Isolated by default** — Every native invocation runs in a short-lived Docker/Podman container.
+- **Isolated by default** — Every agent turn runs in a short-lived Docker/Podman container.
 
 ## Features
 
@@ -59,16 +60,17 @@ The primary interface is a durable event timeline labeled by project context. It
 
 ### Autonomous Task Execution
 
-Native workers pick up tasks from a queue and publish structured progress and artifacts. Schedule recurring work with cron expressions. Workflows coordinate different products—for example, Codex implementing and Claude reviewing in a loop.
+ACP agents pick up tasks from a queue and publish standard progress, plans, tool activity, and results. Schedule recurring work with cron expressions. Workflows coordinate different products—for example, Codex implementing and Claude reviewing in a loop.
 
-### Multiple Native Runners
+### Multiple ACP Agents
 
 - **Codex:** reuses an eligible host ChatGPT/Codex login
 - **Claude Code:** reuses an eligible host Claude subscription login
-- **OpenCode:** JSON event adapter with configurable authentication
-- **Custom:** one-argument-per-line command templates for other native CLIs
+- **OpenCode:** uses its built-in ACP server
+- **Custom:** any image and command that speaks ACP over stdin/stdout
 
-Each built-in runner image contains one native harness. Language SDKs and
+Codex and Claude use ACP Registry adapters. Each built-in runner image contains
+one agent product and its ACP server. Language SDKs and
 project services belong in a separate development environment rather than in
 the runner image.
 
@@ -77,7 +79,7 @@ the runner image.
 - **Container isolation** — each work attempt runs in its own short-lived container
 - **Explicit resources** — workers receive the configured workspace and volume mounts
 - **Visible provenance** — every queued request records whether it came from a person, schedule, connector, task, or workflow
-- **Local control data** — timelines and task state remain local; native CLI traffic follows the selected provider's terms
+- **Local control data** — timelines and task state remain local; agent traffic follows the selected provider's terms
 - **Credential boundary** — subscription auth is mounted only into short-lived workers built from an image you trust
 
 ### Full Observability
@@ -107,8 +109,8 @@ See [Building](#building) below.
 ### Requirements
 
 - Docker or Podman (required for worker isolation)
-- At least one supported native CLI login on the host
-- The included native worker image, or your own compatible image
+- At least one supported agent login on the host
+- A built-in ACP runner image, or your own ACP-compatible image
 
 ## What Can It Do?
 
@@ -156,7 +158,7 @@ agents: []
 - [LLVM](https://releases.llvm.org/) (provides `libclang`, required by llama.cpp bindings)
 - [CMake](https://cmake.org/) (required by llama.cpp build)
 - [Node.js](https://nodejs.org/) 18+ (for the frontend)
-- Docker (for native workers)
+- Docker or Podman (for isolated ACP agents)
 
 ### Build Everything
 
@@ -202,10 +204,14 @@ Build only the product you use. Each image is deliberately independent so it
 can be versioned or extended without pulling in the other agent CLIs:
 
 ```bash
-docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
-docker build -t ghcr.io/xpressai/xpressclaw-runner-claude:latest harnesses/native/claude
-docker build -t ghcr.io/xpressai/xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker buildx build --load -t xpressclaw-runner-claude:latest harnesses/native/claude
+docker buildx build --load -t xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
+
+Use `podman build` with the same tags when Podman is your runtime. The ACP
+compatibility label on current images prevents an older pre-ACP local tag from
+being selected silently.
 
 See `harnesses/native/README.md` for customization guidance and the planned
 separation between agent runners and development environments.
@@ -256,7 +262,7 @@ xpressclaw (single ~12MB binary)
 +-- Axum server (REST API + embedded SvelteKit frontend)
 +-- Session event log (messages, attempts, provenance, artifacts)
 +-- SQLite (sessions, events, tasks, workflows, and schedules)
-+-- Native worker dispatcher (Codex / Claude Code / OpenCode / custom)
++-- ACP client + task dispatcher (Codex / Claude Code / OpenCode / custom)
 +-- Docker Manager (short-lived attempt containers)
 ```
 
@@ -264,7 +270,7 @@ xpressclaw (single ~12MB binary)
 - **Single binary** — server, API, frontend, and CLI in one executable
 - **Docker required** — worker isolation is not optional
 - **Durable local state** — sessions, task queues, schedules, and workflow runs survive restarts
-- **Native harness ownership** — Codex and Claude own their instructions, tools, reasoning loop, and subagents
+- **ACP boundary** — Agents own their instructions, tools, reasoning loop, and subagents; xpressclaw owns tasks, orchestration, and presentation
 
 ## CLI Reference
 

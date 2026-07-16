@@ -25,6 +25,8 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
+tokio-util = { workspace = true }
+agent-client-protocol = { workspace = true }
 async-stream = "0.3"
 ready-agent-cog = { workspace = true }
 croner = "2"

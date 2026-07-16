@@ -2,14 +2,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, ListContainersOptions, LogsOptions,
-    RemoveContainerOptions, StopContainerOptions, WaitContainerOptions,
+    AttachContainerOptions, Config as ContainerConfig, CreateContainerOptions,
+    ListContainersOptions, LogOutput, LogsOptions, RemoveContainerOptions, StopContainerOptions,
+    WaitContainerOptions,
 };
+use bollard::errors::Error as BollardError;
 use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
+use tokio::io::AsyncWrite;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
@@ -70,7 +74,16 @@ pub struct ContainerInfo {
     pub host_port: Option<u16>,
 }
 
-/// Captured result of a short-lived native worker container.
+/// A running container attached to its stdio streams. ACP agents use this
+/// bidirectional channel for newline-delimited JSON-RPC rather than exposing a
+/// terminal or an HTTP control port.
+pub struct AttachedContainer {
+    pub info: ContainerInfo,
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+    pub output: Pin<Box<dyn Stream<Item = std::result::Result<LogOutput, BollardError>> + Send>>,
+}
+
+/// Captured result of a short-lived worker container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContainerOutput {
     pub status_code: i64,
@@ -286,6 +299,11 @@ impl DockerManager {
         let config = ContainerConfig {
             image: Some(spec.image.clone()),
             user: container_user(spec.run_as_host_user, self.rootless),
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            open_stdin: Some(true),
+            stdin_once: Some(false),
             env: Some(env),
             host_config: Some(host_config),
             exposed_ports: if exposed_ports.is_empty() {
@@ -329,6 +347,39 @@ impl DockerManager {
             agent_id: agent_id.to_string(),
             status: "running".to_string(),
             host_port,
+        })
+    }
+
+    /// Launch a container and attach its stdin/stdout/stderr. The process is
+    /// expected to remain idle until the caller sends its first protocol
+    /// request, which makes attaching immediately after start race-free for
+    /// ACP agents.
+    pub async fn launch_attached(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> Result<AttachedContainer> {
+        let info = self.launch(agent_id, spec).await?;
+        let attached = self
+            .docker
+            .attach_container(
+                &info.container_id,
+                Some(AttachContainerOptions::<String> {
+                    stdin: Some(true),
+                    stdout: Some(true),
+                    stderr: Some(true),
+                    stream: Some(true),
+                    logs: Some(false),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|error| Error::Container(format!("failed to attach container: {error}")))?;
+
+        Ok(AttachedContainer {
+            info,
+            input: attached.input,
+            output: attached.output,
         })
     }
 
@@ -571,6 +622,20 @@ impl DockerManager {
     /// Check if an image exists locally.
     pub async fn has_image(&self, image: &str) -> bool {
         self.docker.inspect_image(image).await.is_ok()
+    }
+
+    /// Check an image's declared protocol without starting it. Built-in ACP
+    /// images carry this label so stale pre-ACP local tags are not reported as
+    /// ready and then fail immediately with a missing server executable.
+    pub async fn image_has_label(&self, image: &str, key: &str, value: &str) -> bool {
+        self.docker
+            .inspect_image(image)
+            .await
+            .ok()
+            .and_then(|image| image.config)
+            .and_then(|config| config.labels)
+            .and_then(|labels| labels.get(key).cloned())
+            .is_some_and(|label| label == value)
     }
 
     /// Check if a container's image matches the latest local image.

@@ -170,7 +170,7 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
                 info!(
                     name = record.name,
                     backend = record.backend,
-                    "synced native session"
+                    "synced ACP project"
                 );
             }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
@@ -189,7 +189,7 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
 
     // No worker startup here. The server dispatches queued work into isolated,
-    // short-lived native CLI containers (ADR-025).
+    // short-lived ACP server containers (ADR-026).
 
     Ok(state)
 }

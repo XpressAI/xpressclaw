@@ -79,7 +79,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // Consume tasks with short-lived native CLI workers. The former harness
+    // Consume tasks with short-lived ACP agent workers. The former harness
     // dispatcher and desired-state agent reconciler are intentionally not
     // started: runtime contexts are durable sessions, not long-running loops.
     let dispatcher_db = state.db.clone();

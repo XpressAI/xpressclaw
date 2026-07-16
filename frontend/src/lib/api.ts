@@ -277,9 +277,9 @@ export interface NativeRunnerConfig {
 	kind: string;
 	image: string;
 	workspace: string | null;
+	model: string | null;
 	command: string[];
 	subscription_auth: boolean;
-	max_turns: number;
 }
 
 export interface LogicalSession {
@@ -345,6 +345,7 @@ export interface SessionOverview {
 }
 
 export interface RunnerReadiness {
+	protocol: string;
 	ready: boolean;
 	docker_available: boolean;
 	kind: string;
@@ -353,6 +354,7 @@ export interface RunnerReadiness {
 	image_present: boolean;
 	workspace: string;
 	workspace_present: boolean;
+	model: string | null;
 	command_present: boolean;
 	subscription_auth: boolean;
 	auth_present: boolean;
@@ -756,7 +758,7 @@ export const setup = {
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
 	complete: (data: {
-		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -765,7 +767,7 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; subscription_auth?: boolean; volumes?: string[];
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; volumes?: string[];
 	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)

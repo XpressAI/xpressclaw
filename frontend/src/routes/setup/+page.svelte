@@ -11,22 +11,29 @@
 			kind: 'codex',
 			name: 'Codex',
 			mark: 'C',
-			description: 'Codex CLI using an eligible ChatGPT subscription login.',
+			description: 'Codex through its ACP adapter, using an eligible ChatGPT login.',
 			image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest'
 		},
 		{
 			kind: 'claude',
 			name: 'Claude Code',
 			mark: 'A',
-			description: 'Claude Code using an eligible Claude subscription login.',
+			description: 'Claude Code through its ACP adapter, using an eligible Claude login.',
 			image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest'
 		},
 		{
 			kind: 'opencode',
 			name: 'OpenCode',
 			mark: 'O',
-			description: 'OpenCode with its native JSON event stream.',
+			description: 'OpenCode through its built-in ACP server.',
 			image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest'
+		},
+		{
+			kind: 'custom',
+			name: 'Other ACP agent',
+			mark: '+',
+			description: 'Any containerized agent that speaks ACP over stdio.',
+			image: ''
 		}
 	] as const;
 
@@ -35,6 +42,8 @@
 	);
 	let runnerKind = $state('codex');
 	let runnerImage = $state(runnerOptions[0].image as string);
+	let runnerModel = $state('');
+	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
 	let workspacePath = $state('');
 	let workspaceFolders = $state<string[]>([]);
@@ -67,6 +76,9 @@
 		if (!runner) return;
 		runnerKind = runner.kind;
 		runnerImage = runner.image;
+		runnerCommand = '';
+		runnerModel = '';
+		subscriptionAuth = runner.kind !== 'custom';
 	}
 
 	function addFolder() {
@@ -94,7 +106,7 @@
 	}
 
 	async function createSession() {
-		if (!workspacePath.trim() || !runnerImage.trim() || saving) return;
+		if (!workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
 		saving = true;
 		saveError = '';
 
@@ -103,6 +115,8 @@
 			runner_kind: runnerKind,
 			runner_image: runnerImage.trim(),
 			runner_workspace: workspacePath.trim(),
+			runner_model: runnerModel.trim() || undefined,
+			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
 			subscription_auth: subscriptionAuth,
 			volumes: additionalVolumes()
 		};
@@ -153,7 +167,7 @@
 				<h3 class="text-sm font-medium text-foreground">Agent</h3>
 				<p class="mt-0.5 text-xs text-muted-foreground">XpressClaw sends tasks to this product; it keeps its own reasoning, tools, and subagents.</p>
 			</div>
-			<div class="grid gap-3 sm:grid-cols-3">
+			<div class="grid gap-3 sm:grid-cols-2">
 				{#each runnerOptions as runner}
 					<button
 						type="button"
@@ -185,13 +199,20 @@
 		</section>
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			{#if runnerKind === 'custom'}
+				<div>
+					<p class="text-sm font-medium text-foreground">Authentication is image-defined</p>
+					<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">Add any required credential directories as mounts below. XpressClaw only knows the standard login locations for its built-in agents.</p>
+				</div>
+			{:else}
 			<label class="flex cursor-pointer items-start gap-3">
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
 				<span>
 					<span class="block text-sm font-medium text-foreground">Use my existing {runnerOptions.find((runner) => runner.kind === runnerKind)?.name} login</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the CLI's standard login directory so its subscription and conversations can continue across tasks. Only enable this for images you trust.</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the agent's standard login directory so its subscription and conversations can continue across tasks. Only enable this for images you trust.</span>
 				</span>
 			</label>
+			{/if}
 		</section>
 
 		<details class="group rounded-xl border border-border">
@@ -211,6 +232,30 @@
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
 					<p class="mt-1 text-xs text-muted-foreground">Use the minimal agent image or a compatible derivative. Richer development environments can be attached separately.</p>
+				</div>
+
+				<div>
+					<label for="runner-model" class="mb-1 block text-xs font-medium text-foreground">Model</label>
+					<input
+						id="runner-model"
+						type="text"
+						bind:value={runnerModel}
+						placeholder="Agent default"
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">Optional ACP model value ID. Invalid values are rejected with the choices advertised by the agent.</p>
+				</div>
+
+				<div>
+					<label for="runner-command" class="mb-1 block text-xs font-medium text-foreground">ACP server command {runnerKind === 'custom' ? '(required)' : '(optional override)'}</label>
+					<textarea
+						id="runner-command"
+						bind:value={runnerCommand}
+						rows="4"
+						placeholder={'my-agent\nacp\n--cwd\n{workspace}'}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					></textarea>
+					<p class="mt-1 text-xs text-muted-foreground">One argument per line. The process must speak ACP over stdin/stdout. Available placeholder: <code>{'{workspace}'}</code>.</p>
 				</div>
 
 				<div>
@@ -289,7 +334,7 @@
 			{/if}
 			<button
 				type="submit"
-				disabled={saving || !workspacePath.trim() || !runnerImage.trim()}
+				disabled={saving || !workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
 				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
 			>
 				{saving ? 'Creating...' : (isAddSession ? 'Create project' : 'Finish setup')}

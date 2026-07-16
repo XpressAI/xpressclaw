@@ -374,7 +374,7 @@ impl TaskBoard {
         Ok(tasks)
     }
 
-    /// Replace the native harness's current plan with its latest snapshot.
+    /// Replace the ACP agent's current plan with its latest snapshot.
     /// These rows are normal subtasks so the UI and completion semantics do
     /// not need a second, runner-specific representation.
     pub fn sync_reported_subtasks(
@@ -720,7 +720,7 @@ pub struct BatchTaskInput {
     pub description: Option<String>,
     pub agent_id: Option<String>,
     pub priority: Option<i32>,
-    /// Start a new native harness conversation instead of continuing the
+    /// Start a new ACP conversation instead of continuing the
     /// project's active one. Dependencies still take precedence so a task can
     /// continue the work it is explicitly chained from.
     #[serde(default)]

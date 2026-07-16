@@ -13,38 +13,17 @@ use crate::config::{default_native_runner_image, AgentConfig, Config, NativeRunn
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
-use crate::docker::manager::{ContainerOutput, ContainerSpec, DockerManager, VolumeMount};
+use crate::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
 use crate::error::{Error, Result};
-use crate::sessions::{NewEvent, SessionManager};
-use crate::tasks::board::{ReportedSubtask, TaskBoard, TaskStatus};
+use crate::sessions::SessionManager;
+use crate::tasks::board::TaskBoard;
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::{QueueItem, TaskQueue};
+use crate::workers::acp::{run_turn, AcpEventRecorder};
 
-const MAX_CAPTURED_OUTPUT: usize = 200_000;
-const MAX_PROGRESS_EVENTS: usize = 250;
-
-#[derive(Debug)]
-struct NativeResult {
-    summary: String,
-    native_session_id: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct NativeStreamUpdate {
-    native_session_id: Option<String>,
-    progress: Vec<(String, Value)>,
-    plans: Vec<Vec<ReportedSubtask>>,
-}
-
-#[derive(Debug, Default)]
-struct NativeProgressDecoder {
-    buffer: String,
-    emitted: usize,
-}
-
-/// Consume the durable task queue with native CLIs instead of a bespoke agent
-/// loop. Each queue item gets its own short-lived container and publishes only
-/// structured events/artifacts to the logical session.
+/// Consume the durable task queue as an Agent Client Protocol client. Each
+/// queue item gets its own short-lived ACP server container and publishes
+/// standard protocol events and artifacts to the logical session.
 pub async fn start_dispatcher(
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
@@ -161,10 +140,23 @@ async fn execute_item(
     if let Some(native_session_id) = resume_session_id.as_deref() {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
-    let mut spec = build_spec(&config, agent, &kind, &prompt, resume_session_id.as_deref())?;
-    if !docker.has_image(&spec.image).await {
+    let mut spec = build_spec(&config, agent, &kind)?;
+    let built_in_image = default_native_runner_image(&kind) == Some(spec.image.as_str());
+    let image_ready = docker.has_image(&spec.image).await
+        && (!built_in_image
+            || docker
+                .image_has_label(&spec.image, "io.xpressclaw.protocol", "acp")
+                .await);
+    if !image_ready {
         let local_fallback = match local_runner_image_alias(&spec.image) {
-            Some(image) if docker.has_image(image).await => Some(image),
+            Some(image)
+                if docker.has_image(image).await
+                    && docker
+                        .image_has_label(image, "io.xpressclaw.protocol", "acp")
+                        .await =>
+            {
+                Some(image)
+            }
             _ => None,
         };
         if let Some(local_image) = local_fallback {
@@ -178,101 +170,87 @@ async fn execute_item(
                 None,
             )?;
             docker.pull_image(&spec.image).await?;
+            if built_in_image
+                && !docker
+                    .image_has_label(&spec.image, "io.xpressclaw.protocol", "acp")
+                    .await
+            {
+                return Err(Error::Backend(format!(
+                    "runner image {} predates the ACP integration; rebuild it from the current Dockerfile",
+                    spec.image
+                )));
+            }
         }
     }
     let workload_id = format!("attempt-{attempt_id}");
-    let container = docker.launch(&workload_id, &spec).await?;
-    sessions.set_container(attempt_id, &container.container_id)?;
+    let attached = docker.launch_attached(&workload_id, &spec).await?;
+    sessions.set_container(attempt_id, &attached.info.container_id)?;
     sessions.transition_attempt(
         attempt_id,
         "running",
-        &format!("{kind} is working"),
+        &format!("{kind} is working over ACP"),
         None,
         None,
     )?;
 
     let attempt = sessions.get_attempt(attempt_id)?;
-    let mut decoder = NativeProgressDecoder::default();
-    let output = docker
-        .wait_for_exit_streaming(&workload_id, |chunk| {
-            let update = decoder.push(&kind, chunk);
-            if let Err(error) = record_stream_update(
-                &db,
-                &sessions,
-                &attempt.session_id,
-                attempt_id,
-                &item.task_id,
-                &kind,
-                update,
-            ) {
-                warn!(%error, attempt_id, "failed to persist native progress");
-            }
-        })
-        .await?;
-    let final_update = decoder.finish(&kind);
-    if let Err(error) = record_stream_update(
-        &db,
-        &sessions,
-        &attempt.session_id,
+    let recorder = AcpEventRecorder::new(
+        db.clone(),
+        attempt.session_id.clone(),
         attempt_id,
-        &item.task_id,
-        &kind,
-        final_update,
-    ) {
-        warn!(%error, attempt_id, "failed to persist final native progress");
-    }
+        item.task_id.clone(),
+        kind.clone(),
+    );
+    let turn = run_turn(
+        attached,
+        recorder,
+        resume_session_id.as_deref(),
+        Path::new("/workspace"),
+        &prompt,
+        agent.runner.model.as_deref(),
+    )
+    .await;
+    let _ = docker.stop(&workload_id).await;
+    let turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
     if current.status == "cancelled" {
         return Ok(());
     }
-    let captured = truncate(&output.output, MAX_CAPTURED_OUTPUT);
     sessions.add_artifact(
         attempt_id,
         "runner_output",
-        "Native runner event stream",
-        Some(&captured),
+        "ACP event transcript",
+        Some(&turn.diagnostic),
         None,
-        json!({ "status_code": output.status_code, "runner": kind }),
+        json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
-
-    if output.status_code != 0 {
-        return Err(Error::Backend(format!(
-            "{kind} exited with status {}: {}",
-            output.status_code,
-            tail(&captured, 2_000)
-        )));
-    }
-
-    let parsed = parse_output(&kind, &output);
-    if let Some(native_session_id) = parsed.native_session_id.as_deref() {
-        sessions.set_native_session(attempt_id, native_session_id)?;
-    }
+    sessions.set_native_session(attempt_id, &turn.session_id)?;
     sessions.add_artifact(
         attempt_id,
         "result",
         "Attempt result",
-        Some(&parsed.summary),
+        Some(&turn.summary),
         None,
-        json!({ "runner": kind }),
+        json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
-    let completion_summary = truncate(&parsed.summary, 2_000);
+    let completion_summary = truncate(&turn.summary, 2_000);
     sessions.transition_attempt(
         attempt_id,
         "completed",
         &completion_summary,
-        Some(&parsed.summary),
+        Some(&turn.summary),
         None,
     )?;
     let queue = TaskQueue::new(db.clone());
-    queue.complete(item.id, &parsed.summary)?;
+    queue.complete(item.id, &turn.summary)?;
     if let Err(error) =
-        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &parsed.summary)
+        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &turn.summary)
     {
-        warn!(%error, task_id = item.task_id, "failed to persist native task reply");
+        warn!(%error, task_id = item.task_id, "failed to persist ACP task reply");
     }
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
-    let waiting_for_user = needs_user_input(&parsed.summary);
+    let waiting_for_user = needs_user_input(&turn.summary);
     let completed_tasks = if continuation_queued {
         board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
         Vec::new()
@@ -291,10 +269,10 @@ async fn execute_item(
         &event_bus,
         &item,
         &agent.context_label(),
-        &parsed.summary,
+        &turn.summary,
     );
     for completed in completed_tasks {
-        advance_workflow(&db, &completed.id, "completed", &parsed.summary);
+        advance_workflow(&db, &completed.id, "completed", &turn.summary);
     }
     Ok(())
 }
@@ -482,7 +460,7 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
     })
 }
 
-/// Pick the native harness conversation for this task turn. Explicit task
+/// Pick the ACP conversation for this task turn. Explicit task
 /// dependencies are strongest, followed by an existing turn on the same task.
 /// A task marked `session_mode: new` then starts clean; all other work resumes
 /// the latest conversation in the project.
@@ -547,14 +525,8 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
     })
 }
 
-fn build_spec(
-    config: &Config,
-    agent: &AgentConfig,
-    kind: &str,
-    prompt: &str,
-    resume_session_id: Option<&str>,
-) -> Result<ContainerSpec> {
-    let command = command_for(&agent.runner, kind, prompt, resume_session_id)?;
+fn build_spec(config: &Config, agent: &AgentConfig, kind: &str) -> Result<ContainerSpec> {
+    let command = acp_command_for(&agent.runner, kind)?;
     let image = resolved_runner_image(&agent.runner, kind)?;
     let workspace = agent
         .runner
@@ -611,7 +583,7 @@ pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<
     Ok(config.image.trim().to_string())
 }
 
-/// Local tags used by the native-session prototype. A published image is the
+/// Local tags used by the ACP runner images. A published image is the
 /// default, but retaining these aliases lets existing developer builds run
 /// without a forced retag or registry pull.
 pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
@@ -627,72 +599,20 @@ pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
     }
 }
 
-fn command_for(
-    config: &NativeRunnerConfig,
-    kind: &str,
-    prompt: &str,
-    resume_session_id: Option<&str>,
-) -> Result<Vec<String>> {
+fn acp_command_for(config: &NativeRunnerConfig, kind: &str) -> Result<Vec<String>> {
     if !config.command.is_empty() {
         return Ok(config
             .command
             .iter()
-            .map(|part| {
-                part.replace("{prompt}", prompt)
-                    .replace("{workspace}", "/workspace")
-                    .replace("{session_id}", resume_session_id.unwrap_or_default())
-            })
+            .map(|part| part.replace("{workspace}", "/workspace"))
             .collect());
     }
     match kind {
-        "codex" => {
-            let mut command = vec!["codex".into(), "exec".into()];
-            if let Some(session_id) = resume_session_id {
-                command.push("resume".into());
-                command.extend([
-                    "--json".into(),
-                    "--dangerously-bypass-approvals-and-sandbox".into(),
-                    "--skip-git-repo-check".into(),
-                    session_id.into(),
-                    prompt.into(),
-                ]);
-            } else {
-                command.extend([
-                    "--json".into(),
-                    "--dangerously-bypass-approvals-and-sandbox".into(),
-                    "--skip-git-repo-check".into(),
-                    "-C".into(),
-                    "/workspace".into(),
-                    prompt.into(),
-                ]);
-            }
-            Ok(command)
-        }
-        "claude" => {
-            let mut command = vec!["claude".into(), "-p".into(), prompt.into()];
-            if let Some(session_id) = resume_session_id {
-                command.extend(["--resume".into(), session_id.into()]);
-            }
-            command.extend([
-                "--output-format".into(),
-                "stream-json".into(),
-                "--verbose".into(),
-                "--dangerously-skip-permissions".into(),
-                "--max-turns".into(),
-                config.max_turns.to_string(),
-            ]);
-            Ok(command)
-        }
-        "opencode" => {
-            let mut command = vec!["opencode".into(), "run".into()];
-            if let Some(session_id) = resume_session_id {
-                command.extend(["--session".into(), session_id.into()]);
-            }
-            command.extend(["--format".into(), "json".into(), prompt.into()]);
-            Ok(command)
-        }
+        "codex" => Ok(vec!["codex-acp".into()]),
+        "claude" => Ok(vec!["claude-agent-acp".into()]),
+        "opencode" => Ok(vec!["opencode".into(), "acp".into()]),
         _ => Err(Error::Backend(format!(
-            "runner '{kind}' requires an explicit command"
+            "ACP runner '{kind}' requires an explicit server command"
         ))),
     }
 }
@@ -724,7 +644,7 @@ fn auth_candidates(kind: &str) -> Vec<(PathBuf, &'static str, bool)> {
 }
 
 /// Whether the host has a standard login location that can be mounted for the
-/// selected native product. This intentionally reports only presence, never
+/// selected agent product. This intentionally reports only presence, never
 /// credential contents.
 pub fn subscription_auth_available(kind: &str) -> bool {
     auth_candidates(kind)
@@ -793,343 +713,6 @@ fn canonical_or_original(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-impl NativeProgressDecoder {
-    fn push(&mut self, kind: &str, chunk: &str) -> NativeStreamUpdate {
-        self.buffer.push_str(chunk);
-        let mut update = NativeStreamUpdate::default();
-        while let Some(newline) = self.buffer.find('\n') {
-            let line = self.buffer[..newline].to_string();
-            self.buffer.drain(..=newline);
-            self.consume_line(kind, &line, &mut update);
-        }
-        update
-    }
-
-    fn finish(&mut self, kind: &str) -> NativeStreamUpdate {
-        let mut update = NativeStreamUpdate::default();
-        let line = std::mem::take(&mut self.buffer);
-        if !line.trim().is_empty() {
-            self.consume_line(kind, &line, &mut update);
-        }
-        update
-    }
-
-    fn consume_line(&mut self, kind: &str, line: &str, update: &mut NativeStreamUpdate) {
-        let parsed = parse_progress_line(kind, line);
-        if parsed.native_session_id.is_some() {
-            update.native_session_id = parsed.native_session_id;
-        }
-        update.plans.extend(parsed.plans);
-        for progress in parsed.progress {
-            if self.emitted >= MAX_PROGRESS_EVENTS {
-                break;
-            }
-            update.progress.push(progress);
-            self.emitted += 1;
-        }
-    }
-}
-
-fn parse_progress_line(kind: &str, line: &str) -> NativeStreamUpdate {
-    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-        return NativeStreamUpdate::default();
-    };
-    let mut update = NativeStreamUpdate::default();
-    match kind {
-        "codex" => match value.get("type").and_then(Value::as_str) {
-            Some("thread.started") => {
-                update.native_session_id = value
-                    .get("thread_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-            Some(event_type)
-                if matches!(
-                    event_type,
-                    "item.started" | "item.updated" | "item.completed"
-                ) =>
-            {
-                if let Some(item) = value.get("item") {
-                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("item");
-                    let summary = match item_type {
-                        "agent_message" if event_type == "item.completed" => item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.trim().is_empty())
-                            .map(|text| truncate(text, 1_000)),
-                        "command_execution" if event_type == "item.completed" => {
-                            let command = item
-                                .get("command")
-                                .and_then(Value::as_str)
-                                .unwrap_or("command");
-                            Some(format!("Ran {}", truncate(command, 160)))
-                        }
-                        "todo_list" => item.get("items").and_then(Value::as_array).map(|items| {
-                            let plan = plan_from_items(items, "text");
-                            let completed = plan
-                                .iter()
-                                .filter(|item| item.status == TaskStatus::Completed)
-                                .count();
-                            update.plans.push(plan);
-                            format!("Updated plan: {completed}/{} complete", items.len())
-                        }),
-                        "file_change" if event_type == "item.completed" => {
-                            Some("Updated project files".to_string())
-                        }
-                        _ => None,
-                    };
-                    if let Some(summary) = summary {
-                        let payload = if item_type == "todo_list" {
-                            json!({ "item_type": item_type, "items": item.get("items") })
-                        } else {
-                            json!({ "item_type": item_type })
-                        };
-                        update.progress.push((summary, payload));
-                    }
-                }
-            }
-            _ => {}
-        },
-        "claude" => match value.get("type").and_then(Value::as_str) {
-            Some("system") | Some("result") => {
-                update.native_session_id = value
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-            Some("assistant") => {
-                if let Some(content) = value
-                    .get("message")
-                    .and_then(|message| message.get("content"))
-                    .and_then(Value::as_array)
-                {
-                    for item in content {
-                        match item.get("type").and_then(Value::as_str) {
-                            Some("text") => {
-                                if let Some(text) = item
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .filter(|text| !text.trim().is_empty())
-                                {
-                                    update.progress.push((
-                                        truncate(text, 1_000),
-                                        json!({ "item_type": "agent_message" }),
-                                    ));
-                                }
-                            }
-                            Some("tool_use") => {
-                                let name =
-                                    item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                                if name.eq_ignore_ascii_case("TodoWrite") {
-                                    if let Some(todos) = item
-                                        .get("input")
-                                        .and_then(|input| input.get("todos"))
-                                        .and_then(Value::as_array)
-                                    {
-                                        let plan = plan_from_items(todos, "content");
-                                        let completed = plan
-                                            .iter()
-                                            .filter(|item| item.status == TaskStatus::Completed)
-                                            .count();
-                                        update.plans.push(plan);
-                                        update.progress.push((
-                                            format!(
-                                                "Updated plan: {completed}/{} complete",
-                                                todos.len()
-                                            ),
-                                            json!({
-                                                "item_type": "todo_list",
-                                                "tool": name,
-                                                "items": todos,
-                                            }),
-                                        ));
-                                    }
-                                } else {
-                                    update.progress.push((
-                                        format!("Used {name}"),
-                                        json!({ "item_type": "tool_use", "tool": name }),
-                                    ));
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
-        },
-        _ => match value.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                let text = value
-                    .get("text")
-                    .or_else(|| value.get("part").and_then(|part| part.get("text")))
-                    .and_then(Value::as_str);
-                if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
-                    update.progress.push((
-                        truncate(text, 1_000),
-                        json!({ "item_type": "agent_message" }),
-                    ));
-                }
-            }
-            Some("tool_use") => {
-                let name = value
-                    .get("name")
-                    .or_else(|| value.get("part").and_then(|part| part.get("tool")))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool");
-                update.progress.push((
-                    format!("Used {name}"),
-                    json!({ "item_type": "tool_use", "tool": name }),
-                ));
-            }
-            _ => {}
-        },
-    }
-    update
-}
-
-fn plan_from_items(items: &[Value], title_key: &str) -> Vec<ReportedSubtask> {
-    let has_explicit_active = items
-        .iter()
-        .any(|item| item.get("status").and_then(Value::as_str) == Some("in_progress"));
-    let first_incomplete = items.iter().position(|item| {
-        item.get("completed").and_then(Value::as_bool) != Some(true)
-            && item.get("status").and_then(Value::as_str) != Some("completed")
-    });
-
-    items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            let title = item
-                .get(title_key)
-                .or_else(|| item.get("text"))
-                .or_else(|| item.get("content"))
-                .or_else(|| item.get("subject"))
-                .and_then(Value::as_str)?
-                .trim();
-            if title.is_empty() {
-                return None;
-            }
-            let status = match item.get("status").and_then(Value::as_str) {
-                Some("completed") => TaskStatus::Completed,
-                Some("in_progress") => TaskStatus::InProgress,
-                Some("cancelled") => TaskStatus::Cancelled,
-                _ if item.get("completed").and_then(Value::as_bool) == Some(true) => {
-                    TaskStatus::Completed
-                }
-                _ if !has_explicit_active && first_incomplete == Some(index) => {
-                    TaskStatus::InProgress
-                }
-                _ => TaskStatus::Pending,
-            };
-            Some(ReportedSubtask {
-                title: title.to_string(),
-                status,
-            })
-        })
-        .collect()
-}
-
-fn record_stream_update(
-    db: &Arc<Database>,
-    sessions: &SessionManager,
-    session_id: &str,
-    attempt_id: &str,
-    task_id: &str,
-    kind: &str,
-    update: NativeStreamUpdate,
-) -> Result<()> {
-    if let Some(native_session_id) = update.native_session_id.as_deref() {
-        sessions.set_native_session(attempt_id, native_session_id)?;
-    }
-    for plan in update.plans {
-        TaskBoard::new(db.clone()).sync_reported_subtasks(task_id, attempt_id, &plan)?;
-    }
-    for (summary, payload) in update.progress {
-        sessions.append_event(
-            session_id,
-            NewEvent {
-                attempt_id: Some(attempt_id),
-                task_id: Some(task_id),
-                source_type: "runner",
-                source_id: Some(kind),
-                event_type: "runner_progress",
-                summary: &summary,
-                payload,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
-    let mut summary = String::new();
-    let mut native_session_id = None;
-
-    for line in output.output.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        match kind {
-            "codex" => match value.get("type").and_then(Value::as_str) {
-                Some("thread.started") => {
-                    native_session_id = value
-                        .get("thread_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                }
-                Some("item.completed") => {
-                    if let Some(item) = value.get("item") {
-                        if item.get("type").and_then(Value::as_str) == Some("agent_message") {
-                            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                summary = text.to_string();
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            "claude" => match value.get("type").and_then(Value::as_str) {
-                Some("system") => {
-                    native_session_id = value
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                }
-                Some("result") => {
-                    if let Some(text) = value.get("result").and_then(Value::as_str) {
-                        summary = text.to_string();
-                    }
-                    if native_session_id.is_none() {
-                        native_session_id = value
-                            .get("session_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                    }
-                }
-                _ => {}
-            },
-            _ => {
-                if let Some(text) = value
-                    .get("result")
-                    .or_else(|| value.get("text"))
-                    .and_then(Value::as_str)
-                {
-                    summary = text.to_string();
-                }
-            }
-        }
-    }
-    if summary.trim().is_empty() {
-        summary = tail(&output.output, 8_000);
-    }
-    NativeResult {
-        summary,
-        native_session_id,
-    }
-}
-
 fn needs_user_input(summary: &str) -> bool {
     if summary.lines().any(|line| {
         line.trim_start()
@@ -1180,15 +763,6 @@ fn truncate(value: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn tail(value: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= max_chars {
-        value.to_string()
-    } else {
-        chars[chars.len() - max_chars..].iter().collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,114 +774,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_runner_kind(&agent).unwrap(), "claude");
-    }
-
-    #[test]
-    fn parses_codex_jsonl_without_exposing_terminal_protocol() {
-        let output = ContainerOutput {
-            status_code: 0,
-            output: concat!(
-                "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
-                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"cargo test\"}}\n",
-                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Implemented and tested.\"}}\n"
-            )
-            .to_string(),
-        };
-        let result = parse_output("codex", &output);
-        assert_eq!(result.native_session_id.as_deref(), Some("thread-1"));
-        assert_eq!(result.summary, "Implemented and tested.");
-
-        let mut decoder = NativeProgressDecoder::default();
-        let first = decoder.push(
-            "codex",
-            concat!(
-                "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
-                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_"
-            ),
-        );
-        assert_eq!(first.native_session_id.as_deref(), Some("thread-1"));
-        assert!(first.progress.is_empty());
-
-        let second = decoder.push(
-            "codex",
-            concat!(
-                "execution\",\"command\":\"cargo test\"}}\n",
-                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Implemented and tested.\"}}\n"
-            ),
-        );
-        assert_eq!(second.progress[0].0, "Ran cargo test");
-        assert_eq!(second.progress[1].0, "Implemented and tested.");
-    }
-
-    #[test]
-    fn extracts_codex_todo_snapshots_as_subtasks() {
-        let mut decoder = NativeProgressDecoder::default();
-        let started = decoder.push(
-            "codex",
-            concat!(
-                "{\"type\":\"item.started\",\"item\":{\"id\":\"item_1\",",
-                "\"type\":\"todo_list\",\"items\":[",
-                "{\"text\":\"Inspect code\",\"completed\":false},",
-                "{\"text\":\"Run tests\",\"completed\":false}]}}\n"
-            ),
-        );
-        assert_eq!(started.plans.len(), 1);
-        assert_eq!(started.plans[0][0].title, "Inspect code");
-        assert_eq!(started.plans[0][0].status, TaskStatus::InProgress);
-        assert_eq!(started.plans[0][1].status, TaskStatus::Pending);
-        assert_eq!(started.progress[0].0, "Updated plan: 0/2 complete");
-
-        let updated = decoder.push(
-            "codex",
-            concat!(
-                "{\"type\":\"item.updated\",\"item\":{\"id\":\"item_1\",",
-                "\"type\":\"todo_list\",\"items\":[",
-                "{\"text\":\"Inspect code\",\"completed\":true},",
-                "{\"text\":\"Run tests\",\"completed\":false}]}}\n"
-            ),
-        );
-        assert_eq!(updated.plans[0][0].status, TaskStatus::Completed);
-        assert_eq!(updated.plans[0][1].status, TaskStatus::InProgress);
-    }
-
-    #[test]
-    fn parses_claude_semantic_progress() {
-        let mut decoder = NativeProgressDecoder::default();
-        let update = decoder.push(
-            "claude",
-            concat!(
-                "{\"type\":\"system\",\"session_id\":\"session-1\"}\n",
-                "{\"type\":\"assistant\",\"message\":{\"content\":[",
-                "{\"type\":\"text\",\"text\":\"Inspecting the project\"},",
-                "{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}\n"
-            ),
-        );
-
-        assert_eq!(update.native_session_id.as_deref(), Some("session-1"));
-        assert_eq!(update.progress[0].0, "Inspecting the project");
-        assert_eq!(update.progress[1].0, "Used Bash");
-    }
-
-    #[test]
-    fn extracts_claude_todo_write_snapshots_as_subtasks() {
-        let mut decoder = NativeProgressDecoder::default();
-        let update = decoder.push(
-            "claude",
-            concat!(
-                "{\"type\":\"assistant\",\"message\":{\"content\":[",
-                "{\"type\":\"tool_use\",\"name\":\"TodoWrite\",\"input\":{\"todos\":[",
-                "{\"content\":\"Inspect code\",\"status\":\"completed\"},",
-                "{\"content\":\"Fix bug\",\"status\":\"in_progress\"},",
-                "{\"content\":\"Run tests\",\"status\":\"pending\"}]}}]}}\n"
-            ),
-        );
-
-        assert_eq!(update.plans.len(), 1);
-        assert_eq!(update.plans[0].len(), 3);
-        assert_eq!(update.plans[0][0].status, TaskStatus::Completed);
-        assert_eq!(update.plans[0][1].status, TaskStatus::InProgress);
-        assert_eq!(update.plans[0][2].status, TaskStatus::Pending);
-        assert_eq!(update.progress[0].0, "Updated plan: 1/3 complete");
     }
 
     #[test]
@@ -1331,43 +797,30 @@ mod tests {
     #[test]
     fn expands_custom_command_placeholders() {
         let config = NativeRunnerConfig {
-            command: vec![
-                "runner".into(),
-                "--cwd={workspace}".into(),
-                "{prompt}".into(),
-            ],
+            command: vec!["runner".into(), "--cwd={workspace}".into()],
             ..Default::default()
         };
         assert_eq!(
-            command_for(&config, "custom", "do work", None).unwrap(),
-            vec!["runner", "--cwd=/workspace", "do work"]
+            acp_command_for(&config, "custom").unwrap(),
+            vec!["runner", "--cwd=/workspace"]
         );
     }
 
     #[test]
-    fn resumes_native_runner_conversations() {
+    fn starts_the_builtin_acp_servers() {
         let config = NativeRunnerConfig::default();
         assert_eq!(
-            command_for(&config, "codex", "keep going", Some("thread-1")).unwrap(),
-            vec![
-                "codex",
-                "exec",
-                "resume",
-                "--json",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--skip-git-repo-check",
-                "thread-1",
-                "keep going",
-            ]
+            acp_command_for(&config, "codex").unwrap(),
+            vec!["codex-acp"]
         );
-        assert!(command_for(&config, "claude", "review", Some("session-1"))
-            .unwrap()
-            .windows(2)
-            .any(|pair| pair == ["--resume", "session-1"]));
-        assert!(command_for(&config, "opencode", "test", Some("session-2"))
-            .unwrap()
-            .windows(2)
-            .any(|pair| pair == ["--session", "session-2"]));
+        assert_eq!(
+            acp_command_for(&config, "claude").unwrap(),
+            vec!["claude-agent-acp"]
+        );
+        assert_eq!(
+            acp_command_for(&config, "opencode").unwrap(),
+            vec!["opencode", "acp"]
+        );
     }
 
     #[test]

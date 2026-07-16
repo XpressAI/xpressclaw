@@ -75,6 +75,10 @@ async-trait = "0.1"
 
 # Futures utilities
 futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# Agent Client Protocol
+agent-client-protocol = "1.2.0"
 
 open = "5"
 

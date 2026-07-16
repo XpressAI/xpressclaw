@@ -185,7 +185,7 @@
 			{#if activeTab === 'session'}
 				<SessionTab agentId={agent.id} />
 			{:else if activeTab === 'runner'}
-				<RunnerTab {agentConfig} onSave={handleSave} {saveSignal} />
+				<RunnerTab {agentConfig} agentId={agent.id} onSave={handleSave} {saveSignal} />
 			{:else if activeTab === 'workspace'}
 				<WorkspaceTab {agentConfig} onSave={handleSave} />
 			{:else if activeTab === 'tasks'}

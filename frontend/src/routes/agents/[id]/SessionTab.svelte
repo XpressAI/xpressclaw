@@ -148,7 +148,7 @@
 			</div>
 			<textarea bind:value={message} onkeydown={handleKeydown} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
 			<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
-				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task continues the project's active native conversation">
+				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task continues the project's active agent conversation">
 					<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 					Start a fresh conversation
 				</label>

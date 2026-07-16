@@ -573,7 +573,7 @@
 					{#if activeAttempt?.status === 'running' || activeAttempt?.status === 'preparing' || activeAttempt?.status === 'review'}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
 							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
-							A native worker is handling this task...
+							The agent is working on this task...
 						</div>
 					{:else if activeAttempt?.status === 'queued'}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
@@ -596,7 +596,7 @@
 				<!-- Message input -->
 				<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4">
 					{#if task.status === 'waiting_for_input'}
-						<div class="text-xs text-orange-400 mb-2">The native worker needs additional input</div>
+						<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
 					{:else if !task.agent_id}
 						<div class="text-xs text-muted-foreground mb-2">Assign a project before sending a message</div>
 					{/if}

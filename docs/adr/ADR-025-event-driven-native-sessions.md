@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Partially superseded by ADR-026
+
+The runtime adapter section is superseded by ADR-026. The project/task UX,
+short-lived attempt isolation, and development-environment decisions remain
+in force.
 
 ## Context
 
@@ -201,9 +205,9 @@ Existing backends map as follows unless `runner.kind` is set explicitly:
 Build the runner images you use with:
 
 ```bash
-docker build -t ghcr.io/xpressai/xpressclaw-runner-codex:latest harnesses/native/codex
-docker build -t ghcr.io/xpressai/xpressclaw-runner-claude:latest harnesses/native/claude
-docker build -t ghcr.io/xpressai/xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker buildx build --load -t xpressclaw-runner-claude:latest harnesses/native/claude
+docker buildx build --load -t xpressclaw-runner-opencode:latest harnesses/native/opencode
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router
