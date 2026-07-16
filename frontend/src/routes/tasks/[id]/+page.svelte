@@ -63,9 +63,11 @@
 			: null
 	);
 	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
+	let finalAssistantMessage = $derived(messages.at(-1)?.role === 'assistant' ? messages.at(-1)! : null);
+	let conversationMessages = $derived(finalAssistantMessage ? messages.slice(0, -1) : messages);
 	let messagePlaceholder = $derived(
 		!task?.agent_id
-			? 'Assign a session to chat about this task'
+			? 'Assign a project to chat about this task'
 			: task.status === 'waiting_for_input'
 				? 'Reply to the worker...'
 				: ['completed', 'blocked', 'cancelled'].includes(task.status)
@@ -273,6 +275,15 @@
 		return session?.title || session?.name || id;
 	}
 
+	function taskLabel(id: string): string {
+		return allTasks.find((candidate) => candidate.id === id)?.title ?? id;
+	}
+
+	function startsFreshConversation(): boolean {
+		if (!task?.context || typeof task.context !== 'object') return false;
+		return (task.context as Record<string, unknown>).session_mode === 'new';
+	}
+
 	function activityDot(eventType: string): string {
 		if (eventType === 'attempt_failed') return 'bg-red-400';
 		if (eventType === 'attempt_cancelled') return 'bg-muted-foreground';
@@ -282,9 +293,9 @@
 	}
 </script>
 
-<div class="flex h-full flex-col">
+<div class="flex min-h-0 h-full flex-col">
 	<!-- Header -->
-	<div class="border-b border-border p-4">
+	<div class="shrink-0 border-b border-border p-3 sm:p-4">
 		<div class="flex items-center gap-2 text-sm text-muted-foreground mb-2">
 			<a href="/tasks" class="hover:text-foreground">Tasks</a>
 			<span>/</span>
@@ -294,18 +305,19 @@
 		{#if error}
 			<div class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>
 		{:else if task}
-			<div class="flex items-start justify-between">
-				<div>
-					<h1 class="text-xl font-bold">{task.title}</h1>
-					<div class="flex items-center gap-3 mt-1 text-sm">
+			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+				<div class="min-w-0">
+					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
+					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
 							<span class="h-2 w-2 rounded-full {task.status === 'in_progress' ? 'animate-pulse' : ''}
 								{task.status === 'completed' ? 'bg-emerald-400' :
 								 task.status === 'in_progress' ? 'bg-blue-400' :
 								 task.status === 'pending' ? 'bg-amber-400' :
+								 task.status === 'waiting_for_input' ? 'bg-orange-400' :
 								 task.status === 'blocked' ? 'bg-red-400' :
 								 'bg-muted-foreground'}"></span>
-							<span class="{statusColor(task.status)}">{task.status.replace('_', ' ')}</span>
+							<span class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</span>
 						</span>
 						{#if task.agent_id}
 							<span class="text-muted-foreground">{sessionLabel(task.agent_id)}</span>
@@ -314,7 +326,7 @@
 						<span class="text-xs text-muted-foreground">{timeAgo(task.created_at)}</span>
 					</div>
 				</div>
-				<div class="flex gap-2">
+				<div class="flex shrink-0 gap-2 overflow-x-auto">
 					{#if task.status !== 'completed' && task.status !== 'cancelled'}
 						<button onclick={startEditing}
 							class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">
@@ -327,7 +339,7 @@
 							Start
 						</button>
 					{/if}
-					{#if task.status === 'in_progress' || task.status === 'pending'}
+					{#if ['in_progress', 'pending', 'waiting_for_input', 'blocked'].includes(task.status)}
 						<button onclick={() => updateStatus('completed')}
 							class="rounded-md border border-emerald-500/50 px-3 py-1.5 text-xs font-medium text-emerald-400 hover:bg-emerald-500/10">
 							Complete
@@ -343,14 +355,14 @@
 	</div>
 
 	{#if editing && task}
-		<div class="border-b border-border p-4 space-y-3 bg-card/50">
+		<div class="shrink-0 space-y-3 overflow-y-auto border-b border-border bg-card/50 p-3 sm:p-4">
 			<input type="text" bind:value={editTitle} placeholder="Task title..."
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring" />
 			<textarea bind:value={editDesc} placeholder="Description..." rows="2"
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
-			<div class="flex gap-3">
+			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<div class="text-xs text-muted-foreground mb-1">Assign to Session</div>
+					<div class="text-xs text-muted-foreground mb-1">Project</div>
 					<select bind:value={editAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value="">Unassigned</option>
@@ -401,10 +413,14 @@
 	{#if loading}
 		<div class="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading...</div>
 	{:else if task}
-		<div class="flex flex-1 overflow-hidden">
+		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
 			<div class="flex-1 flex flex-col overflow-hidden">
-				<div bind:this={messagesEl} class="flex-1 overflow-y-auto p-4 space-y-3">
+				<div bind:this={messagesEl} class="flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
+					<div class="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh conversation' : 'Continues project conversation'}</span>
+						{#if task.depends_on && task.depends_on.length > 0}<span>Continues its dependency</span>{/if}
+					</div>
 					<!-- Task description -->
 					{#if task.description}
 						<div class="rounded-lg border {statusBg(task.status)} p-3 text-sm">
@@ -420,7 +436,7 @@
 							<div class="space-y-1">
 								{#each task.blocked_by as blockerId}
 									<a href="/tasks/{blockerId}" class="block text-xs text-amber-400 hover:underline">
-										{blockerId}
+										{taskLabel(blockerId)}
 									</a>
 								{/each}
 							</div>
@@ -432,7 +448,7 @@
 							<div class="space-y-1">
 								{#each task.depends_on as depId}
 									<a href="/tasks/{depId}" class="block text-xs text-muted-foreground hover:underline">
-										{#if task.blocked_by?.includes(depId)}⏳{:else}✅{/if} {depId}
+										{#if task.blocked_by?.includes(depId)}⏳{:else}✅{/if} {taskLabel(depId)}
 									</a>
 								{/each}
 							</div>
@@ -440,7 +456,7 @@
 					{/if}
 
 					<!-- Messages -->
-					{#each messages as msg (msg.id)}
+					{#each conversationMessages as msg (msg.id)}
 						{@const isSystem = msg.role === 'system'}
 						{@const isAssistant = msg.role === 'assistant'}
 						<div class="flex gap-3 {isSystem ? '' : isAssistant ? '' : 'flex-row-reverse'}">
@@ -508,6 +524,17 @@
 						</section>
 					{/if}
 
+					{#if subtaskList.length > 0}
+						<section class="rounded-lg border border-border/60 bg-card/30 p-3 lg:hidden">
+							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Steps ({subtaskList.filter((step) => step.status === 'completed').length}/{subtaskList.length})</div>
+							<div class="space-y-2">
+								{#each subtaskList as subtask}
+									<div class="flex items-start gap-2 text-sm"><span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : '○'}</span><span class={subtask.status === 'completed' ? 'text-muted-foreground line-through' : ''}>{subtask.title}</span></div>
+								{/each}
+							</div>
+						</section>
+					{/if}
+
 					{#if latestResult}
 						<section class="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
 							<div class="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-emerald-400">
@@ -521,6 +548,16 @@
 							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
 							<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>
 						</section>
+					{/if}
+
+					{#if finalAssistantMessage}
+						<div class="flex gap-3">
+							<div class="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-accent text-xs font-bold text-accent-foreground">A</div>
+							<div class="max-w-[88%]">
+								<div class="mb-0.5 flex items-center gap-2"><span class="text-xs font-medium">assistant</span><span class="text-xs text-muted-foreground">{timeAgo(finalAssistantMessage.timestamp)}</span></div>
+								<div class="prose prose-invert prose-sm max-w-none rounded-lg bg-accent px-3 py-2 text-sm text-accent-foreground">{@html renderContent(finalAssistantMessage.content)}</div>
+							</div>
+						</div>
 					{/if}
 
 					{#if messages.length === 0 && primaryActivityEvents.length === 0 && technicalActivityEvents.length === 0 && !latestResult && !latestError && !task.description}
@@ -557,11 +594,11 @@
 				</div>
 
 				<!-- Message input -->
-				<div class="border-t border-border p-4">
+				<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4">
 					{#if task.status === 'waiting_for_input'}
 						<div class="text-xs text-orange-400 mb-2">The native worker needs additional input</div>
 					{:else if !task.agent_id}
-						<div class="text-xs text-muted-foreground mb-2">Assign a session before sending a message</div>
+						<div class="text-xs text-muted-foreground mb-2">Assign a project before sending a message</div>
 					{/if}
 					<div class="flex items-end gap-3">
 							<div class="flex-1 rounded-xl border border-border bg-secondary/50 focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/30 transition-all">
@@ -589,7 +626,7 @@
 			</div>
 
 			<!-- Right: details sidebar -->
-			<div class="w-72 border-l border-border p-4 overflow-y-auto space-y-4">
+			<div class="hidden w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 lg:block">
 				<!-- Details -->
 				<div class="space-y-2">
 					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
@@ -600,7 +637,7 @@
 						</div>
 						<div class="flex justify-between">
 							<dt class="text-muted-foreground">Status</dt>
-							<dd class="{statusColor(task.status)}">{task.status.replace('_', ' ')}</dd>
+							<dd class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</dd>
 						</div>
 						<div class="flex justify-between">
 							<dt class="text-muted-foreground">Priority</dt>
@@ -608,7 +645,7 @@
 						</div>
 						{#if task.agent_id}
 							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Session</dt>
+								<dt class="text-muted-foreground">Project</dt>
 								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{sessionLabel(task.agent_id)}</a></dd>
 							</div>
 						{/if}
@@ -662,8 +699,8 @@
 
 				{#if task.agent_id}
 					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Session</h3>
-						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open session timeline</a>
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Project</h3>
+						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open project</a>
 					</div>
 				{/if}
 			</div>

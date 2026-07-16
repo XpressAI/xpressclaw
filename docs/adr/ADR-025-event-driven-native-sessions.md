@@ -28,11 +28,24 @@ plane; execution contexts belong to workers.
 
 ## Decision
 
-### One logical session, many work attempts
+### One project, one active native conversation, many tasks
 
-Each configured profile has one durable `logical_session`. Messages from a
-person, task, schedule, connector, or workflow are appended to its event log.
-The session remains writable while work is queued or running.
+Each configured workspace/runner pair is presented as a project and backed by
+one durable `logical_session`. Messages from a person, task, schedule,
+connector, or workflow become durable tasks and are sent to the project's
+active native Codex, Claude Code, or OpenCode conversation. The project remains
+writable while work is queued or running.
+
+The native conversation is resumed across short-lived worker containers. A
+task can explicitly request a fresh conversation. A dependent task instead
+continues the native conversation of its prerequisite when that prerequisite
+used the same project and runner. A follow-up message on an existing task
+always continues that task's conversation. The precedence is therefore:
+
+1. the conversation of a dependency;
+2. an earlier turn on the same task;
+3. a requested fresh conversation;
+4. the project's most recent conversation.
 
 Executable work is represented by a `work_attempt`. An attempt records:
 
@@ -120,6 +133,24 @@ code workflow can, for example, alternate a Codex implementation step and a
 Claude review step until an approval condition is satisfied, then run a PR
 publication step. That policy belongs in the workflow definition, not in a
 new general-purpose agent loop.
+
+### The UI is a task multiplexer, not an attempt inspector
+
+The primary interface exposes projects, tasks, steps, and automations. It does
+not ask users to understand logical sessions, native session IDs, work
+attempts, queue records, containers, or event protocol artifacts.
+
+The project view is the multiplexer: it shows whether the agent is working,
+queued, waiting for the user, or ready; accepts another task immediately; and
+links to each durable task conversation. A task view keeps its conversation,
+semantic progress, native plan steps, result, and reply composer together.
+Diagnostics may retain implementation records, but they are not duplicated in
+the primary work view.
+
+Navigation must work as a remote control from a phone. Desktop keeps a project
+switcher in the sidebar. Narrow viewports use an overlay project switcher and a
+bottom product-area bar, leaving the full viewport width for the task
+conversation and composer.
 
 ### Devices are resources
 

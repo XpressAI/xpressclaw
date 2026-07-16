@@ -74,7 +74,7 @@ flows:
 
 	function codeReviewYaml(name: string): string {
 		return `name: ${JSON.stringify(name.toLowerCase().replace(/\s+/g, '-'))}
-description: One session implements, another reviews, and the loop continues until approval.
+description: One project context implements, another reviews, and the loop continues until approval.
 version: 1
 
 variables:
@@ -156,7 +156,7 @@ flows:
 		try {
 			const yaml = template === 'code-review' ? codeReviewYaml(workflowName.trim()) : blankYaml(workflowName.trim());
 			const description = template === 'code-review'
-				? 'Implementation and independent review loop using native sessions.'
+				? 'Implementation and independent review loop using native agent products.'
 				: 'A reusable native-agent workflow.';
 			const workflow = await workflows.create({ name: workflowName.trim(), description, yaml_content: yaml });
 			goto(`/workflows/${workflow.id}`);
@@ -172,22 +172,22 @@ flows:
 	<div>
 		<a href="/workflows" class="text-xs text-muted-foreground hover:text-foreground">← Workflows</a>
 		<h1 class="mt-2 text-2xl font-bold">New workflow</h1>
-		<p class="mt-1 text-sm text-muted-foreground">Start with a working multi-session pattern or a single editable step.</p>
+		<p class="mt-1 text-sm text-muted-foreground">Start with a working multi-agent pattern or a single editable step.</p>
 	</div>
 
 	{#if loading}
-		<div class="text-sm text-muted-foreground">Loading sessions…</div>
+		<div class="text-sm text-muted-foreground">Loading projects…</div>
 	{:else if agentList.length === 0}
 		<div class="rounded-xl border border-dashed border-border bg-card p-8 text-center">
-			<h2 class="text-base font-semibold">Workflows need at least one session</h2>
-			<p class="mt-2 text-sm text-muted-foreground">Create the native sessions that will perform each step.</p>
-			<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create session</a>
+			<h2 class="text-base font-semibold">Workflows need at least one project</h2>
+			<p class="mt-2 text-sm text-muted-foreground">Create the project contexts that will perform each step.</p>
+			<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">Create project</a>
 		</div>
 	{:else}
 		<div class="grid gap-3 sm:grid-cols-2">
 			<button onclick={() => chooseTemplate('code-review')} class="rounded-xl border p-4 text-left {template === 'code-review' ? 'border-primary bg-primary/5' : 'border-border bg-card hover:border-primary/40'}">
 				<div class="text-sm font-semibold">Implementation + review loop</div>
-				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">One session writes the code, another reviews it, and rejected changes loop back until approval before the PR is marked ready.</p>
+				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">One agent product writes the code, another reviews it, and rejected changes loop back until approval before the PR is marked ready.</p>
 			</button>
 			<button onclick={() => chooseTemplate('blank')} class="rounded-xl border p-4 text-left {template === 'blank' ? 'border-primary bg-primary/5' : 'border-border bg-card hover:border-primary/40'}">
 				<div class="text-sm font-semibold">Single-step workflow</div>
@@ -202,14 +202,14 @@ flows:
 			</div>
 			<div class="grid gap-4 sm:grid-cols-2">
 				<div>
-					<label for="builder-session" class="mb-1 block text-xs font-medium text-muted-foreground">{template === 'code-review' ? 'Implementation session' : 'Session'}</label>
+					<label for="builder-session" class="mb-1 block text-xs font-medium text-muted-foreground">{template === 'code-review' ? 'Implementation project' : 'Project'}</label>
 					<select id="builder-session" bind:value={builderId} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 						{#each agentList as agent}<option value={agent.id}>{displayName(agent)} · {agent.backend}</option>{/each}
 					</select>
 				</div>
 				{#if template === 'code-review'}
 					<div>
-						<label for="reviewer-session" class="mb-1 block text-xs font-medium text-muted-foreground">Review session</label>
+						<label for="reviewer-session" class="mb-1 block text-xs font-medium text-muted-foreground">Review project</label>
 						<select id="reviewer-session" bind:value={reviewerId} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 							{#each agentList as agent}<option value={agent.id}>{displayName(agent)} · {agent.backend}</option>{/each}
 						</select>
@@ -217,9 +217,9 @@ flows:
 				{/if}
 			</div>
 			{#if template === 'code-review' && builderId === reviewerId}
-				<p class="text-xs text-amber-600">Using separate implementation and review sessions gives you a genuinely independent review.</p>
+				<p class="text-xs text-amber-600">Using separate implementation and review contexts gives you a genuinely independent review.</p>
 			{:else if template === 'code-review'}
-				<p class="text-xs text-muted-foreground">Both sessions should use the same project workspace so the reviewer sees the implementer's actual diff.</p>
+				<p class="text-xs text-muted-foreground">Both contexts should use the same workspace so the reviewer sees the implementer's actual diff.</p>
 			{/if}
 			{#if error}<p class="text-xs text-destructive">{error}</p>{/if}
 			<div class="flex justify-end gap-2">

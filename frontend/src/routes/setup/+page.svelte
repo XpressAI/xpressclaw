@@ -119,7 +119,7 @@
 				await goto('/');
 			}
 		} catch (error) {
-			saveError = error instanceof Error ? error.message : 'Could not create the session';
+			saveError = error instanceof Error ? error.message : 'Could not create the project';
 		} finally {
 			saving = false;
 		}
@@ -127,14 +127,14 @@
 </script>
 
 <div class="rounded-2xl border border-border bg-card shadow-sm">
-	<div class="flex items-start justify-between border-b border-border px-6 py-5">
+	<div class="flex items-start justify-between border-b border-border px-4 py-5 sm:px-6">
 		<div>
-			<p class="text-xs font-medium uppercase tracking-wider text-primary">Native session</p>
+			<p class="text-xs font-medium uppercase tracking-wider text-primary">Project</p>
 			<h2 class="mt-1 text-xl font-semibold text-foreground">
-				{isAddSession ? 'Create a session' : 'Create your first session'}
+				{isAddSession ? 'Connect a project' : 'Connect your first project'}
 			</h2>
 			<p class="mt-1 text-sm text-muted-foreground">
-				Connect a native CLI to a project. Work stays queued here while each attempt runs in an isolated container.
+				Choose the agent you already use, then point it at a folder on this computer.
 			</p>
 		</div>
 		{#if isAddSession}
@@ -147,11 +147,11 @@
 		{/if}
 	</div>
 
-	<form class="space-y-7 p-6" onsubmit={(event) => { event.preventDefault(); createSession(); }}>
+	<form class="space-y-7 p-4 sm:p-6" onsubmit={(event) => { event.preventDefault(); createSession(); }}>
 		<section>
 			<div class="mb-3">
-				<h3 class="text-sm font-medium text-foreground">Harness</h3>
-				<p class="mt-0.5 text-xs text-muted-foreground">The selected product owns its reasoning and tool loop.</p>
+				<h3 class="text-sm font-medium text-foreground">Agent</h3>
+				<p class="mt-0.5 text-xs text-muted-foreground">XpressClaw sends tasks to this product; it keeps its own reasoning, tools, and subagents.</p>
 			</div>
 			<div class="grid gap-3 sm:grid-cols-3">
 				{#each runnerOptions as runner}
@@ -189,7 +189,7 @@
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
 				<span>
 					<span class="block text-sm font-medium text-foreground">Use my existing {runnerOptions.find((runner) => runner.kind === runnerKind)?.name} login</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the CLI's standard login directory read-only. Only enable this for images you trust.</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the CLI's standard login directory so its subscription and conversations can continue across tasks. Only enable this for images you trust.</span>
 				</span>
 			</label>
 		</section>
@@ -210,7 +210,7 @@
 						bind:value={runnerImage}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
 					/>
-					<p class="mt-1 text-xs text-muted-foreground">Use the published minimal image or a compatible derivative with your own development tools.</p>
+					<p class="mt-1 text-xs text-muted-foreground">Use the minimal agent image or a compatible derivative. Richer development environments can be attached separately.</p>
 				</div>
 
 				<div>
@@ -257,7 +257,7 @@
 					<span class="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/15 text-xs text-emerald-500">&#10003;</span>
 					<div>
 						<p class="text-sm font-medium text-foreground">Container runtime ready</p>
-						<p class="text-xs text-muted-foreground">The runner image will be checked from the new session.</p>
+						<p class="text-xs text-muted-foreground">The agent image will be checked after the project is created.</p>
 					</div>
 				</div>
 			{:else}
@@ -265,7 +265,7 @@
 					<div class="flex items-start justify-between gap-4">
 						<div>
 							<p class="text-sm font-medium text-foreground">Container runtime not available</p>
-							<p class="mt-0.5 text-xs text-muted-foreground">You can save the session, but work will wait until Docker or Podman is running.</p>
+							<p class="mt-0.5 text-xs text-muted-foreground">You can save the project, but work will wait until Docker or Podman is running.</p>
 						</div>
 						<button type="button" onclick={recheckDocker} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Retry</button>
 					</div>
@@ -292,7 +292,7 @@
 				disabled={saving || !workspacePath.trim() || !runnerImage.trim()}
 				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
 			>
-				{saving ? 'Creating...' : (isAddSession ? 'Create session' : 'Finish setup')}
+				{saving ? 'Creating...' : (isAddSession ? 'Create project' : 'Finish setup')}
 			</button>
 		</div>
 	</form>

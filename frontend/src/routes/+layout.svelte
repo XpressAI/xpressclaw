@@ -6,9 +6,10 @@
 	import type { Agent } from '$lib/api';
 	import { harnessMark } from '$lib/utils';
 
-	// Bottom tabs per ADR-016
+	// Primary product areas. "Projects" are the stable user-facing contexts;
+	// native harness sessions remain an implementation detail.
 	const tabs = [
-		{ id: 'agents', label: 'Sessions', icon: 'M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z' },
+		{ id: 'agents', label: 'Projects', icon: 'M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z' },
 		{ id: 'tasks', label: 'Tasks', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
 		{ id: 'workflows', label: 'Workflows', icon: 'M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5' },
 		{ id: 'settings', label: 'Settings', icon: 'M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
@@ -48,9 +49,29 @@
 
 	// Collapsible sidebar — expanded by default, manual toggle only
 	let sidebarCollapsed = $state(false);
+	let mobileMenuOpen = $state(false);
+	let currentProject = $derived(
+		agentList.find((agent) => $page.url.pathname.startsWith(`/agents/${agent.id}`)) ?? null
+	);
 
 	function toggleSidebar() {
 		sidebarCollapsed = !sidebarCollapsed;
+	}
+
+	function statusDot(status: string): string {
+		if (status === 'running') return 'bg-blue-500 animate-pulse';
+		if (status === 'queued') return 'bg-amber-400';
+		if (status === 'waiting_for_input') return 'bg-orange-500 animate-pulse';
+		if (status === 'error' || status === 'failed' || status === 'blocked') return 'bg-red-500';
+		return 'bg-emerald-500';
+	}
+
+	function statusLabel(status: string): string {
+		if (status === 'running') return 'Working';
+		if (status === 'queued') return 'Queued';
+		if (status === 'waiting_for_input') return 'Waiting for you';
+		if (status === 'error' || status === 'failed' || status === 'blocked') return 'Needs attention';
+		return 'Ready';
 	}
 
 	async function loadSidebar() {
@@ -144,9 +165,9 @@
 {#if isSetupRoute}
 	{@render children()}
 {:else}
-	<div class="flex h-screen">
+	<div class="flex h-[100dvh] min-w-0 overflow-hidden">
 		<!-- Sidebar -->
-		<aside class="flex flex-col transition-all duration-200 ease-in-out {sidebarCollapsed ? 'w-12' : 'w-64'}" style="background: hsl(var(--sidebar))">
+		<aside class="hidden shrink-0 flex-col transition-all duration-200 ease-in-out md:flex {sidebarCollapsed ? 'w-12' : 'w-64'}" style="background: hsl(var(--sidebar))">
 			<!-- Header -->
 			<div class="flex h-11 items-center {sidebarCollapsed ? 'justify-center px-0' : 'gap-2 px-4'}">
 				{#if sidebarCollapsed}
@@ -164,28 +185,47 @@
 
 			<!-- Tab-dependent sidebar content (hidden when collapsed) -->
 			<div class="flex-1 overflow-y-auto {sidebarCollapsed ? 'hidden' : ''}">
-
-				{#if activeTab === 'agents'}
-					<!-- Native sessions -->
+				{#if activeTab !== 'agents'}
 					<div class="px-3 pt-1">
 						<div class="flex items-center justify-between px-1 pb-1.5">
-							<span class={sectionHeader}>Sessions</span>
-							<a href="/setup?mode=add-session" class={plusButton} title="Add session">+</a>
+							<span class={sectionHeader}>Projects</span>
+							<a href="/setup?mode=add-session" class={plusButton} title="Add project">+</a>
+						</div>
+					</div>
+					<div class="space-y-0.5 px-2">
+						{#each agentList as agent}
+							<a href="/agents/{agent.id}" class={linkClass(isAgentActive(agent.id, $page.url.pathname))}>
+								<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
+								<span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span>
+								<span class="h-2 w-2 shrink-0 rounded-full {statusDot(agent.status)}" title={statusLabel(agent.status)}></span>
+							</a>
+						{/each}
+					</div>
+					<div class="mx-3 my-3 border-t border-border/60"></div>
+				{/if}
+
+				{#if activeTab === 'agents'}
+					<!-- Projects -->
+					<div class="px-3 pt-1">
+						<div class="flex items-center justify-between px-1 pb-1.5">
+							<span class={sectionHeader}>Projects</span>
+							<a href="/setup?mode=add-session" class={plusButton} title="Add project">+</a>
 						</div>
 					</div>
 					<div class="px-2 space-y-0.5">
 						<a href="/agents" class={linkClass($page.url.pathname === '/agents')}>
 							<svg class="h-4 w-4 flex-shrink-0" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772M15 6.75a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-							<span>All sessions</span>
+							<span>All projects</span>
 						</a>
 						{#each agentList as agent}
 							{@const active = isAgentActive(agent.id, $page.url.pathname)}
 							<a href="/agents/{agent.id}" class={linkClass(active)}>
 								<span class="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
-								<span class="truncate">{agent.title || agent.name}</span>
+								<span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span>
+								<span class="h-2 w-2 shrink-0 rounded-full {statusDot(agent.status)}" title={statusLabel(agent.status)}></span>
 							</a>
 						{:else}
-							<a href="/setup?mode=add-session" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first session</a>
+							<a href="/setup?mode=add-session" class="block rounded-lg border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground">Create your first project</a>
 						{/each}
 					</div>
 
@@ -272,12 +312,58 @@
 		</aside>
 
 		<!-- Main content -->
-		<main class="flex-1 overflow-hidden">
-			<div class="h-full overflow-y-auto flex flex-col">
+		<main class="min-w-0 flex-1 overflow-hidden pb-16 md:pb-0">
+			<div class="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur md:hidden">
+				<button onclick={() => (mobileMenuOpen = true)} aria-label="Open project switcher" class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
+					<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
+				</button>
+				<div class="min-w-0 flex-1">
+					<div class="truncate text-sm font-semibold">{currentProject?.title || currentProject?.name || 'xpressclaw'}</div>
+					{#if currentProject}<div class="flex items-center gap-1.5 text-[10px] text-muted-foreground"><span class="h-1.5 w-1.5 rounded-full {statusDot(currentProject.status)}"></span>{statusLabel(currentProject.status)}</div>{/if}
+				</div>
+				<a href="/" aria-label="New task" class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground">+</a>
+			</div>
+			<div class="flex h-[calc(100%-3rem)] flex-col overflow-y-auto md:h-full">
 				{@render children()}
 			</div>
 		</main>
 	</div>
+
+	{#if mobileMenuOpen}
+		<div class="fixed inset-0 z-50 md:hidden">
+			<button class="absolute inset-0 bg-black/60" aria-label="Close project switcher" onclick={() => (mobileMenuOpen = false)}></button>
+			<aside class="absolute inset-y-0 left-0 flex w-[min(86vw,22rem)] flex-col border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
+				<div class="mb-4 flex h-9 items-center gap-2 px-1">
+					<img src="/icon-32.png" alt="" class="h-6 w-6 rounded" />
+					<span class="flex-1 text-sm font-semibold">Projects</span>
+					<button onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button>
+				</div>
+				<a href="/" onclick={() => (mobileMenuOpen = false)} class={linkClass($page.url.pathname === '/')}>New task</a>
+				<a href="/agents" onclick={() => (mobileMenuOpen = false)} class={linkClass($page.url.pathname === '/agents')}>All projects</a>
+				<div class="my-3 border-t border-border"></div>
+				<div class="flex-1 space-y-1 overflow-y-auto">
+					{#each agentList as agent}
+						<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} class={linkClass(isAgentActive(agent.id, $page.url.pathname))}>
+							<span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span>
+							<span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span>
+							<span class="h-2 w-2 shrink-0 rounded-full {statusDot(agent.status)}"></span>
+						</a>
+					{/each}
+				</div>
+				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
+			</aside>
+		</div>
+	{/if}
+
+	<nav class="fixed inset-x-0 bottom-0 z-40 grid h-16 grid-cols-4 border-t border-border bg-background/95 pb-[env(safe-area-inset-bottom)] backdrop-blur md:hidden">
+		{#each tabs as tab}
+			{@const active = activeTab === tab.id}
+			<a href={tab.id === 'agents' ? '/' : tab.id === 'tasks' ? '/tasks' : tab.id === 'workflows' ? '/workflows' : '/settings'} class="flex flex-col items-center justify-center gap-1 text-[10px] {active ? 'text-primary' : 'text-muted-foreground'}">
+				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d={tab.icon} /></svg>
+				<span>{tab.label}</span>
+			</a>
+		{/each}
+	</nav>
 
 	<!-- Server disconnected overlay -->
 	{#if !serverConnected}

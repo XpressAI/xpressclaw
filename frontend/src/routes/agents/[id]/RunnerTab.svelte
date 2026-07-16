@@ -57,7 +57,7 @@
 	<div class="rounded-xl border border-border bg-card p-5">
 		<h2 class="text-sm font-semibold">Native worker</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			Each task launches the selected CLI in a short-lived container. The CLI owns its reasoning loop; this session records its semantic events and artifacts.
+			Each task launches the selected CLI in a short-lived container and resumes this project's active conversation by default. The CLI owns its reasoning loop and subagents.
 		</p>
 
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">

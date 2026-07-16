@@ -100,8 +100,14 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
+    let title = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == record.name)
+        .map(|agent| agent.context_label())
+        .unwrap_or_else(|| record.name.clone());
     let session = xpressclaw_core::sessions::SessionManager::new(state.db.clone())
-        .ensure(&record.id, Some(&record.name))
+        .ensure(&record.id, Some(&title))
         .ok();
     Ok(Json(agent_json(&record, &config, session.as_ref())))
 }

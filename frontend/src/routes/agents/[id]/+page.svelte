@@ -28,12 +28,12 @@
 	let unsubPage: (() => void) | null = null;
 
 	const tabs = [
-		{ id: 'session', label: 'Session' },
-		{ id: 'runner', label: 'Runner' },
-		{ id: 'workspace', label: 'Workspace' },
+		{ id: 'session', label: 'Work' },
 		{ id: 'tasks', label: 'Tasks' },
-		{ id: 'schedules', label: 'Schedules' },
-		{ id: 'channels', label: 'Channels' },
+		{ id: 'schedules', label: 'Automations' },
+		{ id: 'runner', label: 'Agent' },
+		{ id: 'workspace', label: 'Environment' },
+		{ id: 'channels', label: 'Connections' },
 	];
 
 	onMount(() => {
@@ -124,9 +124,9 @@
 
 <div class="flex flex-col h-full">
 	<!-- Header -->
-	<div class="shrink-0 px-6 py-4 space-y-3 border-b border-border">
+	<div class="shrink-0 space-y-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
 		<div class="flex items-center gap-2 text-sm text-muted-foreground">
-			<a href="/agents" class="hover:text-foreground">Sessions</a>
+			<a href="/agents" class="hover:text-foreground">Projects</a>
 			<span>/</span>
 			<span class="text-foreground">{sessionTitle()}</span>
 		</div>
@@ -134,15 +134,15 @@
 		{#if error}
 			<div class="rounded-lg border border-destructive/50 bg-destructive/10 p-4 text-sm text-destructive">{error}</div>
 		{:else if agent}
-			<div class="flex items-start justify-between">
-				<div class="flex items-center gap-3">
+			<div class="flex items-start justify-between gap-3">
+				<div class="flex min-w-0 items-center gap-3">
 					<div class="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-sm font-semibold text-primary">
 						{harnessMark(agent.backend)}
 					</div>
-					<div>
-						<h1 class="text-xl font-bold">{sessionTitle()}</h1>
+					<div class="min-w-0">
+						<h1 class="truncate text-lg font-bold sm:text-xl">{sessionTitle()}</h1>
 						<p class="text-sm text-muted-foreground">
-							<span class="{statusColor(agent.status)}">{agent.status}</span>
+							<span class="{statusColor(agent.status)}">{agent.status === 'waiting_for_input' ? 'waiting for you' : agent.status.replaceAll('_', ' ')}</span>
 							&middot; {agent.backend}
 						</p>
 					</div>
@@ -151,9 +151,9 @@
 					{#if saveMessage}
 						<span class="text-xs {saveMessage.startsWith('Error') ? 'text-destructive' : 'text-emerald-500'}">{saveMessage}</span>
 					{/if}
-					<button onclick={() => { showDeleteConfirm = true; }}
+					<button onclick={() => { showDeleteConfirm = true; }} aria-label="Delete project"
 						class="rounded-md border border-destructive/50 px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors">
-						Delete
+						<span class="hidden sm:inline">Delete</span><span class="sm:hidden">×</span>
 					</button>
 				</div>
 			</div>
@@ -181,7 +181,7 @@
 		</div>
 
 		<!-- Tab content -->
-		<div class="flex-1 overflow-y-auto px-6 py-4">
+		<div class="flex-1 overflow-y-auto px-3 py-4 sm:px-6">
 			{#if activeTab === 'session'}
 				<SessionTab agentId={agent.id} />
 			{:else if activeTab === 'runner'}
@@ -219,7 +219,7 @@
 		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4">
 			<h2 class="text-lg font-semibold">Delete {sessionTitle()}?</h2>
 			<p class="text-sm text-muted-foreground">
-				This removes the session and its configuration. Existing task history may still reference it. This action cannot be undone.
+				This removes the project and its agent configuration. Existing task history may still reference it. This action cannot be undone.
 			</p>
 			<div class="flex justify-end gap-2">
 				<button onclick={() => { showDeleteConfirm = false; }}

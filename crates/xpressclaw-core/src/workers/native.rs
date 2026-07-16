@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -129,6 +130,7 @@ async fn execute_item(
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
+    let resume_session_id = resume_session_id(&db, &item, &kind)?;
     let prompt = build_prompt(&db, &item, attempt_id)?;
     db.with_conn(|conn| {
         conn.execute(
@@ -156,7 +158,10 @@ async fn execute_item(
     let board = TaskBoard::new(db.clone());
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
-    let mut spec = build_spec(&config, agent, &kind, &prompt)?;
+    if let Some(native_session_id) = resume_session_id.as_deref() {
+        sessions.set_native_session(attempt_id, native_session_id)?;
+    }
+    let mut spec = build_spec(&config, agent, &kind, &prompt, resume_session_id.as_deref())?;
     if !docker.has_image(&spec.image).await {
         let local_fallback = match local_runner_image_alias(&spec.image) {
             Some(image) if docker.has_image(image).await => Some(image),
@@ -280,6 +285,7 @@ async fn execute_item(
         board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
         Vec::new()
     };
+    sessions.refresh_status(&item.agent_id)?;
     publish_conversation_result(
         &db,
         &event_bus,
@@ -339,6 +345,7 @@ fn fail_item(
         },
         Some(&item.agent_id),
     );
+    let _ = sessions.refresh_status(&item.agent_id);
     if let Some(conversation_id) = conversation_id(db, &item.task_id) {
         event_bus.send(
             &conversation_id,
@@ -429,51 +436,115 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
 
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<String> {
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
-    let sessions = SessionManager::new(db.clone());
-    let events = sessions.list_events(&item.agent_id, None, 30)?;
-    let messages: Vec<(String, String)> = db.with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT role, content FROM task_messages WHERE task_id = ?1 ORDER BY id ASC",
+    let pending_user_messages: Vec<String> = db.with_conn(|conn| {
+        let previous_started: Option<String> = conn
+            .query_row(
+                "SELECT started_at FROM work_attempts
+                 WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
+                 ORDER BY created_at DESC LIMIT 1",
+                rusqlite::params![item.task_id, attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut statement = conn.prepare(
+            "SELECT content FROM task_messages
+             WHERE task_id = ?1 AND role = 'user'
+               AND (?2 IS NULL OR timestamp >= ?2)
+             ORDER BY id ASC",
         )?;
-        let rows = stmt
-            .query_map([&item.task_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        let messages = statement
+            .query_map(rusqlite::params![item.task_id, previous_started], |row| {
+                row.get(0)
+            })?
             .filter_map(|row| row.ok())
             .collect();
-        Ok::<_, Error>(rows)
+        Ok::<_, Error>(messages)
     })?;
+    if !pending_user_messages.is_empty() {
+        return Ok(pending_user_messages.join("\n\n"));
+    }
 
-    let mut prompt = String::new();
-    prompt.push_str(&format!(
-        "You are executing work attempt {attempt_id} inside logical session {}.\n",
-        item.agent_id
-    ));
-    prompt.push_str("Work autonomously in /workspace. Keep your native plan/todo list current so its steps can be shown in the task. Return a concise result describing outcomes, changed files, verification, and any blocker. If you cannot continue without a user decision or missing information, end with `NEEDS_USER_INPUT: <your specific question>`. Do not ask the user to watch a terminal.\n\n");
-    prompt.push_str("Task:\n");
-    prompt.push_str(&task.title);
-    if let Some(description) = task.description.as_deref() {
-        if !description.trim().is_empty() {
-            prompt.push_str("\n\n");
-            prompt.push_str(description);
-        }
+    let description = task
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|description| !description.is_empty());
+    let from_project_composer = task
+        .context
+        .as_ref()
+        .and_then(|context| context.get("origin"))
+        .and_then(Value::as_str)
+        == Some("session_message");
+    Ok(match (description, from_project_composer) {
+        (Some(description), true) => description.to_string(),
+        (Some(description), false) => format!("{}\n\n{}", task.title, description),
+        (None, _) => task.title,
+    })
+}
+
+/// Pick the native harness conversation for this task turn. Explicit task
+/// dependencies are strongest, followed by an existing turn on the same task.
+/// A task marked `session_mode: new` then starts clean; all other work resumes
+/// the latest conversation in the project.
+fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<Option<String>> {
+    let board = TaskBoard::new(db.clone());
+    let task = board.get(&item.task_id)?;
+    let dependency_session = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT a.native_session_id
+             FROM task_dependencies d
+             JOIN work_attempts a ON a.task_id = d.depends_on_id
+             WHERE d.task_id = ?1 AND a.session_id = ?2 AND a.runner = ?3
+               AND a.native_session_id IS NOT NULL AND a.status != 'cancelled'
+             ORDER BY COALESCE(a.completed_at, a.created_at) DESC LIMIT 1",
+            rusqlite::params![item.task_id, item.agent_id, runner],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if dependency_session.is_some() {
+        return Ok(dependency_session);
     }
-    if !events.is_empty() {
-        prompt.push_str("\n\nRecent session activity (oldest to newest):\n");
-        for event in events {
-            if event.attempt_id.as_deref() != Some(attempt_id) {
-                prompt.push_str(&format!(
-                    "- [{}:{}] {}\n",
-                    event.source_type, event.event_type, event.summary
-                ));
-            }
-        }
+
+    let task_session = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT native_session_id FROM work_attempts
+             WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
+               AND native_session_id IS NOT NULL AND status != 'cancelled'
+             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
+            rusqlite::params![item.task_id, item.agent_id, runner],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if task_session.is_some() {
+        return Ok(task_session);
     }
-    if !messages.is_empty() {
-        prompt.push_str("\nTask conversation:\n");
-        for (role, content) in messages {
-            prompt.push_str(&format!("- {role}: {content}\n"));
-        }
+
+    let start_new = task
+        .context
+        .as_ref()
+        .and_then(|context| context.get("session_mode"))
+        .and_then(Value::as_str)
+        == Some("new");
+    if start_new {
+        return Ok(None);
     }
-    Ok(prompt)
+
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT native_session_id FROM work_attempts
+             WHERE session_id = ?1 AND runner = ?2
+               AND native_session_id IS NOT NULL AND status != 'cancelled'
+             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
+            rusqlite::params![item.agent_id, runner],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })
 }
 
 fn build_spec(
@@ -481,8 +552,9 @@ fn build_spec(
     agent: &AgentConfig,
     kind: &str,
     prompt: &str,
+    resume_session_id: Option<&str>,
 ) -> Result<ContainerSpec> {
-    let command = command_for(&agent.runner, kind, prompt)?;
+    let command = command_for(&agent.runner, kind, prompt, resume_session_id)?;
     let image = resolved_runner_image(&agent.runner, kind)?;
     let workspace = agent
         .runner
@@ -555,7 +627,12 @@ pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
     }
 }
 
-fn command_for(config: &NativeRunnerConfig, kind: &str, prompt: &str) -> Result<Vec<String>> {
+fn command_for(
+    config: &NativeRunnerConfig,
+    kind: &str,
+    prompt: &str,
+    resume_session_id: Option<&str>,
+) -> Result<Vec<String>> {
     if !config.command.is_empty() {
         return Ok(config
             .command
@@ -563,38 +640,57 @@ fn command_for(config: &NativeRunnerConfig, kind: &str, prompt: &str) -> Result<
             .map(|part| {
                 part.replace("{prompt}", prompt)
                     .replace("{workspace}", "/workspace")
+                    .replace("{session_id}", resume_session_id.unwrap_or_default())
             })
             .collect());
     }
     match kind {
-        "codex" => Ok(vec![
-            "codex".into(),
-            "exec".into(),
-            "--json".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-            "--skip-git-repo-check".into(),
-            "-C".into(),
-            "/workspace".into(),
-            prompt.into(),
-        ]),
-        "claude" => Ok(vec![
-            "claude".into(),
-            "-p".into(),
-            prompt.into(),
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            "--dangerously-skip-permissions".into(),
-            "--max-turns".into(),
-            config.max_turns.to_string(),
-        ]),
-        "opencode" => Ok(vec![
-            "opencode".into(),
-            "run".into(),
-            "--format".into(),
-            "json".into(),
-            prompt.into(),
-        ]),
+        "codex" => {
+            let mut command = vec!["codex".into(), "exec".into()];
+            if let Some(session_id) = resume_session_id {
+                command.push("resume".into());
+                command.extend([
+                    "--json".into(),
+                    "--dangerously-bypass-approvals-and-sandbox".into(),
+                    "--skip-git-repo-check".into(),
+                    session_id.into(),
+                    prompt.into(),
+                ]);
+            } else {
+                command.extend([
+                    "--json".into(),
+                    "--dangerously-bypass-approvals-and-sandbox".into(),
+                    "--skip-git-repo-check".into(),
+                    "-C".into(),
+                    "/workspace".into(),
+                    prompt.into(),
+                ]);
+            }
+            Ok(command)
+        }
+        "claude" => {
+            let mut command = vec!["claude".into(), "-p".into(), prompt.into()];
+            if let Some(session_id) = resume_session_id {
+                command.extend(["--resume".into(), session_id.into()]);
+            }
+            command.extend([
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "--dangerously-skip-permissions".into(),
+                "--max-turns".into(),
+                config.max_turns.to_string(),
+            ]);
+            Ok(command)
+        }
+        "opencode" => {
+            let mut command = vec!["opencode".into(), "run".into()];
+            if let Some(session_id) = resume_session_id {
+                command.extend(["--session".into(), session_id.into()]);
+            }
+            command.extend(["--format".into(), "json".into(), prompt.into()]);
+            Ok(command)
+        }
         _ => Err(Error::Backend(format!(
             "runner '{kind}' requires an explicit command"
         ))),
@@ -1035,11 +1131,44 @@ fn parse_output(kind: &str, output: &ContainerOutput) -> NativeResult {
 }
 
 fn needs_user_input(summary: &str) -> bool {
-    summary.lines().any(|line| {
+    if summary.lines().any(|line| {
         line.trim_start()
             .trim_start_matches(['`', '*', '-', '#', ' '])
             .starts_with("NEEDS_USER_INPUT:")
-    })
+    }) {
+        return true;
+    }
+
+    // Native products do not share a structured "ask the user" event. Treat
+    // a final, direct question as waiting without requiring XpressClaw to
+    // rewrite the user's task or inject its own agent protocol.
+    let last_line = summary
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .trim_matches(['`', '*', '_', '#', ' ']);
+    if !last_line.ends_with('?') {
+        return false;
+    }
+    let question = last_line.to_lowercase();
+    [
+        "which ",
+        "what ",
+        "where ",
+        "when ",
+        "how ",
+        "can you ",
+        "could you ",
+        "would you ",
+        "should i ",
+        "do you ",
+        "please ",
+        "i need ",
+    ]
+    .iter()
+    .any(|signal| question.starts_with(signal) || question.contains(&format!(" {signal}")))
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -1189,7 +1318,14 @@ mod tests {
         assert!(needs_user_input(
             "**NEEDS_USER_INPUT: Which database should I use?**"
         ));
+        assert!(needs_user_input(
+            "I can continue once you decide.\n\nWhich database should I use?"
+        ));
+        assert!(needs_user_input(
+            "The options are ready. Would you like the compact layout?"
+        ));
         assert!(!needs_user_input("Implemented and tested. No blockers."));
+        assert!(!needs_user_input("Implemented the requested FAQ page."));
     }
 
     #[test]
@@ -1203,8 +1339,105 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            command_for(&config, "custom", "do work").unwrap(),
+            command_for(&config, "custom", "do work", None).unwrap(),
             vec!["runner", "--cwd=/workspace", "do work"]
+        );
+    }
+
+    #[test]
+    fn resumes_native_runner_conversations() {
+        let config = NativeRunnerConfig::default();
+        assert_eq!(
+            command_for(&config, "codex", "keep going", Some("thread-1")).unwrap(),
+            vec![
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "thread-1",
+                "keep going",
+            ]
+        );
+        assert!(command_for(&config, "claude", "review", Some("session-1"))
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--resume", "session-1"]));
+        assert!(command_for(&config, "opencode", "test", Some("session-2"))
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == ["--session", "session-2"]));
+    }
+
+    #[test]
+    fn selects_project_dependency_and_fresh_conversation_contexts() {
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let board = TaskBoard::new(db.clone());
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let first = board
+            .create(&CreateTask {
+                title: "First turn".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let first_item = queue.enqueue(&first.id, "atlas").unwrap();
+        let first_attempt = first_item.attempt_id.as_deref().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET runner = 'codex', status = 'completed',
+                    completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [first_attempt],
+            )
+        })
+        .unwrap();
+        SessionManager::new(db.clone())
+            .set_native_session(first_attempt, "thread-1")
+            .unwrap();
+
+        let regular = board
+            .create(&CreateTask {
+                title: "Continue project".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let regular_item = queue.enqueue(&regular.id, "atlas").unwrap();
+        assert_eq!(
+            resume_session_id(&db, &regular_item, "codex").unwrap(),
+            Some("thread-1".into())
+        );
+
+        let fresh = board
+            .create(&CreateTask {
+                title: "Start clean".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "session_mode": "new" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let fresh_item = queue.enqueue(&fresh.id, "atlas").unwrap();
+        assert_eq!(resume_session_id(&db, &fresh_item, "codex").unwrap(), None);
+
+        let dependent = board
+            .create(&CreateTask {
+                title: "Continue prerequisite".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({ "session_mode": "new" })),
+                ..Default::default()
+            })
+            .unwrap();
+        board.add_dependency(&dependent.id, &first.id).unwrap();
+        let dependent_item = queue.enqueue(&dependent.id, "atlas").unwrap();
+        assert_eq!(
+            resume_session_id(&db, &dependent_item, "codex").unwrap(),
+            Some("thread-1".into())
         );
     }
 

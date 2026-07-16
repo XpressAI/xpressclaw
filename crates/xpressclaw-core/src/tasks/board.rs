@@ -526,8 +526,10 @@ impl TaskBoard {
 
     pub fn counts(&self) -> Result<TaskCounts> {
         let conn = self.db.conn();
-        let mut stmt =
-            conn.prepare("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")?;
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) as count FROM tasks
+             WHERE hidden = 0 AND parent_task_id IS NULL GROUP BY status",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -679,7 +681,9 @@ impl TaskBoard {
                 sop_id: None,
                 conversation_id: None,
                 priority: input.priority,
-                context: None,
+                context: Some(serde_json::json!({
+                    "session_mode": if input.new_session { "new" } else { "continue" },
+                })),
             })?;
             if let Some(ref r) = input.ref_name {
                 ref_to_id.insert(r.clone(), task.id.clone());
@@ -716,6 +720,11 @@ pub struct BatchTaskInput {
     pub description: Option<String>,
     pub agent_id: Option<String>,
     pub priority: Option<i32>,
+    /// Start a new native harness conversation instead of continuing the
+    /// project's active one. Dependencies still take precedence so a task can
+    /// continue the work it is explicitly chained from.
+    #[serde(default)]
+    pub new_session: bool,
     /// Ref names or existing task UUIDs that must complete first.
     pub depends_on: Option<Vec<String>>,
 }
@@ -920,7 +929,7 @@ mod tests {
     #[test]
     fn test_list_and_counts() {
         let (_, board) = setup();
-        board
+        let first = board
             .create(&CreateTask {
                 title: "Task 1".to_string(),
                 description: None,
@@ -942,6 +951,13 @@ mod tests {
                 conversation_id: None,
                 priority: None,
                 context: None,
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "Task 1 step".to_string(),
+                parent_task_id: Some(first.id),
+                ..Default::default()
             })
             .unwrap();
 
@@ -1038,6 +1054,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: false,
                         depends_on: None,
                     },
                     BatchTaskInput {
@@ -1046,6 +1063,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: false,
                         depends_on: Some(vec!["build".into()]),
                     },
                     BatchTaskInput {
@@ -1054,6 +1072,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: true,
                         depends_on: Some(vec!["test".into()]),
                     },
                 ],
@@ -1062,6 +1081,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[2].context.as_ref().unwrap()["session_mode"], "new");
         assert!(!board.is_ready(&tasks[2].id).unwrap()); // deploy blocked
         assert!(!board.is_ready(&tasks[1].id).unwrap()); // test blocked
         assert!(board.is_ready(&tasks[0].id).unwrap()); // build ready

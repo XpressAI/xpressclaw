@@ -34,6 +34,8 @@ struct AttemptsQuery {
 struct MessageInput {
     content: String,
     priority: Option<i32>,
+    #[serde(default)]
+    new_session: bool,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -258,6 +260,7 @@ async fn post_message(
                 "origin": "session_message",
                 "kind": "interactive",
                 "source_event_id": event.id,
+                "session_mode": if input.new_session { "new" } else { "continue" },
             })),
         })
         .map_err(internal_error)?;
@@ -433,6 +436,29 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["queued"], true);
         assert!(value["attempt_id"].is_string());
+        assert_eq!(value["task"]["context"]["session_mode"], "continue");
+    }
+
+    #[tokio::test]
+    async fn message_can_request_a_fresh_native_conversation() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/builder/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "content": "Try another approach", "new_session": true })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["task"]["context"]["session_mode"], "new");
     }
 
     #[tokio::test]

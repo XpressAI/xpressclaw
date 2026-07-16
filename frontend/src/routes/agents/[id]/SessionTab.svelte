@@ -1,28 +1,29 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { sessions } from '$lib/api';
-	import type { SessionOverview, SessionEvent, WorkAttempt, RunnerReadiness } from '$lib/api';
+	import { sessions, tasks } from '$lib/api';
+	import type { SessionOverview, RunnerReadiness, Task } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 
 	let { agentId }: { agentId: string } = $props();
 	let overview = $state<SessionOverview | null>(null);
 	let readiness = $state<RunnerReadiness | null>(null);
+	let taskList = $state<Task[]>([]);
 	let error = $state<string | null>(null);
 	let message = $state('');
 	let sending = $state(false);
-	let cancelling = $state<string | null>(null);
 	let preparing = $state(false);
+	let startFresh = $state(false);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-	let visibleArtifacts = $derived(
-		(overview?.artifacts ?? []).filter((artifact) => artifact.artifact_type !== 'runner_output')
-	);
+	let attentionTasks = $derived(taskList.filter((task) => ['waiting_for_input', 'blocked'].includes(task.status)));
+	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
+	let recentTasks = $derived(taskList.filter((task) => ['completed', 'cancelled'].includes(task.status)).slice(0, 8));
 
 	onMount(() => {
 		load();
 		loadReadiness();
-		pollTimer = setInterval(load, 2000);
+		pollTimer = setInterval(load, 2500);
 	});
 
 	onDestroy(() => {
@@ -31,7 +32,12 @@
 
 	async function load() {
 		try {
-			overview = await sessions.get(agentId);
+			const [nextOverview, result] = await Promise.all([
+				sessions.get(agentId),
+				tasks.list(undefined, agentId),
+			]);
+			overview = nextOverview;
+			taskList = result.tasks;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -64,26 +70,14 @@
 		if (!content || sending) return;
 		sending = true;
 		try {
-			const queued = await sessions.sendMessage(agentId, content);
+			const queued = await sessions.sendMessage(agentId, content, { newSession: startFresh });
 			message = '';
+			startFresh = false;
 			await goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			sending = false;
-		}
-	}
-
-	async function cancel(attempt: WorkAttempt) {
-		if (cancelling) return;
-		cancelling = attempt.id;
-		try {
-			await sessions.cancelAttempt(agentId, attempt.id);
-			await load();
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		} finally {
-			cancelling = null;
 		}
 	}
 
@@ -94,202 +88,128 @@
 		}
 	}
 
-	function statusTone(status: string): string {
-		if (status === 'completed' || status === 'idle') return 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20';
-		if (status === 'failed' || status === 'blocked') return 'text-destructive bg-destructive/10 border-destructive/20';
-		if (status === 'waiting_for_input') return 'text-amber-500 bg-amber-500/10 border-amber-500/20';
-		if (status === 'running' || status === 'preparing') return 'text-blue-500 bg-blue-500/10 border-blue-500/20';
-		return 'text-muted-foreground bg-secondary border-border';
+	function statusMeta(status: string): { label: string; dot: string; text: string } {
+		if (status === 'running') return { label: 'Working', dot: 'bg-blue-500 animate-pulse', text: 'text-blue-500' };
+		if (status === 'queued') return { label: 'Queued', dot: 'bg-amber-400', text: 'text-amber-500' };
+		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-500 animate-pulse', text: 'text-orange-500' };
+		if (status === 'blocked' || status === 'failed') return { label: 'Needs attention', dot: 'bg-red-500', text: 'text-red-500' };
+		if (status === 'completed') return { label: 'Completed', dot: 'bg-emerald-500', text: 'text-emerald-500' };
+		if (status === 'cancelled') return { label: 'Cancelled', dot: 'bg-muted-foreground', text: 'text-muted-foreground' };
+		return { label: 'Ready', dot: 'bg-emerald-500', text: 'text-emerald-500' };
 	}
 
-	function eventMarker(event: SessionEvent): { label: string; tone: string } {
-		if (event.source_type === 'user') return { label: 'You', tone: 'bg-primary text-primary-foreground' };
-		if (event.event_type === 'attempt_failed') return { label: '!', tone: 'bg-destructive text-destructive-foreground' };
-		if (event.event_type === 'attempt_completed') return { label: '✓', tone: 'bg-emerald-500 text-white' };
-		if (event.source_type === 'schedule') return { label: '↻', tone: 'bg-violet-500 text-white' };
-		if (event.source_type === 'connector') return { label: '↗', tone: 'bg-cyan-600 text-white' };
-		return { label: '•', tone: 'bg-secondary text-secondary-foreground' };
-	}
-
-	function compactId(id: string): string {
-		return id.length > 10 ? id.slice(0, 8) : id;
+	function taskTone(status: string): string {
+		if (status === 'in_progress') return 'border-blue-500/25 bg-blue-500/5';
+		if (status === 'pending') return 'border-amber-500/25 bg-amber-500/5';
+		if (status === 'waiting_for_input') return 'border-orange-500/30 bg-orange-500/5';
+		if (status === 'blocked') return 'border-red-500/25 bg-red-500/5';
+		return 'border-border bg-card';
 	}
 </script>
 
-<div class="mx-auto max-w-7xl space-y-5 pb-8">
+<div class="mx-auto w-full max-w-5xl space-y-5 pb-8">
 	{#if error}
-		<div class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
+		<div class="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">{error}</div>
 	{/if}
 
 	{#if readiness && !readiness.ready}
 		<div class="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
 			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div>
-					<h2 class="text-sm font-semibold text-amber-600">Runner needs attention</h2>
+					<h2 class="text-sm font-semibold text-amber-600">This project is not ready to run</h2>
 					<ul class="mt-2 space-y-1 text-xs text-muted-foreground">
 						{#each readiness.issues as issue}<li>• {issue}</li>{/each}
 					</ul>
 					{#if !readiness.auth_present}
-						<p class="mt-2 text-xs text-foreground">Run <code>{readiness.kind} login</code> on the host, then refresh this page.</p>
+						<p class="mt-2 text-xs text-foreground">Run <code>{readiness.kind} login</code> on this computer, then refresh.</p>
 					{/if}
 				</div>
 				{#if readiness.docker_available && !readiness.image_present}
-					<button onclick={prepareRunner} disabled={preparing}
-						class="shrink-0 rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
-						{preparing ? 'Pulling image…' : 'Prepare runner'}
+					<button onclick={prepareRunner} disabled={preparing} class="shrink-0 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50">
+						{preparing ? 'Preparing…' : 'Prepare runner'}
 					</button>
 				{/if}
 			</div>
 		</div>
-	{:else if readiness?.ready}
-		<div class="flex items-center justify-between rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-4 py-2.5 text-xs">
-			<span class="font-medium text-emerald-600">{readiness.kind} runner ready</span>
-			<span class="truncate pl-4 font-mono text-muted-foreground">{readiness.workspace}</span>
-		</div>
 	{/if}
 
 	{#if overview}
-		<div class="grid gap-3 sm:grid-cols-3">
-			<div class="rounded-xl border border-border bg-card p-4">
-				<div class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Session</div>
-				<div class="mt-2 flex items-center gap-2">
-					<span class="h-2 w-2 rounded-full {overview.session.status === 'running' ? 'bg-blue-500 animate-pulse' : 'bg-emerald-500'}"></span>
-					<span class="text-base font-semibold capitalize">{overview.session.status.replaceAll('_', ' ')}</span>
+		{@const projectStatus = statusMeta(overview.session.status)}
+		<section class="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+			<div class="flex flex-col gap-3 border-b border-border px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+				<div class="flex items-center gap-2 text-sm font-medium {projectStatus.text}">
+					<span class="h-2.5 w-2.5 rounded-full {projectStatus.dot}"></span>
+					{projectStatus.label}
 				</div>
-				<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">
-					{overview.session.latest_summary ?? 'Ready for work'}
-				</p>
+				<div class="text-xs text-muted-foreground">
+					{#if activeTasks.length > 0}{activeTasks.length} active{:else}No active tasks{/if}
+					{#if overview.queued_attempts.length > 0} · {overview.queued_attempts.length} queued{/if}
+				</div>
 			</div>
-			<div class="rounded-xl border border-border bg-card p-4">
-				<div class="text-xs font-medium uppercase tracking-wide text-muted-foreground">In progress</div>
-				<div class="mt-2 text-2xl font-semibold">{overview.active_attempts.length}</div>
-				<p class="mt-1 text-xs text-muted-foreground">Background native workers</p>
+			<textarea bind:value={message} onkeydown={handleKeydown} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
+			<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
+				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task continues the project's active native conversation">
+					<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
+					Start a fresh conversation
+				</label>
+				<div class="flex items-center justify-between gap-3 sm:justify-end">
+					<span class="text-[11px] text-muted-foreground">⌘/Ctrl + Enter</span>
+					<button onclick={send} disabled={sending || !message.trim()} class="rounded-lg bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-40">
+						{sending ? 'Sending…' : 'Send'}
+					</button>
+				</div>
 			</div>
-			<div class="rounded-xl border border-border bg-card p-4">
-				<div class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Queued</div>
-				<div class="mt-2 text-2xl font-semibold">{overview.queued_attempts.length}</div>
-				<p class="mt-1 text-xs text-muted-foreground">Messages and automated tasks</p>
+			<div class="border-t border-border/70 bg-secondary/20 px-4 py-2.5 text-[11px] text-muted-foreground">
+				Tasks continue this project’s active {readiness?.kind ?? 'agent'} conversation. Dependent tasks continue the conversation they depend on.
 			</div>
-		</div>
+		</section>
 
-		<div class="rounded-xl border border-border bg-card p-4 shadow-sm">
-			<div class="mb-3 flex items-center justify-between gap-4">
-				<div>
-					<h2 class="text-sm font-semibold">Send work or ask a question</h2>
-					<p class="mt-0.5 text-xs text-muted-foreground">The session accepts messages while native workers continue in the background.</p>
+		{#if attentionTasks.length > 0}
+			<section class="space-y-2">
+				<div class="flex items-center justify-between px-1">
+					<h2 class="text-sm font-semibold text-orange-500">Needs you</h2>
+					<span class="text-xs text-muted-foreground">{attentionTasks.length}</span>
 				</div>
-				<span class="hidden rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-500 sm:inline">Available</span>
-			</div>
-			<textarea
-				bind:value={message}
-				onkeydown={handleKeydown}
-				rows="3"
-				placeholder="Describe the outcome you want…"
-				class="w-full resize-y rounded-lg border border-input bg-background px-3 py-2.5 text-sm outline-none transition-colors placeholder:text-muted-foreground focus:border-primary focus:ring-1 focus:ring-primary"
-			></textarea>
-			<div class="mt-2 flex items-center justify-between">
-				<span class="text-[11px] text-muted-foreground">⌘/Ctrl + Enter to send</span>
-				<button
-					onclick={send}
-					disabled={sending || !message.trim()}
-					class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-				>
-					{sending ? 'Queuing…' : 'Send'}
-				</button>
-			</div>
-		</div>
-
-		<div class="grid gap-5 lg:grid-cols-[minmax(0,1.7fr)_minmax(300px,1fr)]">
-			<section class="min-w-0 rounded-xl border border-border bg-card">
-				<div class="border-b border-border px-4 py-3">
-					<h2 class="text-sm font-semibold">Activity</h2>
-					<p class="text-xs text-muted-foreground">One timeline across people, schedules, workflows, and native workers</p>
-				</div>
-				{#if overview.recent_events.length === 0}
-					<div class="px-4 py-12 text-center text-sm text-muted-foreground">No activity yet. Send the first message above.</div>
-				{:else}
-					<div class="divide-y divide-border">
-						{#each overview.recent_events as event (event.id)}
-							{@const marker = eventMarker(event)}
-							<div class="flex gap-3 px-4 py-3.5">
-								<div class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold {marker.tone}">{marker.label}</div>
-								<div class="min-w-0 flex-1">
-									<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-										<span class="text-xs font-medium capitalize">{event.source_type.replaceAll('_', ' ')}</span>
-										<span class="text-[11px] text-muted-foreground">{event.event_type.replaceAll('_', ' ')}</span>
-										<span class="ml-auto text-[11px] text-muted-foreground">{timeAgo(event.created_at)}</span>
-									</div>
-									<p class="mt-1 whitespace-pre-wrap break-words text-sm leading-relaxed">{event.summary}</p>
-									{#if event.attempt_id || event.task_id}
-										<div class="mt-1.5 flex gap-3 text-[11px] text-muted-foreground">
-											{#if event.attempt_id}<span>attempt {compactId(event.attempt_id)}</span>{/if}
-											{#if event.task_id}<a class="hover:text-foreground hover:underline" href="/tasks/{event.task_id}">view task</a>{/if}
-										</div>
-									{/if}
-								</div>
-							</div>
-						{/each}
-					</div>
-				{/if}
+				{#each attentionTasks as task (task.id)}
+					<a href="/tasks/{task.id}" class="flex items-center gap-3 rounded-xl border p-4 transition-colors hover:border-primary/40 {taskTone(task.status)}">
+						<span class="h-2.5 w-2.5 shrink-0 rounded-full bg-orange-500 animate-pulse"></span>
+						<div class="min-w-0 flex-1">
+							<div class="truncate text-sm font-medium">{task.title}</div>
+							<div class="mt-0.5 text-xs text-muted-foreground">{task.status === 'waiting_for_input' ? 'Waiting for your reply' : 'Blocked'} · {timeAgo(task.updated_at)}</div>
+						</div>
+						<span class="text-muted-foreground">→</span>
+					</a>
+				{/each}
 			</section>
+		{/if}
 
-			<div class="min-w-0 space-y-5">
-				<section class="rounded-xl border border-border bg-card">
-					<div class="border-b border-border px-4 py-3">
-						<h2 class="text-sm font-semibold">Work attempts</h2>
-						<p class="text-xs text-muted-foreground">Isolated native CLI invocations</p>
-					</div>
-					{#if overview.recent_attempts.length === 0}
-						<div class="px-4 py-8 text-center text-xs text-muted-foreground">Nothing queued</div>
-					{:else}
-						<div class="divide-y divide-border">
-							{#each overview.recent_attempts.slice(0, 8) as attempt (attempt.id)}
-								<div class="space-y-2 px-4 py-3">
-									<div class="flex items-center gap-2">
-										<span class="rounded-full border px-2 py-0.5 text-[10px] font-medium capitalize {statusTone(attempt.status)}">{attempt.status.replaceAll('_', ' ')}</span>
-										<span class="text-xs font-medium capitalize">{attempt.runner}</span>
-										<span class="ml-auto text-[10px] text-muted-foreground">{timeAgo(attempt.created_at)}</span>
-									</div>
-									<p class="line-clamp-2 text-xs text-muted-foreground">{attempt.prompt}</p>
-									<div class="flex items-center gap-3 text-[11px]">
-										{#if attempt.task_id}<a href="/tasks/{attempt.task_id}" class="text-muted-foreground hover:text-foreground hover:underline">Task</a>{/if}
-										{#if ['queued', 'preparing', 'running', 'review', 'waiting_for_input'].includes(attempt.status)}
-											<button onclick={() => cancel(attempt)} disabled={cancelling === attempt.id} class="ml-auto text-destructive hover:underline disabled:opacity-50">
-												{cancelling === attempt.id ? 'Cancelling…' : 'Cancel'}
-											</button>
-										{/if}
-									</div>
-								</div>
-							{/each}
-						</div>
-					{/if}
-				</section>
-
-				<section class="rounded-xl border border-border bg-card">
-					<div class="border-b border-border px-4 py-3">
-						<h2 class="text-sm font-semibold">Artifacts</h2>
-						<p class="text-xs text-muted-foreground">Results, patches, reports, and review decisions</p>
-					</div>
-					{#if visibleArtifacts.length === 0}
-						<div class="px-4 py-8 text-center text-xs text-muted-foreground">Completed work will appear here</div>
-					{:else}
-						<div class="divide-y divide-border">
-							{#each visibleArtifacts.slice(0, 6) as artifact (artifact.id)}
-								<div class="px-4 py-3">
-									<div class="flex items-center gap-2">
-										<span class="rounded bg-secondary px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">{artifact.artifact_type}</span>
-										<span class="truncate text-xs font-medium">{artifact.title}</span>
-									</div>
-									{#if artifact.content}<p class="mt-2 line-clamp-5 whitespace-pre-wrap text-xs leading-relaxed text-muted-foreground">{artifact.content}</p>{/if}
-									{#if artifact.uri}<a href={artifact.uri} class="mt-2 block truncate text-xs text-primary hover:underline">{artifact.uri}</a>{/if}
-								</div>
-							{/each}
-						</div>
-					{/if}
-				</section>
+		<section class="overflow-hidden rounded-xl border border-border bg-card">
+			<div class="flex items-center justify-between border-b border-border px-4 py-3">
+				<div>
+					<h2 class="text-sm font-semibold">Work</h2>
+					<p class="mt-0.5 text-xs text-muted-foreground">Open a task to see its conversation and every technical step.</p>
+				</div>
+				<a href="/tasks" class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
 			</div>
-		</div>
+			{#if activeTasks.length === 0 && recentTasks.length === 0}
+				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work in this project.' : 'No work yet. Send the first task above.'}</div>
+			{:else}
+				<div class="divide-y divide-border">
+					{#each [...activeTasks, ...recentTasks] as task (task.id)}
+						{@const meta = statusMeta(task.status)}
+						<a href="/tasks/{task.id}" class="group flex items-center gap-3 px-4 py-3.5 hover:bg-accent/40">
+							<span class="h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
+							<div class="min-w-0 flex-1">
+								<div class="truncate text-sm font-medium group-hover:text-primary">{task.title}</div>
+								<div class="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground"><span>{meta.label}</span><span>·</span><span>{timeAgo(task.updated_at)}</span></div>
+							</div>
+							<span class="text-muted-foreground">→</span>
+						</a>
+					{/each}
+				</div>
+			{/if}
+		</section>
 	{:else if !error}
-		<div class="flex min-h-64 items-center justify-center text-sm text-muted-foreground">Loading session…</div>
+		<div class="flex min-h-64 items-center justify-center text-sm text-muted-foreground">Loading project…</div>
 	{/if}
 </div>

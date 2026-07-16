@@ -374,10 +374,14 @@ export const sessions = {
 		const query = status ? `?status=${encodeURIComponent(status)}` : '';
 		return request<WorkAttempt[]>(`/api/sessions/${id}/attempts${query}`);
 	},
-	sendMessage: (id: string, content: string, priority?: number) =>
+	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean }) =>
 		request<{ event: SessionEvent; task: Task; attempt_id: string; queued: boolean }>(
 			`/api/sessions/${id}/messages`,
-			{ method: 'POST', body: JSON.stringify({ content, priority }) }
+			{ method: 'POST', body: JSON.stringify({
+				content,
+				priority: options?.priority,
+				new_session: options?.newSession ?? false
+			}) }
 		),
 	cancelAttempt: (sessionId: string, attemptId: string) =>
 		request<WorkAttempt>(`/api/sessions/${sessionId}/attempts/${attemptId}/cancel`, {
@@ -430,7 +434,7 @@ export const tasks = {
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
-	create: (data: { title: string; description?: string; agent_id?: string; priority?: number }) =>
+	create: (data: { title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
 	update: (id: string, data: { title?: string; description?: string; agent_id?: string; priority?: number }) =>
 		request<Task>(`/api/tasks/${id}`, {
@@ -454,7 +458,7 @@ export const tasks = {
 			body: JSON.stringify({ role, content })
 		}),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
-	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; depends_on?: string[] }[]; parent_task_id?: string }) =>
+	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
 		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
 	addDependency: (taskId: string, dependsOn: string) =>
 		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {

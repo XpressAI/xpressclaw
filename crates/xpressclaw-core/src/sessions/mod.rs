@@ -472,6 +472,21 @@ impl SessionManager {
         })
     }
 
+    /// Recompute the project-facing status after task state changes that do
+    /// not themselves transition a work attempt (notably waiting for input).
+    pub fn refresh_status(&self, session_id: &str) -> Result<LogicalSession> {
+        self.db.with_conn(|conn| {
+            let status = self.derive_status_with_conn(conn, session_id)?;
+            conn.execute(
+                "UPDATE logical_sessions SET status = ?1, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2",
+                rusqlite::params![status, session_id],
+            )?;
+            Ok::<_, Error>(())
+        })?;
+        self.get(session_id)
+    }
+
     pub fn add_artifact(
         &self,
         attempt_id: &str,
@@ -580,22 +595,31 @@ impl SessionManager {
         if running > 0 {
             return Ok("running".to_string());
         }
-        let waiting: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM work_attempts
-             WHERE session_id = ?1 AND status = 'waiting_for_input'",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        if waiting > 0 {
-            return Ok("waiting_for_input".to_string());
-        }
         let queued: i64 = conn.query_row(
             "SELECT COUNT(*) FROM work_attempts
              WHERE session_id = ?1 AND status = 'queued'",
             [session_id],
             |row| row.get(0),
         )?;
-        Ok(if queued > 0 { "queued" } else { "idle" }.to_string())
+        if queued > 0 {
+            return Ok("queued".to_string());
+        }
+        let waiting: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1 AND status = 'waiting_for_input'",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        if waiting > 0 {
+            return Ok("waiting_for_input".to_string());
+        }
+        let blocked: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE agent_id = ?1 AND status = 'blocked'",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        Ok(if blocked > 0 { "blocked" } else { "idle" }.to_string())
     }
 }
 
