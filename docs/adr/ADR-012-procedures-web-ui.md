@@ -1,7 +1,7 @@
 # ADR-012: Procedures Web UI
 
 ## Status
-Accepted
+Superseded by ADR-025 and ADR-026
 
 ## Context
 

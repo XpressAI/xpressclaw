@@ -69,14 +69,13 @@ if [ "$SKIP_TAURI" = false ]; then
     TAURI_BUNDLER_DMG_IGNORE_CI=true npx -y @tauri-apps/cli build --target "${TARGET_TRIPLE}" $BUNDLE_FLAG
 fi
 
-if [ "$SKIP_DOCKER" = false ] && command -v docker &>/dev/null; then
-    echo "==> Building agent harness Docker images..."
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest harnesses/base
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest harnesses/claude-sdk
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest harnesses/langchain
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest harnesses/xaibo
+if [ "$SKIP_DOCKER" = true ]; then
+    echo "==> Skipping runner builds (--skip-docker)"
+elif command -v docker &>/dev/null || command -v podman &>/dev/null; then
+    echo "==> Building native ACP runner images..."
+    bash scripts/build-runner-images.sh
 else
-    echo "==> Skipping harness builds"
+    echo "==> Skipping runner builds (no Docker or Podman command found)"
 fi
 
 if [ "$SKIP_CHECK" = false ]; then

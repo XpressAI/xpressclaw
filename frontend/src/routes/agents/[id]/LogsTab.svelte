@@ -9,7 +9,7 @@
 	let loading = $state(true);
 	let autoRefresh = $state(true);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
-	let logsEl: HTMLPreElement;
+	let logsEl = $state<HTMLPreElement>();
 
 	async function fetchLogs() {
 		try {

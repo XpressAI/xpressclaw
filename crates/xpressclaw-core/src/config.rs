@@ -252,6 +252,22 @@ pub struct NativeRunnerConfig {
     /// Preferred ACP model value ID. When unset, the agent chooses its own
     /// default. The value is applied through `session/set_config_option`.
     pub model: Option<String>,
+    /// Default ACP session configuration values keyed by the option IDs
+    /// advertised by the native agent. This covers modes, reasoning levels,
+    /// model-related toggles, and adapter-specific selectors without teaching
+    /// XpressClaw provider-specific option names.
+    #[serde(default)]
+    pub session_config: HashMap<String, serde_json::Value>,
+    /// Names from the top-level MCP server catalog to attach to this harness.
+    /// ACP stdio servers run inside the worker container; remote HTTP/SSE
+    /// servers are connected to by the native agent.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    /// Environment supplied to the harness container. This is the escape
+    /// hatch for native product configuration that ACP does not standardize,
+    /// such as adapter flags or an alternate harness configuration root.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
     /// Optional ACP server argv override. `{workspace}` is expanded.
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
@@ -268,6 +284,9 @@ impl Default for NativeRunnerConfig {
             image: String::new(),
             workspace: None,
             model: None,
+            session_config: HashMap::new(),
+            mcp_servers: Vec::new(),
+            environment: HashMap::new(),
             command: Vec::new(),
             subscription_auth: true,
             container_engine: ContainerEngineAccess::None,

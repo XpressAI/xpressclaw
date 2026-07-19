@@ -1,7 +1,16 @@
 # ADR-022: Connectors and Workflows
 
 ## Status
-Accepted
+Partially superseded by ADR-025 and ADR-026
+
+The workflow definition and multi-agent execution portions remain in force.
+The connector runtime and UI are disabled for the ACP beta: connector changes
+were not applied to live runtimes, webhook routing did not create bound tasks,
+and connection tests only validated field presence. Re-enabling connectors
+requires lifecycle-aware reloads, end-to-end routing tests, and real health
+checks for every exposed connector type. Connector routes and settings are not
+exposed, new connector-backed workflows are rejected, and preserved legacy
+trigger/sink definitions cannot be enabled or run through the application.
 
 ## Context
 

@@ -8,10 +8,6 @@
 Run Codex, Claude Code, OpenCode, and other native agents as isolated workers. Queue tasks, schedule recurring work, coordinate multi-agent workflows, and follow everything through one structured session UI.
 </p>
 
-<div align="center">
-  <img width="612" height="426" alt="XpressClaw-screenshot" src="https://github.com/user-attachments/assets/e38079ef-99f7-4e1e-91a0-fa14d39800ca" />
-</div>
-
 <p align="center">
 <a href="https://xpressclaw.ai">Website</a> &bull;
 <a href="https://hub.xpressclaw.ai">Hub</a> &bull;
@@ -32,23 +28,23 @@ xpressclaw init
 xpressclaw up
 ```
 
-Open `http://localhost:8935`, create a session, choose a project workspace,
+Open `http://localhost:8935`, create a project, choose its workspace,
 and send it work. The matching runner image is pulled automatically. To build
 the Codex runner locally instead:
 
 ```bash
-docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
-# Or: podman build -t xpressclaw-runner-codex:latest harnesses/native/codex
+docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
+# Or: podman build -f harnesses/native/codex/Dockerfile -t localhost/xpressclaw-runner-codex:latest harnesses/native
 ```
 
 ## Why xpressclaw?
 
 Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
-- **One logical session** — People, schedules, connectors, workflows, and ACP agents contribute to one event history.
+- **One logical session** — People, schedules, workflows, and ACP agents contribute to one event history.
 - **Agent-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
-- **Native desktop app** — Tauri-based `.app` / `.dmg` with system tray. Runs in the background, always available.
+- **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
 - **Isolated by default** — Every agent turn runs in a short-lived Docker/Podman container.
 - **Container-aware projects** — Opt trusted projects into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
@@ -80,7 +76,7 @@ test workflows can explicitly enable trusted host-engine access.
 
 - **Container isolation** — each work attempt runs in its own short-lived container
 - **Explicit resources** — workers receive the configured workspace and volume mounts
-- **Visible provenance** — every queued request records whether it came from a person, schedule, connector, task, or workflow
+- **Visible provenance** — every queued request records whether it came from a person, schedule, task, or workflow
 - **Local control data** — timelines and task state remain local; agent traffic follows the selected provider's terms
 - **Credential boundary** — subscription auth is mounted only into short-lived workers built from an image you trust
 
@@ -100,9 +96,9 @@ xpressclaw up
 # Open http://localhost:8935
 ```
 
-### Option 2: Native App (macOS)
+### Option 2: Native App
 
-Download `xpressclaw.dmg` from [Releases](https://github.com/XpressAI/xpressclaw/releases) — double-click to install. The app runs in the system tray.
+Download the macOS, Windows, or Linux installer from [Releases](https://github.com/XpressAI/xpressclaw/releases). The app runs in the system tray and keeps the local control plane available in the background.
 
 ### Option 3: Build from Source
 
@@ -155,11 +151,9 @@ agents: []
 
 ### Prerequisites
 
-- [Bazel](https://bazel.build/) 8.2+ (via [Bazelisk](https://github.com/bazelbuild/bazelisk))
-- [Rust](https://rustup.rs/) (stable toolchain, used by Bazel and for fmt/clippy)
-- [LLVM](https://releases.llvm.org/) (provides `libclang`, required by llama.cpp bindings)
-- [CMake](https://cmake.org/) (required by llama.cpp build)
-- [Node.js](https://nodejs.org/) 18+ (for the frontend)
+- [Rust](https://rustup.rs/) stable toolchain
+- [Node.js](https://nodejs.org/) 20+
+- The [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your platform when building the desktop app
 - Docker or Podman (for isolated ACP agents)
 
 ### Build Everything
@@ -168,26 +162,26 @@ agents: []
 git clone https://github.com/XpressAI/xpressclaw.git
 cd xpressclaw
 
-# Build CLI, core, and server (includes frontend)
+# Build CLI, server, desktop app, and native runner images
 ./build.sh
 
-# Or with a clean build
-./build.sh --clean
+# Skip runner images when you only need the application
+./build.sh --skip-docker
 ```
 
 ### Build Individual Targets
 
 ```bash
-# CLI only
-bazel build //crates/xpressclaw-cli:xpressclaw
+# CLI only (also embeds the frontend)
+cargo build --release -p xpressclaw-cli
 
 # Core library
-bazel build //crates/xpressclaw-core:xpressclaw-core
+cargo build -p xpressclaw-core
 
 # Server
-bazel build //crates/xpressclaw-server:xpressclaw-server
+cargo build -p xpressclaw-server
 
-# The CLI binary is at bazel-bin/crates/xpressclaw-cli/xpressclaw
+# The release CLI binary is target/release/xpressclaw
 ```
 
 ### Build the Desktop App (Tauri)
@@ -206,10 +200,22 @@ Build only the product you use. Each image is deliberately independent so it
 can be versioned or extended without pulling in the other agent CLIs:
 
 ```bash
-docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
-docker buildx build --load -t xpressclaw-runner-claude:latest harnesses/native/claude
-docker buildx build --load -t xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
+docker buildx build --load -f harnesses/native/claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest harnesses/native
+docker buildx build --load -f harnesses/native/opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest harnesses/native
 ```
+
+To build every standard and host-engine variant with whichever local runtime
+is available, run `scripts/build-runner-images.sh`. Set
+`CONTAINER_RUNTIME=docker` or `CONTAINER_RUNTIME=podman` to override automatic
+detection.
+
+The `Build & Push Runner Images` workflow publishes all six multi-architecture
+images whenever their sources change on `main`, then verifies that they can be
+pulled without credentials. GHCR creates each package as private on its first
+publication, so an XpressAI organization owner must change each new package to
+**Public** once in the package settings. Releases stop before publication if
+any runner is unavailable anonymously.
 
 The default images stay minimal. Add `--target runner-host` and use the
 corresponding `xpressclaw-runner-<product>-docker:latest` tag to build an
@@ -217,21 +223,64 @@ opt-in image containing Docker CLI, Compose, and Buildx. Enabling host-engine
 access mounts the control plane's Docker or rootless Podman socket; this gives
 the runner control over that engine and is intended only for trusted agents.
 
-Use `podman build` with the same tags when Podman is your runtime. The ACP
+Use `podman build` with the `localhost/` tags when Podman is your runtime. The ACP
 compatibility label on current images prevents an older pre-ACP local tag from
 being selected silently.
 
 See `harnesses/native/README.md` for build commands, customization guidance,
 and the separation between agent runners and development environments.
 
+### Native harness capabilities
+
+Each project session keeps the selected native product's own configuration.
+When host login is enabled, XpressClaw mounts the complete Codex, Claude Code,
+or OpenCode configuration directory—not just its token—so native skills,
+plugins, hooks, custom agents, and user settings remain available. Project
+configuration in the mounted workspace is discovered normally. Extra config
+trees can be attached with per-session volume mounts and environment values.
+
+MCP servers are defined once and enabled per harness. Stdio commands must be
+absolute paths inside that harness image; remote HTTP and SSE endpoints do not
+need to be installed in the image. ACP supplies the selected servers when a
+session is created, resumed, or loaded.
+
+After the first turn, the task composer and workflow editor show the commands,
+modes, models, reasoning levels, and other controls that the ACP agent actually
+advertises. A workflow step can combine all of them:
+
+```yaml
+- id: optimize
+  agent: claude-site
+  command: /loop
+  prompt: Improve {{trigger.payload.page}} until the checks pass.
+  session_config:
+    mode: build
+    thought_level: high
+  mcp_server: seo
+  mcp_tool: audit_page
+  mcp_arguments:
+    url: "{{trigger.payload.page}}"
+  new_session: false
+```
+
+ACP standardizes attaching MCP servers, agent-advertised slash commands, and
+session configuration. It does not define a client-to-agent RPC for directly
+calling an MCP tool. The `mcp_*` workflow fields therefore ask the native
+agent to perform the tool call inside its turn, preserving the harness's
+own permissions, hooks, and tool-call activity.
+
 ### Run Tests
 
 ```bash
-# Via Bazel
-bazel test //crates/xpressclaw-core:core_test //crates/xpressclaw-server:server_test
+# Rust tests
+cargo test -p xpressclaw-core -p xpressclaw-server
 
 # Frontend type check
-cd frontend && npm run check
+cd frontend
+npm run check
+npx playwright install chromium # once per machine
+npm run test:e2e
+cd ..
 
 # Formatting and linting
 ./scripts/rustfmt.sh --check
@@ -266,7 +315,7 @@ xpressclaw is a Cargo workspace with four crates:
 | `xpressclaw-tauri` | Native desktop app with system tray (Tauri v2) |
 
 ```
-xpressclaw (single ~12MB binary)
+xpressclaw
 +-- Axum server (REST API + embedded SvelteKit frontend)
 +-- Session event log (messages, attempts, provenance, artifacts)
 +-- SQLite (sessions, events, tasks, workflows, and schedules)
@@ -276,7 +325,7 @@ xpressclaw (single ~12MB binary)
 
 **Key design decisions:**
 - **Single binary** — server, API, frontend, and CLI in one executable
-- **Docker required** — worker isolation is not optional
+- **Container runtime required** — Docker and Podman are detected automatically; worker isolation is not optional
 - **Durable local state** — sessions, task queues, schedules, and workflow runs survive restarts
 - **ACP boundary** — Agents own their instructions, tools, reasoning loop, and subagents; xpressclaw owns tasks, orchestration, and presentation
 

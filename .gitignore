@@ -11,6 +11,8 @@ __pycache__/
 node_modules/
 frontend/build/
 frontend/.svelte-kit/
+frontend/playwright-report/
+frontend/test-results/
 
 # IDE
 .idea/
@@ -35,6 +37,9 @@ temp/
 
 # xpressclaw runtime
 .xpressclaw/
+/xpressclaw.yaml
+/xpressclaw.yaml.bak
+/skills/
 
 # Models (too large for git)
 models/*.onnx

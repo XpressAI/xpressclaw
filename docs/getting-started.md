@@ -33,6 +33,12 @@ image, project folder, server command, and subscription credentials. Use
 `xpressclaw-runner-<product>:latest` image is accepted as a development
 fallback.
 
+Runtime selection is automatic. An explicit `DOCKER_HOST` wins; otherwise
+Xpressclaw prefers a live user-level Docker Desktop or rootless Podman socket
+before falling back to the platform Docker endpoint. Readiness and server
+settings show the selected runtime and socket so local images are always
+looked up in the same image store used to launch workers.
+
 The project folder name becomes the session's context label. There is no agent
 name, persona, role, or Xpressclaw-authored system prompt.
 

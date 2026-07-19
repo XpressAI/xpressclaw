@@ -1,15 +1,17 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { health, setup } from '$lib/api';
-	import type { LiveConfig } from '$lib/api';
+	import type { DockerStatus, LiveConfig } from '$lib/api';
 
 	let serverInfo = $state<{ status: string; version: string } | null>(null);
 	let config = $state<LiveConfig | null>(null);
+	let runtime = $state<DockerStatus | null>(null);
 
 	onMount(async () => {
-		[serverInfo, config] = await Promise.all([
+		[serverInfo, config, runtime] = await Promise.all([
 			health.check().catch(() => null),
-			setup.getConfig().catch(() => null)
+			setup.getConfig().catch(() => null),
+			setup.checkDocker().catch(() => null)
 		]);
 	});
 </script>
@@ -38,9 +40,21 @@
 				<dd class="text-xs font-mono">{window.location.origin}</dd>
 			</div>
 			<div class="flex justify-between">
-				<dt class="text-muted-foreground">Isolation</dt>
-				<dd>docker</dd>
+				<dt class="text-muted-foreground">Container runtime</dt>
+				<dd class="capitalize">{runtime?.runtime ?? (runtime?.available ? 'Available' : 'Unavailable')}</dd>
 			</div>
+			{#if runtime?.version}
+				<div class="flex justify-between">
+					<dt class="text-muted-foreground">Runtime version</dt>
+					<dd>{runtime.version}{runtime.rootless ? ' · rootless' : ''}</dd>
+				</div>
+			{/if}
+			{#if runtime?.socket}
+				<div class="flex items-start justify-between gap-4">
+					<dt class="text-muted-foreground">Endpoint</dt>
+					<dd class="break-all text-right font-mono text-xs">{runtime.socket}</dd>
+				</div>
+			{/if}
 		</dl>
 	</div>
 
@@ -69,10 +83,10 @@
 		{#if config.mcp_servers.length > 0}
 			<div class="rounded-lg border border-border bg-card p-4 space-y-3">
 				<h2 class="text-sm font-semibold">MCP Servers</h2>
-				<p class="text-xs text-muted-foreground">Registered connectors.</p>
+				<p class="text-xs text-muted-foreground">Available for attachment to ACP harnesses.</p>
 				<div class="flex flex-wrap gap-2">
 					{#each config.mcp_servers as server}
-						<span class="text-xs bg-muted px-2 py-1 rounded">{server}</span>
+						<span class="text-xs bg-muted px-2 py-1 rounded">{server.name} · {server.type}</span>
 					{/each}
 				</div>
 			</div>

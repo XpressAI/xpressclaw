@@ -96,30 +96,32 @@ pub struct DockerManager {
     docker: Docker,
     rootless: bool,
     socket_path: Option<PathBuf>,
+    runtime: &'static str,
+    runtime_version: Option<String>,
 }
 
 impl DockerManager {
     /// Connect to the Docker/Podman daemon.
     ///
-    /// Tries multiple socket paths to handle Docker Desktop on macOS/Windows
-    /// where the default socket may be disabled. Order:
+    /// Tries multiple socket paths to handle rootless Podman and Docker
+    /// Desktop installations. Order:
     /// 1. DOCKER_HOST env var (if set)
-    /// 2. bollard defaults (/var/run/docker.sock, npipe, etc.)
-    /// 3. ~/.docker/run/docker.sock (Docker Desktop macOS without default socket)
-    /// 4. Podman rootless socket
+    /// 2. User-level Docker Desktop and rootless Podman sockets
+    /// 3. bollard defaults (/var/run/docker.sock, npipe, etc.)
+    ///
+    /// User sockets come before the conventional system socket because GUI
+    /// applications often do not inherit the DOCKER_HOST exported by a login
+    /// shell. If rootless Podman is active, its image store must be used
+    /// consistently for image inspection, worker launch, and socket mounts.
     pub async fn connect() -> Result<Self> {
         // If DOCKER_HOST is set, trust it
         if std::env::var("DOCKER_HOST").is_ok() {
             return Self::connect_default().await;
         }
 
-        // Try bollard defaults first
-        if let Ok(mgr) = Self::connect_default().await {
-            return Ok(mgr);
-        }
-
-        // Try user-level Docker Desktop and rootless Podman sockets when the
-        // conventional endpoint is unavailable.
+        // Prefer a running user-level runtime. This makes desktop launches
+        // agree with a user's rootless Podman environment even when a dormant
+        // or unrelated system Docker daemon is also installed.
         #[cfg(unix)]
         {
             for user_socket in fallback_unix_sockets() {
@@ -129,6 +131,11 @@ impl DockerManager {
                     }
                 }
             }
+        }
+
+        // Fall back to the platform default only when no user runtime answers.
+        if let Ok(mgr) = Self::connect_default().await {
+            return Ok(mgr);
         }
 
         Err(Error::DockerNotAvailable(
@@ -149,6 +156,9 @@ impl DockerManager {
             .ping()
             .await
             .map_err(|e| Error::DockerNotAvailable(format!("Docker ping failed: {e}")))?;
+        let version = docker.version().await.ok();
+        let runtime = runtime_from_version(version.as_ref());
+        let runtime_version = version.and_then(|version| version.version);
         let rootless = docker
             .info()
             .await
@@ -157,12 +167,17 @@ impl DockerManager {
             .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
         info!(
             socket = socket_path.as_ref().map(|path| path.display().to_string()),
-            rootless, "connected to container runtime"
+            runtime,
+            version = runtime_version.as_deref(),
+            rootless,
+            "connected to container runtime"
         );
         Ok(Self {
             docker,
             rootless,
             socket_path,
+            runtime,
+            runtime_version,
         })
     }
 
@@ -185,6 +200,20 @@ impl DockerManager {
     /// CLI talks to the same engine as the control plane.
     pub fn host_engine_socket(&self) -> Option<&Path> {
         self.socket_path.as_deref()
+    }
+
+    /// Docker-compatible runtime selected by automatic detection.
+    pub fn runtime(&self) -> &'static str {
+        self.runtime
+    }
+
+    /// Runtime version reported by its compatibility API.
+    pub fn runtime_version(&self) -> Option<&str> {
+        self.runtime_version.as_deref()
+    }
+
+    pub fn is_rootless(&self) -> bool {
+        self.rootless
     }
 
     /// Check if Docker Desktop is installed (macOS/Windows).
@@ -812,6 +841,21 @@ fn unix_socket_from_host(host: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn runtime_from_version(version: Option<&bollard::system::Version>) -> &'static str {
+    let is_podman = version
+        .and_then(|version| version.components.as_deref())
+        .is_some_and(|components| {
+            components
+                .iter()
+                .any(|component| component.name.to_ascii_lowercase().contains("podman"))
+        });
+    if is_podman {
+        "podman"
+    } else {
+        "docker"
+    }
+}
+
 #[cfg(unix)]
 fn fallback_unix_sockets() -> Vec<PathBuf> {
     let mut sockets = Vec::new();
@@ -910,6 +954,21 @@ mod tests {
         assert_eq!(
             unix_socket_from_host("npipe:////./pipe/docker_engine"),
             None
+        );
+    }
+
+    #[test]
+    fn identifies_podman_from_compatibility_api_components() {
+        let mut version = bollard::system::Version::default();
+        version.components = Some(vec![bollard::system::VersionComponents {
+            name: "Podman Engine".to_string(),
+            version: "5.7.0".to_string(),
+            details: None,
+        }]);
+        assert_eq!(runtime_from_version(Some(&version)), "podman");
+        assert_eq!(
+            runtime_from_version(Some(&bollard::system::Version::default())),
+            "docker"
         );
     }
 

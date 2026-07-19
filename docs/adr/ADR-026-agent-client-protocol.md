@@ -64,12 +64,17 @@ ACP session updates are the source of user-visible activity:
 - thought chunks are visible activity, not hidden provider logs;
 - tool calls and updates become technical steps;
 - ACP plans are synchronized into task subtasks;
+- ACP form elicitations become inline task questions with single-select,
+  multi-select, free-text, review, skip, and cancel controls;
 - usage and mode changes become structured events;
 - the complete protocol transcript is retained as a diagnostic artifact.
 
 A task is complete after the prompt has returned and every extracted subtask
-is complete. If the response asks for user input, the task waits and a later
-reply resumes the same ACP session.
+is complete. A structured elicitation keeps the current prompt and container
+alive, durably marks the task and attempt as waiting, and sends the user's form
+response directly back to that in-flight ACP request. If an agent only asks in
+ordinary response text, the task still waits and a later chat reply resumes the
+same ACP session as a new turn.
 
 ### Permissions
 
@@ -102,7 +107,8 @@ templates.
 
 - Products without native ACP support require an adapter.
 - The control plane must keep a bidirectional container attachment open for a
-  turn instead of consuming one-way logs after process exit.
+  turn instead of consuming one-way logs after process exit. Structured
+  questions extend that lifetime until the user answers or cancels.
 - Session continuation depends on the server implementing `session/resume` or
   `session/load` and retaining the referenced session state.
 - Automatically approving permissions is suitable only for trusted images and

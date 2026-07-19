@@ -4,7 +4,6 @@ use axum::Router;
 use crate::state::AppState;
 
 mod agents;
-mod connectors;
 mod health;
 mod open_url;
 mod schedules;
@@ -24,8 +23,5 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/sessions", sessions::routes())
         .nest("/settings", settings::routes())
         .nest("/setup", setup::routes())
-        .nest("/connectors", connectors::routes())
         .nest("/workflows", workflows::routes())
-        // Webhook receiver lives outside /connectors to keep the URL clean
-        .merge(connectors::webhook_routes())
 }

@@ -86,6 +86,8 @@ pub struct SessionOverview {
 pub struct TaskActivity {
     pub attempts: Vec<WorkAttempt>,
     pub events: Vec<SessionEvent>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -337,9 +339,15 @@ impl SessionManager {
         &self,
         task_id: &str,
         after: Option<i64>,
+        before: Option<i64>,
         event_limit: i64,
         attempt_limit: i64,
     ) -> Result<TaskActivity> {
+        if after.is_some() && before.is_some() {
+            return Err(Error::Task(
+                "task activity accepts either 'after' or 'before', not both".to_string(),
+            ));
+        }
         self.db.with_conn(|conn| {
             let mut attempt_stmt = conn.prepare(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
@@ -353,33 +361,54 @@ impl SessionManager {
                 .filter_map(|row| row.ok())
                 .collect();
 
-            let (event_sql, pivot) = if let Some(after_id) = after {
+            let (event_sql, pivot, descending) = if let Some(after_id) = after {
                 (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
                      FROM session_events WHERE task_id = ?1 AND id > ?2
                      ORDER BY id ASC LIMIT ?3",
                     after_id,
+                    false,
+                )
+            } else if let Some(before_id) = before {
+                (
+                    "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
+                            event_type, summary, payload, created_at
+                     FROM session_events WHERE task_id = ?1 AND id < ?2
+                     ORDER BY id DESC LIMIT ?3",
+                    before_id,
+                    true,
                 )
             } else {
                 (
                     "SELECT id, session_id, attempt_id, task_id, source_type, source_id,
                             event_type, summary, payload, created_at
-                     FROM session_events WHERE task_id = ?1 AND id > ?2
+                    FROM session_events WHERE task_id = ?1 AND id > ?2
                      ORDER BY id DESC LIMIT ?3",
                     -1,
+                    true,
                 )
             };
             let mut event_stmt = conn.prepare(event_sql)?;
+            let fetch_limit = event_limit.saturating_add(1);
             let mut events: Vec<_> = event_stmt
-                .query_map(rusqlite::params![task_id, pivot, event_limit], row_to_event)?
+                .query_map(rusqlite::params![task_id, pivot, fetch_limit], row_to_event)?
                 .filter_map(|row| row.ok())
                 .collect();
-            if after.is_none() {
+            let has_more = events.len() > event_limit as usize;
+            if has_more {
+                events.truncate(event_limit as usize);
+            }
+            if descending {
                 events.reverse();
             }
 
-            Ok(TaskActivity { attempts, events })
+            Ok(TaskActivity {
+                attempts,
+                events,
+                has_more_before: descending && has_more,
+                has_more_after: !descending && has_more,
+            })
         })
     }
 
@@ -812,7 +841,9 @@ mod tests {
             .transition_attempt(&first.id, "running", "Inspecting files", None, None)
             .unwrap();
 
-        let initial = manager.task_activity("task-1", None, 100, 20).unwrap();
+        let initial = manager
+            .task_activity("task-1", None, None, 100, 20)
+            .unwrap();
         assert_eq!(initial.attempts.len(), 1);
         assert!(initial
             .events
@@ -835,10 +866,62 @@ mod tests {
             )
             .unwrap();
         let incremental = manager
-            .task_activity("task-1", Some(last_id), 100, 20)
+            .task_activity("task-1", Some(last_id), None, 100, 20)
             .unwrap();
         assert_eq!(incremental.events.len(), 1);
         assert_eq!(incremental.events[0].summary, "Ran tests");
+    }
+
+    #[test]
+    fn task_activity_pages_back_through_older_events() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("website")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title) VALUES ('task-1', 'First')",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        for index in 0..7 {
+            manager
+                .append_event(
+                    "builder",
+                    NewEvent {
+                        attempt_id: None,
+                        task_id: Some("task-1"),
+                        source_type: "runner",
+                        source_id: Some("codex"),
+                        event_type: "runner_progress",
+                        summary: &format!("Event {index}"),
+                        payload: json!({}),
+                    },
+                )
+                .unwrap();
+        }
+
+        let latest = manager.task_activity("task-1", None, None, 3, 20).unwrap();
+        assert_eq!(latest.events.len(), 3);
+        assert!(latest.has_more_before);
+        assert_eq!(latest.events[0].summary, "Event 4");
+
+        let earlier = manager
+            .task_activity("task-1", None, Some(latest.events[0].id), 3, 20)
+            .unwrap();
+        assert_eq!(earlier.events.len(), 3);
+        assert!(earlier.has_more_before);
+        assert_eq!(earlier.events[0].summary, "Event 1");
+        assert_eq!(earlier.events[2].summary, "Event 3");
+
+        let oldest = manager
+            .task_activity("task-1", None, Some(earlier.events[0].id), 3, 20)
+            .unwrap();
+        assert_eq!(oldest.events.len(), 1);
+        assert!(!oldest.has_more_before);
+        assert_eq!(oldest.events[0].summary, "Event 0");
     }
 
     #[test]

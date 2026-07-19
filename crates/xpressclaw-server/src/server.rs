@@ -85,6 +85,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config.clone();
     let dispatcher_event_bus = state.event_bus.clone();
+    let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -93,6 +94,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                 dispatcher_config,
                 dispatcher_docker,
                 dispatcher_event_bus,
+                dispatcher_elicitations,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }
@@ -105,102 +107,6 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         tokio::select! {
             _ = xpressclaw_core::tasks::scheduler::start_schedule_runner(scheduler_db) => {}
             _ = scheduler_shutdown.cancelled() => { info!("scheduler stopped"); }
-        }
-    });
-
-    // Start connector runtime: launch all enabled connectors and route their events.
-    let connector_db = state.db.clone();
-    let connector_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        use xpressclaw_core::connectors::registry::ConnectorRegistry;
-        use xpressclaw_core::connectors::router;
-        use xpressclaw_core::workflows::engine::WorkflowEngine;
-
-        let mut registry = ConnectorRegistry::new(connector_db.clone());
-        let mut event_rx = registry.take_event_receiver().unwrap();
-
-        // Start all enabled connectors (telegram polling, file watchers, etc.)
-        match registry.start_all().await {
-            Ok(()) => info!("connector registry started"),
-            Err(e) => warn!(error = %e, "some connectors failed to start"),
-        }
-
-        let engine = WorkflowEngine::new(connector_db.clone());
-
-        // Event processing loop: route incoming connector events
-        loop {
-            tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    // Route event: direct agent binding → conversation, or → workflow engine
-                    if let Some((conv_id, agent_id)) = router::route_event(&connector_db, &event) {
-                        // Direct connector messages are session events that queue
-                        // native work, just like UI messages and schedules.
-                        let sessions = xpressclaw_core::sessions::SessionManager::new(connector_db.clone());
-                        let _ = sessions.ensure(&agent_id, Some(&agent_id));
-                        let summary = event.payload.get("text")
-                            .or_else(|| event.payload.get("message"))
-                            .or_else(|| event.payload.get("content"))
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| event.payload.to_string());
-                        let source_id = format!("{}:{}", event.connector_id, event.channel_id);
-                        let _ = sessions.append_event(
-                            &agent_id,
-                            xpressclaw_core::sessions::NewEvent {
-                                attempt_id: None,
-                                task_id: None,
-                                source_type: "connector",
-                                source_id: Some(&source_id),
-                                event_type: &event.event_type,
-                                summary: &summary,
-                                payload: event.payload.clone(),
-                            },
-                        );
-                        let board = xpressclaw_core::tasks::board::TaskBoard::new(connector_db.clone());
-                        if let Ok(task) = board.create(&xpressclaw_core::tasks::board::CreateTask {
-                            title: format!("{} message", event.connector_id),
-                            description: Some(summary),
-                            agent_id: Some(agent_id.clone()),
-                            parent_task_id: None,
-                            sop_id: None,
-                            conversation_id: Some(conv_id),
-                            priority: None,
-                            context: Some(serde_json::json!({
-                                "origin": "connector",
-                                "kind": "interactive",
-                                "source_id": source_id,
-                                "connector_id": event.connector_id,
-                                "channel_id": event.channel_id,
-                            })),
-                        }) {
-                            let queue = xpressclaw_core::tasks::queue::TaskQueue::new(connector_db.clone());
-                            if let Err(error) = queue.enqueue(&task.id, &agent_id) {
-                                warn!(task_id = task.id, error = %error, "failed to queue connector work");
-                            }
-                        }
-                    }
-                    // Also let the workflow engine check for matching triggers
-                    match engine.process_events() {
-                        Ok(n) if n > 0 => info!(count = n, "triggered workflow instances"),
-                        Err(e) => warn!(error = %e, "workflow event processing failed"),
-                        _ => {}
-                    }
-                }
-                // Also poll periodically for events recorded via webhook API
-                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
-                    match engine.process_events() {
-                        Ok(n) if n > 0 => info!(count = n, "processed connector events"),
-                        Err(e) => warn!(error = %e, "workflow event processing failed"),
-                        _ => {}
-                    }
-                }
-                _ = connector_shutdown.cancelled() => {
-                    info!("stopping connectors...");
-                    let _ = registry.stop_all().await;
-                    info!("connector runtime stopped");
-                    break;
-                }
-            }
         }
     });
 

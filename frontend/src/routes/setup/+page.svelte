@@ -118,7 +118,16 @@
 		try {
 			dockerStatus = await setup.checkDocker();
 		} catch {
-			dockerStatus = { available: false, error: 'Could not check the container runtime' };
+			dockerStatus = {
+				available: false,
+				installed: false,
+				can_start: false,
+				runtime: null,
+				version: null,
+				socket: null,
+				rootless: null,
+				error: 'Could not check the container runtime'
+			};
 		}
 		dockerLoading = false;
 	}
@@ -260,7 +269,7 @@
 				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
 				<span>
 					<span class="block text-sm font-medium text-foreground">Use my existing {runnerOptions.find((runner) => runner.kind === runnerKind)?.name} login</span>
-					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the agent's standard login directory so its subscription and conversations can continue across tasks. Only enable this for images you trust.</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the agent's standard login directory so its subscription and native sessions can continue across tasks. Only enable this for images you trust.</span>
 				</span>
 			</label>
 			{/if}
@@ -351,9 +360,11 @@
 			{:else if dockerStatus?.available}
 				<div class="flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3">
 					<span class="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/15 text-xs text-emerald-500">&#10003;</span>
-					<div>
-						<p class="text-sm font-medium text-foreground">Container runtime ready</p>
-						<p class="text-xs text-muted-foreground">The agent image will be checked after the project is created.</p>
+					<div class="min-w-0">
+						<p class="text-sm font-medium text-foreground">{dockerStatus.runtime === 'podman' ? 'Podman' : 'Docker'} ready</p>
+						<p class="truncate text-xs text-muted-foreground">
+							{dockerStatus.rootless ? 'Rootless · ' : ''}{dockerStatus.socket ?? 'Automatic endpoint'}{dockerStatus.version ? ` · ${dockerStatus.version}` : ''}
+						</p>
 					</div>
 				</div>
 			{:else}

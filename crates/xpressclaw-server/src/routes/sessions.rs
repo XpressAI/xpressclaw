@@ -12,7 +12,7 @@ use xpressclaw_core::sessions::{NewEvent, SessionManager};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    local_runner_image_alias, resolve_runner_kind, resolved_runner_image, runner_image_compatible,
     subscription_auth_available,
 };
 
@@ -36,6 +36,8 @@ struct MessageInput {
     priority: Option<i32>,
     #[serde(default)]
     new_session: bool,
+    #[serde(default)]
+    config_options: std::collections::HashMap<String, Value>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -125,7 +127,17 @@ async fn prepare_runner(
     if available_runner_image(&docker, &image).await.is_none() {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
-    Ok(Json(readiness(&state, &agent).await?))
+    let readiness = readiness(&state, &agent).await?;
+    if readiness
+        .get("ready")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        AgentRegistry::new(state.db.clone())
+            .clear_error(&id)
+            .map_err(internal_error)?;
+    }
+    Ok(Json(readiness))
 }
 
 async fn readiness(
@@ -189,6 +201,8 @@ async fn readiness(
         "protocol": "acp",
         "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available,
         "docker_available": docker_available,
+        "container_runtime": docker.as_ref().map(|docker| docker.runtime()),
+        "container_runtime_version": docker.as_ref().and_then(|docker| docker.runtime_version()),
         "kind": kind,
         "image": image,
         "runtime_image": runtime_image,
@@ -231,23 +245,6 @@ async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<S
         }
     }
     None
-}
-
-async fn runner_image_compatible(
-    docker: &DockerManager,
-    image: &str,
-    built_in: bool,
-    host_engine_image: bool,
-) -> bool {
-    docker.has_image(image).await
-        && (!built_in
-            || docker
-                .image_has_label(image, "io.xpressclaw.protocol", "acp")
-                .await)
-        && (!host_engine_image
-            || docker
-                .image_has_label(image, "io.xpressclaw.container-engine", "host")
-                .await)
 }
 
 fn session_config(state: &AppState, id: &str) -> Result<AgentConfig, (StatusCode, Json<Value>)> {
@@ -306,7 +303,10 @@ async fn post_message(
                 source_id: Some("local-user"),
                 event_type: "message_received",
                 summary: input.content.trim(),
-                payload: json!({ "content": input.content.trim() }),
+                payload: json!({
+                    "content": input.content.trim(),
+                    "config_options": input.config_options.clone(),
+                }),
             },
         )
         .map_err(internal_error)?;
@@ -327,6 +327,7 @@ async fn post_message(
                 "kind": "interactive",
                 "source_event_id": event.id,
                 "session_mode": if input.new_session { "new" } else { "continue" },
+                "session_config": input.config_options,
             })),
         })
         .map_err(internal_error)?;
@@ -365,6 +366,7 @@ async fn cancel_attempt(
         return Ok(Json(json!(attempt)));
     }
 
+    state.elicitations.cancel_attempt(&attempt_id);
     let cancelled = sessions
         .transition_attempt(
             &attempt_id,

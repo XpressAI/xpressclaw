@@ -19,7 +19,8 @@ as Codex, Claude Code, and OpenCode.
 The useful part of XpressClaw is elsewhere:
 
 - a durable task queue with dependencies;
-- schedules, connectors, and workflow triggers;
+- schedules and workflow triggers, with connector ingestion deferred until the
+  lifecycle and routing requirements in ADR-022 are met;
 - multi-agent workflow coordination;
 - isolated devices and workspaces, including the Android capability described
   by the in-progress ADR-024 work;
@@ -35,10 +36,11 @@ plane; execution contexts belong to workers.
 ### One project, one active native conversation, many tasks
 
 Each configured workspace/runner pair is presented as a project and backed by
-one durable `logical_session`. Messages from a person, task, schedule,
-connector, or workflow become durable tasks and are sent to the project's
+one durable `logical_session`. Messages from a person, task, schedule, or
+workflow become durable tasks and are sent to the project's
 active native Codex, Claude Code, or OpenCode conversation. The project remains
-writable while work is queued or running.
+writable while work is queued or running. Future connector messages must use
+the same path once that runtime is restored.
 
 The native conversation is resumed across short-lived worker containers. A
 task can explicitly request a fresh conversation. A dependent task instead
@@ -127,9 +129,10 @@ out of the container entirely.
 
 ### Tasks and workflows are messages with lifecycle
 
-Manual tasks, schedules, workflow steps, connector events, and session
+Manual tasks, schedules, workflow steps, and session
 messages all converge on the existing durable task queue. Enqueueing creates a
-work attempt and a provenance-rich session event. Existing scheduling and
+work attempt and a provenance-rich session event. Future connector events must
+converge here as well. Existing scheduling and
 workflow semantics therefore survive the runtime pivot.
 
 Workflows remain the coordination mechanism for multiple native products. A
@@ -164,6 +167,32 @@ events and artifacts join the same session timeline. This lets the Android
 work land behind the native-worker boundary without coupling it to a Python
 MCP harness.
 
+### Native extension surface
+
+XpressClaw treats skills, plugins, hooks, custom subagents, and project-local
+instructions as native harness configuration. Enabling subscription login
+mounts the native product's complete configuration directory writable so the
+same extensions work in an isolated attempt and can refresh their own state.
+Per-session environment values and additional volume mounts support alternate
+configuration roots and extensions that live elsewhere. XpressClaw does not
+translate those extensions into a second proprietary skill or agent layer.
+
+ACP session setup carries the MCP servers enabled for that harness. ACP session
+configuration options and legacy session modes are persisted as events and
+rendered as controls in the harness settings, task composer, and workflow
+editor. ACP available-command updates are also persisted; choosing a command
+sends the ordinary `/command arguments` prompt defined by ACP. Controls chosen
+in task chat are applied before the next turn. Workflow steps can set the same
+opaque ACP option IDs, select a native command, request a fresh session, and
+target different harnesses step by step.
+
+ACP does not expose a client-side method that invokes an attached MCP tool.
+For `mcp_server`, `mcp_tool`, and `mcp_arguments` workflow fields, XpressClaw
+therefore constructs a tool-call request inside the native turn. The harness
+remains responsible for permissions and execution and emits the normal ACP
+tool-call activity; XpressClaw does not independently verify the call. A future deterministic control-plane MCP step
+would belong to the workflow runtime rather than the ACP client.
+
 ## Consequences
 
 ### Positive
@@ -173,8 +202,8 @@ MCP harness.
   instead of maintaining another agent framework.
 - Session history remains coherent even though native execution contexts are
   disposable.
-- Schedules, connectors, task dependencies, and workflows share one dispatch
-  path and one audit model.
+- Schedules, task dependencies, and workflows share one dispatch path and one
+  audit model. Future connector sources must enter through that same path.
 - The UI can be designed around intent, progress, evidence, and decisions
   rather than terminal multiplexing.
 
@@ -185,6 +214,9 @@ MCP harness.
 - The first implementation serializes attempts per session, so an interactive
   message can be queued behind current work even though the session UI remains
   responsive.
+- Commands and control changes selected while a native turn is already running
+  apply to the next turn because attempt containers and ACP connections are
+  short-lived.
 - Existing conversation and legacy harness code remains temporarily for data
   compatibility, but it is no longer the server's task execution path. It can
   be deleted after configuration and CLI migration are complete.
@@ -205,9 +237,9 @@ Existing backends map as follows unless `runner.kind` is set explicitly:
 Build the runner images you use with:
 
 ```bash
-docker buildx build --load -t xpressclaw-runner-codex:latest harnesses/native/codex
-docker buildx build --load -t xpressclaw-runner-claude:latest harnesses/native/claude
-docker buildx build --load -t xpressclaw-runner-opencode:latest harnesses/native/opencode
+docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
+docker buildx build --load -f harnesses/native/claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest harnesses/native
+docker buildx build --load -f harnesses/native/opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest harnesses/native
 ```
 
 Then sign in on the host with the selected CLI. API-key based LLM router
@@ -228,5 +260,5 @@ boundary: use only runner images you control or have audited.
 - ADR-019: Background Conversations (event durability retained)
 - ADR-020: Task Dependencies (retained)
 - ADR-021: Agent Sessions / Actor Model (superseded)
-- ADR-022: Connectors and Workflows (retained)
+- ADR-022: Workflow execution retained; connector runtime deferred
 - ADR-024: Android device capability work (designed to attach as a resource)

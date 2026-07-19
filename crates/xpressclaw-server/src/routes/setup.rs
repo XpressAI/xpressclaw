@@ -147,13 +147,29 @@ async fn setup_status(State(state): State<AppState>) -> Json<Value> {
 /// Check if Docker/Podman is available.
 async fn check_docker() -> Json<Value> {
     use xpressclaw_core::docker::manager::DockerManager;
-    let available = DockerManager::connect().await.is_ok();
     let installed = DockerManager::is_docker_desktop_installed();
-    Json(json!({
-        "available": available,
-        "installed": installed,
-        "can_start": installed && !available,
-    }))
+    match DockerManager::connect().await {
+        Ok(runtime) => Json(json!({
+            "available": true,
+            "installed": installed,
+            "can_start": false,
+            "runtime": runtime.runtime(),
+            "version": runtime.runtime_version(),
+            "socket": runtime.host_engine_socket().map(|path| path.display().to_string()),
+            "rootless": runtime.is_rootless(),
+            "error": null,
+        })),
+        Err(error) => Json(json!({
+            "available": false,
+            "installed": installed,
+            "can_start": installed,
+            "runtime": null,
+            "version": null,
+            "socket": null,
+            "rootless": null,
+            "error": error.to_string(),
+        })),
+    }
 }
 
 /// Try to start Docker Desktop. Only works on macOS/Windows.
@@ -361,6 +377,9 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .map(str::trim)
             .filter(|model| !model.is_empty())
             .map(str::to_owned),
+        session_config: std::collections::HashMap::new(),
+        mcp_servers: Vec::new(),
+        environment: std::collections::HashMap::new(),
         command: setup
             .runner_command
             .clone()
@@ -607,16 +626,81 @@ async fn upsert_mcp_server(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let old_config = state.config();
 
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "MCP server name is required" })),
+        ));
+    }
+    if !matches!(req.server_type.as_str(), "stdio" | "http" | "sse") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "MCP server type must be stdio, http, or sse" })),
+        ));
+    }
+    if req.server_type == "stdio"
+        && req
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "stdio MCP servers require a command" })),
+        ));
+    }
+    if req.server_type == "stdio"
+        && !req
+            .command
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|command| command.starts_with('/'))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({ "error": "stdio MCP server commands must be absolute paths inside the harness container" }),
+            ),
+        ));
+    }
+    if matches!(req.server_type.as_str(), "http" | "sse")
+        && !req
+            .url
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|url| url.starts_with("http://") || url.starts_with("https://"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "HTTP and SSE MCP servers require an http(s) URL" })),
+        ));
+    }
+
     let mut new_mcp = old_config.mcp_servers.clone();
     new_mcp.insert(
-        req.name.clone(),
+        name.clone(),
         McpServerConfig {
-            server_type: req.server_type,
-            command: req.command,
-            args: req.args,
-            env: req.env,
-            url: req.url,
-            headers: req.headers,
+            server_type: req.server_type.clone(),
+            command: req.command.filter(|_| req.server_type == "stdio"),
+            args: if req.server_type == "stdio" {
+                req.args
+            } else {
+                Vec::new()
+            },
+            env: if req.server_type == "stdio" {
+                req.env
+            } else {
+                std::collections::HashMap::new()
+            },
+            url: req.url.filter(|_| req.server_type != "stdio"),
+            headers: if req.server_type == "stdio" {
+                std::collections::HashMap::new()
+            } else {
+                req.headers
+            },
         },
     );
 
@@ -636,7 +720,7 @@ async fn upsert_mcp_server(
     let new_config = std::sync::Arc::new(new_config);
     state.apply_config(new_config, state.llm_router());
 
-    Ok(Json(json!({ "success": true, "name": req.name })))
+    Ok(Json(json!({ "success": true, "name": name })))
 }
 
 /// Delete an MCP server from the global config.
@@ -654,9 +738,14 @@ async fn delete_mcp_server(
         ));
     }
 
+    let mut agents = old_config.agents.clone();
+    for agent in &mut agents {
+        agent.runner.mcp_servers.retain(|server| server != &name);
+    }
+
     let new_config = Config {
         mcp_servers: new_mcp,
-        agents: old_config.agents.clone(),
+        agents,
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -1005,7 +1094,7 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
     }
 
-    /// Explicit connector configuration is still preserved.
+    /// Explicit MCP server configuration is still preserved.
     #[tokio::test]
     async fn test_explicit_mcp_servers_are_preserved() {
         let config_path = std::env::temp_dir().join("test-xpressclaw-wizard-override.yaml");

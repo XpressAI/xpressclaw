@@ -168,31 +168,33 @@
 			></textarea>
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<label class="block text-xs text-muted-foreground mb-1">Project</label>
+					<label class="block text-xs text-muted-foreground mb-1">Project
 					<select
 						bind:value={newAgentId}
-						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
 						{#each agentList as agent}
 							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
+					</label>
 				</div>
 				<div class="w-24">
-					<label class="block text-xs text-muted-foreground mb-1">Priority</label>
+					<label class="block text-xs text-muted-foreground mb-1">Priority
 					<select
 						bind:value={newPriority}
-						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
 						<option value={0}>Normal</option>
 						<option value={5}>High</option>
 						<option value={10}>Urgent</option>
 					</select>
+					</label>
 				</div>
 			</div>
 			{#if availableDeps.length > 0}
 				<div>
-					<label class="block text-xs text-muted-foreground mb-1">Depends on (optional)</label>
+					<div class="block text-xs text-muted-foreground mb-1">Depends on (optional)</div>
 					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
 						{#each availableDeps as dep}
 							<button

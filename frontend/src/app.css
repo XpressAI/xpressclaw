@@ -170,6 +170,12 @@
 	background-color: hsl(var(--card));
 	color: hsl(var(--foreground));
 }
+.dark select.composer-value-select {
+	background-color: transparent;
+	background-image: none;
+	border-color: transparent;
+	padding-right: 1rem;
+}
 .dark input[type="checkbox"] {
 	color-scheme: dark;
 	accent-color: hsl(var(--primary));

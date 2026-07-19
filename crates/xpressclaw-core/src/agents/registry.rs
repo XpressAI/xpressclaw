@@ -254,6 +254,17 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Clear a recovered runtime error without changing the logical session status.
+    pub fn clear_error(&self, agent_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET error_message = NULL WHERE id = ?1",
+                [agent_id],
+            )
+        })?;
+        Ok(())
+    }
+
     /// Remove agents from DB that are no longer in the YAML config.
     pub fn remove_stale(&self, valid_names: &[&str]) -> Result<()> {
         let existing = self.list()?;
@@ -340,6 +351,11 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, "error");
         assert_eq!(updated.error_message.as_deref(), Some("OOM killed"));
+
+        registry.clear_error("atlas").unwrap();
+        let recovered = registry.get("atlas").unwrap();
+        assert_eq!(recovered.status, "error");
+        assert!(recovered.error_message.is_none());
     }
 
     #[test]

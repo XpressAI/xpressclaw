@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { sessions } from '$lib/api';
-	import type { LiveConfig, NativeRunnerConfig } from '$lib/api';
+	import { mcpServers, sessions } from '$lib/api';
+	import type { AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
 		agentId: string;
 		saveSignal: number;
-		onSave: (data: { runner: NativeRunnerConfig }) => void;
+		onSave: (data: { runner: NativeRunnerConfig; volumes: string[] }) => void;
 	}
 
 	let { agentConfig, agentId, saveSignal, onSave }: Props = $props();
@@ -18,7 +18,23 @@
 	let subscriptionAuth = $state(true);
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
-	let modelOptions = $state<{ value: string; name: string }[]>([]);
+	let configOptions = $state<AcpConfigOption[]>([]);
+	let sessionConfig = $state<Record<string, string | boolean>>({});
+	let selectedMcpServers = $state<string[]>([]);
+	let serverCatalog = $state<McpServerDefinition[]>([]);
+	let environmentText = $state('');
+	let volumesText = $state('');
+	let addingMcp = $state(false);
+	let mcpName = $state('');
+	let mcpType = $state<'stdio' | 'http' | 'sse'>('stdio');
+	let mcpCommandOrUrl = $state('');
+	let mcpArgs = $state('');
+	let mcpEnvironment = $state('');
+	let mcpHeaders = $state('');
+	let editingMcpName = $state<string | null>(null);
+	let confirmDeleteMcp = $state<string | null>(null);
+	let mcpError = $state('');
+	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
 	const defaultImages: Record<string, { none: string; host: string }> = {
 		codex: {
 			none: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
@@ -47,6 +63,11 @@
 		return defaultImages[kind]?.[containerEngine] ?? '';
 	}
 
+	function selectChoices(option: AcpConfigOption | undefined): { value: string; name: string; description?: string | null }[] {
+		if (!option || !Array.isArray(option.options)) return [];
+		return option.options.flatMap((entry) => 'options' in entry ? entry.options : [entry]);
+	}
+
 	function selectDefaultImage() {
 		image = defaultImage();
 		if (kind === 'custom') subscriptionAuth = false;
@@ -58,20 +79,48 @@
 		if (kind !== 'custom' && replaceImage) image = defaultImage();
 	}
 
+	function validConfigOptions(value: unknown): AcpConfigOption[] {
+		if (!Array.isArray(value)) return [];
+		return value.filter((option): option is AcpConfigOption => {
+			if (typeof option !== 'object' || option === null) return false;
+			const item = option as Record<string, unknown>;
+			return typeof item.id === 'string' && typeof item.name === 'string'
+				&& (item.type === 'select' || item.type === 'boolean');
+		});
+	}
+
+	function modeOption(value: unknown): AcpConfigOption | null {
+		if (typeof value !== 'object' || value === null) return null;
+		const modes = value as unknown as AcpModeState;
+		if (typeof modes.currentModeId !== 'string' || !Array.isArray(modes.availableModes)) return null;
+		return {
+			id: 'mode', name: 'Mode', category: 'mode', type: 'select',
+			currentValue: modes.currentModeId,
+			options: modes.availableModes.map((mode) => ({ value: mode.id, name: mode.name, description: mode.description }))
+		};
+	}
+
+	function applyAdvertisedControls(events: Awaited<ReturnType<typeof sessions.events>>) {
+		const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
+		const options = validConfigOptions(advertised?.payload.config_options);
+		if (!options.some((option) => option.category === 'mode' || option.id === 'mode')) {
+			const legacyMode = modeOption(advertised?.payload.modes);
+			if (legacyMode) options.unshift(legacyMode);
+		}
+		configOptions = options;
+	}
+
 	onMount(async () => {
 		try {
-			const events = await sessions.events(agentId);
-			const advertised = [...events].reverse().find((event) => event.event_type === 'session_config_options');
-			const choices = advertised?.payload.models;
-			if (Array.isArray(choices)) {
-				modelOptions = choices.filter((choice): choice is { value: string; name: string } =>
-					typeof choice === 'object' && choice !== null
-					&& typeof (choice as Record<string, unknown>).value === 'string'
-					&& typeof (choice as Record<string, unknown>).name === 'string'
-				);
-			}
+			const [events, catalog] = await Promise.all([
+				sessions.events(agentId).catch(() => []),
+				mcpServers.list().catch(() => ({ servers: [] }))
+			]);
+			applyAdvertisedControls(events);
+			serverCatalog = catalog.servers;
 		} catch {
-			modelOptions = [];
+			configOptions = [];
+			serverCatalog = [];
 		}
 	});
 
@@ -85,6 +134,10 @@
 			image = builtInImages.has(agentConfig.runner.image) ? defaultImage() : agentConfig.runner.image;
 			workspace = agentConfig.runner.workspace ?? '';
 			model = agentConfig.runner.model ?? '';
+			sessionConfig = { ...agentConfig.runner.session_config };
+			selectedMcpServers = [...agentConfig.runner.mcp_servers];
+			environmentText = Object.entries(agentConfig.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
+			volumesText = agentConfig.volumes.join('\n');
 			subscriptionAuth = agentConfig.runner.subscription_auth;
 			commandText = agentConfig.runner.command.join('\n');
 		}
@@ -99,14 +152,108 @@
 					kind,
 					image: image.trim() || defaultImage(),
 					workspace: workspace.trim() || null,
-					model: model.trim() || null,
+					// Generic ACP model controls supersede the pre-discovery
+					// compatibility preference once the harness advertises them.
+					model: modelOptions.length > 0 ? null : (model.trim() || null),
+					session_config: sessionConfig,
+					mcp_servers: selectedMcpServers,
+					environment: Object.fromEntries(environmentText.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+						const separator = line.indexOf('=');
+						return separator === -1 ? [line, ''] : [line.slice(0, separator).trim(), line.slice(separator + 1)];
+					}).filter(([key]) => key)),
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
 					container_engine: containerEngine
-				}
+				},
+				volumes: volumesText.split('\n').map((line) => line.trim()).filter(Boolean)
 			});
 		}
 	});
+
+	function toggleMcp(name: string) {
+		selectedMcpServers = selectedMcpServers.includes(name)
+			? selectedMcpServers.filter((item) => item !== name)
+			: [...selectedMcpServers, name];
+	}
+
+	function parseKeyValueLines(value: string): Record<string, string> {
+		return Object.fromEntries(value.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+			const separator = line.indexOf('=');
+			return separator === -1 ? [line, ''] : [line.slice(0, separator).trim(), line.slice(separator + 1)];
+		}).filter(([key]) => key));
+	}
+
+	function formatKeyValueLines(value: Record<string, string> | string[] | undefined): string {
+		if (!value || Array.isArray(value)) return '';
+		return Object.entries(value).map(([key, entry]) => `${key}=${entry}`).join('\n');
+	}
+
+	function resetMcpForm() {
+		addingMcp = false;
+		editingMcpName = null;
+		mcpName = '';
+		mcpType = 'stdio';
+		mcpCommandOrUrl = '';
+		mcpArgs = '';
+		mcpEnvironment = '';
+		mcpHeaders = '';
+		mcpError = '';
+	}
+
+	function openNewMcp() {
+		resetMcpForm();
+		addingMcp = true;
+	}
+
+	function editMcpServer(server: McpServerDefinition) {
+		editingMcpName = server.name;
+		mcpName = server.name;
+		mcpType = server.type === 'http' || server.type === 'sse' ? server.type : 'stdio';
+		mcpCommandOrUrl = server.type === 'stdio' ? (server.command ?? '') : (server.url ?? '');
+		mcpArgs = server.args.join('\n');
+		mcpEnvironment = formatKeyValueLines(server.env);
+		mcpHeaders = formatKeyValueLines(server.headers);
+		mcpError = '';
+		addingMcp = true;
+	}
+
+	async function saveMcpServer() {
+		mcpError = '';
+		if (!mcpName.trim() || !mcpCommandOrUrl.trim()) return;
+		try {
+			const definition: McpServerDefinition = {
+				name: mcpName.trim(), type: mcpType,
+				command: mcpType === 'stdio' ? mcpCommandOrUrl.trim() : null,
+				url: mcpType === 'stdio' ? null : mcpCommandOrUrl.trim(),
+				args: mcpType === 'stdio' ? mcpArgs.split('\n').map((line) => line.trim()).filter(Boolean) : [],
+				env: mcpType === 'stdio' ? parseKeyValueLines(mcpEnvironment) : {},
+				headers: mcpType === 'stdio' ? {} : parseKeyValueLines(mcpHeaders)
+			};
+			await mcpServers.upsert(definition);
+			serverCatalog = (await mcpServers.list()).servers;
+			if (!selectedMcpServers.includes(definition.name)) selectedMcpServers = [...selectedMcpServers, definition.name];
+			resetMcpForm();
+		} catch (error) {
+			mcpError = String(error);
+		}
+	}
+
+	async function deleteMcpServer(name: string) {
+		if (confirmDeleteMcp !== name) {
+			confirmDeleteMcp = name;
+			return;
+		}
+		mcpError = '';
+		try {
+			await mcpServers.delete(name);
+			selectedMcpServers = selectedMcpServers.filter((item) => item !== name);
+			serverCatalog = (await mcpServers.list()).servers;
+			confirmDeleteMcp = null;
+			if (editingMcpName === name) resetMcpForm();
+		} catch (error) {
+			mcpError = String(error);
+		}
+	}
 </script>
 
 <div class="mx-auto max-w-3xl space-y-6">
@@ -117,7 +264,7 @@
 		</p>
 
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">
-			<div>
+			<div class={modelOptions.length > 0 ? 'sm:col-span-2' : ''}>
 				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Agent</label>
 				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 					<option value="codex">Codex</option>
@@ -126,7 +273,7 @@
 					<option value="custom">Other ACP agent</option>
 				</select>
 			</div>
-			<div>
+			{#if modelOptions.length === 0}<div>
 				<label for="runner-model" class="mb-1 block text-xs font-medium text-muted-foreground">Model</label>
 				<input id="runner-model" list="runner-model-options" bind:value={model} placeholder="Agent default" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				<datalist id="runner-model-options">
@@ -138,7 +285,7 @@
 					{modelOptions.length > 0 ? `${modelOptions.length} choices reported by the agent. ` : 'Choices appear after the agent starts its first session. '}
 					Leave blank to use the agent's default.
 				</p>
-			</div>
+			</div>{/if}
 		</div>
 
 		<div class="mt-4">
@@ -156,6 +303,107 @@
 			<input id="runner-image" bind:value={image} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 			<p class="mt-1 text-[11px] text-muted-foreground">Published images are pulled on demand. Extend one or provide a custom image whose command starts an ACP server over stdio.</p>
 		</div>
+	</div>
+
+	<div class="rounded-xl border border-border bg-card p-5">
+		<h2 class="text-sm font-semibold">Harness capabilities</h2>
+		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
+			These controls come directly from this ACP agent. They become available after its first turn and are applied before every new task turn.
+		</p>
+		{#if configOptions.length === 0}
+			<div class="mt-4 rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
+				Run one task to discover this harness's modes, models, reasoning levels, and custom controls.
+			</div>
+		{:else}
+			<div class="mt-4 grid gap-4 sm:grid-cols-2">
+				{#each configOptions as option}
+					<div>
+						<label for={`config-${option.id}`} class="mb-1 block text-xs font-medium text-muted-foreground">{option.name}</label>
+						{#if option.type === 'boolean'}
+							<label class="flex min-h-9 items-center gap-2 rounded-md border border-input bg-background px-3 text-sm">
+								<input id={`config-${option.id}`} type="checkbox"
+									checked={Boolean(sessionConfig[option.id] ?? option.currentValue)}
+									onchange={(event) => sessionConfig = { ...sessionConfig, [option.id]: event.currentTarget.checked }} />
+								Enabled
+							</label>
+						{:else}
+							<select id={`config-${option.id}`}
+								value={String(sessionConfig[option.id] ?? option.currentValue)}
+								onchange={(event) => sessionConfig = { ...sessionConfig, [option.id]: event.currentTarget.value }}
+								class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+								{#each selectChoices(option) as choice}
+									<option value={choice.value}>{choice.name}</option>
+								{/each}
+							</select>
+						{/if}
+						{#if option.description}<p class="mt-1 text-[11px] text-muted-foreground">{option.description}</p>{/if}
+					</div>
+				{/each}
+			</div>
+		{/if}
+	</div>
+
+	<div class="rounded-xl border border-border bg-card p-5">
+		<div class="flex items-start justify-between gap-3">
+			<div>
+				<h2 class="text-sm font-semibold">MCP servers</h2>
+				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">Attach only the servers this harness needs. Stdio commands are paths inside its image; HTTP and SSE servers can be remote.</p>
+			</div>
+			<button type="button" onclick={openNewMcp} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">+ Server</button>
+		</div>
+
+		{#if serverCatalog.length === 0 && !addingMcp}
+			<div class="mt-4 rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">No MCP servers configured.</div>
+		{:else}
+			<div class="mt-4 space-y-2">
+				{#each serverCatalog as server}
+					<div class="flex items-start gap-3 rounded-md border border-border/70 px-3 py-2.5 hover:bg-accent/30">
+						<input type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" checked={selectedMcpServers.includes(server.name)} onchange={() => toggleMcp(server.name)} />
+						<span class="min-w-0 flex-1">
+							<span class="block text-sm font-medium">{server.name} <span class="ml-1 text-[10px] font-normal uppercase text-muted-foreground">{server.type}</span></span>
+							<span class="block truncate font-mono text-[11px] text-muted-foreground">{server.command || server.url}</span>
+						</span>
+						<button type="button" onclick={() => editMcpServer(server)} class="text-[11px] text-muted-foreground hover:text-foreground">Edit</button>
+						<button type="button" onclick={() => deleteMcpServer(server.name)} class="text-[11px] {confirmDeleteMcp === server.name ? 'text-destructive' : 'text-muted-foreground hover:text-destructive'}">
+							{confirmDeleteMcp === server.name ? 'Confirm' : 'Delete'}
+						</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
+
+		{#if addingMcp}
+			<div class="mt-4 space-y-3 rounded-lg border border-border bg-background/50 p-3">
+				<div class="grid gap-3 sm:grid-cols-3">
+					<input bind:value={mcpName} disabled={editingMcpName !== null} placeholder="Server name" class="rounded-md border border-input bg-background px-3 py-2 text-sm disabled:opacity-60" />
+					<select bind:value={mcpType} class="rounded-md border border-input bg-background px-3 py-2 text-sm"><option value="stdio">stdio</option><option value="http">HTTP</option><option value="sse">SSE</option></select>
+					<input bind:value={mcpCommandOrUrl} placeholder={mcpType === 'stdio' ? '/absolute/path/in/container' : 'https://server.example/mcp'} class="rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" />
+				</div>
+				{#if mcpType === 'stdio'}
+					<textarea bind:value={mcpArgs} rows="3" placeholder="One argument per line" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea>
+					<textarea bind:value={mcpEnvironment} rows="3" placeholder={'Environment, one KEY=value per line\nAPI_TOKEN=...'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea>
+				{:else}
+					<textarea bind:value={mcpHeaders} rows="3" placeholder={'HTTP headers, one Name=value per line\nAuthorization=Bearer ...'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea>
+				{/if}
+				<p class="text-[11px] text-muted-foreground">Values are stored in the local XpressClaw configuration and supplied only to harnesses that enable this server.</p>
+				{#if mcpError}<p class="text-xs text-destructive">{mcpError}</p>{/if}
+				<div class="flex justify-end gap-2"><button type="button" onclick={resetMcpForm} class="rounded-md border border-border px-3 py-1.5 text-xs">Cancel</button><button type="button" onclick={saveMcpServer} disabled={!mcpName.trim() || !mcpCommandOrUrl.trim()} class="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-40">{editingMcpName ? 'Save' : 'Add and enable'}</button></div>
+			</div>
+		{/if}
+	</div>
+
+	<div class="rounded-xl border border-border bg-card p-5">
+		<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
+		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
+			With host login enabled, the harness's normal configuration directory is mounted read-write, so its installed skills, plugins, hooks, custom agents, and settings load normally. Project-local configuration is loaded from the workspace. Add explicit mounts for any other configuration directories.
+		</p>
+		<label for="customization-volumes" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Additional mounts</label>
+		<textarea id="customization-volumes" bind:value={volumesText} rows="4" placeholder={'~/my-claude-plugin:/home/node/.claude/plugins/my-plugin:ro\n~/shared-skills:/home/node/.codex/skills:ro'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
+		<p class="mt-1 text-[11px] text-muted-foreground">One <code>host-path:container-path[:ro]</code> mount per line. These are trusted harness inputs and may execute code through hooks or plugins.</p>
+
+		<label for="harness-environment" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Harness environment</label>
+		<textarea id="harness-environment" bind:value={environmentText} rows="4" placeholder={'CODEX_CONFIG={"features":{"example":true}}\nCLAUDE_CONFIG_DIR=/home/node/.claude'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
+		<p class="mt-1 text-[11px] text-muted-foreground">One <code>NAME=value</code> entry per line. Values are stored in the local XpressClaw configuration.</p>
 	</div>
 
 	<div class="rounded-xl border border-border bg-card p-5">
@@ -185,11 +433,11 @@
 		<div class="flex items-start gap-3">
 			<input id="subscription-auth" type="checkbox" bind:checked={subscriptionAuth} disabled={kind === 'custom'} class="mt-0.5 h-4 w-4 rounded border-input disabled:opacity-50" />
 			<div>
-				<label for="subscription-auth" class="text-sm font-medium">Use host subscription login</label>
+				<label for="subscription-auth" class="text-sm font-medium">Use host login and harness configuration</label>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
 						? 'Custom agents manage their own authentication; add any required directories in the Volumes tab.'
-						: "Mount the selected agent's standard login directory into each worker. Git identity and GitHub CLI auth are also shared when present; SSH keys require an explicit volume."}
+						: "Mount the selected agent's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. SSH keys still require an explicit mount."}
 				</p>
 				{#if subscriptionAuth}
 					<p class="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">

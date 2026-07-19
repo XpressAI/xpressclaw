@@ -1,6 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -9,6 +9,7 @@ use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::workers::acp::{AcpElicitationResponseError, CreateElicitationResponse};
 
 use crate::state::AppState;
 
@@ -30,12 +31,22 @@ pub struct StatusUpdate {
 pub struct MessageInput {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub config_options: std::collections::HashMap<String, Value>,
 }
 
 #[derive(Deserialize)]
 pub struct ActivityParams {
     pub after: Option<i64>,
+    pub before: Option<i64>,
     pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct ElicitationResponseInput {
+    pub action: String,
+    pub content: Option<Value>,
+    pub message: Option<String>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -50,6 +61,10 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/status", patch(update_task_status))
         .route("/{id}/messages", get(get_messages).post(add_message))
         .route("/{id}/activity", get(get_activity))
+        .route(
+            "/{id}/elicitations/{elicitation_id}/response",
+            post(respond_to_elicitation),
+        )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
 }
 
@@ -175,6 +190,7 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state.elicitations.cancel_task(&id);
     let board = TaskBoard::new(state.db.clone());
     board.delete(&id).map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -191,6 +207,57 @@ async fn update_task_status(
             StatusCode::CONFLICT,
             Json(json!({ "error": "all subtasks must be completed first" })),
         ));
+    }
+    if req.status == "cancelled" {
+        let active_attempt_id = state
+            .db
+            .with_conn(|conn| {
+                let attempt_id = conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                Ok::<_, xpressclaw_core::error::Error>(attempt_id)
+            })
+            .map_err(internal_error)?;
+        if let Some(attempt_id) = active_attempt_id {
+            let sessions = SessionManager::new(state.db.clone());
+            if let Ok(attempt) = sessions.get_attempt(&attempt_id) {
+                if !matches!(
+                    attempt.status.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) {
+                    sessions
+                        .transition_attempt(
+                            &attempt_id,
+                            "cancelled",
+                            "Work cancelled by user",
+                            None,
+                            None,
+                        )
+                        .map_err(internal_error)?;
+                    if let Some(queue_id) = attempt.queue_id {
+                        state
+                            .db
+                            .with_conn(|conn| {
+                                conn.execute(
+                                    "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                                        harness_response = 'cancelled by user' WHERE id = ?1",
+                                    [queue_id],
+                                )?;
+                                Ok::<_, xpressclaw_core::error::Error>(())
+                            })
+                            .map_err(internal_error)?;
+                    }
+                }
+            }
+            state.elicitations.cancel_attempt(&attempt_id);
+            if let Some(docker) = state.docker().await {
+                let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
+            }
+        } else {
+            state.elicitations.cancel_task(&id);
+        }
     }
     let updated = if req.status == "completed" {
         board
@@ -240,6 +307,12 @@ async fn get_activity(
     Path(id): Path<String>,
     Query(params): Query<ActivityParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if params.after.is_some() && params.before.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "use either 'after' or 'before', not both" })),
+        ));
+    }
     TaskBoard::new(state.db.clone())
         .get(&id)
         .map_err(|error| match &error {
@@ -253,11 +326,83 @@ async fn get_activity(
         .task_activity(
             &id,
             params.after,
+            params.before,
             params.limit.unwrap_or(250).clamp(1, 500),
             20,
         )
         .map_err(internal_error)?;
     Ok(Json(json!(activity)))
+}
+
+async fn respond_to_elicitation(
+    State(state): State<AppState>,
+    Path((id, elicitation_id)): Path<(String, String)>,
+    Json(req): Json<ElicitationResponseInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    TaskBoard::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            _ => internal_error(error),
+        })?;
+
+    if !matches!(req.action.as_str(), "accept" | "decline" | "cancel") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "action must be accept, decline, or cancel" })),
+        ));
+    }
+    let mut wire = json!({ "action": req.action });
+    if req.action == "accept" {
+        let content = req.content.clone().unwrap_or_else(|| json!({}));
+        if !content.is_object() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "accepted elicitation content must be an object" })),
+            ));
+        }
+        wire["content"] = content;
+    }
+    let response: CreateElicitationResponse = serde_json::from_value(wire).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid elicitation response: {error}") })),
+        )
+    })?;
+
+    state
+        .elicitations
+        .respond(&id, &elicitation_id, response)
+        .map_err(|error| match error {
+            AcpElicitationResponseError::WrongTask => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "elicitation does not belong to this task" })),
+            ),
+            AcpElicitationResponseError::NotFound | AcpElicitationResponseError::Closed => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "this question is no longer awaiting a response" })),
+            ),
+        })?;
+
+    if req.action == "accept" {
+        let message = req
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "Answered the agent's question".to_string());
+        if let Err(error) =
+            TaskConversation::new(state.db.clone()).add_message(&id, "user", &message)
+        {
+            tracing::warn!(%error, task_id = id, "failed to persist elicitation answer in task chat");
+        }
+    }
+
+    Ok(Json(json!({ "resolved": true, "action": req.action })))
 }
 
 async fn add_message(
@@ -307,7 +452,11 @@ async fn add_message(
                     source_id: Some("local-user"),
                     event_type: "task_message_received",
                     summary: &req.content,
-                    payload: json!({ "role": req.role, "content": req.content }),
+                    payload: json!({
+                        "role": req.role,
+                        "content": req.content,
+                        "config_options": req.config_options,
+                    }),
                 },
             )
             .map_err(internal_error)?;

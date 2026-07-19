@@ -4,13 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use agent_client_protocol::schema::v1::{
+    EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
+};
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 use crate::config::{
-    default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, NativeRunnerConfig,
+    default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
+    NativeRunnerConfig,
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
@@ -21,7 +25,10 @@ use crate::sessions::SessionManager;
 use crate::tasks::board::TaskBoard;
 use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::{QueueItem, TaskQueue};
-use crate::workers::acp::{run_turn, AcpEventRecorder};
+use crate::workers::acp::{run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnOptions};
+use crate::workers::github;
+
+const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-github-v1";
 
 /// Consume the durable task queue as an Agent Client Protocol client. Each
 /// queue item gets its own short-lived ACP server container and publishes
@@ -31,6 +38,7 @@ pub async fn start_dispatcher(
     config: Arc<RwLock<Arc<Config>>>,
     initial_docker: Option<Arc<DockerManager>>,
     event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
 ) {
     info!("native attempt dispatcher started");
     let concurrency = Arc::new(Semaphore::new(4));
@@ -63,11 +71,18 @@ pub async fn start_dispatcher(
                 let db = db.clone();
                 let config = config.read().unwrap().clone();
                 let event_bus = event_bus.clone();
+                let elicitation_broker = elicitation_broker.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) =
-                        execute_item(db.clone(), config, docker, event_bus.clone(), item.clone())
-                            .await
+                    if let Err(error) = execute_item(
+                        db.clone(),
+                        config,
+                        docker,
+                        event_bus.clone(),
+                        elicitation_broker,
+                        item.clone(),
+                    )
+                    .await
                     {
                         error!(
                             queue_id = item.id,
@@ -97,6 +112,7 @@ async fn execute_item(
     config: Arc<Config>,
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
     item: QueueItem,
 ) -> Result<()> {
     let attempt_id = item
@@ -112,6 +128,7 @@ async fn execute_item(
         })?;
     let kind = resolve_runner_kind(agent)?;
     let resume_session_id = resume_session_id(&db, &item, &kind)?;
+    let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let prompt = build_prompt(&db, &item, attempt_id)?;
     db.with_conn(|conn| {
         conn.execute(
@@ -142,7 +159,9 @@ async fn execute_item(
     if let Some(native_session_id) = resume_session_id.as_deref() {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
-    let mut spec = build_spec(&config, agent, &kind, &docker)?;
+    let workspace = resolved_workspace(&config, agent);
+    let github = github::discover(&db, &workspace);
+    let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -176,6 +195,27 @@ async fn execute_item(
             }
         }
     }
+    let mut mcp_servers = configured_mcp_servers(&config, agent)?;
+    if let Some(access) = github.as_ref() {
+        if docker
+            .image_has_label(
+                &spec.image,
+                "io.xpressclaw.protocol",
+                BUILT_IN_RUNNER_PROTOCOL,
+            )
+            .await
+        {
+            if !agent.runner.mcp_servers.iter().any(|name| name == "github") {
+                mcp_servers.push(access.mcp_server());
+            }
+        } else {
+            warn!(
+                image = spec.image,
+                repository = access.repository(),
+                "runner image does not include the constrained GitHub MCP server"
+            );
+        }
+    }
     let workload_id = format!("attempt-{attempt_id}");
     let attached = docker.launch_attached(&workload_id, &spec).await?;
     sessions.set_container(attempt_id, &attached.info.container_id)?;
@@ -198,10 +238,15 @@ async fn execute_item(
     let turn = run_turn(
         attached,
         recorder,
+        elicitation_broker,
         resume_session_id.as_deref(),
         Path::new(&container_workspace),
         &prompt,
-        agent.runner.model.as_deref(),
+        AcpTurnOptions {
+            model: agent.runner.model.clone(),
+            session_config: requested_session_config,
+            mcp_servers,
+        },
     )
     .await;
     let _ = docker.stop(&workload_id).await;
@@ -525,21 +570,157 @@ async fn runner_image_ready(
     built_in_image: bool,
     agent: &AgentConfig,
 ) -> bool {
-    if !docker.has_image(image).await {
-        return false;
+    runner_image_compatible(
+        docker,
+        image,
+        built_in_image,
+        built_in_image && agent.runner.container_engine == ContainerEngineAccess::Host,
+    )
+    .await
+}
+
+/// Apply the one compatibility contract used by readiness checks and the
+/// dispatcher. Keeping this in the core worker module prevents the UI from
+/// accepting a stale local image that the dispatcher will reject (or vice
+/// versa), which otherwise turns Prepare runner into an unnecessary registry
+/// pull.
+pub async fn runner_image_compatible(
+    docker: &DockerManager,
+    image: &str,
+    built_in_image: bool,
+    host_engine_image: bool,
+) -> bool {
+    docker.has_image(image).await
+        && (!built_in_image
+            || docker
+                .image_has_label(image, "io.xpressclaw.protocol", BUILT_IN_RUNNER_PROTOCOL)
+                .await)
+        && (!host_engine_image
+            || docker
+                .image_has_label(image, "io.xpressclaw.container-engine", "host")
+                .await)
+}
+
+fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<McpServer>> {
+    agent
+        .runner
+        .mcp_servers
+        .iter()
+        .map(|name| {
+            let server = config.mcp_servers.get(name).ok_or_else(|| {
+                Error::Backend(format!(
+                    "harness references MCP server '{name}', but it is not configured"
+                ))
+            })?;
+            mcp_server_from_config(name, server)
+        })
+        .collect()
+}
+
+fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpServer> {
+    let headers = || {
+        config
+            .headers
+            .iter()
+            .map(|(name, value)| HttpHeader::new(name, value))
+            .collect::<Vec<_>>()
+    };
+    match config.server_type.as_str() {
+        "stdio" => {
+            let command = config
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| Error::Backend(format!("MCP server '{name}' has no command")))?;
+            if !Path::new(command).is_absolute() {
+                return Err(Error::Backend(format!(
+                    "MCP server '{name}' command must be an absolute path inside the harness container"
+                )));
+            }
+            let env = config
+                .env
+                .iter()
+                .map(|(name, value)| EnvVariable::new(name, value))
+                .collect();
+            Ok(McpServer::Stdio(
+                McpServerStdio::new(name, command)
+                    .args(config.args.clone())
+                    .env(env),
+            ))
+        }
+        "http" => {
+            let url = config
+                .url
+                .as_deref()
+                .ok_or_else(|| Error::Backend(format!("HTTP MCP server '{name}' has no URL")))?;
+            Ok(McpServer::Http(
+                McpServerHttp::new(name, url).headers(headers()),
+            ))
+        }
+        "sse" => {
+            let url = config
+                .url
+                .as_deref()
+                .ok_or_else(|| Error::Backend(format!("SSE MCP server '{name}' has no URL")))?;
+            Ok(McpServer::Sse(
+                McpServerSse::new(name, url).headers(headers()),
+            ))
+        }
+        other => Err(Error::Backend(format!(
+            "MCP server '{name}' has unsupported transport '{other}'"
+        ))),
     }
-    if built_in_image
-        && !docker
-            .image_has_label(image, "io.xpressclaw.protocol", "acp")
-            .await
+}
+
+/// Merge harness defaults, workflow/task overrides, and the controls chosen
+/// alongside the latest user message. Values stay keyed by opaque ACP option
+/// IDs; the adapter remains the source of truth for what each option means.
+fn requested_session_config(
+    db: &Arc<Database>,
+    agent: &AgentConfig,
+    task_id: &str,
+) -> Result<std::collections::HashMap<String, Value>> {
+    let mut requested = agent.runner.session_config.clone();
+    let task = TaskBoard::new(db.clone()).get(task_id)?;
+    if let Some(overrides) = task
+        .context
+        .as_ref()
+        .and_then(|context| context.get("session_config"))
+        .and_then(Value::as_object)
     {
-        return false;
+        requested.extend(
+            overrides
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
     }
-    agent.runner.container_engine != ContainerEngineAccess::Host
-        || !built_in_image
-        || docker
-            .image_has_label(image, "io.xpressclaw.container-engine", "host")
-            .await
+
+    let latest_message_payload: Option<String> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT payload FROM session_events
+             WHERE task_id = ?1 AND event_type = 'task_message_received'
+             ORDER BY id DESC LIMIT 1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if let Some(overrides) = latest_message_payload
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .as_ref()
+        .and_then(|payload| payload.get("config_options"))
+        .and_then(Value::as_object)
+    {
+        requested.extend(
+            overrides
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    Ok(requested)
 }
 
 fn build_spec(
@@ -547,18 +728,10 @@ fn build_spec(
     agent: &AgentConfig,
     kind: &str,
     docker: &DockerManager,
+    github: Option<&github::GithubSessionAccess>,
 ) -> Result<ContainerSpec> {
     let image = resolved_runner_image(&agent.runner, kind)?;
-    let workspace = agent
-        .runner
-        .workspace
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(expand_home)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config.system.workspace_dir.clone());
-    let workspace = canonical_or_original(&workspace);
+    let workspace = resolved_workspace(config, agent);
     let container_workspace = container_workspace_path(&workspace, agent.runner.container_engine);
     let command = acp_command_for(&agent.runner, kind, &container_workspace)?;
     let mut volumes = vec![VolumeMount {
@@ -579,6 +752,15 @@ fn build_spec(
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
+    for (name, value) in &agent.runner.environment {
+        if name.trim().is_empty() || name.contains('=') {
+            return Err(Error::Backend(format!(
+                "invalid harness environment variable name: {name:?}"
+            )));
+        }
+        environment.push(format!("{name}={value}"));
+    }
+    github::extend_git_environment(&mut environment, github);
     if agent.runner.container_engine == ContainerEngineAccess::Host {
         let socket = docker.host_engine_socket().ok_or_else(|| {
             Error::DockerNotAvailable(
@@ -614,6 +796,19 @@ fn container_workspace_path(workspace: &Path, container_engine: ContainerEngineA
     } else {
         "/workspace".to_string()
     }
+}
+
+fn resolved_workspace(config: &Config, agent: &AgentConfig) -> PathBuf {
+    let workspace = agent
+        .runner
+        .workspace
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(expand_home)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.system.workspace_dir.clone());
+    canonical_or_original(&workspace)
 }
 
 pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
@@ -723,18 +918,7 @@ pub fn subscription_auth_available(kind: &str) -> bool {
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
-    let Some(home) = host_home() else {
-        return Vec::new();
-    };
-    let mut candidates = auth_candidates(kind);
-    // Git identity and `gh` authentication let coding workflows push or mark
-    // a PR ready without copying credentials into the image. SSH keys are not
-    // mounted implicitly; users can opt in with an explicit volume.
-    candidates.extend([
-        (home.join(".gitconfig"), "/home/node/.gitconfig", true),
-        (home.join(".config/gh"), "/home/node/.config/gh", true),
-    ]);
-    candidates
+    auth_candidates(kind)
         .into_iter()
         .filter(|(source, _, _)| source.exists())
         .map(|(source, target, read_only)| VolumeMount {
@@ -836,6 +1020,121 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn converts_selected_mcp_servers_to_acp_session_configuration() {
+        let stdio = mcp_server_from_config(
+            "project-tools",
+            &McpServerConfig {
+                command: Some("/opt/project/mcp-server".into()),
+                args: vec!["--stdio".into()],
+                env: [("PROJECT_ROOT".into(), "/workspace".into())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let McpServer::Stdio(stdio) = stdio else {
+            panic!("expected stdio MCP configuration");
+        };
+        assert_eq!(stdio.name, "project-tools");
+        assert_eq!(stdio.command, PathBuf::from("/opt/project/mcp-server"));
+        assert_eq!(stdio.args, ["--stdio"]);
+        assert_eq!(stdio.env.len(), 1);
+
+        let http = mcp_server_from_config(
+            "metrics",
+            &McpServerConfig {
+                server_type: "http".into(),
+                url: Some("https://mcp.example.test/rpc".into()),
+                headers: [("Authorization".into(), "Bearer test".into())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let McpServer::Http(http) = http else {
+            panic!("expected HTTP MCP configuration");
+        };
+        assert_eq!(http.name, "metrics");
+        assert_eq!(http.url, "https://mcp.example.test/rpc");
+        assert_eq!(http.headers.len(), 1);
+
+        let error = mcp_server_from_config(
+            "host-only",
+            &McpServerConfig {
+                command: Some("npx".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("absolute path inside the harness container"));
+    }
+
+    #[test]
+    fn message_controls_override_workflow_and_harness_session_defaults() {
+        use crate::sessions::NewEvent;
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("atlas", Some("Atlas")).unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Configurable turn".into(),
+                agent_id: Some("atlas".into()),
+                context: Some(json!({
+                    "session_config": {
+                        "mode": "plan",
+                        "thought_level": "medium"
+                    }
+                })),
+                ..Default::default()
+            })
+            .unwrap();
+        sessions
+            .append_event(
+                "atlas",
+                NewEvent {
+                    attempt_id: None,
+                    task_id: Some(&task.id),
+                    source_type: "user",
+                    source_id: None,
+                    event_type: "task_message_received",
+                    summary: "Change controls",
+                    payload: json!({
+                        "config_options": {
+                            "mode": "build",
+                            "approval_policy": true
+                        }
+                    }),
+                },
+            )
+            .unwrap();
+
+        let agent = AgentConfig {
+            runner: NativeRunnerConfig {
+                session_config: [
+                    ("mode".into(), json!("default")),
+                    ("model".into(), json!("fast")),
+                    ("approval_policy".into(), json!(false)),
+                ]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let requested = requested_session_config(&db, &agent, &task.id).unwrap();
+        assert_eq!(requested.get("model"), Some(&json!("fast")));
+        assert_eq!(requested.get("thought_level"), Some(&json!("medium")));
+        assert_eq!(requested.get("mode"), Some(&json!("build")));
+        assert_eq!(requested.get("approval_policy"), Some(&json!(true)));
+    }
 
     #[test]
     fn resolves_legacy_claude_backend_to_native_cli() {

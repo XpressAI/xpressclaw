@@ -49,9 +49,9 @@
 
 <svelte:window onclick={onclose} />
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="fixed z-50 rounded-lg border border-border bg-card shadow-xl py-1 min-w-[220px] max-h-[200px] overflow-y-auto"
-	style="left: {x}px; top: {y}px" onclick={(e) => e.stopPropagation()}>
+	style="left: {x}px; top: {y}px" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}
+	role="listbox" tabindex="-1" aria-label="Workflow variables">
 	{#if filtered.length === 0}
 		<div class="px-3 py-2 text-xs text-muted-foreground">No matching variables</div>
 	{:else}

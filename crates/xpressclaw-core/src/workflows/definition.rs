@@ -50,6 +50,30 @@ pub struct Step {
     pub agent: Option<String>,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Optional harness-native slash command. The rendered prompt is passed
+    /// as its argument, so `command: /loop` plus a goal prompt behaves like
+    /// the same command in the native product UI.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// ACP configuration values to apply before this step's prompt. Keys are
+    /// the opaque IDs advertised by the selected harness (for example mode,
+    /// model, or reasoning effort).
+    #[serde(default)]
+    pub session_config: HashMap<String, Value>,
+    /// Optional MCP tool that the selected native harness must invoke during
+    /// this step. ACP attaches the server to the native session; the tool call
+    /// itself remains part of the agent turn because ACP has no client-side
+    /// MCP invocation method.
+    #[serde(default)]
+    pub mcp_server: Option<String>,
+    #[serde(default)]
+    pub mcp_tool: Option<String>,
+    #[serde(default)]
+    pub mcp_arguments: Option<Value>,
+    /// Start a clean native conversation for this step. Dependencies still
+    /// take precedence so dependent steps can deliberately continue context.
+    #[serde(default)]
+    pub new_session: bool,
     #[serde(default)]
     pub procedure: Option<String>,
     #[serde(default)]
@@ -116,6 +140,22 @@ impl WorkflowDefinition {
     pub fn to_yaml(&self) -> Result<String> {
         serde_yaml::to_string(self)
             .map_err(|e| Error::Workflow(format!("YAML serialize error: {e}")))
+    }
+
+    /// Whether this definition depends on the connector runtime that is
+    /// intentionally disabled for the ACP beta.
+    pub fn uses_connector_automation(&self) -> bool {
+        self.trigger.is_some()
+            || self
+                .flows
+                .values()
+                .any(|flow| Self::steps_use_connectors(&flow.steps))
+    }
+
+    fn steps_use_connectors(steps: &[Step]) -> bool {
+        steps.iter().any(|step| {
+            step.step_type == "sink" || step.body.as_deref().is_some_and(Self::steps_use_connectors)
+        })
     }
 
     /// Validate the definition:
@@ -668,6 +708,48 @@ flows:
         let sinks = step.sinks.as_ref().unwrap();
         assert_eq!(sinks.len(), 1);
         assert_eq!(sinks[0].connector, "telegram");
+    }
+
+    #[test]
+    fn detects_connector_automation_in_triggers_and_nested_sinks() {
+        let triggered = WorkflowDefinition::parse(SAMPLE_YAML).unwrap();
+        assert!(triggered.uses_connector_automation());
+
+        let nested_sink = WorkflowDefinition::parse(
+            r#"
+name: nested-sink
+flows:
+  main:
+    steps:
+      - id: iterate
+        type: loop
+        over: "{{items}}"
+        as: item
+        steps:
+          - id: notify
+            type: sink
+            sinks:
+              - connector: webhook
+                channel: results
+"#,
+        )
+        .unwrap();
+        assert!(nested_sink.uses_connector_automation());
+
+        let native_only = WorkflowDefinition::parse(
+            r#"
+name: native-only
+flows:
+  main:
+    steps:
+      - id: implement
+        type: step
+        agent: codex
+        prompt: Implement the change.
+"#,
+        )
+        .unwrap();
+        assert!(!native_only.uses_connector_automation());
     }
 
     #[test]

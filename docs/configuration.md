@@ -75,6 +75,12 @@ selects the matching host-engine image for a built-in runner. The project and
 additional folders are mounted at their absolute host paths so Compose bind
 mounts resolve against the same paths in the host engine.
 
+Docker versus Podman is not a configuration choice. Xpressclaw automatically
+uses an explicit `DOCKER_HOST`, then a live user-level Docker Desktop or
+rootless Podman socket, then the platform Docker default. Image inspection,
+pulls, worker launches, and trusted host-engine access all use that one
+selected endpoint.
+
 This mode gives the runner the authority of the host Docker or Podman daemon:
 it can manage containers, images, networks, and volumes and ask the daemon to
 mount host paths. It is intentionally opt-in and is suitable only when the

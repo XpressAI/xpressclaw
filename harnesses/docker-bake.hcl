@@ -10,49 +10,55 @@ variable "TAG" {
 }
 
 group "default" {
-  targets = ["native-codex", "native-claude", "native-opencode", "native-codex-docker", "native-claude-docker", "native-opencode-docker", "base", "generic", "claude-sdk", "xaibo", "langchain"]
+  targets = ["native-codex", "native-claude", "native-opencode", "native-codex-docker", "native-claude-docker", "native-opencode-docker"]
+}
+
+// Retained only for developers maintaining the pre-ACP compatibility images.
+// Product builds and releases do not build or publish this group.
+group "legacy" {
+  targets = ["base", "generic", "claude-sdk", "xaibo", "langchain"]
 }
 
 target "native-codex" {
-  context    = "./native/codex"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "codex/Dockerfile"
   target     = "runner"
-  tags       = ["xpressclaw-runner-codex:${TAG}", "${REGISTRY}/xpressclaw-runner-codex:${TAG}"]
+  tags       = ["xpressclaw-runner-codex:${TAG}", "localhost/xpressclaw-runner-codex:${TAG}", "${REGISTRY}/xpressclaw-runner-codex:${TAG}"]
 }
 
 target "native-claude" {
-  context    = "./native/claude"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "claude/Dockerfile"
   target     = "runner"
-  tags       = ["xpressclaw-runner-claude:${TAG}", "${REGISTRY}/xpressclaw-runner-claude:${TAG}"]
+  tags       = ["xpressclaw-runner-claude:${TAG}", "localhost/xpressclaw-runner-claude:${TAG}", "${REGISTRY}/xpressclaw-runner-claude:${TAG}"]
 }
 
 target "native-opencode" {
-  context    = "./native/opencode"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "opencode/Dockerfile"
   target     = "runner"
-  tags       = ["xpressclaw-runner-opencode:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode:${TAG}"]
+  tags       = ["xpressclaw-runner-opencode:${TAG}", "localhost/xpressclaw-runner-opencode:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode:${TAG}"]
 }
 
 target "native-codex-docker" {
-  context    = "./native/codex"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "codex/Dockerfile"
   target     = "runner-host"
-  tags       = ["xpressclaw-runner-codex-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-codex-docker:${TAG}"]
+  tags       = ["xpressclaw-runner-codex-docker:${TAG}", "localhost/xpressclaw-runner-codex-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-codex-docker:${TAG}"]
 }
 
 target "native-claude-docker" {
-  context    = "./native/claude"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "claude/Dockerfile"
   target     = "runner-host"
-  tags       = ["xpressclaw-runner-claude-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-claude-docker:${TAG}"]
+  tags       = ["xpressclaw-runner-claude-docker:${TAG}", "localhost/xpressclaw-runner-claude-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-claude-docker:${TAG}"]
 }
 
 target "native-opencode-docker" {
-  context    = "./native/opencode"
-  dockerfile = "Dockerfile"
+  context    = "./native"
+  dockerfile = "opencode/Dockerfile"
   target     = "runner-host"
-  tags       = ["xpressclaw-runner-opencode-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode-docker:${TAG}"]
+  tags       = ["xpressclaw-runner-opencode-docker:${TAG}", "localhost/xpressclaw-runner-opencode-docker:${TAG}", "${REGISTRY}/xpressclaw-runner-opencode-docker:${TAG}"]
 }
 
 target "base" {

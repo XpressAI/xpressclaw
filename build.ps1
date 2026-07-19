@@ -53,15 +53,42 @@ if (-not $SkipTauri) {
     npx -y @tauri-apps/cli build --target $triple
 }
 
-if ((-not $SkipDocker) -and (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Host "==> Building agent harness Docker images..."
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-base:latest harnesses/base
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-generic:latest harnesses/generic
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-claude-sdk:latest harnesses/claude-sdk
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-langchain:latest harnesses/langchain
-    docker build -t ghcr.io/xpressai/xpressclaw-harness-xaibo:latest harnesses/xaibo
+$ContainerRuntime = $null
+if (-not $SkipDocker) {
+    foreach ($candidate in @("docker", "podman")) {
+        if (Get-Command $candidate -ErrorAction SilentlyContinue) {
+            & $candidate info *> $null
+            if ($LASTEXITCODE -eq 0) {
+                $ContainerRuntime = $candidate
+                break
+            }
+        }
+    }
+}
+
+if ($ContainerRuntime) {
+    $BuildArgs = @("build")
+    if ($ContainerRuntime -eq "docker") {
+        & docker buildx version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $BuildArgs = @("buildx", "build", "--load")
+        }
+    }
+    Write-Host "==> Building native ACP runner images with $ContainerRuntime $($BuildArgs -join ' ')..."
+    foreach ($runner in @("codex", "claude", "opencode")) {
+        & $ContainerRuntime @BuildArgs --file "harnesses/native/$runner/Dockerfile" --target runner `
+            --tag "xpressclaw-runner-${runner}:latest" `
+            --tag "localhost/xpressclaw-runner-${runner}:latest" harnesses/native
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        & $ContainerRuntime @BuildArgs --file "harnesses/native/$runner/Dockerfile" --target runner-host `
+            --tag "xpressclaw-runner-${runner}-docker:latest" `
+            --tag "localhost/xpressclaw-runner-${runner}-docker:latest" harnesses/native
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+} elseif ($SkipDocker) {
+    Write-Host "==> Skipping runner builds (--skip-docker)"
 } else {
-    Write-Host "==> Skipping harness builds"
+    Write-Host "==> Skipping runner builds (no usable Docker or Podman runtime found)"
 }
 
 if (-not $SkipCheck) {

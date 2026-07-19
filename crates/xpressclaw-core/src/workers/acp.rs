@@ -5,12 +5,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
-    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, TextContent, ToolCallStatus,
+    BooleanConfigOptionCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+    CreateElicitationRequest, ElicitationAction, ElicitationCapabilities,
+    ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, McpServer,
+    NewSessionRequest, PermissionOptionKind, PlanEntryStatus, PromptRequest,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
+    SessionConfigSelectOptions, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
@@ -18,7 +23,9 @@ use bollard::container::LogOutput;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::docker::manager::AttachedContainer;
@@ -30,6 +37,109 @@ const MAX_EVENTS: usize = 250;
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
 
+struct PendingElicitation {
+    task_id: String,
+    attempt_id: String,
+    responder: oneshot::Sender<CreateElicitationResponse>,
+}
+
+/// Coordinates agent-initiated forms with the task HTTP API while the ACP
+/// prompt remains in flight. The durable session event owns presentation and
+/// recovery; this broker only owns the live response channel to the container.
+#[derive(Default)]
+pub struct AcpElicitationBroker {
+    pending: Mutex<HashMap<String, PendingElicitation>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpElicitationResponseError {
+    NotFound,
+    WrongTask,
+    Closed,
+}
+
+impl AcpElicitationBroker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn begin(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> (String, oneshot::Receiver<CreateElicitationResponse>) {
+        let id = Uuid::new_v4().to_string();
+        let (responder, receiver) = oneshot::channel();
+        self.pending.lock().unwrap().insert(
+            id.clone(),
+            PendingElicitation {
+                task_id: task_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                responder,
+            },
+        );
+        (id, receiver)
+    }
+
+    fn abandon(&self, elicitation_id: &str) {
+        self.pending.lock().unwrap().remove(elicitation_id);
+    }
+
+    pub fn respond(
+        &self,
+        task_id: &str,
+        elicitation_id: &str,
+        response: CreateElicitationResponse,
+    ) -> std::result::Result<(), AcpElicitationResponseError> {
+        let pending = {
+            let mut entries = self.pending.lock().unwrap();
+            let Some(entry) = entries.get(elicitation_id) else {
+                return Err(AcpElicitationResponseError::NotFound);
+            };
+            if entry.task_id != task_id {
+                return Err(AcpElicitationResponseError::WrongTask);
+            }
+            entries.remove(elicitation_id).unwrap()
+        };
+        pending
+            .responder
+            .send(response)
+            .map_err(|_| AcpElicitationResponseError::Closed)
+    }
+
+    /// Cancel live questions for an attempt before its container is stopped.
+    /// Returning an ACP cancellation releases any adapter waiting inside a
+    /// tool call instead of leaving the dispatcher future parked forever.
+    pub fn cancel_attempt(&self, attempt_id: &str) -> usize {
+        self.cancel_matching(|entry| entry.attempt_id == attempt_id)
+    }
+
+    pub fn cancel_task(&self, task_id: &str) -> usize {
+        self.cancel_matching(|entry| entry.task_id == task_id)
+    }
+
+    fn cancel_matching(&self, matches: impl Fn(&PendingElicitation) -> bool) -> usize {
+        let pending = {
+            let mut entries = self.pending.lock().unwrap();
+            let ids = entries
+                .iter()
+                .filter(|(_, entry)| matches(entry))
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| entries.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        let count = pending.len();
+        for entry in pending {
+            let _ = entry
+                .responder
+                .send(CreateElicitationResponse::new(ElicitationAction::Cancel));
+        }
+        count
+    }
+}
+
 /// Result of one ACP prompt turn. ACP session IDs remain opaque and are only
 /// used with `session/resume` or `session/load` on later attempts.
 #[derive(Debug)]
@@ -38,6 +148,15 @@ pub struct AcpTurnResult {
     pub summary: String,
     pub stop_reason: String,
     pub diagnostic: String,
+}
+
+/// Per-turn client choices applied after the ACP session is created or
+/// resumed and before its prompt is sent.
+#[derive(Debug, Default)]
+pub struct AcpTurnOptions {
+    pub model: Option<String>,
+    pub session_config: HashMap<String, Value>,
+    pub mcp_servers: Vec<McpServer>,
 }
 
 #[derive(Debug, Default)]
@@ -203,9 +322,20 @@ impl AcpEventRecorder {
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_thought()?;
-                self.record_config_options(&update.config_options)?;
+                self.record_session_controls(&update.config_options, None)?;
             }
-            SessionUpdate::AvailableCommandsUpdate(_) | SessionUpdate::UserMessageChunk(_) => {}
+            SessionUpdate::AvailableCommandsUpdate(update) => {
+                self.flush_thought()?;
+                self.append_event(
+                    "available_commands",
+                    &format!(
+                        "Agent advertised {} commands",
+                        update.available_commands.len()
+                    ),
+                    json!({ "available_commands": update.available_commands }),
+                )?;
+            }
+            SessionUpdate::UserMessageChunk(_) => {}
             _ => {}
         }
         Ok(())
@@ -226,6 +356,85 @@ impl AcpEventRecorder {
         let _ = self.append_event("permission", &summary, payload);
     }
 
+    fn record_elicitation_pending(
+        &self,
+        elicitation_id: &str,
+        request: &CreateElicitationRequest,
+    ) -> Result<()> {
+        self.flush_thought()?;
+        SessionManager::new(self.db.clone()).transition_attempt(
+            &self.attempt_id,
+            "waiting_for_input",
+            "Waiting for your answer",
+            None,
+            None,
+        )?;
+        TaskBoard::new(self.db.clone()).update_status(
+            &self.task_id,
+            "waiting_for_input",
+            Some(&self.logical_session_id),
+        )?;
+        let mut payload = serde_json::to_value(request).map_err(|error| {
+            Error::Backend(format!("failed to serialize ACP elicitation: {error}"))
+        })?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("elicitationId".into(), json!(elicitation_id));
+            object.insert("status".into(), json!("pending"));
+        }
+        self.append_event("elicitation_pending", "The agent needs your input", payload)
+    }
+
+    fn record_elicitation_response(
+        &self,
+        elicitation_id: &str,
+        response: &CreateElicitationResponse,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_value(response).map_err(|error| {
+            Error::Backend(format!(
+                "failed to serialize ACP elicitation response: {error}"
+            ))
+        })?;
+        let action = payload
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("cancel")
+            .to_string();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("elicitationId".into(), json!(elicitation_id));
+            object.insert("status".into(), json!("resolved"));
+        }
+        self.append_event(
+            "elicitation_resolved",
+            match action.as_str() {
+                "accept" => "You answered the agent",
+                "decline" => "You skipped the agent's question",
+                _ => "The agent's question was cancelled",
+            },
+            payload,
+        )?;
+
+        let sessions = SessionManager::new(self.db.clone());
+        let attempt = sessions.get_attempt(&self.attempt_id)?;
+        if !matches!(
+            attempt.status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            sessions.transition_attempt(
+                &self.attempt_id,
+                "running",
+                "Continuing with your answer",
+                None,
+                None,
+            )?;
+            TaskBoard::new(self.db.clone()).update_status(
+                &self.task_id,
+                "in_progress",
+                Some(&self.logical_session_id),
+            )?;
+        }
+        Ok(())
+    }
+
     fn record_model_selection(&self, model: &str) -> Result<()> {
         self.append_event(
             "session_config",
@@ -234,15 +443,26 @@ impl AcpEventRecorder {
         )
     }
 
-    fn record_config_options(&self, options: &[SessionConfigOption]) -> Result<()> {
-        let Some((_, choices)) = advertised_model_choices(options) else {
-            return Ok(());
-        };
+    fn record_session_controls(
+        &self,
+        options: &[SessionConfigOption],
+        modes: Option<&SessionModeState>,
+    ) -> Result<()> {
+        let models = advertised_model_choices(options)
+            .map(|(_, choices)| choices)
+            .unwrap_or_default();
         self.append_event(
             "session_config_options",
-            &format!("Agent advertised {} models", choices.len()),
+            &format!(
+                "Agent advertised {} session controls",
+                options.len() + usize::from(modes.is_some())
+            ),
             json!({
-                "models": choices
+                "config_options": options,
+                "modes": modes,
+                // Retained for older frontends that only understood model
+                // choices before generic ACP controls were exposed.
+                "models": models
                     .iter()
                     .map(|(value, name)| json!({ "value": value, "name": name }))
                     .collect::<Vec<_>>()
@@ -267,7 +487,8 @@ impl AcpEventRecorder {
     }
 
     fn append_event(&self, event_type: &str, summary: &str, payload: Value) -> Result<()> {
-        if self.emitted.fetch_add(1, Ordering::Relaxed) >= MAX_EVENTS {
+        let must_persist = matches!(event_type, "elicitation_pending" | "elicitation_resolved");
+        if !must_persist && self.emitted.fetch_add(1, Ordering::Relaxed) >= MAX_EVENTS {
             return Ok(());
         }
         SessionManager::new(self.db.clone()).append_event(
@@ -301,11 +522,17 @@ impl AcpEventRecorder {
 pub async fn run_turn(
     attached: AttachedContainer,
     recorder: AcpEventRecorder,
+    elicitation_broker: Arc<AcpElicitationBroker>,
     existing_session_id: Option<&str>,
     cwd: &Path,
     prompt: &str,
-    model: Option<&str>,
+    options: AcpTurnOptions,
 ) -> Result<AcpTurnResult> {
+    let AcpTurnOptions {
+        model,
+        session_config: requested_config,
+        mcp_servers,
+    } = options;
     let AttachedContainer {
         input, mut output, ..
     } = attached;
@@ -339,11 +566,13 @@ pub async fn run_turn(
     let transport = ByteStreams::new(input.compat_write(), stdout_reader.compat());
     let notification_recorder = recorder.clone();
     let permission_recorder = recorder.clone();
+    let elicitation_recorder = recorder.clone();
+    let elicitation_task_id = recorder.task_id.clone();
+    let elicitation_attempt_id = recorder.attempt_id.clone();
     let prompt_recorder = recorder.clone();
     let existing_session_id = existing_session_id.map(str::to_owned);
     let cwd = cwd.to_path_buf();
     let prompt = prompt.to_string();
-    let model = model.map(str::to_owned);
 
     let protocol_result = Client
         .builder()
@@ -384,13 +613,68 @@ pub async fn run_turn(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            async move |request: CreateElicitationRequest, responder, _connection| {
+                let (elicitation_id, receiver) = elicitation_broker
+                    .begin(&elicitation_task_id, &elicitation_attempt_id);
+                if let Err(error) = elicitation_recorder
+                    .record_elicitation_pending(&elicitation_id, &request)
+                {
+                    elicitation_broker.abandon(&elicitation_id);
+                    return Err(agent_client_protocol::Error::into_internal_error(error));
+                }
+
+                let response = receiver.await.unwrap_or_else(|_| {
+                    CreateElicitationResponse::new(ElicitationAction::Cancel)
+                });
+                elicitation_recorder
+                    .record_elicitation_response(&elicitation_id, &response)
+                    .map_err(agent_client_protocol::Error::into_internal_error)?;
+                responder.respond(response)
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             let initialized = connection
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                        ClientCapabilities::new()
+                            .session(ClientSessionCapabilities::new().config_options(
+                                SessionConfigOptionsCapabilities::new()
+                                    .boolean(BooleanConfigOptionCapabilities::new()),
+                            ))
+                            .elicitation(
+                                ElicitationCapabilities::new()
+                                    .form(ElicitationFormCapabilities::new()),
+                            ),
+                    ),
+                )
                 .block_task()
                 .await?;
 
-            let (session_id, config_options) = if let Some(session_id) = existing_session_id {
+            for server in &mcp_servers {
+                match server {
+                    McpServer::Http(server)
+                        if !initialized.agent_capabilities.mcp_capabilities.http =>
+                    {
+                        return Err(agent_client_protocol::util::internal_error(format!(
+                            "ACP agent does not support HTTP MCP server '{}'",
+                            server.name
+                        )));
+                    }
+                    McpServer::Sse(server)
+                        if !initialized.agent_capabilities.mcp_capabilities.sse =>
+                    {
+                        return Err(agent_client_protocol::util::internal_error(format!(
+                            "ACP agent does not support SSE MCP server '{}'",
+                            server.name
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            let (session_id, mut config_options, mut modes) = if let Some(session_id) = existing_session_id {
                 if initialized
                     .agent_capabilities
                     .session_capabilities
@@ -398,16 +682,30 @@ pub async fn run_turn(
                     .is_some()
                 {
                     let response = connection
-                        .send_request(ResumeSessionRequest::new(session_id.clone(), cwd.clone()))
+                        .send_request(
+                            ResumeSessionRequest::new(session_id.clone(), cwd.clone())
+                                .mcp_servers(mcp_servers.clone()),
+                        )
                         .block_task()
                         .await?;
-                    (session_id, response.config_options.unwrap_or_default())
+                    (
+                        session_id,
+                        response.config_options.unwrap_or_default(),
+                        response.modes,
+                    )
                 } else if initialized.agent_capabilities.load_session {
                     let response = connection
-                        .send_request(LoadSessionRequest::new(session_id.clone(), cwd.clone()))
+                        .send_request(
+                            LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                                .mcp_servers(mcp_servers.clone()),
+                        )
                         .block_task()
                         .await?;
-                    (session_id, response.config_options.unwrap_or_default())
+                    (
+                        session_id,
+                        response.config_options.unwrap_or_default(),
+                        response.modes,
+                    )
                 } else {
                     return Err(agent_client_protocol::util::internal_error(
                         "ACP agent cannot resume or load an existing session",
@@ -415,24 +713,27 @@ pub async fn run_turn(
                 }
             } else {
                 let response = connection
-                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .send_request(
+                        NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()),
+                    )
                     .block_task()
                     .await?;
                 (
                     response.session_id.to_string(),
                     response.config_options.unwrap_or_default(),
+                    response.modes,
                 )
             };
 
             prompt_recorder
-                .record_config_options(&config_options)
+                .record_session_controls(&config_options, modes.as_ref())
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
 
             if let Some(requested_model) = model.as_deref() {
                 let (config_id, model_id) =
                     resolve_model_selection(&config_options, requested_model)
                         .map_err(agent_client_protocol::util::internal_error)?;
-                connection
+                let response = connection
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
                         config_id,
@@ -440,9 +741,93 @@ pub async fn run_turn(
                     ))
                     .block_task()
                     .await?;
+                if !response.config_options.is_empty() {
+                    config_options = response.config_options;
+                }
                 prompt_recorder
                     .record_model_selection(&model_id)
                     .map_err(agent_client_protocol::Error::into_internal_error)?;
+            }
+
+            let mut requested_config = requested_config.into_iter().collect::<Vec<_>>();
+            requested_config.sort_by(|left, right| left.0.cmp(&right.0));
+            for (config_id, value) in requested_config {
+                if let Some(option) = config_options
+                    .iter()
+                    .find(|option| option.id.to_string() == config_id)
+                {
+                    let option_name = option.name.clone();
+                    let value = resolve_config_value(option, &value)
+                        .map_err(agent_client_protocol::util::internal_error)?;
+                    let display_value = match &value {
+                        SessionConfigOptionValue::Boolean { value } => value.to_string(),
+                        SessionConfigOptionValue::ValueId { value } => value.to_string(),
+                        _ => "updated".to_string(),
+                    };
+                    let response = connection
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            config_id.clone(),
+                            value.clone(),
+                        ))
+                        .block_task()
+                        .await?;
+                    if !response.config_options.is_empty() {
+                        config_options = response.config_options;
+                    }
+                    prompt_recorder
+                        .append_event(
+                            "session_config",
+                            &format!("Set {option_name} to {display_value}"),
+                            json!({ "config_id": config_id, "value": value }),
+                        )
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    continue;
+                }
+
+                if config_id == "mode" {
+                    let requested_mode = value.as_str().ok_or_else(|| {
+                        agent_client_protocol::util::internal_error(
+                            "legacy ACP mode values must be strings",
+                        )
+                    })?;
+                    let available = modes.as_ref().ok_or_else(|| {
+                        agent_client_protocol::util::internal_error(format!(
+                            "ACP agent does not advertise a session config option or legacy mode named '{config_id}'"
+                        ))
+                    })?;
+                    if !available
+                        .available_modes
+                        .iter()
+                        .any(|mode| mode.id.to_string() == requested_mode)
+                    {
+                        return Err(agent_client_protocol::util::internal_error(format!(
+                            "ACP agent does not offer mode '{requested_mode}'"
+                        )));
+                    }
+                    connection
+                        .send_request(SetSessionModeRequest::new(
+                            session_id.clone(),
+                            requested_mode.to_string(),
+                        ))
+                        .block_task()
+                        .await?;
+                    if let Some(modes) = modes.as_mut() {
+                        modes.current_mode_id = requested_mode.to_string().into();
+                    }
+                    prompt_recorder
+                        .append_event(
+                            "session_mode",
+                            &format!("Switched to {requested_mode} mode"),
+                            json!({ "mode_id": requested_mode }),
+                        )
+                        .map_err(agent_client_protocol::Error::into_internal_error)?;
+                    continue;
+                }
+
+                return Err(agent_client_protocol::util::internal_error(format!(
+                    "ACP agent does not advertise session configuration '{config_id}'"
+                )));
             }
 
             // `session/load` may replay prior messages. Only output emitted for
@@ -530,6 +915,54 @@ fn resolve_model_selection(
     Ok((config_id, value.clone()))
 }
 
+fn resolve_config_value(
+    option: &SessionConfigOption,
+    requested: &Value,
+) -> std::result::Result<SessionConfigOptionValue, String> {
+    match &option.kind {
+        SessionConfigKind::Boolean(_) => requested
+            .as_bool()
+            .map(SessionConfigOptionValue::boolean)
+            .ok_or_else(|| format!("session option '{}' requires a boolean", option.name)),
+        SessionConfigKind::Select(select) => {
+            let requested = requested.as_str().ok_or_else(|| {
+                format!("session option '{}' requires a string value", option.name)
+            })?;
+            let choices = match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(|option| (option.value.to_string(), option.name.as_str()))
+                    .collect::<Vec<_>>(),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| group.options.iter())
+                    .map(|option| (option.value.to_string(), option.name.as_str()))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            };
+            let selected = choices
+                .iter()
+                .find(|(value, name)| {
+                    value == requested
+                        || value.eq_ignore_ascii_case(requested)
+                        || name.eq_ignore_ascii_case(requested)
+                })
+                .map(|(value, _)| value.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "session option '{}' does not offer value '{requested}'",
+                        option.name
+                    )
+                })?;
+            Ok(SessionConfigOptionValue::value_id(selected))
+        }
+        _ => Err(format!(
+            "session option '{}' has an unsupported type",
+            option.name
+        )),
+    }
+}
+
 fn advertised_model_choices(
     config_options: &[SessionConfigOption],
 ) -> Option<(String, Vec<(String, String)>)> {
@@ -589,9 +1022,10 @@ fn truncate_bytes(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        ContentChunk, InitializeResponse, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority,
-        PromptResponse, SessionConfigSelectOption, SetSessionConfigOptionResponse, StopReason,
-        ToolCall, ToolCallUpdate, ToolCallUpdateFields,
+        AvailableCommand, AvailableCommandsUpdate, ContentChunk, EnvVariable, InitializeResponse,
+        McpServerStdio, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PromptResponse,
+        SessionConfigSelectOption, SessionMode, SessionModeState, SetSessionConfigOptionResponse,
+        StopReason, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
     };
     use bytes::Bytes;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -613,39 +1047,90 @@ mod tests {
                 let id = request["id"].clone();
                 let method = request["method"].as_str().unwrap();
                 let response = match method {
-                    "initialize" => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": InitializeResponse::new(ProtocolVersion::V1),
-                    }),
-                    "session/new" => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": NewSessionResponse::new("acp-session-1").config_options(vec![
-                            SessionConfigOption::select(
-                                "model",
-                                "Model",
-                                "model-default",
+                    "initialize" => {
+                        assert!(
+                            request["params"]["clientCapabilities"]["elicitation"]["form"]
+                                .is_object()
+                        );
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": InitializeResponse::new(ProtocolVersion::V1),
+                        })
+                    }
+                    "session/new" => {
+                        assert_eq!(request["params"]["mcpServers"][0]["name"], "github");
+                        assert_eq!(
+                            request["params"]["mcpServers"][0]["command"],
+                            "/opt/xpressclaw/mcp-github.mjs"
+                        );
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": NewSessionResponse::new("acp-session-1").config_options(vec![
+                                SessionConfigOption::select(
+                                    "model",
+                                    "Model",
+                                    "model-default",
+                                    vec![
+                                        SessionConfigSelectOption::new("model-default", "Default"),
+                                        SessionConfigSelectOption::new("model-test", "Test Model"),
+                                    ],
+                                ).category(SessionConfigOptionCategory::Model),
+                                SessionConfigOption::boolean(
+                                    "use_fast_tools",
+                                    "Use fast tools",
+                                    false,
+                                ),
+                            ]).modes(SessionModeState::new(
+                                "plan",
                                 vec![
-                                    SessionConfigSelectOption::new("model-default", "Default"),
-                                    SessionConfigSelectOption::new("model-test", "Test Model"),
+                                    SessionMode::new("plan", "Plan"),
+                                    SessionMode::new("build", "Build"),
                                 ],
-                            ).category(SessionConfigOptionCategory::Model),
-                        ]),
-                    }),
+                            )),
+                        })
+                    }
                     "session/set_config_option" => {
                         assert_eq!(request["params"]["sessionId"], "acp-session-1");
-                        assert_eq!(request["params"]["configId"], "model");
-                        assert_eq!(request["params"]["value"], "model-test");
+                        match request["params"]["configId"].as_str().unwrap() {
+                            "model" => assert_eq!(request["params"]["value"], "model-test"),
+                            "use_fast_tools" => {
+                                assert_eq!(request["params"]["type"], "boolean");
+                                assert_eq!(request["params"]["value"], true);
+                            }
+                            other => panic!("unexpected config option: {other}"),
+                        }
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": SetSessionConfigOptionResponse::new(vec![]),
                         })
                     }
+                    "session/set_mode" => {
+                        assert_eq!(request["params"]["sessionId"], "acp-session-1");
+                        assert_eq!(request["params"]["modeId"], "build");
+                        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+                    }
                     "session/prompt" => {
                         assert_eq!(request["params"]["sessionId"], "acp-session-1");
                         assert_eq!(request["params"]["prompt"][0]["text"], "Do the work");
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": SessionNotification::new(
+                                    "acp-session-1",
+                                    SessionUpdate::AvailableCommandsUpdate(
+                                        AvailableCommandsUpdate::new(vec![
+                                            AvailableCommand::new("loop", "Keep working toward a goal"),
+                                        ]),
+                                    ),
+                                ),
+                            }),
+                        )
+                        .await;
                         send_json(
                             &output_tx,
                             json!({
@@ -688,10 +1173,23 @@ mod tests {
         let result = run_turn(
             attached,
             recorder,
+            Arc::new(AcpElicitationBroker::new()),
             None,
             Path::new("/workspace"),
             "Do the work",
-            Some("Test Model"),
+            AcpTurnOptions {
+                model: Some("Test Model".into()),
+                session_config: [
+                    ("mode".into(), json!("build")),
+                    ("use_fast_tools".into(), json!(true)),
+                ]
+                .into_iter()
+                .collect(),
+                mcp_servers: vec![McpServer::Stdio(
+                    McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
+                        .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
+                )],
+            },
         )
         .await
         .unwrap();
@@ -708,7 +1206,232 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.summary == "Using model model-test"));
+        assert!(events
+            .iter()
+            .any(|event| event.summary == "Set Use fast tools to true"));
+        assert!(events
+            .iter()
+            .any(|event| event.summary == "Switched to build mode"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "available_commands"));
         mock_agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_elicitation_pauses_and_resumes_the_active_prompt() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, task_id) = test_recorder(db.clone());
+        let broker = Arc::new(AcpElicitationBroker::new());
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            let mut prompt_id = None;
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                if request.get("method").is_none() && request["id"] == 700 {
+                    assert_eq!(request["result"]["action"], "accept");
+                    assert_eq!(request["result"]["content"]["question_0"], "PostgreSQL");
+                    send_json(
+                        &output_tx,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": SessionNotification::new(
+                                "acp-session-questions",
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new("Continuing with PostgreSQL")),
+                                )),
+                            ),
+                        }),
+                    )
+                    .await;
+                    send_json(
+                        &output_tx,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": prompt_id.take().unwrap(),
+                            "result": PromptResponse::new(StopReason::EndTurn),
+                        }),
+                    )
+                    .await;
+                    break;
+                }
+
+                let id = request["id"].clone();
+                match request["method"].as_str().unwrap() {
+                    "initialize" => {
+                        assert!(
+                            request["params"]["clientCapabilities"]["elicitation"]["form"]
+                                .is_object()
+                        );
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": InitializeResponse::new(ProtocolVersion::V1),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": NewSessionResponse::new("acp-session-questions"),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        prompt_id = Some(id);
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 700,
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "sessionId": "acp-session-questions",
+                                    "message": "Which database should I use?",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "question_0": {
+                                                "type": "string",
+                                                "oneOf": [
+                                                    { "const": "PostgreSQL", "title": "PostgreSQL" },
+                                                    { "const": "SQLite", "title": "SQLite" }
+                                                ]
+                                            },
+                                            "question_0_custom": {
+                                                "type": "string",
+                                                "title": "Other"
+                                            }
+                                        }
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    method => panic!("unexpected ACP method: {method}"),
+                }
+            }
+        });
+
+        let response_db = db.clone();
+        let response_broker = broker.clone();
+        let response_task_id = task_id.clone();
+        let simulated_ui = tokio::spawn(async move {
+            for _ in 0..100 {
+                let events = SessionManager::new(response_db.clone())
+                    .list_events("session-1", None, 50)
+                    .unwrap();
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.event_type == "elicitation_pending")
+                {
+                    let elicitation_id = event.payload["elicitationId"].as_str().unwrap();
+                    let response = serde_json::from_value(json!({
+                        "action": "accept",
+                        "content": { "question_0": "PostgreSQL" }
+                    }))
+                    .unwrap();
+                    response_broker
+                        .respond(&response_task_id, elicitation_id, response)
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("elicitation was not persisted");
+        });
+
+        let attached = AttachedContainer {
+            info: ContainerInfo {
+                container_id: "test-container".to_string(),
+                agent_id: "test-attempt".to_string(),
+                status: "running".to_string(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            run_turn(
+                attached,
+                recorder,
+                broker,
+                None,
+                Path::new("/workspace"),
+                "Choose the database",
+                AcpTurnOptions::default(),
+            ),
+        )
+        .await
+        .expect("ACP turn timed out")
+        .unwrap();
+
+        assert_eq!(result.summary, "Continuing with PostgreSQL");
+        simulated_ui.await.unwrap();
+        mock_agent.await.unwrap();
+        let events = SessionManager::new(db.clone())
+            .list_events("session-1", None, 50)
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "elicitation_pending"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "elicitation_resolved"));
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn elicitation_broker_routes_only_the_matching_task_response() {
+        let broker = AcpElicitationBroker::new();
+        let (elicitation_id, receiver) = broker.begin("task-1", "attempt-1");
+        let response: CreateElicitationResponse = serde_json::from_value(json!({
+            "action": "accept",
+            "content": { "question_0": "PostgreSQL" }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            broker.respond("task-2", &elicitation_id, response.clone()),
+            Err(AcpElicitationResponseError::WrongTask)
+        );
+        broker.respond("task-1", &elicitation_id, response).unwrap();
+        let delivered = serde_json::to_value(receiver.await.unwrap()).unwrap();
+        assert_eq!(delivered["action"], "accept");
+        assert_eq!(delivered["content"]["question_0"], "PostgreSQL");
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_attempt_releases_its_pending_elicitation() {
+        let broker = AcpElicitationBroker::new();
+        let (_first_id, first) = broker.begin("task-1", "attempt-1");
+        let (_second_id, second) = broker.begin("task-2", "attempt-2");
+
+        assert_eq!(broker.cancel_attempt("attempt-1"), 1);
+        let cancelled = serde_json::to_value(first.await.unwrap()).unwrap();
+        assert_eq!(cancelled["action"], "cancel");
+        assert_eq!(broker.cancel_attempt("attempt-2"), 1);
+        assert_eq!(
+            serde_json::to_value(second.await.unwrap()).unwrap()["action"],
+            "cancel"
+        );
     }
 
     #[test]
