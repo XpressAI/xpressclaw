@@ -15,217 +15,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	return JSON.parse(text);
 }
 
-// -- Conversations --
-
-export interface Conversation {
-	id: string;
-	title: string | null;
-	icon: string | null;
-	created_at: string;
-	updated_at: string;
-	last_message_at: string | null;
-	participants: ConversationParticipant[];
-}
-
-export interface ConversationParticipant {
-	participant_type: string;
-	participant_id: string;
-	joined_at: string;
-}
-
-export interface ConversationMessage {
-	id: number;
-	conversation_id: string;
-	sender_type: string;
-	sender_id: string;
-	sender_name: string | null;
-	content: string;
-	message_type: string;
-	created_at: string;
-}
-
-export interface StreamCallbacks {
-	onUserMessage?: (msg: ConversationMessage) => void;
-	onThinking?: (agentId: string) => void;
-	onChunk?: (agentId: string, content: string) => void;
-	onAgentMessage?: (msg: ConversationMessage) => void;
-	onError?: (agentId: string | null, error: string) => void;
-	onDone?: () => void;
-}
-
-export const conversations = {
-	list: (limit = 50) => request<Conversation[]>(`/api/conversations?limit=${limit}`),
-	get: (id: string) => request<Conversation>(`/api/conversations/${id}`),
-	create: (data: { title?: string; icon?: string; participant_ids?: string[] }) =>
-		request<Conversation>('/api/conversations', { method: 'POST', body: JSON.stringify(data) }),
-	update: (id: string, data: { title?: string; icon?: string }) =>
-		request<Conversation>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-	delete: (id: string) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
-	stop: (id: string, agentId?: string) => {
-		const params = agentId ? `?agent_id=${encodeURIComponent(agentId)}` : '';
-		return request<void>(`/api/conversations/${id}/stop${params}`, { method: 'POST' });
-	},
-	messages: (id: string, limit = 50, beforeId?: number) => {
-		const params = new URLSearchParams({ limit: String(limit) });
-		if (beforeId) params.set('before_id', String(beforeId));
-		return request<ConversationMessage[]>(`/api/conversations/${id}/messages?${params}`);
-	},
-	sendMessage: (id: string, content: string, senderName?: string) =>
-		request<ConversationMessage[]>(`/api/conversations/${id}/messages`, {
-			method: 'POST',
-			body: JSON.stringify({ content, sender_name: senderName })
-		}),
-	streamMessage: (id: string, content: string, senderName: string | undefined, callbacks: StreamCallbacks): (() => void) => {
-		const controller = new AbortController();
-
-		(async () => {
-			try {
-				const res = await fetch(`${BASE}/api/conversations/${id}/messages/stream`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ content, sender_name: senderName }),
-					signal: controller.signal
-				});
-				if (!res.ok) {
-					const body = await res.json().catch(() => ({ error: res.statusText }));
-					callbacks.onError?.(null, body.error || res.statusText);
-					return;
-				}
-
-				const reader = res.body?.getReader();
-				if (!reader) return;
-
-				const decoder = new TextDecoder();
-				let buffer = '';
-				let currentEvent = '';
-
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-
-					buffer += decoder.decode(value, { stream: true });
-
-					// Process complete SSE messages (separated by \n\n)
-					while (buffer.includes('\n\n')) {
-						const idx = buffer.indexOf('\n\n');
-						const block = buffer.slice(0, idx);
-						buffer = buffer.slice(idx + 2);
-
-						let eventType = '';
-						let data = '';
-						for (const line of block.split('\n')) {
-							if (line.startsWith('event:')) eventType = line.slice(6).trim();
-							else if (line.startsWith('data:')) data = line.slice(5).trim();
-						}
-
-						if (!data || data === 'ping') continue;
-
-						try {
-							const parsed = JSON.parse(data);
-							switch (eventType) {
-								case 'user_message':
-									callbacks.onUserMessage?.(parsed);
-									break;
-								case 'thinking':
-									callbacks.onThinking?.(parsed.agent_id);
-									break;
-								case 'chunk':
-									callbacks.onChunk?.(parsed.agent_id, parsed.content);
-									break;
-								case 'agent_message':
-									callbacks.onAgentMessage?.(parsed);
-									break;
-								case 'error':
-									callbacks.onError?.(parsed.agent_id ?? null, parsed.error);
-									break;
-								case 'done':
-									callbacks.onDone?.();
-									break;
-							}
-						} catch { /* skip unparseable */ }
-					}
-				}
-
-				callbacks.onDone?.();
-			} catch (e) {
-				if (!controller.signal.aborted) {
-					callbacks.onError?.(null, e instanceof Error ? e.message : String(e));
-				}
-			}
-		})();
-
-		return () => controller.abort();
-	},
-	/** Subscribe to conversation events via SSE (ADR-019).
-	 * Replays missed messages from DB, then streams live events.
-	 * Returns a cleanup function to close the connection. */
-	subscribeEvents: (id: string, afterMessageId: number, callbacks: StreamCallbacks): { cancel: () => void; ready: Promise<void> } => {
-		const url = `${BASE}/api/conversations/${id}/events?after=${afterMessageId}`;
-		const eventSource = new EventSource(url);
-
-		// Resolves when the SSE connection is established
-		let resolveReady: () => void;
-		const ready = new Promise<void>(r => { resolveReady = r; });
-		eventSource.addEventListener('open', () => resolveReady());
-
-		eventSource.addEventListener('thinking', (e) => {
-			try {
-				const d = JSON.parse(e.data);
-				callbacks.onThinking?.(d.agent_id);
-			} catch {}
-		});
-		eventSource.addEventListener('chunk', (e) => {
-			try {
-				const d = JSON.parse(e.data);
-				callbacks.onChunk?.(d.agent_id, d.content);
-			} catch {}
-		});
-		eventSource.addEventListener('agent_message', (e) => {
-			try {
-				const data = JSON.parse(e.data);
-				// Live events are wrapped: {type, message: {...}}
-				// Replayed events are raw: {id, content, ...}
-				const msg = data.message ?? data;
-				callbacks.onAgentMessage?.(msg);
-			} catch {}
-		});
-		eventSource.addEventListener('error', (e) => {
-			if (e instanceof MessageEvent) {
-				try { const d = JSON.parse(e.data); callbacks.onError?.(d.agent_id ?? null, d.error); } catch {}
-			}
-		});
-		eventSource.addEventListener('done', () => {
-			callbacks.onDone?.();
-		});
-
-		return { cancel: () => eventSource.close(), ready };
-	},
-	addParticipant: (id: string, participantType: string, participantId: string) =>
-		request<void>(`/api/conversations/${id}/participants`, {
-			method: 'POST',
-			body: JSON.stringify({ participant_type: participantType, participant_id: participantId })
-		}),
-	removeParticipant: (id: string, participantId: string) =>
-		request<void>(`/api/conversations/${id}/participants/${participantId}`, { method: 'DELETE' })
-};
-
 // -- Agents --
 
 export interface Agent {
 	id: string;
 	name: string;
+	title: string;
 	backend: string;
 	status: string;
 	desired_status: string;
 	observed_status: string;
 	container_id: string | null;
 	config?: {
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role?: string;
 		model?: string | null;
+		runner?: NativeRunnerConfig;
 		tools?: string[];
 		skills?: string[];
 		volumes?: string[];
@@ -245,13 +48,9 @@ export const agents = {
 	stop: (id: string) => request<Agent>(`/api/agents/${id}/stop`, { method: 'POST', body: '{}' }),
 	delete: (id: string) => request<void>(`/api/agents/${id}`, { method: 'DELETE' }),
 	updateConfig: (id: string, data: {
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role?: string;
 		model?: string;
 		llm?: { provider: string | null; api_key: string | null; base_url: string | null };
+		runner?: NativeRunnerConfig;
 		tools?: string[];
 		skills?: string[];
 		volumes?: string[];
@@ -276,6 +75,176 @@ export const agents = {
 	),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
+};
+
+// -- Logical sessions and native work attempts --
+
+export interface NativeRunnerConfig {
+	kind: string;
+	image: string;
+	workspace: string | null;
+	model: string | null;
+	session_config: Record<string, string | boolean>;
+	mcp_servers: string[];
+	environment: Record<string, string>;
+	command: string[];
+	subscription_auth: boolean;
+	container_engine: 'none' | 'host';
+}
+
+export interface LogicalSession {
+	id: string;
+	agent_id: string;
+	title: string | null;
+	status: string;
+	latest_summary: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WorkAttempt {
+	id: string;
+	session_id: string;
+	task_id: string | null;
+	queue_id: number | null;
+	kind: string;
+	runner: string;
+	status: string;
+	prompt: string;
+	native_session_id: string | null;
+	container_id: string | null;
+	result: string | null;
+	error_message: string | null;
+	created_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+export interface SessionEvent {
+	id: number;
+	session_id: string;
+	attempt_id: string | null;
+	task_id: string | null;
+	source_type: string;
+	source_id: string | null;
+	event_type: string;
+	summary: string;
+	payload: Record<string, unknown>;
+	created_at: string;
+}
+
+export interface AcpConfigChoice {
+	value: string;
+	name: string;
+	description?: string | null;
+}
+
+export interface AcpConfigGroup {
+	group: string;
+	name: string;
+	options: AcpConfigChoice[];
+}
+
+export interface AcpConfigOption {
+	id: string;
+	name: string;
+	description?: string | null;
+	category?: string | null;
+	type: 'select' | 'boolean';
+	currentValue: string | boolean;
+	options?: AcpConfigChoice[] | AcpConfigGroup[];
+}
+
+export interface AcpMode {
+	id: string;
+	name: string;
+	description?: string | null;
+}
+
+export interface AcpModeState {
+	currentModeId: string;
+	availableModes: AcpMode[];
+}
+
+export interface AcpCommand {
+	name: string;
+	description: string;
+	input?: { hint: string } | null;
+}
+
+export interface AttemptArtifact {
+	id: string;
+	attempt_id: string;
+	session_id: string;
+	artifact_type: string;
+	title: string;
+	content: string | null;
+	uri: string | null;
+	metadata: Record<string, unknown>;
+	created_at: string;
+}
+
+export interface SessionOverview {
+	session: LogicalSession;
+	active_attempts: WorkAttempt[];
+	queued_attempts: WorkAttempt[];
+	recent_attempts: WorkAttempt[];
+	recent_events: SessionEvent[];
+	artifacts: AttemptArtifact[];
+}
+
+export interface RunnerReadiness {
+	protocol: string;
+	ready: boolean;
+	docker_available: boolean;
+	container_runtime: 'docker' | 'podman' | null;
+	container_runtime_version: string | null;
+	kind: string;
+	image: string;
+	runtime_image: string | null;
+	image_present: boolean;
+	workspace: string;
+	workspace_present: boolean;
+	model: string | null;
+	container_engine: 'none' | 'host';
+	container_engine_available: boolean;
+	container_engine_socket: string | null;
+	command_present: boolean;
+	subscription_auth: boolean;
+	auth_present: boolean;
+	issues: string[];
+}
+
+export const sessions = {
+	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
+	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
+	prepare: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`, {
+		method: 'POST',
+		body: '{}'
+	}),
+	events: (id: string, after?: number) => {
+		const query = after ? `?after=${after}` : '';
+		return request<SessionEvent[]>(`/api/sessions/${id}/events${query}`);
+	},
+	attempts: (id: string, status?: string) => {
+		const query = status ? `?status=${encodeURIComponent(status)}` : '';
+		return request<WorkAttempt[]>(`/api/sessions/${id}/attempts${query}`);
+	},
+	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean; configOptions?: Record<string, string | boolean> }) =>
+		request<{ event: SessionEvent; task: Task; attempt_id: string; queued: boolean }>(
+			`/api/sessions/${id}/messages`,
+			{ method: 'POST', body: JSON.stringify({
+				content,
+				priority: options?.priority,
+				new_session: options?.newSession ?? false,
+				config_options: options?.configOptions ?? {}
+			}) }
+		),
+	cancelAttempt: (sessionId: string, attemptId: string) =>
+		request<WorkAttempt>(`/api/sessions/${sessionId}/attempts/${attemptId}/cancel`, {
+			method: 'POST',
+			body: '{}'
+		})
 };
 
 // -- Tasks --
@@ -308,6 +277,13 @@ export interface TaskCounts {
 	cancelled: number;
 }
 
+export interface TaskActivity {
+	attempts: WorkAttempt[];
+	events: SessionEvent[];
+	has_more_before: boolean;
+	has_more_after: boolean;
+}
+
 export const tasks = {
 	list: (status?: string, agentId?: string) => {
 		const params = new URLSearchParams();
@@ -317,7 +293,7 @@ export const tasks = {
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
-	create: (data: { title: string; description?: string; agent_id?: string; priority?: number }) =>
+	create: (data: { title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
 	update: (id: string, data: { title?: string; description?: string; agent_id?: string; priority?: number }) =>
 		request<Task>(`/api/tasks/${id}`, {
@@ -331,13 +307,29 @@ export const tasks = {
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
 	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
-	addMessage: (id: string, role: string, content: string) =>
-		request<TaskMessage>(`/api/tasks/${id}/messages`, {
+	activity: (id: string, options: { after?: number; before?: number; limit?: number } = {}) => {
+		const params = new URLSearchParams();
+		if (options.after !== undefined) params.set('after', String(options.after));
+		if (options.before !== undefined) params.set('before', String(options.before));
+		if (options.limit !== undefined) params.set('limit', String(options.limit));
+		const query = params.size ? `?${params}` : '';
+		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
+	},
+	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean> }) =>
+		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
-			body: JSON.stringify({ role, content })
+			body: JSON.stringify({ role, content, config_options: options?.configOptions ?? {} })
 		}),
+	respondToElicitation: (id: string, elicitationId: string, data: {
+		action: 'accept' | 'decline' | 'cancel';
+		content?: Record<string, unknown>;
+		message?: string;
+	}) => request<{ resolved: boolean; action: string }>(
+		`/api/tasks/${id}/elicitations/${encodeURIComponent(elicitationId)}/response`,
+		{ method: 'POST', body: JSON.stringify(data) }
+	),
 	subtasks: (id: string) => request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks?parent_task_id=${id}`),
-	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; depends_on?: string[] }[]; parent_task_id?: string }) =>
+	createBatch: (data: { tasks: { ref: string; title: string; description?: string; agent_id?: string; priority?: number; new_session?: boolean; depends_on?: string[] }[]; parent_task_id?: string }) =>
 		request<Task[]>('/api/tasks/batch', { method: 'POST', body: JSON.stringify(data) }),
 	addDependency: (taskId: string, dependsOn: string) =>
 		request<{ task_id: string; depends_on: string }>(`/api/tasks/${taskId}/dependencies`, {
@@ -354,47 +346,11 @@ export interface TaskMessage {
 	timestamp: string;
 }
 
-// -- Memory --
-
-export interface Memory {
-	id: string;
-	content: string;
-	summary: string;
-	source: string;
-	layer: string;
-	agent_id: string | null;
-	tags: string[];
-	created_at: string;
-	accessed_at: string;
-	access_count: number;
+export interface TaskMessageResponse {
+	message: TaskMessage;
+	continuation_queued: boolean;
+	attempt_id: string | null;
 }
-
-export interface MemorySearchResult {
-	memory: Memory;
-	relevance_score: number;
-	source: string;
-}
-
-export interface MemoryStats {
-	zettelkasten: { total_memories: number; total_links: number; total_tags: number };
-	vector: { embedding_count: number; dimension: number; model: string };
-}
-
-export const memory = {
-	list: (limit = 50, agentId?: string) => {
-		const params = new URLSearchParams({ limit: String(limit) });
-		if (agentId) params.set('agent_id', agentId);
-		return request<MemorySearchResult[]>(`/api/memory?${params}`);
-	},
-	get: (id: string) => request<Memory>(`/api/memory/${id}`),
-	search: (q: string, limit = 10) =>
-		request<MemorySearchResult[]>(`/api/memory/search?q=${encodeURIComponent(q)}&limit=${limit}`),
-	create: (data: { content: string; summary: string; source: string; tags?: string[] }) =>
-		request<Memory>('/api/memory', { method: 'POST', body: JSON.stringify(data) }),
-	delete: (id: string) => request<void>(`/api/memory/${id}`, { method: 'DELETE' }),
-	stats: () => request<MemoryStats>('/api/memory/stats'),
-	related: (id: string) => request<MemorySearchResult[]>(`/api/memory/${id}/related`)
-};
 
 // -- Schedules --
 
@@ -430,98 +386,6 @@ export const schedules = {
 	trigger: (id: string) => request<Task>(`/api/schedules/${id}/trigger`, { method: 'POST' })
 };
 
-// -- Procedures (SOPs) --
-
-export interface Sop {
-	id: string;
-	name: string;
-	description: string | null;
-	content: string;
-	triggers: string | null;
-	created_at: string;
-	updated_at: string;
-	created_by: string | null;
-	version: number;
-	parsed: {
-		summary?: string;
-		tools?: string[];
-		inputs?: { name: string; description: string; required: boolean; default?: string }[];
-		outputs?: { name: string; description: string }[];
-		steps?: { name: string; description: string; tools?: string[]; optional: boolean }[];
-	} | null;
-}
-
-export const procedures = {
-	list: () => request<Sop[]>('/api/procedures'),
-	get: (name: string) => request<Sop>(`/api/procedures/${name}`),
-	create: (data: { name: string; description?: string; content: string }) =>
-		request<Sop>('/api/procedures', { method: 'POST', body: JSON.stringify(data) }),
-	update: (name: string, data: { description?: string; content?: string }) =>
-		request<Sop>(`/api/procedures/${name}`, { method: 'PUT', body: JSON.stringify(data) }),
-	delete: (name: string) => request<void>(`/api/procedures/${name}`, { method: 'DELETE' }),
-	run: (name: string, data: { agent_id: string; inputs?: Record<string, string> }) =>
-		request<Task>(`/api/procedures/${name}/run`, { method: 'POST', body: JSON.stringify(data) })
-};
-
-// -- Budget --
-
-export interface BudgetSummary {
-	global: {
-		daily_limit: number | null;
-		monthly_limit: number | null;
-		daily_spent: number;
-		monthly_spent: number;
-		total_spent: number;
-	};
-	agents: {
-		agent_id: string;
-		daily_spent: number;
-		monthly_spent: number;
-		total_spent: number;
-		is_paused: boolean;
-	}[];
-}
-
-export interface UsageRecord {
-	id: number;
-	agent_id: string;
-	timestamp: string;
-	model: string;
-	input_tokens: number;
-	output_tokens: number;
-	cost_usd: number;
-	operation: string | null;
-}
-
-export const budget = {
-	summary: () => request<BudgetSummary>('/api/budget'),
-	usage: (agentId?: string, limit?: number) => {
-		const params = new URLSearchParams();
-		if (agentId) params.set('agent_id', agentId);
-		if (limit) params.set('limit', String(limit));
-		const qs = params.toString();
-		return request<UsageRecord[]>(`/api/budget/usage${qs ? `?${qs}` : ''}`);
-	},
-	resume: (agentId: string) =>
-		request<{ agent_id: string; is_paused: boolean; resumed: boolean }>(
-			`/api/budget/${agentId}/resume`, { method: 'POST' }
-		)
-};
-
-// -- Activity --
-
-export interface ActivityEvent {
-	id: number;
-	timestamp: string;
-	agent_id: string | null;
-	event_type: string;
-	event_data: unknown;
-}
-
-export const activity = {
-	list: (limit = 50) => request<ActivityEvent[]>(`/api/activity?limit=${limit}`)
-};
-
 // -- Health --
 
 export const health = {
@@ -536,6 +400,12 @@ export interface SetupStatus {
 
 export interface DockerStatus {
 	available: boolean;
+	installed: boolean;
+	can_start: boolean;
+	runtime: 'docker' | 'podman' | null;
+	version: string | null;
+	socket: string | null;
+	rootless: boolean | null;
 	error: string | null;
 }
 
@@ -550,6 +420,7 @@ export interface SystemInfo {
 	};
 	os: string;
 	arch: string;
+	working_directory: string | null;
 }
 
 export interface OllamaInfo {
@@ -572,18 +443,6 @@ export interface ModelRecommendation {
 	all_options: ModelOption[];
 }
 
-export interface AgentPreset {
-	id: string;
-	name: string;
-	description: string;
-	icon: string;
-	role: string;
-	backend: string;
-	default_tools: string[];
-	default_mcp_servers: Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>;
-	recommended_llm: string;
-}
-
 /// Per-agent provider summary (no api_key — it's masked).
 export interface AgentProviderEntry {
 	agent: string;
@@ -593,7 +452,7 @@ export interface AgentProviderEntry {
 	has_api_key: boolean;
 }
 
-/// Full per-agent LLM config — used by the agent profile editor.
+/// Legacy per-session LLM config retained for old configurations.
 export interface AgentLlmConfig {
 	provider: string | null;
 	model: string | null;
@@ -609,14 +468,11 @@ export interface LiveConfig {
 	};
 	agents: {
 		name: string;
+		title: string;
 		backend: string;
-		display_name?: string | null;
-		role_title?: string | null;
-		responsibilities?: string | null;
-		avatar?: string | null;
-		role: string;
 		model: string | null;
 		llm?: AgentLlmConfig;
+		runner: NativeRunnerConfig;
 		tools: string[];
 		skills: string[];
 		volumes: string[];
@@ -627,8 +483,31 @@ export interface LiveConfig {
 		idle_prompt?: string | null;
 	}[];
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
-	mcp_servers: string[];
+	mcp_servers: McpServerDefinition[];
 }
+
+export interface McpServerDefinition {
+	name: string;
+	type: 'stdio' | 'http' | 'sse' | string;
+	command?: string | null;
+	args: string[];
+	url?: string | null;
+	env: Record<string, string> | string[];
+	headers?: Record<string, string>;
+}
+
+export const mcpServers = {
+	list: () => request<{ servers: McpServerDefinition[] }>('/api/setup/mcp-servers'),
+	upsert: (server: McpServerDefinition) =>
+		request<{ success: boolean; name: string }>('/api/setup/mcp-servers', {
+			method: 'POST',
+			body: JSON.stringify(server)
+		}),
+	delete: (name: string) =>
+		request<{ success: boolean; deleted: string }>(`/api/setup/mcp-servers/${encodeURIComponent(name)}`, {
+			method: 'DELETE'
+		})
+};
 
 export const setup = {
 	status: () => request<SetupStatus>('/api/setup/status'),
@@ -642,12 +521,8 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
-	presets: () => request<AgentPreset[]>('/api/setup/presets'),
 	complete: (data: {
-		// `provider` is one of: openai, anthropic, ollama. Local inference goes
-		// through Ollama only — there is no embedded llama.cpp anymore.
-		llm: { provider: string; api_key?: string; base_url?: string; local_model?: string; local_base_url?: string };
-		agents: { name: string; preset?: string; role?: string; role_title?: string; responsibilities?: string; model?: string; tools?: string[]; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -655,11 +530,9 @@ export const setup = {
 			method: 'POST',
 			body: JSON.stringify(data)
 		}),
-	addAgent: (data: {
-		name: string; preset?: string; role?: string; model?: string;
-		backend?: string; tools?: string[]; volumes?: string[];
-		mcp_servers?: Record<string, unknown>;
-	}) => request<{ success: boolean; agent: string }>('/api/setup/add-agent', {
+	addSession: (data: {
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
+	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})
@@ -679,29 +552,6 @@ export const settings = {
 		})
 };
 
-export interface App {
-	id: string;
-	title: string;
-	icon: string | null;
-	description: string | null;
-	agent_id: string;
-	conversation_id: string | null;
-	container_id: string | null;
-	port: number;
-	source_version: number;
-	status: string;
-	created_at: string;
-	updated_at: string;
-}
-
-export const apps = {
-	list: () => request<App[]>('/api/apps'),
-	get: (id: string) => request<App>(`/api/apps/${id}`),
-	create: (data: { id: string; title: string; icon?: string; description?: string; agent_id: string; port?: number }) =>
-		request<App>('/api/apps', { method: 'POST', body: JSON.stringify(data) }),
-	delete: (id: string) => request<{ deleted: boolean }>(`/api/apps/${id}`, { method: 'DELETE' }),
-};
-
 // -- Connectors --
 
 export interface Connector {
@@ -715,35 +565,6 @@ export interface Connector {
 	created_at: string;
 	updated_at: string;
 }
-
-export interface Channel {
-	id: string;
-	connector_id: string;
-	name: string;
-	channel_type: string;
-	config: Record<string, unknown>;
-	agent_id: string | null;
-	enabled: boolean;
-	created_at: string;
-}
-
-export const connectors = {
-	list: () => request<Connector[]>('/api/connectors'),
-	create: (data: { name: string; connector_type: string; config: Record<string, unknown> }) =>
-		request<Connector>('/api/connectors', { method: 'POST', body: JSON.stringify(data) }),
-	get: (id: string) => request<Connector>(`/api/connectors/${id}`),
-	update: (id: string, data: Partial<{ name: string; config: Record<string, unknown>; enabled: boolean }>) =>
-		request<Connector>(`/api/connectors/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-	delete: (id: string) => request<void>(`/api/connectors/${id}`, { method: 'DELETE' }),
-	test: (id: string) => request<{ ok: boolean; error?: string }>(`/api/connectors/${id}/test`, { method: 'POST' }),
-	channels: (id: string) => request<Channel[]>(`/api/connectors/${id}/channels`),
-	createChannel: (connectorId: string, data: { name: string; channel_type?: string; config?: Record<string, unknown>; agent_id?: string }) =>
-		request<Channel>(`/api/connectors/${connectorId}/channels`, { method: 'POST', body: JSON.stringify(data) }),
-	updateChannel: (connectorId: string, channelId: string, data: Partial<{ agent_id: string | null; config: Record<string, unknown> }>) =>
-		request<Channel>(`/api/connectors/${connectorId}/channels/${channelId}`, { method: 'PATCH', body: JSON.stringify(data) }),
-	deleteChannel: (connectorId: string, channelId: string) =>
-		request<void>(`/api/connectors/${connectorId}/channels/${channelId}`, { method: 'DELETE' }),
-};
 
 // -- Workflows --
 

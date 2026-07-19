@@ -100,6 +100,13 @@ pub struct TaskCounts {
     pub cancelled: i64,
 }
 
+/// A step reported by a native coding harness through its plan/todo stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedSubtask {
+    pub title: String,
+    pub status: TaskStatus,
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -275,9 +282,13 @@ impl TaskBoard {
                 });
             }
 
-            // Update status
+            // Update status. Reopening a completed task must also clear its
+            // old completion timestamp so the API does not report two
+            // conflicting states.
             conn.execute(
-                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE tasks SET status = ?1, updated_at = ?2,
+                    completed_at = CASE WHEN ?1 = 'completed' THEN ?2 ELSE NULL END
+                 WHERE id = ?3",
                 rusqlite::params![status, now, task_id],
             )?;
 
@@ -289,14 +300,6 @@ impl TaskBoard {
                         rusqlite::params![aid, task_id],
                     )?;
                 }
-            }
-
-            // Set completed_at if completing
-            if parsed == TaskStatus::Completed {
-                conn.execute(
-                    "UPDATE tasks SET completed_at = ?1 WHERE id = ?2",
-                    rusqlite::params![now, task_id],
-                )?;
             }
         }
 
@@ -371,6 +374,144 @@ impl TaskBoard {
         Ok(tasks)
     }
 
+    /// Replace the ACP agent's current plan with its latest snapshot.
+    /// These rows are normal subtasks so the UI and completion semantics do
+    /// not need a second, runner-specific representation.
+    pub fn sync_reported_subtasks(
+        &self,
+        parent_task_id: &str,
+        attempt_id: &str,
+        items: &[ReportedSubtask],
+    ) -> Result<Vec<Task>> {
+        self.get(parent_task_id)?;
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, context FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at ASC",
+            )?;
+            let existing: Vec<(String, usize)> = stmt
+                .query_map([parent_task_id], |row| {
+                    let id: String = row.get(0)?;
+                    let context: Option<String> = row.get(1)?;
+                    let index = context
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .filter(|value| {
+                            value.get("origin").and_then(|value| value.as_str())
+                                == Some("native_plan")
+                        })
+                        .and_then(|value| value.get("index").and_then(|value| value.as_u64()))
+                        .map(|value| value as usize);
+                    Ok(index.map(|index| (id, index)))
+                })?
+                .filter_map(|row| row.ok().flatten())
+                .collect();
+            drop(stmt);
+
+            for (index, item) in items.iter().enumerate() {
+                let completed_at = (item.status == TaskStatus::Completed).then_some(now.as_str());
+                let context = serde_json::json!({
+                    "origin": "native_plan",
+                    "attempt_id": attempt_id,
+                    "index": index,
+                })
+                .to_string();
+                if let Some((id, _)) = existing.iter().find(|(_, current)| *current == index) {
+                    conn.execute(
+                        "UPDATE tasks SET title = ?1, status = ?2, updated_at = ?3,
+                            completed_at = ?4, context = ?5 WHERE id = ?6",
+                        rusqlite::params![
+                            item.title,
+                            item.status.as_str(),
+                            now,
+                            completed_at,
+                            context,
+                            id,
+                        ],
+                    )?;
+                } else {
+                    let id = Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO tasks
+                            (id, title, status, priority, parent_task_id, context,
+                             created_at, updated_at, completed_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+                        rusqlite::params![
+                            id,
+                            item.title,
+                            item.status.as_str(),
+                            -(index as i32),
+                            parent_task_id,
+                            context,
+                            now,
+                            completed_at,
+                        ],
+                    )?;
+                }
+            }
+
+            for (id, index) in existing {
+                if index >= items.len() {
+                    conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+                }
+            }
+            Ok::<_, Error>(())
+        })?;
+
+        self.list_subtasks(parent_task_id)
+    }
+
+    /// A task with steps is complete only when every step is complete. A task
+    /// without steps can be completed by its own successful response.
+    pub fn subtasks_complete(&self, task_id: &str) -> Result<bool> {
+        let subtasks = self.list_subtasks(task_id)?;
+        Ok(subtasks.is_empty()
+            || subtasks
+                .iter()
+                .all(|subtask| subtask.status == TaskStatus::Completed))
+    }
+
+    /// Complete a task whose steps are done, then roll that completion through
+    /// any ready parents. Parents with queued/running work are left active.
+    pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        let mut completed = Vec::new();
+        let mut current_id = Some(task_id.to_string());
+        let mut first = true;
+
+        while let Some(id) = current_id {
+            if !self.subtasks_complete(&id)? {
+                break;
+            }
+            if self.has_open_attempt(&id)? {
+                break;
+            }
+            let task = self.update_status(&id, "completed", if first { agent_id } else { None })?;
+            current_id = task.parent_task_id.clone();
+            completed.push(task);
+            first = false;
+        }
+
+        Ok(completed)
+    }
+
+    fn has_open_attempt(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM work_attempts WHERE task_id = ?1
+                    AND status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
+                )",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
+    }
+
     pub fn delete(&self, task_id: &str) -> Result<()> {
         let conn = self.db.conn();
         conn.execute("DELETE FROM tasks WHERE id = ?1", [task_id])?;
@@ -385,8 +526,10 @@ impl TaskBoard {
 
     pub fn counts(&self) -> Result<TaskCounts> {
         let conn = self.db.conn();
-        let mut stmt =
-            conn.prepare("SELECT status, COUNT(*) as count FROM tasks GROUP BY status")?;
+        let mut stmt = conn.prepare(
+            "SELECT status, COUNT(*) as count FROM tasks
+             WHERE hidden = 0 AND parent_task_id IS NULL GROUP BY status",
+        )?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -538,7 +681,9 @@ impl TaskBoard {
                 sop_id: None,
                 conversation_id: None,
                 priority: input.priority,
-                context: None,
+                context: Some(serde_json::json!({
+                    "session_mode": if input.new_session { "new" } else { "continue" },
+                })),
             })?;
             if let Some(ref r) = input.ref_name {
                 ref_to_id.insert(r.clone(), task.id.clone());
@@ -575,6 +720,11 @@ pub struct BatchTaskInput {
     pub description: Option<String>,
     pub agent_id: Option<String>,
     pub priority: Option<i32>,
+    /// Start a new ACP conversation instead of continuing the
+    /// project's active one. Dependencies still take precedence so a task can
+    /// continue the work it is explicitly chained from.
+    #[serde(default)]
+    pub new_session: bool,
     /// Ref names or existing task UUIDs that must complete first.
     pub depends_on: Option<Vec<String>>,
 }
@@ -667,12 +817,119 @@ mod tests {
         let completed = board.update_status(&task.id, "completed", None).unwrap();
         assert_eq!(completed.status, TaskStatus::Completed);
         assert!(completed.completed_at.is_some());
+
+        let reopened = board.update_status(&task.id, "pending", None).unwrap();
+        assert_eq!(reopened.status, TaskStatus::Pending);
+        assert!(reopened.completed_at.is_none());
+    }
+
+    #[test]
+    fn syncs_native_plan_steps_and_rolls_up_completion() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Implement feature".to_string(),
+                description: None,
+                agent_id: Some("developer".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let initial = board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[
+                    ReportedSubtask {
+                        title: "Inspect the code".to_string(),
+                        status: TaskStatus::InProgress,
+                    },
+                    ReportedSubtask {
+                        title: "Run tests".to_string(),
+                        status: TaskStatus::Pending,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(initial.len(), 2);
+        assert!(!board.subtasks_complete(&parent.id).unwrap());
+
+        let updated = board
+            .sync_reported_subtasks(
+                &parent.id,
+                "attempt-1",
+                &[
+                    ReportedSubtask {
+                        title: "Inspect the code".to_string(),
+                        status: TaskStatus::Completed,
+                    },
+                    ReportedSubtask {
+                        title: "Run the full test suite".to_string(),
+                        status: TaskStatus::Completed,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated.len(), 2);
+        assert_eq!(updated[1].title, "Run the full test suite");
+        assert!(board.subtasks_complete(&parent.id).unwrap());
+
+        let completed = board
+            .complete_and_roll_up(&parent.id, Some("developer"))
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn completing_the_last_child_completes_its_parent() {
+        let (_, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                description: None,
+                agent_id: None,
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let make_child = |title: &str| {
+            board
+                .create(&CreateTask {
+                    title: title.to_string(),
+                    description: None,
+                    agent_id: None,
+                    parent_task_id: Some(parent.id.clone()),
+                    sop_id: None,
+                    conversation_id: None,
+                    priority: None,
+                    context: None,
+                })
+                .unwrap()
+        };
+        let first = make_child("First");
+        let second = make_child("Second");
+
+        let first_completion = board.complete_and_roll_up(&first.id, None).unwrap();
+        assert_eq!(first_completion.len(), 1);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Pending);
+
+        let second_completion = board.complete_and_roll_up(&second.id, None).unwrap();
+        assert_eq!(second_completion.len(), 2);
+        assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
     }
 
     #[test]
     fn test_list_and_counts() {
         let (_, board) = setup();
-        board
+        let first = board
             .create(&CreateTask {
                 title: "Task 1".to_string(),
                 description: None,
@@ -694,6 +951,13 @@ mod tests {
                 conversation_id: None,
                 priority: None,
                 context: None,
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "Task 1 step".to_string(),
+                parent_task_id: Some(first.id),
+                ..Default::default()
             })
             .unwrap();
 
@@ -790,6 +1054,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: false,
                         depends_on: None,
                     },
                     BatchTaskInput {
@@ -798,6 +1063,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: false,
                         depends_on: Some(vec!["build".into()]),
                     },
                     BatchTaskInput {
@@ -806,6 +1072,7 @@ mod tests {
                         description: None,
                         agent_id: None,
                         priority: None,
+                        new_session: true,
                         depends_on: Some(vec!["test".into()]),
                     },
                 ],
@@ -814,6 +1081,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[2].context.as_ref().unwrap()["session_mode"], "new");
         assert!(!board.is_ready(&tasks[2].id).unwrap()); // deploy blocked
         assert!(!board.is_ready(&tasks[1].id).unwrap()); // test blocked
         assert!(board.is_ready(&tasks[0].id).unwrap()); // build ready

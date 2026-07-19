@@ -1,7 +1,7 @@
 # ADR-016: Navigation Restructure
 
 ## Status
-Accepted
+Superseded by ADR-028
 
 ## Context
 

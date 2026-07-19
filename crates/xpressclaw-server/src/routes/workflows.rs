@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::workflows::definition::WorkflowDefinition;
 use xpressclaw_core::workflows::engine::WorkflowEngine;
 use xpressclaw_core::workflows::instance::InstanceManager;
 use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
@@ -50,6 +51,7 @@ async fn create_workflow(
     State(state): State<AppState>,
     Json(req): Json<CreateWorkflowReq>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    reject_new_connector_automation(&req.yaml_content)?;
     let mgr = WorkflowManager::new(state.db.clone());
     let wf = mgr
         .create(&CreateWorkflow {
@@ -82,6 +84,16 @@ async fn update_workflow(
     Json(req): Json<CreateWorkflowReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = WorkflowManager::new(state.db.clone());
+    let previous = mgr.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+    let previous_uses_connectors = WorkflowDefinition::parse(&previous.yaml_content)
+        .map_err(|e| bad_request(&e))?
+        .uses_connector_automation();
+    if !previous_uses_connectors {
+        reject_new_connector_automation(&req.yaml_content)?;
+    }
     let wf = mgr.update(&id, &req.yaml_content).map_err(|e| match &e {
         xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
         xpressclaw_core::error::Error::Workflow(_) => bad_request(&e),
@@ -107,6 +119,11 @@ async fn enable_workflow(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mgr = WorkflowManager::new(state.db.clone());
+    let record = mgr.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+    reject_connector_execution(&record.yaml_content)?;
     let wf = mgr.set_enabled(&id, true).map_err(|e| match &e {
         xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
         _ => internal_error(e),
@@ -131,6 +148,12 @@ async fn run_workflow(
     Path(id): Path<String>,
     Json(trigger_data): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let mgr = WorkflowManager::new(state.db.clone());
+    let record = mgr.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+    reject_connector_execution(&record.yaml_content)?;
     let engine = WorkflowEngine::new(state.db.clone());
     let instance_id = engine
         .start_instance(&id, trigger_data)
@@ -207,4 +230,24 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": e.to_string() })),
     )
+}
+
+fn reject_new_connector_automation(yaml_content: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let definition = WorkflowDefinition::parse(yaml_content).map_err(|e| bad_request(&e))?;
+    if definition.uses_connector_automation() {
+        return Err(bad_request(
+            "connector triggers and notification sinks are disabled in this beta",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_connector_execution(yaml_content: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let definition = WorkflowDefinition::parse(yaml_content).map_err(|e| bad_request(&e))?;
+    if definition.uses_connector_automation() {
+        return Err(bad_request(
+            "remove disabled connector triggers and notification sinks before enabling or running this workflow",
+        ));
+    }
+    Ok(())
 }

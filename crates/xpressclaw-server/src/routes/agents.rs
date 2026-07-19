@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -6,11 +6,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::agents::registry::{AgentRecord, AgentRegistry};
-use xpressclaw_core::agents::state::{DesiredStatus, ObservedStatus};
 use xpressclaw_core::config::{
-    AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, RateLimitConfig, WakeOnConfig,
+    AgentConfig, AgentLlmConfig, BudgetConfig, HooksConfig, NativeRunnerConfig, RateLimitConfig,
+    WakeOnConfig,
 };
-use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::sessions::LogicalSession;
 
 use crate::state::AppState;
 
@@ -26,45 +26,37 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/config", axum::routing::patch(update_agent_config))
         .route("/{id}/start", axum::routing::post(start_agent))
         .route("/{id}/stop", axum::routing::post(stop_agent))
-        .route("/{id}/logs", get(get_agent_logs))
+        .route("/{id}/logs", get(raw_logs_removed))
 }
 
-/// Build a JSON response for an agent by merging YAML config, DB desired state,
-/// and live Docker observed state.
+/// Build the legacy `/agents` compatibility response from a logical session.
 fn agent_json(
     record: &AgentRecord,
     config: &xpressclaw_core::config::Config,
-    observed: &xpressclaw_core::agents::state::ObservedStatus,
+    session: Option<&LogicalSession>,
 ) -> Value {
     let agent_cfg = config.agents.iter().find(|a| a.name == record.name);
-    let desired: xpressclaw_core::agents::state::DesiredStatus = record
-        .desired_status
-        .parse()
-        .unwrap_or(xpressclaw_core::agents::state::DesiredStatus::Stopped);
-    let status = xpressclaw_core::agents::state::compute_status(&desired, observed);
+    let status = session.map(|s| s.status.as_str()).unwrap_or("idle");
     json!({
         "id": record.id,
         "name": record.name,
+        "title": agent_cfg.map(|config| config.context_label()).unwrap_or_else(|| record.name.clone()),
         "backend": record.backend,
         "status": status,
-        "desired_status": record.desired_status,
-        "observed_status": observed.to_string(),
-        "container_id": record.container_id,
+        "desired_status": "available",
+        "observed_status": "native",
+        "container_id": Value::Null,
         "created_at": record.created_at,
         "started_at": record.started_at,
         "stopped_at": record.stopped_at,
         "error_message": record.error_message,
         "restart_count": record.restart_count,
         "config": agent_cfg.map(|c| json!({
-            "display_name": c.display_name,
-            "role_title": c.role_title,
-            "responsibilities": c.responsibilities,
-            "avatar": c.avatar,
-            "role": c.role,
             // For backward compat with frontend code that reads `model` at
             // the top level — same value as `llm.model`.
             "model": c.effective_model(),
             "llm": c.llm,
+            "runner": c.runner,
             "tools": c.tools,
             "skills": c.skills,
             "volumes": c.volumes,
@@ -76,19 +68,6 @@ fn agent_json(
     })
 }
 
-/// Query live observed status from Docker for an agent.
-/// Query live observed status from Docker for an agent.
-async fn observe_with(docker: &DockerManager, agent_id: &str) -> ObservedStatus {
-    let container_name = format!("xpressclaw-{agent_id}");
-    if docker.is_container_running(&container_name).await {
-        ObservedStatus::Running
-    } else if docker.inspect_by_name(&container_name).await.is_some() {
-        ObservedStatus::Exited
-    } else {
-        ObservedStatus::NotFound
-    }
-}
-
 async fn list_agents(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -96,15 +75,17 @@ async fn list_agents(
     let agents = registry.list().map_err(internal_error)?;
     let config = state.config();
 
-    // Use shared Docker connection from AppState
-    let docker = state.docker().await;
+    let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
     let mut result = Vec::new();
     for a in &agents {
-        let observed = match &docker {
-            Some(d) => observe_with(d, &a.id).await,
-            None => ObservedStatus::DockerUnavailable,
-        };
-        result.push(agent_json(a, &config, &observed));
+        let title = config
+            .agents
+            .iter()
+            .find(|cfg| cfg.name == a.name)
+            .map(|cfg| cfg.context_label())
+            .unwrap_or_else(|| a.name.clone());
+        let session = sessions.ensure(&a.id, Some(&title)).ok();
+        result.push(agent_json(a, &config, session.as_ref()));
     }
     Ok(Json(json!(result)))
 }
@@ -119,11 +100,16 @@ async fn get_agent(
         _ => internal_error(e),
     })?;
     let config = state.config();
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
-    Ok(Json(agent_json(&record, &config, &observed)))
+    let title = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == record.name)
+        .map(|agent| agent.context_label())
+        .unwrap_or_else(|| record.name.clone());
+    let session = xpressclaw_core::sessions::SessionManager::new(state.db.clone())
+        .ensure(&record.id, Some(&title))
+        .ok();
+    Ok(Json(agent_json(&record, &config, session.as_ref())))
 }
 
 async fn delete_agent(
@@ -131,13 +117,26 @@ async fn delete_agent(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
-    // Set desired=stopped so the reconciler stops the container
-    let _ = registry.set_desired_status(&id, &DesiredStatus::Stopped);
-    // Also stop immediately for responsiveness
+    registry.get(&id).map_err(|e| match &e {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
+        _ => internal_error(e),
+    })?;
+    let sessions = xpressclaw_core::sessions::SessionManager::new(state.db.clone());
+    let attempts = sessions.list_attempts(&id, None, 1_000).unwrap_or_default();
     if let Some(docker) = state.docker().await {
+        for attempt in attempts.iter().filter(|attempt| {
+            !matches!(
+                attempt.status.as_str(),
+                "completed" | "failed" | "cancelled"
+            )
+        }) {
+            let _ = docker.stop(&format!("attempt-{}", attempt.id)).await;
+        }
+        // Clean up a legacy long-running container from pre-ADR-025 installs.
         let _ = docker.stop(&id).await;
     }
     registry.delete(&id).map_err(internal_error)?;
+    sessions.delete(&id).map_err(internal_error)?;
 
     // Remove from YAML config
     let old_config = state.config();
@@ -163,8 +162,8 @@ async fn delete_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Start an agent: sets desired_status to 'running'.
-/// The reconciler handles image pulling and container launch.
+/// Compatibility endpoint. Logical sessions are always available; worker
+/// containers are created only after work is queued.
 async fn start_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -177,28 +176,16 @@ async fn start_agent(
         _ => internal_error(e),
     })?;
 
-    registry
-        .set_desired_status(&id, &DesiredStatus::Running)
-        .map_err(internal_error)?;
-
-    // Also set old status for backward compat during transition
-    let _ = registry.update_status(
-        &id,
-        &xpressclaw_core::agents::state::AgentStatus::Starting,
-        None,
-    );
-
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
-    Ok(Json(agent_json(&record, &config, &observed)))
+    let session = xpressclaw_core::sessions::SessionManager::new(state.db.clone())
+        .ensure(&record.id, Some(&record.name))
+        .ok();
+    Ok(Json(agent_json(&record, &config, session.as_ref())))
 }
 
-/// Stop an agent: sets desired_status to 'stopped'.
-/// The reconciler handles container shutdown.
+/// Compatibility endpoint. There is no persistent agent process to stop;
+/// individual attempts are cancelled through the sessions API.
 async fn stop_agent(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -209,35 +196,19 @@ async fn stop_agent(
         _ => internal_error(e),
     })?;
 
-    registry
-        .set_desired_status(&id, &DesiredStatus::Stopped)
-        .map_err(internal_error)?;
-
-    // Also set old status for backward compat during transition
-    let _ = registry.update_status(
-        &id,
-        &xpressclaw_core::agents::state::AgentStatus::Stopped,
-        None,
-    );
-
     let config = state.config();
     let record = registry.get(&id).map_err(internal_error)?;
-    let observed = match state.docker().await {
-        Some(d) => observe_with(&d, &record.id).await,
-        None => ObservedStatus::DockerUnavailable,
-    };
-    Ok(Json(agent_json(&record, &config, &observed)))
+    let session = xpressclaw_core::sessions::SessionManager::new(state.db.clone())
+        .ensure(&record.id, Some(&record.name))
+        .ok();
+    Ok(Json(agent_json(&record, &config, session.as_ref())))
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateAgentConfigRequest {
-    display_name: Option<String>,
-    role_title: Option<String>,
-    responsibilities: Option<String>,
-    avatar: Option<String>,
-    role: Option<String>,
     model: Option<String>,
     llm: Option<AgentLlmConfig>,
+    runner: Option<NativeRunnerConfig>,
     tools: Option<Vec<String>>,
     skills: Option<Vec<String>>,
     volumes: Option<Vec<String>>,
@@ -276,22 +247,6 @@ async fn update_agent_config(
         new_agents.last_mut().unwrap()
     };
 
-    // Apply partial updates — profile fields
-    if let Some(dn) = req.display_name {
-        agent.display_name = if dn.is_empty() { None } else { Some(dn) };
-    }
-    if let Some(rt) = req.role_title {
-        agent.role_title = if rt.is_empty() { None } else { Some(rt) };
-    }
-    if let Some(resp) = req.responsibilities {
-        agent.responsibilities = if resp.is_empty() { None } else { Some(resp) };
-    }
-    if let Some(av) = req.avatar {
-        agent.avatar = if av.is_empty() { None } else { Some(av) };
-    }
-    if let Some(role) = req.role {
-        agent.role = role;
-    }
     // Model lives on llm.model now. If the request supplies a top-level
     // `model`, write it into llm.model — creating the AgentLlmConfig if
     // missing, so the field never gets silently dropped.
@@ -311,6 +266,9 @@ async fn update_agent_config(
         } else {
             agent.llm = None;
         }
+    }
+    if let Some(runner) = req.runner {
+        agent.runner = runner;
     }
     if let Some(mut tools) = req.tools {
         // Ensure shell + filesystem are always present
@@ -347,7 +305,7 @@ async fn update_agent_config(
         };
     }
 
-    let needs_restart = record.desired_status == "running";
+    let needs_restart = false;
 
     // Save updated config — preserve all top-level fields
     let new_config = xpressclaw_core::config::Config {
@@ -383,12 +341,8 @@ async fn update_agent_config(
     Ok(Json(json!({
         "agent": {
             "name": updated.name,
+            "title": updated.context_label(),
             "backend": updated.backend,
-            "display_name": updated.display_name,
-            "role_title": updated.role_title,
-            "responsibilities": updated.responsibilities,
-            "avatar": updated.avatar,
-            "role": updated.role,
             "model": updated.effective_model(),
             "llm": updated.llm.as_ref().map(|l| json!({
                 "provider": l.provider,
@@ -396,6 +350,7 @@ async fn update_agent_config(
                 "has_api_key": l.api_key.is_some(),
                 "base_url": l.base_url,
             })),
+            "runner": updated.runner,
             "tools": updated.tools,
             "volumes": updated.volumes,
             "budget": updated.budget.as_ref().map(|b| json!({
@@ -422,23 +377,13 @@ async fn update_agent_config(
     })))
 }
 
-#[derive(Debug, Deserialize)]
-struct LogsQuery {
-    tail: Option<usize>,
-}
-
-async fn get_agent_logs(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<LogsQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let tail = query.tail.unwrap_or(100);
-    let docker = state
-        .docker()
-        .await
-        .ok_or_else(|| internal_error("Docker not available"))?;
-    let logs = docker.logs(&id, tail).await.map_err(internal_error)?;
-    Ok(Json(json!({ "logs": logs })))
+async fn raw_logs_removed() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "raw terminal logs were replaced by structured session events and artifacts"
+        })),
+    )
 }
 
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
@@ -531,7 +476,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["id"], "atlas");
-        assert_eq!(body["status"], "stopped");
+        assert_eq!(body["status"], "idle");
     }
 
     #[tokio::test]
@@ -591,12 +536,11 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         let db = Arc::new(Database::open_memory().unwrap());
-        // Create a config with a test agent
+        // Create a config with a test session
         let mut config = Config::load_default().unwrap();
         config.agents.push(AgentConfig {
             name: "atlas".to_string(),
             backend: "generic".to_string(),
-            role: "You are a test agent.".to_string(),
             ..Default::default()
         });
         config.save(&config_path).unwrap();
@@ -766,7 +710,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Second: update only role — budget should be preserved
+        // Second: update only mounts — budget should be preserved
         let resp = app
             .clone()
             .oneshot(
@@ -774,7 +718,9 @@ mod tests {
                     .method("PATCH")
                     .uri("/agents/atlas/config")
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({ "role": "Updated role." }).to_string()))
+                    .body(Body::from(
+                        json!({ "volumes": ["/tmp:/tmp:ro"] }).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -782,7 +728,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
-        assert_eq!(body["agent"]["role"], "Updated role.");
+        assert_eq!(body["agent"]["volumes"][0], "/tmp:/tmp:ro");
         // Budget should still be there
         assert_eq!(body["agent"]["budget"]["daily"], "$5.00");
 

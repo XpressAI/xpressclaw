@@ -1,7 +1,7 @@
 # ADR-021: Agent Sessions (Actor Model)
 
 ## Status
-Proposed
+Superseded by ADR-025
 
 ## Context
 

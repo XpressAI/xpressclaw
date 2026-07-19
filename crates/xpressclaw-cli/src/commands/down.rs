@@ -1,36 +1,10 @@
 use super::client;
 
 pub async fn run(port: u16) -> anyhow::Result<()> {
-    // First try to stop agents via the API
-    match client::connect(port).await {
-        Ok(api) => {
-            let agents: Vec<serde_json::Value> = api.get("/agents").await?;
-
-            let mut stopped = 0;
-            for agent in &agents {
-                let id = agent["id"].as_str().unwrap_or_default();
-                let status = agent["status"].as_str().unwrap_or_default();
-
-                if status == "running" || status == "starting" {
-                    match api.post_empty(&format!("/agents/{id}/stop")).await {
-                        Ok(_) => {
-                            println!("  stopped {id}");
-                            stopped += 1;
-                        }
-                        Err(e) => eprintln!("  failed to stop {id}: {e}"),
-                    }
-                }
-            }
-
-            if stopped == 0 {
-                println!("No running agents to stop.");
-            } else {
-                println!("Stopped {stopped} agent(s).");
-            }
-        }
-        Err(_) => {
-            // Server not reachable via API — try killing via PID file
-        }
+    // Sessions have no persistent processes to stop. A graceful server
+    // shutdown cancels and removes any active short-lived worker containers.
+    if client::connect(port).await.is_ok() {
+        println!("Stopping the control plane and active ACP workers...");
     }
 
     // Kill background server process if running
@@ -49,7 +23,7 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
 
                 match result {
                     Ok(output) if output.status.success() => {
-                        println!("Stopped background server (pid {pid}).");
+                        println!("Stopped background control plane (pid {pid}).");
                     }
                     _ => {
                         // Process already dead

@@ -25,6 +25,8 @@ uuid = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
+tokio-util = { workspace = true }
+agent-client-protocol = { workspace = true }
 async-stream = "0.3"
 ready-agent-cog = { workspace = true }
 croner = "2"
@@ -36,6 +38,7 @@ async-imap = "0.10"
 async-native-tls = "0.5"
 async-std = { version = "1", features = ["default"] }
 base64 = "0.22"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

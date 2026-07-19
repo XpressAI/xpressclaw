@@ -8,6 +8,7 @@ use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
+use xpressclaw_core::workers::acp::AcpElicitationBroker;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -29,6 +30,8 @@ pub struct AppState {
     pub event_bus: Arc<ConversationEventBus>,
     /// Shared Docker connection (reused across all requests).
     pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
+    /// Live ACP forms waiting for a response from the task UI.
+    pub elicitations: Arc<AcpElicitationBroker>,
 }
 
 impl AppState {
@@ -51,6 +54,7 @@ impl AppState {
             mcp_manager: Arc::new(McpManager::new()),
             event_bus: Arc::new(ConversationEventBus::new()),
             docker: Arc::new(RwLock::new(None)),
+            elicitations: Arc::new(AcpElicitationBroker::new()),
         }
     }
 

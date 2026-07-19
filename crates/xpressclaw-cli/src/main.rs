@@ -6,10 +6,11 @@ mod commands;
 #[derive(Parser)]
 #[command(
     name = "xpressclaw",
-    about = "Your AI agents. Running while you sleep.",
+    about = "Control plane for native agent work",
     version,
-    long_about = "xpressclaw is an open-source AI agent runtime. Define agents in YAML, \
-                  give them tasks, and let them work autonomously."
+    long_about = "Run the xpressclaw control plane for durable sessions, queued work, \
+                  schedules, and isolated Codex, Claude Code, or OpenCode workers. \
+                  Create and operate sessions from the web UI."
 )]
 struct Cli {
     #[command(subcommand)]

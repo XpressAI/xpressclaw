@@ -5,6 +5,7 @@ use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
@@ -21,61 +22,22 @@ async fn run_foreground(port: u16, workdir: Option<String>) -> anyhow::Result<()
     let state = build_state(port, workdir).await?;
 
     if !state.is_setup_complete() {
-        println!("xpressclaw is starting in setup mode...");
+        println!("xpressclaw control plane is starting...");
         println!();
-        println!("  Open http://localhost:{port} to complete setup.");
+        println!("  Open http://localhost:{port} to create your first session.");
         println!();
         println!("Press Ctrl+C to stop.");
     } else {
-        println!("xpressclaw is starting...");
+        println!("xpressclaw control plane is starting...");
         println!("  Web UI: http://localhost:{port}");
         println!("  API:    http://localhost:{port}/api");
-        println!("  LLM:    http://localhost:{port}/v1");
-
-        // Check LLM availability per-agent.
         let config = state.config();
-        let providers: std::collections::HashSet<&str> = config
-            .agents
-            .iter()
-            .filter_map(|a| a.llm.as_ref().and_then(|l| l.provider.as_deref()))
-            .collect();
-        let has_cloud = providers.contains("openai") || providers.contains("anthropic");
-        let uses_ollama = providers.contains("ollama");
-        let uses_local = providers.contains("local");
-        if has_cloud {
-            println!("  LLM:    cloud provider configured");
-        }
-        if uses_ollama {
-            // Pick a representative ollama agent's base_url for the probe.
-            let base_url = config
-                .agents
-                .iter()
-                .find_map(|a| {
-                    a.llm.as_ref().and_then(|l| {
-                        if l.provider.as_deref() == Some("ollama") {
-                            l.base_url.clone()
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_else(|| "http://localhost:11434".into());
-            let probe = format!("{}/api/tags", base_url.trim_end_matches('/'));
-            match reqwest::get(&probe).await {
-                Ok(resp) if resp.status().is_success() => {
-                    println!("  LLM:    Ollama at {base_url}");
-                }
-                _ => {
-                    println!();
-                    println!("  Warning: Ollama not reachable at {base_url}.");
-                    println!("  Chat and agent tasks need it running. Start with `ollama serve`.");
-                }
-            }
-        }
-        if !has_cloud && !uses_ollama && !uses_local && config.agents.is_empty() {
+        if config.agents.is_empty() {
             println!();
-            println!("  Warning: No agents configured.");
-            println!("  Run setup at http://localhost:{port}/setup to add one.");
+            println!("  No sessions configured yet.");
+            println!("  Create one at http://localhost:{port}/setup?mode=add-session");
+        } else {
+            println!("  Sessions: {}", config.agents.len());
         }
 
         println!();
@@ -189,25 +151,26 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
     let db = Arc::new(Database::open(&db_path)?);
     info!(path = %db_path.display(), "database ready");
 
-    // Sync agents from YAML config into DB runtime state table.
-    // Config (role, model, tools, llm, etc.) always comes from the YAML.
-    // The DB only tracks runtime state (status, container_id, timestamps).
+    // Sync configured runtime contexts and their durable logical sessions. Native
+    // workers are launched later for individual queued attempts.
     let registry = AgentRegistry::new(db.clone());
+    let sessions = SessionManager::new(db.clone());
     let valid_names: Vec<&str> = config.agents.iter().map(|a| a.name.as_str()).collect();
+    for existing in registry.list().unwrap_or_default() {
+        if !valid_names.contains(&existing.name.as_str()) {
+            let _ = sessions.delete(&existing.id);
+        }
+    }
     registry.remove_stale(&valid_names).unwrap_or_default();
     for agent_config in &config.agents {
         match registry.ensure(&agent_config.name, &agent_config.backend) {
             Ok(record) => {
-                // Agents in the config should be running — set desired state.
-                // This ensures agents auto-start on boot without manual intervention.
-                let _ = registry.set_desired_status(
-                    &record.id,
-                    &xpressclaw_core::agents::state::DesiredStatus::Running,
-                );
+                let title = agent_config.context_label();
+                sessions.ensure(&record.id, Some(&title))?;
                 info!(
                     name = record.name,
                     backend = record.backend,
-                    "synced agent (desired=running)"
+                    "synced ACP project"
                 );
             }
             Err(e) => warn!(name = agent_config.name, error = %e, "failed to sync agent"),
@@ -225,10 +188,8 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
 
     let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
 
-    // No agent startup here — the reconciler (ADR-018) handles all container
-    // lifecycle: pulling images, starting agents with desired_status='running',
-    // restarting crashed containers, and re-queuing orphaned tasks.
-    // It runs as a background task started in server::serve().
+    // No worker startup here. The server dispatches queued work into isolated,
+    // short-lived ACP server containers (ADR-026).
 
     Ok(state)
 }

@@ -1,62 +1,61 @@
-name: Build & Push Harness Images
+name: Build & Push Runner Images
 
 on:
   push:
     branches: [main]
     paths:
       - 'harnesses/**'
+      - 'scripts/verify-runner-images.sh'
+      - '.github/workflows/harnesses.yml'
   pull_request:
     branches: [main]
     paths:
       - 'harnesses/**'
+      - 'scripts/verify-runner-images.sh'
+      - '.github/workflows/harnesses.yml'
   workflow_dispatch:
+
+concurrency:
+  group: harness-images-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io/xpressai
 
 jobs:
-  build-base:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/setup-qemu-action@v3
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: harnesses/base
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ env.REGISTRY }}/xpressclaw-harness-base:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-harnesses:
-    needs: build-base
+  build-native-runners:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     strategy:
       matrix:
-        harness: [claude-sdk, xaibo, langchain]
+        include:
+          - runner: codex
+            target: runner
+            suffix: ''
+          - runner: claude
+            target: runner
+            suffix: ''
+          - runner: opencode
+            target: runner
+            suffix: ''
+          - runner: codex
+            target: runner-host
+            suffix: '-docker'
+          - runner: claude
+            target: runner-host
+            suffix: '-docker'
+          - runner: opencode
+            target: runner-host
+            suffix: '-docker'
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -64,12 +63,31 @@ jobs:
 
       - uses: docker/setup-qemu-action@v3
 
-      # Base image is already pushed by build-base job
       - uses: docker/build-push-action@v6
         with:
-          context: harnesses/${{ matrix.harness }}
+          context: harnesses/native
+          file: harnesses/native/${{ matrix.runner }}/Dockerfile
+          target: ${{ matrix.target }}
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/xpressclaw-harness-${{ matrix.harness }}:latest
+          tags: |
+            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}${{ matrix.suffix }}:latest
+            ${{ env.REGISTRY }}/xpressclaw-runner-${{ matrix.runner }}${{ matrix.suffix }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  verify-public-runners:
+    if: github.event_name != 'pull_request'
+    needs: build-native-runners
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Verify anonymous runner access
+        run: bash scripts/verify-runner-images.sh 120

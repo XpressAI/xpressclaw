@@ -1,12 +1,15 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, UpdateTask};
+use xpressclaw_core::sessions::SessionManager;
+use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
+use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::workers::acp::{AcpElicitationResponseError, CreateElicitationResponse};
 
 use crate::state::AppState;
 
@@ -28,6 +31,22 @@ pub struct StatusUpdate {
 pub struct MessageInput {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub config_options: std::collections::HashMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+pub struct ActivityParams {
+    pub after: Option<i64>,
+    pub before: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct ElicitationResponseInput {
+    pub action: String,
+    pub content: Option<Value>,
+    pub message: Option<String>,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -41,6 +60,11 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/status", patch(update_task_status))
         .route("/{id}/messages", get(get_messages).post(add_message))
+        .route("/{id}/activity", get(get_activity))
+        .route(
+            "/{id}/elicitations/{elicitation_id}/response",
+            post(respond_to_elicitation),
+        )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
 }
 
@@ -148,8 +172,8 @@ async fn update_task(
             && (task.status == xpressclaw_core::tasks::board::TaskStatus::Pending
                 || task.status == xpressclaw_core::tasks::board::TaskStatus::InProgress)
         {
-            let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
-            let _ = queue.enqueue(&task.id, agent_id);
+            let queue = TaskQueue::new(state.db.clone());
+            let _ = queue.enqueue_continuation(&task.id, agent_id);
             // Also set to in_progress if it was pending
             if task.status == xpressclaw_core::tasks::board::TaskStatus::Pending {
                 let _ = board.update_status(&task.id, "in_progress", Some(agent_id));
@@ -166,6 +190,7 @@ async fn delete_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    state.elicitations.cancel_task(&id);
     let board = TaskBoard::new(state.db.clone());
     board.delete(&id).map_err(internal_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -177,19 +202,86 @@ async fn update_task_status(
     Json(req): Json<StatusUpdate>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    let task = board
-        .update_status(&id, &req.status, req.agent_id.as_deref())
-        .map_err(|e| match &e {
-            xpressclaw_core::error::Error::TaskNotFound { .. } => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": e.to_string() })),
-            ),
-            xpressclaw_core::error::Error::Task(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": e.to_string() })),
-            ),
-            _ => internal_error(e),
-        })?;
+    if req.status == "completed" && !board.subtasks_complete(&id).map_err(internal_error)? {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "all subtasks must be completed first" })),
+        ));
+    }
+    if req.status == "cancelled" {
+        let active_attempt_id = state
+            .db
+            .with_conn(|conn| {
+                let attempt_id = conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                Ok::<_, xpressclaw_core::error::Error>(attempt_id)
+            })
+            .map_err(internal_error)?;
+        if let Some(attempt_id) = active_attempt_id {
+            let sessions = SessionManager::new(state.db.clone());
+            if let Ok(attempt) = sessions.get_attempt(&attempt_id) {
+                if !matches!(
+                    attempt.status.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) {
+                    sessions
+                        .transition_attempt(
+                            &attempt_id,
+                            "cancelled",
+                            "Work cancelled by user",
+                            None,
+                            None,
+                        )
+                        .map_err(internal_error)?;
+                    if let Some(queue_id) = attempt.queue_id {
+                        state
+                            .db
+                            .with_conn(|conn| {
+                                conn.execute(
+                                    "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                                        harness_response = 'cancelled by user' WHERE id = ?1",
+                                    [queue_id],
+                                )?;
+                                Ok::<_, xpressclaw_core::error::Error>(())
+                            })
+                            .map_err(internal_error)?;
+                    }
+                }
+            }
+            state.elicitations.cancel_attempt(&attempt_id);
+            if let Some(docker) = state.docker().await {
+                let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
+            }
+        } else {
+            state.elicitations.cancel_task(&id);
+        }
+    }
+    let updated = if req.status == "completed" {
+        board
+            .complete_and_roll_up(&id, req.agent_id.as_deref())
+            .and_then(|tasks| {
+                tasks
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
+            })
+    } else {
+        board.update_status(&id, &req.status, req.agent_id.as_deref())
+    };
+    let task = updated.map_err(|e| match &e {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Task(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+        _ => internal_error(e),
+    })?;
     Ok(Json(json!(task)))
 }
 
@@ -210,32 +302,198 @@ async fn get_messages(
     Ok(Json(json!(messages)))
 }
 
+async fn get_activity(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<ActivityParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if params.after.is_some() && params.before.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "use either 'after' or 'before', not both" })),
+        ));
+    }
+    TaskBoard::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            _ => internal_error(error),
+        })?;
+    let activity = SessionManager::new(state.db.clone())
+        .task_activity(
+            &id,
+            params.after,
+            params.before,
+            params.limit.unwrap_or(250).clamp(1, 500),
+            20,
+        )
+        .map_err(internal_error)?;
+    Ok(Json(json!(activity)))
+}
+
+async fn respond_to_elicitation(
+    State(state): State<AppState>,
+    Path((id, elicitation_id)): Path<(String, String)>,
+    Json(req): Json<ElicitationResponseInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    TaskBoard::new(state.db.clone())
+        .get(&id)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            _ => internal_error(error),
+        })?;
+
+    if !matches!(req.action.as_str(), "accept" | "decline" | "cancel") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "action must be accept, decline, or cancel" })),
+        ));
+    }
+    let mut wire = json!({ "action": req.action });
+    if req.action == "accept" {
+        let content = req.content.clone().unwrap_or_else(|| json!({}));
+        if !content.is_object() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "accepted elicitation content must be an object" })),
+            ));
+        }
+        wire["content"] = content;
+    }
+    let response: CreateElicitationResponse = serde_json::from_value(wire).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("invalid elicitation response: {error}") })),
+        )
+    })?;
+
+    state
+        .elicitations
+        .respond(&id, &elicitation_id, response)
+        .map_err(|error| match error {
+            AcpElicitationResponseError::WrongTask => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "elicitation does not belong to this task" })),
+            ),
+            AcpElicitationResponseError::NotFound | AcpElicitationResponseError::Closed => (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "this question is no longer awaiting a response" })),
+            ),
+        })?;
+
+    if req.action == "accept" {
+        let message = req
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "Answered the agent's question".to_string());
+        if let Err(error) =
+            TaskConversation::new(state.db.clone()).add_message(&id, "user", &message)
+        {
+            tracing::warn!(%error, task_id = id, "failed to persist elicitation answer in task chat");
+        }
+    }
+
+    Ok(Json(json!({ "resolved": true, "action": req.action })))
+}
+
 async fn add_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<MessageInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if req.role != "user" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "task chat only accepts user messages" })),
+        ));
+    }
+    if req.content.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "message cannot be empty" })),
+        ));
+    }
+
+    let board = TaskBoard::new(state.db.clone());
+    let task = board.get(&id).map_err(|error| match &error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        _ => internal_error(error),
+    })?;
     let conv = TaskConversation::new(state.db.clone());
     let msg = conv
         .add_message(&id, &req.role, &req.content)
         .map_err(internal_error)?;
 
-    // When a user sends a message to a waiting_for_input task, resume it.
-    if req.role == "user" {
-        let board = TaskBoard::new(state.db.clone());
-        if let Ok(task) = board.get(&id) {
-            if task.status == xpressclaw_core::tasks::board::TaskStatus::WaitingForInput {
-                if let Some(ref agent_id) = task.agent_id {
-                    let _ = board.update_status(&id, "in_progress", Some(agent_id));
-                    let queue = xpressclaw_core::tasks::queue::TaskQueue::new(state.db.clone());
-                    let _ = queue.enqueue(&id, agent_id);
-                    tracing::info!(task_id = id, agent_id, "resumed task after user input");
-                }
-            }
+    let mut continuation = None;
+    if let Some(ref agent_id) = task.agent_id {
+        let sessions = SessionManager::new(state.db.clone());
+        sessions
+            .ensure(agent_id, Some(agent_id))
+            .map_err(internal_error)?;
+        sessions
+            .append_event(
+                agent_id,
+                xpressclaw_core::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: Some(&id),
+                    source_type: "user",
+                    source_id: Some("local-user"),
+                    event_type: "task_message_received",
+                    summary: &req.content,
+                    payload: json!({
+                        "role": req.role,
+                        "content": req.content,
+                        "config_options": req.config_options,
+                    }),
+                },
+            )
+            .map_err(internal_error)?;
+
+        let queue = TaskQueue::new(state.db.clone());
+        continuation = queue
+            .enqueue_continuation(&id, agent_id)
+            .map_err(internal_error)?;
+        if continuation.is_some()
+            && matches!(
+                task.status,
+                TaskStatus::WaitingForInput
+                    | TaskStatus::Blocked
+                    | TaskStatus::Completed
+                    | TaskStatus::Cancelled
+            )
+        {
+            board
+                .update_status(&id, "pending", Some(agent_id))
+                .map_err(internal_error)?;
         }
+        tracing::info!(
+            task_id = id,
+            agent_id,
+            continuation_queued = continuation.is_some(),
+            "received task chat message"
+        );
     }
 
-    Ok((StatusCode::CREATED, Json(json!(msg))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "message": msg,
+            "continuation_queued": continuation.is_some(),
+            "attempt_id": continuation.and_then(|item| item.attempt_id),
+        })),
+    ))
 }
 
 /// Batch create tasks with ref-based dependencies (ADR-020).
@@ -304,18 +562,22 @@ mod tests {
 
     use super::*;
 
-    fn test_app() -> Router {
+    fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
-            db,
+            db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
             true,
         );
 
-        Router::new().nest("/tasks", routes()).with_state(state)
+        (Router::new().nest("/tasks", routes()).with_state(state), db)
+    }
+
+    fn test_app() -> Router {
+        test_app_with_db().0
     }
 
     async fn body_json(body: Body) -> Value {
@@ -572,8 +834,9 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::CREATED);
         let body = body_json(resp.into_body()).await;
-        assert_eq!(body["role"], "user");
-        assert_eq!(body["content"], "Hello agent");
+        assert_eq!(body["message"]["role"], "user");
+        assert_eq!(body["message"]["content"], "Hello agent");
+        assert_eq!(body["continuation_queued"], false);
 
         // Get messages
         let resp = app
@@ -590,5 +853,109 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_task_message_queues_one_continuation() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Correct this", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+
+        let queue = TaskQueue::new(db.clone());
+        let first = queue.list(Some("developer"), Some("queued"), 10).unwrap()[0].clone();
+        let attempt_id = first.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(attempt_id, "completed", "Done", Some("Done"), None)
+            .unwrap();
+        queue.complete(first.id, "Done").unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "completed", Some("developer"))
+            .unwrap();
+
+        let send = |content: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/tasks/{task_id}/messages"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"role": "user", "content": content}).to_string(),
+                ))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(send("Please fix the mistake"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["continuation_queued"], true);
+        assert!(body["attempt_id"].is_string());
+        let reopened = TaskBoard::new(db.clone()).get(&task_id).unwrap();
+        assert_eq!(reopened.status, TaskStatus::Pending);
+        assert!(reopened.completed_at.is_none());
+
+        let resp = app.clone().oneshot(send("One more detail")).await.unwrap();
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["continuation_queued"], false);
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_activity_includes_native_attempt_events() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "title": "Visible native work",
+                            "agent_id": "website-codex"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/tasks/{task_id}/activity"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 1);
+        assert!(body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event_type"] == "attempt_queued"));
     }
 }

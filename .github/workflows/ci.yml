@@ -29,7 +29,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Check formatting
-        run: cargo fmt -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri -- --check
+        run: ./scripts/rustfmt.sh --check
 
   # Frontend type checking (independent of Rust)
   frontend:
@@ -50,6 +50,8 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
 
   # Build + test + clippy (only ubuntu — macOS is only needed for release)
   build:

@@ -112,32 +112,35 @@
 			<div class="rounded-md border border-border p-3 space-y-3">
 				<div class="grid grid-cols-2 gap-3">
 					<div>
-						<label class="block text-xs text-muted-foreground mb-1">Name</label>
+						<label class="block text-xs text-muted-foreground mb-1">Name
 						<input
 							type="text"
 							bind:value={newName}
 							placeholder="daily-check"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+							class="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 						/>
+						</label>
 					</div>
 					<div>
-						<label class="block text-xs text-muted-foreground mb-1">Cron Expression</label>
+						<label class="block text-xs text-muted-foreground mb-1">Cron Expression
 						<input
 							type="text"
 							bind:value={newCron}
 							placeholder="0 9 * * *"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring"
+							class="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-ring"
 						/>
+						</label>
 					</div>
 				</div>
 				<div>
-					<label class="block text-xs text-muted-foreground mb-1">Task Title</label>
+					<label class="block text-xs text-muted-foreground mb-1">Task Title
 					<input
 						type="text"
 						bind:value={newTitle}
 						placeholder="Task title when triggered (defaults to name)"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
+						class="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
 					/>
+					</label>
 				</div>
 				<div class="flex justify-end">
 					<button

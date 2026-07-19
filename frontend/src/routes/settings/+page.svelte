@@ -96,7 +96,7 @@
 <div class="p-6 space-y-6">
 	<div>
 		<h1 class="text-2xl font-bold">Profile</h1>
-		<p class="text-sm text-muted-foreground mt-1">Your identity in conversations</p>
+		<p class="text-sm text-muted-foreground mt-1">Your identity in task chat</p>
 	</div>
 
 	<!-- User Profile -->
@@ -134,7 +134,6 @@
 							bind:value={profileName}
 							placeholder="Your name"
 							class="flex-1 rounded-lg border border-border bg-secondary px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-							autofocus
 						/>
 						<button type="submit" class="text-xs text-primary hover:underline">Save</button>
 						<button type="button" onclick={() => (editingProfile = false)} class="text-xs text-muted-foreground hover:underline">Cancel</button>
@@ -145,7 +144,7 @@
 						<button onclick={startEditProfile} class="text-xs text-muted-foreground hover:text-foreground transition-colors">Edit</button>
 					</div>
 					<div class="flex items-center gap-2 mt-0.5">
-						<p class="text-xs text-muted-foreground">Shown in conversations</p>
+						<p class="text-xs text-muted-foreground">Shown beside your messages</p>
 						{#if userProfile.avatar}
 							<button onclick={removeAvatar} class="text-xs text-muted-foreground hover:text-destructive transition-colors">Remove picture</button>
 						{/if}

@@ -14,14 +14,17 @@
 	let newAgentId = $state('');
 	let newPriority = $state(0);
 	let newDependsOn = $state<string[]>([]);
+	let newSession = $state(false);
+	let filter = $state<'attention' | 'active' | 'all' | 'done'>('active');
+	let formError = $state('');
+	let creating = $state(false);
 
-	const columns: { key: keyof TaskCounts; label: string; color: string }[] = [
-		{ key: 'pending', label: 'Pending', color: 'text-yellow-400' },
-		{ key: 'in_progress', label: 'In Progress', color: 'text-blue-400' },
-		{ key: 'waiting_for_input', label: 'Waiting for Input', color: 'text-orange-400' },
-		{ key: 'completed', label: 'Completed', color: 'text-emerald-400' },
-		{ key: 'cancelled', label: 'Cancelled', color: 'text-red-400' }
-	];
+	let visibleTasks = $derived(taskList.filter((task) => {
+		if (filter === 'attention') return ['waiting_for_input', 'blocked'].includes(task.status);
+		if (filter === 'active') return ['pending', 'in_progress', 'waiting_for_input', 'blocked'].includes(task.status);
+		if (filter === 'done') return ['completed', 'cancelled'].includes(task.status);
+		return true;
+	}));
 
 	onMount(async () => {
 		await Promise.all([load(), loadAgents()]);
@@ -29,6 +32,7 @@
 
 	async function loadAgents() {
 		agentList = await agents.list().catch(() => []);
+		if (!newAgentId && agentList.length > 0) newAgentId = agentList[0].id;
 	}
 
 	async function load() {
@@ -41,10 +45,6 @@
 			taskList = [];
 		}
 		loading = false;
-	}
-
-	function tasksByStatus(status: string): Task[] {
-		return taskList.filter((t) => t.status === status);
 	}
 
 	function statusCount(key: keyof TaskCounts): number {
@@ -64,24 +64,40 @@
 	}
 
 	async function createTask() {
-		if (!newTitle.trim()) return;
-		const task = await tasks.create({
-			title: newTitle,
-			description: newDesc || undefined,
-			agent_id: newAgentId || undefined,
-			priority: newPriority || undefined
-		});
-		// Add dependencies after creation
-		for (const depId of newDependsOn) {
-			await tasks.addDependency(task.id, depId).catch(() => {});
+		if (!newTitle.trim() || !newAgentId || creating) return;
+		creating = true;
+		formError = '';
+		try {
+			// Batch creation records dependencies before the dispatcher can
+			// claim the task, even when the batch contains only one item.
+			await tasks.createBatch({ tasks: [{
+				ref: 'task',
+				title: newTitle.trim(),
+				description: newDesc.trim() || undefined,
+				agent_id: newAgentId,
+				priority: newPriority || undefined,
+				new_session: newDependsOn.length === 0 && newSession,
+				depends_on: newDependsOn.length > 0 ? newDependsOn : undefined
+			}] });
+			newTitle = '';
+			newDesc = '';
+			newPriority = 0;
+			newDependsOn = [];
+			newSession = false;
+			showCreate = false;
+			await load();
+		} catch (e) {
+			formError = e instanceof Error ? e.message : String(e);
+		} finally {
+			creating = false;
 		}
-		newTitle = '';
-		newDesc = '';
-		newAgentId = '';
-		newPriority = 0;
-		newDependsOn = [];
-		showCreate = false;
-		await load();
+	}
+
+	function openCreate() {
+		if (agentList.length === 0) return;
+		formError = '';
+		if (!newAgentId) newAgentId = agentList[0].id;
+		showCreate = !showCreate;
 	}
 
 	async function cancelTask(id: string) {
@@ -98,12 +114,21 @@
 	function agentName(agentId: string | null): string | null {
 		if (!agentId) return null;
 		const agent = agentList.find((a) => a.id === agentId);
-		return agent?.name ?? agentId;
+		return agent?.title || agent?.name || agentId;
+	}
+
+	function statusMeta(status: string): { label: string; dot: string; tone: string } {
+		if (status === 'in_progress') return { label: 'Working', dot: 'bg-blue-400 animate-pulse', tone: 'text-blue-400' };
+		if (status === 'pending') return { label: 'Queued', dot: 'bg-amber-400', tone: 'text-amber-400' };
+		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-400 animate-pulse', tone: 'text-orange-400' };
+		if (status === 'blocked') return { label: 'Blocked', dot: 'bg-red-400', tone: 'text-red-400' };
+		if (status === 'completed') return { label: 'Completed', dot: 'bg-emerald-400', tone: 'text-emerald-400' };
+		return { label: 'Cancelled', dot: 'bg-muted-foreground', tone: 'text-muted-foreground' };
 	}
 </script>
 
-<div class="p-6 space-y-6">
-	<div class="flex items-center justify-between">
+<div class="space-y-6 p-4 sm:p-6">
+	<div class="flex items-center justify-between gap-3">
 		<div>
 			<h1 class="text-2xl font-bold">Tasks</h1>
 			{#if counts}
@@ -113,12 +138,19 @@
 			{/if}
 		</div>
 		<button
-			onclick={() => (showCreate = !showCreate)}
-			class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+			onclick={openCreate}
+			disabled={agentList.length === 0}
+			class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
 		>
 			New Task
 		</button>
 	</div>
+
+	{#if agentList.length === 0}
+		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
+			Tasks need a project so they know which workspace and agent to use. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create a project</a> first.
+		</div>
+	{/if}
 
 	{#if showCreate}
 		<div class="rounded-lg border border-border bg-card p-4 space-y-3">
@@ -134,34 +166,35 @@
 				rows="2"
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-none"
 			></textarea>
-			<div class="flex gap-3">
+			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<label class="block text-xs text-muted-foreground mb-1">Assign to Agent</label>
+					<label class="block text-xs text-muted-foreground mb-1">Project
 					<select
 						bind:value={newAgentId}
-						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
-						<option value="">Unassigned</option>
 						{#each agentList as agent}
-							<option value={agent.id}>{agent.name}</option>
+							<option value={agent.id}>{agent.title || agent.name}</option>
 						{/each}
 					</select>
+					</label>
 				</div>
 				<div class="w-24">
-					<label class="block text-xs text-muted-foreground mb-1">Priority</label>
+					<label class="block text-xs text-muted-foreground mb-1">Priority
 					<select
 						bind:value={newPriority}
-						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					>
 						<option value={0}>Normal</option>
 						<option value={5}>High</option>
 						<option value={10}>Urgent</option>
 					</select>
+					</label>
 				</div>
 			</div>
 			{#if availableDeps.length > 0}
 				<div>
-					<label class="block text-xs text-muted-foreground mb-1">Depends on (optional)</label>
+					<div class="block text-xs text-muted-foreground mb-1">Depends on (optional)</div>
 					<div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
 						{#each availableDeps as dep}
 							<button
@@ -178,17 +211,23 @@
 					</div>
 					{#if newDependsOn.length > 0}
 						<div class="text-xs text-muted-foreground mt-1">
-							This task will wait for {newDependsOn.length} task{newDependsOn.length > 1 ? 's' : ''} to complete.
+							This task will wait, then continue the conversation it depends on.
 						</div>
 					{/if}
 				</div>
 			{/if}
+			<label class="flex items-start gap-2 text-xs text-muted-foreground {newDependsOn.length > 0 ? 'opacity-50' : ''}">
+				<input type="checkbox" bind:checked={newSession} disabled={newDependsOn.length > 0} class="mt-0.5 h-3.5 w-3.5 accent-primary" />
+				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this continues the project’s active agent conversation.</span>
+			</label>
+			{#if formError}<p class="text-xs text-destructive">{formError}</p>{/if}
 			<div class="flex gap-2">
 				<button
 					onclick={createTask}
-					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+					disabled={!newTitle.trim() || !newAgentId || creating}
+					class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
 				>
-					Create
+					{creating ? 'Queuing…' : 'Create and queue'}
 				</button>
 				<button
 					onclick={() => (showCreate = false)}
@@ -200,74 +239,43 @@
 		</div>
 	{/if}
 
-	<!-- Kanban columns -->
-	<div class="grid grid-cols-1 lg:grid-cols-5 gap-4">
-		{#each columns as col}
-			{@const colTasks = tasksByStatus(col.key)}
-			<div class="rounded-lg border border-border bg-card/50">
-				<div class="border-b border-border px-4 py-3 flex items-center justify-between">
-					<h2 class="text-sm font-semibold {col.color}">{col.label}</h2>
-					<span class="text-xs text-muted-foreground">
-						{colTasks.length}
-					</span>
+	<div class="flex gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1">
+		{#each [
+			{ id: 'attention', label: 'Needs you', count: statusCount('waiting_for_input') + statusCount('blocked') },
+			{ id: 'active', label: 'Active', count: statusCount('pending') + statusCount('in_progress') },
+			{ id: 'all', label: 'All', count: taskList.length },
+			{ id: 'done', label: 'Done', count: statusCount('completed') }
+		] as item}
+			<button onclick={() => (filter = item.id as typeof filter)} class="shrink-0 rounded-lg px-3 py-2 text-xs font-medium {filter === item.id ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}">
+				{item.label} <span class="ml-1 opacity-70">{item.count}</span>
+			</button>
+		{/each}
+	</div>
+
+	<div class="overflow-hidden rounded-xl border border-border bg-card">
+		{#each visibleTasks as task (task.id)}
+			{@const meta = statusMeta(task.status)}
+			<a href="/tasks/{task.id}" class="group flex items-start gap-3 border-b border-border px-4 py-4 last:border-b-0 hover:bg-accent/30">
+				<span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
+				<div class="min-w-0 flex-1">
+					<div class="flex items-start justify-between gap-3">
+						<h2 class="min-w-0 truncate text-sm font-medium group-hover:text-primary">{task.title}</h2>
+						<span class="shrink-0 text-[11px] {meta.tone}">{meta.label}</span>
+					</div>
+					{#if task.description}<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>{/if}
+					<div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+						<span>{agentName(task.agent_id) ?? 'Unassigned'}</span><span>·</span><span>{timeAgo(task.updated_at)}</span>
+						{#if task.blocked_by && task.blocked_by.length > 0}<span class="text-amber-500">· Waiting on {task.blocked_by.length}</span>{/if}
+						{#if task.priority >= 5}<span class="text-orange-400">· High priority</span>{/if}
+					</div>
 				</div>
-				<div class="p-2 space-y-2 min-h-[200px]">
-					{#each colTasks as task}
-						<a href="/tasks/{task.id}" class="block rounded-md border border-border bg-card p-3 space-y-2 hover:border-primary/30 transition-colors">
-							<div class="flex items-start justify-between gap-2">
-								<span class="text-sm font-medium">{task.title}</span>
-								<button
-									onclick={() => deleteTask(task.id)}
-									class="text-xs text-muted-foreground hover:text-destructive shrink-0"
-									title="Delete"
-								>&times;</button>
-							</div>
-							{#if task.blocked_by && task.blocked_by.length > 0}
-								<div class="text-xs text-amber-500">
-									⏳ Waiting on {task.blocked_by.length} task{task.blocked_by.length > 1 ? 's' : ''}
-								</div>
-							{/if}
-							{#if task.description}
-								<p class="text-xs text-muted-foreground line-clamp-2">{task.description}</p>
-							{/if}
-							<div class="flex items-center justify-between">
-								<div class="flex items-center gap-2">
-									{#if task.agent_id}
-										<span class="text-xs bg-muted px-1.5 py-0.5 rounded">{agentName(task.agent_id)}</span>
-									{:else}
-										<span class="text-xs text-muted-foreground italic">unassigned</span>
-									{/if}
-									{#if task.priority >= 10}
-										<span class="text-xs text-red-400">urgent</span>
-									{:else if task.priority >= 5}
-										<span class="text-xs text-orange-400">high</span>
-									{/if}
-								</div>
-								<div class="flex gap-1">
-									{#if col.key !== 'completed' && col.key !== 'cancelled'}
-										<button
-											onclick={() => cancelTask(task.id)}
-											class="text-xs text-muted-foreground hover:text-red-400"
-											title="Cancel task"
-										>Cancel</button>
-									{/if}
-								</div>
-							</div>
-							{#if task.completed_at}
-								<div class="text-xs text-muted-foreground">
-									Completed {timeAgo(task.completed_at)}
-								</div>
-							{:else}
-								<div class="text-xs text-muted-foreground">
-									Created {timeAgo(task.created_at)}
-								</div>
-							{/if}
-						</a>
-					{:else}
-						<div class="text-center text-xs text-muted-foreground py-8">No tasks</div>
-					{/each}
+				<div class="flex shrink-0 items-center gap-2">
+					{#if !['completed', 'cancelled'].includes(task.status)}<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); cancelTask(task.id); }} class="hidden text-xs text-muted-foreground hover:text-destructive sm:block">Cancel</button>{/if}
+					<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); deleteTask(task.id); }} aria-label="Delete task" class="hidden text-lg leading-none text-muted-foreground hover:text-destructive sm:block">×</button>
 				</div>
-			</div>
+			</a>
+		{:else}
+			<div class="px-4 py-16 text-center text-sm text-muted-foreground">No tasks in this view.</div>
 		{/each}
 	</div>
 </div>

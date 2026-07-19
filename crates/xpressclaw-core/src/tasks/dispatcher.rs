@@ -90,7 +90,7 @@ async fn run_task(
 
     loop {
         state = match state {
-            State::LoadTask => load_task(db, config, task_id, agent_id, &mut ctx).await,
+            State::LoadTask => load_task(db, task_id, agent_id, &mut ctx).await,
             State::BuildPrompt => build_prompt(db, ctx.as_mut().unwrap()),
             State::CallAgent => call_agent(db, config, ctx.as_mut().unwrap()).await,
             State::ProcessResponse => process_response(db, config, ctx.as_mut().unwrap()),
@@ -102,7 +102,6 @@ async fn run_task(
 
 async fn load_task(
     db: &Arc<Database>,
-    config: &Config,
     task_id: &str,
     agent_id: &str,
     ctx: &mut Option<Context>,
@@ -135,11 +134,8 @@ async fn load_task(
         }
     }
 
-    // Get agent config
-    let agent_cfg = config.agents.iter().find(|a| a.name == agent_id);
-    let system_prompt = agent_cfg
-        .map(|a| a.full_system_prompt())
-        .unwrap_or_else(|| "You are a helpful AI assistant.".to_string());
+    // Native products own their system instructions and any subagents.
+    let system_prompt = String::new();
 
     // Verify agent is running and get harness port
     let registry = AgentRegistry::new(db.clone());
@@ -632,12 +628,11 @@ fn notify_conversation(
     })
     .to_string();
 
-    // Use display_name if available, fall back to agent_id
-    let display_name = config
+    let context_label = config
         .agents
         .iter()
         .find(|a| a.name == agent_id)
-        .and_then(|a| a.display_name.clone())
+        .map(|a| a.context_label())
         .unwrap_or_else(|| agent_id.to_string());
 
     if let Err(e) = mgr.send_message(
@@ -645,7 +640,7 @@ fn notify_conversation(
         &SendMessage {
             sender_type: "system".into(),
             sender_id: agent_id.to_string(),
-            sender_name: Some(display_name.clone()),
+            sender_name: Some(context_label.clone()),
             content,
             message_type: Some("task_status".into()),
         },

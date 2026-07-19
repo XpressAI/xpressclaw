@@ -491,6 +491,7 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
             expose_port: Some(app_port),
             cmd: Some(vec!["sh".to_string(), "-c".to_string(), cmd]),
             working_dir: Some(format!("/workspace/apps/{app_id}")),
+            run_as_host_user: false,
         };
 
         // Record attempt time + bump restart count

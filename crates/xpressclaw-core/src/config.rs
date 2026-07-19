@@ -221,9 +221,114 @@ pub struct AgentLlmConfig {
     pub base_url: Option<String>,
 }
 
+/// Configuration for an Agent Client Protocol worker.
+///
+/// The ACP agent owns its reasoning loop, tools, subagents, and model
+/// authentication. XpressClaw acts as the client: it supplies a task and an
+/// isolated workspace, then records the agent's standard protocol events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerEngineAccess {
+    /// Do not expose the host container engine to the worker.
+    #[default]
+    None,
+    /// Mount the control plane's Docker-compatible Unix socket. This is a
+    /// trusted mode: the worker can control host containers, images, volumes,
+    /// and any host paths the engine is allowed to mount.
+    Host,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NativeRunnerConfig {
+    /// ACP agent to invoke: auto, codex, claude, opencode, or custom.
+    pub kind: String,
+    /// Image containing one ACP-compatible agent server. When empty, the
+    /// runner kind selects the matching xpressclaw-runner-* image.
+    pub image: String,
+    /// Host project directory mounted at /workspace for this session. Falls
+    /// back to system.workspace_dir for existing configurations.
+    pub workspace: Option<String>,
+    /// Preferred ACP model value ID. When unset, the agent chooses its own
+    /// default. The value is applied through `session/set_config_option`.
+    pub model: Option<String>,
+    /// Default ACP session configuration values keyed by the option IDs
+    /// advertised by the native agent. This covers modes, reasoning levels,
+    /// model-related toggles, and adapter-specific selectors without teaching
+    /// XpressClaw provider-specific option names.
+    #[serde(default)]
+    pub session_config: HashMap<String, serde_json::Value>,
+    /// Names from the top-level MCP server catalog to attach to this harness.
+    /// ACP stdio servers run inside the worker container; remote HTTP/SSE
+    /// servers are connected to by the native agent.
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    /// Environment supplied to the harness container. This is the escape
+    /// hatch for native product configuration that ACP does not standardize,
+    /// such as adapter flags or an alternate harness configuration root.
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+    /// Optional ACP server argv override. `{workspace}` is expanded.
+    pub command: Vec<String>,
+    /// Reuse the host agent login from its standard config directory.
+    pub subscription_auth: bool,
+    /// Optional access to the same Docker-compatible engine used by the
+    /// control plane. Built-in agents select a separate CLI-enabled image.
+    pub container_engine: ContainerEngineAccess,
+}
+
+impl Default for NativeRunnerConfig {
+    fn default() -> Self {
+        Self {
+            kind: "auto".to_string(),
+            image: String::new(),
+            workspace: None,
+            model: None,
+            session_config: HashMap::new(),
+            mcp_servers: Vec::new(),
+            environment: HashMap::new(),
+            command: Vec::new(),
+            subscription_auth: true,
+            container_engine: ContainerEngineAccess::None,
+        }
+    }
+}
+
+/// Built-in image for a resolved ACP agent. Keeping this mapping in the
+/// control plane lets each image contain only its own server while custom ACP
+/// agents continue to require an explicit image.
+pub fn default_native_runner_image(
+    kind: &str,
+    container_engine: ContainerEngineAccess,
+) -> Option<&'static str> {
+    match (kind, container_engine) {
+        ("codex", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
+        }
+        ("claude", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
+        }
+        ("opencode", ContainerEngineAccess::None) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
+        }
+        ("codex", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest")
+        }
+        ("claude", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest")
+        }
+        ("opencode", ContainerEngineAccess::Host) => {
+            Some("ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest")
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
+    /// Stable internal identifier for the session. The UI derives this from
+    /// project context and runner kind; it is not a persona or agent name.
     pub name: String,
     pub backend: String,
     /// Legacy field — agents now store the model name in `llm.model`.
@@ -234,17 +339,10 @@ pub struct AgentConfig {
     /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
-    /// Human-friendly display name (e.g. "Avery (PA)").
-    pub display_name: Option<String>,
-    /// Short role title (e.g. "Personal Assistant").
-    pub role_title: Option<String>,
-    /// Longer description of what this agent does.
-    pub responsibilities: Option<String>,
-    /// Path or URL to avatar image.
-    pub avatar: Option<String>,
-    /// Raw system prompt. display_name, role_title, and responsibilities
-    /// are prepended automatically when building the LLM messages.
-    pub role: String,
+    /// Short-lived ACP worker configuration. This supersedes the old in-house
+    /// harness for task execution.
+    #[serde(default)]
+    pub runner: NativeRunnerConfig,
     #[serde(default)]
     pub tools: Vec<String>,
     /// Skills available to this agent (names matching templates/skills/{name}/).
@@ -273,11 +371,7 @@ impl Default for AgentConfig {
             backend: "claude-sdk".to_string(),
             model: None,
             llm: None,
-            display_name: None,
-            role_title: None,
-            responsibilities: None,
-            avatar: None,
-            role: String::new(),
+            runner: NativeRunnerConfig::default(),
             tools: Vec::new(),
             skills: Vec::new(),
             budget: None,
@@ -305,41 +399,101 @@ impl AgentConfig {
     /// No-op if `llm.model` is already set or if there's no legacy `model`.
     /// Called after loading config from YAML so the rest of the code only
     /// has to look at `llm.model`.
-    pub fn migrate_legacy_model(&mut self) {
+    pub fn migrate_legacy_model(&mut self) -> bool {
         let Some(legacy) = self.model.take() else {
-            return;
+            return false;
         };
         let llm = self.llm.get_or_insert_with(AgentLlmConfig::default);
         if llm.model.is_none() {
             llm.model = Some(legacy);
         }
         // self.model is now None — won't be re-serialized.
+        true
     }
 
-    /// Build the full system prompt by prepending profile fields
-    /// (display_name, role_title, responsibilities) to the raw role.
-    pub fn full_system_prompt(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(ref name) = self.display_name {
-            parts.push(format!("Your name is {name}."));
+    /// Replace the retired all-in-one native runner with the image for the
+    /// configured product. Exact matches only so custom images are untouched.
+    pub fn migrate_legacy_runner_image(&mut self) -> bool {
+        if !matches!(
+            self.runner.image.as_str(),
+            "xpressclaw-native-runner:latest" | "ghcr.io/xpressai/xpressclaw-native-runner:latest"
+        ) {
+            return false;
         }
-        if let Some(ref title) = self.role_title {
-            parts.push(format!("Your role is: {title}."));
-        }
-        if let Some(ref resp) = self.responsibilities {
-            parts.push(format!("Your responsibilities: {resp}"));
-        }
-        if parts.is_empty() {
-            self.role.clone()
+
+        let configured_kind = self.runner.kind.trim().to_lowercase();
+        let kind = if configured_kind.is_empty() || configured_kind == "auto" {
+            let backend = self.backend.to_lowercase();
+            if backend.contains("codex") {
+                "codex"
+            } else if backend.contains("claude") {
+                "claude"
+            } else if backend.contains("opencode") {
+                "opencode"
+            } else {
+                return false;
+            }
         } else {
-            parts.push(String::new()); // blank line separator
-            parts.push(self.role.clone());
-            parts.join("\n")
+            configured_kind.as_str()
+        };
+
+        if let Some(image) = default_native_runner_image(kind, ContainerEngineAccess::None) {
+            self.runner.kind = kind.to_string();
+            self.runner.image = image.to_string();
+            true
+        } else {
+            false
         }
+    }
+
+    /// Remove the exact tool/skill bundle injected by the old setup wizard.
+    /// Custom configurations are left alone; this marker requires the complete
+    /// retired developer bundle.
+    pub fn migrate_legacy_tool_bundle(&mut self) -> bool {
+        let legacy_tools = ["filesystem", "shell", "memory"];
+        let legacy_skills = ["memory-system", "task-management", "build-app"];
+        let is_injected_bundle = legacy_tools
+            .iter()
+            .all(|tool| self.tools.iter().any(|configured| configured == tool))
+            && legacy_skills
+                .iter()
+                .all(|skill| self.skills.iter().any(|configured| configured == skill));
+        if !is_injected_bundle {
+            return false;
+        }
+
+        self.tools.clear();
+        self.skills.clear();
+        true
+    }
+
+    /// User-facing context label. Native harnesses own identity and any
+    /// subagents; XpressClaw labels a session by its project instead.
+    pub fn context_label(&self) -> String {
+        context_label(self.runner.workspace.as_deref(), &self.runner.kind)
     }
 }
 
-/// Generate a URL-safe slug from a display name.
+/// Derive a user-facing session label from project context.
+pub fn context_label(workspace: Option<&str>, runner_kind: &str) -> String {
+    workspace
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let kind = runner_kind.trim();
+            if kind.is_empty() || kind == "auto" {
+                "session".to_string()
+            } else {
+                kind.to_string()
+            }
+        })
+}
+
+/// Generate a URL-safe slug from a project context label.
 ///
 /// Handles Unicode (including Japanese) by:
 /// 1. Lowercasing ASCII characters
@@ -348,7 +502,7 @@ impl AgentConfig {
 /// 4. Collapsing multiple hyphens
 /// 5. Trimming leading/trailing hyphens
 ///
-/// If the result is empty (e.g. all emoji), falls back to "agent".
+/// If the result is empty (e.g. all emoji), falls back to "session".
 pub fn slugify(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
     let mut last_was_hyphen = true; // prevent leading hyphen
@@ -373,16 +527,16 @@ pub fn slugify(name: &str) -> String {
     }
 
     if slug.is_empty() {
-        "agent".to_string()
+        "session".to_string()
     } else {
         slug
     }
 }
 
-/// Generate a unique agent ID from a display name, given existing IDs.
+/// Generate a unique internal session ID from project context and harness.
 /// Appends a numeric suffix if the slug already exists.
-pub fn unique_agent_id(display_name: &str, existing_ids: &[&str]) -> String {
-    let base = slugify(display_name);
+pub fn unique_session_id(context: &str, runner_kind: &str, existing_ids: &[&str]) -> String {
+    let base = slugify(&format!("{context}-{runner_kind}"));
 
     if !existing_ids.contains(&base.as_str()) {
         return base;
@@ -491,11 +645,18 @@ impl Config {
 
         match serde_yaml::from_str::<Config>(&contents) {
             Ok(mut config) => {
-                config.migrate_legacy_fields();
+                // Profile fields are intentionally no longer represented by
+                // AgentConfig. Detect them in the source document so the
+                // normal migration save removes them from disk as well.
+                let migrated =
+                    contains_legacy_profile_fields(&contents) || config.migrate_legacy_fields();
                 config.validate()?;
                 // Save a backup of the known-good config
                 let backup = path.with_extension("yaml.bak");
                 let _ = std::fs::copy(path, backup);
+                if migrated {
+                    config.save(path)?;
+                }
                 Ok(config)
             }
             Err(e) => {
@@ -509,10 +670,15 @@ impl Config {
                     let backup_contents = std::fs::read_to_string(&backup)
                         .map_err(|e2| Error::Config(format!("failed to read backup: {e2}")))?;
                     let mut config: Config = serde_yaml::from_str(&backup_contents)?;
-                    config.migrate_legacy_fields();
+                    let migrated = contains_legacy_profile_fields(&backup_contents)
+                        || config.migrate_legacy_fields();
                     config.validate()?;
-                    // Restore the good config
-                    let _ = std::fs::copy(&backup, path);
+                    if migrated {
+                        config.save(path)?;
+                    } else {
+                        // Restore the good config
+                        let _ = std::fs::copy(&backup, path);
+                    }
                     Ok(config)
                 } else {
                     Err(Error::Config(format!("failed to parse config: {e}")))
@@ -521,12 +687,21 @@ impl Config {
         }
     }
 
-    /// Migrate legacy fields after loading. Currently this only moves the
-    /// per-agent `model` field into `llm.model`. Safe to call repeatedly.
-    pub fn migrate_legacy_fields(&mut self) {
+    /// Migrate legacy fields after loading. Safe to call repeatedly.
+    pub fn migrate_legacy_fields(&mut self) -> bool {
+        let mut migrated = false;
+        let mut removed_legacy_bundle = false;
         for agent in &mut self.agents {
-            agent.migrate_legacy_model();
+            migrated |= agent.migrate_legacy_model();
+            migrated |= agent.migrate_legacy_runner_image();
+            removed_legacy_bundle |= agent.migrate_legacy_tool_bundle();
         }
+        if removed_legacy_bundle {
+            for name in ["xpressclaw", "shell", "filesystem"] {
+                migrated |= self.mcp_servers.remove(name).is_some();
+            }
+        }
+        migrated || removed_legacy_bundle
     }
 
     /// Load config from the default location (./xpressclaw.yaml).
@@ -587,6 +762,32 @@ impl Config {
     }
 }
 
+fn contains_legacy_profile_fields(contents: &str) -> bool {
+    const PROFILE_KEYS: [&str; 5] = [
+        "display_name",
+        "role_title",
+        "responsibilities",
+        "avatar",
+        "role",
+    ];
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(contents) else {
+        return false;
+    };
+    value
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("agents".to_string())))
+        .and_then(serde_yaml::Value::as_sequence)
+        .is_some_and(|agents| {
+            agents.iter().any(|agent| {
+                agent.as_mapping().is_some_and(|mapping| {
+                    PROFILE_KEYS.iter().any(|key| {
+                        mapping.contains_key(serde_yaml::Value::String((*key).to_string()))
+                    })
+                })
+            })
+        })
+}
+
 /// Apply environment variable overrides to per-agent LLM configs.
 ///
 /// For each agent, if its api_key/base_url isn't set, fall back to the
@@ -635,75 +836,13 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# xpressclaw Configuration
 # Generated by `xpressclaw init`
 # Docs: https://xpressclaw.ai
 
-# System-wide settings
 system:
-  # Container isolation for agents (docker required)
   isolation: docker
+  workspace_dir: .
 
-  # Budget controls
-  budget:
-    daily: $20.00
-    on_exceeded: pause  # pause | alert | degrade | stop
-
-# Agent definitions
-agents:
-  - name: atlas
-    backend: claude-sdk
-    # Per-agent LLM configuration. Each agent picks its own model and provider.
-    # API keys can come from env vars: ANTHROPIC_API_KEY (provider: anthropic),
-    # OPENAI_API_KEY / OPENAI_BASE_URL (provider: openai).
-    llm:
-      provider: ollama
-      model: qwen3.5:latest
-      base_url: http://localhost:11434
-      # api_key: sk-...   # set explicitly, or leave blank to read from env
-    role: |
-      You are a helpful AI assistant.
-
-      ## CRITICAL: YOU HAVE ANTEROGRADE AMNESIA
-      You cannot form new long-term memories naturally. After each conversation ends,
-      you will forget everything unless you explicitly save it.
-
-      - **Before starting work:** Use `search_memory` to recall relevant context
-      - **During conversations:** Use `create_memory` IMMEDIATELY when you learn important facts
-      - **Be proactive:** If someone tells you about themselves or their work, SAVE IT
-
-    # Volumes mounted into the agent container
-    volumes:
-      - ~/agent-workspace:/workspace
-
-# Memory settings
-memory:
-  near_term_slots: 8
-  eviction: least-recently-relevant
-
-# Shared LLM concerns (per-agent settings live on each agent above).
-# llm:
-#   custom_pricing:
-#     my-proxied-model:
-#       input: 0.50
-#       output: 2.00
-
-# Tool policy rules (evaluated in order, first match wins)
-# tool_policies:
-#   - pattern: "dangerous_*"
-#     action: deny
-#   - pattern: "github__*"
-#     action: allow
-#   - pattern: "*"
-#     action: require_approval
-#     approval:
-#       type: script
-#       command: /usr/local/bin/approve-tool
-
-# MCP (Model Context Protocol) servers
-# mcp_servers:
-#   github:
-#     type: stdio
-#     command: npx
-#     args: ["-y", "@modelcontextprotocol/server-github"]
-#     env:
-#       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+# Sessions are created in the web UI. Each one selects its own native runner
+# image and project workspace.
+agents: []
 "#;
 
 #[cfg(test)]
@@ -736,7 +875,6 @@ system:
 agents:
   - name: test-agent
     backend: claude-sdk
-    role: "Test role"
 memory:
   near_term_slots: 4
 "#;
@@ -761,100 +899,6 @@ memory:
     }
 
     #[test]
-    fn test_japanese_prompt_round_trip() {
-        let role = "あなたは日本語のアシスタントです。\n\n## 責任\n- タスクの管理\n- メールの返信\n- スケジュールの確認";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        eprintln!("=== YAML ===\n{yaml}");
-
-        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(
-            parsed.agents[0].role, role,
-            "Japanese role round-trip failed"
-        );
-    }
-
-    #[test]
-    fn test_markdown_list_prompt_round_trip() {
-        let role = "You are a helpful assistant.\n\n## Guidelines\n- Write clean code\n- Ask clarifying questions\n* Use bullet points\n  - Nested items too";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "test".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let parsed: Config = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(
-            parsed.agents[0].role, role,
-            "Markdown list round-trip failed"
-        );
-    }
-
-    #[test]
-    fn test_prompt_save_load_file() {
-        let role = "パーソナルファイナンスアシスタント\n\n## 責任\n- 予算管理\n- 投資アドバイス";
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let path = std::env::temp_dir().join("xpressclaw-test-jp.yaml");
-        config.save(&path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        eprintln!("=== FILE ===\n{contents}");
-
-        let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.agents[0].role, role, "File round-trip failed");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_xclaw59_exact_prompt() {
-        // Exact prompt from XCLAW-59 bug report
-        let role = "あなたは徹底的に調査を行うリサーチアシスタントです。\n\n\
-            あなたの仕事は、ユーザーが求めるトピックに関する情報を見つけ、統合し、整理することです。\n\
-            また、調査結果が会話をまたいでも保持されるよう、メモリシステムを使って詳細なメモを記録します。\n\
-            ガイドライン\n\n\
-            - まず広く調査し、その後有望な情報について深掘りする\n\
-            - 常に情報源を明示する\n\
-            - 重要な発見はすぐにメモリに保存する\n\
-            - 情報は構造化され、読みやすい形式で提示する\n\
-            - 情報が古い、または信頼性に疑問がある場合はその旨を明示する";
-
-        let mut config = Config::default();
-        config.agents.push(AgentConfig {
-            name: "eri".to_string(),
-            role: role.to_string(),
-            ..Default::default()
-        });
-
-        let path = std::env::temp_dir().join("xpressclaw-test-xclaw59.yaml");
-        config.save(&path).unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        eprintln!("=== XCLAW-59 YAML ===\n{contents}");
-
-        let loaded = Config::load(&path).unwrap();
-        assert_eq!(
-            loaded.agents[0].role, role,
-            "XCLAW-59 prompt round-trip failed"
-        );
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("yaml.bak"));
-    }
-
-    #[test]
     fn test_slugify_ascii() {
         assert_eq!(slugify("My Agent"), "my-agent");
         assert_eq!(slugify("Code Reviewer"), "code-reviewer");
@@ -871,22 +915,27 @@ memory:
 
     #[test]
     fn test_slugify_empty() {
-        assert_eq!(slugify(""), "agent");
-        assert_eq!(slugify("!!!"), "agent");
-        assert_eq!(slugify("   "), "agent");
+        assert_eq!(slugify(""), "session");
+        assert_eq!(slugify("!!!"), "session");
+        assert_eq!(slugify("   "), "session");
     }
 
     #[test]
-    fn test_unique_agent_id() {
-        assert_eq!(unique_agent_id("Atlas", &[]), "atlas");
-        assert_eq!(unique_agent_id("Atlas", &["atlas"]), "atlas-2");
-        assert_eq!(unique_agent_id("Atlas", &["atlas", "atlas-2"]), "atlas-3");
+    fn test_unique_session_id() {
+        assert_eq!(unique_session_id("Website", "codex", &[]), "website-codex");
+        assert_eq!(
+            unique_session_id("Website", "codex", &["website-codex"]),
+            "website-codex-2"
+        );
     }
 
     #[test]
-    fn test_unique_agent_id_japanese() {
-        assert_eq!(unique_agent_id("エリ", &[]), "エリ");
-        assert_eq!(unique_agent_id("エリ", &["エリ"]), "エリ-2");
+    fn context_label_uses_the_project_folder() {
+        assert_eq!(
+            context_label(Some("/home/me/projects/website"), "codex"),
+            "website"
+        );
+        assert_eq!(context_label(None, "claude"), "claude");
     }
 
     #[test]
@@ -931,6 +980,126 @@ agents:
             Some("explicit-model")
         );
         assert_eq!(agent.model, None);
+    }
+
+    #[test]
+    fn default_template_defers_session_creation_to_the_ui() {
+        let config: Config = serde_yaml::from_str(DEFAULT_CONFIG_TEMPLATE).unwrap();
+        assert!(config.agents.is_empty());
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn retired_shared_runner_image_migrates_to_the_selected_product() {
+        let yaml = r#"
+agents:
+  - name: developer
+    backend: codex
+    runner:
+      kind: codex
+      image: xpressclaw-native-runner:latest
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.migrate_legacy_fields();
+        assert_eq!(config.agents[0].runner.kind, "codex");
+        assert_eq!(
+            config.agents[0].runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+        );
+    }
+
+    #[test]
+    fn loading_persists_the_product_runner_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("xpressclaw.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - name: reviewer
+    backend: claude
+    runner:
+      kind: auto
+      image: xpressclaw-native-runner:latest
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agents[0].runner.kind, "claude");
+        assert_eq!(
+            loaded.agents[0].runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
+        );
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(saved.contains("xpressclaw-runner-claude:latest"));
+        assert!(!saved.contains("xpressclaw-native-runner:latest"));
+    }
+
+    #[test]
+    fn injected_agent_layer_bundle_is_removed_during_migration() {
+        let yaml = r#"
+agents:
+  - name: developer
+    role: Always search memory before starting.
+    tools: [filesystem, shell, memory]
+    skills: [memory-system, task-management, build-app]
+mcp_servers:
+  xpressclaw:
+    type: stdio
+    command: python3
+  shell:
+    type: stdio
+    command: npx
+  filesystem:
+    type: stdio
+    command: npx
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.migrate_legacy_fields());
+        let session = &config.agents[0];
+        assert!(session.tools.is_empty());
+        assert!(session.skills.is_empty());
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn loading_removes_legacy_profile_fields_from_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("xpressclaw.yaml");
+        std::fs::write(
+            &path,
+            r#"
+agents:
+  - name: website-codex
+    backend: codex
+    display_name: Avery
+    role_title: Developer
+    responsibilities: Maintain the website
+    avatar: /tmp/avery.png
+    role: Always act as Avery.
+    runner:
+      kind: codex
+      workspace: /home/me/projects/website
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.agents[0].context_label(), "website");
+        let saved = std::fs::read_to_string(path).unwrap();
+        for retired in [
+            "display_name:",
+            "role_title:",
+            "responsibilities:",
+            "avatar:",
+            "role:",
+        ] {
+            assert!(
+                !saved.contains(retired),
+                "retired field remained: {retired}"
+            );
+        }
     }
 
     #[test]

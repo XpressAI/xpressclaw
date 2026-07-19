@@ -218,6 +218,66 @@ impl WorkflowEngine {
             None => format!("Execute workflow step: {}", step.id),
         };
 
+        let rendered_session_config: HashMap<String, Value> = step
+            .session_config
+            .iter()
+            .map(|(key, value)| {
+                let value = value
+                    .as_str()
+                    .map(|value| Value::String(context::render_template(value, ctx)))
+                    .unwrap_or_else(|| value.clone());
+                (key.clone(), value)
+            })
+            .collect();
+
+        let rendered_prompt = if let Some(tool) = step
+            .mcp_tool
+            .as_deref()
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+        {
+            let server = step
+                .mcp_server
+                .as_deref()
+                .map(str::trim)
+                .filter(|server| !server.is_empty())
+                .map(|server| format!(" from the attached '{server}' server"))
+                .unwrap_or_default();
+            let arguments = step
+                .mcp_arguments
+                .as_ref()
+                .map(|value| render_json_templates(value, ctx))
+                .unwrap_or_else(|| serde_json::json!({}));
+            let arguments =
+                serde_json::to_string_pretty(&arguments).unwrap_or_else(|_| "{}".to_string());
+            format!(
+                "Call the MCP tool '{tool}'{server} with these arguments before completing this step:\n{arguments}\n\n{rendered_prompt}"
+            )
+        } else {
+            rendered_prompt
+        };
+
+        let rendered_prompt = if let Some(command) = step
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            let command = context::render_template(command, ctx);
+            let command = if command.starts_with('/') {
+                command
+            } else {
+                format!("/{command}")
+            };
+            if !rendered_prompt.trim().is_empty() {
+                format!("{command} {}", rendered_prompt.trim())
+            } else {
+                command
+            }
+        } else {
+            rendered_prompt
+        };
+
         // If step has declared outputs, append output schema to prompt
         let full_prompt = if let Some(ref outputs) = step.outputs {
             let mut schema_lines = vec![
@@ -245,7 +305,15 @@ impl WorkflowEngine {
             sop_id: step.procedure.clone(),
             conversation_id: None,
             priority: None,
-            context: None,
+            context: Some(serde_json::json!({
+                "origin": "workflow",
+                "kind": "workflow",
+                "source_id": instance_id,
+                "flow": flow_name,
+                "step": step.id,
+                "session_mode": if step.new_session { "new" } else { "continue" },
+                "session_config": rendered_session_config,
+            })),
         })?;
 
         // Enqueue for the dispatcher
@@ -1088,6 +1156,25 @@ impl WorkflowEngine {
     }
 }
 
+fn render_json_templates(value: &Value, ctx: &Value) -> Value {
+    match value {
+        Value::String(value) => Value::String(context::render_template(value, ctx)),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| render_json_templates(value, ctx))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), render_json_templates(value, ctx)))
+                .collect(),
+        ),
+        value => value.clone(),
+    }
+}
+
 /// Check if a workflow trigger matches an incoming connector event.
 pub fn matches_trigger(
     trigger: &WorkflowTrigger,
@@ -1122,6 +1209,7 @@ pub fn matches_trigger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn setup() -> (Arc<Database>, WorkflowEngine) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -1180,6 +1268,64 @@ flows:
         assert_eq!(execs[0].flow_name, "main");
         assert_eq!(execs[0].status, "running");
         assert!(execs[0].task_id.is_some());
+    }
+
+    #[test]
+    fn workflow_steps_render_native_commands_and_session_controls() {
+        let (db, engine) = setup();
+        let workflow = r#"
+name: native-controls
+version: 1
+flows:
+  main:
+    steps:
+      - id: optimize
+        agent: atlas
+        command: /loop
+        prompt: "Improve {{trigger.payload.page}}"
+        new_session: true
+        session_config:
+          mode: build
+          thought_level: "{{trigger.payload.effort}}"
+          use_fast_tools: true
+        mcp_server: seo
+        mcp_tool: audit_page
+        mcp_arguments:
+          page: "{{trigger.payload.page}}"
+          depth: 2
+"#;
+        let workflow_id = create_workflow(&db, workflow);
+        let instance_id = engine
+            .start_instance(
+                &workflow_id,
+                json!({ "page": "the pricing page", "effort": "high" }),
+            )
+            .unwrap();
+        let execution = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let task = TaskBoard::new(db)
+            .get(execution.task_id.as_deref().unwrap())
+            .unwrap();
+
+        let description = task.description.as_deref().unwrap();
+        assert!(description
+            .starts_with("/loop Call the MCP tool 'audit_page' from the attached 'seo' server"));
+        assert!(description.contains("\"page\": \"the pricing page\""));
+        assert!(description.ends_with("Improve the pricing page"));
+        assert_eq!(task.context.as_ref().unwrap()["session_mode"], "new");
+        assert_eq!(
+            task.context.as_ref().unwrap()["session_config"],
+            json!({
+                "mode": "build",
+                "thought_level": "high",
+                "use_fast_tools": true
+            })
+        );
     }
 
     #[test]

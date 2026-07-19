@@ -2,850 +2,405 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { setup, agents as agentsApi } from '$lib/api';
+	import { setup } from '$lib/api';
 	import { openExternal } from '$lib/utils';
-	import type {
-		DockerStatus,
-		SystemInfo,
-		OllamaInfo,
-		ModelRecommendation,
-		AgentPreset
-	} from '$lib/api';
+	import type { DockerStatus } from '$lib/api';
 
-	// New flow: 0=agent, 1=llm, 2=connectors, 3=docker, 4=complete
-	let step = $state(0);
-	const steps = ['Agent', 'LLM', 'Workspace', 'Environment', 'Complete'];
+	const runnerOptions = [
+		{
+			kind: 'codex',
+			name: 'Codex',
+			mark: 'C',
+			description: 'Codex through its ACP adapter, using an eligible ChatGPT login.',
+			image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest'
+		},
+		{
+			kind: 'claude',
+			name: 'Claude Code',
+			mark: 'A',
+			description: 'Claude Code through its ACP adapter, using an eligible Claude login.',
+			image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest'
+		},
+		{
+			kind: 'opencode',
+			name: 'OpenCode',
+			mark: 'O',
+			description: 'OpenCode through its built-in ACP server.',
+			image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest',
+			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest'
+		},
+		{
+			kind: 'custom',
+			name: 'Other ACP agent',
+			mark: '+',
+			description: 'Any containerized agent that speaks ACP over stdio.',
+			image: '',
+			hostImage: ''
+		}
+	] as const;
 
-	// Mode: 'setup' (full onboarding) or 'add-agent' (from agents page)
-	let mode = $derived($page.url.searchParams.get('mode') === 'add-agent' ? 'add-agent' : 'setup');
-
-	// -- Step 0: Agent --
-	let presets = $state<AgentPreset[]>([]);
-	let agentName = $state('');
-	let selectedPreset = $state<AgentPreset | null>(null);
-	let customRole = $state('');
-	let agentRoleTitle = $state('');
-	let agentResponsibilities = $state('');
-
-	// -- Step 1: LLM --
-	let systemInfo = $state<SystemInfo | null>(null);
-	let ollamaInfo = $state<OllamaInfo | null>(null);
-	let modelRec = $state<ModelRecommendation | null>(null);
-	let llmProvider = $state('ollama');
-	let isOpenRouter = $state(false);
-	let llmApiKey = $state('');
-	let llmBaseUrl = $state('');
-	let llmLocalModel = $state('');
-	let llmLocalBaseUrl = $state('');
-	let llmModel = $state('');
-	let availableModels = $state<{ id: string }[]>([]);
-	let keyValidating = $state(false);
-	let keyValid = $state<boolean | null>(null);
-	let keyError = $state('');
-	let llmLoading = $state(false);
-
-	// -- Step 2: Workspace & Tools --
-	let mcpServers = $state<Record<string, { type: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string }>>({});
-	let showAddMcp = $state(false);
-	let newMcpName = $state('');
-	let newMcpCommand = $state('');
-	let newMcpArgs = $state('');
-
-	// Workspace folders to mount into /workspace/{basename}
+	let isAddSession = $derived(
+		['add-session', 'add-agent'].includes($page.url.searchParams.get('mode') ?? '')
+	);
+	let runnerKind = $state('codex');
+	let runnerImage = $state(runnerOptions[0].image as string);
+	let runnerModel = $state('');
+	let runnerCommand = $state('');
+	let subscriptionAuth = $state(true);
+	let containerEngine = $state<'none' | 'host'>('none');
+	let workspacePath = $state('');
+	let hostOs = $state('');
 	let workspaceFolders = $state<string[]>([]);
 	let newFolderPath = $state('');
-	let composingFolder = $state(false);
-
-	// Optional tool toggles + config
-	let gitEnabled = $state(false);
-	let gitSshKeyPath = $state('');
-	let githubEnabled = $state(false);
-	let githubPat = $state('');
-
-	// Legacy preset list for custom MCP servers only
-	const mcpPresets: { name: string; id: string; command: string; args: string; envKey: string }[] = [];
-
-	// -- Step 3: Docker --
 	let dockerStatus = $state<DockerStatus | null>(null);
 	let dockerLoading = $state(true);
-	let containerless = $state(false);
-
-	// -- Step 4: Complete --
 	let saving = $state(false);
 	let saveError = $state('');
-	let startingAgents = $state(false);
-
-	const presetIcons: Record<string, string> = {
-		brain: '&#x1f9e0;',
-		code: '&#x1f4bb;',
-		search: '&#x1f50d;',
-		calendar: '&#x1f4c5;'
-	};
+	let contextLabel = $derived(
+		workspacePath.split('/').filter(Boolean).pop() || runnerKind
+	);
 
 	onMount(async () => {
-		// Load presets immediately (first step)
-		try { presets = await setup.presets(); } catch {}
-
-		// Check Docker in background
-		try { dockerStatus = await setup.checkDocker(); } catch {
-			dockerStatus = { available: false, error: 'Failed to check' };
+		// Keep old bookmarks working while making the native-session URL canonical.
+		if ($page.url.searchParams.get('mode') === 'add-agent') {
+			await goto('/setup?mode=add-session', { replaceState: true });
 		}
-		dockerLoading = false;
 
-		// If Docker is available, auto-enable it
-		if (dockerStatus?.available) containerless = false;
+		try {
+			const info = await setup.systemInfo();
+			workspacePath = info.working_directory ?? '';
+			hostOs = info.os;
+		} catch {
+			workspacePath = '';
+		}
+		await recheckDocker();
 	});
 
-	function selectPreset(preset: AgentPreset) {
-		selectedPreset = preset;
-		if (!agentName) agentName = preset.id;
-		customRole = preset.role;
+	function selectRunner(kind: string) {
+		const runner = runnerOptions.find((option) => option.kind === kind);
+		if (!runner) return;
+		runnerKind = runner.kind;
+		runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
+		runnerCommand = '';
+		runnerModel = '';
+		subscriptionAuth = runner.kind !== 'custom';
+	}
 
-		// Pre-fill optional tools from preset
-		const tools = preset.default_tools || [];
-		const servers = preset.default_mcp_servers || {};
-		gitEnabled = tools.includes('git') || 'git' in servers;
-		githubEnabled = tools.includes('github') || 'github' in servers;
-
-		// Keep non-default MCP servers (custom ones)
-		const defaultKeys = new Set(['shell', 'filesystem', 'git', 'github']);
-		const custom: typeof mcpServers = {};
-		for (const [k, v] of Object.entries(servers)) {
-			if (!defaultKeys.has(k)) custom[k] = v;
+	function setContainerEngine(enabled: boolean) {
+		const defaults = new Set<string>([
+			...runnerOptions.flatMap((runner) => [runner.image, runner.hostImage]),
+			'xpressclaw-runner-codex:latest',
+			'xpressclaw-runner-codex-docker:latest',
+			'xpressclaw-runner-claude:latest',
+			'xpressclaw-runner-claude-docker:latest',
+			'xpressclaw-runner-opencode:latest',
+			'xpressclaw-runner-opencode-docker:latest'
+		]);
+		const replaceImage = !runnerImage.trim() || defaults.has(runnerImage.trim());
+		containerEngine = enabled ? 'host' : 'none';
+		const runner = runnerOptions.find((option) => option.kind === runnerKind);
+		if (runner && runner.kind !== 'custom' && replaceImage) {
+			runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
 		}
-		mcpServers = custom;
-
-		// Pre-fill LLM from preset recommendation
-		if (preset.recommended_llm === 'local') {
-			llmProvider = 'local';
-		}
 	}
 
-	async function loadLlmInfo() {
-		if (systemInfo) return; // already loaded
-		llmLoading = true;
-		try {
-			const [sys, ollama, rec] = await Promise.all([
-				setup.systemInfo(),
-				setup.checkOllama(),
-				setup.recommendModel()
-			]);
-			systemInfo = sys;
-			ollamaInfo = ollama;
-			modelRec = rec;
-			if (rec?.model && !llmLocalModel) llmLocalModel = rec.model;
-		} catch {}
-		llmLoading = false;
-	}
-
-	async function validateApiKey() {
-		if (!llmApiKey.trim()) return;
-		keyValidating = true;
-		keyValid = null;
-		keyError = '';
-		availableModels = [];
-		try {
-			const result = await setup.validateKey(llmProvider, llmApiKey,
-				llmBaseUrl || undefined);
-			keyValid = result.valid;
-			if (!result.valid) {
-				keyError = result.error || 'Invalid API key';
-			} else if (result.models?.length) {
-				availableModels = result.models;
-				if (!llmModel && availableModels.length > 0) {
-					llmModel = availableModels[0].id;
-				}
-			}
-		} catch (e) {
-			keyValid = false;
-			keyError = e instanceof Error ? e.message : 'Validation failed';
-		}
-		keyValidating = false;
-	}
-
-	function addMcpPreset(preset: typeof mcpPresets[0]) {
-		mcpServers[preset.id] = {
-			type: 'stdio', command: preset.command,
-			args: preset.args.split(' '),
-			env: preset.envKey ? { [preset.envKey]: '' } : {}
-		};
-		mcpServers = { ...mcpServers };
-	}
-
-	function removeMcpServer(id: string) {
-		const next = { ...mcpServers };
-		delete next[id];
-		mcpServers = next;
-	}
-
-	function addCustomMcp() {
-		if (!newMcpName.trim()) return;
-		mcpServers[newMcpName] = {
-			type: 'stdio', command: newMcpCommand || undefined,
-			args: newMcpArgs ? newMcpArgs.split(' ') : undefined
-		};
-		mcpServers = { ...mcpServers };
-		newMcpName = ''; newMcpCommand = ''; newMcpArgs = '';
-		showAddMcp = false;
-	}
-
-	async function goToStep(target: number) {
-		if (target === 1) await loadLlmInfo();
-		if (target === 3) recheckDocker();
-		step = target;
+	function addFolder() {
+		const folder = newFolderPath.trim();
+		if (!folder || workspaceFolders.includes(folder)) return;
+		workspaceFolders = [...workspaceFolders, folder];
+		newFolderPath = '';
 	}
 
 	async function recheckDocker() {
 		dockerLoading = true;
-		try { dockerStatus = await setup.checkDocker(); } catch {
-			dockerStatus = { available: false, error: 'Failed to check' };
+		try {
+			dockerStatus = await setup.checkDocker();
+		} catch {
+			dockerStatus = {
+				available: false,
+				installed: false,
+				can_start: false,
+				runtime: null,
+				version: null,
+				socket: null,
+				rootless: null,
+				error: 'Could not check the container runtime'
+			};
 		}
 		dockerLoading = false;
-		if (dockerStatus?.available) containerless = false;
 	}
 
-	function canProceedLlm(): boolean {
-		if (llmProvider === 'ollama') return !!llmLocalModel;
-		if (llmProvider === 'openai' || llmProvider === 'anthropic') return !!llmApiKey && keyValid === true && !!llmModel;
-		return false;
+	function additionalVolumes(): string[] {
+		return workspaceFolders.map((folder) => {
+			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}`;
+			const basename = folder.split('/').filter(Boolean).pop() || 'shared';
+			return `${folder}:/workspace/${basename}`;
+		});
 	}
 
-	function formatBytes(bytes: number): string {
-		if (bytes === 0) return '0 B';
-		const units = ['B', 'KB', 'MB', 'GB'];
-		const i = Math.floor(Math.log(bytes) / Math.log(1024));
-		return (bytes / Math.pow(1024, i)).toFixed(1) + ' ' + units[i];
-	}
-
-	async function autoStartAgents() {
-		try {
-			startingAgents = true;
-			const allAgents = await agentsApi.list();
-			for (const agent of allAgents) {
-				if (agent.status !== 'running') await agentsApi.start(agent.id).catch(() => {});
-			}
-		} catch {}
-		startingAgents = false;
-	}
-
-	async function completeSetup() {
+	async function createSession() {
+		if (!workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
 		saving = true;
 		saveError = '';
-		// Re-check Docker right before saving — if available, always use it
+
+		const session = {
+			backend: runnerKind,
+			runner_kind: runnerKind,
+			runner_image: runnerImage.trim(),
+			runner_workspace: workspacePath.trim(),
+			runner_model: runnerModel.trim() || undefined,
+			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
+			subscription_auth: subscriptionAuth,
+			runner_container_engine: containerEngine,
+			volumes: additionalVolumes()
+		};
+
 		try {
-			const ds = await setup.checkDocker();
-			if (ds?.available) containerless = false;
-		} catch {}
-		try {
-			const isOllama = llmProvider === 'ollama';
-
-			// Build MCP servers from tool toggles + any custom servers
-			const allMcpServers = { ...mcpServers };
-			if (gitEnabled) {
-				allMcpServers['git'] = {
-					type: 'stdio', command: 'npx',
-					args: ['-y', '@modelcontextprotocol/server-git'],
-					env: gitSshKeyPath.trim() ? { SSH_KEY_PATH: gitSshKeyPath.trim() } : {}
-				};
-			}
-			if (githubEnabled && githubPat.trim()) {
-				allMcpServers['github'] = {
-					type: 'stdio', command: 'docker',
-					args: ['run', '-i', '--rm', '-e', 'GITHUB_PERSONAL_ACCESS_TOKEN', 'ghcr.io/github/github-mcp-server'],
-					env: { GITHUB_PERSONAL_ACCESS_TOKEN: githubPat.trim() }
-				};
-			}
-
-			// Build volumes from workspace folders
-			const volumes = workspaceFolders
-				.filter(f => f.trim())
-				.map(f => {
-					const basename = f.trim().split('/').filter(Boolean).pop() || 'workspace';
-					return `${f.trim()}:/workspace/${basename}`;
-				});
-
-			// Build tools list from enabled toggles
-			const tools = ['filesystem', 'shell', 'memory'];
-			if (gitEnabled) tools.push('git');
-			if (githubEnabled) tools.push('github');
-
-			// Cloud providers send a real model name; Ollama sends the tag.
-			const realModel = (llmProvider === 'openai' || llmProvider === 'anthropic')
-				? llmModel
-				: (isOllama ? llmLocalModel : undefined);
-
-			if (mode === 'add-agent') {
-				// Add agent to existing config without replacing other agents
-				await setup.addAgent({
-					name: agentName,
-					preset: selectedPreset?.id,
-					role: customRole || undefined,
-					model: realModel,
-					tools,
-					volumes: volumes.length > 0 ? volumes : undefined,
-					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
-				});
-				step = 4;
-				autoStartAgents();
+			if (isAddSession) {
+				const created = await setup.addSession(session);
+				await goto(`/agents/${created.session_id}`);
 			} else {
-				// Full setup: replace entire config
 				await setup.complete({
-					llm: {
-						provider: llmProvider,
-						api_key: (llmProvider === 'openai' || llmProvider === 'anthropic') ? llmApiKey : undefined,
-						base_url: llmBaseUrl || undefined,
-						local_model: isOllama ? llmLocalModel : undefined,
-						local_base_url: isOllama && llmLocalBaseUrl ? llmLocalBaseUrl : undefined,
-					},
-					agents: [{
-						name: agentName,
-						preset: selectedPreset?.id,
-						role: customRole || undefined,
-						role_title: agentRoleTitle || undefined,
-						responsibilities: agentResponsibilities || undefined,
-						model: realModel,
-						tools,
-						volumes: volumes.length > 0 ? volumes : undefined,
-					}],
-					mcp_servers: Object.keys(allMcpServers).length > 0 ? allMcpServers : undefined,
-					isolation: containerless ? 'none' : 'docker'
+					agents: [session],
+					isolation: 'docker'
 				});
-				step = 4;
-				autoStartAgents();
+				await goto('/');
 			}
-		} catch (e) {
-			saveError = e instanceof Error ? e.message : 'Failed to save configuration';
-			console.error('Setup failed:', e);
+		} catch (error) {
+			saveError = error instanceof Error ? error.message : 'Could not create the project';
+		} finally {
+			saving = false;
 		}
-		saving = false;
 	}
 </script>
 
-<!-- Step indicator -->
-<div class="mb-6 flex justify-center gap-2">
-	{#each steps as s, i}
-		<div class="flex items-center gap-2">
-			<div
-				class="flex h-8 w-8 items-center justify-center rounded-full text-xs font-medium transition-colors {i === step
-					? 'bg-primary text-primary-foreground'
-					: i < step
-						? 'bg-primary/20 text-primary'
-						: 'bg-muted text-muted-foreground'}"
-			>
-				{#if i < step}&#10003;{:else}{i + 1}{/if}
-			</div>
-			{#if i < steps.length - 1}
-				<div class="h-px w-6 {i < step ? 'bg-primary/40' : 'bg-border'}"></div>
-			{/if}
+<div class="rounded-2xl border border-border bg-card shadow-sm">
+	<div class="flex items-start justify-between border-b border-border px-4 py-5 sm:px-6">
+		<div>
+			<p class="text-xs font-medium uppercase tracking-wider text-primary">Project</p>
+			<h2 class="mt-1 text-xl font-semibold text-foreground">
+				{isAddSession ? 'Connect a project' : 'Connect your first project'}
+			</h2>
+			<p class="mt-1 text-sm text-muted-foreground">
+				Choose the agent you already use, then point it at a folder on this computer.
+			</p>
 		</div>
-	{/each}
-</div>
-
-<div class="rounded-xl border border-border bg-card p-6">
-	<!-- Step 0: Agent Preset -->
-	{#if step === 0}
-		<div class="flex items-start justify-between mb-1">
-			<div>
-				<h2 class="text-lg font-semibold text-foreground">
-					{mode === 'add-agent' ? 'Add Agent' : 'Choose Your Agent'}
-				</h2>
-				<p class="text-sm text-muted-foreground mt-1">
-					Pick a template to get started. You can customize everything in the next steps.
-				</p>
-			</div>
-			{#if mode === 'add-agent'}
-				<button onclick={() => goto('/agents')} class="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground">
-					<span class="text-xl">&times;</span>
-				</button>
-			{/if}
-		</div>
-
-		<div class="grid grid-cols-2 gap-3 mb-6">
-			{#each presets as preset}
-				<button
-					onclick={() => selectPreset(preset)}
-					class="flex items-start gap-3 rounded-lg border p-4 text-left transition-colors {selectedPreset?.id === preset.id
-						? 'border-primary bg-primary/5'
-						: 'border-border hover:border-primary/40'}"
-				>
-					<span class="text-2xl">{@html presetIcons[preset.icon] || '&#x2699;'}</span>
-					<div>
-						<div class="text-sm font-medium text-foreground">{preset.name}</div>
-						<div class="text-xs text-muted-foreground">{preset.description}</div>
-						{#if preset.default_tools.length > 0}
-							<div class="mt-1 flex flex-wrap gap-1">
-								{#each preset.default_tools as tool}
-									<span class="text-xs bg-muted px-1.5 py-0.5 rounded">{tool}</span>
-								{/each}
-							</div>
-						{/if}
-					</div>
-				</button>
-			{/each}
-		</div>
-
-		{#if selectedPreset}
-			<div class="space-y-3 rounded-lg border border-border p-4">
-				<div>
-					<label for="agent-name" class="block text-xs font-medium text-foreground mb-1">Agent Name</label>
-					<input
-						id="agent-name"
-						type="text"
-						bind:value={agentName}
-						placeholder="atlas"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-					/>
-				</div>
-				<div>
-					<label for="agent-role-title" class="block text-xs font-medium text-foreground mb-1">
-						Role Title <span class="text-muted-foreground font-normal">(e.g. Personal Assistant, Code Reviewer)</span>
-					</label>
-					<input
-						id="agent-role-title"
-						type="text"
-						bind:value={agentRoleTitle}
-						placeholder="e.g. Developer, Personal Assistant"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-					/>
-				</div>
-				<div>
-					<label for="agent-responsibilities" class="block text-xs font-medium text-foreground mb-1">
-						Responsibilities <span class="text-muted-foreground font-normal">(what should this agent do?)</span>
-					</label>
-					<textarea
-						id="agent-responsibilities"
-						bind:value={agentResponsibilities}
-						rows="2"
-						placeholder="e.g. Manages code reviews, writes tests, fixes bugs"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
-					></textarea>
-				</div>
-				<div>
-					<label for="agent-role" class="block text-xs font-medium text-foreground mb-1">
-						System Prompt <span class="text-muted-foreground font-normal">(advanced)</span>
-					</label>
-					<textarea
-						id="agent-role"
-						bind:value={customRole}
-						rows="4"
-						class="w-full rounded-md border border-border bg-background px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-ring"
-					></textarea>
-				</div>
-			</div>
-		{/if}
-
-		<div class="mt-6 flex justify-end">
+		{#if isAddSession}
 			<button
-				onclick={() => goToStep(1)}
-				disabled={!selectedPreset || !agentName.trim()}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
-			>Continue</button>
-		</div>
+				type="button"
+				onclick={() => goto('/agents')}
+				aria-label="Cancel"
+				class="ml-4 rounded-md p-2 text-xl leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
+			>&times;</button>
+		{/if}
+	</div>
 
-	<!-- Step 1: LLM Provider -->
-	{:else if step === 1}
-		<h2 class="text-lg font-semibold text-foreground mb-1">LLM Provider</h2>
-		<p class="text-sm text-muted-foreground mb-6">
-			Choose how your agents will think. You can change this later.
-		</p>
-
-		{#if llmLoading}
-			<div class="flex items-center gap-3 p-4">
-				<div class="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent"></div>
-				<span class="text-sm text-muted-foreground">Detecting hardware...</span>
+	<form class="space-y-7 p-4 sm:p-6" onsubmit={(event) => { event.preventDefault(); createSession(); }}>
+		<section>
+			<div class="mb-3">
+				<h3 class="text-sm font-medium text-foreground">Agent</h3>
+				<p class="mt-0.5 text-xs text-muted-foreground">XpressClaw sends tasks to this product; it keeps its own reasoning, tools, and subagents.</p>
 			</div>
-		{:else}
-			{#if systemInfo}
-				<div class="mb-4 rounded-lg border border-border p-3 text-xs text-muted-foreground">
-					<span class="font-medium text-foreground">{systemInfo.os} {systemInfo.arch}</span>
-					&mdash; {systemInfo.total_memory_gb.toFixed(0)}GB RAM, {systemInfo.cpu_count} CPUs
-					{#if systemInfo.gpu.available}, {systemInfo.gpu.name}{/if}
-				</div>
+			<div class="grid gap-3 sm:grid-cols-2">
+				{#each runnerOptions as runner}
+					<button
+						type="button"
+						onclick={() => selectRunner(runner.kind)}
+						class="rounded-xl border p-4 text-left transition-colors {runnerKind === runner.kind
+							? 'border-primary bg-primary/5 ring-1 ring-primary/20'
+							: 'border-border hover:border-primary/40 hover:bg-accent/30'}"
+					>
+						<span class="flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-sm font-semibold text-foreground">{runner.mark}</span>
+						<span class="mt-3 block text-sm font-medium text-foreground">{runner.name}</span>
+						<span class="mt-1 block text-xs leading-relaxed text-muted-foreground">{runner.description}</span>
+					</button>
+				{/each}
+			</div>
+		</section>
+
+		<section>
+			<label for="workspace-path" class="mb-1.5 block text-sm font-medium text-foreground">Project folder</label>
+			<input
+				id="workspace-path"
+				type="text"
+				bind:value={workspacePath}
+				placeholder="/home/me/projects/my-app"
+				class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+			/>
+			<p class="mt-1.5 text-xs text-muted-foreground">
+				The folder must exist on this machine.
+				{containerEngine === 'host'
+					? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
+					: ' It is mounted at /workspace.'}
+				It appears as <strong>{contextLabel}</strong> in the UI.
+			</p>
+		</section>
+
+		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			<label class="flex cursor-pointer items-start gap-3">
+				<input
+					type="checkbox"
+					checked={containerEngine === 'host'}
+					onchange={(event) => setContainerEngine(event.currentTarget.checked)}
+					class="mt-0.5 rounded border-border"
+				/>
+				<span>
+					<span class="block text-sm font-medium text-foreground">Give the agent host Docker or Podman access</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Use Docker Compose, Buildx, and the host engine's image cache from inside the runner.</span>
+				</span>
+			</label>
+			{#if containerEngine === 'host'}
+				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+					The agent can control host containers, images, volumes, and any paths the engine can mount. Enable this only for agents and images you trust.
+				</p>
 			{/if}
+		</section>
 
-			<div class="space-y-2 mb-4">
-				<button
-					onclick={() => { llmProvider = 'ollama'; isOpenRouter = false; keyValid = null; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'ollama' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
-					disabled={ollamaInfo !== null && !ollamaInfo.available}
-				>
-					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F999;</div>
-					<div class="flex-1">
-						<div class="text-sm font-medium text-foreground flex items-center gap-2">
-							Ollama
-							{#if ollamaInfo?.available}
-								<span class="inline-block h-2 w-2 rounded-full bg-emerald-500"></span>
-							{:else if ollamaInfo !== null}
-								<span class="inline-block h-2 w-2 rounded-full bg-red-500"></span>
-							{/if}
+		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			{#if runnerKind === 'custom'}
+				<div>
+					<p class="text-sm font-medium text-foreground">Authentication is image-defined</p>
+					<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">Add any required credential directories as mounts below. XpressClaw only knows the standard login locations for its built-in agents.</p>
+				</div>
+			{:else}
+			<label class="flex cursor-pointer items-start gap-3">
+				<input type="checkbox" bind:checked={subscriptionAuth} class="mt-0.5 rounded border-border" />
+				<span>
+					<span class="block text-sm font-medium text-foreground">Use my existing {runnerOptions.find((runner) => runner.kind === runnerKind)?.name} login</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Mount the agent's standard login directory so its subscription and native sessions can continue across tasks. Only enable this for images you trust.</span>
+				</span>
+			</label>
+			{/if}
+		</section>
+
+		<details class="group rounded-xl border border-border">
+			<summary class="cursor-pointer list-none px-4 py-3 text-sm font-medium text-foreground">
+				<span class="inline-flex items-center gap-2">
+					<span class="text-muted-foreground transition-transform group-open:rotate-90">&#9656;</span>
+					Advanced container options
+				</span>
+			</summary>
+			<div class="space-y-5 border-t border-border px-4 py-4">
+				<div>
+					<label for="runner-image" class="mb-1 block text-xs font-medium text-foreground">Runner image</label>
+					<input
+						id="runner-image"
+						type="text"
+						bind:value={runnerImage}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">{containerEngine === 'host' ? 'The built-in Docker variant adds Docker CLI, Compose, and Buildx.' : 'Use the minimal agent image or a compatible derivative.'}</p>
+				</div>
+
+				<div>
+					<label for="runner-model" class="mb-1 block text-xs font-medium text-foreground">Model</label>
+					<input
+						id="runner-model"
+						type="text"
+						bind:value={runnerModel}
+						placeholder="Agent default"
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">Optional ACP model value ID. Invalid values are rejected with the choices advertised by the agent.</p>
+				</div>
+
+				<div>
+					<label for="runner-command" class="mb-1 block text-xs font-medium text-foreground">ACP server command {runnerKind === 'custom' ? '(required)' : '(optional override)'}</label>
+					<textarea
+						id="runner-command"
+						bind:value={runnerCommand}
+						rows="4"
+						placeholder={'my-agent\nacp\n--cwd\n{workspace}'}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					></textarea>
+					<p class="mt-1 text-xs text-muted-foreground">One argument per line. The process must speak ACP over stdin/stdout. Available placeholder: <code>{'{workspace}'}</code>.</p>
+				</div>
+
+				<div>
+					<label for="additional-folder" class="mb-1 block text-xs font-medium text-foreground">Additional folder mounts</label>
+					{#if workspaceFolders.length > 0}
+						<div class="mb-2 space-y-2">
+							{#each workspaceFolders as folder, index}
+								<div class="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-2">
+									<span class="min-w-0 flex-1 truncate font-mono text-xs">{folder}</span>
+									<button
+										type="button"
+										onclick={() => { workspaceFolders = workspaceFolders.filter((_, itemIndex) => itemIndex !== index); }}
+										aria-label={`Remove ${folder}`}
+										class="text-muted-foreground hover:text-destructive"
+									>&times;</button>
+								</div>
+							{/each}
 						</div>
-						<div class="text-xs text-muted-foreground">
-							{#if ollamaInfo?.available}
-								{ollamaInfo.models.length} model{ollamaInfo.models.length !== 1 ? 's' : ''} installed. Free and private.
-							{:else if ollamaInfo !== null}
-								Not running. Install from ollama.com and run <code class="bg-muted px-1 rounded">ollama serve</code>.
-							{:else}
-								Use Ollama for local inference. Free and private.
-							{/if}
-						</div>
+					{/if}
+					<div class="flex gap-2">
+						<input
+							id="additional-folder"
+							type="text"
+							bind:value={newFolderPath}
+							onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addFolder(); } }}
+							placeholder="/home/me/projects/shared"
+							class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+						/>
+						<button type="button" onclick={addFolder} disabled={!newFolderPath.trim()}
+							class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">Add</button>
 					</div>
-				</button>
-				<button
-					onclick={() => { llmProvider = 'openai'; isOpenRouter = false; keyValid = null; llmApiKey = ''; llmBaseUrl = ''; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'openai' && !isOpenRouter ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
-				>
-					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x2601;</div>
-					<div>
-						<div class="text-sm font-medium text-foreground">OpenAI</div>
-						<div class="text-xs text-muted-foreground">GPT-4o, GPT-5 series. Requires API key.</div>
-					</div>
-				</button>
-				<button
-					onclick={() => { llmProvider = 'anthropic'; isOpenRouter = false; keyValid = null; llmApiKey = ''; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {llmProvider === 'anthropic' ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
-				>
-					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x2728;</div>
-					<div>
-						<div class="text-sm font-medium text-foreground">Anthropic</div>
-						<div class="text-xs text-muted-foreground">Claude Opus, Sonnet, Haiku. Requires API key.</div>
-					</div>
-				</button>
-				<button
-					onclick={() => { llmProvider = 'openai'; isOpenRouter = true; keyValid = null; llmApiKey = ''; llmBaseUrl = 'https://openrouter.ai/api/v1'; }}
-					class="w-full flex items-start gap-3 rounded-lg border p-3 text-left transition-colors {isOpenRouter ? 'border-primary bg-primary/5' : 'border-border hover:border-primary/40'}"
-				>
-					<div class="flex h-8 w-8 items-center justify-center rounded-md bg-muted text-sm">&#x1F310;</div>
-					<div>
-						<div class="text-sm font-medium text-foreground">OpenRouter</div>
-						<div class="text-xs text-muted-foreground">Access 200+ models via a single API. OpenAI-compatible.</div>
-					</div>
-				</button>
+				</div>
 			</div>
+		</details>
 
-			{#if llmProvider === 'ollama'}
-				<div class="space-y-3 rounded-lg border border-border p-4">
-					<div>
-						<label for="ollama-model" class="block text-xs font-medium text-foreground mb-1">Model</label>
-						<input id="ollama-model" type="text" bind:value={llmLocalModel} placeholder="qwen3:8b"
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-						<p class="mt-1 text-xs text-muted-foreground">
-							Any Ollama model name. xpressclaw pulls it in the background after setup if it isn't installed yet — your agent will start replying once the pull completes.
+		<section>
+			{#if dockerLoading}
+				<div class="flex items-center gap-3 rounded-lg border border-border px-4 py-3">
+					<span class="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent"></span>
+					<span class="text-xs text-muted-foreground">Checking Docker or Podman...</span>
+				</div>
+			{:else if dockerStatus?.available}
+				<div class="flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3">
+					<span class="flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500/15 text-xs text-emerald-500">&#10003;</span>
+					<div class="min-w-0">
+						<p class="text-sm font-medium text-foreground">{dockerStatus.runtime === 'podman' ? 'Podman' : 'Docker'} ready</p>
+						<p class="truncate text-xs text-muted-foreground">
+							{dockerStatus.rootless ? 'Rootless · ' : ''}{dockerStatus.socket ?? 'Automatic endpoint'}{dockerStatus.version ? ` · ${dockerStatus.version}` : ''}
 						</p>
 					</div>
-					{#if modelRec?.all_options}
-						<div class="space-y-1">
-							<div class="text-xs font-medium text-muted-foreground">Suggested sizes for this hardware:</div>
-							<div class="grid grid-cols-2 gap-1">
-								{#each modelRec.all_options as opt}
-									<button onclick={() => llmLocalModel = opt.model}
-										class="rounded px-2 py-1 text-xs text-left transition-colors {llmLocalModel === opt.model
-											? 'bg-primary/10 border border-primary text-foreground'
-											: 'border border-border hover:border-primary/40 text-foreground'}">
-										{opt.display_name} <span class="text-muted-foreground">({opt.ram_required_gb}GB)</span>
-										{#if !opt.suitable}<span class="text-amber-500/60">*</span>{/if}
-									</button>
-								{/each}
-							</div>
-						</div>
-					{/if}
-					{#if ollamaInfo?.models && ollamaInfo.models.length > 0}
-						<div class="space-y-1">
-							<div class="text-xs font-medium text-muted-foreground">Already installed:</div>
-							<div class="flex flex-wrap gap-1">
-								{#each ollamaInfo.models as m}
-									<button onclick={() => llmLocalModel = m.name}
-										class="rounded px-2 py-1 text-xs transition-colors {llmLocalModel === m.name
-											? 'bg-primary/10 border border-primary text-foreground'
-											: 'border border-border hover:border-primary/40 text-foreground'}">
-										{m.name}{#if m.size} <span class="text-muted-foreground">({formatBytes(m.size)})</span>{/if}
-									</button>
-								{/each}
-							</div>
-						</div>
-					{/if}
 				</div>
-			{:else if llmProvider === 'openai' || llmProvider === 'anthropic'}
-				<div class="space-y-3 rounded-lg border border-border p-4">
-					<div>
-						<label for="base-url" class="block text-xs font-medium text-foreground mb-1">
-							Base URL <span class="text-muted-foreground font-normal">(optional)</span>
-						</label>
-						<input id="base-url" type="text" bind:value={llmBaseUrl}
-							placeholder={llmProvider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com'}
-							class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-					</div>
-					<div>
-						<label for="api-key" class="block text-xs font-medium text-foreground mb-1">API Key</label>
-						<div class="flex gap-2">
-							<input id="api-key" type="password" bind:value={llmApiKey}
-								placeholder={llmProvider === 'anthropic' ? 'sk-ant-...' : 'sk-...'}
-								class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-							<button onclick={validateApiKey} disabled={!llmApiKey.trim() || keyValidating}
-								class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">
-								{keyValidating ? 'Checking...' : 'Validate'}
-							</button>
-						</div>
-						{#if keyValid === true}<p class="mt-1 text-xs text-emerald-500">API key is valid</p>{/if}
-						{#if keyValid === false}<p class="mt-1 text-xs text-red-500">{keyError}</p>{/if}
-					</div>
-					{#if keyValid === true && availableModels.length > 0}
-						<div>
-							<label for="model-select" class="block text-xs font-medium text-foreground mb-1">Model</label>
-							<select id="model-select" bind:value={llmModel}
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring">
-								{#each availableModels as m}
-									<option value={m.id}>{m.id}</option>
-								{/each}
-							</select>
-						</div>
-					{:else if keyValid === true}
-						<div>
-							<label for="model-input" class="block text-xs font-medium text-foreground mb-1">Model</label>
-							<input id="model-input" type="text" bind:value={llmModel}
-								placeholder={llmProvider === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o'}
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-						</div>
-					{/if}
-				</div>
-
-			{/if}
-		{/if}
-
-		<div class="mt-6 flex justify-between">
-			{#if mode === 'add-agent'}
-				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
 			{:else}
-				<button onclick={() => goToStep(0)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
-			{/if}
-			<button onclick={() => goToStep(2)} disabled={!canProceedLlm()}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">Continue</button>
-		</div>
-
-	<!-- Step 2: Workspace & Tools -->
-	{:else if step === 2}
-		<h2 class="text-lg font-semibold text-foreground mb-1">Workspace & Tools</h2>
-		<p class="text-sm text-muted-foreground mb-6">
-			Share folders with your agent and configure optional tools.
-		</p>
-
-		<!-- Workspace Folders -->
-		<div class="mb-6">
-			<h3 class="text-sm font-medium text-foreground mb-2">Workspace Folders</h3>
-			<p class="text-xs text-muted-foreground mb-3">
-				Folders from your machine that the agent can read and write. Each folder is mounted at <code class="bg-muted px-1 rounded">/workspace/</code> in the container.
-			</p>
-			{#if workspaceFolders.length > 0}
-				<div class="space-y-2 mb-3">
-					{#each workspaceFolders as folder, i}
-						<div class="flex items-center gap-2 rounded-lg border border-border px-3 py-2">
-							<span class="flex-1 text-sm font-mono text-foreground truncate">{folder}</span>
-							<span class="text-xs text-muted-foreground">/workspace/{folder.split('/').filter(Boolean).pop()}</span>
-							<button onclick={() => { workspaceFolders = workspaceFolders.filter((_, j) => j !== i); }}
-								class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground">&#x2715;</button>
-						</div>
-					{/each}
-				</div>
-			{/if}
-			<div class="flex gap-2">
-				<input type="text" bind:value={newFolderPath} placeholder="~/projects/my-app"
-					onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' && !e.isComposing && !composingFolder && e.keyCode !== 229 && newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
-					oncompositionstart={() => (composingFolder = true)}
-					oncompositionend={() => setTimeout(() => (composingFolder = false), 0)}
-					class="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-				<button onclick={() => { if (newFolderPath.trim()) { workspaceFolders = [...workspaceFolders, newFolderPath.trim()]; newFolderPath = ''; } }}
-					disabled={!newFolderPath.trim()}
-					class="rounded-md border border-border px-3 py-2 text-sm hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed">Add</button>
-			</div>
-		</div>
-
-		<!-- Default Tools -->
-		<div class="mb-4">
-			<h3 class="text-sm font-medium text-foreground mb-2">Built-in Tools</h3>
-			<div class="flex flex-wrap gap-1.5">
-				{#each [
-					'Filesystem', 'Shell', 'Tasks', 'Memory', 'Apps', 'Skills',
-					'Office', 'Browser', 'Logs'
-				] as tool}
-					<span class="inline-flex items-center rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">{tool}</span>
-				{/each}
-			</div>
-			<p class="text-xs text-muted-foreground mt-1">Always included for all agents.</p>
-		</div>
-
-		<!-- Optional Tools -->
-		<div class="mb-4">
-			<h3 class="text-sm font-medium text-foreground mb-3">Optional Tools</h3>
-			<div class="space-y-2">
-				<!-- Git -->
-				<div class="rounded-lg border {gitEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" bind:checked={gitEnabled} class="rounded border-border" />
+				<div class="rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3">
+					<div class="flex items-start justify-between gap-4">
 						<div>
-							<div class="text-sm font-medium text-foreground">Git</div>
-							<div class="text-xs text-muted-foreground">Interact with Git repositories</div>
+							<p class="text-sm font-medium text-foreground">Container runtime not available</p>
+							<p class="mt-0.5 text-xs text-muted-foreground">You can save the project, but work will wait until Docker or Podman is running.</p>
 						</div>
-					</label>
-					{#if gitEnabled}
-						<div class="mt-3 ml-7">
-							<label for="git-ssh" class="block text-xs font-medium text-foreground mb-1">
-								SSH Key Path <span class="text-muted-foreground font-normal">(optional)</span>
-							</label>
-							<input id="git-ssh" type="text" bind:value={gitSshKeyPath} placeholder="~/.ssh/id_ed25519"
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-						</div>
-					{/if}
-				</div>
-
-				<!-- GitHub -->
-				<div class="rounded-lg border {githubEnabled ? 'border-primary bg-primary/5' : 'border-border'} p-3">
-					<label class="flex items-center gap-3 cursor-pointer">
-						<input type="checkbox" bind:checked={githubEnabled} class="rounded border-border" />
-						<div>
-							<div class="text-sm font-medium text-foreground">GitHub</div>
-							<div class="text-xs text-muted-foreground">Issues, PRs, repos via GitHub MCP Server</div>
-						</div>
-					</label>
-					{#if githubEnabled}
-						<div class="mt-3 ml-7">
-							<label for="github-pat" class="block text-xs font-medium text-foreground mb-1">Personal Access Token</label>
-							<input id="github-pat" type="password" bind:value={githubPat} placeholder="ghp_..."
-								class="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-							<p class="mt-1 text-xs text-muted-foreground">
-								Create a token at GitHub &rarr; Settings &rarr; Developer Settings &rarr; Personal Access Tokens
-							</p>
-						</div>
-					{/if}
-				</div>
-			</div>
-		</div>
-
-		<p class="text-xs text-muted-foreground mb-4">You can add and configure tools later from agent settings.</p>
-
-		<!-- Custom MCP connector (collapsed) -->
-		{#if showAddMcp}
-			<div class="rounded-lg border border-border p-3 space-y-2 mb-4">
-				<div class="text-xs font-medium text-foreground mb-1">Custom MCP Server</div>
-				<input type="text" bind:value={newMcpName} placeholder="Server name"
-					class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-				<input type="text" bind:value={newMcpCommand} placeholder="Command (e.g., npx)"
-					class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-				<input type="text" bind:value={newMcpArgs} placeholder="Arguments (space-separated)"
-					class="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring" />
-				<div class="flex gap-2">
-					<button onclick={addCustomMcp} class="rounded-md bg-primary px-3 py-1 text-xs text-primary-foreground hover:bg-primary/90">Add</button>
-					<button onclick={() => showAddMcp = false} class="rounded-md border border-border px-3 py-1 text-xs hover:bg-accent">Cancel</button>
-				</div>
-			</div>
-		{:else}
-			<button onclick={() => showAddMcp = true} class="text-xs text-muted-foreground hover:text-foreground">+ Add custom MCP connector</button>
-		{/if}
-
-		{#if Object.keys(mcpServers).length > 0}
-			<div class="mt-3 space-y-2">
-				{#each Object.entries(mcpServers) as [id, server]}
-					<div class="flex items-center justify-between rounded-lg border border-border p-2">
-						<div class="text-xs text-foreground">{id} <span class="text-muted-foreground">({server.command} {server.args?.join(' ') || ''})</span></div>
-						<button onclick={() => removeMcpServer(id)} class="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground text-xs">&#x2715;</button>
+						<button type="button" onclick={recheckDocker} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Retry</button>
 					</div>
-				{/each}
-			</div>
+					<div class="mt-3 flex gap-3 text-xs">
+						<button type="button" onclick={() => openExternal('https://docs.docker.com/get-docker/')} class="text-primary hover:underline">Docker setup</button>
+						<button type="button" onclick={() => openExternal('https://podman.io/getting-started/installation')} class="text-primary hover:underline">Podman setup</button>
+					</div>
+				</div>
+			{/if}
+		</section>
+
+		{#if saveError}
+			<p class="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{saveError}</p>
 		{/if}
 
-		<div class="mt-6 flex justify-between">
-			{#if mode === 'add-agent'}
-				<button onclick={() => goto('/agents')} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Cancel</button>
+		<div class="flex items-center justify-between border-t border-border pt-5">
+			{#if isAddSession}
+				<button type="button" onclick={() => goto('/agents')} class="rounded-lg px-4 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground">Cancel</button>
 			{:else}
-				<button onclick={() => goToStep(1)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
+				<span class="text-xs text-muted-foreground">No API key required when using a subscription login.</span>
 			{/if}
-			<button onclick={() => goToStep(3)}
-				class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90">Continue</button>
-		</div>
-
-	<!-- Step 3: Docker / Environment -->
-	{:else if step === 3}
-		<h2 class="text-lg font-semibold text-foreground mb-1">Environment</h2>
-		<p class="text-sm text-muted-foreground mb-6">
-			Agents can run in Docker containers for security isolation.
-		</p>
-
-		{#if dockerLoading}
-			<div class="flex items-center gap-3 rounded-lg border border-border p-4">
-				<div class="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent"></div>
-				<span class="text-sm text-muted-foreground">Checking for Docker...</span>
-			</div>
-		{:else if dockerStatus?.available}
-			<div class="flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
-				<div class="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500">&#10003;</div>
-				<div>
-					<div class="text-sm font-medium text-foreground">Docker is running</div>
-					<div class="text-xs text-muted-foreground">Container isolation is available</div>
-				</div>
-			</div>
-		{:else}
-			<div class="flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 mb-4">
-				<div class="flex h-8 w-8 items-center justify-center rounded-full bg-amber-500/20 text-amber-500">!</div>
-				<div>
-					<div class="text-sm font-medium text-foreground">Docker is not available</div>
-					<div class="text-xs text-muted-foreground">{dockerStatus?.error || ''}</div>
-				</div>
-			</div>
-			<div class="space-y-2 text-sm mb-4">
-				<div class="flex gap-2">
-					<button onclick={() => openExternal('https://docs.docker.com/get-docker/')}
-						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Docker Desktop &#8599;</button>
-					<button onclick={() => openExternal('https://podman.io/getting-started/installation')}
-						class="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Podman &#8599;</button>
-					<button onclick={recheckDocker}
-						class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Retry</button>
-				</div>
-			</div>
-			<label class="flex items-start gap-3 cursor-pointer rounded-lg border border-border p-4">
-				<input type="checkbox" bind:checked={containerless} class="mt-0.5 rounded border-border" />
-				<div>
-					<div class="text-sm font-medium text-foreground">Continue without containers</div>
-					<div class="text-xs text-muted-foreground">
-						Only use this on a dedicated machine or VM where security isolation is not needed.
-					</div>
-				</div>
-			</label>
-		{/if}
-
-		<div class="mt-6 flex items-center justify-between">
-			<button onclick={() => goToStep(2)} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent">Back</button>
-			<div class="flex items-center gap-3">
-				{#if mode === 'add-agent'}
-					<button onclick={() => goto('/agents')} class="rounded-md px-4 py-2 text-sm hover:bg-accent">Cancel</button>
-				{/if}
-				<button onclick={completeSetup} disabled={saving || (!dockerStatus?.available && !containerless)}
-					class="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed">
-					{#if saving}Saving...{:else}Complete Setup{/if}
-				</button>
-			</div>
-		</div>
-
-		{#if saveError}<p class="mt-2 text-xs text-red-500">{saveError}</p>{/if}
-
-	<!-- Step 4: Complete -->
-	{:else if step === 4}
-		<div class="text-center py-8">
-			<div class="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-500 text-3xl">&#10003;</div>
-			<h2 class="text-lg font-semibold text-foreground mb-2">
-				{mode === 'add-agent' ? 'Agent Added!' : 'Setup Complete!'}
-			</h2>
-			<p class="text-sm text-muted-foreground mb-6">
-				{#if startingAgents}
-					Starting agents...
-				{:else}
-					Your agent <strong>{agentName}</strong> is ready.
-					{#if llmProvider === 'ollama' && llmLocalModel}
-						<br />Ollama may still be pulling <code class="bg-muted px-1 rounded">{llmLocalModel}</code> in the background — the agent will start replying once the pull completes.
-					{/if}
-				{/if}
-			</p>
-			<button onclick={() => goto(mode === 'add-agent' ? '/agents' : '/')}
-				class="rounded-md bg-primary px-6 py-2 text-sm text-primary-foreground hover:bg-primary/90">
-				{mode === 'add-agent' ? 'Back to Agents' : 'Start Chatting'}
+			<button
+				type="submit"
+				disabled={saving || !workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
+				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+			>
+				{saving ? 'Creating...' : (isAddSession ? 'Create project' : 'Finish setup')}
 			</button>
 		</div>
-	{/if}
+	</form>
 </div>
