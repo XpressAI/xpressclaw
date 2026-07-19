@@ -523,7 +523,6 @@ async fn add_session(
     };
 
     // Append to existing config (don't replace)
-    let old_config = state.config();
     let mut new_agents = old_config.agents.clone();
 
     new_agents.push(agent_config.clone());
@@ -537,10 +536,10 @@ async fn add_session(
 
     let new_config = Config {
         agents: new_agents,
-        llm: old_config.llm.clone(),
         mcp_servers: new_mcp,
-        system: old_config.system.clone(),
-        ..Default::default()
+        // Preserve every other top-level setting, including tool definitions,
+        // policies, memory, system, and future configuration fields.
+        ..old_config.as_ref().clone()
     };
     new_config
         .save(&state.config_path)
@@ -785,8 +784,9 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use xpressclaw_core::config::Config;
+    use xpressclaw_core::config::{Config, ToolConfig};
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::tools::policy::{PolicyAction, ToolPolicyRule};
 
     use super::*;
 
@@ -894,6 +894,70 @@ mod tests {
             saved.agents[0].runner.workspace.as_deref(),
             Some("/tmp/website")
         );
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    async fn add_session_preserves_custom_top_level_configuration() {
+        let config_path =
+            std::env::temp_dir().join("test-xpressclaw-add-session-preserves-config.yaml");
+        let _ = std::fs::remove_file(&config_path);
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::load_default().unwrap();
+        config.tools.insert(
+            "shell".into(),
+            ToolConfig {
+                enabled: false,
+                confirmation_required: true,
+                ..Default::default()
+            },
+        );
+        config.tool_policies.push(ToolPolicyRule {
+            pattern: "dangerous_*".into(),
+            action: PolicyAction::Deny,
+            approval: None,
+        });
+        config.memory.near_term_slots = 3;
+        config.memory.eviction = "custom-eviction".into();
+
+        let state = AppState::new(Arc::new(config), db, None, config_path.clone(), false);
+        let app = Router::new()
+            .nest("/setup", routes())
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "runner_kind": "claude",
+                            "runner_workspace": "/tmp/preserved-project"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.agents.len(), 1);
+        assert!(!saved.tools["shell"].enabled);
+        assert!(saved.tools["shell"].confirmation_required);
+        assert_eq!(saved.tool_policies.len(), 1);
+        assert_eq!(saved.tool_policies[0].pattern, "dangerous_*");
+        assert_eq!(saved.memory.near_term_slots, 3);
+        assert_eq!(saved.memory.eviction, "custom-eviction");
+
+        let live = state.config();
+        assert_eq!(live.memory.near_term_slots, 3);
+        assert_eq!(live.tool_policies[0].pattern, "dangerous_*");
+
         let _ = std::fs::remove_file(&config_path);
     }
 

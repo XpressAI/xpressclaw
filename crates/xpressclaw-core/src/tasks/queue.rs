@@ -200,7 +200,9 @@ impl TaskQueue {
                                SELECT 1 FROM work_attempts active
                                WHERE active.session_id = candidate.session_id
                                  AND active.id != candidate.id
-                                 AND active.status IN ('preparing', 'running', 'review')
+                                 AND active.status IN (
+                                     'preparing', 'running', 'waiting_for_input', 'review'
+                                 )
                            )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
                         [],
@@ -233,7 +235,9 @@ impl TaskQueue {
                  FROM task_queue q
                  JOIN work_attempts a ON a.id = q.attempt_id
                  WHERE q.status = 'running'
-                   AND a.status IN ('queued', 'preparing', 'running', 'review')",
+                   AND a.status IN (
+                       'queued', 'preparing', 'running', 'waiting_for_input', 'review'
+                   )",
             )?;
             let rows = stmt
                 .query_map([], |row| {
@@ -463,6 +467,114 @@ mod tests {
             .recent_events
             .iter()
             .any(|event| event.event_type == "attempt_requeued"));
+    }
+
+    #[test]
+    fn waiting_attempt_serializes_the_logical_session() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let first_task = board
+            .create(&CreateTask {
+                title: "Needs an answer".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let second_task = board
+            .create(&CreateTask {
+                title: "Queued behind the answer".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let first_item = queue.enqueue(&first_task.id, "atlas").unwrap();
+        let second_item = queue.enqueue(&second_task.id, "atlas").unwrap();
+
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let waiting_attempt_id = claimed.attempt_id.as_deref().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                waiting_attempt_id,
+                "waiting_for_input",
+                "Waiting for an answer",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(queue.claim_next().unwrap().is_none());
+        let unclaimed_id = if claimed.id == first_item.id {
+            second_item.id
+        } else {
+            first_item.id
+        };
+        assert_eq!(queue.get(unclaimed_id).unwrap().status, "queued");
+
+        SessionManager::new(db)
+            .transition_attempt(
+                waiting_attempt_id,
+                "completed",
+                "Answer received",
+                Some("done"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, unclaimed_id);
+    }
+
+    #[test]
+    fn recovers_waiting_attempts_after_restart() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Waiting when the server stopped".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(
+                attempt_id,
+                "waiting_for_input",
+                "Waiting for an answer",
+                None,
+                None,
+            )
+            .unwrap();
+        sessions
+            .set_container(attempt_id, "stopped-container")
+            .unwrap();
+        board
+            .update_status(&task.id, "waiting_for_input", Some("atlas"))
+            .unwrap();
+
+        assert_eq!(queue.recover_in_progress().unwrap(), 1);
+        assert_eq!(queue.get(queued.id).unwrap().status, "queued");
+        assert_eq!(board.get(&task.id).unwrap().status.as_str(), "pending");
+        let recovered = sessions.get_attempt(attempt_id).unwrap();
+        assert_eq!(recovered.status, "queued");
+        assert!(recovered.container_id.is_none());
+        assert_eq!(sessions.overview("atlas").unwrap().session.status, "queued");
     }
 
     #[test]
