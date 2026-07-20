@@ -274,6 +274,46 @@ TOOLS = [
         },
     },
     {
+        "name": "schedule_wakeup",
+        "description": (
+            "Schedule exactly one future agent turn in the current project's existing "
+            "conversation. Use this instead of sleeping or polling when work must be "
+            "checked after a delay. Provide exactly one of delay_seconds or run_at. "
+            "run_at must be RFC 3339 with a timezone offset."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Short label for the wake-up",
+                },
+                "delay_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Relative delay from control-plane time",
+                },
+                "run_at": {
+                    "type": "string",
+                    "description": "Absolute RFC 3339 time, including timezone offset",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Instruction to send when the project wakes",
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent to wake (omit to wake yourself)",
+                },
+            },
+            "required": ["message"],
+            "oneOf": [
+                {"required": ["delay_seconds"]},
+                {"required": ["run_at"]},
+            ],
+        },
+    },
+    {
         "name": "list_schedules",
         "description": "List all scheduled tasks.",
         "inputSchema": {
@@ -519,6 +559,27 @@ def handle_tool(name: str, arguments: dict) -> str:
             f"agent: {schedule.get('agent_id') or 'unassigned'})"
         )
 
+    elif name == "schedule_wakeup":
+        label = arguments.get("name") or "Scheduled wake-up"
+        body = {
+            "name": label,
+            "agent_id": arguments.get("agent_id", AGENT_ID or None),
+            "title": label,
+            "description": arguments["message"],
+        }
+        if "delay_seconds" in arguments:
+            body["delay_seconds"] = arguments["delay_seconds"]
+        if "run_at" in arguments:
+            body["run_at"] = arguments["run_at"]
+
+        schedule = _api("POST", "/schedules/once", body)
+        return (
+            f"Armed one-shot wake-up '{schedule['name']}' "
+            f"(id: {schedule['id']}, run_at: {schedule['run_at']}, "
+            f"agent: {schedule.get('agent_id') or 'unassigned'}). "
+            "The current turn may end; XpressClaw will start the follow-up turn."
+        )
+
     elif name == "list_schedules":
         params = {}
         if "agent_id" in arguments:
@@ -530,9 +591,14 @@ def handle_tool(name: str, arguments: dict) -> str:
         lines = []
         for s in schedules:
             status = "enabled" if s.get("enabled") else "disabled"
+            timing = (
+                f"once: {s.get('run_at')}"
+                if s.get("schedule_type") == "once"
+                else f"cron: {s['cron']}"
+            )
             lines.append(
                 f"- [{status}] {s['name']} (id: {s['id']}, "
-                f"cron: {s['cron']}, agent: {s.get('agent_id')}, "
+                f"{timing}, agent: {s.get('agent_id')}, "
                 f"runs: {s.get('run_count', 0)})"
             )
         return f"{len(schedules)} schedule(s):\n" + "\n".join(lines)

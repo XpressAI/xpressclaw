@@ -95,6 +95,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                 dispatcher_docker,
                 dispatcher_event_bus,
                 dispatcher_elicitations,
+                port,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }

@@ -28,7 +28,7 @@ use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnOptions};
 use crate::workers::github;
 
-const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-github-v1";
+const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
 
 /// Consume the durable task queue as an Agent Client Protocol client. Each
 /// queue item gets its own short-lived ACP server container and publishes
@@ -39,6 +39,7 @@ pub async fn start_dispatcher(
     initial_docker: Option<Arc<DockerManager>>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
+    control_plane_port: u16,
 ) {
     info!("native attempt dispatcher started");
     let concurrency = Arc::new(Semaphore::new(4));
@@ -81,6 +82,7 @@ pub async fn start_dispatcher(
                         event_bus.clone(),
                         elicitation_broker,
                         item.clone(),
+                        control_plane_port,
                     )
                     .await
                     {
@@ -114,6 +116,7 @@ async fn execute_item(
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
     item: QueueItem,
+    control_plane_port: u16,
 ) -> Result<()> {
     let attempt_id = item
         .attempt_id
@@ -196,15 +199,28 @@ async fn execute_item(
         }
     }
     let mut mcp_servers = configured_mcp_servers(&config, agent)?;
+    let bundled_control_tools = docker
+        .image_has_label(
+            &spec.image,
+            "io.xpressclaw.protocol",
+            BUILT_IN_RUNNER_PROTOCOL,
+        )
+        .await;
+    if bundled_control_tools
+        && !agent
+            .runner
+            .mcp_servers
+            .iter()
+            .any(|name| name == "xpressclaw")
+    {
+        mcp_servers.push(xpressclaw_control_mcp_server(
+            &agent.name,
+            control_plane_port,
+            docker.runtime(),
+        ));
+    }
     if let Some(access) = github.as_ref() {
-        if docker
-            .image_has_label(
-                &spec.image,
-                "io.xpressclaw.protocol",
-                BUILT_IN_RUNNER_PROTOCOL,
-            )
-            .await
-        {
+        if bundled_control_tools {
             if !agent.runner.mcp_servers.iter().any(|name| name == "github") {
                 mcp_servers.push(access.mcp_server());
             }
@@ -615,6 +631,27 @@ fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<Mc
             mcp_server_from_config(name, server)
         })
         .collect()
+}
+
+fn xpressclaw_control_mcp_server(
+    agent_id: &str,
+    control_plane_port: u16,
+    container_runtime: &str,
+) -> McpServer {
+    let host = if container_runtime == "podman" {
+        "host.containers.internal"
+    } else {
+        "host.docker.internal"
+    };
+    McpServer::Stdio(
+        McpServerStdio::new("xpressclaw", "/opt/xpressclaw/mcp-xpressclaw.mjs").env(vec![
+            EnvVariable::new(
+                "XPRESSCLAW_URL",
+                format!("http://{host}:{control_plane_port}"),
+            ),
+            EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
+        ]),
+    )
 }
 
 fn is_absolute_container_path(path: &str) -> bool {
@@ -1089,6 +1126,36 @@ mod tests {
     }
 
     #[test]
+    fn scopes_the_bundled_control_mcp_to_the_current_project() {
+        let server = xpressclaw_control_mcp_server("dgx-codex", 9123, "docker");
+        let McpServer::Stdio(server) = server else {
+            panic!("expected stdio MCP configuration");
+        };
+
+        assert_eq!(server.name, "xpressclaw");
+        assert_eq!(
+            server.command,
+            PathBuf::from("/opt/xpressclaw/mcp-xpressclaw.mjs")
+        );
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_URL"
+                && variable.value == "http://host.docker.internal:9123"
+        }));
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_AGENT_ID" && variable.value == "dgx-codex"
+        }));
+
+        let McpServer::Stdio(podman) = xpressclaw_control_mcp_server("dgx-codex", 9123, "podman")
+        else {
+            panic!("expected stdio MCP configuration");
+        };
+        assert!(podman.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_URL"
+                && variable.value == "http://host.containers.internal:9123"
+        }));
+    }
+
+    #[test]
     fn message_controls_override_workflow_and_harness_session_defaults() {
         use crate::sessions::NewEvent;
         use crate::tasks::board::CreateTask;
@@ -1273,6 +1340,71 @@ mod tests {
         assert_eq!(
             resume_session_id(&db, &dependent_item, "codex").unwrap(),
             Some("thread-1".into())
+        );
+    }
+
+    #[test]
+    fn scheduled_wakeup_resumes_the_projects_codex_conversation() {
+        use crate::tasks::board::CreateTask;
+        use crate::tasks::scheduler::{CreateOneShotSchedule, ScheduleManager};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let board = TaskBoard::new(db.clone());
+        let sessions = SessionManager::new(db.clone());
+        sessions.ensure("dgx-codex", Some("DGX")).unwrap();
+        let original = board
+            .create(&CreateTask {
+                title: "Run the DGX experiment".into(),
+                agent_id: Some("dgx-codex".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        let original_item = queue.enqueue(&original.id, "dgx-codex").unwrap();
+        let original_attempt = original_item.attempt_id.as_deref().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET runner = 'codex' WHERE id = ?1",
+                [original_attempt],
+            )
+        })
+        .unwrap();
+        sessions
+            .set_native_session(original_attempt, "codex-thread-1")
+            .unwrap();
+        sessions
+            .transition_attempt(
+                original_attempt,
+                "completed",
+                "Waiting",
+                Some("Waiting"),
+                None,
+            )
+            .unwrap();
+        queue.complete(original_item.id, "Waiting").unwrap();
+
+        let schedules = ScheduleManager::new(db.clone());
+        let wakeup = schedules
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Check DGX".into(),
+                run_at: None,
+                delay_seconds: Some(5 * 60 * 60),
+                agent_id: "dgx-codex".into(),
+                title: "Resume the DGX experiment".into(),
+                description: Some("Inspect the results and continue the active goal.".into()),
+            })
+            .unwrap();
+        let wakeup_task = schedules.trigger(&wakeup.id, &board).unwrap();
+        let wakeup_item = queue
+            .list(Some("dgx-codex"), Some("queued"), 10)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.task_id == wakeup_task.id)
+            .unwrap();
+
+        assert_eq!(
+            resume_session_id(&db, &wakeup_item, "codex").unwrap(),
+            Some("codex-thread-1".into())
         );
     }
 

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::tasks::board::TaskBoard;
-use xpressclaw_core::tasks::scheduler::{CreateSchedule, ScheduleManager};
+use xpressclaw_core::tasks::scheduler::{CreateOneShotSchedule, CreateSchedule, ScheduleManager};
 
 use crate::state::AppState;
 
@@ -19,6 +19,7 @@ pub struct ListParams {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_schedules).post(create_schedule))
+        .route("/once", post(create_one_shot_schedule))
         .route("/{id}", get(get_schedule).delete(delete_schedule))
         .route("/{id}/enable", post(enable_schedule))
         .route("/{id}/disable", post(disable_schedule))
@@ -43,6 +44,18 @@ async fn create_schedule(
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
     let schedule = mgr.create(&req).map_err(internal_error)?;
+    Ok((StatusCode::CREATED, Json(json!(schedule))))
+}
+
+async fn create_one_shot_schedule(
+    State(state): State<AppState>,
+    Json(req): Json<CreateOneShotSchedule>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let mgr = ScheduleManager::new(state.db.clone());
+    let schedule = mgr.create_one_shot(&req).map_err(|error| match &error {
+        xpressclaw_core::error::Error::Schedule(_) => bad_request(&error),
+        _ => internal_error(error),
+    })?;
     Ok((StatusCode::CREATED, Json(json!(schedule))))
 }
 
@@ -77,6 +90,7 @@ async fn enable_schedule(
     let mgr = ScheduleManager::new(state.db.clone());
     let schedule = mgr.enable(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::ScheduleNotFound { .. } => not_found(&e),
+        xpressclaw_core::error::Error::Schedule(_) => bad_request(&e),
         _ => internal_error(e),
     })?;
     Ok(Json(json!(schedule)))
@@ -102,6 +116,7 @@ async fn trigger_schedule(
     let board = TaskBoard::new(state.db.clone());
     let task = mgr.trigger(&id, &board).map_err(|e| match &e {
         xpressclaw_core::error::Error::ScheduleNotFound { .. } => not_found(&e),
+        xpressclaw_core::error::Error::Schedule(_) => bad_request(&e),
         _ => internal_error(e),
     })?;
     Ok((StatusCode::CREATED, Json(json!(task))))
@@ -117,6 +132,13 @@ fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
+fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
         Json(json!({ "error": e.to_string() })),
     )
 }
@@ -181,6 +203,33 @@ mod tests {
         body_json(resp.into_body()).await
     }
 
+    async fn create_test_one_shot(app: &Router) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/schedules/once")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Experiment wake-up",
+                            "delay_seconds": 18_000,
+                            "agent_id": "atlas",
+                            "title": "Resume experiment",
+                            "description": "Check the results and continue the goal"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        body_json(resp.into_body()).await
+    }
+
     #[tokio::test]
     async fn test_create_and_list() {
         let app = test_app();
@@ -201,6 +250,45 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_create_one_shot() {
+        let app = test_app();
+        let created = create_test_one_shot(&app).await;
+
+        assert_eq!(created["schedule_type"], "once");
+        assert_eq!(created["cron"], "");
+        assert!(created["run_at"].is_string());
+        assert_eq!(created["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_one_shot_rejects_ambiguous_deadline() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/schedules/once")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Ambiguous",
+                            "run_at": "2026-07-20T20:48:00+09:00",
+                            "delay_seconds": 60,
+                            "agent_id": "atlas",
+                            "title": "Resume"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -323,5 +411,39 @@ mod tests {
         let task = body_json(resp.into_body()).await;
         assert!(task["title"].as_str().unwrap().starts_with("Standup "));
         assert_eq!(task["agent_id"], "atlas");
+    }
+
+    #[tokio::test]
+    async fn test_trigger_one_shot_disables_it() {
+        let app = test_app();
+        let created = create_test_one_shot(&app).await;
+        let id = created["id"].as_str().unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/schedules/{id}/trigger"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/schedules/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let schedule = body_json(resp.into_body()).await;
+        assert_eq!(schedule["enabled"], false);
+        assert_eq!(schedule["run_count"], 1);
     }
 }

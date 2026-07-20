@@ -76,6 +76,21 @@ response directly back to that in-flight ACP request. If an agent only asks in
 ordinary response text, the task still waits and a later chat reply resumes the
 same ACP session as a new turn.
 
+### Scoped control-plane wake-ups
+
+Built-in runner images include a narrow Xpressclaw MCP server that can arm,
+list, and cancel one-shot wake-ups for the current logical project. Xpressclaw
+attaches it at ACP session creation or resume with the project identity and
+local control-plane address fixed by the client. It does not expose arbitrary
+task mutation or cross-project scheduling.
+
+The scheduler persists the deadline independently of the disposable attempt
+container. When due, it creates ordinary scheduled work, which follows the
+same ACP session-selection precedence described above. This supplies the
+future callback that an in-turn sleep, host timer, or persistent goal runner
+cannot provide on its own while keeping model-loop ownership in the native
+product.
+
 ### Permissions
 
 The initial client chooses an affirmative permission option when an ACP agent
