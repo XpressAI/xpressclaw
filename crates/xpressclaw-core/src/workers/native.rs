@@ -654,6 +654,12 @@ fn xpressclaw_control_mcp_server(
     )
 }
 
+fn is_absolute_container_path(path: &str) -> bool {
+    // MCP servers run inside the Linux harness container, so their command
+    // paths must not be interpreted using the desktop host's path semantics.
+    path.starts_with('/')
+}
+
 fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpServer> {
     let headers = || {
         config
@@ -670,7 +676,7 @@ fn mcp_server_from_config(name: &str, config: &McpServerConfig) -> Result<McpSer
                 .map(str::trim)
                 .filter(|command| !command.is_empty())
                 .ok_or_else(|| Error::Backend(format!("MCP server '{name}' has no command")))?;
-            if !Path::new(command).is_absolute() {
+            if !is_absolute_container_path(command) {
                 return Err(Error::Backend(format!(
                     "MCP server '{name}' command must be an absolute path inside the harness container"
                 )));
@@ -1057,6 +1063,13 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_commands_use_container_path_semantics() {
+        assert!(is_absolute_container_path("/opt/project/mcp-server"));
+        assert!(!is_absolute_container_path("npx"));
+        assert!(!is_absolute_container_path(r"C:\tools\mcp-server.exe"));
+    }
 
     #[test]
     fn converts_selected_mcp_servers_to_acp_session_configuration() {
