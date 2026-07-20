@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -9,6 +9,11 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
 use crate::tasks::queue::TaskQueue;
+
+pub const SCHEDULE_TYPE_CRON: &str = "cron";
+pub const SCHEDULE_TYPE_ONCE: &str = "once";
+
+const MAX_WAKEUP_DELAY_SECONDS: i64 = 10 * 365 * 24 * 60 * 60;
 
 /// A scheduled task definition stored in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,6 +28,8 @@ pub struct Schedule {
     pub last_run: Option<String>,
     pub run_count: i64,
     pub created_at: String,
+    pub schedule_type: String,
+    pub run_at: Option<String>,
 }
 
 /// Request to create a new schedule.
@@ -35,11 +42,25 @@ pub struct CreateSchedule {
     pub description: Option<String>,
 }
 
-/// Manages cron-based schedules that create tasks when triggered.
+/// Request to create a durable one-shot schedule.
+///
+/// Exactly one of `run_at` (RFC 3339, including an offset) or
+/// `delay_seconds` must be provided. Relative delays are resolved by the
+/// control plane so an agent does not need to calculate wall-clock time.
+#[derive(Debug, Deserialize)]
+pub struct CreateOneShotSchedule {
+    pub name: String,
+    pub run_at: Option<String>,
+    pub delay_seconds: Option<i64>,
+    pub agent_id: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+/// Manages recurring and one-shot schedules that create tasks when triggered.
 ///
 /// Handles CRUD for schedule definitions and triggering (creating tasks).
-/// The actual cron timer execution is handled by the server layer using
-/// `tokio-cron-scheduler`.
+/// The background timer execution is handled by the server layer.
 pub struct ScheduleManager {
     db: Arc<Database>,
 }
@@ -62,6 +83,42 @@ impl ScheduleManager {
                 "INSERT INTO schedules (id, name, cron, agent_id, title, description, enabled, run_count, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, ?7)",
                 rusqlite::params![id, req.name, req.cron, req.agent_id, req.title, req.description, now],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+
+        self.get(&id)
+    }
+
+    /// Create a one-shot schedule that is disabled after its first run.
+    pub fn create_one_shot(&self, req: &CreateOneShotSchedule) -> Result<Schedule> {
+        validate_required("name", &req.name)?;
+        validate_required("agent_id", &req.agent_id)?;
+        validate_required("title", &req.title)?;
+
+        let run_at = resolve_one_shot_deadline(req)?.to_rfc3339_opts(SecondsFormat::Secs, true);
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO schedules
+                 (id, name, cron, agent_id, title, description, enabled, run_count, created_at,
+                  schedule_type, run_at)
+                 VALUES (?1, ?2, '', ?3, ?4, ?5, 1, 0, ?6, ?7, ?8)",
+                rusqlite::params![
+                    id,
+                    req.name,
+                    req.agent_id,
+                    req.title,
+                    req.description,
+                    now,
+                    SCHEDULE_TYPE_ONCE,
+                    run_at,
+                ],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -137,6 +194,15 @@ impl ScheduleManager {
     }
 
     fn set_enabled(&self, id: &str, enabled: bool) -> Result<Schedule> {
+        if enabled {
+            let schedule = self.get(id)?;
+            if schedule.schedule_type == SCHEDULE_TYPE_ONCE && schedule.run_count > 0 {
+                return Err(Error::Schedule(
+                    "a completed one-shot schedule cannot be enabled again".to_string(),
+                ));
+            }
+        }
+
         let affected = self.db.with_conn(|conn| {
             conn.execute(
                 "UPDATE schedules SET enabled = ?1 WHERE id = ?2",
@@ -159,6 +225,22 @@ impl ScheduleManager {
     /// - `{datetime}` → current datetime
     pub fn trigger(&self, id: &str, board: &TaskBoard) -> Result<Task> {
         let schedule = self.get(id)?;
+        let is_one_shot = schedule.schedule_type == SCHEDULE_TYPE_ONCE;
+        if is_one_shot {
+            let claimed = self.db.with_conn(|conn| {
+                conn.execute(
+                    "UPDATE schedules SET enabled = 0
+                     WHERE id = ?1 AND enabled = 1 AND run_count = 0",
+                    [id],
+                )
+                .map_err(|e| Error::Database(e.to_string()))
+            })?;
+            if claimed == 0 {
+                return Err(Error::Schedule(
+                    "one-shot schedule is disabled or has already run".to_string(),
+                ));
+            }
+        }
         let now = Utc::now().naive_utc();
 
         // Format title with date/time placeholders
@@ -175,7 +257,7 @@ impl ScheduleManager {
         });
 
         let agent_id = schedule.agent_id.clone();
-        let task = board.create(&CreateTask {
+        let task = match board.create(&CreateTask {
             title,
             description,
             agent_id: Some(agent_id.clone()),
@@ -187,12 +269,26 @@ impl ScheduleManager {
                 "origin": "schedule",
                 "kind": "scheduled",
                 "source_id": id,
+                "schedule_type": schedule.schedule_type,
             })),
-        })?;
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                if is_one_shot {
+                    self.release_one_shot_claim(id);
+                }
+                return Err(error);
+            }
+        };
 
         // Enqueue for the dispatcher
         let queue = TaskQueue::new(self.db.clone());
         if let Err(e) = queue.enqueue(&task.id, &agent_id) {
+            if is_one_shot {
+                self.release_one_shot_claim(id);
+                let _ = board.delete(&task.id);
+                return Err(e);
+            }
             warn!(
                 task_id = task.id.as_str(),
                 schedule_id = id,
@@ -205,13 +301,26 @@ impl ScheduleManager {
         let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
         self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE schedules SET last_run = ?1, run_count = run_count + 1 WHERE id = ?2",
+                "UPDATE schedules
+                 SET last_run = ?1,
+                     run_count = run_count + 1,
+                     enabled = CASE WHEN schedule_type = 'once' THEN 0 ELSE enabled END
+                 WHERE id = ?2",
                 rusqlite::params![now_str, id],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
 
         Ok(task)
+    }
+
+    fn release_one_shot_claim(&self, id: &str) {
+        let _ = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE schedules SET enabled = 1 WHERE id = ?1 AND run_count = 0",
+                [id],
+            )
+        });
     }
 }
 
@@ -221,8 +330,8 @@ impl ScheduleManager {
 
 /// Start the schedule runner background loop.
 ///
-/// Checks all enabled schedules every 60 seconds and triggers any whose
-/// cron expression matches the current time. Uses `croner` for cron parsing.
+/// Checks all enabled schedules every 60 seconds and triggers due one-shot
+/// deadlines or cron expressions that match the current time.
 pub async fn start_schedule_runner(db: Arc<Database>) {
     info!("schedule runner started");
 
@@ -287,6 +396,15 @@ fn parse_cron(expr: &str) -> std::result::Result<croner::Cron, croner::errors::C
 /// "0 9 * * *" means 9am in the user's timezone, not 9am UTC.
 /// Checks if a cron match occurred between last_run and now.
 fn should_trigger(schedule: &Schedule, now: chrono::DateTime<Utc>) -> bool {
+    if schedule.schedule_type == SCHEDULE_TYPE_ONCE {
+        return schedule.run_count == 0
+            && schedule
+                .run_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|run_at| run_at.with_timezone(&Utc) <= now);
+    }
+
     // Convert to local time for cron matching
     let now_local = now.with_timezone(&chrono::Local);
     let cron = match parse_cron(&schedule.cron) {
@@ -330,6 +448,41 @@ fn row_to_schedule(row: &rusqlite::Row) -> Schedule {
         last_run: row.get("last_run").unwrap_or_default(),
         run_count: row.get("run_count").unwrap_or(0),
         created_at: row.get("created_at").unwrap_or_default(),
+        schedule_type: row
+            .get("schedule_type")
+            .unwrap_or_else(|_| SCHEDULE_TYPE_CRON.to_string()),
+        run_at: row.get("run_at").unwrap_or_default(),
+    }
+}
+
+fn validate_required(name: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(Error::Schedule(format!("{name} cannot be empty")));
+    }
+    Ok(())
+}
+
+fn resolve_one_shot_deadline(req: &CreateOneShotSchedule) -> Result<DateTime<Utc>> {
+    match (req.run_at.as_deref(), req.delay_seconds) {
+        (Some(run_at), None) => DateTime::parse_from_rfc3339(run_at.trim())
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|_| {
+                Error::Schedule(
+                    "run_at must be an RFC 3339 timestamp with a timezone offset".to_string(),
+                )
+            }),
+        (None, Some(delay)) if (1..=MAX_WAKEUP_DELAY_SECONDS).contains(&delay) => Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(delay))
+            .ok_or_else(|| Error::Schedule("delay_seconds is out of range".to_string())),
+        (None, Some(_)) => Err(Error::Schedule(format!(
+            "delay_seconds must be between 1 and {MAX_WAKEUP_DELAY_SECONDS}"
+        ))),
+        (Some(_), Some(_)) => Err(Error::Schedule(
+            "provide exactly one of run_at or delay_seconds".to_string(),
+        )),
+        (None, None) => Err(Error::Schedule(
+            "provide exactly one of run_at or delay_seconds".to_string(),
+        )),
     }
 }
 
@@ -355,6 +508,18 @@ mod tests {
         .unwrap()
     }
 
+    fn create_one_shot(mgr: &ScheduleManager, delay_seconds: i64) -> Schedule {
+        mgr.create_one_shot(&CreateOneShotSchedule {
+            name: "Experiment wake-up".to_string(),
+            run_at: None,
+            delay_seconds: Some(delay_seconds),
+            agent_id: "atlas".to_string(),
+            title: "Resume experiment".to_string(),
+            description: Some("Inspect the completed experiment and continue the goal.".into()),
+        })
+        .unwrap()
+    }
+
     #[test]
     fn test_create_and_get() {
         let (_, mgr, _) = setup();
@@ -369,6 +534,40 @@ mod tests {
         let fetched = mgr.get(&schedule.id).unwrap();
         assert_eq!(fetched.id, schedule.id);
         assert_eq!(fetched.name, "Daily standup");
+    }
+
+    #[test]
+    fn test_create_one_shot_with_relative_delay() {
+        let (_, mgr, _) = setup();
+        let before = Utc::now();
+        let schedule = create_one_shot(&mgr, 5 * 60 * 60);
+        let deadline = DateTime::parse_from_rfc3339(schedule.run_at.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(schedule.schedule_type, SCHEDULE_TYPE_ONCE);
+        assert!(schedule.cron.is_empty());
+        assert!(schedule.enabled);
+        assert!(deadline >= before + chrono::Duration::seconds(5 * 60 * 60 - 1));
+        assert!(deadline <= before + chrono::Duration::seconds(5 * 60 * 60 + 1));
+    }
+
+    #[test]
+    fn test_one_shot_requires_exactly_one_deadline() {
+        let (_, mgr, _) = setup();
+        let invalid = CreateOneShotSchedule {
+            name: "Invalid".into(),
+            run_at: Some(Utc::now().to_rfc3339()),
+            delay_seconds: Some(60),
+            agent_id: "atlas".into(),
+            title: "Invalid".into(),
+            description: None,
+        };
+
+        assert!(matches!(
+            mgr.create_one_shot(&invalid),
+            Err(Error::Schedule(_))
+        ));
     }
 
     #[test]
@@ -453,6 +652,56 @@ mod tests {
     }
 
     #[test]
+    fn test_one_shot_triggers_only_once_and_disables_itself() {
+        let (db, mgr, board) = setup();
+        let schedule = create_one_shot(&mgr, 60);
+
+        let task = mgr.trigger(&schedule.id, &board).unwrap();
+        assert_eq!(
+            task.context
+                .as_ref()
+                .and_then(|value| value.get("schedule_type"))
+                .and_then(|value| value.as_str()),
+            Some(SCHEDULE_TYPE_ONCE)
+        );
+        let updated = mgr.get(&schedule.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.run_count, 1);
+        assert!(matches!(
+            mgr.trigger(&schedule.id, &board),
+            Err(Error::Schedule(_))
+        ));
+        assert!(matches!(mgr.enable(&schedule.id), Err(Error::Schedule(_))));
+        assert_eq!(TaskQueue::new(db).pending_count("atlas").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_due_one_shot_is_recovered_and_dispatched_once() {
+        let (db, mgr, _) = setup();
+        let schedule = mgr
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Overdue wake-up".into(),
+                run_at: Some(
+                    (Utc::now() - chrono::Duration::minutes(5))
+                        .to_rfc3339_opts(SecondsFormat::Secs, true),
+                ),
+                delay_seconds: None,
+                agent_id: "atlas".into(),
+                title: "Resume overdue work".into(),
+                description: None,
+            })
+            .unwrap();
+
+        check_schedules(&db).unwrap();
+        check_schedules(&db).unwrap();
+
+        let updated = mgr.get(&schedule.id).unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.run_count, 1);
+        assert_eq!(TaskQueue::new(db).pending_count("atlas").unwrap(), 1);
+    }
+
+    #[test]
     fn test_list_enabled_only() {
         let (_, mgr, _) = setup();
         let s1 = create_schedule(&mgr);
@@ -496,6 +745,8 @@ mod tests {
             last_run: None,
             run_count: 0,
             created_at: String::new(),
+            schedule_type: SCHEDULE_TYPE_CRON.into(),
+            run_at: None,
         };
 
         assert!(should_trigger(&schedule, Utc::now()));
@@ -516,6 +767,8 @@ mod tests {
             last_run: Some(now.format("%Y-%m-%d %H:%M:%S").to_string()),
             run_count: 1,
             created_at: String::new(),
+            schedule_type: SCHEDULE_TYPE_CRON.into(),
+            run_at: None,
         };
 
         // Just ran — next match is next hour, so should not trigger now
@@ -535,6 +788,8 @@ mod tests {
             last_run: None,
             run_count: 0,
             created_at: String::new(),
+            schedule_type: SCHEDULE_TYPE_CRON.into(),
+            run_at: None,
         };
 
         assert!(!should_trigger(&schedule, Utc::now()));

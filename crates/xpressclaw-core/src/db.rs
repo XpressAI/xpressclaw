@@ -145,6 +145,7 @@ impl Database {
             (22, MIGRATION_V22),
             (23, MIGRATION_V23),
             (24, MIGRATION_V24),
+            (25, MIGRATION_V25),
         ];
 
         for &(target, sql) in migrations {
@@ -810,6 +811,13 @@ SET active_attempt_id = (
 WHERE active_attempt_id IS NULL;
 ";
 
+const MIGRATION_V25: &str = "
+-- Durable one-shot schedules for resuming a native project conversation.
+ALTER TABLE schedules ADD COLUMN schedule_type TEXT NOT NULL DEFAULT 'cron';
+ALTER TABLE schedules ADD COLUMN run_at TEXT;
+CREATE INDEX idx_schedules_due ON schedules(enabled, schedule_type, run_at);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,7 +835,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "24");
+        assert_eq!(version, "25");
     }
 
     #[test]

@@ -80,6 +80,9 @@ pub enum Error {
     #[error("schedule not found: {id}")]
     ScheduleNotFound { id: String },
 
+    #[error("schedule error: {0}")]
+    Schedule(String),
+
     #[error("SOP error: {0}")]
     Sop(String),
 

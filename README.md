@@ -116,11 +116,13 @@ See [Building](#building) below.
 
 Open a persistent session and describe the outcome. The request becomes a task and native work attempt while the UI remains available.
 
-**Schedule recurring tasks:**
+**Schedule recurring tasks or one-off follow-ups:**
 
 Create a task in **Work → Tasks**, select its session, then add a cron schedule
 in **Work → Schedules**. Scheduled work enters the same queue and timeline as a
-message sent by a person.
+message sent by a person. Native agents can arm a durable `schedule_wakeup`
+when a long-running external job needs to be checked hours later; the future
+turn resumes the same project conversation.
 
 **Review what happened while you were away:**
 

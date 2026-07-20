@@ -19,7 +19,8 @@ You can create, track, and manage tasks on a kanban board. Tasks can have subtas
 ## When to Create Tasks
 
 - The user asks you to do something complex → break it into subtasks
-- The user says "remind me to..." or "every day at..." → create a task + schedule
+- The user says "remind me to..." or "every day at..." → create a one-off or recurring schedule
+- Work must pause for an external job and continue later → arm `schedule_wakeup`; do not sleep or poll
 - You need to track progress on multi-step work
 - You want to hand work off to another agent
 
@@ -39,8 +40,20 @@ Break complex work into subtasks by setting `parent_task_id`:
 Create recurring tasks with cron schedules:
 
 - `create_schedule(name, cron_expression, task_title, task_description, agent_id)` — Create a recurring schedule.
+- `schedule_wakeup(message, delay_seconds | run_at, name)` — Start exactly one future turn in the current project's existing conversation.
 - `list_schedules()` — List all schedules.
 - `delete_schedule(schedule_id)` — Remove a schedule.
+
+### One-off wake-ups
+
+Use `schedule_wakeup` when the current turn needs to end and work should resume
+after a delay. Provide exactly one of:
+
+- `delay_seconds` — resolved against the Xpressclaw control-plane clock.
+- `run_at` — an RFC 3339 timestamp including a timezone offset.
+
+After the tool confirms the wake-up is armed, end the current turn. A shell
+timer or sentinel cannot initiate a later model turn.
 
 ### Cron Format
 

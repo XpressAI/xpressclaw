@@ -326,6 +326,8 @@ impl DockerManager {
             memory: spec.memory_limit,
             nano_cpus: spec.cpu_limit,
             group_add: socket_mount_groups(spec),
+            extra_hosts: (self.runtime == "docker")
+                .then(|| vec!["host.docker.internal:host-gateway".to_string()]),
             mounts: if mounts.is_empty() {
                 None
             } else {

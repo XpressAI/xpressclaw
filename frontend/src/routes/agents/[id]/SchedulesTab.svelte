@@ -40,6 +40,7 @@
 	}
 
 	async function toggleEnabled(schedule: Schedule) {
+		if (completedOneShot(schedule)) return;
 		togglingId = schedule.id;
 		try {
 			if (schedule.enabled) {
@@ -58,10 +59,22 @@
 		triggeringId = id;
 		try {
 			await schedules.trigger(id);
+			await loadSchedules();
 		} catch (e) {
 			error = `Failed to trigger: ${e}`;
 		}
 		triggeringId = null;
+	}
+
+	function timing(schedule: Schedule): string {
+		if (schedule.schedule_type === 'once' && schedule.run_at) {
+			return `Once · ${new Date(schedule.run_at).toLocaleString()}`;
+		}
+		return schedule.cron;
+	}
+
+	function completedOneShot(schedule: Schedule): boolean {
+		return schedule.schedule_type === 'once' && schedule.run_count > 0;
 	}
 
 	async function createSchedule() {
@@ -168,25 +181,29 @@
 					<div class="rounded-md border border-border p-3 space-y-2 hover:bg-accent/30">
 						<div class="flex items-center justify-between">
 							<div class="flex items-center gap-3 min-w-0">
-								<button
-									onclick={() => toggleEnabled(schedule)}
-									disabled={togglingId === schedule.id}
-									class="shrink-0 w-9 h-5 rounded-full relative transition-colors {schedule.enabled ? 'bg-emerald-500' : 'bg-muted'}"
-									title={schedule.enabled ? 'Disable' : 'Enable'}
-								>
-									<span
-										class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform {schedule.enabled ? 'left-4' : 'left-0.5'}"
-									></span>
-								</button>
+								{#if completedOneShot(schedule)}
+									<span class="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">Completed</span>
+								{:else}
+									<button
+										onclick={() => toggleEnabled(schedule)}
+										disabled={togglingId === schedule.id}
+										class="shrink-0 w-9 h-5 rounded-full relative transition-colors {schedule.enabled ? 'bg-emerald-500' : 'bg-muted'}"
+										title={schedule.enabled ? 'Disable' : 'Enable'}
+									>
+										<span
+											class="absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform {schedule.enabled ? 'left-4' : 'left-0.5'}"
+										></span>
+									</button>
+								{/if}
 								<div class="min-w-0">
 									<span class="text-sm font-medium text-foreground">{schedule.name}</span>
-									<span class="ml-2 text-xs font-mono text-muted-foreground">{schedule.cron}</span>
+									<span class="ml-2 text-xs font-mono text-muted-foreground">{timing(schedule)}</span>
 								</div>
 							</div>
 							<div class="flex items-center gap-2 shrink-0">
 								<button
 									onclick={() => triggerNow(schedule.id)}
-									disabled={triggeringId === schedule.id}
+									disabled={triggeringId === schedule.id || completedOneShot(schedule)}
 									class="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
 								>
 									{triggeringId === schedule.id ? 'Triggering...' : 'Trigger Now'}
