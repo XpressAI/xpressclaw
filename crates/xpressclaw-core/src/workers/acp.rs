@@ -9,7 +9,7 @@ pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
     CreateElicitationRequest, ElicitationAction, ElicitationCapabilities,
-    ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, McpServer,
+    ElicitationFormCapabilities, ImageContent, InitializeRequest, LoadSessionRequest, McpServer,
     NewSessionRequest, PermissionOptionKind, PlanEntryStatus, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
@@ -19,6 +19,8 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use bollard::container::LogOutput;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -32,6 +34,7 @@ use crate::docker::manager::AttachedContainer;
 use crate::error::{Error, Result};
 use crate::sessions::{NewEvent, SessionManager};
 use crate::tasks::board::{ReportedSubtask, TaskBoard, TaskStatus};
+use crate::tasks::conversation::PromptImageAttachment;
 
 const MAX_EVENTS: usize = 250;
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
@@ -157,6 +160,7 @@ pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
     pub mcp_servers: Vec<McpServer>,
+    pub image_attachments: Vec<PromptImageAttachment>,
 }
 
 #[derive(Debug, Default)]
@@ -583,6 +587,7 @@ pub async fn run_turn(
         model,
         session_config: requested_config,
         mcp_servers,
+        image_attachments,
     } = options;
     let AttachedContainer {
         input, mut output, ..
@@ -702,6 +707,14 @@ pub async fn run_turn(
                 )
                 .block_task()
                 .await?;
+
+            if !image_attachments.is_empty()
+                && !initialized.agent_capabilities.prompt_capabilities.image
+            {
+                return Err(agent_client_protocol::util::internal_error(
+                    "the selected ACP agent does not support image prompts",
+                ));
+            }
 
             for server in &mcp_servers {
                 match server {
@@ -884,11 +897,18 @@ pub async fn run_turn(
             // `session/load` may replay prior messages. Only output emitted for
             // the prompt below belongs in this attempt's final response.
             prompt_recorder.reset_prompt_output();
-            let response = connection
-                .send_request(PromptRequest::new(
-                    session_id.clone(),
-                    vec![ContentBlock::Text(TextContent::new(prompt))],
+            let mut prompt_blocks = Vec::with_capacity(1 + image_attachments.len());
+            if !prompt.trim().is_empty() {
+                prompt_blocks.push(ContentBlock::Text(TextContent::new(prompt)));
+            }
+            prompt_blocks.extend(image_attachments.into_iter().map(|attachment| {
+                ContentBlock::Image(ImageContent::new(
+                    STANDARD.encode(attachment.data),
+                    attachment.mime_type,
                 ))
+            }));
+            let response = connection
+                .send_request(PromptRequest::new(session_id.clone(), prompt_blocks))
                 .block_task()
                 .await?;
 
@@ -1103,10 +1123,16 @@ mod tests {
                             request["params"]["clientCapabilities"]["elicitation"]["form"]
                                 .is_object()
                         );
+                        let mut result =
+                            serde_json::to_value(InitializeResponse::new(ProtocolVersion::V1))
+                                .unwrap();
+                        result["agentCapabilities"] = json!({
+                            "promptCapabilities": { "image": true }
+                        });
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": InitializeResponse::new(ProtocolVersion::V1),
+                            "result": result,
                         })
                     }
                     "session/new" => {
@@ -1166,6 +1192,12 @@ mod tests {
                     "session/prompt" => {
                         assert_eq!(request["params"]["sessionId"], "acp-session-1");
                         assert_eq!(request["params"]["prompt"][0]["text"], "Do the work");
+                        assert_eq!(request["params"]["prompt"][1]["type"], "image");
+                        assert_eq!(request["params"]["prompt"][1]["mimeType"], "image/png");
+                        assert_eq!(
+                            request["params"]["prompt"][1]["data"],
+                            STANDARD.encode(b"image bytes")
+                        );
                         send_json(
                             &output_tx,
                             json!({
@@ -1240,6 +1272,11 @@ mod tests {
                     McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
                         .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
                 )],
+                image_attachments: vec![PromptImageAttachment {
+                    name: "screen.png".into(),
+                    mime_type: "image/png".into(),
+                    data: b"image bytes".to_vec(),
+                }],
             },
         )
         .await

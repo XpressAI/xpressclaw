@@ -2,7 +2,9 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { sessions, tasks } from '$lib/api';
-	import type { SessionOverview, RunnerReadiness, Task } from '$lib/api';
+	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
+	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
 
 	let { agentId }: { agentId: string } = $props();
@@ -14,6 +16,12 @@
 	let sending = $state(false);
 	let preparing = $state(false);
 	let startFresh = $state(false);
+	let imageAttachments = $state<ImageAttachmentUpload[]>([]);
+	let imageInput = $state<HTMLInputElement>();
+	let imagePreviews = $derived(imageAttachments.map((attachment) => ({
+		name: attachment.name,
+		src: imageDataUrl(attachment),
+	})));
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 	let attentionTasks = $derived(taskList.filter((task) => ['waiting_for_input', 'blocked'].includes(task.status)));
@@ -67,11 +75,15 @@
 
 	async function send() {
 		const content = message.trim();
-		if (!content || sending) return;
+		if ((!content && imageAttachments.length === 0) || sending) return;
 		sending = true;
 		try {
-			const queued = await sessions.sendMessage(agentId, content, { newSession: startFresh });
+			const queued = await sessions.sendMessage(agentId, content, {
+				newSession: startFresh,
+				attachments: imageAttachments,
+			});
 			message = '';
+			imageAttachments = [];
 			startFresh = false;
 			await goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
@@ -79,6 +91,27 @@
 		} finally {
 			sending = false;
 		}
+	}
+
+	async function addImages(files: File[]) {
+		try {
+			imageAttachments = await appendImageFiles(imageAttachments, files);
+			error = null;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	function handleImageInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		void addImages(Array.from(input.files ?? [])).finally(() => (input.value = ''));
+	}
+
+	function handlePaste(event: ClipboardEvent) {
+		const files = clipboardImageFiles(event);
+		if (files.length === 0) return;
+		event.preventDefault();
+		void addImages(files);
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -146,15 +179,21 @@
 					{#if overview.queued_attempts.length > 0} · {overview.queued_attempts.length} queued{/if}
 				</div>
 			</div>
-			<textarea bind:value={message} onkeydown={handleKeydown} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
+			<textarea bind:value={message} onkeydown={handleKeydown} onpaste={handlePaste} rows="4" placeholder="Send work or ask a question…" class="w-full resize-y bg-transparent px-5 pb-3 pt-5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"></textarea>
+			<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 			<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
 				<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="By default, this task continues the project's active agent conversation">
 					<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 					Start a fresh conversation
 				</label>
 				<div class="flex items-center justify-between gap-3 sm:justify-end">
+					<input bind:this={imageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleImageInput} class="hidden" />
+					<button type="button" onclick={() => imageInput?.click()} disabled={sending || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title="Attach images (you can also paste)"
+						class="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
+						<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+					</button>
 					<span class="text-[11px] text-muted-foreground">⌘/Ctrl + Enter</span>
-					<button onclick={send} disabled={sending || !message.trim()} class="rounded-lg bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-40">
+					<button onclick={send} disabled={sending || (!message.trim() && imageAttachments.length === 0)} class="rounded-lg bg-primary px-5 py-2 text-sm font-medium text-primary-foreground disabled:opacity-40">
 						{sending ? 'Sending…' : 'Send'}
 					</button>
 				</div>

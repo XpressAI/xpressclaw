@@ -1,11 +1,14 @@
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
+use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
@@ -31,6 +34,8 @@ pub struct StatusUpdate {
 pub struct MessageInput {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<ImageAttachmentInput>,
     #[serde(default)]
     pub config_options: std::collections::HashMap<String, Value>,
 }
@@ -60,6 +65,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/status", patch(update_task_status))
         .route("/{id}/messages", get(get_messages).post(add_message))
+        .route(
+            "/{id}/messages/{message_id}/attachments/{attachment_id}",
+            get(get_message_attachment),
+        )
         .route("/{id}/activity", get(get_activity))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",
@@ -302,6 +311,30 @@ async fn get_messages(
     Ok(Json(json!(messages)))
 }
 
+async fn get_message_attachment(
+    State(state): State<AppState>,
+    Path((id, message_id, attachment_id)): Path<(String, i64, String)>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let attachment = TaskConversation::new(state.db.clone())
+        .get_attachment(&id, message_id, &attachment_id)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "image attachment not found" })),
+            )
+        })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, attachment.mime_type)
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .body(Body::from(attachment.data))
+        .map_err(internal_error)
+}
+
 async fn get_activity(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -416,12 +449,14 @@ async fn add_message(
             Json(json!({ "error": "task chat only accepts user messages" })),
         ));
     }
-    if req.content.trim().is_empty() {
+    let content = req.content.trim().to_string();
+    if content.is_empty() && req.attachments.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "message cannot be empty" })),
+            Json(json!({ "error": "message must include text or an image" })),
         ));
     }
+    let attachments = decode_image_attachments(&req.attachments).map_err(bad_request)?;
 
     let board = TaskBoard::new(state.db.clone());
     let task = board.get(&id).map_err(|error| match &error {
@@ -433,8 +468,18 @@ async fn add_message(
     })?;
     let conv = TaskConversation::new(state.db.clone());
     let msg = conv
-        .add_message(&id, &req.role, &req.content)
+        .add_message_with_attachments(&id, &req.role, &content, &attachments)
         .map_err(internal_error)?;
+
+    let summary = if content.is_empty() {
+        if attachments.len() == 1 {
+            "Sent an image".to_string()
+        } else {
+            format!("Sent {} images", attachments.len())
+        }
+    } else {
+        content.clone()
+    };
 
     let mut continuation = None;
     if let Some(ref agent_id) = task.agent_id {
@@ -451,10 +496,11 @@ async fn add_message(
                     source_type: "user",
                     source_id: Some("local-user"),
                     event_type: "task_message_received",
-                    summary: &req.content,
+                    summary: &summary,
                     payload: json!({
                         "role": req.role,
-                        "content": req.content,
+                        "content": content,
+                        "attachments": msg.attachments,
                         "config_options": req.config_options,
                     }),
                 },
@@ -544,6 +590,13 @@ async fn add_dependency(
 fn internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
+fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
         Json(json!({ "error": e.to_string() })),
     )
 }
@@ -853,6 +906,115 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn image_only_task_message_can_be_previewed() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"title": "Image message"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "role": "user",
+                            "content": "",
+                            "attachments": [{
+                                "name": "screen.png",
+                                "mime_type": "image/png",
+                                "data": "iVBORw0KGgpieXRlcw=="
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        let message_id = body["message"]["id"].as_i64().unwrap();
+        let attachment = &body["message"]["attachments"][0];
+        assert_eq!(attachment["name"], "screen.png");
+        assert_eq!(attachment["size"], 13);
+        assert!(attachment.get("data").is_none());
+        let attachment_id = attachment["id"].as_str().unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/tasks/{task_id}/messages/{message_id}/attachments/{attachment_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"\x89PNG\r\n\x1a\nbytes");
+    }
+
+    #[tokio::test]
+    async fn rejects_an_image_with_a_mismatched_type() {
+        let app = test_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"title": "Bad image"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "role": "user",
+                            "content": "Inspect this",
+                            "attachments": [{
+                                "name": "fake.jpg",
+                                "mime_type": "image/jpeg",
+                                "data": "iVBORw0KGgpieXRlcw=="
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

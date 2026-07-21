@@ -2,7 +2,9 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { setup, sessions, agents as agentsApi } from '$lib/api';
-	import type { Agent } from '$lib/api';
+	import type { Agent, ImageAttachmentUpload } from '$lib/api';
+	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
 	import { harnessMark } from '$lib/utils';
 
 	let status_text = $state('Connecting to server...');
@@ -16,6 +18,12 @@
 	let composing = $state(false);
 	let sendError = $state('');
 	let startFresh = $state(false);
+	let imageAttachments = $state<ImageAttachmentUpload[]>([]);
+	let imageInput = $state<HTMLInputElement>();
+	let imagePreviews = $derived(imageAttachments.map((attachment) => ({
+		name: attachment.name,
+		src: imageDataUrl(attachment),
+	})));
 
 	async function checkReady() {
 		try {
@@ -55,18 +63,43 @@
 	let selectedAgentObj = $derived(agentList.find(a => a.id === selectedAgent));
 
 	async function send() {
-		if (!message.trim() || !selectedAgent || sending) return;
+		if ((!message.trim() && imageAttachments.length === 0) || !selectedAgent || sending) return;
 		sending = true;
 		sendError = '';
 
 		try {
-			const queued = await sessions.sendMessage(selectedAgent, message.trim(), { newSession: startFresh });
+			const queued = await sessions.sendMessage(selectedAgent, message.trim(), {
+				newSession: startFresh,
+				attachments: imageAttachments,
+			});
+			imageAttachments = [];
 			goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
 			sendError = e instanceof Error ? e.message : String(e);
 		} finally {
 			sending = false;
 		}
+	}
+
+	async function addImages(files: File[]) {
+		try {
+			imageAttachments = await appendImageFiles(imageAttachments, files);
+			sendError = '';
+		} catch (e) {
+			sendError = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	function handleImageInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		void addImages(Array.from(input.files ?? [])).finally(() => (input.value = ''));
+	}
+
+	function handlePaste(event: ClipboardEvent) {
+		const files = clipboardImageFiles(event);
+		if (files.length === 0) return;
+		event.preventDefault();
+		void addImages(files);
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
@@ -112,17 +145,24 @@
 					onkeydown={handleKeydown}
 					oncompositionstart={() => (composing = true)}
 					oncompositionend={() => setTimeout(() => (composing = false), 0)}
+					onpaste={handlePaste}
 					placeholder="Describe the outcome you want…"
 					rows="3"
 					disabled={sending}
 					class="w-full resize-none rounded-t-2xl bg-transparent px-5 pt-5 pb-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
 				></textarea>
+				<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
 					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not use this project's current Codex, Claude, or OpenCode conversation">
 						<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 						Start a fresh conversation
 					</label>
 					<div class="flex min-w-0 items-center justify-end gap-2 sm:gap-3">
+						<input bind:this={imageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleImageInput} class="hidden" />
+						<button type="button" onclick={() => imageInput?.click()} disabled={sending || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title="Attach images (you can also paste)"
+							class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
+							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+						</button>
 						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
 								{#if selectedAgentObj}
 									<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(selectedAgentObj.backend)}</span>
@@ -141,7 +181,7 @@
 						</div>
 						<button
 							onclick={send}
-							disabled={!message.trim() || sending}
+							disabled={(!message.trim() && imageAttachments.length === 0) || sending}
 							class="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shadow-lg shadow-primary/20"
 						>
 							{#if sending}

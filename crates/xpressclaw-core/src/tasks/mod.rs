@@ -1,3 +1,4 @@
+pub mod attachments;
 pub mod board;
 pub mod conversation;
 pub mod dispatcher;
