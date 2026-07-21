@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
@@ -36,7 +35,6 @@ use crate::sessions::{NewEvent, SessionManager};
 use crate::tasks::board::{ReportedSubtask, TaskBoard, TaskStatus};
 use crate::tasks::conversation::PromptImageAttachment;
 
-const MAX_EVENTS: usize = 250;
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
 
@@ -184,7 +182,6 @@ pub struct AcpEventRecorder {
     attempt_id: String,
     task_id: String,
     runner: String,
-    emitted: Arc<AtomicUsize>,
     state: Arc<Mutex<TurnState>>,
 }
 
@@ -202,7 +199,6 @@ impl AcpEventRecorder {
             attempt_id: attempt_id.into(),
             task_id: task_id.into(),
             runner: runner.into(),
-            emitted: Arc::new(AtomicUsize::new(0)),
             state: Arc::new(Mutex::new(TurnState::default())),
         }
     }
@@ -336,9 +332,13 @@ impl AcpEventRecorder {
                     self.append_event("session_info", &format!("Session title: {title}"), payload)?;
                 }
             }
-            SessionUpdate::UsageUpdate(_) => {
+            SessionUpdate::UsageUpdate(update) => {
                 self.flush_prompt_output()?;
-                self.append_event("usage", "Updated context usage", payload)?;
+                SessionManager::new(self.db.clone()).set_context_usage(
+                    &self.attempt_id,
+                    update.used,
+                    update.size,
+                )?;
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -537,10 +537,6 @@ impl AcpEventRecorder {
     }
 
     fn append_event(&self, event_type: &str, summary: &str, payload: Value) -> Result<()> {
-        let must_persist = matches!(event_type, "elicitation_pending" | "elicitation_resolved");
-        if !must_persist && self.emitted.fetch_add(1, Ordering::Relaxed) >= MAX_EVENTS {
-            return Ok(());
-        }
         SessionManager::new(self.db.clone()).append_event(
             &self.logical_session_id,
             NewEvent {
@@ -1064,7 +1060,7 @@ fn tool_summary(title: &str, status: ToolCallStatus) -> String {
     match status {
         ToolCallStatus::Pending => format!("Preparing {title}"),
         ToolCallStatus::InProgress => title.to_string(),
-        ToolCallStatus::Completed => format!("Completed {title}"),
+        ToolCallStatus::Completed => title.to_string(),
         ToolCallStatus::Failed => format!("Failed {title}"),
         _ => title.to_string(),
     }
@@ -1652,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn acp_tool_updates_are_visible_activity() {
+    fn acp_tool_updates_do_not_prefix_completed_titles() {
         let db = Arc::new(Database::open_memory().unwrap());
         let (recorder, _) = test_recorder(db.clone());
         recorder
@@ -1677,9 +1673,69 @@ mod tests {
             .list_events("session-1", None, 20)
             .unwrap();
         assert!(events.iter().any(|event| event.summary == "Run tests"));
-        assert!(events
+        assert!(!events
             .iter()
             .any(|event| event.summary == "Completed Run tests"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.summary == "Run tests")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn acp_usage_updates_attempt_state_without_timeline_noise() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        let attempt_id = recorder.attempt_id.clone();
+        recorder
+            .record_notification(SessionNotification::new(
+                "session-1",
+                SessionUpdate::UsageUpdate(agent_client_protocol::schema::v1::UsageUpdate::new(
+                    125_436, 258_400,
+                )),
+            ))
+            .unwrap();
+
+        let manager = SessionManager::new(db);
+        let attempt = manager.get_attempt(&attempt_id).unwrap();
+        assert_eq!(attempt.context_used, Some(125_436));
+        assert_eq!(attempt.context_size, Some(258_400));
+        assert!(!manager
+            .list_events("session-1", None, 20)
+            .unwrap()
+            .iter()
+            .any(|event| event.event_type == "usage"));
+    }
+
+    #[test]
+    fn acp_activity_is_not_capped_at_250_events() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        for index in 0..300 {
+            recorder
+                .record_notification(SessionNotification::new(
+                    "session-1",
+                    SessionUpdate::ToolCall(
+                        ToolCall::new(format!("tool-{index}"), format!("Tool {index}"))
+                            .status(ToolCallStatus::InProgress),
+                    ),
+                ))
+                .unwrap();
+        }
+
+        let events = SessionManager::new(db)
+            .list_events("session-1", None, 500)
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "tool_call")
+                .count(),
+            300
+        );
     }
 
     #[test]

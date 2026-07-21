@@ -33,7 +33,7 @@ function timelineEvent(id: number, second: number, eventType: string, summary: s
 	};
 }
 
-function attempt(status: string) {
+function attempt(status: string, contextUsed = 128_000) {
 	return {
 		id: 'attempt-browser-test',
 		session_id: agentId,
@@ -50,14 +50,22 @@ function attempt(status: string) {
 		created_at: timestamp(0),
 		started_at: timestamp(1),
 		completed_at: status === 'completed' ? timestamp(61) : null,
+		context_used: contextUsed,
+		context_size: 256_000,
 	};
 }
 
 async function mockApi(
 	page: Page,
-	options: { live?: boolean; agentTimeline?: boolean; postedMessages?: Record<string, unknown>[] } = {},
+	options: {
+		live?: boolean;
+		agentTimeline?: boolean;
+		richToolActivity?: boolean;
+		postedMessages?: Record<string, unknown>[];
+	} = {},
 ) {
 	let liveEvent = 0;
+	let contextUsed = 128_000;
 	const status = options.live ? 'in_progress' : 'completed';
 	const task = {
 		id: taskId,
@@ -154,24 +162,61 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [attempt(status)],
+					attempts: [attempt(status, contextUsed)],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
 				};
 			} else if (url.searchParams.has('after')) {
 				liveEvent += 1;
+				contextUsed += 1_000;
 				response = {
-					attempts: [attempt(status)],
+					attempts: [attempt(status, contextUsed)],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [attempt(status)],
-					events: Array.from({ length: 40 }, (_, index) => activityEvent(index + 21)),
-					has_more_before: true,
+					attempts: [attempt(status, contextUsed)],
+					events: options.richToolActivity ? [
+						{
+							...activityEvent(21),
+							event_type: 'usage',
+							summary: 'Updated context usage',
+							payload: { sessionUpdate: 'usage_update', used: 128_000, size: 256_000 },
+						},
+						{
+							...activityEvent(22),
+							event_type: 'tool_call',
+							summary: 'Tool call',
+							payload: {
+								sessionUpdate: 'tool_call',
+								toolCallId: 'edit-browser-test',
+								title: 'Tool call',
+								kind: 'edit',
+								status: 'in_progress',
+								content: [{
+									type: 'diff',
+									path: '/workspace/src/example.ts',
+									oldText: 'const state = "before";\n',
+									newText: 'const state = "after";\n',
+								}],
+							},
+						},
+						{
+							...activityEvent(23),
+							event_type: 'tool_call_update',
+							summary: 'Completed Editing files',
+							payload: {
+								sessionUpdate: 'tool_call_update',
+								toolCallId: 'edit-browser-test',
+								status: 'completed',
+								rawOutput: { formatted_output: 'Applied patch.' },
+							},
+						},
+					] : Array.from({ length: 40 }, (_, index) => activityEvent(index + 21)),
+					has_more_before: !options.richToolActivity,
 					has_more_after: false,
 				};
 			}
@@ -264,6 +309,26 @@ test('agent updates stay beside their tools while the final reply is shown once'
 	expect(toolIndex).toBeLessThan(testIndex);
 	expect(finalIndexes).toHaveLength(1);
 	expect(testIndex).toBeLessThan(finalIndexes[0]);
+});
+
+test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {
+	await mockApi(page, { live: true, richToolActivity: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	await expect(page.locator('[data-context-usage]')).toContainText('128,000 / 256,000 tokens');
+	await expect(page.locator('[data-context-usage]')).toContainText('129,000 / 256,000 tokens', { timeout: 5_000 });
+	await expect(page.getByText('Updated context usage', { exact: true })).toHaveCount(0);
+	await expect(page.getByText('Completed Editing files', { exact: true })).toHaveCount(0);
+	await expect(page.getByText('Tool call', { exact: true })).toHaveCount(0);
+
+	const editing = page.getByRole('button', { name: /Editing files/ });
+	await expect(editing).toHaveCount(1);
+	await editing.click();
+	const diff = page.locator('[data-tool-diffs]');
+	await expect(diff).toContainText('src/example.ts');
+	await expect(diff).toContainText('const state = "before";');
+	await expect(diff).toContainText('const state = "after";');
+	await expect(page.getByText('Applied patch.', { exact: true })).toBeVisible();
 });
 
 test('new activity follows only while the transcript is at the bottom', async ({ page }) => {

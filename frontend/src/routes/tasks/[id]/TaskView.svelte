@@ -42,6 +42,12 @@
 		fields: ElicitationField[];
 	}
 
+	interface ContextUsage {
+		used: number;
+		size: number;
+		percent: number;
+	}
+
 	type TranscriptItem =
 		| {
 			kind: 'message';
@@ -113,21 +119,22 @@
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
+	let collapsedActivityEvents = $derived(collapseToolActivity(activityEvents));
 	let primaryActivityEvents = $derived(
-		activityEvents.filter(event => {
+		collapsedActivityEvents.filter(event => {
 			const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
 				message.role === 'assistant' && (
 					message.content === event.summary ||
 					(event.summary.length >= 200 && message.content.startsWith(event.summary.slice(0, 180)))
 				)
 			);
-			return !['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved'].includes(event.event_type) &&
+			return !['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved', 'usage'].includes(event.event_type) &&
 				(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
 				!mirrorsTaskReply;
 		})
 	);
 	let technicalActivityEvents = $derived(
-		activityEvents.filter(event =>
+		collapsedActivityEvents.filter(event =>
 			event.event_type === 'runner_progress' && event.payload?.item_type !== 'agent_message'
 		)
 	);
@@ -197,6 +204,8 @@
 	let activeAttempt = $derived(
 		attempts.find(attempt => ['queued', 'preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
 	);
+	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
+	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
 	let latestAttemptResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
 	let latestResult = $derived(
 		latestAttemptResult && !messages.some(message =>
@@ -254,6 +263,101 @@
 		return transcriptTimestamp(left.timestamp) - transcriptTimestamp(right.timestamp)
 			|| transcriptRank(left) - transcriptRank(right)
 			|| left.sequence - right.sequence;
+	}
+
+	function toolCallKey(event: SessionEvent): string | null {
+		const toolCallId = event.payload?.toolCallId;
+		if (typeof toolCallId !== 'string' || !toolCallId) return null;
+		return `${event.attempt_id ?? ''}:${toolCallId}`;
+	}
+
+	function mergeToolContent(original: unknown, update: unknown): unknown {
+		if (!Array.isArray(update)) return original;
+		if (!Array.isArray(original)) return update;
+		const updatedDiffPaths = new Set(update.flatMap(item =>
+			typeof item === 'object' && item !== null && 'type' in item && item.type === 'diff' && 'path' in item && typeof item.path === 'string'
+				? [item.path]
+				: []
+		));
+		const retainedDiffs = original.filter(item =>
+			typeof item === 'object' && item !== null && 'type' in item && item.type === 'diff'
+				&& (!('path' in item) || typeof item.path !== 'string' || !updatedDiffPaths.has(item.path))
+		);
+		return [...retainedDiffs, ...update];
+	}
+
+	/** Collapse the append-only ACP start/update pair into one visible tool row. */
+	function collapseToolActivity(events: SessionEvent[]): SessionEvent[] {
+		const collapsed: SessionEvent[] = [];
+		const toolIndexes = new Map<string, number>();
+		for (const event of events) {
+			const key = toolCallKey(event);
+			if (event.event_type === 'tool_call') {
+				collapsed.push({ ...event, payload: { ...event.payload } });
+				if (key) toolIndexes.set(key, collapsed.length - 1);
+				continue;
+			}
+			if (event.event_type !== 'tool_call_update') {
+				collapsed.push(event);
+				continue;
+			}
+
+			const existingIndex = key ? toolIndexes.get(key) : undefined;
+			if (existingIndex !== undefined) {
+				const existing = collapsed[existingIndex];
+				const content = mergeToolContent(existing.payload.content, event.payload.content);
+				const summary = event.summary.replace(/^Completed\s+/, '') || existing.summary;
+				collapsed[existingIndex] = {
+					...existing,
+					summary,
+					payload: {
+						...existing.payload,
+						...event.payload,
+						sessionUpdate: 'tool_call',
+						updatedAt: event.created_at,
+						...(content === undefined ? {} : { content }),
+					},
+				};
+				continue;
+			}
+
+			// A paged response can contain the update while its start event is on
+			// an earlier page. Keep one useful row until that page is loaded.
+			const title = typeof event.payload?.title === 'string'
+				? event.payload.title
+				: event.summary.replace(/^Completed\s+/, '');
+			collapsed.push({
+				...event,
+				event_type: 'tool_call',
+				summary: title,
+				payload: { ...event.payload, title, sessionUpdate: 'tool_call', updatedAt: event.created_at },
+			});
+			if (key) toolIndexes.set(key, collapsed.length - 1);
+		}
+		return collapsed;
+	}
+
+	function contextUsageFor(attempt: WorkAttempt | null, events: SessionEvent[]): ContextUsage | null {
+		if (!attempt) return null;
+		let used = attempt.context_used;
+		let size = attempt.context_size;
+		if (typeof used !== 'number' || !Number.isFinite(used) || typeof size !== 'number' || !Number.isFinite(size)) {
+			const legacyUsage = [...events].reverse().find(event =>
+				event.event_type === 'usage' && event.attempt_id === attempt.id
+			);
+			used = typeof legacyUsage?.payload.used === 'number' ? legacyUsage.payload.used : null;
+			size = typeof legacyUsage?.payload.size === 'number' ? legacyUsage.payload.size : null;
+		}
+		if (used === null || size === null || used < 0 || size <= 0) return null;
+		return {
+			used,
+			size,
+			percent: Math.min(100, Math.max(0, (used / size) * 100)),
+		};
+	}
+
+	function formatTokens(value: number): string {
+		return new Intl.NumberFormat('en-US').format(value);
 	}
 
 	function selectChoices(option: AcpConfigOption): { value: string; name: string; description?: string | null }[] {
@@ -1387,6 +1491,22 @@
 						{/if}
 					</dl>
 				</div>
+
+				{#if contextUsage}
+					<div class="space-y-2" data-context-usage>
+						<div class="flex items-center justify-between">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Context window</h3>
+							<span class="text-xs tabular-nums text-muted-foreground">{contextUsage.percent.toFixed(1)}%</span>
+						</div>
+						<div class="h-1.5 overflow-hidden rounded-full bg-secondary">
+							<div class="h-full rounded-full bg-blue-500 transition-[width] duration-300" style:width={`${contextUsage.percent}%`}></div>
+						</div>
+						<div class="text-right text-xs tabular-nums text-muted-foreground">
+							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
+							<span> / {formatTokens(contextUsage.size)} tokens</span>
+						</div>
+					</div>
+				{/if}
 
 				<!-- Subtasks -->
 				{#if subtaskList.length > 0}

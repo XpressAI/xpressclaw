@@ -118,6 +118,8 @@ export interface WorkAttempt {
 	created_at: string;
 	started_at: string | null;
 	completed_at: string | null;
+	context_used: number | null;
+	context_size: number | null;
 }
 
 export interface SessionEvent {

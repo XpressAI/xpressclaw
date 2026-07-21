@@ -147,6 +147,7 @@ impl Database {
             (24, MIGRATION_V24),
             (25, MIGRATION_V25),
             (26, MIGRATION_V26),
+            (27, MIGRATION_V27),
         ];
 
         for &(target, sql) in migrations {
@@ -834,6 +835,12 @@ CREATE INDEX idx_task_message_attachments_message
     ON task_message_attachments(message_id);
 ";
 
+const MIGRATION_V27: &str = "
+-- Latest ACP context-window state belongs to the attempt, not its activity feed.
+ALTER TABLE work_attempts ADD COLUMN context_used INTEGER;
+ALTER TABLE work_attempts ADD COLUMN context_size INTEGER;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,7 +858,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "26");
+        assert_eq!(version, "27");
     }
 
     #[test]
