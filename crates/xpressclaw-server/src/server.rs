@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -15,6 +16,9 @@ pub fn create_router(state: AppState) -> Router {
         .nest("/api", routes::api_routes())
         // Serve embedded SvelteKit frontend for all other paths
         .fallback(frontend::serve_frontend)
+        // Base64 encoding expands image messages beyond Axum's 2 MiB JSON default.
+        // Message handlers enforce tighter decoded per-image and aggregate limits.
+        .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

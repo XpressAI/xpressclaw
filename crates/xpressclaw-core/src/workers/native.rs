@@ -23,7 +23,7 @@ use crate::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
 use crate::error::{Error, Result};
 use crate::sessions::SessionManager;
 use crate::tasks::board::TaskBoard;
-use crate::tasks::conversation::TaskConversation;
+use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnOptions};
 use crate::workers::github;
@@ -136,7 +136,7 @@ async fn execute_item(
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE work_attempts SET runner = ?1, prompt = ?2 WHERE id = ?3",
-            rusqlite::params![kind, prompt, attempt_id],
+            rusqlite::params![kind, prompt.content, attempt_id],
         )
     })?;
 
@@ -257,11 +257,12 @@ async fn execute_item(
         elicitation_broker,
         resume_session_id.as_deref(),
         Path::new(&container_workspace),
-        &prompt,
+        &prompt.content,
         AcpTurnOptions {
             model: agent.runner.model.clone(),
             session_config: requested_session_config,
             mcp_servers,
+            image_attachments: prompt.attachments,
         },
     )
     .await;
@@ -467,34 +468,40 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
     }
 }
 
-fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<String> {
+struct AgentPrompt {
+    content: String,
+    attachments: Vec<PromptImageAttachment>,
+}
+
+fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
-    let pending_user_messages: Vec<String> = db.with_conn(|conn| {
-        let previous_started: Option<String> = conn
-            .query_row(
-                "SELECT started_at FROM work_attempts
+    let previous_started: Option<String> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT started_at FROM work_attempts
                  WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
                  ORDER BY created_at DESC LIMIT 1",
-                rusqlite::params![item.task_id, attempt_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let mut statement = conn.prepare(
-            "SELECT content FROM task_messages
-             WHERE task_id = ?1 AND role = 'user'
-               AND (?2 IS NULL OR timestamp >= ?2)
-             ORDER BY id ASC",
-        )?;
-        let messages = statement
-            .query_map(rusqlite::params![item.task_id, previous_started], |row| {
-                row.get(0)
-            })?
-            .filter_map(|row| row.ok())
-            .collect();
-        Ok::<_, Error>(messages)
+            rusqlite::params![item.task_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
     })?;
+    let pending_user_messages = TaskConversation::new(db.clone())
+        .get_user_messages_since(&item.task_id, previous_started.as_deref())?;
     if !pending_user_messages.is_empty() {
-        return Ok(pending_user_messages.join("\n\n"));
+        let content = pending_user_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let attachments = pending_user_messages
+            .into_iter()
+            .flat_map(|message| message.attachments)
+            .collect();
+        return Ok(AgentPrompt {
+            content,
+            attachments,
+        });
     }
 
     let description = task
@@ -508,10 +515,14 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
         .and_then(|context| context.get("origin"))
         .and_then(Value::as_str)
         == Some("session_message");
-    Ok(match (description, from_project_composer) {
+    let content = match (description, from_project_composer) {
         (Some(description), true) => description.to_string(),
         (Some(description), false) => format!("{}\n\n{}", task.title, description),
         (None, _) => task.title,
+    };
+    Ok(AgentPrompt {
+        content,
+        attachments: Vec::new(),
     })
 }
 

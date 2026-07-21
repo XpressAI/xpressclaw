@@ -43,7 +43,7 @@ function attempt(status: string) {
 	};
 }
 
-async function mockApi(page: Page, options: { live?: boolean } = {}) {
+async function mockApi(page: Page, options: { live?: boolean; postedMessages?: Record<string, unknown>[] } = {}) {
 	let liveEvent = 0;
 	const status = options.live ? 'in_progress' : 'completed';
 	const task = {
@@ -111,11 +111,21 @@ async function mockApi(page: Page, options: { live?: boolean } = {}) {
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
-			response = [
-				{ id: 1, task_id: taskId, role: 'assistant', content: 'First answer', timestamp: timestamp(25) },
-				{ id: 2, task_id: taskId, role: 'user', content: 'Please continue', timestamp: timestamp(40) },
-				{ id: 3, task_id: taskId, role: 'assistant', content: 'Second answer', timestamp: timestamp(55) },
-			];
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.postedMessages?.push(payload);
+				response = {
+					message: { id: 4, task_id: taskId, role: 'user', content: payload.content, attachments: [], timestamp: timestamp(62) },
+					continuation_queued: true,
+					attempt_id: 'attempt-image-message',
+				};
+			} else {
+				response = [
+					{ id: 1, task_id: taskId, role: 'assistant', content: 'First answer', attachments: [], timestamp: timestamp(25) },
+					{ id: 2, task_id: taskId, role: 'user', content: 'Please continue', attachments: [], timestamp: timestamp(40) },
+					{ id: 3, task_id: taskId, role: 'assistant', content: 'Second answer', attachments: [], timestamp: timestamp(55) },
+				];
+			}
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (url.searchParams.has('before')) {
 				response = {
@@ -230,6 +240,43 @@ test('new activity follows only while the transcript is at the bottom', async ({
 	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(24);
 	await expect(page.getByRole('button', { name: /New background activity 62/ })).toBeVisible({ timeout: 5_000 });
 	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(24);
+});
+
+test('task messages accept selected and pasted images', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.goto(`/tasks/${taskId}`);
+
+	const fileInput = page.locator('input[type="file"][accept*="image/png"]');
+	await fileInput.setInputFiles({
+		name: 'selected.png',
+		mimeType: 'image/png',
+		buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+	});
+	await expect(page.getByAltText('selected.png')).toBeVisible();
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.items.add(new File(
+			[new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			'pasted.png',
+			{ type: 'image/png' },
+		));
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(page.getByAltText('pasted.png')).toBeVisible();
+
+	await page.getByRole('button', { name: 'Send message' }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	const attachments = postedMessages[0].attachments as { name: string; mime_type: string; data: string }[];
+	expect(postedMessages[0].content).toBe('');
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png']);
+	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
 });
 
 test('workspace panes split on wide screens and collapse cleanly on mobile', async ({ page, browser }) => {
