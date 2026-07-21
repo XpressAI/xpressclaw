@@ -189,11 +189,11 @@ async function mockApi(
 						{
 							...activityEvent(22),
 							event_type: 'tool_call',
-							summary: 'Editing files',
+							summary: 'Tool call',
 							payload: {
 								sessionUpdate: 'tool_call',
 								toolCallId: 'edit-browser-test',
-								title: 'Editing files',
+								title: 'Tool call',
 								kind: 'edit',
 								status: 'in_progress',
 								content: [{
@@ -319,6 +319,7 @@ test('context usage is stateful and tool completion details stay on one row', as
 	await expect(page.locator('[data-context-usage]')).toContainText('129,000 / 256,000 tokens', { timeout: 5_000 });
 	await expect(page.getByText('Updated context usage', { exact: true })).toHaveCount(0);
 	await expect(page.getByText('Completed Editing files', { exact: true })).toHaveCount(0);
+	await expect(page.getByText('Tool call', { exact: true })).toHaveCount(0);
 
 	const editing = page.getByRole('button', { name: /Editing files/ });
 	await expect(editing).toHaveCount(1);

@@ -306,8 +306,10 @@
 			if (existingIndex !== undefined) {
 				const existing = collapsed[existingIndex];
 				const content = mergeToolContent(existing.payload.content, event.payload.content);
+				const summary = event.summary.replace(/^Completed\s+/, '') || existing.summary;
 				collapsed[existingIndex] = {
 					...existing,
+					summary,
 					payload: {
 						...existing.payload,
 						...event.payload,
