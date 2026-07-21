@@ -162,10 +162,12 @@ pub struct AcpTurnOptions {
 #[derive(Debug, Default)]
 struct TurnState {
     assistant_text: String,
+    last_assistant_text: String,
     current_message_id: Option<String>,
     pending_thought: String,
     tool_titles: HashMap<String, String>,
     transcript: Vec<Value>,
+    capture_prompt_output: bool,
 }
 
 /// Persists standardized ACP updates as the semantic activity shown on task
@@ -204,8 +206,10 @@ impl AcpEventRecorder {
     fn reset_prompt_output(&self) {
         let mut state = self.state.lock().unwrap();
         state.assistant_text.clear();
+        state.last_assistant_text.clear();
         state.current_message_id = None;
         state.pending_thought.clear();
+        state.capture_prompt_output = true;
     }
 
     fn record_notification(&self, notification: SessionNotification) -> Result<()> {
@@ -222,29 +226,41 @@ impl AcpEventRecorder {
             SessionUpdate::AgentMessageChunk(chunk) => {
                 if let ContentBlock::Text(text) = chunk.content {
                     let message_id = chunk.message_id.map(|id| id.to_string());
-                    let mut state = self.state.lock().unwrap();
-                    if message_id.is_some()
-                        && state.current_message_id.is_some()
-                        && message_id != state.current_message_id
-                        && !state.assistant_text.ends_with('\n')
-                    {
-                        state.assistant_text.push('\n');
+                    let starts_new_message = {
+                        let state = self.state.lock().unwrap();
+                        if !state.capture_prompt_output {
+                            return Ok(());
+                        }
+                        message_id.is_some()
+                            && state.current_message_id.is_some()
+                            && message_id != state.current_message_id
+                    };
+                    if starts_new_message {
+                        self.flush_agent_message()?;
                     }
-                    state.current_message_id = message_id.or(state.current_message_id.take());
+                    self.flush_thought()?;
+                    let mut state = self.state.lock().unwrap();
+                    if message_id.is_some() {
+                        state.current_message_id = message_id;
+                    }
                     state.assistant_text.push_str(&text.text);
                 }
             }
             SessionUpdate::AgentThoughtChunk(chunk) => {
                 if let ContentBlock::Text(text) = chunk.content {
-                    self.state
-                        .lock()
-                        .unwrap()
-                        .pending_thought
-                        .push_str(&text.text);
+                    let capture = self.state.lock().unwrap().capture_prompt_output;
+                    if capture {
+                        self.flush_agent_message()?;
+                        self.state
+                            .lock()
+                            .unwrap()
+                            .pending_thought
+                            .push_str(&text.text);
+                    }
                 }
             }
             SessionUpdate::ToolCall(call) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 self.state
                     .lock()
                     .unwrap()
@@ -254,7 +270,7 @@ impl AcpEventRecorder {
                 self.append_event("tool_call", &summary, payload)?;
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 let id = update.tool_call_id.to_string();
                 let title = {
                     let mut state = self.state.lock().unwrap();
@@ -273,7 +289,7 @@ impl AcpEventRecorder {
                 }
             }
             SessionUpdate::Plan(plan) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 let reported: Vec<ReportedSubtask> = plan
                     .entries
                     .iter()
@@ -303,7 +319,7 @@ impl AcpEventRecorder {
                 )?;
             }
             SessionUpdate::CurrentModeUpdate(update) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 self.append_event(
                     "session_mode",
                     &format!("Switched to {} mode", update.current_mode_id),
@@ -311,21 +327,21 @@ impl AcpEventRecorder {
                 )?;
             }
             SessionUpdate::SessionInfoUpdate(update) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 if let Some(title) = update.title.take() {
                     self.append_event("session_info", &format!("Session title: {title}"), payload)?;
                 }
             }
             SessionUpdate::UsageUpdate(_) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 self.append_event("usage", "Updated context usage", payload)?;
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 self.record_session_controls(&update.config_options, None)?;
             }
             SessionUpdate::AvailableCommandsUpdate(update) => {
-                self.flush_thought()?;
+                self.flush_prompt_output()?;
                 self.append_event(
                     "available_commands",
                     &format!(
@@ -342,6 +358,7 @@ impl AcpEventRecorder {
     }
 
     fn record_permission(&self, request: &RequestPermissionRequest, choice: Option<&str>) {
+        let _ = self.flush_prompt_output();
         let title = request
             .tool_call
             .fields
@@ -361,7 +378,7 @@ impl AcpEventRecorder {
         elicitation_id: &str,
         request: &CreateElicitationRequest,
     ) -> Result<()> {
-        self.flush_thought()?;
+        self.flush_prompt_output()?;
         SessionManager::new(self.db.clone()).transition_attempt(
             &self.attempt_id,
             "waiting_for_input",
@@ -486,6 +503,35 @@ impl AcpEventRecorder {
         Ok(())
     }
 
+    fn flush_agent_message(&self) -> Result<()> {
+        let (message_id, message) = {
+            let mut state = self.state.lock().unwrap();
+            if !state.capture_prompt_output {
+                return Ok(());
+            }
+            let message = std::mem::take(&mut state.assistant_text).trim().to_string();
+            let message_id = state.current_message_id.take();
+            if message.is_empty() {
+                return Ok(());
+            }
+            state.last_assistant_text = message.clone();
+            (message_id, message)
+        };
+        self.append_event(
+            "runner_progress",
+            &message,
+            json!({
+                "item_type": "agent_message",
+                "message_id": message_id,
+            }),
+        )
+    }
+
+    fn flush_prompt_output(&self) -> Result<()> {
+        self.flush_agent_message()?;
+        self.flush_thought()
+    }
+
     fn append_event(&self, event_type: &str, summary: &str, payload: Value) -> Result<()> {
         let must_persist = matches!(event_type, "elicitation_pending" | "elicitation_resolved");
         if !must_persist && self.emitted.fetch_add(1, Ordering::Relaxed) >= MAX_EVENTS {
@@ -509,7 +555,12 @@ impl AcpEventRecorder {
     fn finish(&self) -> Result<(String, String)> {
         self.flush_thought()?;
         let state = self.state.lock().unwrap();
-        let summary = state.assistant_text.trim().to_string();
+        let current_message = state.assistant_text.trim();
+        let summary = if current_message.is_empty() {
+            state.last_assistant_text.clone()
+        } else {
+            current_message.to_string()
+        };
         let diagnostic =
             serde_json::to_string_pretty(&state.transcript).unwrap_or_else(|_| "[]".to_string());
         Ok((summary, truncate_bytes(&diagnostic, MAX_DIAGNOSTIC_BYTES)))
@@ -1481,6 +1532,89 @@ mod tests {
     }
 
     #[test]
+    fn acp_agent_updates_are_emitted_before_the_tool_that_follows_them() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        recorder
+            .record_notification(SessionNotification::new(
+                "session-1",
+                SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(
+                        "Yes, I'll inspect the project.",
+                    )))
+                    .message_id("status-1"),
+                ),
+            ))
+            .unwrap();
+        recorder
+            .record_notification(SessionNotification::new(
+                "session-1",
+                SessionUpdate::ToolCall(
+                    ToolCall::new("tool-1", "Read the project").status(ToolCallStatus::InProgress),
+                ),
+            ))
+            .unwrap();
+        recorder
+            .record_notification(SessionNotification::new(
+                "session-1",
+                SessionUpdate::AgentMessageChunk(
+                    ContentChunk::new(ContentBlock::Text(TextContent::new(
+                        "The project is ready.",
+                    )))
+                    .message_id("final-1"),
+                ),
+            ))
+            .unwrap();
+
+        assert_eq!(recorder.finish().unwrap().0, "The project is ready.");
+        let events = SessionManager::new(db)
+            .list_events("session-1", None, 50)
+            .unwrap();
+        let update = events
+            .iter()
+            .find(|event| event.payload["item_type"] == "agent_message")
+            .unwrap();
+        let tool = events
+            .iter()
+            .find(|event| event.event_type == "tool_call")
+            .unwrap();
+        assert_eq!(update.summary, "Yes, I'll inspect the project.");
+        assert_eq!(update.payload["message_id"], "status-1");
+        assert!(update.id < tool.id);
+        assert!(!events
+            .iter()
+            .any(|event| event.summary == "The project is ready."));
+    }
+
+    #[test]
+    fn acp_message_ids_separate_updates_without_a_tool_boundary() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        for (message_id, text) in [("status-1", "Starting now."), ("final-1", "Finished.")] {
+            recorder
+                .record_notification(SessionNotification::new(
+                    "session-1",
+                    SessionUpdate::AgentMessageChunk(
+                        ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+                            .message_id(message_id),
+                    ),
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(recorder.finish().unwrap().0, "Finished.");
+        let events = SessionManager::new(db)
+            .list_events("session-1", None, 50)
+            .unwrap();
+        let updates = events
+            .iter()
+            .filter(|event| event.payload["item_type"] == "agent_message")
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].summary, "Starting now.");
+    }
+
+    #[test]
     fn acp_tool_updates_are_visible_activity() {
         let db = Arc::new(Database::open_memory().unwrap());
         let (recorder, _) = test_recorder(db.clone());
@@ -1555,10 +1689,9 @@ mod tests {
             .enqueue(&task.id, "session-1")
             .unwrap();
         let attempt_id = queued.attempt_id.unwrap();
-        (
-            AcpEventRecorder::new(db, "session-1", attempt_id, task.id.clone(), "codex"),
-            task.id,
-        )
+        let recorder = AcpEventRecorder::new(db, "session-1", attempt_id, task.id.clone(), "codex");
+        recorder.reset_prompt_output();
+        (recorder, task.id)
     }
 
     async fn send_json(
