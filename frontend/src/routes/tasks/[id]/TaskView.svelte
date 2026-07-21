@@ -6,7 +6,7 @@
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
-	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
+	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 
@@ -673,10 +673,11 @@
 	}
 
 	function handleMessagePaste(event: ClipboardEvent) {
-		const files = clipboardImageFiles(event);
-		if (files.length === 0) return;
+		if (!shouldHandleImagePaste(event)) return;
 		event.preventDefault();
-		void addMessageImages(files);
+		void pastedImageFiles(event)
+			.then(addMessageImages)
+			.catch((e) => (messageAttachmentError = e instanceof Error ? e.message : String(e)));
 	}
 
 	function handleMessageKeydown(e: KeyboardEvent) {
