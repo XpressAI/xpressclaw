@@ -1018,7 +1018,23 @@ fn expand_home(path: &str) -> String {
 }
 
 fn canonical_or_original(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    strip_verbatim(resolved)
+}
+
+/// Strip the `\\?\` prefix Windows `canonicalize()` adds to drive paths;
+/// Docker Desktop's bind-mount parser rejects it. Others pass through as-is.
+#[cfg(windows)]
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    path
 }
 
 fn needs_user_input(summary: &str) -> bool {
