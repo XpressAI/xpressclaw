@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { tasks, agents, sessions } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
+	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 
@@ -47,6 +49,7 @@
 			timestamp: string;
 			role: string;
 			content: string;
+			attachments: { id?: string; name: string; src: string }[];
 			sequence: number;
 		}
 		| {
@@ -74,6 +77,13 @@
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
 	let messageSending = $state(false);
+	let messageAttachments = $state<ImageAttachmentUpload[]>([]);
+	let messageAttachmentError = $state('');
+	let messageImageInput = $state<HTMLInputElement>();
+	let messageImagePreviews = $derived(messageAttachments.map((attachment) => ({
+		name: attachment.name,
+		src: imageDataUrl(attachment),
+	})));
 	let sessionEvents = $state<SessionEvent[]>([]);
 	let configOptions = $state<AcpConfigOption[]>([]);
 	let selectedConfig = $state<Record<string, string | boolean>>({});
@@ -138,6 +148,7 @@
 				timestamp: task.created_at,
 				role: 'user',
 				content: taskPrompt,
+				attachments: [],
 				sequence: -1,
 			});
 		}
@@ -147,6 +158,11 @@
 			timestamp: message.timestamp,
 			role: message.role,
 			content: message.content,
+			attachments: (message.attachments ?? []).map((attachment) => ({
+				id: attachment.id,
+				name: attachment.name,
+				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+			})),
 			sequence: message.id,
 		})));
 		items.push(...activityTimelineEvents.map((event): TranscriptItem => ({
@@ -615,23 +631,52 @@
 	}
 
 	async function sendTaskMessage() {
-		if (!messageInput.trim() || !task || pendingElicitation) return;
+		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || pendingElicitation) return;
 		const content = messageInput.trim();
+		const attachments = messageAttachments;
 		messageInput = '';
+		messageAttachments = [];
+		messageAttachmentError = '';
 		modelMenuOpen = false;
 		slashMenuDismissed = false;
 		messageSending = true;
 		followLatest = true;
 		showJumpToLatest = false;
 		try {
-			await tasks.addMessage(task.id, 'user', content, { configOptions: selectedConfig });
+			await tasks.addMessage(task.id, 'user', content, {
+				configOptions: selectedConfig,
+				attachments,
+			});
 			await poll();
 			scrollToBottom(true);
 		} catch (e) {
-			alert(String(e));
+			messageInput = content;
+			messageAttachments = attachments;
+			messageAttachmentError = e instanceof Error ? e.message : String(e);
 		} finally {
 			messageSending = false;
 		}
+	}
+
+	async function addMessageImages(files: File[]) {
+		try {
+			messageAttachments = await appendImageFiles(messageAttachments, files);
+			messageAttachmentError = '';
+		} catch (e) {
+			messageAttachmentError = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	function handleMessageImageInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		void addMessageImages(Array.from(input.files ?? [])).finally(() => (input.value = ''));
+	}
+
+	function handleMessagePaste(event: ClipboardEvent) {
+		const files = clipboardImageFiles(event);
+		if (files.length === 0) return;
+		event.preventDefault();
+		void addMessageImages(files);
 	}
 
 	function handleMessageKeydown(e: KeyboardEvent) {
@@ -960,11 +1005,12 @@
 												<span class="text-xs text-muted-foreground">{timeAgo(item.timestamp)}</span>
 											</div>
 											<div class="rounded-lg px-3 py-2 text-sm prose prose-invert prose-sm max-w-none
-												{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
-												 isAssistant ? 'bg-accent text-accent-foreground' :
-												 'bg-primary text-primary-foreground'}">
-												{@html renderContent(item.content)}
-											</div>
+											{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
+											 isAssistant ? 'bg-accent text-accent-foreground' :
+											 'bg-primary text-primary-foreground'}">
+											{@html renderContent(item.content)}
+											<ImageAttachmentPreviews attachments={item.attachments} message />
+										</div>
 										</div>
 									</div>
 								{:else}
@@ -1234,6 +1280,8 @@
 							</div>
 						{/if}
 
+						<ImageAttachmentPreviews attachments={messageImagePreviews} onremove={(index) => (messageAttachments = messageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
+
 						<textarea
 							id="task-message-input-{taskId}"
 							bind:value={messageInput}
@@ -1241,6 +1289,7 @@
 							onfocus={() => (messageInputFocused = true)}
 							onblur={() => setTimeout(() => (messageInputFocused = false), 150)}
 							onkeydown={handleMessageKeydown}
+							onpaste={handleMessagePaste}
 							oncompositionstart={() => (composing = true)}
 							oncompositionend={() => setTimeout(() => (composing = false), 0)}
 							placeholder={messagePlaceholder}
@@ -1248,8 +1297,16 @@
 							class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
 							disabled={messageSending || !task.agent_id || Boolean(pendingElicitation)}
 						></textarea>
+						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
 
 						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
+							<input bind:this={messageImageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleMessageImageInput} class="hidden" />
+							<button type="button" onclick={() => messageImageInput?.click()}
+								disabled={messageSending || !task.agent_id || Boolean(pendingElicitation) || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
+								aria-label="Attach images" title="Attach images (you can also paste)"
+								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
+								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
+							</button>
 							{#if task.agent_id && (otherConfigOptions.length > 0 || hasModelMenu)}
 								<div class="flex min-w-0 flex-1 items-center gap-3 overflow-x-auto scrollbar-hide">
 									{#each otherConfigOptions as option}
@@ -1284,7 +1341,7 @@
 							<button
 								onclick={sendTaskMessage}
 								aria-label="Send message"
-								disabled={!messageInput.trim() || messageSending || !task.agent_id || Boolean(pendingElicitation)}
+								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || !task.agent_id || Boolean(pendingElicitation)}
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30"
 							>
 								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>

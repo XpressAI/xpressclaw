@@ -146,6 +146,7 @@ impl Database {
             (23, MIGRATION_V23),
             (24, MIGRATION_V24),
             (25, MIGRATION_V25),
+            (26, MIGRATION_V26),
         ];
 
         for &(target, sql) in migrations {
@@ -818,6 +819,21 @@ ALTER TABLE schedules ADD COLUMN run_at TEXT;
 CREATE INDEX idx_schedules_due ON schedules(enabled, schedule_type, run_at);
 ";
 
+const MIGRATION_V26: &str = "
+-- Binary image attachments sent alongside task chat messages.
+CREATE TABLE task_message_attachments (
+    id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES task_messages(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    size INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_task_message_attachments_message
+    ON task_message_attachments(message_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,7 +851,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "25");
+        assert_eq!(version, "26");
     }
 
     #[test]
@@ -864,5 +880,6 @@ mod tests {
         assert!(tables.contains(&"session_events".to_string()));
         assert!(tables.contains(&"work_attempts".to_string()));
         assert!(tables.contains(&"attempt_artifacts".to_string()));
+        assert!(tables.contains(&"task_message_attachments".to_string()));
     }
 }

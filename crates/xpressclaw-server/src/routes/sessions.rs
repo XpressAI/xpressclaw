@@ -9,7 +9,9 @@ use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::sessions::{NewEvent, SessionManager};
+use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
+use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
     local_runner_image_alias, resolve_runner_kind, resolved_runner_image, runner_image_compatible,
@@ -33,6 +35,8 @@ struct AttemptsQuery {
 #[derive(Debug, Deserialize)]
 struct MessageInput {
     content: String,
+    #[serde(default)]
+    attachments: Vec<ImageAttachmentInput>,
     priority: Option<i32>,
     #[serde(default)]
     new_session: bool,
@@ -285,12 +289,23 @@ async fn post_message(
     Path(id): Path<String>,
     Json(input): Json<MessageInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    if input.content.trim().is_empty() {
+    let content = input.content.trim().to_string();
+    if content.is_empty() && input.attachments.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "message cannot be empty" })),
+            Json(json!({ "error": "message must include text or an image" })),
         ));
     }
+    let attachments = decode_image_attachments(&input.attachments).map_err(bad_request)?;
+    let summary = if content.is_empty() {
+        if attachments.len() == 1 {
+            "Sent an image".to_string()
+        } else {
+            format!("Sent {} images", attachments.len())
+        }
+    } else {
+        content.clone()
+    };
     ensure_session(&state, &id)?;
     let sessions = SessionManager::new(state.db.clone());
     let event = sessions
@@ -302,21 +317,34 @@ async fn post_message(
                 source_type: "user",
                 source_id: Some("local-user"),
                 event_type: "message_received",
-                summary: input.content.trim(),
+                summary: &summary,
                 payload: json!({
-                    "content": input.content.trim(),
+                    "content": content,
+                    "attachments": attachments.iter().map(|attachment| json!({
+                        "name": attachment.name,
+                        "mime_type": attachment.mime_type,
+                        "size": attachment.data.len(),
+                    })).collect::<Vec<_>>(),
                     "config_options": input.config_options.clone(),
                 }),
             },
         )
         .map_err(internal_error)?;
 
-    let title = concise_title(input.content.trim());
+    let title = if content.is_empty() {
+        if attachments.len() == 1 {
+            "Image attachment".to_string()
+        } else {
+            "Image attachments".to_string()
+        }
+    } else {
+        concise_title(&content)
+    };
     let board = TaskBoard::new(state.db.clone());
     let task = board
         .create(&CreateTask {
             title,
-            description: Some(input.content.trim().to_string()),
+            description: (!content.is_empty()).then(|| content.clone()),
             agent_id: Some(id.clone()),
             parent_task_id: None,
             sop_id: None,
@@ -330,6 +358,9 @@ async fn post_message(
                 "session_config": input.config_options,
             })),
         })
+        .map_err(internal_error)?;
+    TaskConversation::new(state.db.clone())
+        .add_message_with_attachments(&task.id, "user", &content, &attachments)
         .map_err(internal_error)?;
     let queue_item = TaskQueue::new(state.db.clone())
         .enqueue(&task.id, &id)
@@ -463,7 +494,7 @@ mod tests {
 
     use super::*;
 
-    fn test_app() -> Router {
+    fn test_app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         AgentRegistry::new(db.clone())
             .ensure("builder", "codex")
@@ -476,12 +507,19 @@ mod tests {
         });
         let state = AppState::new(
             Arc::new(config),
-            db,
+            db.clone(),
             None,
             std::path::PathBuf::from("test.yaml"),
             true,
         );
-        Router::new().nest("/sessions", routes()).with_state(state)
+        (
+            Router::new().nest("/sessions", routes()).with_state(state),
+            db,
+        )
+    }
+
+    fn test_app() -> Router {
+        test_app_with_db().0
     }
 
     #[tokio::test]
@@ -527,6 +565,41 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["task"]["context"]["session_mode"], "new");
+    }
+
+    #[tokio::test]
+    async fn image_message_is_persisted_before_it_is_queued() {
+        let (app, db) = test_app_with_db();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/builder/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "content": "",
+                            "attachments": [{
+                                "name": "screen.png",
+                                "mime_type": "image/png",
+                                "data": "iVBORw0KGgpieXRlcw=="
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["task"]["title"], "Image attachment");
+        let task_id = value["task"]["id"].as_str().unwrap();
+        let messages = TaskConversation::new(db).get_messages(task_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.is_empty());
+        assert_eq!(messages[0].attachments[0].name, "screen.png");
     }
 
     #[tokio::test]

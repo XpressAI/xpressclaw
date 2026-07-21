@@ -215,6 +215,12 @@ export interface RunnerReadiness {
 	issues: string[];
 }
 
+export interface ImageAttachmentUpload {
+	name: string;
+	mime_type: string;
+	data: string;
+}
+
 export const sessions = {
 	get: (id: string) => request<SessionOverview>(`/api/sessions/${id}`),
 	readiness: (id: string) => request<RunnerReadiness>(`/api/sessions/${id}/readiness`),
@@ -230,14 +236,15 @@ export const sessions = {
 		const query = status ? `?status=${encodeURIComponent(status)}` : '';
 		return request<WorkAttempt[]>(`/api/sessions/${id}/attempts${query}`);
 	},
-	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean; configOptions?: Record<string, string | boolean> }) =>
+	sendMessage: (id: string, content: string, options?: { priority?: number; newSession?: boolean; configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[] }) =>
 		request<{ event: SessionEvent; task: Task; attempt_id: string; queued: boolean }>(
 			`/api/sessions/${id}/messages`,
 			{ method: 'POST', body: JSON.stringify({
 				content,
 				priority: options?.priority,
 				new_session: options?.newSession ?? false,
-				config_options: options?.configOptions ?? {}
+				config_options: options?.configOptions ?? {},
+				attachments: options?.attachments ?? []
 			}) }
 		),
 	cancelAttempt: (sessionId: string, attemptId: string) =>
@@ -315,10 +322,10 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
-	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean> }) =>
+	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[] }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
-			body: JSON.stringify({ role, content, config_options: options?.configOptions ?? {} })
+			body: JSON.stringify({ role, content, config_options: options?.configOptions ?? {}, attachments: options?.attachments ?? [] })
 		}),
 	respondToElicitation: (id: string, elicitationId: string, data: {
 		action: 'accept' | 'decline' | 'cancel';
@@ -344,6 +351,14 @@ export interface TaskMessage {
 	role: string;
 	content: string;
 	timestamp: string;
+	attachments: TaskMessageAttachment[];
+}
+
+export interface TaskMessageAttachment {
+	id: string;
+	name: string;
+	mime_type: string;
+	size: number;
 }
 
 export interface TaskMessageResponse {
