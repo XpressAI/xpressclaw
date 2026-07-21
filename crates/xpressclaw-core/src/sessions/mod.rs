@@ -41,6 +41,8 @@ pub struct WorkAttempt {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    pub context_used: Option<i64>,
+    pub context_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,7 +292,7 @@ impl SessionManager {
             conn.query_row(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at
+                        created_at, started_at, completed_at, context_used, context_size
                  FROM work_attempts WHERE id = ?1",
                 [attempt_id],
                 row_to_attempt,
@@ -309,7 +311,7 @@ impl SessionManager {
             let mut sql = String::from(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at
+                        created_at, started_at, completed_at, context_used, context_size
                  FROM work_attempts WHERE session_id = ?1",
             );
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -352,7 +354,7 @@ impl SessionManager {
             let mut attempt_stmt = conn.prepare(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at
+                        created_at, started_at, completed_at, context_used, context_size
                  FROM work_attempts WHERE task_id = ?1
                  ORDER BY created_at DESC LIMIT ?2",
             )?;
@@ -497,6 +499,26 @@ impl SessionManager {
                 "UPDATE work_attempts SET native_session_id = ?1 WHERE id = ?2",
                 rusqlite::params![native_session_id, attempt_id],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Store the latest ACP context-window counters without adding a noisy
+    /// timeline event. Task activity polling returns attempts on every request,
+    /// so clients still receive live usage updates while a turn is running.
+    pub fn set_context_usage(&self, attempt_id: &str, used: u64, size: u64) -> Result<()> {
+        let used = i64::try_from(used)
+            .map_err(|_| Error::Backend("ACP context usage exceeds SQLite range".to_string()))?;
+        let size = i64::try_from(size)
+            .map_err(|_| Error::Backend("ACP context size exceeds SQLite range".to_string()))?;
+        self.db.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE work_attempts SET context_used = ?1, context_size = ?2 WHERE id = ?3",
+                rusqlite::params![used, size, attempt_id],
+            )?;
+            if updated == 0 {
+                return Err(Error::Task(format!("attempt {attempt_id} not found")));
+            }
             Ok(())
         })
     }
@@ -685,6 +707,8 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkAttempt> {
         created_at: row.get(12)?,
         started_at: row.get(13)?,
         completed_at: row.get(14)?,
+        context_used: row.get(15)?,
+        context_size: row.get(16)?,
     })
 }
 
