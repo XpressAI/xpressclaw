@@ -23,6 +23,16 @@ function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Cur
 	};
 }
 
+function timelineEvent(id: number, second: number, eventType: string, summary: string, payload: Record<string, unknown>) {
+	return {
+		...activityEvent(id),
+		event_type: eventType,
+		summary,
+		payload,
+		created_at: timestamp(second),
+	};
+}
+
 function attempt(status: string) {
 	return {
 		id: 'attempt-browser-test',
@@ -43,7 +53,10 @@ function attempt(status: string) {
 	};
 }
 
-async function mockApi(page: Page, options: { live?: boolean; postedMessages?: Record<string, unknown>[] } = {}) {
+async function mockApi(
+	page: Page,
+	options: { live?: boolean; agentTimeline?: boolean; postedMessages?: Record<string, unknown>[] } = {},
+) {
 	let liveEvent = 0;
 	const status = options.live ? 'in_progress' : 'completed';
 	const task = {
@@ -127,7 +140,19 @@ async function mockApi(page: Page, options: { live?: boolean; postedMessages?: R
 				];
 			}
 		} else if (path === `/api/tasks/${taskId}/activity`) {
-			if (url.searchParams.has('before')) {
+			if (options.agentTimeline) {
+				response = {
+					attempts: [attempt(status)],
+					events: [
+						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.", { item_type: 'agent_message', message_id: 'status-1' }),
+						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
+						timelineEvent(3, 20, 'runner_progress', 'Tests are running.', { item_type: 'agent_message', message_id: 'status-2' }),
+						timelineEvent(4, 24, 'runner_progress', 'First answer', { item_type: 'agent_message', message_id: 'final-1' }),
+					],
+					has_more_before: false,
+					has_more_after: false,
+				};
+			} else if (url.searchParams.has('before')) {
 				response = {
 					attempts: [attempt(status)],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
@@ -217,6 +242,28 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 
 	await page.getByTitle('Model and reasoning effort').click();
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
+});
+
+test('agent updates stay beside their tools while the final reply is shown once', async ({ page }) => {
+	await mockApi(page, { agentTimeline: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	await expect(transcript).toBeVisible();
+	await expect(page.getByRole('button', { name: /Yes, I'll inspect the project\./ })).toBeVisible();
+	const entries = await transcript.locator('[data-transcript-kind]').allTextContents();
+	const statusIndex = entries.findIndex((entry) => entry.includes("Yes, I'll inspect the project."));
+	const toolIndex = entries.findIndex((entry) => entry.includes('Read the project'));
+	const testIndex = entries.findIndex((entry) => entry.includes('Tests are running.'));
+	const finalIndexes = entries
+		.map((entry, index) => entry.includes('First answer') ? index : -1)
+		.filter((index) => index >= 0);
+
+	expect(statusIndex).toBeGreaterThanOrEqual(0);
+	expect(statusIndex).toBeLessThan(toolIndex);
+	expect(toolIndex).toBeLessThan(testIndex);
+	expect(finalIndexes).toHaveLength(1);
+	expect(testIndex).toBeLessThan(finalIndexes[0]);
 });
 
 test('new activity follows only while the transcript is at the bottom', async ({ page }) => {
