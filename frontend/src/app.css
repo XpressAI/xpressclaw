@@ -195,3 +195,14 @@
 .dark ::-webkit-scrollbar-thumb:hover {
 	background: hsl(225 18% 35%);
 }
+
+/* Keep scrollable tab strips usable without a native scrollbar taking their height. */
+.scrollbar-hide {
+	-ms-overflow-style: none;
+	scrollbar-width: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+	display: none;
+	width: 0;
+	height: 0;
+}

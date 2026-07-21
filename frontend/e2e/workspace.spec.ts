@@ -330,6 +330,7 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] .scrollbar-hide').first()).toHaveCSS('scrollbar-width', 'none');
 	await page.getByRole('button', { name: 'Split active tab right' }).click();
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
 	await expect(page.locator(`#task-message-input-${taskId}`)).toHaveCount(2);
