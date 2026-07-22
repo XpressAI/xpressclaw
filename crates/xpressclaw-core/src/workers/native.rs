@@ -27,10 +27,21 @@ use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{
     run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnControlBroker, AcpTurnOptions,
+    AcpTurnRuntime,
 };
 use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
+
+struct NativeAttemptRuntime {
+    db: Arc<Database>,
+    config: Arc<Config>,
+    docker: Arc<DockerManager>,
+    event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+    control_plane_port: u16,
+}
 
 /// Consume the durable task queue as an Agent Client Protocol client. Each
 /// queue item gets its own short-lived ACP server container and publishes
@@ -83,14 +94,16 @@ pub async fn start_dispatcher(
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = execute_item(
-                        db.clone(),
-                        config,
-                        docker,
-                        event_bus.clone(),
-                        elicitation_broker,
-                        turn_controls.clone(),
+                        NativeAttemptRuntime {
+                            db: db.clone(),
+                            config,
+                            docker,
+                            event_bus: event_bus.clone(),
+                            elicitation_broker,
+                            turn_controls: turn_controls.clone(),
+                            control_plane_port,
+                        },
                         item.clone(),
-                        control_plane_port,
                     )
                     .await;
                     if let Some(attempt_id) = item.attempt_id.as_deref() {
@@ -120,16 +133,16 @@ pub async fn start_dispatcher(
     }
 }
 
-async fn execute_item(
-    db: Arc<Database>,
-    config: Arc<Config>,
-    docker: Arc<DockerManager>,
-    event_bus: Arc<ConversationEventBus>,
-    elicitation_broker: Arc<AcpElicitationBroker>,
-    turn_controls: Arc<AcpTurnControlBroker>,
-    item: QueueItem,
-    control_plane_port: u16,
-) -> Result<()> {
+async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {
+    let NativeAttemptRuntime {
+        db,
+        config,
+        docker,
+        event_bus,
+        elicitation_broker,
+        turn_controls,
+        control_plane_port,
+    } = runtime;
     let attempt_id = item
         .attempt_id
         .as_deref()
@@ -281,9 +294,7 @@ async fn execute_item(
     );
     let turn = run_turn(
         attached,
-        recorder,
-        elicitation_broker,
-        turn_controls,
+        AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls),
         resume_session_id.as_deref(),
         Path::new(&container_workspace),
         &prompt.content,

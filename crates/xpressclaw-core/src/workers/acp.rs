@@ -287,6 +287,27 @@ pub struct AcpTurnOptions {
     pub image_attachments: Vec<PromptImageAttachment>,
 }
 
+/// Live services associated with one ACP prompt turn.
+pub struct AcpTurnRuntime {
+    recorder: AcpEventRecorder,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+}
+
+impl AcpTurnRuntime {
+    pub fn new(
+        recorder: AcpEventRecorder,
+        elicitation_broker: Arc<AcpElicitationBroker>,
+        turn_controls: Arc<AcpTurnControlBroker>,
+    ) -> Self {
+        Self {
+            recorder,
+            elicitation_broker,
+            turn_controls,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct TurnState {
     assistant_text: String,
@@ -702,14 +723,17 @@ impl AcpEventRecorder {
 /// loaded as a compatibility fallback.
 pub async fn run_turn(
     attached: AttachedContainer,
-    recorder: AcpEventRecorder,
-    elicitation_broker: Arc<AcpElicitationBroker>,
-    turn_controls: Arc<AcpTurnControlBroker>,
+    runtime: AcpTurnRuntime,
     existing_session_id: Option<&str>,
     cwd: &Path,
     prompt: &str,
     options: AcpTurnOptions,
 ) -> Result<AcpTurnResult> {
+    let AcpTurnRuntime {
+        recorder,
+        elicitation_broker,
+        turn_controls,
+    } = runtime;
     let AcpTurnOptions {
         model,
         session_config: requested_config,
@@ -1388,9 +1412,7 @@ mod tests {
                 input: Box::pin(client_input),
                 output: Box::pin(ReceiverStream::new(output_rx)),
             },
-            recorder,
-            Arc::new(AcpElicitationBroker::new()),
-            controls,
+            AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls),
             None,
             Path::new("/workspace"),
             "Do the work",
@@ -1563,9 +1585,11 @@ mod tests {
         };
         let result = run_turn(
             attached,
-            recorder,
-            Arc::new(AcpElicitationBroker::new()),
-            Arc::new(AcpTurnControlBroker::new()),
+            AcpTurnRuntime::new(
+                recorder,
+                Arc::new(AcpElicitationBroker::new()),
+                Arc::new(AcpTurnControlBroker::new()),
+            ),
             None,
             Path::new("/workspace"),
             "Do the work",
@@ -1765,9 +1789,7 @@ mod tests {
             std::time::Duration::from_secs(3),
             run_turn(
                 attached,
-                recorder,
-                broker,
-                Arc::new(AcpTurnControlBroker::new()),
+                AcpTurnRuntime::new(recorder, broker, Arc::new(AcpTurnControlBroker::new())),
                 None,
                 Path::new("/workspace"),
                 "Choose the database",
