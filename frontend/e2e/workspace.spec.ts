@@ -356,6 +356,18 @@ test('new activity follows only while the transcript is at the bottom', async ({
 
 test('task messages accept selected and pasted images', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				if (command === 'plugin:clipboard-manager|read_image') return 42;
+				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
+				if (command === 'plugin:image|size') return { width: 1, height: 1 };
+				if (command === 'plugin:resources|close') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
 	await mockApi(page, { postedMessages });
 	await page.goto(`/tasks/${taskId}`);
 
@@ -375,6 +387,7 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 			'pasted.png',
 			{ type: 'image/png' },
 		));
+		Object.defineProperty(transfer, 'files', { value: [] });
 		element.dispatchEvent(new ClipboardEvent('paste', {
 			clipboardData: transfer,
 			bubbles: true,
@@ -383,11 +396,30 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	});
 	await expect(page.getByAltText('pasted.png')).toBeVisible();
 
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(page.getByAltText('pasted-image.png')).toBeVisible();
+	const textPasteAllowed = await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'ordinary text');
+		return element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	expect(textPasteAllowed).toBe(true);
+
 	await page.getByRole('button', { name: 'Send message' }).click();
 	await expect.poll(() => postedMessages.length).toBe(1);
 	const attachments = postedMessages[0].attachments as { name: string; mime_type: string; data: string }[];
 	expect(postedMessages[0].content).toBe('');
-	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png']);
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png', 'pasted-image.png']);
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
 });
 

@@ -4,7 +4,7 @@
 	import { setup, sessions, agents as agentsApi } from '$lib/api';
 	import type { Agent, ImageAttachmentUpload } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
-	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
+	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { harnessMark } from '$lib/utils';
 
 	let status_text = $state('Connecting to server...');
@@ -96,10 +96,11 @@
 	}
 
 	function handlePaste(event: ClipboardEvent) {
-		const files = clipboardImageFiles(event);
-		if (files.length === 0) return;
+		if (!shouldHandleImagePaste(event)) return;
 		event.preventDefault();
-		void addImages(files);
+		void pastedImageFiles(event)
+			.then(addImages)
+			.catch((e) => (sendError = e instanceof Error ? e.message : String(e)));
 	}
 
 	function handleKeydown(e: KeyboardEvent) {

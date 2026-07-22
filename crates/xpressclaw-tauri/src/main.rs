@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8935;
+const DEV_FRONTEND_PORT: u16 = 5173;
 
 /// Holds the sidecar child process for cleanup on exit.
 struct SidecarState(Mutex<Option<std::process::Child>>);
@@ -234,11 +235,16 @@ fn main() {
             // Wait for server to be ready, then show the window
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                wait_for_server(port).await;
-                info!("server is ready");
+                let server_ready = wait_for_server(port).await;
                 if let Some(window) = handle.get_webview_window("main") {
-                    let url = format!("http://localhost:{port}");
-                    let _ = window.navigate(url.parse().unwrap());
+                    if server_ready {
+                        info!("server is ready");
+                        if let Err(error) = enable_image_paste_capability(&handle, port) {
+                            warn!(%error, "failed to enable image paste capability");
+                        }
+                        let url = format!("http://localhost:{port}");
+                        let _ = window.navigate(url.parse().unwrap());
+                    }
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -348,13 +354,48 @@ fn sidecar_binary_name() -> String {
     }
 }
 
-async fn wait_for_server(port: u16) {
+fn image_paste_origins(port: u16) -> Vec<String> {
+    let mut origins = vec![format!("http://localhost:{port}/*")];
+    if cfg!(debug_assertions) && port != DEV_FRONTEND_PORT {
+        origins.push(format!("http://localhost:{DEV_FRONTEND_PORT}/*"));
+    }
+    origins
+}
+
+fn enable_image_paste_capability(app: &tauri::AppHandle, port: u16) -> tauri::Result<()> {
+    let mut capability = tauri::ipc::CapabilityBuilder::new("localhost-image-paste")
+        .local(false)
+        .window("main")
+        .permission("clipboard-manager:allow-read-image")
+        .permission("core:image:allow-rgba")
+        .permission("core:image:allow-size")
+        .permission("core:resources:allow-close");
+    for origin in image_paste_origins(port) {
+        capability = capability.remote(origin);
+    }
+    app.add_capability(capability)
+}
+
+fn is_xpressclaw_health(body: &serde_json::Value) -> bool {
+    body.get("status").and_then(serde_json::Value::as_str) == Some("ok")
+        && body.get("name").and_then(serde_json::Value::as_str) == Some("xpressclaw")
+}
+
+async fn wait_for_server(port: u16) -> bool {
     let url = format!("http://localhost:{port}/api/health");
     let client = reqwest::Client::new();
 
     for i in 0..120 {
         match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) if resp.status().is_success() => {
+                if resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .is_ok_and(|body| is_xpressclaw_health(&body))
+                {
+                    return true;
+                }
+            }
             _ => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -362,5 +403,32 @@ async fn wait_for_server(port: u16) {
             info!("waiting for server to start...");
         }
     }
-    warn!("server did not become ready within 60 seconds, showing window anyway");
+    warn!("xpressclaw server did not become ready within 60 seconds");
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn image_paste_origins_are_port_scoped() {
+        let origins = image_paste_origins(19_435);
+        assert!(origins.contains(&"http://localhost:19435/*".to_string()));
+        assert!(!origins.iter().any(|origin| origin.contains(":*")));
+    }
+
+    #[test]
+    fn health_check_requires_xpressclaw_identity() {
+        assert!(is_xpressclaw_health(&json!({
+            "status": "ok",
+            "name": "xpressclaw"
+        })));
+        assert!(!is_xpressclaw_health(&json!({ "status": "ok" })));
+        assert!(!is_xpressclaw_health(&json!({
+            "status": "ok",
+            "name": "another-local-service"
+        })));
+    }
 }

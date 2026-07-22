@@ -1,4 +1,6 @@
 import type { ImageAttachmentUpload } from '$lib/api';
+import { isTauri } from '@tauri-apps/api/core';
+import { readImage } from '@tauri-apps/plugin-clipboard-manager';
 
 export const MAX_IMAGE_ATTACHMENTS = 5;
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -38,7 +40,44 @@ export async function appendImageFiles(
 }
 
 export function clipboardImageFiles(event: ClipboardEvent): File[] {
-	return Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith('image/'));
+	const clipboard = event.clipboardData;
+	if (!clipboard) return [];
+
+	const files = Array.from(clipboard.files).filter((file) => file.type.startsWith('image/'));
+	if (files.length > 0) return files;
+
+	return Array.from(clipboard.items)
+		.filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+		.map((item) => item.getAsFile())
+		.filter((file): file is File => file !== null);
+}
+
+export function shouldHandleImagePaste(event: ClipboardEvent): boolean {
+	if (clipboardImageFiles(event).length > 0) return true;
+	if (!isTauri()) return false;
+
+	const types = Array.from(event.clipboardData?.types ?? []);
+	return types.length === 0 || types.some((type) => type === 'Files' || type.startsWith('image/'));
+}
+
+export async function pastedImageFiles(event: ClipboardEvent): Promise<File[]> {
+	const browserFiles = clipboardImageFiles(event);
+	if (browserFiles.length > 0) return browserFiles;
+	if (!shouldHandleImagePaste(event)) return [];
+
+	let image;
+	try {
+		image = await readImage();
+	} catch {
+		throw new Error('Could not read an image from the system clipboard.');
+	}
+
+	try {
+		const [rgba, size] = await Promise.all([image.rgba(), image.size()]);
+		return [await rgbaImageFile(rgba, size.width, size.height)];
+	} finally {
+		await image.close().catch(() => undefined);
+	}
 }
 
 export function imageDataUrl(attachment: Pick<ImageAttachmentUpload, 'mime_type' | 'data'>): string {
@@ -70,4 +109,26 @@ function decodedSize(data: string): number {
 function extensionFor(mimeType: string): string {
 	if (mimeType === 'image/jpeg') return 'jpg';
 	return mimeType.slice('image/'.length) || 'png';
+}
+
+async function rgbaImageFile(rgba: Uint8Array, width: number, height: number): Promise<File> {
+	const expectedLength = width * height * 4;
+	if (!Number.isSafeInteger(expectedLength) || width <= 0 || height <= 0 || rgba.length !== expectedLength) {
+		throw new Error('The clipboard returned invalid image data.');
+	}
+
+	const canvas = document.createElement('canvas');
+	canvas.width = width;
+	canvas.height = height;
+	const context = canvas.getContext('2d');
+	if (!context) throw new Error('Could not prepare the clipboard image.');
+
+	context.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+	const blob = await new Promise<Blob>((resolve, reject) => {
+		canvas.toBlob((result) => {
+			if (result) resolve(result);
+			else reject(new Error('Could not encode the clipboard image.'));
+		}, 'image/png');
+	});
+	return new File([blob], 'pasted-image.png', { type: 'image/png' });
 }

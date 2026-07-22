@@ -4,7 +4,7 @@
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
-	import { appendImageFiles, clipboardImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS } from '$lib/imageAttachments';
+	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
 
 	let { agentId }: { agentId: string } = $props();
@@ -108,10 +108,11 @@
 	}
 
 	function handlePaste(event: ClipboardEvent) {
-		const files = clipboardImageFiles(event);
-		if (files.length === 0) return;
+		if (!shouldHandleImagePaste(event)) return;
 		event.preventDefault();
-		void addImages(files);
+		void pastedImageFiles(event)
+			.then(addImages)
+			.catch((e) => (error = e instanceof Error ? e.message : String(e)));
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
