@@ -62,11 +62,13 @@ async function mockApi(
 		agentTimeline?: boolean;
 		richToolActivity?: boolean;
 		postedMessages?: Record<string, unknown>[];
+		interruptedAttempts?: string[];
 	} = {},
 ) {
 	let liveEvent = 0;
 	let contextUsed = 128_000;
 	const status = options.live ? 'in_progress' : 'completed';
+	const attemptStatus = options.live ? 'running' : 'completed';
 	const task = {
 		id: taskId,
 		title: 'Browser-tested workspace',
@@ -170,6 +172,7 @@ async function mockApi(
 					message: { id: 4, task_id: taskId, role: 'user', content: payload.content, attachments: [], timestamp: timestamp(62) },
 					continuation_queued: true,
 					attempt_id: 'attempt-image-message',
+					delivery: payload.delivery === 'immediate' ? 'immediate' : (options.live ? 'after_tool' : 'queued'),
 				};
 			} else {
 				response = [
@@ -181,7 +184,7 @@ async function mockApi(
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: [attempt(status)],
+					attempts: [attempt(attemptStatus)],
 					events: [
 						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.", { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
@@ -193,7 +196,7 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [attempt(status, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed)],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -202,14 +205,14 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: [attempt(status, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed)],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [attempt(status, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed)],
 					events: options.richToolActivity ? [
 						{
 							...activityEvent(21),
@@ -251,6 +254,9 @@ async function mockApi(
 					has_more_after: false,
 				};
 			}
+		} else if (path === `/api/sessions/${agentId}/attempts/attempt-browser-test/interrupt`) {
+			options.interruptedAttempts?.push('attempt-browser-test');
+			response = { ...attempt('interrupted'), status: 'interrupted', completed_at: timestamp(62) };
 		} else if (path === `/api/sessions/${agentId}/events`) {
 			response = [
 				{
@@ -454,6 +460,28 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
 });
 
+test('running agents can be guided at a safe break or interrupted immediately', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	const interruptedAttempts: string[] = [];
+	await mockApi(page, { live: true, postedMessages, interruptedAttempts });
+	await page.goto(`/tasks/${taskId}`);
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await expect(page.getByRole('button', { name: 'Interrupt agent now' })).toBeVisible();
+	await composer.fill('Use the smaller API instead');
+	await page.getByRole('button', { name: 'Send message' }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	expect(postedMessages[0].delivery).toBe('after_tool');
+
+	await composer.fill('Stop and apply this correction now');
+	await page.getByRole('button', { name: 'Interrupt and send now' }).click();
+	await expect.poll(() => postedMessages.length).toBe(2);
+	expect(postedMessages[1].delivery).toBe('immediate');
+
+	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
+	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+});
+
 test('workspace panes split on wide screens and collapse cleanly on mobile', async ({ page, browser }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
@@ -469,9 +497,10 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(page.getByText('Connections', { exact: true })).toHaveCount(0);
 
 	const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-	await mockApi(mobile);
+	await mockApi(mobile, { live: true });
 	await mobile.goto(`/tasks/${taskId}`);
 	await expect(mobile.locator('[data-workspace-pane]:visible')).toHaveCount(1);
+	await expect(mobile.getByRole('button', { name: 'Interrupt agent now' })).toBeVisible();
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
 	await mobile.getByRole('button', { name: 'Open project switcher' }).click();

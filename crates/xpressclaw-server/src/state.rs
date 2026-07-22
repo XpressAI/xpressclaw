@@ -8,7 +8,7 @@ use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
-use xpressclaw_core::workers::acp::AcpElicitationBroker;
+use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -32,6 +32,8 @@ pub struct AppState {
     pub docker: Arc<RwLock<Option<Arc<DockerManager>>>>,
     /// Live ACP forms waiting for a response from the task UI.
     pub elicitations: Arc<AcpElicitationBroker>,
+    /// Live signals that let queued user guidance interrupt an ACP prompt.
+    pub turn_controls: Arc<AcpTurnControlBroker>,
 }
 
 impl AppState {
@@ -55,6 +57,7 @@ impl AppState {
             event_bus: Arc::new(ConversationEventBus::new()),
             docker: Arc::new(RwLock::new(None)),
             elicitations: Arc::new(AcpElicitationBroker::new()),
+            turn_controls: Arc::new(AcpTurnControlBroker::new()),
         }
     }
 
@@ -106,5 +109,88 @@ impl AppState {
         *self.llm_router.write().unwrap() = llm_router;
         *self.rate_limiter.write().unwrap() = rate_limiter;
         *self.setup_complete.write().unwrap() = true;
+    }
+
+    /// Stop one worker attempt without cancelling its task. Any queued user
+    /// messages remain runnable; otherwise the task returns to pending.
+    pub async fn interrupt_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> xpressclaw_core::error::Result<xpressclaw_core::sessions::WorkAttempt> {
+        use xpressclaw_core::sessions::SessionManager;
+        use xpressclaw_core::tasks::board::TaskBoard;
+        use xpressclaw_core::tasks::queue::TaskQueue;
+
+        let sessions = SessionManager::new(self.db.clone());
+        let attempt = sessions.get_attempt(attempt_id)?;
+        if matches!(
+            attempt.status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Ok(attempt);
+        }
+
+        self.turn_controls
+            .request_interrupt(attempt_id, AcpInterruptMode::Immediate);
+        self.elicitations.cancel_attempt(attempt_id);
+
+        // Re-read after signalling so a container launched concurrently with
+        // the request is still stopped. Terminal transitions are immutable,
+        // so a late worker update cannot revive this attempt afterwards.
+        let current = sessions.get_attempt(attempt_id)?;
+        if matches!(
+            current.status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Ok(current);
+        }
+        if current.container_id.is_some() {
+            let docker = self.docker().await.ok_or_else(|| {
+                xpressclaw_core::error::Error::DockerNotAvailable(
+                    "cannot stop the active agent container".to_string(),
+                )
+            })?;
+            let workload_id = format!("attempt-{attempt_id}");
+            if docker.is_running(&workload_id).await {
+                docker.stop(&workload_id).await?;
+            }
+        }
+
+        // The worker may have completed while its container was stopping.
+        let current = sessions.get_attempt(attempt_id)?;
+        if matches!(
+            current.status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        ) {
+            return Ok(current);
+        }
+        let interrupted = sessions.transition_attempt(
+            attempt_id,
+            "interrupted",
+            "Agent interrupted by user",
+            None,
+            None,
+        )?;
+        if interrupted.status != "interrupted" {
+            return Ok(interrupted);
+        }
+        let queue = TaskQueue::new(self.db.clone());
+        if let Some(queue_id) = current.queue_id {
+            queue.complete(queue_id, "interrupted by user")?;
+        }
+        if let Some(task_id) = current.task_id.as_deref() {
+            let status = if queue.has_queued_for_task(task_id)? {
+                "in_progress"
+            } else {
+                "pending"
+            };
+            TaskBoard::new(self.db.clone()).update_status(
+                task_id,
+                status,
+                Some(&current.session_id),
+            )?;
+        }
+        sessions.refresh_status(&current.session_id)?;
+        Ok(interrupted)
     }
 }

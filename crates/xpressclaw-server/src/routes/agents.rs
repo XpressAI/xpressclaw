@@ -127,7 +127,7 @@ async fn delete_agent(
         for attempt in attempts.iter().filter(|attempt| {
             !matches!(
                 attempt.status.as_str(),
-                "completed" | "failed" | "cancelled"
+                "completed" | "failed" | "cancelled" | "interrupted"
             )
         }) {
             let _ = docker.stop(&format!("attempt-{}", attempt.id)).await;

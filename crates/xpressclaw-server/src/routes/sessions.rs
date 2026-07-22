@@ -51,6 +51,10 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/attempts", get(get_attempts))
         .route("/{id}/readiness", get(get_readiness).post(prepare_runner))
         .route("/{id}/messages", post(post_message))
+        .route(
+            "/{id}/attempts/{attempt_id}/interrupt",
+            post(interrupt_attempt),
+        )
         .route("/{id}/attempts/{attempt_id}/cancel", post(cancel_attempt))
 }
 
@@ -392,7 +396,7 @@ async fn cancel_attempt(
     }
     if matches!(
         attempt.status.as_str(),
-        "completed" | "failed" | "cancelled"
+        "completed" | "failed" | "cancelled" | "interrupted"
     ) {
         return Ok(Json(json!(attempt)));
     }
@@ -432,6 +436,27 @@ async fn cancel_attempt(
         let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
     }
     Ok(Json(json!(cancelled)))
+}
+
+async fn interrupt_attempt(
+    State(state): State<AppState>,
+    Path((id, attempt_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    ensure_session(&state, &id)?;
+    let attempt = SessionManager::new(state.db.clone())
+        .get_attempt(&attempt_id)
+        .map_err(not_found)?;
+    if attempt.session_id != id {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "attempt does not belong to this session" })),
+        ));
+    }
+    let interrupted = state
+        .interrupt_attempt(&attempt_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!(interrupted)))
 }
 
 fn ensure_session(state: &AppState, id: &str) -> Result<(), (StatusCode, Json<Value>)> {
@@ -491,6 +516,7 @@ mod tests {
 
     use xpressclaw_core::config::{AgentConfig, Config};
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::tasks::board::TaskStatus;
 
     use super::*;
 
@@ -600,6 +626,50 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.is_empty());
         assert_eq!(messages[0].attachments[0].name, "screen.png");
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_only_the_active_attempt() {
+        let (app, db) = test_app_with_db();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/builder/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "content": "Long task" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let attempt_id = value["attempt_id"].as_str().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/builder/attempts/{attempt_id}/interrupt"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "interrupted");
+        let task_id = value["task_id"].as_str().unwrap();
+        assert_eq!(
+            TaskBoard::new(db).get(task_id).unwrap().status,
+            TaskStatus::Pending
+        );
     }
 
     #[tokio::test]

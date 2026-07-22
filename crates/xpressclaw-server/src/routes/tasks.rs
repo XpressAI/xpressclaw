@@ -12,7 +12,9 @@ use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachm
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
-use xpressclaw_core::workers::acp::{AcpElicitationResponseError, CreateElicitationResponse};
+use xpressclaw_core::workers::acp::{
+    AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
+};
 
 use crate::state::AppState;
 
@@ -38,6 +40,16 @@ pub struct MessageInput {
     pub attachments: Vec<ImageAttachmentInput>,
     #[serde(default)]
     pub config_options: std::collections::HashMap<String, Value>,
+    #[serde(default)]
+    pub delivery: MessageDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDelivery {
+    #[default]
+    AfterTool,
+    Immediate,
 }
 
 #[derive(Deserialize)]
@@ -234,7 +246,7 @@ async fn update_task_status(
             if let Ok(attempt) = sessions.get_attempt(&attempt_id) {
                 if !matches!(
                     attempt.status.as_str(),
-                    "completed" | "failed" | "cancelled"
+                    "completed" | "failed" | "cancelled" | "interrupted"
                 ) {
                     sessions
                         .transition_attempt(
@@ -482,11 +494,23 @@ async fn add_message(
     };
 
     let mut continuation = None;
+    let mut delivery = "stored";
     if let Some(ref agent_id) = task.agent_id {
         let sessions = SessionManager::new(state.db.clone());
         sessions
             .ensure(agent_id, Some(agent_id))
             .map_err(internal_error)?;
+        let active_attempt = sessions
+            .task_activity(&id, None, None, 1, 50)
+            .map_err(internal_error)?
+            .attempts
+            .into_iter()
+            .find(|attempt| {
+                matches!(
+                    attempt.status.as_str(),
+                    "preparing" | "running" | "waiting_for_input" | "review"
+                )
+            });
         sessions
             .append_event(
                 agent_id,
@@ -511,6 +535,22 @@ async fn add_message(
         continuation = queue
             .enqueue_continuation(&id, agent_id)
             .map_err(internal_error)?;
+        delivery = if let Some(active_attempt) = active_attempt {
+            if req.delivery == MessageDelivery::Immediate {
+                state
+                    .interrupt_attempt(&active_attempt.id)
+                    .await
+                    .map_err(internal_error)?;
+                "immediate"
+            } else {
+                state
+                    .turn_controls
+                    .request_interrupt(&active_attempt.id, AcpInterruptMode::AfterTool);
+                "after_tool"
+            }
+        } else {
+            "queued"
+        };
         if continuation.is_some()
             && matches!(
                 task.status,
@@ -538,6 +578,7 @@ async fn add_message(
             "message": msg,
             "continuation_queued": continuation.is_some(),
             "attempt_id": continuation.and_then(|item| item.attempt_id),
+            "delivery": delivery,
         })),
     ))
 }
@@ -890,6 +931,7 @@ mod tests {
         assert_eq!(body["message"]["role"], "user");
         assert_eq!(body["message"]["content"], "Hello agent");
         assert_eq!(body["continuation_queued"], false);
+        assert_eq!(body["delivery"], "stored");
 
         // Get messages
         let resp = app
@@ -1067,6 +1109,7 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], true);
         assert!(body["attempt_id"].is_string());
+        assert_eq!(body["delivery"], "queued");
         let reopened = TaskBoard::new(db.clone()).get(&task_id).unwrap();
         assert_eq!(reopened.status, TaskStatus::Pending);
         assert!(reopened.completed_at.is_none());
@@ -1075,6 +1118,124 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], false);
         assert_eq!(queue.pending_count("developer").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn running_task_message_yields_after_the_current_tool() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Steer this", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+        let queue = TaskQueue::new(db.clone());
+        let first = queue.claim("developer").unwrap().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                first.attempt_id.as_deref().unwrap(),
+                "running",
+                "Working",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"role": "user", "content": "Use the smaller API"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["delivery"], "after_tool");
+        assert_eq!(body["continuation_queued"], true);
+        assert_eq!(
+            SessionManager::new(db)
+                .get_attempt(first.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .status,
+            "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_message_interrupts_the_running_attempt_and_keeps_the_continuation() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Interrupt this", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+        let queue = TaskQueue::new(db.clone());
+        let first = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = first.attempt_id.as_deref().unwrap().to_string();
+        SessionManager::new(db.clone())
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "role": "user",
+                            "content": "Stop and do this instead",
+                            "delivery": "immediate"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["delivery"], "immediate");
+        assert_eq!(body["continuation_queued"], true);
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .status,
+            "interrupted"
+        );
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::InProgress
+        );
     }
 
     #[tokio::test]

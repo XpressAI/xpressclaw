@@ -28,6 +28,7 @@
 			attempt_running: 'Running',
 			attempt_failed: 'Failed',
 			attempt_cancelled: 'Cancelled',
+			attempt_interrupted: 'Interrupted',
 			runner_progress: itemType === 'agent_message' ? 'Update' : 'Progress',
 			agent_thought: 'Thought',
 			tool_call: 'Tool',
@@ -40,6 +41,7 @@
 
 	function labelTone(eventType: string): string {
 		if (eventType.includes('failed')) return 'text-red-400/80';
+		if (eventType === 'attempt_interrupted') return 'text-amber-400/80';
 		if (eventType === 'attempt_running') return 'text-emerald-400/75';
 		if (eventType === 'agent_thought') return 'text-violet-300/70';
 		return 'text-foreground/45';

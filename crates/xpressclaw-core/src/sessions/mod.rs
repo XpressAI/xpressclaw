@@ -431,20 +431,22 @@ impl SessionManager {
             "completed",
             "failed",
             "cancelled",
+            "interrupted",
         ];
         if !VALID.contains(&status) {
             return Err(Error::Task(format!("invalid attempt status: {status}")));
         }
         let attempt = self.get_attempt(attempt_id)?;
-        let is_terminal = matches!(status, "completed" | "failed" | "cancelled");
-        self.db.with_conn(|conn| {
-            conn.execute(
+        let is_terminal = matches!(status, "completed" | "failed" | "cancelled" | "interrupted");
+        let transitioned = self.db.with_conn(|conn| {
+            let updated = conn.execute(
                 "UPDATE work_attempts SET status = ?1,
                     started_at = CASE WHEN ?1 IN ('preparing', 'running')
                         THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END,
                     completed_at = CASE WHEN ?2 = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
                     result = COALESCE(?3, result), error_message = ?4
-                 WHERE id = ?5",
+                 WHERE id = ?5
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
                 rusqlite::params![
                     status,
                     is_terminal as i32,
@@ -453,6 +455,9 @@ impl SessionManager {
                     attempt_id
                 ],
             )?;
+            if updated == 0 {
+                return Ok::<_, Error>(false);
+            }
             let session_status = self.derive_status_with_conn(conn, &attempt.session_id)?;
             conn.execute(
                 "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
@@ -466,8 +471,11 @@ impl SessionManager {
                     rusqlite::params![attempt.task_id, attempt_id],
                 )?;
             }
-            Ok::<_, Error>(())
+            Ok::<_, Error>(true)
         })?;
+        if !transitioned {
+            return self.get_attempt(attempt_id);
+        }
         self.append_event(
             &attempt.session_id,
             NewEvent {
@@ -995,5 +1003,43 @@ mod tests {
                 .unwrap();
             assert_eq!(queue_attempt, None);
         });
+    }
+
+    #[test]
+    fn terminal_attempt_cannot_be_revived_by_a_late_worker_transition() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("Builder")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title) VALUES ('task-1', 'Build it')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status)
+                 VALUES (1, 'task-1', 'builder', 'running')",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        let attempt = manager
+            .create_attempt(
+                "builder", "task-1", 1, "codex", "task", "task", None, "Build it",
+            )
+            .unwrap();
+
+        manager
+            .transition_attempt(&attempt.id, "interrupted", "Stopped", None, None)
+            .unwrap();
+        let late_transition = manager
+            .transition_attempt(&attempt.id, "running", "Started late", None, None)
+            .unwrap();
+
+        assert_eq!(late_transition.status, "interrupted");
+        let events = manager.list_events("builder", None, 50).unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "attempt_running"));
     }
 }

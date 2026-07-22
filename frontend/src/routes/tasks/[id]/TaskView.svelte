@@ -83,6 +83,7 @@
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
 	let messageSending = $state(false);
+	let interrupting = $state(false);
 	let messageAttachments = $state<ImageAttachmentUpload[]>([]);
 	let messageAttachmentError = $state('');
 	let messageImageInput = $state<HTMLInputElement>();
@@ -188,7 +189,7 @@
 			.map(event => String(event.payload?.elicitationId ?? ''))
 			.filter(Boolean));
 		const liveAttempts = new Set(attempts
-			.filter(attempt => !['completed', 'failed', 'cancelled'].includes(attempt.status))
+			.filter(attempt => !['completed', 'failed', 'cancelled', 'interrupted'].includes(attempt.status))
 			.map(attempt => attempt.id));
 		return activityEvents
 			.filter(event => event.event_type === 'elicitation_pending')
@@ -201,9 +202,11 @@
 			.filter((item): item is PendingElicitation => item !== null);
 	})());
 	let pendingElicitation = $derived(pendingElicitations.at(-1) ?? null);
-	let activeAttempt = $derived(
-		attempts.find(attempt => ['queued', 'preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
+	let runningAttempt = $derived(
+		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
 	);
+	let queuedAttempt = $derived(attempts.find(attempt => attempt.status === 'queued') ?? null);
+	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
 	let contextUsage = $derived(contextUsageFor(usageAttempt, activityEvents));
 	let latestAttemptResult = $derived(attempts.find(attempt => attempt.result)?.result ?? null);
@@ -734,7 +737,7 @@
 		scrollToBottom(true);
 	}
 
-	async function sendTaskMessage() {
+	async function sendTaskMessage(immediate = false) {
 		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || pendingElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
@@ -750,6 +753,7 @@
 			await tasks.addMessage(task.id, 'user', content, {
 				configOptions: selectedConfig,
 				attachments,
+				delivery: immediate ? 'immediate' : 'after_tool',
 			});
 			await poll();
 			scrollToBottom(true);
@@ -759,6 +763,23 @@
 			messageAttachmentError = e instanceof Error ? e.message : String(e);
 		} finally {
 			messageSending = false;
+		}
+	}
+
+	async function interruptAgent() {
+		if (!task?.agent_id || !runningAttempt || interrupting || messageSending) return;
+		if (!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
+			await sendTaskMessage(true);
+			return;
+		}
+		interrupting = true;
+		try {
+			await sessions.interruptAttempt(task.agent_id, runningAttempt.id);
+			await poll();
+		} catch (e) {
+			messageAttachmentError = e instanceof Error ? e.message : String(e);
+		} finally {
+			interrupting = false;
 		}
 	}
 
@@ -1273,12 +1294,14 @@
 					{/if}
 
 					<!-- Live indicator -->
-					{#if activeAttempt?.status === 'running' || activeAttempt?.status === 'preparing' || activeAttempt?.status === 'review'}
+					{#if runningAttempt}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
 							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
-							The agent is working on this task...
+							{queuedAttempt
+								? 'New guidance queued; switching at the next safe break...'
+								: 'The agent is working on this task...'}
 						</div>
-					{:else if activeAttempt?.status === 'queued'}
+					{:else if queuedAttempt}
 						<div class="flex items-center gap-2 text-xs text-muted-foreground">
 							<span class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
 							The next worker turn is queued...
@@ -1400,14 +1423,14 @@
 							placeholder={messagePlaceholder}
 							rows={2}
 							class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-							disabled={messageSending || !task.agent_id || Boolean(pendingElicitation)}
+							disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
 						></textarea>
 						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
 
 						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
 							<input bind:this={messageImageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleMessageImageInput} class="hidden" />
 							<button type="button" onclick={() => messageImageInput?.click()}
-								disabled={messageSending || !task.agent_id || Boolean(pendingElicitation) || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
+								disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation) || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
 								aria-label="Attach images" title="Attach images (you can also paste)"
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
@@ -1443,10 +1466,26 @@
 							{:else}
 								<div class="flex-1"></div>
 							{/if}
+							{#if runningAttempt}
+								<button
+									type="button"
+									onclick={interruptAgent}
+									aria-label={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
+									title={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
+									disabled={messageSending || interrupting}
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+								>
+									{#if interrupting}
+										<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
+									{:else}
+										<svg class="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg>
+									{/if}
+								</button>
+							{/if}
 							<button
-								onclick={sendTaskMessage}
+								onclick={() => sendTaskMessage()}
 								aria-label="Send message"
-								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || !task.agent_id || Boolean(pendingElicitation)}
+								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30"
 							>
 								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>

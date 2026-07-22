@@ -1,16 +1,17 @@
 //! Agent Client Protocol transport and event normalization for isolated runners.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
 use agent_client_protocol::schema::v1::{
-    BooleanConfigOptionCapabilities, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-    CreateElicitationRequest, ElicitationAction, ElicitationCapabilities,
-    ElicitationFormCapabilities, ImageContent, InitializeRequest, LoadSessionRequest, McpServer,
-    NewSessionRequest, PermissionOptionKind, PlanEntryStatus, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
+    ClientSessionCapabilities, ContentBlock, CreateElicitationRequest, ElicitationAction,
+    ElicitationCapabilities, ElicitationFormCapabilities, ImageContent, InitializeRequest,
+    LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind, PlanEntryStatus,
+    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
     SessionConfigSelectOptions, SessionModeState, SessionNotification, SessionUpdate,
@@ -24,7 +25,7 @@ use bollard::container::LogOutput;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -37,6 +38,129 @@ use crate::tasks::conversation::PromptImageAttachment;
 
 const MAX_TRANSCRIPT_UPDATES: usize = 500;
 const MAX_DIAGNOSTIC_BYTES: usize = 200_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpInterruptMode {
+    /// Finish any tool that is already in flight, then start the queued turn.
+    AfterTool,
+    /// Stop the current prompt turn as soon as the ACP agent can cancel it.
+    Immediate,
+}
+
+#[derive(Default)]
+struct PendingTurnControl {
+    sender: Option<mpsc::UnboundedSender<()>>,
+    active_tools: HashSet<String>,
+    requested: Option<AcpInterruptMode>,
+    sent: bool,
+}
+
+/// Routes task-page guidance into an active ACP prompt turn.
+///
+/// Messages themselves remain durable in task chat and the queue. This broker
+/// only owns the short-lived signal that ends the current prompt either now or
+/// after its in-flight tool finishes, allowing the queued turn to start early.
+#[derive(Default)]
+pub struct AcpTurnControlBroker {
+    turns: Mutex<HashMap<String, PendingTurnControl>>,
+}
+
+impl AcpTurnControlBroker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a claimed worker before it enters preparation. This lets
+    /// guidance received during image setup wait for the ACP turn to connect.
+    pub fn begin_attempt(&self, attempt_id: &str) {
+        self.turns
+            .lock()
+            .unwrap()
+            .entry(attempt_id.to_string())
+            .or_default();
+    }
+
+    /// Request that an active attempt yield to its queued continuation.
+    /// Returns false when the worker already finished or was already signalled.
+    pub fn request_interrupt(&self, attempt_id: &str, mode: AcpInterruptMode) -> bool {
+        let mut turns = self.turns.lock().unwrap();
+        let Some(control) = turns.get_mut(attempt_id) else {
+            return false;
+        };
+        if control.sent {
+            return false;
+        }
+        if mode == AcpInterruptMode::Immediate
+            || control.requested != Some(AcpInterruptMode::Immediate)
+        {
+            control.requested = Some(mode);
+        }
+        Self::send_if_ready(control);
+        true
+    }
+
+    fn register(&self, attempt_id: &str) -> mpsc::UnboundedReceiver<()> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut turns = self.turns.lock().unwrap();
+        let control = turns.entry(attempt_id.to_string()).or_default();
+        control.sender = Some(sender);
+        Self::send_if_ready(control);
+        receiver
+    }
+
+    fn observe_update(&self, attempt_id: &str, update: &SessionUpdate) {
+        let mut turns = self.turns.lock().unwrap();
+        let control = turns.entry(attempt_id.to_string()).or_default();
+        match update {
+            SessionUpdate::ToolCall(call) => {
+                Self::set_tool_status(control, call.tool_call_id.to_string(), &call.status)
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                if let Some(status) = update.fields.status.as_ref() {
+                    Self::set_tool_status(control, update.tool_call_id.to_string(), status);
+                }
+            }
+            _ => {}
+        }
+        Self::send_if_ready(control);
+    }
+
+    fn set_tool_status(
+        control: &mut PendingTurnControl,
+        tool_call_id: String,
+        status: &ToolCallStatus,
+    ) {
+        if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            control.active_tools.remove(&tool_call_id);
+        } else {
+            control.active_tools.insert(tool_call_id);
+        }
+    }
+
+    fn send_if_ready(control: &mut PendingTurnControl) {
+        let ready = match control.requested {
+            Some(AcpInterruptMode::Immediate) => true,
+            Some(AcpInterruptMode::AfterTool) => control.active_tools.is_empty(),
+            None => false,
+        };
+        if !ready {
+            return;
+        }
+        let Some(sender) = control.sender.as_ref() else {
+            return;
+        };
+        if sender.send(()).is_ok() {
+            control.requested = None;
+            control.sent = true;
+        } else {
+            control.sender = None;
+        }
+    }
+
+    pub fn finish_attempt(&self, attempt_id: &str) {
+        self.turns.lock().unwrap().remove(attempt_id);
+    }
+}
 
 struct PendingElicitation {
     task_id: String,
@@ -149,6 +273,8 @@ pub struct AcpTurnResult {
     pub summary: String,
     pub stop_reason: String,
     pub diagnostic: String,
+    /// True when XpressClaw asked this turn to yield to newer user guidance.
+    pub interrupted: bool,
 }
 
 /// Per-turn client choices applied after the ACP session is created or
@@ -210,6 +336,10 @@ impl AcpEventRecorder {
         state.current_message_id = None;
         state.pending_thought.clear();
         state.capture_prompt_output = true;
+    }
+
+    fn persist_native_session(&self, native_session_id: &str) -> Result<()> {
+        SessionManager::new(self.db.clone()).set_native_session(&self.attempt_id, native_session_id)
     }
 
     fn record_notification(&self, notification: SessionNotification) -> Result<()> {
@@ -438,7 +568,7 @@ impl AcpEventRecorder {
         let attempt = sessions.get_attempt(&self.attempt_id)?;
         if !matches!(
             attempt.status.as_str(),
-            "completed" | "failed" | "cancelled"
+            "completed" | "failed" | "cancelled" | "interrupted"
         ) {
             sessions.transition_attempt(
                 &self.attempt_id,
@@ -574,6 +704,7 @@ pub async fn run_turn(
     attached: AttachedContainer,
     recorder: AcpEventRecorder,
     elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
     existing_session_id: Option<&str>,
     cwd: &Path,
     prompt: &str,
@@ -621,6 +752,13 @@ pub async fn run_turn(
     let elicitation_recorder = recorder.clone();
     let elicitation_task_id = recorder.task_id.clone();
     let elicitation_attempt_id = recorder.attempt_id.clone();
+    let notification_attempt_id = recorder.attempt_id.clone();
+    let notification_controls = turn_controls.clone();
+    let mut interrupt_receiver = turn_controls.register(&recorder.attempt_id);
+    let interrupt_sent = Arc::new(AtomicBool::new(false));
+    let interrupt_sent_for_turn = interrupt_sent.clone();
+    let live_session_id = Arc::new(Mutex::new(None::<String>));
+    let live_session_id_for_turn = live_session_id.clone();
     let prompt_recorder = recorder.clone();
     let existing_session_id = existing_session_id.map(str::to_owned);
     let cwd = cwd.to_path_buf();
@@ -631,6 +769,8 @@ pub async fn run_turn(
         .name("xpressclaw")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
+                notification_controls
+                    .observe_update(&notification_attempt_id, &notification.update);
                 notification_recorder
                     .record_notification(notification)
                     .map_err(agent_client_protocol::Error::into_internal_error)
@@ -785,6 +925,9 @@ pub async fn run_turn(
                 )
             };
 
+            let native_session_id = session_id.to_string();
+            *live_session_id_for_turn.lock().unwrap() = Some(native_session_id.clone());
+
             prompt_recorder
                 .record_session_controls(&config_options, modes.as_ref())
                 .map_err(agent_client_protocol::Error::into_internal_error)?;
@@ -903,30 +1046,64 @@ pub async fn run_turn(
                     attachment.mime_type,
                 ))
             }));
-            let response = connection
-                .send_request(PromptRequest::new(session_id.clone(), prompt_blocks))
-                .block_task()
-                .await?;
+            let prompt_request = connection
+                .send_request(PromptRequest::new(session_id.clone(), prompt_blocks));
+            // Persist only once the prompt has been dispatched. If startup is
+            // interrupted before this point, the next turn must replay the
+            // original prompt and its attachments instead of resuming an
+            // empty native session.
+            prompt_recorder
+                .persist_native_session(&native_session_id)
+                .map_err(agent_client_protocol::Error::into_internal_error)?;
+            let mut prompt_response = Box::pin(prompt_request.block_task());
+            let mut controls_open = true;
+            let response = loop {
+                tokio::select! {
+                    response = &mut prompt_response => break response?,
+                    interrupt = interrupt_receiver.recv(), if controls_open => {
+                        match interrupt {
+                            Some(()) => {
+                                interrupt_sent_for_turn.store(true, Ordering::SeqCst);
+                                connection.send_notification(CancelNotification::new(
+                                    session_id.clone(),
+                                ))?;
+                                controls_open = false;
+                            }
+                            None => controls_open = false,
+                        }
+                    }
+                }
+            };
+            let stop_reason = serde_json::to_value(response.stop_reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_string());
 
-            Ok((session_id.to_string(), response.stop_reason))
+            Ok((native_session_id, stop_reason))
         })
         .await;
 
     output_task.abort();
     let stderr = stderr.lock().unwrap().trim().to_string();
     let (summary, transcript) = recorder.finish()?;
-    let (session_id, stop_reason) = protocol_result.map_err(|error| {
-        let detail = if stderr.is_empty() {
-            error.to_string()
-        } else {
-            format!("{error}: {stderr}")
-        };
-        Error::Backend(format!("ACP turn failed: {detail}"))
-    })?;
-    let stop_reason = serde_json::to_value(stop_reason)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_string());
+    let interrupted = interrupt_sent.load(Ordering::SeqCst);
+    let (session_id, stop_reason) = match protocol_result {
+        Ok(result) => result,
+        Err(_) if interrupted => {
+            let session_id = live_session_id.lock().unwrap().clone().ok_or_else(|| {
+                Error::Backend("ACP turn was interrupted before session setup completed".into())
+            })?;
+            (session_id, "cancelled".to_string())
+        }
+        Err(error) => {
+            let detail = if stderr.is_empty() {
+                error.to_string()
+            } else {
+                format!("{error}: {stderr}")
+            };
+            return Err(Error::Backend(format!("ACP turn failed: {detail}")));
+        }
+    };
     let summary = if summary.is_empty() {
         format!("ACP turn finished ({stop_reason})")
     } else {
@@ -946,6 +1123,7 @@ pub async fn run_turn(
         summary,
         stop_reason,
         diagnostic,
+        interrupted,
     })
 }
 
@@ -1100,6 +1278,140 @@ mod tests {
 
     use crate::docker::manager::ContainerInfo;
 
+    #[test]
+    fn queued_guidance_interrupts_after_the_active_tool_finishes() {
+        let broker = AcpTurnControlBroker::new();
+        broker.begin_attempt("attempt-1");
+        let mut receiver = broker.register("attempt-1");
+        broker.observe_update(
+            "attempt-1",
+            &SessionUpdate::ToolCall(
+                ToolCall::new("tool-1", "Run tests").status(ToolCallStatus::InProgress),
+            ),
+        );
+
+        assert!(broker.request_interrupt("attempt-1", AcpInterruptMode::AfterTool));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        broker.observe_update(
+            "attempt-1",
+            &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "tool-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+        );
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert!(!broker.request_interrupt("attempt-1", AcpInterruptMode::Immediate));
+    }
+
+    #[test]
+    fn immediate_interrupt_is_retained_until_the_turn_connects() {
+        let broker = AcpTurnControlBroker::new();
+        broker.begin_attempt("attempt-1");
+        assert!(broker.request_interrupt("attempt-1", AcpInterruptMode::Immediate));
+        let mut receiver = broker.register("attempt-1");
+        assert_eq!(receiver.try_recv(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn acp_turn_sends_the_standard_cancel_notification() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        let attempt_id = recorder.attempt_id.clone();
+        let controls = Arc::new(AcpTurnControlBroker::new());
+        controls.begin_attempt(&attempt_id);
+        assert!(controls.request_interrupt(&attempt_id, AcpInterruptMode::Immediate));
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                match request["method"].as_str().unwrap() {
+                    "initialize" => {
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": InitializeResponse::new(ProtocolVersion::V1),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": NewSessionResponse::new("acp-session-cancel"),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        let line = requests.next_line().await.unwrap().unwrap();
+                        let cancellation: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(cancellation["method"], "session/cancel");
+                        assert_eq!(cancellation["params"]["sessionId"], "acp-session-cancel");
+                        assert!(cancellation.get("id").is_none());
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": PromptResponse::new(StopReason::Cancelled),
+                            }),
+                        )
+                        .await;
+                        break;
+                    }
+                    other => panic!("unexpected ACP method: {other}"),
+                }
+            }
+        });
+
+        let result = run_turn(
+            AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "test-container".to_string(),
+                    agent_id: "test-attempt".to_string(),
+                    status: "running".to_string(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            },
+            recorder,
+            Arc::new(AcpElicitationBroker::new()),
+            controls,
+            None,
+            Path::new("/workspace"),
+            "Do the work",
+            AcpTurnOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.interrupted);
+        assert_eq!(result.stop_reason, "cancelled");
+        assert_eq!(
+            SessionManager::new(db)
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("acp-session-cancel")
+        );
+        mock_agent.await.unwrap();
+    }
+
     #[tokio::test]
     async fn acp_turn_uses_the_standard_handshake_and_prompt() {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -1253,6 +1565,7 @@ mod tests {
             attached,
             recorder,
             Arc::new(AcpElicitationBroker::new()),
+            Arc::new(AcpTurnControlBroker::new()),
             None,
             Path::new("/workspace"),
             "Do the work",
@@ -1454,6 +1767,7 @@ mod tests {
                 attached,
                 recorder,
                 broker,
+                Arc::new(AcpTurnControlBroker::new()),
                 None,
                 Path::new("/workspace"),
                 "Choose the database",

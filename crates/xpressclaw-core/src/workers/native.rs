@@ -25,7 +25,9 @@ use crate::sessions::SessionManager;
 use crate::tasks::board::TaskBoard;
 use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
-use crate::workers::acp::{run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnOptions};
+use crate::workers::acp::{
+    run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnControlBroker, AcpTurnOptions,
+};
 use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
@@ -39,6 +41,7 @@ pub async fn start_dispatcher(
     initial_docker: Option<Arc<DockerManager>>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
     control_plane_port: u16,
 ) {
     info!("native attempt dispatcher started");
@@ -73,19 +76,27 @@ pub async fn start_dispatcher(
                 let config = config.read().unwrap().clone();
                 let event_bus = event_bus.clone();
                 let elicitation_broker = elicitation_broker.clone();
+                let turn_controls = turn_controls.clone();
+                if let Some(attempt_id) = item.attempt_id.as_deref() {
+                    turn_controls.begin_attempt(attempt_id);
+                }
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = execute_item(
+                    let result = execute_item(
                         db.clone(),
                         config,
                         docker,
                         event_bus.clone(),
                         elicitation_broker,
+                        turn_controls.clone(),
                         item.clone(),
                         control_plane_port,
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(attempt_id) = item.attempt_id.as_deref() {
+                        turn_controls.finish_attempt(attempt_id);
+                    }
+                    if let Err(error) = result {
                         error!(
                             queue_id = item.id,
                             task_id = item.task_id,
@@ -115,6 +126,7 @@ async fn execute_item(
     docker: Arc<DockerManager>,
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
     item: QueueItem,
     control_plane_port: u16,
 ) -> Result<()> {
@@ -132,7 +144,10 @@ async fn execute_item(
     let kind = resolve_runner_kind(agent)?;
     let resume_session_id = resume_session_id(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
-    let prompt = build_prompt(&db, &item, attempt_id)?;
+    let mut prompt = build_prompt(&db, &item, attempt_id)?;
+    if resume_session_id.is_none() {
+        prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
+    }
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE work_attempts SET runner = ?1, prompt = ?2 WHERE id = ?3",
@@ -141,13 +156,16 @@ async fn execute_item(
     })?;
 
     let sessions = SessionManager::new(db.clone());
-    sessions.transition_attempt(
+    let preparing = sessions.transition_attempt(
         attempt_id,
         "preparing",
         &format!("Preparing {kind}"),
         None,
         None,
     )?;
+    if attempt_is_terminal(&preparing.status) {
+        return Ok(());
+    }
     if let Some(conversation_id) = conversation_id(&db, &item.task_id) {
         event_bus.send(
             &conversation_id,
@@ -182,13 +200,16 @@ async fn execute_item(
         if let Some(local_image) = local_fallback {
             spec.image = local_image.to_string();
         } else {
-            sessions.transition_attempt(
+            let pulling = sessions.transition_attempt(
                 attempt_id,
                 "preparing",
                 &format!("Pulling {kind} runner image"),
                 None,
                 None,
             )?;
+            if attempt_is_terminal(&pulling.status) {
+                return Ok(());
+            }
             docker.pull_image(&spec.image).await?;
             if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
                 return Err(Error::Backend(format!(
@@ -197,6 +218,9 @@ async fn execute_item(
                 )));
             }
         }
+    }
+    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+        return Ok(());
     }
     let mut mcp_servers = configured_mcp_servers(&config, agent)?;
     let bundled_control_tools = docker
@@ -235,13 +259,17 @@ async fn execute_item(
     let workload_id = format!("attempt-{attempt_id}");
     let attached = docker.launch_attached(&workload_id, &spec).await?;
     sessions.set_container(attempt_id, &attached.info.container_id)?;
-    sessions.transition_attempt(
+    let running = sessions.transition_attempt(
         attempt_id,
         "running",
         &format!("{kind} is working over ACP"),
         None,
         None,
     )?;
+    if attempt_is_terminal(&running.status) {
+        let _ = docker.stop(&workload_id).await;
+        return Ok(());
+    }
 
     let attempt = sessions.get_attempt(attempt_id)?;
     let recorder = AcpEventRecorder::new(
@@ -255,6 +283,7 @@ async fn execute_item(
         attached,
         recorder,
         elicitation_broker,
+        turn_controls,
         resume_session_id.as_deref(),
         Path::new(&container_workspace),
         &prompt.content,
@@ -269,7 +298,38 @@ async fn execute_item(
     let _ = docker.stop(&workload_id).await;
     let turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
-    if current.status == "cancelled" {
+    if matches!(current.status.as_str(), "cancelled" | "interrupted") {
+        return Ok(());
+    }
+    if turn.interrupted {
+        sessions.add_artifact(
+            attempt_id,
+            "runner_output",
+            "Interrupted ACP event transcript",
+            Some(&turn.diagnostic),
+            None,
+            json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
+        )?;
+        sessions.set_native_session(attempt_id, &turn.session_id)?;
+        let interrupted = sessions.transition_attempt(
+            attempt_id,
+            "interrupted",
+            "Agent interrupted to apply new guidance",
+            None,
+            None,
+        )?;
+        if interrupted.status != "interrupted" {
+            return Ok(());
+        }
+        let queue = TaskQueue::new(db.clone());
+        queue.complete(item.id, "interrupted to apply new guidance")?;
+        let next_status = if queue.has_queued_for_task(&item.task_id)? {
+            "in_progress"
+        } else {
+            "pending"
+        };
+        board.update_status(&item.task_id, next_status, Some(&item.agent_id))?;
+        sessions.refresh_status(&item.agent_id)?;
         return Ok(());
     }
     sessions.add_artifact(
@@ -290,13 +350,16 @@ async fn execute_item(
         json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
     let completion_summary = truncate(&turn.summary, 2_000);
-    sessions.transition_attempt(
+    let completed = sessions.transition_attempt(
         attempt_id,
         "completed",
         &completion_summary,
         Some(&turn.summary),
         None,
     )?;
+    if completed.status != "completed" {
+        return Ok(());
+    }
     let queue = TaskQueue::new(db.clone());
     queue.complete(item.id, &turn.summary)?;
     if let Err(error) =
@@ -333,6 +396,10 @@ async fn execute_item(
     Ok(())
 }
 
+fn attempt_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+}
+
 fn fail_item(
     db: &Arc<Database>,
     item: &QueueItem,
@@ -345,7 +412,7 @@ fn fail_item(
             // Cancellation updates the durable queue/task state before it
             // stops the container. The waiter may then observe a Docker error;
             // do not overwrite the user's cancellation with a failure.
-            if attempt.status == "cancelled" {
+            if matches!(attempt.status.as_str(), "cancelled" | "interrupted") {
                 return Ok(());
             }
             let _ = sessions.transition_attempt(
@@ -473,12 +540,49 @@ struct AgentPrompt {
     attachments: Vec<PromptImageAttachment>,
 }
 
+fn prepend_unresumed_interrupted_prompt(
+    db: &Arc<Database>,
+    item: &QueueItem,
+    attempt_id: &str,
+    prompt: &mut AgentPrompt,
+) -> Result<()> {
+    let previous_prompt: Option<String> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT prompt FROM work_attempts
+             WHERE task_id = ?1 AND id != ?2 AND status = 'interrupted'
+               AND native_session_id IS NULL AND prompt != ''
+             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
+            rusqlite::params![item.task_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    let Some(previous_prompt) = previous_prompt else {
+        return Ok(());
+    };
+    if prompt.content.trim().is_empty() {
+        prompt.content = previous_prompt;
+    } else if prompt.content != previous_prompt
+        && !prompt
+            .content
+            .starts_with(&format!("{previous_prompt}\n\n"))
+    {
+        prompt.content = format!(
+            "{previous_prompt}\n\nAdditional guidance from the user:\n{}",
+            prompt.content
+        );
+    }
+    Ok(())
+}
+
 fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Result<AgentPrompt> {
     let task = TaskBoard::new(db.clone()).get(&item.task_id)?;
     let previous_started: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT started_at FROM work_attempts
                  WHERE task_id = ?1 AND id != ?2 AND started_at IS NOT NULL
+                   AND NOT (status = 'interrupted' AND native_session_id IS NULL)
                  ORDER BY created_at DESC LIMIT 1",
             rusqlite::params![item.task_id, attempt_id],
             |row| row.get(0),
@@ -539,7 +643,8 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
              FROM task_dependencies d
              JOIN work_attempts a ON a.task_id = d.depends_on_id
              WHERE d.task_id = ?1 AND a.session_id = ?2 AND a.runner = ?3
-               AND a.native_session_id IS NOT NULL AND a.status != 'cancelled'
+               AND a.native_session_id IS NOT NULL
+               AND a.status IN ('completed', 'interrupted')
              ORDER BY COALESCE(a.completed_at, a.created_at) DESC LIMIT 1",
             rusqlite::params![item.task_id, item.agent_id, runner],
             |row| row.get(0),
@@ -555,7 +660,8 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
         conn.query_row(
             "SELECT native_session_id FROM work_attempts
              WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
-               AND native_session_id IS NOT NULL AND status != 'cancelled'
+               AND native_session_id IS NOT NULL
+               AND status IN ('completed', 'interrupted')
              ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
             rusqlite::params![item.task_id, item.agent_id, runner],
             |row| row.get(0),
@@ -581,7 +687,8 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
         conn.query_row(
             "SELECT native_session_id FROM work_attempts
              WHERE session_id = ?1 AND runner = ?2
-               AND native_session_id IS NOT NULL AND status != 'cancelled'
+               AND native_session_id IS NOT NULL
+               AND status IN ('completed', 'interrupted')
              ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
             rusqlite::params![item.agent_id, runner],
             |row| row.get(0),
@@ -1300,6 +1407,81 @@ mod tests {
     }
 
     #[test]
+    fn startup_interrupt_preserves_original_messages_and_images() {
+        use crate::tasks::attachments::DecodedImageAttachment;
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let board = TaskBoard::new(db.clone());
+        SessionManager::new(db.clone())
+            .ensure("atlas", Some("atlas"))
+            .unwrap();
+        let task = board
+            .create(&CreateTask {
+                title: "Inspect the screenshot".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message_with_attachments(
+                &task.id,
+                "user",
+                "Original request",
+                &[DecodedImageAttachment {
+                    name: "screen.png".into(),
+                    mime_type: "image/png".into(),
+                    data: b"original image".to_vec(),
+                }],
+            )
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let first = queue.claim("atlas").unwrap().unwrap();
+        let first_attempt_id = first.attempt_id.as_deref().unwrap();
+        let first_prompt = build_prompt(&db, &first, first_attempt_id).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET prompt = ?1 WHERE id = ?2",
+                rusqlite::params![first_prompt.content, first_attempt_id],
+            )
+        })
+        .unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                first_attempt_id,
+                "interrupted",
+                "Stopped during startup",
+                None,
+                None,
+            )
+            .unwrap();
+        queue.complete(first.id, "interrupted").unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(&task.id, "user", "New guidance")
+            .unwrap();
+        let continuation = queue
+            .enqueue_continuation(&task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        let continuation_attempt_id = continuation.attempt_id.as_deref().unwrap();
+
+        let mut prompt = build_prompt(&db, &continuation, continuation_attempt_id).unwrap();
+        prepend_unresumed_interrupted_prompt(
+            &db,
+            &continuation,
+            continuation_attempt_id,
+            &mut prompt,
+        )
+        .unwrap();
+
+        assert_eq!(prompt.content, "Original request\n\nNew guidance");
+        assert_eq!(prompt.attachments.len(), 1);
+        assert_eq!(prompt.attachments[0].name, "screen.png");
+        assert_eq!(prompt.attachments[0].data, b"original image");
+    }
+
+    #[test]
     fn selects_project_dependency_and_fresh_conversation_contexts() {
         use crate::tasks::board::CreateTask;
 
@@ -1328,6 +1510,35 @@ mod tests {
         .unwrap();
         SessionManager::new(db.clone())
             .set_native_session(first_attempt, "thread-1")
+            .unwrap();
+
+        let failed = board
+            .create(&CreateTask {
+                title: "Failed setup".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let failed_item = queue.enqueue(&failed.id, "atlas").unwrap();
+        let failed_attempt = failed_item.attempt_id.as_deref().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET runner = 'codex' WHERE id = ?1",
+                [failed_attempt],
+            )
+        })
+        .unwrap();
+        SessionManager::new(db.clone())
+            .set_native_session(failed_attempt, "failed-thread")
+            .unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(
+                failed_attempt,
+                "failed",
+                "Setup failed",
+                None,
+                Some("bad config"),
+            )
             .unwrap();
 
         let regular = board
