@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
 	import { harnessMark, statusColor } from '$lib/utils';
+	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	import SessionTab from './SessionTab.svelte';
 	import RunnerTab from './RunnerTab.svelte';
@@ -10,12 +12,12 @@
 	import TasksTab from './TasksTab.svelte';
 	import SchedulesTab from './SchedulesTab.svelte';
 
-	let { agentId }: { agentId: string } = $props();
+	let { agentId, section = 'session' }: { agentId: string; section?: ProjectSection } = $props();
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
 	let agentConfig = $state<LiveConfig['agents'][0] | null>(null);
-	let activeTab = $state('session');
+	let activeTab = $derived(section);
 	let saveMessage = $state('');
 	let showDeleteConfirm = $state(false);
 	let deleting = $state(false);
@@ -25,7 +27,7 @@
 
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-	const tabs = [
+	const tabs: { id: ProjectSection; label: string }[] = [
 		{ id: 'session', label: 'Work' },
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Automations' },
@@ -94,6 +96,10 @@
 		saveSignal++;
 	}
 
+	function selectTab(tab: ProjectSection) {
+		goto(projectPath(agentId, tab), { keepFocus: true, noScroll: true });
+	}
+
 	async function handleSave(data: Parameters<typeof agents.updateConfig>[1]) {
 		if (!agent) return;
 		saving = true;
@@ -157,10 +163,13 @@
 	<!-- Tab bar -->
 	{#if agent}
 		<div class="shrink-0 border-b border-border px-4">
-			<div class="flex gap-0 -mb-px overflow-x-auto scrollbar-hide">
+			<div class="flex gap-0 -mb-px overflow-x-auto scrollbar-hide" role="tablist" aria-label="Project sections">
 				{#each tabs as tab}
 					<button
-						onclick={() => activeTab = tab.id}
+						type="button"
+						role="tab"
+						aria-selected={activeTab === tab.id}
+						onclick={() => selectTab(tab.id)}
 						class="px-3 py-2 text-xs whitespace-nowrap transition-colors border-b-2 {activeTab === tab.id
 							? 'border-primary text-foreground font-medium'
 							: 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'}">

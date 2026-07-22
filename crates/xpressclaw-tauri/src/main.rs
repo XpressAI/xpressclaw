@@ -64,12 +64,15 @@ fn main() {
 
     builder
         .manage(SidecarState(Mutex::new(None)))
-        // Window close (Cmd-W / red X) → hide to tray instead of quitting.
+        // Window close (Cmd-W / red X) hides the main window to the tray.
+        // Secondary workspace windows must be allowed to close normally.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
-                info!("window hidden to tray");
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    info!("window hidden to tray");
+                }
             }
         })
         // Handle our custom "quit" menu item (Cmd-Q on macOS)
@@ -242,6 +245,9 @@ fn main() {
                         if let Err(error) = enable_image_paste_capability(&handle, port) {
                             warn!(%error, "failed to enable image paste capability");
                         }
+                        if let Err(error) = enable_workspace_window_capability(&handle, port) {
+                            warn!(%error, "failed to enable workspace window capability");
+                        }
                         let url = format!("http://localhost:{port}");
                         let _ = window.navigate(url.parse().unwrap());
                     }
@@ -354,7 +360,7 @@ fn sidecar_binary_name() -> String {
     }
 }
 
-fn image_paste_origins(port: u16) -> Vec<String> {
+fn localhost_origins(port: u16) -> Vec<String> {
     let mut origins = vec![format!("http://localhost:{port}/*")];
     if cfg!(debug_assertions) && port != DEV_FRONTEND_PORT {
         origins.push(format!("http://localhost:{DEV_FRONTEND_PORT}/*"));
@@ -366,11 +372,26 @@ fn enable_image_paste_capability(app: &tauri::AppHandle, port: u16) -> tauri::Re
     let mut capability = tauri::ipc::CapabilityBuilder::new("localhost-image-paste")
         .local(false)
         .window("main")
+        .window("workspace-*")
         .permission("clipboard-manager:allow-read-image")
         .permission("core:image:allow-rgba")
         .permission("core:image:allow-size")
         .permission("core:resources:allow-close");
-    for origin in image_paste_origins(port) {
+    for origin in localhost_origins(port) {
+        capability = capability.remote(origin);
+    }
+    app.add_capability(capability)
+}
+
+fn enable_workspace_window_capability(app: &tauri::AppHandle, port: u16) -> tauri::Result<()> {
+    let mut capability = tauri::ipc::CapabilityBuilder::new("localhost-workspace-windows")
+        .local(false)
+        .window("main")
+        .window("workspace-*")
+        .permission("core:webview:allow-create-webview-window")
+        .permission("core:window:allow-create")
+        .permission("core:window:allow-set-focus");
+    for origin in localhost_origins(port) {
         capability = capability.remote(origin);
     }
     app.add_capability(capability)
@@ -413,8 +434,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn image_paste_origins_are_port_scoped() {
-        let origins = image_paste_origins(19_435);
+    fn localhost_origins_are_port_scoped() {
+        let origins = localhost_origins(19_435);
         assert!(origins.contains(&"http://localhost:19435/*".to_string()));
         assert!(!origins.iter().any(|origin| origin.contains(":*")));
     }

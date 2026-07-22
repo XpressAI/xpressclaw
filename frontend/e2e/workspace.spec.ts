@@ -123,8 +123,39 @@ async function mockApi(
 			response = { available: true, installed: true, can_start: false };
 		} else if (path === '/api/agents') {
 			response = [agent];
+		} else if (path === `/api/agents/${agentId}`) {
+			response = agent;
 		} else if (path === '/api/workflows') {
 			response = [];
+		} else if (path === '/api/schedules') {
+			response = [];
+		} else if (path === '/api/setup/config') {
+			response = {
+				llm: { providers: [] },
+				agents: [{
+					name: agent.name,
+					title: agent.title,
+					backend: agent.backend,
+					model: null,
+					runner: {
+						kind: 'codex',
+						image: 'xpressclaw-runner-codex:latest',
+						workspace: '/workspace',
+						model: null,
+						session_config: {},
+						mcp_servers: [],
+						environment: {},
+						command: [],
+						subscription_auth: true,
+						container_engine: 'none',
+					},
+					tools: [],
+					skills: [],
+					volumes: [],
+				}],
+				system: { budget: { daily: '0', monthly: null, on_exceeded: 'warn' } },
+				mcp_servers: [],
+			};
 		} else if (path === '/api/tasks') {
 			response = url.searchParams.has('parent_task_id')
 				? { tasks: [], counts: { ...counts, completed: 0 } }
@@ -444,4 +475,109 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await expect(mobile.getByRole('button', { name: 'Open project switcher' })).toBeVisible();
 	await mobile.close();
+});
+
+test('project context menus open sections and separate windows', async ({ page }) => {
+	await mockApi(page);
+	await page.goto('/');
+
+	const projectLink = page.locator('aside').first().locator(`a[href="/agents/${agentId}"]`);
+	await projectLink.click({ button: 'right' });
+	const projectMenu = page.getByRole('menu', { name: 'Browser-tested workspace actions' });
+	await expect(projectMenu).toBeVisible();
+	await expect(projectMenu.getByRole('menuitem')).toHaveText([
+		'Open in New Window',
+		'Open Tasks',
+		'Open Automations',
+		'Open Agent',
+		'Open Environment',
+	]);
+	await projectMenu.getByRole('menuitem', { name: 'Open Automations' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=schedules`);
+	await expect(page.getByRole('tab', { name: 'Automations' })).toHaveAttribute('aria-selected', 'true');
+
+	await projectLink.click({ button: 'right' });
+	const popupPromise = page.waitForEvent('popup');
+	await page.getByRole('menuitem', { name: 'Open in New Window' }).click();
+	const popup = await popupPromise;
+	await expect.poll(() => new URL(popup.url()).pathname).toBe(`/agents/${agentId}`);
+	await expect(popup.locator('[data-workspace-pane] [data-workspace-tab]')).toHaveCount(1);
+	await popup.close();
+});
+
+test('tab context menus close one, other, or all tabs within a pane', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+	const sidebar = page.locator('aside').first();
+	const tabs = page.locator('[data-workspace-pane] [data-workspace-tab]');
+
+	await sidebar.locator('a[href="/agents"]').click();
+	await sidebar.locator('a[href="/settings"]').click();
+	await expect(tabs).toHaveCount(3);
+
+	await tabs.filter({ has: page.locator('[title="Projects"]') }).click({ button: 'right' });
+	await page.getByRole('menuitem', { name: 'Close Other Tabs' }).click();
+	await expect(tabs).toHaveCount(1);
+	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Projects');
+	await expect(page).toHaveURL('/agents');
+
+	await tabs.click({ button: 'right' });
+	await expect(page.getByRole('menuitem', { name: 'Close Other Tabs' })).toBeDisabled();
+	await page.keyboard.press('Escape');
+
+	await sidebar.locator('a[href="/settings"]').click();
+	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
+	await page.getByRole('menuitem', { name: 'Close Tab', exact: true }).click();
+	await expect(tabs).toHaveCount(1);
+	await expect(page).toHaveURL('/agents');
+
+	await sidebar.locator('a[href="/settings"]').click();
+	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
+	await page.getByRole('menuitem', { name: 'Close All Tabs' }).click();
+	await expect(tabs).toHaveCount(1);
+	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'New work');
+	await expect(page).toHaveURL('/');
+});
+
+test('tab context menus open isolated browser windows', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.locator('[data-workspace-pane] [data-workspace-tab]').click({ button: 'right' });
+	const popupPromise = page.waitForEvent('popup');
+	await page.getByRole('menuitem', { name: 'Open in New Window' }).click();
+	const popup = await popupPromise;
+	await expect.poll(() => new URL(popup.url()).pathname).toBe(`/tasks/${taskId}`);
+	await expect(popup.locator('[data-workspace-pane] [data-workspace-tab]')).toHaveCount(1);
+	await popup.close();
+});
+
+test('tab context menus create native webview windows in the desktop app', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __workspaceWindowCalls: unknown[] }).__workspaceWindowCalls = [];
+		(window as unknown as {
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		}).__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				(window as unknown as { __workspaceWindowCalls: unknown[] }).__workspaceWindowCalls.push({ command, args });
+				return null;
+			},
+		};
+	});
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.locator('[data-workspace-pane] [data-workspace-tab]').click({ button: 'right' });
+	await page.getByRole('menuitem', { name: 'Open in New Window' }).click();
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __workspaceWindowCalls: unknown[] }
+	).__workspaceWindowCalls.length)).toBe(1);
+	const call = await page.evaluate(() => (
+		window as unknown as { __workspaceWindowCalls: { command: string; args: { options: { label: string; url: string } } }[] }
+	).__workspaceWindowCalls[0]);
+	expect(call.command).toBe('plugin:webview|create_webview_window');
+	expect(call.args.options.label).toMatch(/^workspace-/);
+	expect(new URL(call.args.options.url).pathname).toBe(`/tasks/${taskId}`);
+	expect(new URL(call.args.options.url).searchParams.get('_xpressclaw_window')).toBe(call.args.options.label);
 });

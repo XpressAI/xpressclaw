@@ -10,6 +10,7 @@
 		onfocus,
 		onactivate,
 		onclose,
+		oncontext,
 		onsplit,
 	}: {
 		pane: WorkspacePaneState;
@@ -19,6 +20,7 @@
 		onfocus: () => void;
 		onactivate: (tab: WorkspaceTab) => void;
 		onclose: (tab: WorkspaceTab) => void;
+		oncontext: (event: MouseEvent, tab: WorkspaceTab) => void;
 		onsplit: () => void;
 	} = $props();
 
@@ -43,7 +45,13 @@
 	<div class="hidden h-9 shrink-0 items-stretch border-b border-border bg-card/35 lg:flex">
 		<div class="flex min-w-0 flex-1 overflow-x-auto scrollbar-hide">
 			{#each pane.tabs as tab (tab.id)}
-				<div class="group flex min-w-0 max-w-56 shrink-0 items-center border-r border-border/70 {tab.id === pane.activeTabId ? 'bg-background text-foreground' : 'text-muted-foreground hover:bg-accent/30 hover:text-foreground'}">
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div
+					data-workspace-tab
+					data-workspace-tab-title={tab.title}
+					oncontextmenu={(event) => oncontext(event, tab)}
+					class="group flex min-w-0 max-w-56 shrink-0 items-center border-r border-border/70 {tab.id === pane.activeTabId ? 'bg-background text-foreground' : 'text-muted-foreground hover:bg-accent/30 hover:text-foreground'}"
+				>
 					<button type="button" onclick={() => onactivate(tab)} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-left text-xs" title={tab.title}>
 						{#if tab.status}<span class="h-1.5 w-1.5 shrink-0 rounded-full {statusClass(tab.status)}"></span>{/if}
 						<span class="truncate">{tab.title}</span>

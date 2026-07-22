@@ -5,26 +5,42 @@
 	import { page } from '$app/stores';
 	import { agents, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
 	import type { Agent, Task, Workflow } from '$lib/api';
+	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
+	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
 	import { harnessMark, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
 		describeWorkspacePath,
+		projectPath,
 		sameWorkspaceTab,
 		statusPriority,
 		validWorkspacePane,
 		workspaceId,
 		workspacePath,
 		type WorkspacePaneState,
+		type ProjectSection,
 		type WorkspaceTab,
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
+	import ContextMenu from '../ContextMenu.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
 
 	let { children }: { children: Snippet } = $props();
+	type WorkspaceContextMenu =
+		| { kind: 'project'; agent: Agent; x: number; y: number }
+		| { kind: 'tab'; paneId: string; tab: WorkspaceTab; x: number; y: number };
 
-	const WORKSPACE_STORAGE_KEY = 'xpressclaw.workspace.v1';
+	const WORKSPACE_WINDOW_SESSION_KEY = 'xpressclaw.workspace.window-id';
+	const requestedWorkspaceWindowId = validWorkspaceWindowId($page.url.searchParams.get(WORKSPACE_WINDOW_PARAM));
+	if (requestedWorkspaceWindowId) sessionStorage.setItem(WORKSPACE_WINDOW_SESSION_KEY, requestedWorkspaceWindowId);
+	const workspaceWindowId = requestedWorkspaceWindowId
+		?? validWorkspaceWindowId(sessionStorage.getItem(WORKSPACE_WINDOW_SESSION_KEY));
+	const WORKSPACE_STORAGE_KEY = workspaceWindowId
+		? `xpressclaw.workspace.v1.${workspaceWindowId}`
+		: 'xpressclaw.workspace.v1';
 	const MAX_PANES = 4;
-	const initialDescription = describeWorkspacePath($page.url.pathname);
+	const initialRoute = currentRoute();
+	const initialDescription = describeWorkspacePath(initialRoute);
 	const initialTab: WorkspaceTab = { id: 'initial-tab', status: null, ...initialDescription };
 
 	let panes = $state<WorkspacePaneState[]>([
@@ -39,6 +55,7 @@
 	let agentList = $state<Agent[]>([]);
 	let taskList = $state<Task[]>([]);
 	let workflowList = $state<Workflow[]>([]);
+	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 
 	let dockerAvailable = $state(true);
 	let dockerInstalled = $state(true);
@@ -75,11 +92,26 @@
 	];
 
 	$effect(() => {
-		const pathname = $page.url.pathname;
-		if (!workspaceReady || !workspacePath(pathname) || pathname === lastSyncedPath) return;
-		lastSyncedPath = pathname;
-		openPath(pathname, false);
+		const route = currentRoute();
+		if (!workspaceReady || !workspacePath(route) || route === lastSyncedPath) return;
+		lastSyncedPath = route;
+		openPath(route, false);
 	});
+
+	function validWorkspaceWindowId(value: string | null): string | null {
+		return value && /^workspace-\d+-\d+$/.test(value) ? value : null;
+	}
+
+	function currentRoute(): string {
+		const search = new URLSearchParams($page.url.search);
+		search.delete(WORKSPACE_WINDOW_PARAM);
+		const query = search.toString();
+		return `${$page.url.pathname}${query ? `?${query}` : ''}${$page.url.hash}`;
+	}
+
+	function workspaceStateStorage(): Storage {
+		return workspaceWindowId ? sessionStorage : localStorage;
+	}
 
 	function activeTabFor(pane: WorkspacePaneState): WorkspaceTab {
 		return pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0];
@@ -88,7 +120,7 @@
 	function persistWorkspace() {
 		if (!workspaceReady) return;
 		try {
-			localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify({ panes, focusedPaneId }));
+			workspaceStateStorage().setItem(WORKSPACE_STORAGE_KEY, JSON.stringify({ panes, focusedPaneId }));
 			localStorage.setItem('xpressclaw.sidebar.collapsed', String(sidebarCollapsed));
 		} catch {}
 	}
@@ -120,23 +152,23 @@
 		persistWorkspace();
 	}
 
-	function openPath(pathname: string, navigate = true) {
-		if (!workspacePath(pathname)) return;
+	function openPath(route: string, navigate = true) {
+		if (!workspacePath(route)) return;
 		let paneIndex = Math.max(0, panes.findIndex((pane) => pane.id === focusedPaneId));
-		let tabIndex = panes[paneIndex]?.tabs.findIndex((tab) => sameWorkspaceTab(tab, pathname)) ?? -1;
+		let tabIndex = panes[paneIndex]?.tabs.findIndex((tab) => sameWorkspaceTab(tab, route)) ?? -1;
 
 		if (tabIndex < 0) {
-			const existingPaneIndex = panes.findIndex((pane) => pane.tabs.some((tab) => sameWorkspaceTab(tab, pathname)));
+			const existingPaneIndex = panes.findIndex((pane) => pane.tabs.some((tab) => sameWorkspaceTab(tab, route)));
 			if (existingPaneIndex >= 0) {
 				paneIndex = existingPaneIndex;
-				tabIndex = panes[paneIndex].tabs.findIndex((tab) => sameWorkspaceTab(tab, pathname));
+				tabIndex = panes[paneIndex].tabs.findIndex((tab) => sameWorkspaceTab(tab, route));
 			}
 		}
 
 		if (tabIndex >= 0) {
 			const pane = panes[paneIndex];
 			const existing = pane.tabs[tabIndex];
-			const updated = decorateTab({ ...existing, ...describeWorkspacePath(pathname) });
+			const updated = decorateTab({ ...existing, ...describeWorkspacePath(route) });
 			panes = panes.map((candidate, index) => index === paneIndex ? {
 				...candidate,
 				tabs: candidate.tabs.map((tab) => tab.id === existing.id ? updated : tab),
@@ -144,7 +176,7 @@
 			} : candidate);
 			focusedPaneId = pane.id;
 		} else {
-			const tab = decorateTab(createWorkspaceTab(pathname));
+			const tab = decorateTab(createWorkspaceTab(route));
 			const pane = panes[paneIndex];
 			panes = panes.map((candidate, index) => index === paneIndex
 				? { ...candidate, tabs: [...candidate.tabs, tab], activeTabId: tab.id }
@@ -153,9 +185,9 @@
 		}
 
 		persistWorkspace();
-		if (navigate && $page.url.pathname !== pathname) {
-			lastSyncedPath = pathname;
-			goto(pathname, { keepFocus: true, noScroll: true });
+		if (navigate && currentRoute() !== route) {
+			lastSyncedPath = route;
+			goto(route, { keepFocus: true, noScroll: true });
 		}
 	}
 
@@ -163,7 +195,7 @@
 		panes = panes.map((pane) => pane.id === paneId ? { ...pane, activeTabId: tab.id } : pane);
 		focusedPaneId = paneId;
 		persistWorkspace();
-		if ($page.url.pathname !== tab.path) {
+		if (currentRoute() !== tab.path) {
 			lastSyncedPath = tab.path;
 			goto(tab.path, { keepFocus: true, noScroll: true });
 		}
@@ -175,7 +207,7 @@
 		const pane = panes.find((candidate) => candidate.id === paneId);
 		const tab = pane ? activeTabFor(pane) : null;
 		persistWorkspace();
-		if (tab && $page.url.pathname !== tab.path) {
+		if (tab && currentRoute() !== tab.path) {
 			lastSyncedPath = tab.path;
 			goto(tab.path, { replaceState: true, keepFocus: true, noScroll: true });
 		}
@@ -205,10 +237,104 @@
 		persistWorkspace();
 		const nextFocusedPane = panes.find((candidate) => candidate.id === focusedPaneId) ?? panes[0];
 		const nextTab = activeTabFor(nextFocusedPane);
-		if ($page.url.pathname !== nextTab.path) {
+		if (currentRoute() !== nextTab.path) {
 			lastSyncedPath = nextTab.path;
 			goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
 		}
+	}
+
+	function closeOtherTabs(paneId: string, tab: WorkspaceTab) {
+		const pane = panes.find((candidate) => candidate.id === paneId);
+		const target = pane?.tabs.find((candidate) => candidate.id === tab.id);
+		if (!pane || !target || pane.tabs.length <= 1) return;
+
+		panes = panes.map((candidate) => candidate.id === paneId
+			? { ...candidate, tabs: [target], activeTabId: target.id }
+			: candidate);
+		focusedPaneId = paneId;
+		persistWorkspace();
+		if (currentRoute() !== target.path) {
+			lastSyncedPath = target.path;
+			goto(target.path, { replaceState: true, keepFocus: true, noScroll: true });
+		}
+	}
+
+	function closeAllTabs(paneId: string) {
+		const paneIndex = panes.findIndex((pane) => pane.id === paneId);
+		if (paneIndex < 0) return;
+
+		if (panes.length > 1) {
+			panes = panes.filter((pane) => pane.id !== paneId);
+			focusedPaneId = panes[Math.min(paneIndex, panes.length - 1)].id;
+		} else {
+			const pane = panes[0];
+			const home = createWorkspaceTab('/');
+			panes = [{ ...pane, tabs: [home], activeTabId: home.id }];
+			focusedPaneId = pane.id;
+		}
+
+		persistWorkspace();
+		const nextPane = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
+		const nextTab = activeTabFor(nextPane);
+		if (currentRoute() !== nextTab.path) {
+			lastSyncedPath = nextTab.path;
+			goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
+		}
+	}
+
+	function showProjectContextMenu(event: MouseEvent, agent: Agent) {
+		event.preventDefault();
+		event.stopPropagation();
+		contextMenu = { kind: 'project', agent, x: event.clientX, y: event.clientY };
+	}
+
+	function showTabContextMenu(event: MouseEvent, paneId: string, tab: WorkspaceTab) {
+		event.preventDefault();
+		event.stopPropagation();
+		contextMenu = { kind: 'tab', paneId, tab, x: event.clientX, y: event.clientY };
+	}
+
+	function contextMenuItems(target: WorkspaceContextMenu): ContextMenuItem[] {
+		if (target.kind === 'project') return PROJECT_CONTEXT_MENU_ITEMS;
+		const pane = panes.find((candidate) => candidate.id === target.paneId);
+		return [
+			{ id: 'close-tab', label: 'Close Tab' },
+			{ id: 'close-other-tabs', label: 'Close Other Tabs', disabled: !pane || pane.tabs.length <= 1 },
+			{ id: 'close-all-tabs', label: 'Close All Tabs' },
+			{ id: 'open-new-window', label: 'Open in New Window', separatorBefore: true },
+		];
+	}
+
+	function launchWorkspaceWindow(path: string, title: string) {
+		void openWorkspaceWindow(path, title).catch((error) => {
+			console.error('failed to open workspace window', error);
+			window.alert(error instanceof Error ? error.message : 'Could not open the window.');
+		});
+	}
+
+	function selectContextMenuItem(target: WorkspaceContextMenu, action: string) {
+		if (target.kind === 'tab') {
+			if (action === 'close-tab') closeTab(target.paneId, target.tab);
+			else if (action === 'close-other-tabs') closeOtherTabs(target.paneId, target.tab);
+			else if (action === 'close-all-tabs') closeAllTabs(target.paneId);
+			else if (action === 'open-new-window') launchWorkspaceWindow(target.tab.path, target.tab.title);
+			return;
+		}
+
+		mobileMenuOpen = false;
+		if (action === 'open-new-window') {
+			launchWorkspaceWindow(projectPath(target.agent.id), target.agent.title || target.agent.name);
+			return;
+		}
+
+		const sections: Record<string, ProjectSection> = {
+			'open-tasks': 'tasks',
+			'open-schedules': 'schedules',
+			'open-runner': 'runner',
+			'open-workspace': 'workspace',
+		};
+		const section = sections[action];
+		if (section) openPath(projectPath(target.agent.id, section));
 	}
 
 	function splitPane(paneId: string) {
@@ -364,7 +490,10 @@
 	onMount(() => {
 		let restored = false;
 		try {
-			const saved = JSON.parse(localStorage.getItem(WORKSPACE_STORAGE_KEY) ?? 'null') as { panes?: unknown[]; focusedPaneId?: string } | null;
+			if (requestedWorkspaceWindowId) {
+				window.history.replaceState(window.history.state, '', currentRoute());
+			}
+			const saved = JSON.parse(workspaceStateStorage().getItem(WORKSPACE_STORAGE_KEY) ?? 'null') as { panes?: unknown[]; focusedPaneId?: string } | null;
 			const savedPanes = saved?.panes?.filter(validWorkspacePane).slice(0, MAX_PANES) ?? [];
 			if (savedPanes.length > 0) {
 				panes = savedPanes.map((pane) => ({
@@ -378,14 +507,14 @@
 		} catch {}
 
 		workspaceReady = true;
-		const pathname = $page.url.pathname;
-		if (restored && pathname === '/') {
+		const route = currentRoute();
+		if (restored && route === '/') {
 			const restoredTab = activeTabFor(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 			lastSyncedPath = restoredTab.path;
-			if (restoredTab.path !== pathname) goto(restoredTab.path, { replaceState: true, noScroll: true });
+			if (restoredTab.path !== route) goto(restoredTab.path, { replaceState: true, noScroll: true });
 		} else {
-			lastSyncedPath = pathname;
-			openPath(pathname, false);
+			lastSyncedPath = route;
+			openPath(route, false);
 		}
 
 		loadWorkspaceSummary();
@@ -414,7 +543,7 @@
 				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
 				{#each agentList as agent (agent.id)}
 					{@const status = projectStatus(agent)}
-					<a href="/agents/{agent.id}" class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {statusLabel(status)}">
+					<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {statusLabel(status)}">
 						{harnessMark(agent.backend)}
 						<span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(status)}"></span>
 					</a>
@@ -450,7 +579,7 @@
 				<div class="space-y-0.5">
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
-						<a href="/agents/{agent.id}" class={linkClass(projectFocused(agent))}>
+						<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}>
 							<span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
 							<span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block text-[10px] font-normal text-muted-foreground">{statusLabel(status)}</span></span>
 							<span class="h-2 w-2 shrink-0 rounded-full {statusDot(status)}"></span>
@@ -484,7 +613,13 @@
 		{#if workspacePath($page.url.pathname)}
 			<div class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-card/35 lg:hidden scrollbar-hide">
 				{#each openTabs as item (item.tab.id)}
-					<div class="group flex max-w-52 shrink-0 items-center border-r border-border/70 {item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId ? 'bg-background text-foreground' : 'text-muted-foreground'}">
+					<!-- svelte-ignore a11y_no_static_element_interactions -->
+					<div
+						data-workspace-tab
+						data-workspace-tab-title={item.tab.title}
+						oncontextmenu={(event) => showTabContextMenu(event, item.paneId, item.tab)}
+						class="group flex max-w-52 shrink-0 items-center border-r border-border/70 {item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId ? 'bg-background text-foreground' : 'text-muted-foreground'}"
+					>
 						<button type="button" onclick={() => activateTab(item.paneId, item.tab)} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-xs">
 							{#if item.tab.status}<span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(item.tab.status)}"></span>{/if}<span class="truncate">{item.tab.title}</span>
 						</button>
@@ -504,6 +639,7 @@
 							onfocus={() => focusPane(pane.id)}
 							onactivate={(tab) => activateTab(pane.id, tab)}
 							onclose={(tab) => closeTab(pane.id, tab)}
+							oncontext={(event, tab) => showTabContextMenu(event, pane.id, tab)}
 							onsplit={() => splitPane(pane.id)}
 						/>
 					</div>
@@ -531,7 +667,7 @@
 			<div class="flex-1 space-y-1 overflow-y-auto">
 				{#each agentList as agent (agent.id)}
 					{@const status = projectStatus(agent)}
-					<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
+					<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
 				{/each}
 			</div>
 			<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
@@ -544,6 +680,17 @@
 		<a href={item.href} class="flex flex-col items-center justify-center gap-1 text-[10px] {tabCategory(focusedTab?.kind) === tabCategory(item.kind) ? 'text-primary' : 'text-muted-foreground'}"><svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d={item.icon} /></svg><span>{item.label}</span></a>
 	{/each}
 </nav>
+
+{#if contextMenu}
+	<ContextMenu
+		x={contextMenu.x}
+		y={contextMenu.y}
+		label={contextMenu.kind === 'project' ? `${contextMenu.agent.title || contextMenu.agent.name} actions` : `${contextMenu.tab.title} tab actions`}
+		items={contextMenuItems(contextMenu)}
+		onselect={(action) => selectContextMenuItem(contextMenu!, action)}
+		onclose={() => (contextMenu = null)}
+	/>
+{/if}
 
 {#if !serverConnected}
 	<div class="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm"><div class="mx-4 w-full max-w-xs space-y-3 rounded-xl border border-border bg-card p-6 text-center shadow-2xl"><div class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-amber-500/10"><svg class="h-5 w-5 animate-pulse text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" /></svg></div><h3 class="text-sm font-semibold">Reconnecting…</h3><p class="text-xs text-muted-foreground">Lost connection to the server. XpressClaw will reconnect automatically.</p></div></div>
