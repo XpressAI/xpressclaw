@@ -1,12 +1,18 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { agents } from '$lib/api';
 	import type { Agent } from '$lib/api';
+	import ContextMenu from '$lib/components/ContextMenu.svelte';
+	import { PROJECT_CONTEXT_MENU_ITEMS } from '$lib/contextMenu';
+	import { openWorkspaceWindow } from '$lib/openWorkspaceWindow';
 	import { harnessMark, statusColor, timeAgo } from '$lib/utils';
+	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	let agentList = $state<Agent[]>([]);
 	let loading = $state(true);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let projectMenu = $state<{ agent: Agent; x: number; y: number } | null>(null);
 
 	onMount(async () => {
 		agentList = await agents.list().catch(() => []);
@@ -20,6 +26,31 @@
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
 	});
+
+	function showProjectMenu(event: MouseEvent, agent: Agent) {
+		event.preventDefault();
+		event.stopPropagation();
+		projectMenu = { agent, x: event.clientX, y: event.clientY };
+	}
+
+	function selectProjectMenuItem(agent: Agent, action: string) {
+		if (action === 'open-new-window') {
+			void openWorkspaceWindow(projectPath(agent.id), agent.title || agent.name).catch((error) => {
+				console.error('failed to open project window', error);
+				window.alert(error instanceof Error ? error.message : 'Could not open the window.');
+			});
+			return;
+		}
+
+		const sections: Record<string, ProjectSection> = {
+			'open-tasks': 'tasks',
+			'open-schedules': 'schedules',
+			'open-runner': 'runner',
+			'open-workspace': 'workspace',
+		};
+		const section = sections[action];
+		if (section) goto(projectPath(agent.id, section), { keepFocus: true, noScroll: true });
+	}
 
 </script>
 
@@ -46,7 +77,8 @@
 	{:else}
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 			{#each agentList as agent}
-				<div class="rounded-lg border border-border bg-card p-4 space-y-3">
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<div oncontextmenu={(event) => showProjectMenu(event, agent)} class="rounded-lg border border-border bg-card p-4 space-y-3">
 					<div class="flex items-start justify-between">
 						<div class="flex items-center gap-3">
 							<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-sm font-semibold">{harnessMark(agent.backend)}</span>
@@ -80,3 +112,14 @@
 		</div>
 	{/if}
 </div>
+
+{#if projectMenu}
+	<ContextMenu
+		x={projectMenu.x}
+		y={projectMenu.y}
+		label={`${projectMenu.agent.title || projectMenu.agent.name} actions`}
+		items={PROJECT_CONTEXT_MENU_ITEMS}
+		onselect={(action) => selectProjectMenuItem(projectMenu!.agent, action)}
+		onclose={() => (projectMenu = null)}
+	/>
+{/if}
