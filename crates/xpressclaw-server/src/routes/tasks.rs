@@ -243,33 +243,31 @@ async fn update_task_status(
             .map_err(internal_error)?;
         if let Some(attempt_id) = active_attempt_id {
             let sessions = SessionManager::new(state.db.clone());
-            if let Ok(attempt) = sessions.get_attempt(&attempt_id) {
-                if !matches!(
-                    attempt.status.as_str(),
-                    "completed" | "failed" | "cancelled" | "interrupted"
-                ) {
-                    sessions
-                        .transition_attempt(
-                            &attempt_id,
-                            "cancelled",
-                            "Work cancelled by user",
-                            None,
-                            None,
-                        )
+            if sessions.get_attempt(&attempt_id).is_ok() {
+                let cancelled = sessions
+                    .transition_attempt(
+                        &attempt_id,
+                        "cancelled",
+                        "Work cancelled by user",
+                        None,
+                        None,
+                    )
+                    .map_err(internal_error)?;
+                if cancelled.status != "cancelled" {
+                    return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
+                }
+                if let Some(queue_id) = cancelled.queue_id {
+                    state
+                        .db
+                        .with_conn(|conn| {
+                            conn.execute(
+                                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                                    harness_response = 'cancelled by user' WHERE id = ?1",
+                                [queue_id],
+                            )?;
+                            Ok::<_, xpressclaw_core::error::Error>(())
+                        })
                         .map_err(internal_error)?;
-                    if let Some(queue_id) = attempt.queue_id {
-                        state
-                            .db
-                            .with_conn(|conn| {
-                                conn.execute(
-                                    "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                                        harness_response = 'cancelled by user' WHERE id = ?1",
-                                    [queue_id],
-                                )?;
-                                Ok::<_, xpressclaw_core::error::Error>(())
-                            })
-                            .map_err(internal_error)?;
-                    }
                 }
             }
             state.elicitations.cancel_attempt(&attempt_id);
@@ -784,6 +782,77 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "in_progress");
         assert_eq!(body["agent_id"], "atlas");
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_attempt_completion_preserves_terminal_state() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Race task", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+
+        let queue = TaskQueue::new(db.clone());
+        let queue_item = queue.list(Some("developer"), Some("queued"), 1).unwrap()[0].clone();
+        let attempt_id = queue_item.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "completed", "Done", Some("Done"), None)
+            .unwrap();
+        queue.complete(queue_item.id, "Done").unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "completed", Some("developer"))
+            .unwrap();
+
+        // Model a cancel handler that read the active attempt immediately
+        // before the worker committed its terminal transition.
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET active_attempt_id = ?1 WHERE id = ?2",
+                [attempt_id.as_str(), task_id.as_str()],
+            )?;
+            Ok::<_, xpressclaw_core::error::Error>(())
+        })
+        .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{task_id}/status"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"status": "cancelled"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+
+        assert_eq!(body["status"], "completed");
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "completed"
+        );
+        let queue_item = queue.get(queue_item.id).unwrap();
+        assert_eq!(queue_item.status, "completed");
+        assert_eq!(queue_item.harness_response.as_deref(), Some("Done"));
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::Completed
+        );
     }
 
     #[tokio::test]

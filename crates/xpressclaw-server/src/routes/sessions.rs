@@ -394,14 +394,6 @@ async fn cancel_attempt(
             Json(json!({ "error": "attempt does not belong to this session" })),
         ));
     }
-    if matches!(
-        attempt.status.as_str(),
-        "completed" | "failed" | "cancelled" | "interrupted"
-    ) {
-        return Ok(Json(json!(attempt)));
-    }
-
-    state.elicitations.cancel_attempt(&attempt_id);
     let cancelled = sessions
         .transition_attempt(
             &attempt_id,
@@ -411,17 +403,22 @@ async fn cancel_attempt(
             None,
         )
         .map_err(internal_error)?;
+    if cancelled.status != "cancelled" {
+        return Ok(Json(json!(cancelled)));
+    }
+
+    state.elicitations.cancel_attempt(&attempt_id);
     state
         .db
         .with_conn(|conn| {
-            if let Some(queue_id) = attempt.queue_id {
+            if let Some(queue_id) = cancelled.queue_id {
                 conn.execute(
                     "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
                         harness_response = 'cancelled by user' WHERE id = ?1",
                     [queue_id],
                 )?;
             }
-            if let Some(task_id) = attempt.task_id.as_deref() {
+            if let Some(task_id) = cancelled.task_id.as_deref() {
                 conn.execute(
                     "UPDATE tasks SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
                         updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -669,6 +666,65 @@ mod tests {
         assert_eq!(
             TaskBoard::new(db).get(task_id).unwrap().status,
             TaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_completed_attempt_preserves_completion_state() {
+        let (app, db) = test_app_with_db();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/builder/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "content": "Quick task" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let attempt_id = value["attempt_id"].as_str().unwrap().to_string();
+        let task_id = value["task"]["id"].as_str().unwrap().to_string();
+
+        let sessions = SessionManager::new(db.clone());
+        let queue = TaskQueue::new(db.clone());
+        let queue_id = sessions.get_attempt(&attempt_id).unwrap().queue_id.unwrap();
+        sessions
+            .transition_attempt(&attempt_id, "completed", "Done", Some("Done"), None)
+            .unwrap();
+        queue.complete(queue_id, "Done").unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "completed", Some("builder"))
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/builder/attempts/{attempt_id}/cancel"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "completed"
+        );
+        let queue_item = queue.get(queue_id).unwrap();
+        assert_eq!(queue_item.status, "completed");
+        assert_eq!(queue_item.harness_response.as_deref(), Some("Done"));
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::Completed
         );
     }
 
