@@ -90,6 +90,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     let dispatcher_config = state.config.clone();
     let dispatcher_event_bus = state.event_bus.clone();
     let dispatcher_elicitations = state.elicitations.clone();
+    let dispatcher_turn_controls = state.turn_controls.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -99,6 +100,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                 dispatcher_docker,
                 dispatcher_event_bus,
                 dispatcher_elicitations,
+                dispatcher_turn_controls,
                 port,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }

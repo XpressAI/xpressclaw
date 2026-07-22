@@ -253,6 +253,11 @@ export const sessions = {
 		request<WorkAttempt>(`/api/sessions/${sessionId}/attempts/${attemptId}/cancel`, {
 			method: 'POST',
 			body: '{}'
+		}),
+	interruptAttempt: (sessionId: string, attemptId: string) =>
+		request<WorkAttempt>(`/api/sessions/${sessionId}/attempts/${attemptId}/interrupt`, {
+			method: 'POST',
+			body: '{}'
 		})
 };
 
@@ -324,10 +329,16 @@ export const tasks = {
 		const query = params.size ? `?${params}` : '';
 		return request<TaskActivity>(`/api/tasks/${id}/activity${query}`);
 	},
-	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[] }) =>
+	addMessage: (id: string, role: string, content: string, options?: { configOptions?: Record<string, string | boolean>; attachments?: ImageAttachmentUpload[]; delivery?: 'after_tool' | 'immediate' }) =>
 		request<TaskMessageResponse>(`/api/tasks/${id}/messages`, {
 			method: 'POST',
-			body: JSON.stringify({ role, content, config_options: options?.configOptions ?? {}, attachments: options?.attachments ?? [] })
+			body: JSON.stringify({
+				role,
+				content,
+				config_options: options?.configOptions ?? {},
+				attachments: options?.attachments ?? [],
+				delivery: options?.delivery ?? 'after_tool'
+			})
 		}),
 	respondToElicitation: (id: string, elicitationId: string, data: {
 		action: 'accept' | 'decline' | 'cancel';
@@ -367,6 +378,7 @@ export interface TaskMessageResponse {
 	message: TaskMessage;
 	continuation_queued: boolean;
 	attempt_id: string | null;
+	delivery: 'stored' | 'queued' | 'after_tool' | 'immediate';
 }
 
 // -- Schedules --
