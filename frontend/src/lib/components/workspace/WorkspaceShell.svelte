@@ -32,9 +32,7 @@
 
 	const WORKSPACE_WINDOW_SESSION_KEY = 'xpressclaw.workspace.window-id';
 	const requestedWorkspaceWindowId = validWorkspaceWindowId($page.url.searchParams.get(WORKSPACE_WINDOW_PARAM));
-	if (requestedWorkspaceWindowId) sessionStorage.setItem(WORKSPACE_WINDOW_SESSION_KEY, requestedWorkspaceWindowId);
-	const workspaceWindowId = requestedWorkspaceWindowId
-		?? validWorkspaceWindowId(sessionStorage.getItem(WORKSPACE_WINDOW_SESSION_KEY));
+	const workspaceWindowId = resolveWorkspaceWindowId(requestedWorkspaceWindowId);
 	const WORKSPACE_STORAGE_KEY = workspaceWindowId
 		? `xpressclaw.workspace.v1.${workspaceWindowId}`
 		: 'xpressclaw.workspace.v1';
@@ -100,6 +98,15 @@
 
 	function validWorkspaceWindowId(value: string | null): string | null {
 		return value && /^workspace-\d+-\d+$/.test(value) ? value : null;
+	}
+
+	function resolveWorkspaceWindowId(requestedId: string | null): string | null {
+		try {
+			if (requestedId) sessionStorage.setItem(WORKSPACE_WINDOW_SESSION_KEY, requestedId);
+			return requestedId ?? validWorkspaceWindowId(sessionStorage.getItem(WORKSPACE_WINDOW_SESSION_KEY));
+		} catch {
+			return null;
+		}
 	}
 
 	function currentRoute(): string {

@@ -29,8 +29,10 @@
 	function placeAndFocus() {
 		if (!menu) return;
 		const bounds = menu.getBoundingClientRect();
-		left = Math.max(8, Math.min(x, window.innerWidth - bounds.width - 8));
-		top = Math.max(8, Math.min(y, window.innerHeight - bounds.height - 8));
+		const requestedLeft = Number.isFinite(x) ? x : 8;
+		const requestedTop = Number.isFinite(y) ? y : 8;
+		left = Math.max(8, Math.min(requestedLeft, window.innerWidth - bounds.width - 8));
+		top = Math.max(8, Math.min(requestedTop, window.innerHeight - bounds.height - 8));
 		enabledItems()[0]?.focus({ preventScroll: true });
 	}
 

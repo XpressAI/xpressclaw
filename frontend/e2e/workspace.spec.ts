@@ -468,13 +468,75 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toBeVisible();
 	await expect(page.getByText('Connections', { exact: true })).toHaveCount(0);
 
-	const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true });
+	const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
 	await mockApi(mobile);
 	await mobile.goto(`/tasks/${taskId}`);
 	await expect(mobile.locator('[data-workspace-pane]:visible')).toHaveCount(1);
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-	await expect(mobile.getByRole('button', { name: 'Open project switcher' })).toBeVisible();
+
+	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	let mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
+	await mobileProject.click();
+	await expect(mobile).toHaveURL(`/agents/${agentId}`);
+	await mobile.getByRole('tab', { name: 'Automations' }).click();
+	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=schedules`);
+
+	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
+	await mobileProject.evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
+		bubbles: true,
+		cancelable: true,
+		button: 2,
+		clientX: 380,
+		clientY: 830,
+	})));
+	const projectMenu = mobile.getByRole('menu', { name: 'Browser-tested workspace actions' });
+	await expect(projectMenu).toBeVisible();
+	const mobileViewport = await mobile.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+	await expect.poll(async () => {
+		const bounds = await projectMenu.boundingBox();
+		return bounds ? bounds.y + bounds.height : Number.POSITIVE_INFINITY;
+	}).toBeLessThanOrEqual(mobileViewport.height);
+	const menuBounds = await projectMenu.boundingBox();
+	expect(menuBounds).not.toBeNull();
+	expect(menuBounds!.x).toBeGreaterThanOrEqual(0);
+	expect(menuBounds!.y).toBeGreaterThanOrEqual(0);
+	expect(menuBounds!.x + menuBounds!.width).toBeLessThanOrEqual(mobileViewport.width);
+	expect(menuBounds!.y + menuBounds!.height).toBeLessThanOrEqual(mobileViewport.height);
+	await projectMenu.getByRole('menuitem', { name: 'Open Environment' }).click();
+	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=workspace`);
+
+	const mobileTabs = mobile.locator('[data-workspace-tab]:visible');
+	await expect(mobileTabs).toHaveCount(2);
+	await mobileTabs.nth(1).evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
+		bubbles: true,
+		cancelable: true,
+		button: 2,
+		clientX: 380,
+		clientY: 20,
+	})));
+	await mobile.getByRole('menuitem', { name: 'Close Other Tabs' }).click();
+	await expect(mobileTabs).toHaveCount(1);
+	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await mobile.close();
+});
+
+test('workspace renders when session storage is unavailable', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'sessionStorage', {
+			configurable: true,
+			get: () => {
+				throw new DOMException('Storage access is disabled.', 'SecurityError');
+			},
+		});
+	});
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}?_xpressclaw_window=workspace-123-1`);
+
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab]')).toHaveCount(1);
+	await expect.poll(() => page.evaluate(() => localStorage.getItem('xpressclaw.workspace.v1') !== null)).toBe(true);
 });
 
 test('project context menus open sections and separate windows', async ({ page }) => {
