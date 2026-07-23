@@ -15,6 +15,7 @@ env:
 
 concurrency:
   group: xpressclaw-release
+  queue: max
   cancel-in-progress: false
 
 jobs:
