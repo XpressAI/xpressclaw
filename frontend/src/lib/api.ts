@@ -83,10 +83,12 @@ export interface NativeRunnerConfig {
 	kind: string;
 	image: string;
 	workspace: string | null;
+	project_name: string | null;
 	model: string | null;
 	session_config: Record<string, string | boolean>;
 	mcp_servers: string[];
 	environment: Record<string, string>;
+	startup_commands: string[];
 	command: string[];
 	subscription_auth: boolean;
 	container_engine: 'none' | 'host';
@@ -462,6 +464,45 @@ export interface SystemInfo {
 	working_directory: string | null;
 }
 
+export interface AcpAgentCatalogEntry {
+	kind: string;
+	name: string;
+	mark: string;
+	description: string;
+	command: string[];
+	login_command: string;
+	install_url: string;
+	image: string;
+	host_image: string;
+	installed: boolean;
+	configured: boolean;
+	status: 'ready' | 'sign_in' | 'not_installed';
+	executable: string | null;
+}
+
+export interface DirectoryListing {
+	path: string;
+	parent: string | null;
+	home: string | null;
+	roots: string[];
+	directories: { name: string; path: string }[];
+}
+
+export interface ProjectEnvironmentSuggestion {
+	id: string;
+	name: string;
+	description: string;
+	detected_file: string;
+	command: string | null;
+	requires_host_engine: boolean;
+}
+
+export interface ProjectEnvironment {
+	workspace: string;
+	detected_files: string[];
+	suggestions: ProjectEnvironmentSuggestion[];
+}
+
 export interface OllamaInfo {
 	available: boolean;
 	models: { name: string; size: number | null }[];
@@ -553,6 +594,13 @@ export const setup = {
 	getConfig: () => request<LiveConfig>('/api/setup/config'),
 	checkDocker: () => request<DockerStatus>('/api/setup/check-docker'),
 	systemInfo: () => request<SystemInfo>('/api/setup/system-info'),
+	agentCatalog: () => request<{ agents: AcpAgentCatalogEntry[] }>('/api/setup/agent-catalog'),
+	directories: (path?: string) => {
+		const query = path ? `?path=${encodeURIComponent(path)}` : '';
+		return request<DirectoryListing>(`/api/setup/directories${query}`);
+	},
+	projectEnvironment: (path: string) =>
+		request<ProjectEnvironment>(`/api/setup/project-environment?path=${encodeURIComponent(path)}`),
 	checkOllama: () => request<OllamaInfo>('/api/setup/check-ollama'),
 	recommendModel: () => request<ModelRecommendation>('/api/setup/recommend-model'),
 	validateKey: (provider: string, apiKey: string, baseUrl?: string) =>
@@ -561,7 +609,7 @@ export const setup = {
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
 	complete: (data: {
-		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -570,7 +618,7 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; runner_model?: string; runner_command?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
 	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)

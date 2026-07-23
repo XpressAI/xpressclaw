@@ -4,14 +4,14 @@ set -euo pipefail
 wait_seconds="${1:-0}"
 deadline=$((SECONDS + wait_seconds))
 registry="${XPRESSCLAW_RUNNER_REGISTRY:-ghcr.io/xpressai}"
-runners=(
-  xpressclaw-runner-codex
-  xpressclaw-runner-claude
-  xpressclaw-runner-opencode
-  xpressclaw-runner-codex-docker
-  xpressclaw-runner-claude-docker
-  xpressclaw-runner-opencode-docker
+agents=(
+  codex claude github-copilot junie kimi opencode pi qwen
+  cline cursor glm grok kilo mistral-vibe
 )
+runners=()
+for agent in "${agents[@]}"; do
+  runners+=("xpressclaw-runner-${agent}" "xpressclaw-runner-${agent}-docker")
+done
 
 while true; do
   missing=()

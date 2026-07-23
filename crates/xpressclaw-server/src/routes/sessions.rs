@@ -5,6 +5,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use xpressclaw_core::acp::{is_builtin_runner_image, is_host_runner_image};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{default_native_runner_image, AgentConfig, ContainerEngineAccess};
 use xpressclaw_core::docker::manager::DockerManager;
@@ -158,7 +159,7 @@ async fn readiness(
     let workspace_present = workspace.is_dir();
     let command_present = kind != "custom" || !agent.runner.command.is_empty();
     let auth_required =
-        agent.runner.subscription_auth && matches!(kind.as_str(), "codex" | "claude" | "opencode");
+        agent.runner.subscription_auth && xpressclaw_core::acp::agent_definition(&kind).is_some();
     let auth_present = !auth_required || subscription_auth_available(&kind);
     let docker = state.docker().await;
     let docker_available = docker.is_some();
@@ -229,21 +230,8 @@ async fn readiness(
 }
 
 async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
-    let host_engine_image = matches!(
-        image,
-        "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest"
-    );
-    let built_in = matches!(
-        image,
-        "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-claude:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-opencode:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest"
-            | "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest"
-    );
+    let host_engine_image = is_host_runner_image(image);
+    let built_in = is_builtin_runner_image(image);
     if runner_image_compatible(docker, image, built_in, host_engine_image).await {
         return Some(image.to_string());
     }

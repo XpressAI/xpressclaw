@@ -1,25 +1,33 @@
 # Native runner images
 
-Each directory builds one ACP-compatible agent product:
+XpressClaw publishes one product-specific image for each supported ACP agent:
 
-```bash
-docker buildx build --load -f codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest .
-docker buildx build --load -f claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest .
-docker buildx build --load -f opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest .
-```
+| Image suffix | ACP product |
+| --- | --- |
+| `claude` | Claude Agent |
+| `codex` | Codex |
+| `github-copilot` | GitHub Copilot CLI |
+| `junie` | Junie |
+| `kimi` | Kimi CLI |
+| `opencode` | OpenCode |
+| `pi` | pi ACP |
+| `qwen` | Qwen Code |
+| `cline` | Cline |
+| `cursor` | Cursor |
+| `glm` | GLM Agent |
+| `grok` | Grok Build |
+| `kilo` | Kilo Code |
+| `mistral-vibe` | Mistral Vibe |
 
-Run these commands from `harnesses/native`, or use the paths documented in the
-repository README from the repository root. The duplicate local tag keeps the
-same build discoverable through Docker and Podman's short-name conventions.
+`codex`, `claude`, and `opencode` retain dedicated Dockerfiles. The `npm` and
+`binary` Dockerfiles are parameterized templates; CI supplies the exact
+package or platform archive pinned by the official ACP Registry. Run
+`scripts/build-runner-images.sh` from the repository root to build every local
+tag.
 
-The default `runner` stage stays minimal. For a project that needs the host
-Docker-compatible engine, build the separate `runner-host` stage:
-
-```bash
-docker buildx build --load --target runner-host -f codex/Dockerfile -t xpressclaw-runner-codex-docker:latest -t localhost/xpressclaw-runner-codex-docker:latest .
-docker buildx build --load --target runner-host -f claude/Dockerfile -t xpressclaw-runner-claude-docker:latest -t localhost/xpressclaw-runner-claude-docker:latest .
-docker buildx build --load --target runner-host -f opencode/Dockerfile -t xpressclaw-runner-opencode-docker:latest -t localhost/xpressclaw-runner-opencode-docker:latest .
-```
+The default `runner` stage stays minimal. The build script also creates a
+separate `xpressclaw-runner-<agent>-docker:latest` `runner-host` variant for
+projects that need the host Docker-compatible engine.
 
 These variants copy Docker CLI, Compose, and Buildx from the official Docker
 CLI image. Xpressclaw mounts its detected Docker or rootless Podman Unix socket
@@ -27,12 +35,12 @@ only when a project explicitly enables host-engine access.
 
 The control plane launches the image's ACP server and attaches over
 bidirectional stdio. Tasks are sent with `session/prompt`, while fresh and
-continued work use ACP session lifecycle methods. Codex and Claude use the
-ACP Registry adapters; OpenCode exposes ACP directly.
+continued work use ACP session lifecycle methods. Agent commands and versions
+follow the official ACP Registry.
 
 ## Publishing
 
-`Build & Push Runner Images` publishes all six multi-architecture tags on a
+`Build & Push Runner Images` publishes all multi-architecture tags on a
 push to `main` or a manual workflow dispatch. It then verifies every tag from
 an unauthenticated job. GitHub creates a container package as private on its
 first publication, so an XpressAI organization owner must change each new
@@ -49,8 +57,8 @@ operations are exposed as one constrained, `gh`-shaped MCP tool; arbitrary
 
 With **Use host login and harness configuration** enabled, XpressClaw mounts
 the product's normal host configuration directory into `/home/node` in the
-worker. This includes installed Codex skills and plugins, Claude Code plugins,
-hooks and custom agents, OpenCode configuration, and the subscription login.
+worker. This includes the product's subscription login, native settings, and
+any supported skills, plugins, hooks, or custom agents.
 Project-local configuration is read from the workspace. The session settings
 UI can add other host-to-container mounts and environment values when an
 extension uses a nonstandard location.

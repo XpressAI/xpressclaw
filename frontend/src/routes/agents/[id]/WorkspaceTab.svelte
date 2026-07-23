@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { LiveConfig } from '$lib/api';
+	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -10,6 +11,7 @@
 	let newVolumePath = $state('');
 	let saving = $state(false);
 	let error = $state('');
+	let showFolderPicker = $state(false);
 
 	let rawVolumes = $derived(agentConfig?.volumes ?? []);
 
@@ -22,7 +24,7 @@
 	async function addVolume() {
 		const path = newVolumePath.trim();
 		if (!path || saving) return;
-		const basename = path.split('/').filter(Boolean).pop() || 'resource';
+		const basename = path.split(/[\\/]/).filter(Boolean).pop() || 'resource';
 		await saveVolumes([...rawVolumes, `${path}:/workspace/resources/${basename}`]);
 		newVolumePath = '';
 	}
@@ -74,7 +76,20 @@
 		<div class="mt-4 flex gap-2">
 			<input bind:value={newVolumePath} placeholder="~/projects/shared-library" class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 			<button onclick={addVolume} disabled={!newVolumePath.trim() || saving} class="rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving ? 'Saving…' : 'Add folder'}</button>
+			<button type="button" onclick={() => (showFolderPicker = true)} disabled={saving} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:opacity-50">Browse…</button>
 		</div>
 		{#if error}<p class="mt-2 text-xs text-destructive">{error}</p>{/if}
 	</div>
 </div>
+
+{#if showFolderPicker}
+	<DirectoryPicker
+		title="Choose additional folder"
+		initialPath={newVolumePath || agentConfig?.runner.workspace || ''}
+		onclose={() => (showFolderPicker = false)}
+		onselect={(path) => {
+			newVolumePath = path;
+			showFolderPicker = false;
+		}}
+	/>
+{/if}

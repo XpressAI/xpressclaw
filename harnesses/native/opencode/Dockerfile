@@ -2,7 +2,7 @@ FROM docker:29.6.1-cli AS docker-cli
 
 FROM node:22-bookworm-slim AS runner-base
 
-ARG OPENCODE_VERSION=1.18.2
+ARG OPENCODE_VERSION=1.18.4
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="opencode"
 

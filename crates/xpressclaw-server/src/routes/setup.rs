@@ -1,6 +1,7 @@
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -8,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
+use xpressclaw_core::acp::ACP_AGENTS;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
@@ -18,6 +20,7 @@ use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::system;
+use xpressclaw_core::workers::native::subscription_auth_available;
 
 use crate::state::AppState;
 
@@ -27,6 +30,9 @@ pub fn routes() -> Router<AppState> {
         .route("/check-docker", get(check_docker))
         .route("/start-docker", post(start_docker))
         .route("/system-info", get(system_info))
+        .route("/agent-catalog", get(agent_catalog))
+        .route("/directories", get(list_directories))
+        .route("/project-environment", get(project_environment))
         .route("/check-ollama", get(check_ollama))
         .route("/recommend-model", get(recommend_model))
         .route("/validate-key", post(validate_key))
@@ -194,6 +200,406 @@ async fn system_info() -> Json<Value> {
     Json(value)
 }
 
+/// Return every supported ACP product and read-only host detection signals.
+///
+/// Detection never starts a product or opens credential files. We only check
+/// for a known executable on PATH and for the existence of a standard config
+/// location that can later be mounted into its isolated runner.
+async fn agent_catalog() -> Json<Value> {
+    let mut detected = ACP_AGENTS
+        .iter()
+        .enumerate()
+        .map(|(index, agent)| {
+            let executable = find_first_executable(agent.host_executables);
+            let installed = executable.is_some();
+            let configured = subscription_auth_available(agent.kind);
+            let status = if installed && configured {
+                "ready"
+            } else if installed {
+                "sign_in"
+            } else {
+                "not_installed"
+            };
+            (
+                !installed,
+                !configured,
+                index,
+                json!({
+                    "kind": agent.kind,
+                    "name": agent.name,
+                    "mark": agent.mark,
+                    "description": agent.description,
+                    "command": agent.command,
+                    "login_command": agent.login_command,
+                    "install_url": agent.install_url,
+                    "image": agent.minimal_image,
+                    "host_image": agent.host_image,
+                    "installed": installed,
+                    "configured": configured,
+                    "status": status,
+                    "executable": executable.map(|path| path.display().to_string()),
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    detected.sort_by_key(|(not_installed, not_configured, index, _)| {
+        (*not_installed, *not_configured, *index)
+    });
+    Json(json!({
+        "agents": detected
+            .into_iter()
+            .map(|(_, _, _, agent)| agent)
+            .collect::<Vec<_>>()
+    }))
+}
+
+fn find_first_executable(names: &[&str]) -> Option<PathBuf> {
+    names.iter().find_map(|name| find_executable(name))
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(name);
+    if direct.components().count() > 1 && executable_file(&direct) {
+        return Some(direct);
+    }
+    for directory in executable_search_directories() {
+        let candidate = directory.join(name);
+        if executable_file(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let extensions = std::env::var_os("PATHEXT")
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+            for extension in extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+            {
+                let candidate = directory.join(format!("{name}{extension}"));
+                if executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn executable_search_directories() -> Vec<PathBuf> {
+    let mut directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    if let Some(home) = home.as_ref() {
+        directories.extend(
+            [
+                ".local/bin",
+                "bin",
+                ".npm-global/bin",
+                ".bun/bin",
+                ".cargo/bin",
+                ".volta/bin",
+                ".local/share/pnpm",
+            ]
+            .map(|path| home.join(path)),
+        );
+        let nvm_versions = home.join(".nvm/versions/node");
+        if let Ok(versions) = std::fs::read_dir(nvm_versions) {
+            directories.extend(
+                versions
+                    .filter_map(|version| version.ok())
+                    .map(|version| version.path().join("bin"))
+                    .filter(|path| path.is_dir()),
+            );
+        }
+    }
+    #[cfg(unix)]
+    directories.extend([
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/snap/bin"),
+    ]);
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            directories.push(PathBuf::from(app_data).join("npm"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            directories.push(PathBuf::from(local_app_data).join("Programs"));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    directories.retain(|path| seen.insert(path.clone()));
+    directories
+}
+
+fn executable_file(path: &FsPath) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryQuery {
+    path: Option<String>,
+}
+
+/// Browse directories on the machine running XpressClaw. Returning directory
+/// names only (never file names or contents) gives web and mobile clients a
+/// usable server-side folder picker without relying on a desktop-only API.
+async fn list_directories(
+    Query(query): Query<DirectoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let requested = query
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            if path == "~" {
+                home.clone().unwrap_or_else(|| PathBuf::from(path))
+            } else if let Some(rest) = path.strip_prefix("~/") {
+                home.clone()
+                    .map(|home| home.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(path))
+            } else {
+                PathBuf::from(path)
+            }
+        })
+        .or_else(|| home.clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let current = requested.canonicalize().map_err(|error| {
+        bad_request(format!(
+            "Cannot open directory {}: {error}",
+            requested.display()
+        ))
+    })?;
+    if !current.is_dir() {
+        return Err(bad_request(format!(
+            "{} is not a directory",
+            current.display()
+        )));
+    }
+
+    let mut directories = std::fs::read_dir(&current)
+        .map_err(internal_error)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                return None;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            Some((
+                entry.file_name().to_string_lossy().into_owned(),
+                path.display().to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|(name, _)| name.to_lowercase());
+    let root = current
+        .ancestors()
+        .last()
+        .unwrap_or(current.as_path())
+        .display()
+        .to_string();
+    Ok(Json(json!({
+        "path": current.display().to_string(),
+        "parent": current.parent().map(|path| path.display().to_string()),
+        "home": home.map(|path| path.display().to_string()),
+        "roots": [root],
+        "directories": directories.into_iter().map(|(name, path)| json!({
+            "name": name,
+            "path": path,
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectEnvironmentQuery {
+    path: String,
+}
+
+/// Inspect well-known project metadata without reading project source files.
+/// Suggestions are informational and opt-in; the client decides which
+/// commands, if any, become runner startup commands.
+async fn project_environment(
+    Query(query): Query<ProjectEnvironmentQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let requested = PathBuf::from(query.path.trim());
+    let workspace = requested.canonicalize().map_err(|error| {
+        bad_request(format!(
+            "Cannot inspect workspace {}: {error}",
+            requested.display()
+        ))
+    })?;
+    if !workspace.is_dir() {
+        return Err(bad_request(format!(
+            "{} is not a directory",
+            workspace.display()
+        )));
+    }
+
+    let mut detected_files = Vec::new();
+    let mut suggestions = Vec::new();
+    let mut add = |id: &str,
+                   name: &str,
+                   description: &str,
+                   file: &str,
+                   command: Option<&str>,
+                   requires_host_engine: bool| {
+        detected_files.push(file.to_string());
+        suggestions.push(json!({
+            "id": id,
+            "name": name,
+            "description": description,
+            "detected_file": file,
+            "command": command,
+            "requires_host_engine": requires_host_engine,
+        }));
+    };
+
+    if let Some(file) = first_existing(
+        &workspace,
+        &[
+            "compose.yaml",
+            "compose.yml",
+            "docker-compose.yaml",
+            "docker-compose.yml",
+        ],
+    ) {
+        add(
+            "compose",
+            "Start Docker Compose services",
+            "Starts the project's declared development services before the ACP agent.",
+            file,
+            Some("docker compose up -d"),
+            true,
+        );
+    }
+    if workspace.join(".devcontainer/devcontainer.json").is_file() {
+        add(
+            "devcontainer",
+            "Prepare the development container",
+            "Uses the project's devcontainer definition and the host container engine.",
+            ".devcontainer/devcontainer.json",
+            Some("npx --yes @devcontainers/cli up --workspace-folder ."),
+            true,
+        );
+    }
+    if let Some(file) = first_existing(&workspace, &["Dockerfile", "dockerfile"]) {
+        add(
+            "dockerfile",
+            "Build the project development image",
+            "Builds the checked-in Dockerfile with the host image cache.",
+            file,
+            Some("docker build --tag xpressclaw-project-dev ."),
+            true,
+        );
+    }
+    if workspace.join("Vagrantfile").is_file() {
+        add(
+            "vagrant",
+            "Vagrant environment detected",
+            "Vagrant needs to be started on the host before agent work; it is not run inside the isolated ACP container.",
+            "Vagrantfile",
+            None,
+            false,
+        );
+    }
+
+    if workspace.join("pnpm-lock.yaml").is_file() {
+        add(
+            "pnpm",
+            "Install pnpm dependencies",
+            "Uses the committed lockfile before each agent task.",
+            "pnpm-lock.yaml",
+            Some("corepack enable && pnpm install --frozen-lockfile"),
+            false,
+        );
+    } else if workspace.join("yarn.lock").is_file() {
+        add(
+            "yarn",
+            "Install Yarn dependencies",
+            "Uses the committed lockfile before each agent task.",
+            "yarn.lock",
+            Some("corepack enable && yarn install --immutable"),
+            false,
+        );
+    } else if workspace.join("package-lock.json").is_file() {
+        add(
+            "npm",
+            "Install npm dependencies",
+            "Uses the committed lockfile before each agent task.",
+            "package-lock.json",
+            Some("npm ci"),
+            false,
+        );
+    } else if workspace.join("package.json").is_file() {
+        add(
+            "npm",
+            "Install npm dependencies",
+            "Installs dependencies declared by package.json before each agent task.",
+            "package.json",
+            Some("npm install"),
+            false,
+        );
+    }
+
+    for (file, ecosystem) in [
+        ("pyproject.toml", "Python"),
+        ("requirements.txt", "Python"),
+        ("Cargo.toml", "Rust"),
+        ("go.mod", "Go"),
+    ] {
+        if workspace.join(file).is_file() {
+            add(
+                &format!("{}-sdk", ecosystem.to_lowercase()),
+                &format!("{ecosystem} SDK required"),
+                "Use the detected Docker, Compose, or devcontainer setup, or provide a runner image with this SDK.",
+                file,
+                None,
+                false,
+            );
+        }
+    }
+
+    Ok(Json(json!({
+        "workspace": workspace.display().to_string(),
+        "detected_files": detected_files,
+        "suggestions": suggestions,
+    })))
+}
+
+fn first_existing<'a>(workspace: &FsPath, candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .find(|candidate| workspace.join(candidate).is_file())
+        .copied()
+}
+
 /// Check if Ollama is running and list models.
 async fn check_ollama() -> Json<Value> {
     let info = detect_ollama().await;
@@ -314,8 +720,11 @@ struct AgentSetup {
     runner_kind: Option<String>,
     runner_image: Option<String>,
     runner_workspace: Option<String>,
+    workspace_mode: Option<String>,
+    project_name: Option<String>,
     runner_model: Option<String>,
     runner_command: Option<Vec<String>>,
+    startup_commands: Option<Vec<String>>,
     subscription_auth: Option<bool>,
     runner_container_engine: Option<ContainerEngineAccess>,
     volumes: Option<Vec<String>>,
@@ -371,6 +780,13 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .map(str::trim)
             .filter(|workspace| !workspace.is_empty())
             .map(str::to_owned),
+        project_name: setup
+            .project_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .or_else(|| managed_workspace_requested(setup).then(|| "New project".to_string())),
         model: setup
             .runner_model
             .as_deref()
@@ -380,6 +796,14 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
         session_config: std::collections::HashMap::new(),
         mcp_servers: Vec::new(),
         environment: std::collections::HashMap::new(),
+        startup_commands: setup
+            .startup_commands
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty())
+            .collect(),
         command: setup
             .runner_command
             .clone()
@@ -403,6 +827,35 @@ fn validate_runner(runner: &NativeRunnerConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn managed_workspace_requested(setup: &AgentSetup) -> bool {
+    setup.workspace_mode.as_deref() == Some("managed")
+}
+
+fn runner_context(runner: &NativeRunnerConfig) -> String {
+    runner
+        .project_name
+        .clone()
+        .unwrap_or_else(|| context_label(runner.workspace.as_deref(), &runner.kind))
+}
+
+fn assign_managed_workspace(
+    setup: &AgentSetup,
+    runner: &mut NativeRunnerConfig,
+    session_id: &str,
+    data_dir: &FsPath,
+) -> std::io::Result<()> {
+    if !managed_workspace_requested(setup) {
+        return Ok(());
+    }
+    let workspace = data_dir.join("workspaces").join(session_id);
+    std::fs::create_dir_all(&workspace)?;
+    runner.workspace = Some(workspace.display().to_string());
+    if runner.project_name.is_none() {
+        runner.project_name = Some("New project".to_string());
+    }
+    Ok(())
+}
+
 /// Save the setup configuration and mark setup as complete.
 async fn complete_setup(
     State(state): State<AppState>,
@@ -418,27 +871,25 @@ async fn complete_setup(
     // subagents. The control plane stores only session runtime context.
     let llm = LlmConfig::default();
 
+    let managed_root = state.config().system.data_dir.clone();
     let mut used_ids: Vec<String> = Vec::new();
-    let agents: Vec<AgentConfig> = req
-        .agents
-        .iter()
-        .map(|session| {
-            let runner = runner_from_setup(session);
-            let context = context_label(runner.workspace.as_deref(), &runner.kind);
-            let id_refs: Vec<&str> = used_ids.iter().map(String::as_str).collect();
-            let session_id = unique_session_id(&context, &runner.kind, &id_refs);
-            used_ids.push(session_id.clone());
-            AgentConfig {
-                name: session_id,
-                backend: runner.kind.clone(),
-                runner,
-                volumes: session.volumes.clone().unwrap_or_default(),
-                ..Default::default()
-            }
-        })
-        .collect();
-    for agent in &agents {
-        validate_runner(&agent.runner).map_err(bad_request)?;
+    let mut agents: Vec<AgentConfig> = Vec::new();
+    for session in &req.agents {
+        let mut runner = runner_from_setup(session);
+        let context = runner_context(&runner);
+        let id_refs: Vec<&str> = used_ids.iter().map(String::as_str).collect();
+        let session_id = unique_session_id(&context, &runner.kind, &id_refs);
+        assign_managed_workspace(session, &mut runner, &session_id, &managed_root)
+            .map_err(internal_error)?;
+        validate_runner(&runner).map_err(bad_request)?;
+        used_ids.push(session_id.clone());
+        agents.push(AgentConfig {
+            name: session_id,
+            backend: runner.kind.clone(),
+            runner,
+            volumes: session.volumes.clone().unwrap_or_default(),
+            ..Default::default()
+        });
     }
 
     let mut config = Config {
@@ -450,6 +901,7 @@ async fn complete_setup(
         ..Default::default()
     };
     config.system.isolation = req.isolation.clone();
+    config.system.data_dir = managed_root;
 
     // Save config to disk
     config.save(&state.config_path).map_err(internal_error)?;
@@ -509,10 +961,12 @@ async fn add_session(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
-    let runner = runner_from_setup(&req);
+    let mut runner = runner_from_setup(&req);
     validate_runner(&runner).map_err(bad_request)?;
-    let title = context_label(runner.workspace.as_deref(), &runner.kind);
+    let title = runner_context(&runner);
     let session_id = unique_session_id(&title, &runner.kind, &existing_ids);
+    assign_managed_workspace(&req, &mut runner, &session_id, &old_config.system.data_dir)
+        .map_err(internal_error)?;
 
     let agent_config = AgentConfig {
         name: session_id,
@@ -836,6 +1290,76 @@ mod tests {
             runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest"
         );
+    }
+
+    #[test]
+    fn setup_selects_an_expanded_catalog_runner() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "qwen"
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert_eq!(
+            runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-qwen:latest"
+        );
+    }
+
+    #[test]
+    fn managed_workspace_creates_a_durable_empty_project_folder() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "workspace_mode": "managed",
+            "project_name": "Clone this later"
+        }))
+        .unwrap();
+        let mut runner = runner_from_setup(&setup);
+        let root =
+            std::env::temp_dir().join(format!("xpressclaw-managed-test-{}", std::process::id()));
+        assign_managed_workspace(&setup, &mut runner, "clone-this-later-codex", &root).unwrap();
+
+        let workspace = PathBuf::from(runner.workspace.as_deref().unwrap());
+        assert!(workspace.is_dir());
+        assert_eq!(runner_context(&runner), "Clone this later");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_catalog_lists_every_supported_product() {
+        let catalog = agent_catalog().await.0;
+        let agents = catalog["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), ACP_AGENTS.len());
+        assert!(agents.iter().any(|agent| agent["kind"] == "cursor"));
+        assert!(agents.iter().any(|agent| agent["kind"] == "mistral-vibe"));
+        assert!(!agents.iter().any(|agent| agent["kind"] == "agoragentic"));
+    }
+
+    #[tokio::test]
+    async fn environment_inspection_suggests_opt_in_commands() {
+        let workspace = std::env::temp_dir().join(format!(
+            "xpressclaw-environment-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("compose.yaml"), "services: {}\n").unwrap();
+        std::fs::write(workspace.join("package-lock.json"), "{}\n").unwrap();
+
+        let response = project_environment(Query(ProjectEnvironmentQuery {
+            path: workspace.display().to_string(),
+        }))
+        .await
+        .unwrap()
+        .0;
+        let suggestions = response["suggestions"].as_array().unwrap();
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion["command"] == "docker compose up -d"));
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion["command"] == "npm ci"));
+
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
