@@ -536,7 +536,7 @@ async fn project_environment(
             "Install pnpm dependencies",
             "Uses the committed lockfile before each agent task.",
             "pnpm-lock.yaml",
-            Some("corepack enable && pnpm install --frozen-lockfile"),
+            Some("COREPACK_HOME=/tmp/xpressclaw-corepack corepack pnpm install --frozen-lockfile"),
             false,
         );
     } else if workspace.join("yarn.lock").is_file() {
@@ -545,7 +545,7 @@ async fn project_environment(
             "Install Yarn dependencies",
             "Uses the committed lockfile before each agent task.",
             "yarn.lock",
-            Some("corepack enable && yarn install --immutable"),
+            Some("COREPACK_HOME=/tmp/xpressclaw-corepack corepack yarn install --immutable"),
             false,
         );
     } else if workspace.join("package-lock.json").is_file() {
@@ -1360,6 +1360,47 @@ mod tests {
             .any(|suggestion| suggestion["command"] == "npm ci"));
 
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn package_manager_suggestions_do_not_enable_global_corepack_shims() {
+        for (lockfile, expected_command) in [
+            (
+                "pnpm-lock.yaml",
+                "COREPACK_HOME=/tmp/xpressclaw-corepack corepack pnpm install --frozen-lockfile",
+            ),
+            (
+                "yarn.lock",
+                "COREPACK_HOME=/tmp/xpressclaw-corepack corepack yarn install --immutable",
+            ),
+        ] {
+            let workspace = std::env::temp_dir().join(format!(
+                "xpressclaw-corepack-test-{}-{}",
+                std::process::id(),
+                lockfile
+            ));
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join(lockfile), "").unwrap();
+
+            let response = project_environment(Query(ProjectEnvironmentQuery {
+                path: workspace.display().to_string(),
+            }))
+            .await
+            .unwrap()
+            .0;
+            let commands: Vec<&str> = response["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|suggestion| suggestion["command"].as_str())
+                .collect();
+            assert!(commands.contains(&expected_command));
+            assert!(commands
+                .iter()
+                .all(|command| !command.contains("corepack enable")));
+
+            std::fs::remove_dir_all(workspace).unwrap();
+        }
     }
 
     #[test]
