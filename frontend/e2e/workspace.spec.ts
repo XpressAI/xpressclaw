@@ -120,7 +120,7 @@ async function mockApi(
 		let response: unknown;
 
 		if (path === '/api/health') {
-			response = { status: 'ok' };
+			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
 			response = { available: true, installed: true, can_start: false };
 		} else if (path === '/api/agents') {

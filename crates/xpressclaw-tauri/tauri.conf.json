@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri-conf-schema/main/schema.json",
   "productName": "xpressclaw",
   "identifier": "ai.xpress.xpressclaw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "build": {
     "frontendDist": "../../frontend/build",
     "devUrl": "http://localhost:5173",

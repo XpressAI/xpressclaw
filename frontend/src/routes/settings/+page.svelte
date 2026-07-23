@@ -7,7 +7,7 @@
 
 	let userProfile = $state<{ name: string; avatar: string | null }>({ name: 'You', avatar: null });
 	let editingProfile = $state(false);
-	let buildInfo = $state<{ version: string; git_hash: string } | null>(null);
+	let buildInfo = $state<{ version: string; build: string; git_hash: string } | null>(null);
 	let profileName = $state('');
 	let profileSaved = $state(false);
 	let fileInput: HTMLInputElement;
@@ -88,7 +88,7 @@
 			setCachedProfile(profile);
 		}
 		if (info) {
-			buildInfo = { version: info.version, git_hash: info.git_hash };
+			buildInfo = { version: info.version, build: info.build, git_hash: info.git_hash };
 		}
 	});
 </script>
@@ -165,6 +165,10 @@
 				</div>
 				<div class="flex gap-2">
 					<span>Build:</span>
+					<span class="font-mono text-foreground">{buildInfo.build}</span>
+				</div>
+				<div class="flex gap-2">
+					<span>Commit:</span>
 					<span class="font-mono text-foreground">{buildInfo.git_hash}</span>
 				</div>
 			</div>

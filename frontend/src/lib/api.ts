@@ -428,7 +428,8 @@ export const schedules = {
 // -- Health --
 
 export const health = {
-	check: () => request<{ status: string; version: string; git_hash: string }>('/api/health')
+	check: () =>
+		request<{ status: string; version: string; build: string; git_hash: string }>('/api/health')
 };
 
 // -- Setup --
