@@ -13,8 +13,50 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: xpressclaw-release
+  cancel-in-progress: false
+
 jobs:
+  release-metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      build: ${{ steps.meta.outputs.build }}
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Compute release metadata
+        id: meta
+        shell: bash
+        run: |
+          VERSION=$(node scripts/release-metadata.mjs --version)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          LAST_BUILD=$(
+            {
+              git tag -l 'beta-*' | sed -nE 's/^beta-([0-9]+)$/\1/p'
+              git tag -l 'v*-build.*' | sed -nE 's/^v.*-build\.([0-9]+)$/\1/p'
+            } | sort -n | tail -1
+          )
+          NEXT_BUILD=$((${LAST_BUILD:-0} + 1))
+          TAG="v${VERSION}-build.${NEXT_BUILD}"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=$NEXT_BUILD" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release: XpressClaw $VERSION build $NEXT_BUILD ($SHORT_SHA)"
+
   build-tauri:
+    needs: release-metadata
     strategy:
       matrix:
         include:
@@ -31,6 +73,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             label: Linux-x64
     runs-on: ${{ matrix.os }}
+    env:
+      XPRESSCLAW_BUILD_NUMBER: ${{ needs.release-metadata.outputs.build }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +86,9 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Stamp release metadata
+        run: node scripts/release-metadata.mjs --build ${{ needs.release-metadata.outputs.build }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -157,14 +204,12 @@ jobs:
           path: target/${{ matrix.target }}/release/bundle/rpm/*.rpm
 
   pre-release:
-    needs: build-tauri
+    needs: [release-metadata, build-tauri]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # need full history for release number
 
       - uses: docker/setup-buildx-action@v3
 
@@ -182,25 +227,15 @@ jobs:
           find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Compute release number
-        id: meta
-        run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          # Count releases so far (tags matching beta-* or v*) + 1
-          RELEASE_COUNT=$(git tag -l 'beta-*' 'v*' | wc -l | tr -d ' ')
-          NEXT_NUM=$((RELEASE_COUNT + 1))
-          TAG="beta-${NEXT_NUM}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG (commit $SHORT_SHA)"
-
       - name: Create pre-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: "Beta ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.sha }})"
+          tag_name: ${{ needs.release-metadata.outputs.tag }}
+          name: "XpressClaw ${{ needs.release-metadata.outputs.version }} (build ${{ needs.release-metadata.outputs.build }})"
           body: |
-            Pre-release build from `main` at ${{ github.sha }}.
+            XpressClaw `${{ needs.release-metadata.outputs.version }}`, build `${{ needs.release-metadata.outputs.build }}`.
+
+            Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
 
             **Downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
