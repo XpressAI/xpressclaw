@@ -39,22 +39,23 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION=$(node scripts/release-metadata.mjs --version)
           SHORT_SHA=$(git rev-parse --short HEAD)
           LAST_BUILD=$(
             {
               git tag -l 'beta-*' | sed -nE 's/^beta-([0-9]+)$/\1/p'
               git tag -l 'v*-build.*' | sed -nE 's/^v.*-build\.([0-9]+)$/\1/p'
+              git tag -l 'v*' | sed -nE 's/^v[0-9]+\.[0-9]+\.([0-9]+)$/\1/p'
             } | sort -n | tail -1
           )
           NEXT_BUILD=$((${LAST_BUILD:-0} + 1))
-          TAG="v${VERSION}-build.${NEXT_BUILD}"
+          VERSION=$(node scripts/release-metadata.mjs --release-version "$NEXT_BUILD")
+          TAG="v${VERSION}"
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "build=$NEXT_BUILD" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "Release: XpressClaw $VERSION build $NEXT_BUILD ($SHORT_SHA)"
+          echo "Release: XpressClaw $VERSION ($SHORT_SHA)"
 
   build-tauri:
     needs: release-metadata
@@ -89,7 +90,9 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Stamp release metadata
-        run: node scripts/release-metadata.mjs --build ${{ needs.release-metadata.outputs.build }}
+        run: |
+          node scripts/release-metadata.mjs --build ${{ needs.release-metadata.outputs.build }}
+          node scripts/release-metadata.mjs --check
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -232,9 +235,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release-metadata.outputs.tag }}
-          name: "XpressClaw ${{ needs.release-metadata.outputs.version }} (build ${{ needs.release-metadata.outputs.build }})"
+          name: "XpressClaw ${{ needs.release-metadata.outputs.version }}"
           body: |
-            XpressClaw `${{ needs.release-metadata.outputs.version }}`, build `${{ needs.release-metadata.outputs.build }}`.
+            XpressClaw `${{ needs.release-metadata.outputs.version }}`.
 
             Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
 

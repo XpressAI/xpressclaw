@@ -48,7 +48,10 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Check release version metadata
-        run: node ../scripts/release-metadata.mjs --check
+        run: |
+          node ../scripts/release-metadata.mjs --check
+          node ../scripts/release-metadata.mjs --build 1
+          node ../scripts/release-metadata.mjs --check
 
       - run: npm ci
       - run: npm run check
