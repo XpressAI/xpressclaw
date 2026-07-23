@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (path) => readFileSync(join(root, path), 'utf8').replace(/\r\n?/g, '\n');
+const write = (path, contents) => writeFileSync(join(root, path), contents);
 
 const cargoToml = read('Cargo.toml');
 const workspaceVersion = cargoToml.match(
@@ -59,10 +60,10 @@ const componentFiles = [
 	'harnesses/native/common/mcp-github.mjs',
 	'harnesses/native/common/mcp-xpressclaw.mjs'
 ];
+const componentVersionPattern =
+	/(serverInfo[\s\S]{0,200}?(?:["']version["']|version)\s*:\s*["'])([^"']+)(["'])/;
 for (const path of componentFiles) {
-	const version = read(path).match(
-		/serverInfo[\s\S]{0,200}?(?:["']version["']|version)\s*:\s*["']([^"']+)["']/
-	)?.[1];
+	const version = read(path).match(componentVersionPattern)?.[2];
 	if (!version) {
 		mismatches.push(`${path}: version metadata is missing`);
 		continue;
@@ -76,24 +77,75 @@ if (mismatches.length) {
 	process.exit(1);
 }
 
+const buildNumber = (value, command) => {
+	if (!value || !/^(0|[1-9]\d*)$/.test(value)) {
+		throw new Error(`${command} requires a non-negative integer`);
+	}
+	return value;
+};
+
+const releaseVersion = (build) => {
+	const [major, minor] = workspaceVersion.split('.');
+	return `${major}.${minor}.${build}`;
+};
+
+const stampRelease = (build) => {
+	const version = releaseVersion(build);
+	const stampedCargoToml = cargoToml.replace(
+		/^(\[workspace\.package\]\s*\nversion\s*=\s*")[^"]+(")/m,
+		(_match, prefix, suffix) => `${prefix}${version}${suffix}`
+	);
+	const stampedCargoLock = cargoLock
+		.split(/\n(?=\[\[package\]\]\n)/)
+		.map((block) => {
+			const name = block.match(/^name = "([^"]+)"/m)?.[1];
+			if (!name || !workspacePackages.has(name)) return block;
+			return block.replace(/^version = "[^"]+"/m, `version = "${version}"`);
+		})
+		.join('\n');
+
+	tauriConfig.version = version;
+	tauriConfig.bundle ??= {};
+	tauriConfig.bundle.macOS ??= {};
+	tauriConfig.bundle.macOS.bundleVersion = build;
+	frontendPackage.version = version;
+	frontendLock.version = version;
+	frontendLock.packages[''].version = version;
+
+	const stampedComponents = componentFiles.map((path) => {
+		const contents = read(path);
+		return [
+			path,
+			contents.replace(
+				componentVersionPattern,
+				(_match, prefix, _currentVersion, suffix) => `${prefix}${version}${suffix}`
+			)
+		];
+	});
+
+	write('Cargo.toml', stampedCargoToml);
+	write('Cargo.lock', stampedCargoLock);
+	write('crates/xpressclaw-tauri/tauri.conf.json', `${JSON.stringify(tauriConfig, null, 2)}\n`);
+	write('frontend/package.json', `${JSON.stringify(frontendPackage, null, 2)}\n`);
+	write('frontend/package-lock.json', `${JSON.stringify(frontendLock, null, 2)}\n`);
+	for (const [path, contents] of stampedComponents) write(path, contents);
+
+	return version;
+};
+
 const [command, value] = process.argv.slice(2);
 if (command === '--check') {
 	console.log(`Release version metadata is synchronized at ${workspaceVersion}.`);
 } else if (command === '--version') {
 	console.log(workspaceVersion);
+} else if (command === '--release-version') {
+	console.log(releaseVersion(buildNumber(value, '--release-version')));
 } else if (command === '--build') {
-	if (!value || !/^\d+$/.test(value)) {
-		throw new Error('--build requires a non-negative integer');
-	}
-	tauriConfig.bundle ??= {};
-	tauriConfig.bundle.macOS ??= {};
-	tauriConfig.bundle.macOS.bundleVersion = value;
-	writeFileSync(
-		join(root, 'crates/xpressclaw-tauri/tauri.conf.json'),
-		`${JSON.stringify(tauriConfig, null, 2)}\n`
-	);
-	console.log(`Stamped XpressClaw ${workspaceVersion} build ${value}.`);
+	const build = buildNumber(value, '--build');
+	console.log(`Stamped XpressClaw ${stampRelease(build)} (build ${build}).`);
 } else {
-	console.error('Usage: release-metadata.mjs --check | --version | --build <number>');
+	console.error(
+		'Usage: release-metadata.mjs --check | --version | --release-version <build> | --build <number>'
+	);
 	process.exit(2);
 }
