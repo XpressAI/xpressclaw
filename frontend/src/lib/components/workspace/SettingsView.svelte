@@ -1,12 +1,14 @@
 <script lang="ts">
 	import type { WorkspaceTabKind } from '$lib/workspace';
 	import SettingsPage from '../../../routes/settings/+page.svelte';
+	import McpSettingsPage from '../../../routes/settings/mcp/+page.svelte';
 	import ServerSettingsPage from '../../../routes/settings/server/+page.svelte';
 
 	let { kind }: { kind: WorkspaceTabKind } = $props();
 
 	const sections = [
 		{ kind: 'settings', label: 'Profile', href: '/settings' },
+		{ kind: 'settings-mcp', label: 'MCP servers', href: '/settings/mcp' },
 		{ kind: 'settings-server', label: 'Server', href: '/settings/server' },
 	] as const;
 </script>
@@ -20,6 +22,8 @@
 	<div class="min-h-0 flex-1 overflow-y-auto">
 		{#if kind === 'settings-server'}
 			<ServerSettingsPage />
+		{:else if kind === 'settings-mcp'}
+			<McpSettingsPage />
 		{:else}
 			<SettingsPage />
 		{/if}

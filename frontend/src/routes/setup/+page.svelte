@@ -4,62 +4,56 @@
 	import { page } from '$app/stores';
 	import { setup } from '$lib/api';
 	import { openExternal } from '$lib/utils';
-	import type { DockerStatus } from '$lib/api';
+	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import type { AcpAgentCatalogEntry, DockerStatus, ProjectEnvironmentSuggestion } from '$lib/api';
 
-	const runnerOptions = [
-		{
-			kind: 'codex',
-			name: 'Codex',
-			mark: 'C',
-			description: 'Codex through its ACP adapter, using an eligible ChatGPT login.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
-			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest'
-		},
-		{
-			kind: 'claude',
-			name: 'Claude Code',
-			mark: 'A',
-			description: 'Claude Code through its ACP adapter, using an eligible Claude login.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest',
-			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest'
-		},
-		{
-			kind: 'opencode',
-			name: 'OpenCode',
-			mark: 'O',
-			description: 'OpenCode through its built-in ACP server.',
-			image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest',
-			hostImage: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest'
-		},
-		{
-			kind: 'custom',
-			name: 'Other ACP agent',
-			mark: '+',
-			description: 'Any containerized agent that speaks ACP over stdio.',
-			image: '',
-			hostImage: ''
-		}
-	] as const;
+	const customRunner: AcpAgentCatalogEntry = {
+		kind: 'custom',
+		name: 'Other ACP agent',
+		mark: '+',
+		description: 'Any containerized agent that speaks ACP over stdio.',
+		command: [],
+		login_command: '',
+		install_url: '',
+		image: '',
+		host_image: '',
+		installed: false,
+		configured: false,
+		status: 'not_installed',
+		executable: null
+	};
 
 	let isAddSession = $derived(
 		['add-session', 'add-agent'].includes($page.url.searchParams.get('mode') ?? '')
 	);
+	let agentCatalog = $state<AcpAgentCatalogEntry[]>([]);
+	let agentCatalogLoading = $state(true);
+	let runnerOptions = $derived([...agentCatalog, customRunner]);
 	let runnerKind = $state('codex');
-	let runnerImage = $state(runnerOptions[0].image as string);
+	let runnerImage = $state('ghcr.io/xpressai/xpressclaw-runner-codex:latest');
 	let runnerModel = $state('');
 	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
 	let containerEngine = $state<'none' | 'host'>('none');
+	let workspaceMode = $state<'existing' | 'managed'>('existing');
 	let workspacePath = $state('');
+	let projectName = $state('');
 	let hostOs = $state('');
 	let workspaceFolders = $state<string[]>([]);
 	let newFolderPath = $state('');
+	let folderPicker = $state<'workspace' | 'additional' | null>(null);
+	let environmentSuggestions = $state<ProjectEnvironmentSuggestion[]>([]);
+	let environmentLoading = $state(false);
+	let inspectedWorkspace = $state('');
+	let startupCommandText = $state('');
 	let dockerStatus = $state<DockerStatus | null>(null);
 	let dockerLoading = $state(true);
 	let saving = $state(false);
 	let saveError = $state('');
 	let contextLabel = $derived(
-		workspacePath.split('/').filter(Boolean).pop() || runnerKind
+		workspaceMode === 'managed'
+			? projectName.trim() || 'New project'
+			: workspacePath.split(/[\\/]/).filter(Boolean).pop() || runnerKind
 	);
 
 	onMount(async () => {
@@ -68,13 +62,21 @@
 			await goto('/setup?mode=add-session', { replaceState: true });
 		}
 
-		try {
-			const info = await setup.systemInfo();
-			workspacePath = info.working_directory ?? '';
-			hostOs = info.os;
-		} catch {
-			workspacePath = '';
+		const [systemResult, catalogResult] = await Promise.allSettled([
+			setup.systemInfo(),
+			setup.agentCatalog()
+		]);
+		if (systemResult.status === 'fulfilled') {
+			workspacePath = systemResult.value.working_directory ?? '';
+			hostOs = systemResult.value.os;
 		}
+		if (catalogResult.status === 'fulfilled') {
+			agentCatalog = catalogResult.value.agents;
+			const selected = agentCatalog.find((agent) => agent.kind === runnerKind);
+			if (selected) runnerImage = selected.image;
+		}
+		agentCatalogLoading = false;
+		if (workspacePath) await inspectEnvironment();
 		await recheckDocker();
 	});
 
@@ -82,7 +84,7 @@
 		const runner = runnerOptions.find((option) => option.kind === kind);
 		if (!runner) return;
 		runnerKind = runner.kind;
-		runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
+		runnerImage = containerEngine === 'host' ? runner.host_image : runner.image;
 		runnerCommand = '';
 		runnerModel = '';
 		subscriptionAuth = runner.kind !== 'custom';
@@ -90,7 +92,7 @@
 
 	function setContainerEngine(enabled: boolean) {
 		const defaults = new Set<string>([
-			...runnerOptions.flatMap((runner) => [runner.image, runner.hostImage]),
+			...runnerOptions.flatMap((runner) => [runner.image, runner.host_image]),
 			'xpressclaw-runner-codex:latest',
 			'xpressclaw-runner-codex-docker:latest',
 			'xpressclaw-runner-claude:latest',
@@ -102,7 +104,48 @@
 		containerEngine = enabled ? 'host' : 'none';
 		const runner = runnerOptions.find((option) => option.kind === runnerKind);
 		if (runner && runner.kind !== 'custom' && replaceImage) {
-			runnerImage = containerEngine === 'host' ? runner.hostImage : runner.image;
+			runnerImage = containerEngine === 'host' ? runner.host_image : runner.image;
+		}
+	}
+
+	async function copyLoginCommand(command: string) {
+		try {
+			await navigator.clipboard.writeText(command);
+		} catch {
+			// The command remains visible and selectable if clipboard
+			// permissions are unavailable.
+		}
+	}
+
+	function startupCommands(): string[] {
+		return startupCommandText.split('\n').map((line) => line.trim()).filter(Boolean);
+	}
+
+	function toggleStartupCommand(suggestion: ProjectEnvironmentSuggestion, enabled: boolean) {
+		if (!suggestion.command) return;
+		let commands = startupCommands().filter((command) => command !== suggestion.command);
+		if (enabled) {
+			commands = [...commands, suggestion.command];
+			if (suggestion.requires_host_engine && containerEngine !== 'host') {
+				setContainerEngine(true);
+			}
+		}
+		startupCommandText = commands.join('\n');
+	}
+
+	async function inspectEnvironment() {
+		const path = workspacePath.trim();
+		if (!path || environmentLoading) return;
+		environmentLoading = true;
+		try {
+			const result = await setup.projectEnvironment(path);
+			environmentSuggestions = result.suggestions;
+			inspectedWorkspace = result.workspace;
+		} catch {
+			environmentSuggestions = [];
+			inspectedWorkspace = path;
+		} finally {
+			environmentLoading = false;
 		}
 	}
 
@@ -135,13 +178,13 @@
 	function additionalVolumes(): string[] {
 		return workspaceFolders.map((folder) => {
 			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}`;
-			const basename = folder.split('/').filter(Boolean).pop() || 'shared';
+			const basename = folder.split(/[\\/]/).filter(Boolean).pop() || 'shared';
 			return `${folder}:/workspace/${basename}`;
 		});
 	}
 
 	async function createSession() {
-		if (!workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
+		if ((workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim()) || saving) return;
 		saving = true;
 		saveError = '';
 
@@ -149,9 +192,12 @@
 			backend: runnerKind,
 			runner_kind: runnerKind,
 			runner_image: runnerImage.trim(),
-			runner_workspace: workspacePath.trim(),
+			runner_workspace: workspaceMode === 'existing' ? workspacePath.trim() : undefined,
+			workspace_mode: workspaceMode,
+			project_name: projectName.trim() || undefined,
 			runner_model: runnerModel.trim() || undefined,
 			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
+			startup_commands: startupCommands(),
 			subscription_auth: subscriptionAuth,
 			runner_container_engine: containerEngine,
 			volumes: additionalVolumes()
@@ -201,42 +247,133 @@
 		<section>
 			<div class="mb-3">
 				<h3 class="text-sm font-medium text-foreground">Agent</h3>
-				<p class="mt-0.5 text-xs text-muted-foreground">XpressClaw sends tasks to this product; it keeps its own reasoning, tools, and subagents.</p>
+				<p class="mt-0.5 text-xs text-muted-foreground">Detected tools are shown first. Sign in on this computer once; XpressClaw reuses that login inside the isolated ACP runner.</p>
 			</div>
+			{#if agentCatalogLoading}
+				<div class="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+					<span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary border-t-transparent"></span>
+					Detecting installed agent tools...
+				</div>
+			{/if}
 			<div class="grid gap-3 sm:grid-cols-2">
 				{#each runnerOptions as runner}
-					<button
-						type="button"
-						onclick={() => selectRunner(runner.kind)}
-						class="rounded-xl border p-4 text-left transition-colors {runnerKind === runner.kind
+					<div
+						class="rounded-xl border transition-colors {runnerKind === runner.kind
 							? 'border-primary bg-primary/5 ring-1 ring-primary/20'
 							: 'border-border hover:border-primary/40 hover:bg-accent/30'}"
 					>
-						<span class="flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-sm font-semibold text-foreground">{runner.mark}</span>
-						<span class="mt-3 block text-sm font-medium text-foreground">{runner.name}</span>
-						<span class="mt-1 block text-xs leading-relaxed text-muted-foreground">{runner.description}</span>
-					</button>
+						<button type="button" onclick={() => selectRunner(runner.kind)} class="w-full p-4 text-left">
+							<span class="flex items-start justify-between gap-3">
+								<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-xs font-semibold text-foreground">{runner.mark}</span>
+								{#if runner.kind !== 'custom'}
+									<span class="rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide {runner.status === 'ready'
+										? 'bg-emerald-500/15 text-emerald-600'
+										: runner.status === 'sign_in'
+											? 'bg-amber-500/15 text-amber-600'
+											: 'bg-muted text-muted-foreground'}">
+										{runner.status === 'ready' ? 'Ready' : runner.status === 'sign_in' ? 'Sign in' : 'Not installed'}
+									</span>
+								{/if}
+							</span>
+							<span class="mt-3 block text-sm font-medium text-foreground">{runner.name}</span>
+							<span class="mt-1 block text-xs leading-relaxed text-muted-foreground">{runner.description}</span>
+						</button>
+						{#if runner.kind !== 'custom' && runner.status !== 'ready'}
+							<div class="flex items-center justify-between gap-2 border-t border-border/70 px-4 py-2.5">
+								{#if runner.status === 'sign_in'}
+									<code class="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">{runner.login_command}</code>
+									<button type="button" onclick={() => copyLoginCommand(runner.login_command)} class="shrink-0 text-xs font-medium text-primary hover:underline">Copy</button>
+								{:else}
+									<span class="text-[11px] text-muted-foreground">Install and sign in on this computer</span>
+									<button type="button" onclick={() => openExternal(runner.install_url)} class="shrink-0 text-xs font-medium text-primary hover:underline">Install</button>
+								{/if}
+							</div>
+						{/if}
+					</div>
 				{/each}
 			</div>
 		</section>
 
 		<section>
-			<label for="workspace-path" class="mb-1.5 block text-sm font-medium text-foreground">Project folder</label>
-			<input
-				id="workspace-path"
-				type="text"
-				bind:value={workspacePath}
-				placeholder="/home/me/projects/my-app"
-				class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-			/>
-			<p class="mt-1.5 text-xs text-muted-foreground">
-				The folder must exist on this machine.
-				{containerEngine === 'host'
-					? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
-					: ' It is mounted at /workspace.'}
-				It appears as <strong>{contextLabel}</strong> in the UI.
-			</p>
+			<h3 class="mb-2 text-sm font-medium text-foreground">Workspace</h3>
+			<div class="mb-3 grid grid-cols-2 rounded-lg border border-border bg-muted/30 p-1">
+				<button type="button" onclick={() => (workspaceMode = 'existing')} class="rounded-md px-3 py-2 text-xs font-medium {workspaceMode === 'existing' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">Existing folder</button>
+				<button type="button" onclick={() => (workspaceMode = 'managed')} class="rounded-md px-3 py-2 text-xs font-medium {workspaceMode === 'managed' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">Start without a folder</button>
+			</div>
+			{#if workspaceMode === 'existing'}
+				<label for="workspace-path" class="mb-1.5 block text-xs font-medium text-foreground">Project folder</label>
+				<div class="flex gap-2">
+					<input
+						id="workspace-path"
+						type="text"
+						bind:value={workspacePath}
+						placeholder="/home/me/projects/my-app"
+						class="min-w-0 flex-1 rounded-lg border border-input bg-background px-3.5 py-2.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+					/>
+					<button type="button" onclick={() => (folderPicker = 'workspace')} class="rounded-lg border border-border px-3.5 py-2.5 text-sm hover:bg-accent">Browse…</button>
+				</div>
+				<p class="mt-1.5 text-xs text-muted-foreground">
+					The folder must exist on this machine.
+					{containerEngine === 'host'
+						? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
+						: ' It is mounted at /workspace.'}
+					It appears as <strong>{contextLabel}</strong> in the UI.
+				</p>
+			{:else}
+				<label for="project-name" class="mb-1.5 block text-xs font-medium text-foreground">Project name</label>
+				<input
+					id="project-name"
+					type="text"
+					bind:value={projectName}
+					placeholder="New project"
+					class="w-full rounded-lg border border-input bg-background px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+				/>
+				<p class="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+					XpressClaw creates an empty persistent workspace. Your first message can ask the agent to clone a GitHub repository or create a project from scratch.
+				</p>
+			{/if}
 		</section>
+
+		{#if workspaceMode === 'existing'}
+			<section class="rounded-xl border border-border bg-muted/20 p-4">
+				<div class="flex items-start justify-between gap-3">
+					<div>
+						<h3 class="text-sm font-medium text-foreground">Environment setup</h3>
+						<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">XpressClaw detects standard project manifests and suggests optional setup commands. Nothing runs unless you select it.</p>
+					</div>
+					<button type="button" onclick={inspectEnvironment} disabled={!workspacePath.trim() || environmentLoading} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50">
+						{environmentLoading ? 'Inspecting…' : inspectedWorkspace === workspacePath ? 'Rescan' : 'Inspect'}
+					</button>
+				</div>
+				{#if environmentSuggestions.length > 0}
+					<div class="mt-3 space-y-2">
+						{#each environmentSuggestions as suggestion}
+							<label class="flex items-start gap-3 rounded-lg border border-border bg-background px-3 py-2.5 {suggestion.command ? 'cursor-pointer' : ''}">
+								<input
+									type="checkbox"
+									class="mt-0.5 rounded border-border"
+									disabled={!suggestion.command}
+									checked={Boolean(suggestion.command && startupCommands().includes(suggestion.command))}
+									onchange={(event) => toggleStartupCommand(suggestion, event.currentTarget.checked)}
+								/>
+								<span class="min-w-0 flex-1">
+									<span class="flex flex-wrap items-center gap-2 text-xs font-medium text-foreground">
+										{suggestion.name}
+										<code class="font-normal text-muted-foreground">{suggestion.detected_file}</code>
+										{#if suggestion.requires_host_engine}<span class="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] uppercase text-amber-600">Host engine</span>{/if}
+									</span>
+									<span class="mt-0.5 block text-[11px] leading-relaxed text-muted-foreground">{suggestion.description}</span>
+									{#if suggestion.command}<code class="mt-1 block truncate text-[11px] text-primary">{suggestion.command}</code>{/if}
+								</span>
+							</label>
+						{/each}
+					</div>
+					<p class="mt-2 text-[11px] text-muted-foreground">Selected commands run in the workspace before every short-lived ACP task. Keep them idempotent.</p>
+				{:else if inspectedWorkspace && !environmentLoading}
+					<p class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-xs text-muted-foreground">No supported environment manifests were detected.</p>
+				{/if}
+			</section>
+		{/if}
 
 		<section class="rounded-xl border border-border bg-muted/20 p-4">
 			<label class="flex cursor-pointer items-start gap-3">
@@ -319,6 +456,18 @@
 				</div>
 
 				<div>
+					<label for="startup-commands" class="mb-1 block text-xs font-medium text-foreground">Workspace startup commands</label>
+					<textarea
+						id="startup-commands"
+						bind:value={startupCommandText}
+						rows="3"
+						placeholder={'npm ci\ndocker compose up -d'}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+					></textarea>
+					<p class="mt-1 text-xs text-muted-foreground">One shell command per line, run before each ACP task. Commands have the same workspace and container permissions as the agent.</p>
+				</div>
+
+				<div>
 					<label for="additional-folder" class="mb-1 block text-xs font-medium text-foreground">Additional folder mounts</label>
 					{#if workspaceFolders.length > 0}
 						<div class="mb-2 space-y-2">
@@ -346,6 +495,8 @@
 						/>
 						<button type="button" onclick={addFolder} disabled={!newFolderPath.trim()}
 							class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">Add</button>
+						<button type="button" onclick={() => (folderPicker = 'additional')}
+							class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Browse…</button>
 					</div>
 				</div>
 			</div>
@@ -396,7 +547,7 @@
 			{/if}
 			<button
 				type="submit"
-				disabled={saving || !workspacePath.trim() || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
+				disabled={saving || (workspaceMode === 'existing' && !workspacePath.trim()) || !runnerImage.trim() || (runnerKind === 'custom' && !runnerCommand.trim())}
 				class="rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
 			>
 				{saving ? 'Creating...' : (isAddSession ? 'Create project' : 'Finish setup')}
@@ -404,3 +555,21 @@
 		</div>
 	</form>
 </div>
+
+{#if folderPicker}
+	<DirectoryPicker
+		title={folderPicker === 'workspace' ? 'Choose project folder' : 'Choose additional folder'}
+		initialPath={folderPicker === 'workspace' ? workspacePath : newFolderPath || workspacePath}
+		onclose={() => (folderPicker = null)}
+		onselect={(path) => {
+			if (folderPicker === 'workspace') {
+				workspacePath = path;
+				void inspectEnvironment();
+			} else {
+				newFolderPath = path;
+				addFolder();
+			}
+			folderPicker = null;
+		}}
+	/>
+{/if}

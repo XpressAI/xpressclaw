@@ -2,7 +2,7 @@ FROM docker:29.6.1-cli AS docker-cli
 
 FROM node:22-bookworm-slim AS runner-base
 
-ARG CODEX_ACP_VERSION=1.1.4
+ARG CODEX_ACP_VERSION=1.1.7
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="codex"
 

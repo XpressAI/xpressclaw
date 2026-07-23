@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
+use crate::acp::{agent_definition, local_runner_image};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
     NativeRunnerConfig,
@@ -530,12 +531,12 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
         return Ok(agent.runner.kind.to_lowercase());
     }
     let backend = agent.backend.to_lowercase();
-    if backend.contains("codex") {
-        Ok("codex".to_string())
-    } else if backend.contains("claude") {
-        Ok("claude".to_string())
-    } else if backend.contains("opencode") {
-        Ok("opencode".to_string())
+    if let Some(agent) = crate::acp::ACP_AGENTS.iter().find(|agent| {
+        backend == agent.kind
+            || (agent.kind.len() >= 4 && backend.contains(agent.kind))
+            || (agent.kind == "github-copilot" && backend.contains("copilot"))
+    }) {
+        Ok(agent.kind.to_string())
     } else if !agent.runner.command.is_empty() {
         Ok("custom".to_string())
     } else {
@@ -906,6 +907,7 @@ fn build_spec(
     let workspace = resolved_workspace(config, agent);
     let container_workspace = container_workspace_path(&workspace, agent.runner.container_engine);
     let command = acp_command_for(&agent.runner, kind, &container_workspace)?;
+    let command = with_startup_commands(command, &agent.runner.startup_commands);
     let mut volumes = vec![VolumeMount {
         source: workspace.display().to_string(),
         target: container_workspace.clone(),
@@ -962,6 +964,29 @@ fn build_spec(
     })
 }
 
+fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> Vec<String> {
+    if startup_commands.is_empty() {
+        return command;
+    }
+    let mut script = String::from("set -eu\n");
+    for startup_command in startup_commands {
+        let startup_command = startup_command.trim();
+        if !startup_command.is_empty() {
+            script.push_str(startup_command);
+            script.push('\n');
+        }
+    }
+    script.push_str("exec \"$@\"");
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        script,
+        "xpressclaw-startup".to_string(),
+    ];
+    wrapped.extend(command);
+    wrapped
+}
+
 fn container_workspace_path(workspace: &Path, container_engine: ContainerEngineAccess) -> String {
     if container_engine == ContainerEngineAccess::Host && cfg!(unix) {
         workspace.display().to_string()
@@ -1011,25 +1036,7 @@ pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<
 /// default, but retaining these aliases lets existing developer builds run
 /// without a forced retag or registry pull.
 pub fn local_runner_image_alias(image: &str) -> Option<&'static str> {
-    match image {
-        "ghcr.io/xpressai/xpressclaw-runner-codex:latest" => Some("xpressclaw-runner-codex:latest"),
-        "ghcr.io/xpressai/xpressclaw-runner-claude:latest" => {
-            Some("xpressclaw-runner-claude:latest")
-        }
-        "ghcr.io/xpressai/xpressclaw-runner-opencode:latest" => {
-            Some("xpressclaw-runner-opencode:latest")
-        }
-        "ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest" => {
-            Some("xpressclaw-runner-codex-docker:latest")
-        }
-        "ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest" => {
-            Some("xpressclaw-runner-claude-docker:latest")
-        }
-        "ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest" => {
-            Some("xpressclaw-runner-opencode-docker:latest")
-        }
-        _ => None,
-    }
+    local_runner_image(image)
 }
 
 fn acp_command_for(
@@ -1044,40 +1051,34 @@ fn acp_command_for(
             .map(|part| part.replace("{workspace}", container_workspace))
             .collect());
     }
-    match kind {
-        "codex" => Ok(vec!["codex-acp".into()]),
-        "claude" => Ok(vec!["claude-agent-acp".into()]),
-        "opencode" => Ok(vec!["opencode".into(), "acp".into()]),
-        _ => Err(Error::Backend(format!(
-            "ACP runner '{kind}' requires an explicit server command"
-        ))),
-    }
+    agent_definition(kind)
+        .map(|agent| {
+            agent
+                .command
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect()
+        })
+        .ok_or_else(|| {
+            Error::Backend(format!(
+                "ACP runner '{kind}' requires an explicit server command"
+            ))
+        })
 }
 
 fn auth_candidates(kind: &str) -> Vec<(PathBuf, &'static str, bool)> {
     let Some(home) = host_home() else {
         return Vec::new();
     };
-    match kind {
-        "codex" => vec![(home.join(".codex"), "/home/node/.codex", false)],
-        "claude" => vec![
-            (home.join(".claude"), "/home/node/.claude", false),
-            (home.join(".claude.json"), "/home/node/.claude.json", false),
-        ],
-        "opencode" => vec![
-            (
-                home.join(".local/share/opencode"),
-                "/home/node/.local/share/opencode",
-                false,
-            ),
-            (
-                home.join(".config/opencode"),
-                "/home/node/.config/opencode",
-                false,
-            ),
-        ],
-        _ => Vec::new(),
-    }
+    agent_definition(kind)
+        .map(|agent| {
+            agent
+                .auth_mounts
+                .iter()
+                .map(|mount| (home.join(mount.source), mount.target, mount.read_only))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether the host has a standard login location that can be mounted for the
@@ -1371,6 +1372,15 @@ mod tests {
     }
 
     #[test]
+    fn does_not_confuse_copilot_with_pi() {
+        let agent = AgentConfig {
+            backend: "copilot-cli".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(resolve_runner_kind(&agent).unwrap(), "github-copilot");
+    }
+
+    #[test]
     fn recognizes_explicit_native_questions() {
         assert!(needs_user_input(
             "I need one decision.\n\nNEEDS_USER_INPUT: Which database should I use?"
@@ -1398,6 +1408,18 @@ mod tests {
             acp_command_for(&config, "custom", "/workspace").unwrap(),
             vec!["runner", "--cwd=/workspace"]
         );
+    }
+
+    #[test]
+    fn wraps_acp_command_with_opt_in_workspace_startup() {
+        let wrapped = with_startup_commands(
+            vec!["qwen".into(), "--acp".into()],
+            &["npm ci".into(), "docker compose up -d".into()],
+        );
+        assert_eq!(&wrapped[..2], ["/bin/sh", "-lc"]);
+        assert!(wrapped[2].contains("npm ci\ndocker compose up -d"));
+        assert!(wrapped[2].ends_with("exec \"$@\""));
+        assert_eq!(&wrapped[4..], ["qwen", "--acp"]);
     }
 
     #[test]

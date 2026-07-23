@@ -241,7 +241,7 @@ pub enum ContainerEngineAccess {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NativeRunnerConfig {
-    /// ACP agent to invoke: auto, codex, claude, opencode, or custom.
+    /// ACP agent catalog ID to invoke, or `auto`/`custom`.
     pub kind: String,
     /// Image containing one ACP-compatible agent server. When empty, the
     /// runner kind selects the matching xpressclaw-runner-* image.
@@ -249,6 +249,9 @@ pub struct NativeRunnerConfig {
     /// Host project directory mounted at /workspace for this session. Falls
     /// back to system.workspace_dir for existing configurations.
     pub workspace: Option<String>,
+    /// User-facing project name. This is especially useful for managed empty
+    /// workspaces whose generated directory name is intentionally opaque.
+    pub project_name: Option<String>,
     /// Preferred ACP model value ID. When unset, the agent chooses its own
     /// default. The value is applied through `session/set_config_option`.
     pub model: Option<String>,
@@ -268,6 +271,11 @@ pub struct NativeRunnerConfig {
     /// such as adapter flags or an alternate harness configuration root.
     #[serde(default)]
     pub environment: HashMap<String, String>,
+    /// Optional shell commands run in the mounted workspace before each
+    /// short-lived ACP server starts. They are intentionally explicit and
+    /// opt-in; detected project files only suggest commands.
+    #[serde(default)]
+    pub startup_commands: Vec<String>,
     /// Optional ACP server argv override. `{workspace}` is expanded.
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
@@ -283,10 +291,12 @@ impl Default for NativeRunnerConfig {
             kind: "auto".to_string(),
             image: String::new(),
             workspace: None,
+            project_name: None,
             model: None,
             session_config: HashMap::new(),
             mcp_servers: Vec::new(),
             environment: HashMap::new(),
+            startup_commands: Vec::new(),
             command: Vec::new(),
             subscription_auth: true,
             container_engine: ContainerEngineAccess::None,
@@ -301,27 +311,7 @@ pub fn default_native_runner_image(
     kind: &str,
     container_engine: ContainerEngineAccess,
 ) -> Option<&'static str> {
-    match (kind, container_engine) {
-        ("codex", ContainerEngineAccess::None) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-codex:latest")
-        }
-        ("claude", ContainerEngineAccess::None) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-claude:latest")
-        }
-        ("opencode", ContainerEngineAccess::None) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
-        }
-        ("codex", ContainerEngineAccess::Host) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest")
-        }
-        ("claude", ContainerEngineAccess::Host) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest")
-        }
-        ("opencode", ContainerEngineAccess::Host) => {
-            Some("ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest")
-        }
-        _ => None,
-    }
+    crate::acp::default_runner_image(kind, container_engine)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,7 +460,13 @@ impl AgentConfig {
     /// User-facing context label. Native harnesses own identity and any
     /// subagents; XpressClaw labels a session by its project instead.
     pub fn context_label(&self) -> String {
-        context_label(self.runner.workspace.as_deref(), &self.runner.kind)
+        self.runner
+            .project_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| context_label(self.runner.workspace.as_deref(), &self.runner.kind))
     }
 }
 

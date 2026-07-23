@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { mcpServers, sessions } from '$lib/api';
-	import type { AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, NativeRunnerConfig } from '$lib/api';
+	import { mcpServers, sessions, setup } from '$lib/api';
+	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -14,6 +15,7 @@
 	let kind = $state('auto');
 	let image = $state('');
 	let workspace = $state('');
+	let projectName = $state('');
 	let model = $state('');
 	let subscriptionAuth = $state(true);
 	let containerEngine = $state<'none' | 'host'>('none');
@@ -23,7 +25,10 @@
 	let selectedMcpServers = $state<string[]>([]);
 	let serverCatalog = $state<McpServerDefinition[]>([]);
 	let environmentText = $state('');
+	let startupCommandsText = $state('');
 	let volumesText = $state('');
+	let showWorkspacePicker = $state(false);
+	let agentCatalog = $state<AcpAgentCatalogEntry[]>([]);
 	let addingMcp = $state(false);
 	let mcpName = $state('');
 	let mcpType = $state<'stdio' | 'http' | 'sse'>('stdio');
@@ -35,32 +40,25 @@
 	let confirmDeleteMcp = $state<string | null>(null);
 	let mcpError = $state('');
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
-	const defaultImages: Record<string, { none: string; host: string }> = {
-		codex: {
-			none: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest',
-			host: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest'
-		},
-		claude: {
-			none: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest',
-			host: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest'
-		},
-		opencode: {
-			none: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest',
-			host: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest'
-		}
-	};
-	const builtInImages = new Set([
-		...Object.values(defaultImages).flatMap((images) => Object.values(images)),
-		'xpressclaw-runner-codex:latest',
-		'xpressclaw-runner-codex-docker:latest',
-		'xpressclaw-runner-claude:latest',
-		'xpressclaw-runner-claude-docker:latest',
-		'xpressclaw-runner-opencode:latest',
-		'xpressclaw-runner-opencode-docker:latest'
-	]);
+	const fallbackAgents = [
+		{ kind: 'codex', name: 'Codex', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
+		{ kind: 'claude', name: 'Claude Agent', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
+		{ kind: 'opencode', name: 'OpenCode', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' }
+	];
+	let agentOptions = $derived(agentCatalog.length > 0 ? agentCatalog : fallbackAgents);
 
 	function defaultImage(): string {
-		return defaultImages[kind]?.[containerEngine] ?? '';
+		const agent = agentOptions.find((option) => option.kind === kind);
+		if (!agent) return '';
+		return containerEngine === 'host' ? agent.host_image : agent.image;
+	}
+
+	function isBuiltInImage(candidate: string): boolean {
+		return agentOptions.some((agent) => {
+			const localImage = agent.image.replace('ghcr.io/xpressai/', '');
+			const localHostImage = agent.host_image.replace('ghcr.io/xpressai/', '');
+			return [agent.image, agent.host_image, localImage, localHostImage].includes(candidate);
+		});
 	}
 
 	function selectChoices(option: AcpConfigOption | undefined): { value: string; name: string; description?: string | null }[] {
@@ -74,7 +72,7 @@
 	}
 
 	function setContainerEngine(enabled: boolean) {
-		const replaceImage = !image.trim() || builtInImages.has(image.trim());
+		const replaceImage = !image.trim() || isBuiltInImage(image.trim());
 		containerEngine = enabled ? 'host' : 'none';
 		if (kind !== 'custom' && replaceImage) image = defaultImage();
 	}
@@ -112,12 +110,14 @@
 
 	onMount(async () => {
 		try {
-			const [events, catalog] = await Promise.all([
+			const [events, catalog, agents] = await Promise.all([
 				sessions.events(agentId).catch(() => []),
-				mcpServers.list().catch(() => ({ servers: [] }))
+				mcpServers.list().catch(() => ({ servers: [] })),
+				setup.agentCatalog().catch(() => ({ agents: [] }))
 			]);
 			applyAdvertisedControls(events);
 			serverCatalog = catalog.servers;
+			agentCatalog = agents.agents;
 		} catch {
 			configOptions = [];
 			serverCatalog = [];
@@ -131,12 +131,14 @@
 				? (agentConfig.backend.includes('claude') ? 'claude' : agentConfig.backend.includes('opencode') ? 'opencode' : 'codex')
 				: configuredKind;
 			containerEngine = agentConfig.runner.container_engine ?? 'none';
-			image = builtInImages.has(agentConfig.runner.image) ? defaultImage() : agentConfig.runner.image;
+			image = isBuiltInImage(agentConfig.runner.image) ? defaultImage() : agentConfig.runner.image;
 			workspace = agentConfig.runner.workspace ?? '';
+			projectName = agentConfig.runner.project_name ?? '';
 			model = agentConfig.runner.model ?? '';
 			sessionConfig = { ...agentConfig.runner.session_config };
 			selectedMcpServers = [...agentConfig.runner.mcp_servers];
 			environmentText = Object.entries(agentConfig.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
+			startupCommandsText = (agentConfig.runner.startup_commands ?? []).join('\n');
 			volumesText = agentConfig.volumes.join('\n');
 			subscriptionAuth = agentConfig.runner.subscription_auth;
 			commandText = agentConfig.runner.command.join('\n');
@@ -152,6 +154,7 @@
 					kind,
 					image: image.trim() || defaultImage(),
 					workspace: workspace.trim() || null,
+					project_name: projectName.trim() || null,
 					// Generic ACP model controls supersede the pre-discovery
 					// compatibility preference once the harness advertises them.
 					model: modelOptions.length > 0 ? null : (model.trim() || null),
@@ -161,6 +164,7 @@
 						const separator = line.indexOf('=');
 						return separator === -1 ? [line, ''] : [line.slice(0, separator).trim(), line.slice(separator + 1)];
 					}).filter(([key]) => key)),
+					startup_commands: startupCommandsText.split('\n').map((line) => line.trim()).filter(Boolean),
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
 					container_engine: containerEngine
@@ -267,9 +271,9 @@
 			<div class={modelOptions.length > 0 ? 'sm:col-span-2' : ''}>
 				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Agent</label>
 				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
-					<option value="codex">Codex</option>
-					<option value="claude">Claude Code</option>
-					<option value="opencode">OpenCode</option>
+					{#each agentOptions as agent}
+						<option value={agent.kind}>{agent.name}</option>
+					{/each}
 					<option value="custom">Other ACP agent</option>
 				</select>
 			</div>
@@ -290,12 +294,20 @@
 
 		<div class="mt-4">
 			<label for="runner-workspace" class="mb-1 block text-xs font-medium text-muted-foreground">Project workspace</label>
-			<input id="runner-workspace" bind:value={workspace} placeholder="~/projects/my-app" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+			<div class="flex gap-2">
+				<input id="runner-workspace" bind:value={workspace} placeholder="~/projects/my-app" class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+				<button type="button" onclick={() => (showWorkspacePicker = true)} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Browse…</button>
+			</div>
 			<p class="mt-1 text-[11px] text-muted-foreground">
 				{containerEngine === 'host'
 					? 'Mounted read-write at the same absolute path so Docker Compose bind mounts resolve on the host.'
 					: 'Mounted read-write at /workspace.'}
 			</p>
+		</div>
+
+		<div class="mt-4">
+			<label for="runner-project-name" class="mb-1 block text-xs font-medium text-muted-foreground">Project name</label>
+			<input id="runner-project-name" bind:value={projectName} placeholder="Derived from workspace folder" class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
 		</div>
 
 		<div class="mt-4">
@@ -404,6 +416,10 @@
 		<label for="harness-environment" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Harness environment</label>
 		<textarea id="harness-environment" bind:value={environmentText} rows="4" placeholder={'CODEX_CONFIG={"features":{"example":true}}\nCLAUDE_CONFIG_DIR=/home/node/.claude'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
 		<p class="mt-1 text-[11px] text-muted-foreground">One <code>NAME=value</code> entry per line. Values are stored in the local XpressClaw configuration.</p>
+
+		<label for="startup-commands" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Workspace startup commands</label>
+		<textarea id="startup-commands" bind:value={startupCommandsText} rows="4" placeholder={'npm ci\ndocker compose up -d'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
+		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
 	<div class="rounded-xl border border-border bg-card p-5">
@@ -454,3 +470,15 @@
 		<textarea bind:value={commandText} rows="7" placeholder={'my-agent\nacp\n--cwd\n{workspace}'} class="mt-3 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
 	</div>
 </div>
+
+{#if showWorkspacePicker}
+	<DirectoryPicker
+		title="Choose project workspace"
+		initialPath={workspace}
+		onclose={() => (showWorkspacePicker = false)}
+		onselect={(path) => {
+			workspace = path;
+			showWorkspacePicker = false;
+		}}
+	/>
+{/if}

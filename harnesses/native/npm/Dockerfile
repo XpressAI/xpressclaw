@@ -1,25 +1,30 @@
 FROM docker:29.6.1-cli AS docker-cli
 
-FROM node:22-bookworm-slim AS runner-base
+FROM node:24-bookworm-slim AS runner-base
 
-ARG CLAUDE_ACP_VERSION=0.61.0
+ARG AGENT_KIND
+ARG AGENT_PACKAGE
+ARG AGENT_BINARY
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
-    io.xpressclaw.agent="claude"
+    io.xpressclaw.agent="${AGENT_KIND}"
 
-RUN apt-get update \
+RUN test -n "${AGENT_KIND}" \
+    && test -n "${AGENT_PACKAGE}" \
+    && test -n "${AGENT_BINARY}" \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates gh git openssh-client ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && install -d /opt/xpressclaw/libexec \
     && mv /usr/bin/gh /opt/xpressclaw/libexec/gh \
-    && npm install --global --omit=dev "@agentclientprotocol/claude-agent-acp@${CLAUDE_ACP_VERSION}" \
-    && npm cache clean --force
+    && npm install --global --omit=dev "${AGENT_PACKAGE}" \
+    && npm cache clean --force \
+    && command -v "${AGENT_BINARY}"
 
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
-RUN claude-agent-acp --version \
-    && /opt/xpressclaw/libexec/gh --version \
+RUN /opt/xpressclaw/libexec/gh --version \
     && node --check /opt/xpressclaw/mcp-github.mjs \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs
 
@@ -30,8 +35,6 @@ ENV HOME=/home/node \
 WORKDIR /workspace
 ENTRYPOINT []
 
-# Opt-in image for trusted projects that need the host Docker-compatible
-# engine. The default final stage below remains the smaller runner image.
 FROM runner-base AS runner-host
 USER root
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker

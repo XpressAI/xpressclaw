@@ -1,0 +1,405 @@
+//! Built-in Agent Client Protocol product catalog.
+//!
+//! Product metadata lives here so setup, readiness checks, and the worker
+//! dispatcher cannot drift onto different image names, commands, or standard
+//! host configuration locations.
+
+use serde::Serialize;
+
+use crate::config::ContainerEngineAccess;
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AcpAuthMount {
+    /// Path relative to the host user's home directory.
+    pub source: &'static str,
+    /// Matching path inside the Linux runner image.
+    pub target: &'static str,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct AcpAgentDefinition {
+    pub kind: &'static str,
+    pub name: &'static str,
+    pub mark: &'static str,
+    pub description: &'static str,
+    pub command: &'static [&'static str],
+    /// Host executables whose presence indicates that the user has installed
+    /// the product. These are never executed during detection.
+    pub host_executables: &'static [&'static str],
+    pub login_command: &'static str,
+    pub install_url: &'static str,
+    pub minimal_image: &'static str,
+    pub host_image: &'static str,
+    pub local_minimal_image: &'static str,
+    pub local_host_image: &'static str,
+    pub auth_mounts: &'static [AcpAuthMount],
+}
+
+const CODEX_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".codex",
+    target: "/home/node/.codex",
+    read_only: false,
+}];
+
+const CLAUDE_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: ".claude",
+        target: "/home/node/.claude",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".claude.json",
+        target: "/home/node/.claude.json",
+        read_only: false,
+    },
+];
+
+const COPILOT_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".copilot",
+    target: "/home/node/.copilot",
+    read_only: false,
+}];
+
+const JUNIE_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".junie",
+    target: "/home/node/.junie",
+    read_only: false,
+}];
+
+const KIMI_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".kimi",
+    target: "/home/node/.kimi",
+    read_only: false,
+}];
+
+const OPENCODE_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: ".local/share/opencode",
+        target: "/home/node/.local/share/opencode",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".config/opencode",
+        target: "/home/node/.config/opencode",
+        read_only: false,
+    },
+];
+
+const PI_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".pi",
+    target: "/home/node/.pi",
+    read_only: false,
+}];
+
+const QWEN_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".qwen",
+    target: "/home/node/.qwen",
+    read_only: false,
+}];
+
+const CLINE_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".cline",
+    target: "/home/node/.cline",
+    read_only: false,
+}];
+
+const CURSOR_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".cursor",
+    target: "/home/node/.cursor",
+    read_only: false,
+}];
+
+const GLM_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".config/glm-acp-agent",
+    target: "/home/node/.config/glm-acp-agent",
+    read_only: false,
+}];
+
+const GROK_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".grok",
+    target: "/home/node/.grok",
+    read_only: false,
+}];
+
+const KILO_AUTH: &[AcpAuthMount] = &[
+    AcpAuthMount {
+        source: ".config/kilo",
+        target: "/home/node/.config/kilo",
+        read_only: false,
+    },
+    AcpAuthMount {
+        source: ".local/share/kilo",
+        target: "/home/node/.local/share/kilo",
+        read_only: false,
+    },
+];
+
+const VIBE_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".vibe",
+    target: "/home/node/.vibe",
+    read_only: false,
+}];
+
+macro_rules! agent {
+    (
+        $kind:literal, $name:literal, $mark:literal, $description:literal,
+        $command:expr, $host_executables:expr, $login_command:literal,
+        $install_url:literal, $auth_mounts:expr
+    ) => {
+        AcpAgentDefinition {
+            kind: $kind,
+            name: $name,
+            mark: $mark,
+            description: $description,
+            command: $command,
+            host_executables: $host_executables,
+            login_command: $login_command,
+            install_url: $install_url,
+            minimal_image: concat!("ghcr.io/xpressai/xpressclaw-runner-", $kind, ":latest"),
+            host_image: concat!(
+                "ghcr.io/xpressai/xpressclaw-runner-",
+                $kind,
+                "-docker:latest"
+            ),
+            local_minimal_image: concat!("xpressclaw-runner-", $kind, ":latest"),
+            local_host_image: concat!("xpressclaw-runner-", $kind, "-docker:latest"),
+            auth_mounts: $auth_mounts,
+        }
+    };
+}
+
+pub const ACP_AGENTS: &[AcpAgentDefinition] = &[
+    agent!(
+        "claude",
+        "Claude Agent",
+        "A",
+        "Anthropic's Claude Code through the official ACP adapter.",
+        &["claude-agent-acp"],
+        &["claude"],
+        "claude",
+        "https://docs.anthropic.com/en/docs/claude-code/setup",
+        CLAUDE_AUTH
+    ),
+    agent!(
+        "codex",
+        "Codex",
+        "C",
+        "OpenAI Codex through the official ACP adapter.",
+        &["codex-acp"],
+        &["codex"],
+        "codex login",
+        "https://developers.openai.com/codex/cli/",
+        CODEX_AUTH
+    ),
+    agent!(
+        "github-copilot",
+        "GitHub Copilot",
+        "GH",
+        "GitHub Copilot CLI's built-in ACP server.",
+        &["copilot", "--acp"],
+        &["copilot"],
+        "copilot login",
+        "https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli",
+        COPILOT_AUTH
+    ),
+    agent!(
+        "junie",
+        "Junie",
+        "J",
+        "JetBrains Junie in ACP mode.",
+        &["junie", "--acp=true"],
+        &["junie"],
+        "junie",
+        "https://www.jetbrains.com/help/junie/installation.html",
+        JUNIE_AUTH
+    ),
+    agent!(
+        "kimi",
+        "Kimi CLI",
+        "K",
+        "Moonshot AI's Kimi coding agent in ACP mode.",
+        &["kimi", "acp"],
+        &["kimi"],
+        "kimi login",
+        "https://github.com/MoonshotAI/kimi-cli",
+        KIMI_AUTH
+    ),
+    agent!(
+        "opencode",
+        "OpenCode",
+        "O",
+        "The open source OpenCode agent's built-in ACP server.",
+        &["opencode", "acp"],
+        &["opencode"],
+        "opencode auth login",
+        "https://opencode.ai/docs/",
+        OPENCODE_AUTH
+    ),
+    agent!(
+        "pi",
+        "pi ACP",
+        "π",
+        "ACP adapter for the pi coding agent.",
+        &["pi-acp"],
+        &["pi", "pi-acp"],
+        "pi-acp --terminal-login",
+        "https://github.com/svkozak/pi-acp",
+        PI_AUTH
+    ),
+    agent!(
+        "qwen",
+        "Qwen Code",
+        "Q",
+        "Alibaba's Qwen Code agent in ACP mode.",
+        &["qwen", "--acp", "--experimental-skills"],
+        &["qwen"],
+        "qwen",
+        "https://qwenlm.github.io/qwen-code-docs/en/users/overview/",
+        QWEN_AUTH
+    ),
+    agent!(
+        "cline",
+        "Cline",
+        "CL",
+        "Cline CLI's built-in ACP server.",
+        &["cline", "--acp"],
+        &["cline"],
+        "cline auth",
+        "https://docs.cline.bot/cline-cli/installation",
+        CLINE_AUTH
+    ),
+    agent!(
+        "cursor",
+        "Cursor",
+        "CU",
+        "Cursor Agent's built-in ACP server.",
+        &["cursor-agent", "acp"],
+        &["cursor-agent"],
+        "cursor-agent login",
+        "https://cursor.com/docs/cli/installation",
+        CURSOR_AUTH
+    ),
+    agent!(
+        "glm",
+        "GLM Agent",
+        "G",
+        "Zhipu AI's GLM coding agent ACP server.",
+        &["glm-acp-agent"],
+        &["glm-acp-agent"],
+        "glm-acp-agent --setup",
+        "https://github.com/zai-org/glm-acp-agent",
+        GLM_AUTH
+    ),
+    agent!(
+        "grok",
+        "Grok Build",
+        "X",
+        "xAI's Grok Build agent over ACP stdio.",
+        &["grok", "agent", "stdio"],
+        &["grok"],
+        "grok login",
+        "https://github.com/xai-org/grok-cli",
+        GROK_AUTH
+    ),
+    agent!(
+        "kilo",
+        "Kilo Code",
+        "KI",
+        "Kilo Code CLI's built-in ACP server.",
+        &["kilo", "acp"],
+        &["kilo"],
+        "kilo auth login",
+        "https://kilo.ai/docs/code-with-ai/platforms/cli",
+        KILO_AUTH
+    ),
+    agent!(
+        "mistral-vibe",
+        "Mistral Vibe",
+        "M",
+        "Mistral's Vibe coding agent through its ACP executable.",
+        &["vibe-acp"],
+        &["vibe", "vibe-acp"],
+        "vibe --setup",
+        "https://docs.mistral.ai/mistral-vibe/introduction",
+        VIBE_AUTH
+    ),
+];
+
+pub fn agent_definition(kind: &str) -> Option<&'static AcpAgentDefinition> {
+    ACP_AGENTS.iter().find(|agent| agent.kind == kind)
+}
+
+pub fn default_runner_image(
+    kind: &str,
+    container_engine: ContainerEngineAccess,
+) -> Option<&'static str> {
+    let agent = agent_definition(kind)?;
+    Some(match container_engine {
+        ContainerEngineAccess::None => agent.minimal_image,
+        ContainerEngineAccess::Host => agent.host_image,
+    })
+}
+
+pub fn local_runner_image(image: &str) -> Option<&'static str> {
+    ACP_AGENTS.iter().find_map(|agent| {
+        if image == agent.minimal_image {
+            Some(agent.local_minimal_image)
+        } else if image == agent.host_image {
+            Some(agent.local_host_image)
+        } else {
+            None
+        }
+    })
+}
+
+pub fn is_builtin_runner_image(image: &str) -> bool {
+    ACP_AGENTS.iter().any(|agent| {
+        image == agent.minimal_image
+            || image == agent.host_image
+            || image == agent.local_minimal_image
+            || image == agent.local_host_image
+    })
+}
+
+pub fn is_host_runner_image(image: &str) -> bool {
+    ACP_AGENTS
+        .iter()
+        .any(|agent| image == agent.host_image || image == agent.local_host_image)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn catalog_ids_and_images_are_unique() {
+        let mut kinds = HashSet::new();
+        let mut images = HashSet::new();
+        for agent in ACP_AGENTS {
+            assert!(kinds.insert(agent.kind), "duplicate kind {}", agent.kind);
+            assert!(images.insert(agent.minimal_image));
+            assert!(images.insert(agent.host_image));
+            assert!(!agent.command.is_empty());
+            assert!(!agent.host_executables.is_empty());
+        }
+    }
+
+    #[test]
+    fn resolves_published_and_local_images() {
+        let codex = agent_definition("codex").unwrap();
+        assert_eq!(
+            default_runner_image("codex", ContainerEngineAccess::Host),
+            Some(codex.host_image)
+        );
+        assert_eq!(
+            local_runner_image(codex.minimal_image),
+            Some(codex.local_minimal_image)
+        );
+        assert!(is_builtin_runner_image(codex.local_host_image));
+        assert!(is_host_runner_image(codex.host_image));
+        assert!(!is_host_runner_image(codex.minimal_image));
+    }
+}
