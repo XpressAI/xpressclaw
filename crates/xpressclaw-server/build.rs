@@ -58,6 +58,19 @@ fn hash_dir(dir: &Path, hasher: &mut DefaultHasher) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=XPRESSCLAW_BUILD_NUMBER");
+    let build_number =
+        std::env::var("XPRESSCLAW_BUILD_NUMBER").unwrap_or_else(|_| "dev".to_string());
+    if build_number != "dev"
+        && (build_number.is_empty()
+            || !build_number
+                .chars()
+                .all(|character| character.is_ascii_digit()))
+    {
+        panic!("XPRESSCLAW_BUILD_NUMBER must be a non-negative integer or 'dev'");
+    }
+    println!("cargo:rustc-env=XPRESSCLAW_BUILD_NUMBER={build_number}");
+
     // Embed git commit hash at compile time
     if let Ok(output) = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

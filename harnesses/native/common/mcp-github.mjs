@@ -229,7 +229,7 @@ async function handle(message) {
     result(id, {
       protocolVersion: params?.protocolVersion ?? '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'xpressclaw-github', version: '0.1.0' },
+      serverInfo: { name: 'xpressclaw-github', version: '0.2.0' },
       instructions: TOOL_DESCRIPTION,
     });
     return;

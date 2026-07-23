@@ -3,7 +3,7 @@
 	import { health, setup } from '$lib/api';
 	import type { DockerStatus, LiveConfig } from '$lib/api';
 
-	let serverInfo = $state<{ status: string; version: string } | null>(null);
+	let serverInfo = $state<{ status: string; version: string; build: string } | null>(null);
 	let config = $state<LiveConfig | null>(null);
 	let runtime = $state<DockerStatus | null>(null);
 
@@ -34,6 +34,10 @@
 			<div class="flex justify-between">
 				<dt class="text-muted-foreground">Version</dt>
 				<dd>{serverInfo?.version ?? '—'}</dd>
+			</div>
+			<div class="flex justify-between">
+				<dt class="text-muted-foreground">Build</dt>
+				<dd>{serverInfo?.build ?? '—'}</dd>
 			</div>
 			<div class="flex justify-between">
 				<dt class="text-muted-foreground">Address</dt>

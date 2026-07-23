@@ -197,7 +197,7 @@ async function handle(message) {
     result(id, {
       protocolVersion: params?.protocolVersion ?? '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'xpressclaw-control', version: '0.1.0' },
+      serverInfo: { name: 'xpressclaw-control', version: '0.2.0' },
       instructions: INSTRUCTIONS,
     });
     return;

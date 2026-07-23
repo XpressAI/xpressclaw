@@ -196,6 +196,18 @@ cargo build -p xpressclaw-server
 ./build-signed.sh
 ```
 
+### Release Versioning
+
+The product version comes from `[workspace.package]` in `Cargo.toml`; run
+`node scripts/release-metadata.mjs --check` to verify the Tauri, frontend,
+lockfile, and bundled MCP metadata agree with it.
+
+Each successful release receives the next numeric build and a tag such as
+`v0.2.0-build.51`. The release workflow derives that number from existing
+release tags, embeds it in `/api/health` and the About screen, and uses it as
+the macOS bundle version. The Git commit remains available separately for
+diagnostics.
+
 ### Build Native Worker Images
 
 Build only the product you use. Each image is deliberately independent so it
