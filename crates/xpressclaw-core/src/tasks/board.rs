@@ -113,6 +113,18 @@ enum TaskListOrder {
     Recent,
 }
 
+#[derive(Clone, Copy)]
+struct TaskListPage {
+    limit: i64,
+    offset: i64,
+}
+
+impl TaskListPage {
+    fn first(limit: i64) -> Self {
+        Self { limit, offset: 0 }
+    }
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -209,8 +221,7 @@ impl TaskBoard {
             &statuses,
             agent_id,
             &[],
-            limit,
-            0,
+            TaskListPage::first(limit),
             false,
             TaskListOrder::Scheduler,
         )
@@ -228,8 +239,7 @@ impl TaskBoard {
             statuses,
             agent_id,
             &[],
-            limit,
-            offset,
+            TaskListPage { limit, offset },
             false,
             TaskListOrder::Scheduler,
         )
@@ -249,8 +259,7 @@ impl TaskBoard {
             &statuses,
             agent_id,
             excluded_statuses,
-            limit,
-            0,
+            TaskListPage::first(limit),
             false,
             TaskListOrder::Recent,
         )
@@ -269,8 +278,7 @@ impl TaskBoard {
             statuses,
             agent_id,
             excluded_statuses,
-            limit,
-            offset,
+            TaskListPage { limit, offset },
             false,
             TaskListOrder::Recent,
         )
@@ -316,8 +324,7 @@ impl TaskBoard {
             &statuses,
             agent_id,
             &[],
-            limit,
-            0,
+            TaskListPage::first(limit),
             true,
             TaskListOrder::Scheduler,
         )
@@ -328,8 +335,7 @@ impl TaskBoard {
         statuses: &[&str],
         agent_id: Option<&str>,
         excluded_statuses: &[&str],
-        limit: i64,
-        offset: i64,
+        page: TaskListPage,
         include_hidden: bool,
         order: TaskListOrder,
     ) -> Result<Vec<Task>> {
@@ -374,8 +380,8 @@ impl TaskBoard {
                 );
             }
         }
-        params.push(Box::new(limit));
-        params.push(Box::new(offset.max(0)));
+        params.push(Box::new(page.limit));
+        params.push(Box::new(page.offset.max(0)));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
