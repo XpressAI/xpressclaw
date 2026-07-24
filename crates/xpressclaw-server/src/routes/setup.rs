@@ -19,6 +19,7 @@ use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
+use xpressclaw_core::paths::strip_verbatim;
 use xpressclaw_core::system;
 use xpressclaw_core::workers::native::subscription_auth_available;
 
@@ -387,12 +388,12 @@ async fn list_directories(
         .or_else(|| home.clone())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let current = requested.canonicalize().map_err(|error| {
+    let current = strip_verbatim(requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot open directory {}: {error}",
             requested.display()
         ))
-    })?;
+    })?);
     if !current.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
@@ -449,12 +450,12 @@ async fn project_environment(
     Query(query): Query<ProjectEnvironmentQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let requested = PathBuf::from(query.path.trim());
-    let workspace = requested.canonicalize().map_err(|error| {
+    let workspace = strip_verbatim(requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot inspect workspace {}: {error}",
             requested.display()
         ))
-    })?;
+    })?);
     if !workspace.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",

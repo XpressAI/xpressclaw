@@ -2,6 +2,7 @@ pub mod acp;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod paths;
 pub mod runtime;
 pub mod system;
 
