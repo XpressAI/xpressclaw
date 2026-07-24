@@ -388,16 +388,19 @@ async fn list_directories(
         .or_else(|| home.clone())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    let current = strip_verbatim(requested.canonicalize().map_err(|error| {
+    let current = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot open directory {}: {error}",
             requested.display()
         ))
-    })?);
+    })?;
+    // Filesystem calls keep the verbatim path, which is what lifts MAX_PATH;
+    // only what leaves this handler is stripped.
+    let display_path = strip_verbatim(current.clone());
     if !current.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            current.display()
+            display_path.display()
         )));
     }
 
@@ -415,20 +418,20 @@ async fn list_directories(
             }
             Some((
                 entry.file_name().to_string_lossy().into_owned(),
-                path.display().to_string(),
+                strip_verbatim(path).display().to_string(),
             ))
         })
         .collect::<Vec<_>>();
     directories.sort_by_key(|(name, _)| name.to_lowercase());
-    let root = current
+    let root = display_path
         .ancestors()
         .last()
-        .unwrap_or(current.as_path())
+        .unwrap_or(display_path.as_path())
         .display()
         .to_string();
     Ok(Json(json!({
-        "path": current.display().to_string(),
-        "parent": current.parent().map(|path| path.display().to_string()),
+        "path": display_path.display().to_string(),
+        "parent": display_path.parent().map(|path| path.display().to_string()),
         "home": home.map(|path| path.display().to_string()),
         "roots": [root],
         "directories": directories.into_iter().map(|(name, path)| json!({
@@ -450,16 +453,18 @@ async fn project_environment(
     Query(query): Query<ProjectEnvironmentQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let requested = PathBuf::from(query.path.trim());
-    let workspace = strip_verbatim(requested.canonicalize().map_err(|error| {
+    let workspace = requested.canonicalize().map_err(|error| {
         bad_request(format!(
             "Cannot inspect workspace {}: {error}",
             requested.display()
         ))
-    })?);
+    })?;
+    // Probes below join onto the verbatim path; only the response is stripped.
+    let display_workspace = strip_verbatim(workspace.clone());
     if !workspace.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            workspace.display()
+            display_workspace.display()
         )));
     }
 
@@ -588,7 +593,7 @@ async fn project_environment(
     }
 
     Ok(Json(json!({
-        "workspace": workspace.display().to_string(),
+        "workspace": display_workspace.display().to_string(),
         "detected_files": detected_files,
         "suggestions": suggestions,
     })))
