@@ -178,6 +178,8 @@ async function mockApi(
 			response = url.searchParams.has('parent_task_id')
 				? { tasks: [], counts: { ...counts, completed: 0 } }
 				: { tasks: [task], counts };
+		} else if (path === '/api/tasks/recent-by-agent') {
+			response = { tasks: [task] };
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
@@ -769,13 +771,17 @@ test('task pages show five recent tasks per project in the sidebar', async ({ pa
 		{ id: 'secondary-newest', title: 'Secondary newest', agentId: 'project-secondary-test', updatedAt: 70, status: 'pending' },
 		{ id: 'primary-second', title: 'Primary second', agentId, updatedAt: 90, status: 'completed' },
 	];
-	await page.route('**/api/tasks*', async (route) => {
+	const recentRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks/recent-by-agent';
+	});
+	await page.route('**/api/tasks**', async (route) => {
 		const url = new URL(route.request().url());
-		if (url.pathname !== '/api/tasks' || url.searchParams.has('parent_task_id')) {
+		if (!['/api/tasks', '/api/tasks/recent-by-agent'].includes(url.pathname) || url.searchParams.has('parent_task_id')) {
 			await route.fallback();
 			return;
 		}
-		const tasks = sidebarTasks.map((sidebarTask, index) => ({
+		const allTasks = sidebarTasks.map((sidebarTask, index) => ({
 			id: sidebarTask.id,
 			title: sidebarTask.title,
 			description: null,
@@ -793,6 +799,9 @@ test('task pages show five recent tasks per project in the sidebar', async ({ pa
 			blocked_by: [],
 			ready: true,
 		}));
+		const tasks = url.pathname === '/api/tasks/recent-by-agent'
+			? allTasks.filter((listedTask) => listedTask.id !== 'primary-oldest')
+			: allTasks.filter((listedTask) => [taskId, 'primary-oldest', 'secondary-older'].includes(listedTask.id));
 		await route.fulfill({
 			status: 200,
 			contentType: 'application/json',
@@ -803,6 +812,8 @@ test('task pages show five recent tasks per project in the sidebar', async ({ pa
 		});
 	});
 	await page.goto(`/tasks/${taskId}`);
+	const recentUrl = new URL((await recentRequest).url());
+	expect(recentUrl.searchParams.get('limit')).toBe('5');
 
 	const sidebar = page.locator('aside').first();
 	const taskSidebar = sidebar.locator('[data-sidebar-mode="tasks"]');

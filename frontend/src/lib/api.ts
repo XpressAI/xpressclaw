@@ -308,6 +308,8 @@ export const tasks = {
 		const qs = params.toString();
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
+	recentByAgent: (limit = 5) =>
+		request<{ tasks: Task[] }>(`/api/tasks/recent-by-agent?limit=${encodeURIComponent(limit)}`),
 	get: (id: string) => request<Task>(`/api/tasks/${id}`),
 	create: (data: { title: string; description?: string; agent_id?: string; priority?: number; context?: Record<string, unknown> }) =>
 		request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),

@@ -53,6 +53,7 @@
 	let mobileMenuOpen = $state(false);
 	let agentList = $state<Agent[]>([]);
 	let taskList = $state<Task[]>([]);
+	let sidebarTaskList = $state<Task[]>([]);
 	let workflowList = $state<Workflow[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 
@@ -79,7 +80,8 @@
 		if (!focusedTab) return null;
 		if (focusedTab.kind === 'project') return agentList.find((agent) => agent.id === focusedTab.resourceId) ?? null;
 		if (focusedTab.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId);
+			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId)
+				?? sidebarTaskList.find((candidate) => candidate.id === focusedTab.resourceId);
 			return agentList.find((agent) => agent.id === task?.agent_id) ?? null;
 		}
 		return null;
@@ -143,7 +145,8 @@
 	function decorateTab(tab: WorkspaceTab): WorkspaceTab {
 		const description = describeWorkspacePath(tab.path);
 		if (description.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === description.resourceId);
+			const task = taskList.find((candidate) => candidate.id === description.resourceId)
+				?? sidebarTaskList.find((candidate) => candidate.id === description.resourceId);
 			return { ...tab, ...description, title: task?.title ?? tab.title ?? 'Task', status: task?.status ?? tab.status };
 		}
 		if (description.kind === 'project') {
@@ -440,13 +443,15 @@
 
 	async function loadWorkspaceSummary() {
 		try {
-			const [nextAgents, taskResult, nextWorkflows] = await Promise.all([
+			const [nextAgents, taskResult, sidebarTaskResult, nextWorkflows] = await Promise.all([
 				agents.list().catch(() => agentList),
 				tasksApi.list().catch(() => ({ tasks: taskList })),
+				tasksApi.recentByAgent().catch(() => null),
 				workflowsApi.list().catch(() => workflowList),
 			]);
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
+			sidebarTaskList = sidebarTaskResult?.tasks ?? taskResult.tasks;
 			workflowList = nextWorkflows;
 			refreshTabMetadata();
 		} catch {}
@@ -557,7 +562,7 @@
 			<div class="flex flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-2">
 				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
 				{#if sidebarCategory === 'tasks'}
-					<SidebarTasks {agentList} {taskList} activeTaskId={focusedTaskId} compact />
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} compact />
 				{:else}
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
@@ -575,7 +580,7 @@
 				</a>
 
 				{#if sidebarCategory === 'tasks'}
-					<SidebarTasks {agentList} {taskList} activeTaskId={focusedTaskId} />
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} />
 				{:else}
 					{#if attentionTasks.length > 0}
 						<div class="mb-4">
@@ -685,7 +690,7 @@
 			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
 				<div class="min-h-0 flex-1 overflow-y-auto">
-					<SidebarTasks {agentList} {taskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else}
 				{#if attentionTasks.length > 0}
