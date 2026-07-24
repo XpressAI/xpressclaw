@@ -64,6 +64,8 @@ async function mockApi(
 		postedMessages?: Record<string, unknown>[];
 		interruptedAttempts?: string[];
 		connection?: { online: boolean };
+		multipleAgents?: boolean;
+		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -104,6 +106,13 @@ async function mockApi(
 		error_message: null,
 		restart_count: 0,
 	};
+	const secondaryAgent = {
+		...agent,
+		id: 'project-secondary-test',
+		name: 'secondary-browser-workspace',
+		title: 'Secondary browser workspace',
+	};
+	const availableAgents = options.multipleAgents ? [agent, secondaryAgent] : [agent];
 	const counts = {
 		pending: 0,
 		in_progress: options.live ? 1 : 0,
@@ -128,8 +137,10 @@ async function mockApi(
 			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
 			response = { available: true, installed: true, can_start: false };
+		} else if (path === '/api/setup/status') {
+			response = { setup_complete: true };
 		} else if (path === '/api/agents') {
-			response = [agent];
+			response = availableAgents;
 		} else if (path === `/api/agents/${agentId}`) {
 			response = agent;
 		} else if (path === '/api/workflows') {
@@ -259,6 +270,16 @@ async function mockApi(
 					has_more_after: false,
 				};
 			}
+		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
+			const targetAgentId = path.split('/')[3];
+			const payload = request.postDataJSON() as Record<string, unknown>;
+			options.queuedSessionMessages?.push({ agentId: targetAgentId, payload });
+			response = {
+				event: activityEvent(80),
+				task: { ...task, id: taskId, agent_id: targetAgentId },
+				attempt_id: 'attempt-new-work-test',
+				queued: true,
+			};
 		} else if (path === `/api/sessions/${agentId}/attempts/attempt-browser-test/interrupt`) {
 			options.interruptedAttempts?.push('attempt-browser-test');
 			response = { ...attempt('interrupted'), status: 'interrupted', completed_at: timestamp(62) };
@@ -502,6 +523,25 @@ test('task drafts survive reloads and clear after a successful send', async ({ p
 	await expect(composer).toHaveValue('');
 	await page.reload();
 	await expect(composer).toHaveValue('');
+});
+
+test('new-work drafts restore the project they were written for', async ({ page }) => {
+	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, { multipleAgents: true, queuedSessionMessages });
+	await page.goto('/');
+
+	const composer = page.getByPlaceholder('Describe the outcome you want…');
+	const projectPicker = page.getByRole('combobox');
+	await projectPicker.selectOption('project-secondary-test');
+	await composer.fill('Keep this work with the secondary project');
+	await page.reload();
+
+	await expect(projectPicker).toHaveValue('project-secondary-test');
+	await expect(composer).toHaveValue('Keep this work with the secondary project');
+	await composer.press('Enter');
+	await expect.poll(() => queuedSessionMessages.length).toBe(1);
+	expect(queuedSessionMessages[0].agentId).toBe('project-secondary-test');
+	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {

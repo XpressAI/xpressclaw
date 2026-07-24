@@ -4,7 +4,7 @@
 	import { setup, sessions, agents as agentsApi } from '$lib/api';
 	import type { Agent, ImageAttachmentUpload } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
-	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
+	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { harnessMark } from '$lib/utils';
 
@@ -17,6 +17,7 @@
 	let messageDraftReady = $state(false);
 	let agentList = $state<Agent[]>([]);
 	let selectedAgent = $state('');
+	let selectedAgentReady = $state(false);
 	let sending = $state(false);
 	let composing = $state(false);
 	let sendError = $state('');
@@ -41,7 +42,9 @@
 				agentsApi.list().catch(() => [])
 			]);
 			agentList = agts;
-			if (agts.length > 0) selectedAgent = agts[0].id;
+			const savedAgent = loadComposerTarget(messageDraftScope);
+			selectedAgent = agts.find((agent) => agent.id === savedAgent)?.id ?? agts[0]?.id ?? '';
+			selectedAgentReady = true;
 			loading = false;
 		} catch {
 			retries++;
@@ -56,6 +59,10 @@
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope, message);
+	});
+
+	$effect(() => {
+		if (selectedAgentReady) saveComposerTarget(messageDraftScope, selectedAgent);
 	});
 
 	onMount(() => {

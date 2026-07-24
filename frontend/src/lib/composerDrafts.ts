@@ -1,4 +1,5 @@
 const DRAFT_STORAGE_PREFIX = 'xpressclaw.composer-draft.v1.';
+const TARGET_STORAGE_PREFIX = 'xpressclaw.composer-target.v1.';
 
 function draftStorage(): Storage | null {
 	try {
@@ -36,5 +37,25 @@ export function clearComposerDraft(scope: string): void {
 		draftStorage()?.removeItem(storageKey(scope));
 	} catch {
 		// Draft persistence is best-effort when browser storage is unavailable.
+	}
+}
+
+export function loadComposerTarget(scope: string): string {
+	try {
+		return draftStorage()?.getItem(`${TARGET_STORAGE_PREFIX}${scope}`) ?? '';
+	} catch {
+		return '';
+	}
+}
+
+export function saveComposerTarget(scope: string, target: string): void {
+	try {
+		const storage = draftStorage();
+		if (!storage) return;
+		const key = `${TARGET_STORAGE_PREFIX}${scope}`;
+		if (target) storage.setItem(key, target);
+		else storage.removeItem(key);
+	} catch {
+		// Target persistence is best-effort when browser storage is unavailable.
 	}
 }
