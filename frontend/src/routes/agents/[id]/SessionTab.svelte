@@ -27,9 +27,19 @@
 	})));
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+	const RECENT_WORK_LIMIT = 5;
 	let attentionTasks = $derived(taskList.filter((task) => ['waiting_for_input', 'blocked'].includes(task.status)));
 	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
-	let recentTasks = $derived(taskList.filter((task) => ['completed', 'cancelled'].includes(task.status)).slice(0, 8));
+	let recentWorkTasks = $derived(
+		taskList
+			.filter((task) => !['waiting_for_input', 'blocked'].includes(task.status))
+			.sort((left, right) =>
+				Date.parse(right.updated_at) - Date.parse(left.updated_at)
+				|| Date.parse(right.created_at) - Date.parse(left.created_at)
+				|| right.id.localeCompare(left.id)
+			)
+			.slice(0, RECENT_WORK_LIMIT)
+	);
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
@@ -241,13 +251,13 @@
 				</div>
 				<a href="/tasks" class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
 			</div>
-			{#if activeTasks.length === 0 && recentTasks.length === 0}
+			{#if recentWorkTasks.length === 0}
 				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work in this project.' : 'No work yet. Send the first task above.'}</div>
 			{:else}
-				<div class="divide-y divide-border">
-					{#each [...activeTasks, ...recentTasks] as task (task.id)}
+				<div data-project-work-list class="divide-y divide-border">
+					{#each recentWorkTasks as task (task.id)}
 						{@const meta = statusMeta(task.status)}
-						<a href="/tasks/{task.id}" class="group flex items-center gap-3 px-4 py-3.5 hover:bg-accent/40">
+						<a data-project-work-item href="/tasks/{task.id}" class="group flex items-center gap-3 px-4 py-3.5 hover:bg-accent/40">
 							<span class="h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
 							<div class="min-w-0 flex-1">
 								<div class="truncate text-sm font-medium group-hover:text-primary">{task.title}</div>
