@@ -6,9 +6,11 @@
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
+	const messageDraftScope = () => `task.${taskId}`;
 
 	interface ElicitationOption {
 		const?: unknown;
@@ -82,6 +84,7 @@
 	let editPriority = $state(0);
 	let editDeps = $state<string[]>([]);
 	let messageInput = $state('');
+	let messageDraftReady = $state(false);
 	let messageSending = $state(false);
 	let interrupting = $state(false);
 	let messageAttachments = $state<ImageAttachmentUpload[]>([]);
@@ -116,6 +119,10 @@
 	let followLatest = $state(true);
 	let showJumpToLatest = $state(false);
 	let lastTranscriptScrollTop = 0;
+
+	$effect(() => {
+		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
+	});
 
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
@@ -582,6 +589,8 @@
 
 	onMount(async () => {
 		document.addEventListener('pointerdown', handleComposerPointerDown);
+		messageInput = loadComposerDraft(messageDraftScope());
+		messageDraftReady = true;
 		await load();
 		loading = false;
 		// Auto-poll while task is in progress
@@ -741,8 +750,6 @@
 		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || pendingElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
-		messageInput = '';
-		messageAttachments = [];
 		messageAttachmentError = '';
 		modelMenuOpen = false;
 		slashMenuDismissed = false;
@@ -755,11 +762,12 @@
 				attachments,
 				delivery: immediate ? 'immediate' : 'after_tool',
 			});
+			messageInput = '';
+			messageAttachments = [];
+			clearComposerDraft(messageDraftScope());
 			await poll();
 			scrollToBottom(true);
 		} catch (e) {
-			messageInput = content;
-			messageAttachments = attachments;
 			messageAttachmentError = e instanceof Error ? e.message : String(e);
 		} finally {
 			messageSending = false;
