@@ -756,3 +756,80 @@ test('tab context menus create native webview windows in the desktop app', async
 	expect(new URL(call.args.options.url).pathname).toBe(`/tasks/${taskId}`);
 	expect(new URL(call.args.options.url).searchParams.get('_xpressclaw_window')).toBe(call.args.options.label);
 });
+
+test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
+	await mockApi(page, { multipleAgents: true });
+	const sidebarTasks = [
+		{ id: 'primary-oldest', title: 'Primary oldest', agentId, updatedAt: 10, status: 'completed' },
+		{ id: 'primary-recent', title: 'Primary recent', agentId, updatedAt: 80, status: 'waiting_for_input' },
+		{ id: 'secondary-older', title: 'Secondary older', agentId: 'project-secondary-test', updatedAt: 20, status: 'completed' },
+		{ id: taskId, title: 'Current task', agentId, updatedAt: 50, status: 'in_progress' },
+		{ id: 'primary-newest', title: 'Primary newest', agentId, updatedAt: 100, status: 'completed' },
+		{ id: 'primary-middle', title: 'Primary middle', agentId, updatedAt: 60, status: 'completed' },
+		{ id: 'secondary-newest', title: 'Secondary newest', agentId: 'project-secondary-test', updatedAt: 70, status: 'pending' },
+		{ id: 'primary-second', title: 'Primary second', agentId, updatedAt: 90, status: 'completed' },
+	];
+	await page.route('**/api/tasks*', async (route) => {
+		const url = new URL(route.request().url());
+		if (url.pathname !== '/api/tasks' || url.searchParams.has('parent_task_id')) {
+			await route.fallback();
+			return;
+		}
+		const tasks = sidebarTasks.map((sidebarTask, index) => ({
+			id: sidebarTask.id,
+			title: sidebarTask.title,
+			description: null,
+			status: sidebarTask.status,
+			priority: 0,
+			agent_id: sidebarTask.agentId,
+			parent_task_id: null,
+			sop_id: null,
+			created_at: timestamp(index),
+			updated_at: timestamp(sidebarTask.updatedAt),
+			completed_at: sidebarTask.status === 'completed' ? timestamp(sidebarTask.updatedAt) : null,
+			context: {},
+			depends_on: [],
+			dependents: [],
+			blocked_by: [],
+			ready: true,
+		}));
+		await route.fulfill({
+			status: 200,
+			contentType: 'application/json',
+			body: JSON.stringify({
+				tasks,
+				counts: { pending: 1, in_progress: 1, waiting_for_input: 1, blocked: 0, completed: 5, cancelled: 0 },
+			}),
+		});
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const sidebar = page.locator('aside').first();
+	const taskSidebar = sidebar.locator('[data-sidebar-mode="tasks"]');
+	await expect(taskSidebar).toBeVisible();
+
+	const primaryGroup = taskSidebar.locator(`[data-sidebar-project-group="${agentId}"]`);
+	await expect(primaryGroup.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	const primaryTasks = primaryGroup.locator('[data-sidebar-task]');
+	await expect(primaryTasks).toHaveCount(5);
+	expect(await primaryTasks.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
+		'/tasks/primary-newest',
+		'/tasks/primary-second',
+		'/tasks/primary-recent',
+		'/tasks/primary-middle',
+		`/tasks/${taskId}`,
+	]);
+	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"]`)).toHaveAttribute('aria-current', 'page');
+	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"] [data-task-status="in_progress"]`)).toBeVisible();
+
+	const secondaryGroup = taskSidebar.locator('[data-sidebar-project-group="project-secondary-test"]');
+	await expect(secondaryGroup.getByRole('heading', { name: 'Secondary browser workspace' })).toBeVisible();
+	expect(await secondaryGroup.locator('[data-sidebar-task]').evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
+		'/tasks/secondary-newest',
+		'/tasks/secondary-older',
+	]);
+
+	await sidebar.locator('a[href="/agents"]').click();
+	await expect(sidebar.locator('[data-sidebar-mode="tasks"]')).toHaveCount(0);
+	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toBeVisible();
+});
