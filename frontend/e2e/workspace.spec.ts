@@ -183,9 +183,25 @@ async function mockApi(
 				mcp_servers: [],
 			};
 		} else if (path === '/api/tasks') {
-			response = url.searchParams.has('parent_task_id')
-				? { tasks: [], counts: { ...counts, completed: 0 } }
-				: { tasks: listedTasks, counts };
+			if (url.searchParams.has('parent_task_id')) {
+				response = { tasks: [], counts: { ...counts, completed: 0 } };
+			} else if (url.searchParams.get('sort') === 'recent') {
+				const excludedStatuses = new Set((url.searchParams.get('exclude_statuses') ?? '').split(',').filter(Boolean));
+				const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
+				response = {
+					tasks: [...listedTasks]
+						.filter((listedTask) => !excludedStatuses.has(listedTask.status))
+						.sort((left, right) =>
+							Date.parse(right.updated_at) - Date.parse(left.updated_at)
+							|| Date.parse(right.created_at) - Date.parse(left.created_at)
+							|| right.id.localeCompare(left.id)
+						)
+						.slice(0, limit),
+					counts,
+				};
+			} else {
+				response = { tasks: listedTasks, counts };
+			}
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
@@ -565,8 +581,16 @@ test('new-work drafts restore the project they were written for', async ({ page 
 
 test('project Work shows only the five most recently updated tasks', async ({ page }) => {
 	await mockApi(page, { projectTaskUpdates: [10, 70, 30, 90, 50, 110, 20] });
+	const recentRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks' && url.searchParams.get('sort') === 'recent';
+	});
 	await page.goto(`/agents/${agentId}`);
 
+	const recentUrl = new URL((await recentRequest).url());
+	expect(recentUrl.searchParams.get('agent_id')).toBe(agentId);
+	expect(recentUrl.searchParams.get('limit')).toBe('5');
+	expect(recentUrl.searchParams.get('exclude_statuses')).toBe('waiting_for_input,blocked');
 	const workItems = page.locator('[data-project-work-list] [data-project-work-item]');
 	await expect(workItems).toHaveCount(5);
 	expect(await workItems.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([

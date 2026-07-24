@@ -107,6 +107,12 @@ pub struct ReportedSubtask {
     pub status: TaskStatus,
 }
 
+#[derive(Clone, Copy)]
+enum TaskListOrder {
+    Scheduler,
+    Recent,
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -198,7 +204,33 @@ impl TaskBoard {
         agent_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Task>> {
-        self.list_inner(status, agent_id, limit, false)
+        self.list_inner(
+            status,
+            agent_id,
+            &[],
+            limit,
+            false,
+            TaskListOrder::Scheduler,
+        )
+    }
+
+    /// List the most recently updated tasks, excluding statuses that are
+    /// presented elsewhere in the UI.
+    pub fn list_recent(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        excluded_statuses: &[&str],
+        limit: i64,
+    ) -> Result<Vec<Task>> {
+        self.list_inner(
+            status,
+            agent_id,
+            excluded_statuses,
+            limit,
+            false,
+            TaskListOrder::Recent,
+        )
     }
 
     /// List tasks including hidden ones (e.g. IDLE tasks).
@@ -208,15 +240,17 @@ impl TaskBoard {
         agent_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Task>> {
-        self.list_inner(status, agent_id, limit, true)
+        self.list_inner(status, agent_id, &[], limit, true, TaskListOrder::Scheduler)
     }
 
     fn list_inner(
         &self,
         status: Option<&str>,
         agent_id: Option<&str>,
+        excluded_statuses: &[&str],
         limit: i64,
         include_hidden: bool,
+        order: TaskListOrder,
     ) -> Result<Vec<Task>> {
         let conn = self.db.conn();
         let mut sql = "SELECT * FROM tasks WHERE 1=1".to_string();
@@ -237,8 +271,19 @@ impl TaskBoard {
             sql.push_str(" AND agent_id = ?");
             params.push(Box::new(a.to_string()));
         }
+        for excluded_status in excluded_statuses {
+            sql.push_str(" AND status != ?");
+            params.push(Box::new((*excluded_status).to_string()));
+        }
 
-        sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT ?");
+        match order {
+            TaskListOrder::Scheduler => {
+                sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT ?");
+            }
+            TaskListOrder::Recent => {
+                sql.push_str(" ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?");
+            }
+        }
         params.push(Box::new(limit));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =

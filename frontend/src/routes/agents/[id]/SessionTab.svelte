@@ -28,18 +28,10 @@
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 	const RECENT_WORK_LIMIT = 5;
-	let attentionTasks = $derived(taskList.filter((task) => ['waiting_for_input', 'blocked'].includes(task.status)));
+	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
+	let attentionTasks = $derived(taskList.filter((task) => ATTENTION_STATUSES.includes(task.status)));
 	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
-	let recentWorkTasks = $derived(
-		taskList
-			.filter((task) => !['waiting_for_input', 'blocked'].includes(task.status))
-			.sort((left, right) =>
-				Date.parse(right.updated_at) - Date.parse(left.updated_at)
-				|| Date.parse(right.created_at) - Date.parse(left.created_at)
-				|| right.id.localeCompare(left.id)
-			)
-			.slice(0, RECENT_WORK_LIMIT)
-	);
+	let recentWorkTasks = $state<Task[]>([]);
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
@@ -59,12 +51,18 @@
 
 	async function load() {
 		try {
-			const [nextOverview, result] = await Promise.all([
+			const [nextOverview, result, recentWork] = await Promise.all([
 				sessions.get(agentId),
 				tasks.list(undefined, agentId),
+				tasks.list(undefined, agentId, {
+					limit: RECENT_WORK_LIMIT,
+					sort: 'recent',
+					excludeStatuses: ATTENTION_STATUSES,
+				}),
 			]);
 			overview = nextOverview;
 			taskList = result.tasks;
+			recentWorkTasks = recentWork.tasks;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
