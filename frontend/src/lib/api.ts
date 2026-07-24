@@ -398,6 +398,7 @@ export interface Schedule {
 	created_at: string;
 	schedule_type: 'cron' | 'once';
 	run_at: string | null;
+	continuation_task_id: string | null;
 }
 
 export const schedules = {
@@ -420,6 +421,7 @@ export const schedules = {
 		description?: string;
 		run_at?: string;
 		delay_seconds?: number;
+		continuation_task_id?: string;
 	}) => request<Schedule>('/api/schedules/once', { method: 'POST', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/schedules/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Schedule>(`/api/schedules/${id}/enable`, { method: 'POST' }),

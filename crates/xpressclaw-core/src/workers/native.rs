@@ -253,6 +253,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     {
         mcp_servers.push(xpressclaw_control_mcp_server(
             &agent.name,
+            &item.task_id,
             control_plane_port,
             docker.runtime(),
         ));
@@ -765,6 +766,7 @@ fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<Mc
 
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
+    task_id: &str,
     control_plane_port: u16,
     container_runtime: &str,
 ) -> McpServer {
@@ -780,6 +782,7 @@ fn xpressclaw_control_mcp_server(
                 format!("http://{host}:{control_plane_port}"),
             ),
             EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
+            EnvVariable::new("XPRESSCLAW_TASK_ID", task_id),
         ]),
     )
 }
@@ -1273,7 +1276,7 @@ mod tests {
 
     #[test]
     fn scopes_the_bundled_control_mcp_to_the_current_project() {
-        let server = xpressclaw_control_mcp_server("dgx-codex", 9123, "docker");
+        let server = xpressclaw_control_mcp_server("dgx-codex", "task-123", 9123, "docker");
         let McpServer::Stdio(server) = server else {
             panic!("expected stdio MCP configuration");
         };
@@ -1290,8 +1293,12 @@ mod tests {
         assert!(server.env.iter().any(|variable| {
             variable.name == "XPRESSCLAW_AGENT_ID" && variable.value == "dgx-codex"
         }));
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_TASK_ID" && variable.value == "task-123"
+        }));
 
-        let McpServer::Stdio(podman) = xpressclaw_control_mcp_server("dgx-codex", 9123, "podman")
+        let McpServer::Stdio(podman) =
+            xpressclaw_control_mcp_server("dgx-codex", "task-123", 9123, "podman")
         else {
             panic!("expected stdio MCP configuration");
         };
@@ -1663,6 +1670,7 @@ mod tests {
                 agent_id: "dgx-codex".into(),
                 title: "Resume the DGX experiment".into(),
                 description: Some("Inspect the results and continue the active goal.".into()),
+                continuation_task_id: Some(original.id.clone()),
             })
             .unwrap();
         let wakeup_task = schedules.trigger(&wakeup.id, &board).unwrap();
@@ -1673,10 +1681,19 @@ mod tests {
             .find(|item| item.task_id == wakeup_task.id)
             .unwrap();
 
+        assert_eq!(wakeup_task.id, original.id);
         assert_eq!(
             resume_session_id(&db, &wakeup_item, "codex").unwrap(),
             Some("codex-thread-1".into())
         );
+        let messages = TaskConversation::new(db)
+            .get_messages(&original.id)
+            .unwrap();
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .contains("Inspect the results and continue the active goal.")
+        }));
     }
 
     #[test]

@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::tasks::board::{CreateTask, Task, TaskBoard};
+use crate::sessions::{NewEvent, SessionManager};
+use crate::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus};
+use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
 
 pub const SCHEDULE_TYPE_CRON: &str = "cron";
@@ -30,6 +32,7 @@ pub struct Schedule {
     pub created_at: String,
     pub schedule_type: String,
     pub run_at: Option<String>,
+    pub continuation_task_id: Option<String>,
 }
 
 /// Request to create a new schedule.
@@ -55,6 +58,11 @@ pub struct CreateOneShotSchedule {
     pub agent_id: String,
     pub title: String,
     pub description: Option<String>,
+    /// Existing task whose transcript should receive the future turn.
+    ///
+    /// This is set by the bundled agent control tool. Standalone schedules
+    /// leave it empty and retain their existing create-a-task behavior.
+    pub continuation_task_id: Option<String>,
 }
 
 /// Manages recurring and one-shot schedules that create tasks when triggered.
@@ -95,6 +103,17 @@ impl ScheduleManager {
         validate_required("name", &req.name)?;
         validate_required("agent_id", &req.agent_id)?;
         validate_required("title", &req.title)?;
+        if let Some(task_id) = req.continuation_task_id.as_deref() {
+            let task = TaskBoard::new(self.db.clone()).get(task_id).map_err(|_| {
+                Error::Schedule(format!("continuation task '{task_id}' was not found"))
+            })?;
+            if task.agent_id.as_deref() != Some(req.agent_id.as_str()) {
+                return Err(Error::Schedule(format!(
+                    "continuation task '{task_id}' does not belong to project '{}'",
+                    req.agent_id
+                )));
+            }
+        }
 
         let run_at = resolve_one_shot_deadline(req)?.to_rfc3339_opts(SecondsFormat::Secs, true);
         let id = Uuid::new_v4().to_string();
@@ -107,8 +126,8 @@ impl ScheduleManager {
             conn.execute(
                 "INSERT INTO schedules
                  (id, name, cron, agent_id, title, description, enabled, run_count, created_at,
-                  schedule_type, run_at)
-                 VALUES (?1, ?2, '', ?3, ?4, ?5, 1, 0, ?6, ?7, ?8)",
+                  schedule_type, run_at, continuation_task_id)
+                 VALUES (?1, ?2, '', ?3, ?4, ?5, 1, 0, ?6, ?7, ?8, ?9)",
                 rusqlite::params![
                     id,
                     req.name,
@@ -118,6 +137,7 @@ impl ScheduleManager {
                     now,
                     SCHEDULE_TYPE_ONCE,
                     run_at,
+                    req.continuation_task_id,
                 ],
             )
             .map_err(|e| Error::Database(e.to_string()))
@@ -257,45 +277,65 @@ impl ScheduleManager {
         });
 
         let agent_id = schedule.agent_id.clone();
-        let task = match board.create(&CreateTask {
-            title,
-            description,
-            agent_id: Some(agent_id.clone()),
-            parent_task_id: None,
-            sop_id: None,
-            conversation_id: None,
-            priority: None,
-            context: Some(serde_json::json!({
-                "origin": "schedule",
-                "kind": "scheduled",
-                "source_id": id,
-                "schedule_type": schedule.schedule_type,
-            })),
-        }) {
-            Ok(task) => task,
-            Err(error) => {
+        let task = if let Some(task_id) = schedule.continuation_task_id.as_deref() {
+            match self.enqueue_continuation(
+                &schedule,
+                task_id,
+                &title,
+                description.as_deref(),
+                board,
+            ) {
+                Ok(task) => task,
+                Err(error) => {
+                    if is_one_shot {
+                        self.release_one_shot_claim(id);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            let task = match board.create(&CreateTask {
+                title,
+                description,
+                agent_id: Some(agent_id.clone()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: Some(serde_json::json!({
+                    "origin": "schedule",
+                    "kind": "scheduled",
+                    "source_id": id,
+                    "schedule_type": schedule.schedule_type,
+                })),
+            }) {
+                Ok(task) => task,
+                Err(error) => {
+                    if is_one_shot {
+                        self.release_one_shot_claim(id);
+                    }
+                    return Err(error);
+                }
+            };
+
+            // Standalone and recurring schedules retain their existing
+            // create-a-task behavior.
+            let queue = TaskQueue::new(self.db.clone());
+            if let Err(error) = queue.enqueue(&task.id, &agent_id) {
                 if is_one_shot {
                     self.release_one_shot_claim(id);
+                    let _ = board.delete(&task.id);
+                    return Err(error);
                 }
-                return Err(error);
+                warn!(
+                    task_id = task.id.as_str(),
+                    schedule_id = id,
+                    error = %error,
+                    "failed to enqueue scheduled task"
+                );
             }
+            task
         };
-
-        // Enqueue for the dispatcher
-        let queue = TaskQueue::new(self.db.clone());
-        if let Err(e) = queue.enqueue(&task.id, &agent_id) {
-            if is_one_shot {
-                self.release_one_shot_claim(id);
-                let _ = board.delete(&task.id);
-                return Err(e);
-            }
-            warn!(
-                task_id = task.id.as_str(),
-                schedule_id = id,
-                error = %e,
-                "failed to enqueue scheduled task"
-            );
-        }
 
         // Update last_run and run_count
         let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -312,6 +352,83 @@ impl ScheduleManager {
         })?;
 
         Ok(task)
+    }
+
+    fn enqueue_continuation(
+        &self,
+        schedule: &Schedule,
+        task_id: &str,
+        title: &str,
+        description: Option<&str>,
+        board: &TaskBoard,
+    ) -> Result<Task> {
+        let task = board
+            .get(task_id)
+            .map_err(|_| Error::Schedule(format!("continuation task '{task_id}' was not found")))?;
+        if task.agent_id.as_deref() != Some(schedule.agent_id.as_str()) {
+            return Err(Error::Schedule(format!(
+                "continuation task '{task_id}' does not belong to project '{}'",
+                schedule.agent_id
+            )));
+        }
+
+        let instruction = description
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(title);
+        let content = format!("Scheduled wake-up: {}\n\n{instruction}", schedule.name);
+        let conversation = TaskConversation::new(self.db.clone());
+        let message = conversation.add_message(task_id, "user", &content)?;
+        let queue = TaskQueue::new(self.db.clone());
+        if let Err(error) = queue.enqueue_continuation(task_id, &schedule.agent_id) {
+            let _ = self.db.with_conn(|conn| {
+                conn.execute("DELETE FROM task_messages WHERE id = ?1", [message.id])
+            });
+            return Err(error);
+        }
+
+        if let Err(error) = SessionManager::new(self.db.clone()).append_event(
+            &schedule.agent_id,
+            NewEvent {
+                attempt_id: None,
+                task_id: Some(task_id),
+                source_type: "schedule",
+                source_id: Some(&schedule.id),
+                event_type: "scheduled_wakeup",
+                summary: &format!("Scheduled wake-up '{}' fired", schedule.name),
+                payload: serde_json::json!({
+                    "kind": "scheduled_wakeup",
+                    "schedule_id": schedule.id,
+                    "content": instruction,
+                }),
+            },
+        ) {
+            warn!(
+                task_id,
+                schedule_id = schedule.id,
+                error = %error,
+                "failed to record scheduled wake-up event"
+            );
+        }
+
+        if matches!(
+            task.status,
+            TaskStatus::WaitingForInput
+                | TaskStatus::Blocked
+                | TaskStatus::Completed
+                | TaskStatus::Cancelled
+        ) {
+            if let Err(error) = board.update_status(task_id, "pending", Some(&schedule.agent_id)) {
+                warn!(
+                    task_id,
+                    schedule_id = schedule.id,
+                    error = %error,
+                    "failed to reopen task for scheduled wake-up"
+                );
+            }
+        }
+
+        board.get(task_id)
     }
 
     fn release_one_shot_claim(&self, id: &str) {
@@ -452,6 +569,7 @@ fn row_to_schedule(row: &rusqlite::Row) -> Schedule {
             .get("schedule_type")
             .unwrap_or_else(|_| SCHEDULE_TYPE_CRON.to_string()),
         run_at: row.get("run_at").unwrap_or_default(),
+        continuation_task_id: row.get("continuation_task_id").unwrap_or_default(),
     }
 }
 
@@ -516,6 +634,7 @@ mod tests {
             agent_id: "atlas".to_string(),
             title: "Resume experiment".to_string(),
             description: Some("Inspect the completed experiment and continue the goal.".into()),
+            continuation_task_id: None,
         })
         .unwrap()
     }
@@ -562,6 +681,7 @@ mod tests {
             agent_id: "atlas".into(),
             title: "Invalid".into(),
             description: None,
+            continuation_task_id: None,
         };
 
         assert!(matches!(
@@ -676,6 +796,85 @@ mod tests {
     }
 
     #[test]
+    fn test_one_shot_continues_the_task_that_armed_it() {
+        let (db, mgr, board) = setup();
+        let original = board
+            .create(&CreateTask {
+                title: "Monitor the deployment".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .update_status(&original.id, "completed", Some("atlas"))
+            .unwrap();
+        let schedule = mgr
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Check deployment".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Check deployment".into(),
+                description: Some("Inspect CI and report whether it passed.".into()),
+                continuation_task_id: Some(original.id.clone()),
+            })
+            .unwrap();
+
+        let triggered = mgr.trigger(&schedule.id, &board).unwrap();
+
+        assert_eq!(triggered.id, original.id);
+        assert_eq!(triggered.status, TaskStatus::Pending);
+        assert_eq!(board.list(None, Some("atlas"), 10).unwrap().len(), 1);
+        let messages = TaskConversation::new(db.clone())
+            .get_messages(&original.id)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(
+            messages[0].content,
+            "Scheduled wake-up: Check deployment\n\nInspect CI and report whether it passed."
+        );
+        let queued = TaskQueue::new(db.clone())
+            .list(Some("atlas"), Some("queued"), 10)
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].task_id, original.id);
+        let events = SessionManager::new(db)
+            .list_events("atlas", None, 100)
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.task_id.as_deref() == Some(original.id.as_str())
+                && event.event_type == "scheduled_wakeup"
+                && event.source_id.as_deref() == Some(schedule.id.as_str())
+        }));
+    }
+
+    #[test]
+    fn test_one_shot_rejects_a_continuation_task_from_another_project() {
+        let (_, mgr, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Atlas task".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let result = mgr.create_one_shot(&CreateOneShotSchedule {
+            name: "Cross-project wake-up".into(),
+            run_at: None,
+            delay_seconds: Some(60),
+            agent_id: "scout".into(),
+            title: "Wrong project".into(),
+            description: Some("This must be rejected.".into()),
+            continuation_task_id: Some(task.id),
+        });
+
+        assert!(matches!(result, Err(Error::Schedule(_))));
+        assert!(mgr.list(None, false).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_due_one_shot_is_recovered_and_dispatched_once() {
         let (db, mgr, _) = setup();
         let schedule = mgr
@@ -689,6 +888,7 @@ mod tests {
                 agent_id: "atlas".into(),
                 title: "Resume overdue work".into(),
                 description: None,
+                continuation_task_id: None,
             })
             .unwrap();
 
@@ -747,6 +947,7 @@ mod tests {
             created_at: String::new(),
             schedule_type: SCHEDULE_TYPE_CRON.into(),
             run_at: None,
+            continuation_task_id: None,
         };
 
         assert!(should_trigger(&schedule, Utc::now()));
@@ -769,6 +970,7 @@ mod tests {
             created_at: String::new(),
             schedule_type: SCHEDULE_TYPE_CRON.into(),
             run_at: None,
+            continuation_task_id: None,
         };
 
         // Just ran — next match is next hour, so should not trigger now
@@ -790,6 +992,7 @@ mod tests {
             created_at: String::new(),
             schedule_type: SCHEDULE_TYPE_CRON.into(),
             run_at: None,
+            continuation_task_id: None,
         };
 
         assert!(!should_trigger(&schedule, Utc::now()));

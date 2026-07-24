@@ -5,9 +5,11 @@
 // local API or allowing work to be scheduled for another project.
 
 import { createInterface } from 'node:readline';
+import { pathToFileURL } from 'node:url';
 
 const BASE_URL = (process.env.XPRESSCLAW_URL ?? '').replace(/\/$/, '');
 const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
+const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 
 const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume later.
 
@@ -129,7 +131,10 @@ async function wakeups() {
   return schedules.filter((schedule) => schedule.schedule_type === 'once');
 }
 
-async function scheduleWakeup(argumentsValue) {
+export function buildWakeupRequest(
+  argumentsValue,
+  { agentId = AGENT_ID, taskId = TASK_ID } = {},
+) {
   const args = argumentsValue ?? {};
   const hasDelay = Object.hasOwn(args, 'delay_seconds');
   const hasRunAt = Object.hasOwn(args, 'run_at');
@@ -149,13 +154,18 @@ async function scheduleWakeup(argumentsValue) {
   const name = typeof args.name === 'string' && args.name.trim()
     ? args.name.trim()
     : 'Scheduled wake-up';
-  const body = {
+  return {
     name,
-    agent_id: AGENT_ID,
+    agent_id: agentId,
     title: name,
     description: args.message.trim(),
+    ...(taskId ? { continuation_task_id: taskId } : {}),
     ...(hasDelay ? { delay_seconds: args.delay_seconds } : { run_at: args.run_at.trim() }),
   };
+}
+
+async function scheduleWakeup(argumentsValue) {
+  const body = buildWakeupRequest(argumentsValue);
   const schedule = await api('/api/schedules/once', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -165,6 +175,7 @@ async function scheduleWakeup(argumentsValue) {
     schedule_id: schedule.id,
     run_at: schedule.run_at,
     project: AGENT_ID,
+    task: TASK_ID || null,
     message: 'XpressClaw will initiate the future turn. End this turn instead of waiting or polling.',
   };
 }
@@ -222,12 +233,18 @@ async function handle(message) {
   error(id, -32601, `method not found: ${method}`);
 }
 
-const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of input) {
-  if (!line.trim()) continue;
-  try {
-    await handle(JSON.parse(line));
-  } catch (cause) {
-    error(null, -32603, cause instanceof Error ? cause.message : String(cause));
+async function main() {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of input) {
+    if (!line.trim()) continue;
+    try {
+      await handle(JSON.parse(line));
+    } catch (cause) {
+      error(null, -32603, cause instanceof Error ? cause.message : String(cause));
+    }
   }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
 }

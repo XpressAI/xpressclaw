@@ -28,8 +28,13 @@ Built-in Codex, Claude Code, and OpenCode runners also receive a constrained
 `schedule_wakeup` tool. An agent can provide either `delay_seconds` (for
 example, `18000` for five hours) or an RFC 3339 `run_at` timestamp with a
 timezone offset. The tool is fixed to the current project, so the future work
-resumes that project's existing ACP conversation rather than starting an
-unrelated agent session.
+resumes that project's existing ACP conversation. Xpressclaw also binds the
+wake-up to the task that armed it: when the deadline arrives, the instruction,
+status events, tool calls, and final response are appended to that task's
+existing timeline rather than being buried in a separate scheduled task.
+
+One-shot schedules created outside an active agent task and recurring schedules
+retain the standalone behavior of creating a new task for each run.
 
 This is the appropriate replacement for `sleep`, a sentinel file, or a goal
 loop that keeps taking immediate turns: those mechanisms can delay a process,
