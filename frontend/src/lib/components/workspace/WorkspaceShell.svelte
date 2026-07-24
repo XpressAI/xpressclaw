@@ -23,6 +23,7 @@
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
 	import ContextMenu from '../ContextMenu.svelte';
+	import SidebarTasks from './SidebarTasks.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
 
 	let { children }: { children: Snippet } = $props();
@@ -52,6 +53,7 @@
 	let mobileMenuOpen = $state(false);
 	let agentList = $state<Agent[]>([]);
 	let taskList = $state<Task[]>([]);
+	let sidebarTaskList = $state<Task[]>([]);
 	let workflowList = $state<Workflow[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 
@@ -68,6 +70,8 @@
 	let focusedPane = $derived(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
 	let focusedTab = $derived(focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0] ?? null);
 	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab) => ({ paneId: pane.id, tab }))));
+	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
+	let focusedTaskId = $derived(focusedTab?.kind === 'task' ? focusedTab.resourceId : null);
 	let attentionTasks = $derived(taskList
 		.filter((task) => task.status === 'waiting_for_input' || task.status === 'blocked')
 		.sort((left, right) => statusPriority(right.status) - statusPriority(left.status)
@@ -76,7 +80,8 @@
 		if (!focusedTab) return null;
 		if (focusedTab.kind === 'project') return agentList.find((agent) => agent.id === focusedTab.resourceId) ?? null;
 		if (focusedTab.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId);
+			const task = taskList.find((candidate) => candidate.id === focusedTab.resourceId)
+				?? sidebarTaskList.find((candidate) => candidate.id === focusedTab.resourceId);
 			return agentList.find((agent) => agent.id === task?.agent_id) ?? null;
 		}
 		return null;
@@ -140,7 +145,8 @@
 	function decorateTab(tab: WorkspaceTab): WorkspaceTab {
 		const description = describeWorkspacePath(tab.path);
 		if (description.kind === 'task') {
-			const task = taskList.find((candidate) => candidate.id === description.resourceId);
+			const task = taskList.find((candidate) => candidate.id === description.resourceId)
+				?? sidebarTaskList.find((candidate) => candidate.id === description.resourceId);
 			return { ...tab, ...description, title: task?.title ?? tab.title ?? 'Task', status: task?.status ?? tab.status };
 		}
 		if (description.kind === 'project') {
@@ -437,13 +443,15 @@
 
 	async function loadWorkspaceSummary() {
 		try {
-			const [nextAgents, taskResult, nextWorkflows] = await Promise.all([
+			const [nextAgents, taskResult, sidebarTaskResult, nextWorkflows] = await Promise.all([
 				agents.list().catch(() => agentList),
 				tasksApi.list().catch(() => ({ tasks: taskList })),
+				tasksApi.recentByAgent().catch(() => null),
 				workflowsApi.list().catch(() => workflowList),
 			]);
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
+			sidebarTaskList = sidebarTaskResult?.tasks ?? taskResult.tasks;
 			workflowList = nextWorkflows;
 			refreshTabMetadata();
 		} catch {}
@@ -553,13 +561,17 @@
 		{#if sidebarCollapsed}
 			<div class="flex flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-2">
 				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
-				{#each agentList as agent (agent.id)}
-					{@const status = projectStatus(agent)}
-					<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {statusLabel(status)}">
-						{harnessMark(agent.backend)}
-						<span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(status)}"></span>
-					</a>
-				{/each}
+				{#if sidebarCategory === 'tasks'}
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} compact />
+				{:else}
+					{#each agentList as agent (agent.id)}
+						{@const status = projectStatus(agent)}
+						<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {statusLabel(status)}">
+							{harnessMark(agent.backend)}
+							<span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(status)}"></span>
+						</a>
+					{/each}
+				{/if}
 			</div>
 		{:else}
 			<div class="flex-1 overflow-y-auto px-2 pb-3">
@@ -567,37 +579,41 @@
 					<span class="text-base leading-none">+</span><span>New work</span>
 				</a>
 
-				{#if attentionTasks.length > 0}
-					<div class="mb-4">
-						<div class="mb-1.5 flex items-center justify-between px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">
-							<span>Needs you</span><span>{attentionTasks.length}</span>
+				{#if sidebarCategory === 'tasks'}
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} />
+				{:else}
+					{#if attentionTasks.length > 0}
+						<div class="mb-4">
+							<div class="mb-1.5 flex items-center justify-between px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">
+								<span>Needs you</span><span>{attentionTasks.length}</span>
+							</div>
+							<div class="space-y-0.5">
+								{#each attentionTasks.slice(0, 5) as task (task.id)}
+									{@const project = taskProject(task)}
+									<a href="/tasks/{task.id}" class="group flex items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-accent/50">
+										<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500 animate-pulse'}"></span>
+										<span class="min-w-0 flex-1"><span class="block truncate text-xs text-foreground">{task.title}</span><span class="mt-0.5 block truncate text-[10px] text-muted-foreground">{project?.title || project?.name || 'Unassigned'} · {timeAgo(task.updated_at)}</span></span>
+									</a>
+								{/each}
+							</div>
 						</div>
-						<div class="space-y-0.5">
-							{#each attentionTasks.slice(0, 5) as task (task.id)}
-								{@const project = taskProject(task)}
-								<a href="/tasks/{task.id}" class="group flex items-start gap-2 rounded-lg px-2 py-2 text-left hover:bg-accent/50">
-									<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500 animate-pulse'}"></span>
-									<span class="min-w-0 flex-1"><span class="block truncate text-xs text-foreground">{task.title}</span><span class="mt-0.5 block truncate text-[10px] text-muted-foreground">{project?.title || project?.name || 'Unassigned'} · {timeAgo(task.updated_at)}</span></span>
-								</a>
-							{/each}
-						</div>
+					{/if}
+
+					<div class="mb-1.5 flex items-center justify-between px-2">
+						<span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</span>
+						<a href="/setup?mode=add-session" class="flex h-5 w-5 items-center justify-center rounded text-sm text-muted-foreground hover:bg-accent hover:text-foreground" title="Add project">+</a>
+					</div>
+					<div class="space-y-0.5">
+						{#each agentList as agent (agent.id)}
+							{@const status = projectStatus(agent)}
+							<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}>
+								<span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
+								<span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block text-[10px] font-normal text-muted-foreground">{statusLabel(status)}</span></span>
+								<span class="h-2 w-2 shrink-0 rounded-full {statusDot(status)}"></span>
+							</a>
+						{/each}
 					</div>
 				{/if}
-
-				<div class="mb-1.5 flex items-center justify-between px-2">
-					<span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</span>
-					<a href="/setup?mode=add-session" class="flex h-5 w-5 items-center justify-center rounded text-sm text-muted-foreground hover:bg-accent hover:text-foreground" title="Add project">+</a>
-				</div>
-				<div class="space-y-0.5">
-					{#each agentList as agent (agent.id)}
-						{@const status = projectStatus(agent)}
-						<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}>
-							<span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
-							<span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block text-[10px] font-normal text-muted-foreground">{statusLabel(status)}</span></span>
-							<span class="h-2 w-2 shrink-0 rounded-full {statusDot(status)}"></span>
-						</a>
-					{/each}
-				</div>
 			</div>
 		{/if}
 
@@ -670,19 +686,25 @@
 	<div class="fixed inset-0 z-50 md:hidden">
 		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close project switcher" onclick={() => (mobileMenuOpen = false)}></button>
 		<aside class="absolute inset-y-0 left-0 flex w-[min(88vw,22rem)] flex-col border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
-			<div class="mb-3 flex h-9 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">Projects</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
+			<div class="mb-3 flex h-9 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarCategory === 'tasks' ? 'Tasks' : 'Projects'}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
 			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
-			{#if attentionTasks.length > 0}
-				<div class="mb-4"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
+			{#if sidebarCategory === 'tasks'}
+				<div class="min-h-0 flex-1 overflow-y-auto">
+					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+				</div>
+			{:else}
+				{#if attentionTasks.length > 0}
+					<div class="mb-4"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
+				{/if}
+				<div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</div>
+				<div class="flex-1 space-y-1 overflow-y-auto">
+					{#each agentList as agent (agent.id)}
+						{@const status = projectStatus(agent)}
+						<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
+					{/each}
+				</div>
+				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
 			{/if}
-			<div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</div>
-			<div class="flex-1 space-y-1 overflow-y-auto">
-				{#each agentList as agent (agent.id)}
-					{@const status = projectStatus(agent)}
-					<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
-				{/each}
-			</div>
-			<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
 		</aside>
 	</div>
 {/if}

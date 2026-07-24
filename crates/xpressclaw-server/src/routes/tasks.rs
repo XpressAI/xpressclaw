@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachmentInput};
-use xpressclaw_core::tasks::board::{CreateTask, TaskBoard, TaskStatus, UpdateTask};
+use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::acp::{
@@ -35,6 +35,11 @@ pub enum TaskListSort {
     #[default]
     Scheduler,
     Recent,
+}
+
+#[derive(Deserialize)]
+pub struct RecentByAgentParams {
+    pub limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +87,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(list_tasks).post(create_task))
         .route("/batch", axum::routing::post(create_tasks_batch))
         .route("/counts", get(task_counts))
+        .route("/recent-by-agent", get(list_recent_tasks_by_agent))
         .route(
             "/{id}",
             get(get_task).patch(update_task).delete(delete_task),
@@ -140,8 +146,25 @@ async fn list_tasks(
 
     let counts = board.counts().map_err(internal_error)?;
 
-    // Enrich tasks with dependency info
-    let enriched: Vec<Value> = tasks
+    Ok(Json(json!({
+        "tasks": enrich_tasks(&board, &tasks),
+        "counts": counts,
+    })))
+}
+
+async fn list_recent_tasks_by_agent(
+    State(state): State<AppState>,
+    Query(params): Query<RecentByAgentParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let board = TaskBoard::new(state.db.clone());
+    let limit = params.limit.unwrap_or(5).clamp(1, 100);
+    let tasks = board.list_recent_per_agent(limit).map_err(internal_error)?;
+
+    Ok(Json(json!({ "tasks": enrich_tasks(&board, &tasks) })))
+}
+
+fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
+    tasks
         .iter()
         .map(|t| {
             let mut v = json!(t);
@@ -150,9 +173,7 @@ async fn list_tasks(
             v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
             v
         })
-        .collect();
-
-    Ok(Json(json!({ "tasks": enriched, "counts": counts })))
+        .collect()
 }
 
 async fn create_task(
@@ -774,6 +795,82 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["id"], task_id);
+    }
+
+    #[tokio::test]
+    async fn test_recent_tasks_are_limited_per_agent_after_ordering() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let create_task = |title: &str, agent_id: Option<&str>, priority: i32| {
+            board
+                .create(&CreateTask {
+                    title: title.to_string(),
+                    agent_id: agent_id.map(str::to_string),
+                    priority: Some(priority),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let alpha_old = create_task("Alpha old priority", Some("alpha"), 100);
+        let alpha_second = create_task("Alpha second", Some("alpha"), 0);
+        let alpha_newest = create_task("Alpha newest", Some("alpha"), 0);
+        let beta_old = create_task("Beta old", Some("beta"), 0);
+        let beta_second = create_task("Beta second", Some("beta"), 0);
+        let beta_newest = create_task("Beta newest", Some("beta"), 0);
+        let unassigned_old = create_task("Unassigned old", None, 0);
+        let unassigned_second = create_task("Unassigned second", None, 0);
+        let unassigned_newest = create_task("Unassigned newest", None, 0);
+
+        {
+            let conn = db.conn();
+            for (task, updated_at) in [
+                (&alpha_old, "2026-01-01 00:00:00"),
+                (&unassigned_old, "2026-01-02 00:00:00"),
+                (&beta_old, "2026-01-03 00:00:00"),
+                (&unassigned_second, "2026-01-04 00:00:00"),
+                (&alpha_second, "2026-01-05 00:00:00"),
+                (&beta_second, "2026-01-06 00:00:00"),
+                (&unassigned_newest, "2026-01-07 00:00:00"),
+                (&alpha_newest, "2026-01-08 00:00:00"),
+                (&beta_newest, "2026-01-09 00:00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                    [updated_at, task.id.as_str()],
+                )
+                .unwrap();
+            }
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks/recent-by-agent?limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let task_ids = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            task_ids,
+            vec![
+                beta_newest.id,
+                alpha_newest.id,
+                unassigned_newest.id,
+                beta_second.id,
+                alpha_second.id,
+                unassigned_second.id,
+            ]
+        );
     }
 
     #[tokio::test]

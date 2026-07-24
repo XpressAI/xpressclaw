@@ -233,6 +233,34 @@ impl TaskBoard {
         )
     }
 
+    /// List the most recently updated top-level tasks for each agent.
+    pub fn list_recent_per_agent(&self, limit: i64) -> Result<Vec<Task>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare(
+            "WITH ranked_tasks AS (
+                SELECT tasks.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(agent_id, '')
+                        ORDER BY updated_at DESC, created_at DESC, id DESC
+                    ) AS recency_rank
+                FROM tasks
+                WHERE hidden = 0 AND parent_task_id IS NULL
+            )
+            SELECT *
+            FROM ranked_tasks
+            WHERE recency_rank <= ?1
+            ORDER BY updated_at DESC, created_at DESC, id DESC",
+        )?;
+        let tasks = stmt
+            .query_map([limit.max(0)], |row| Ok(row_to_task(row)))
+            .map_err(|e| Error::Database(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(tasks)
+    }
+
     /// List tasks including hidden ones (e.g. IDLE tasks).
     pub fn list_all(
         &self,
