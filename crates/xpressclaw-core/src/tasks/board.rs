@@ -113,6 +113,18 @@ enum TaskListOrder {
     Recent,
 }
 
+#[derive(Clone, Copy)]
+struct TaskListPage {
+    limit: i64,
+    offset: i64,
+}
+
+impl TaskListPage {
+    fn first(limit: i64) -> Self {
+        Self { limit, offset: 0 }
+    }
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -204,11 +216,30 @@ impl TaskBoard {
         agent_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Task>> {
+        let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            status,
+            &statuses,
             agent_id,
             &[],
-            limit,
+            TaskListPage::first(limit),
+            false,
+            TaskListOrder::Scheduler,
+        )
+    }
+
+    /// List a page of scheduler-ordered tasks matching any supplied status.
+    pub fn list_page(
+        &self,
+        statuses: &[&str],
+        agent_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Task>> {
+        self.list_inner(
+            statuses,
+            agent_id,
+            &[],
+            TaskListPage { limit, offset },
             false,
             TaskListOrder::Scheduler,
         )
@@ -223,11 +254,31 @@ impl TaskBoard {
         excluded_statuses: &[&str],
         limit: i64,
     ) -> Result<Vec<Task>> {
+        let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            status,
+            &statuses,
             agent_id,
             excluded_statuses,
-            limit,
+            TaskListPage::first(limit),
+            false,
+            TaskListOrder::Recent,
+        )
+    }
+
+    /// List a page of recently updated tasks matching any supplied status.
+    pub fn list_recent_page(
+        &self,
+        statuses: &[&str],
+        agent_id: Option<&str>,
+        excluded_statuses: &[&str],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Task>> {
+        self.list_inner(
+            statuses,
+            agent_id,
+            excluded_statuses,
+            TaskListPage { limit, offset },
             false,
             TaskListOrder::Recent,
         )
@@ -268,15 +319,23 @@ impl TaskBoard {
         agent_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<Task>> {
-        self.list_inner(status, agent_id, &[], limit, true, TaskListOrder::Scheduler)
+        let statuses = status.into_iter().collect::<Vec<_>>();
+        self.list_inner(
+            &statuses,
+            agent_id,
+            &[],
+            TaskListPage::first(limit),
+            true,
+            TaskListOrder::Scheduler,
+        )
     }
 
     fn list_inner(
         &self,
-        status: Option<&str>,
+        statuses: &[&str],
         agent_id: Option<&str>,
         excluded_statuses: &[&str],
-        limit: i64,
+        page: TaskListPage,
         include_hidden: bool,
         order: TaskListOrder,
     ) -> Result<Vec<Task>> {
@@ -291,9 +350,16 @@ impl TaskBoard {
         // Subtasks belong inside their parent, not the top-level list.
         sql.push_str(" AND parent_task_id IS NULL");
 
-        if let Some(s) = status {
-            sql.push_str(" AND status = ?");
-            params.push(Box::new(s.to_string()));
+        if !statuses.is_empty() {
+            sql.push_str(" AND status IN (");
+            for (index, status) in statuses.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                params.push(Box::new((*status).to_string()));
+            }
+            sql.push(')');
         }
         if let Some(a) = agent_id {
             sql.push_str(" AND agent_id = ?");
@@ -306,13 +372,16 @@ impl TaskBoard {
 
         match order {
             TaskListOrder::Scheduler => {
-                sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT ?");
+                sql.push_str(" ORDER BY priority DESC, created_at ASC, id ASC LIMIT ? OFFSET ?");
             }
             TaskListOrder::Recent => {
-                sql.push_str(" ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ?");
+                sql.push_str(
+                    " ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
+                );
             }
         }
-        params.push(Box::new(limit));
+        params.push(Box::new(page.limit));
+        params.push(Box::new(page.offset.max(0)));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();

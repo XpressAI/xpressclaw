@@ -2,12 +2,24 @@
 	import { onMount } from 'svelte';
 	import { agents, tasks } from '$lib/api';
 	import type { Agent, Task, TaskCounts } from '$lib/api';
-	import { statusColor, timeAgo } from '$lib/utils';
+	import { timeAgo } from '$lib/utils';
+
+	const PAGE_SIZE = 20;
+	const FILTER_STATUSES = {
+		attention: ['waiting_for_input', 'blocked'],
+		active: ['pending', 'in_progress', 'waiting_for_input', 'blocked'],
+		all: [],
+		done: ['completed', 'cancelled'],
+	} as const;
 
 	let taskList = $state<Task[]>([]);
+	let dependencyTasks = $state<Task[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let counts = $state<TaskCounts | null>(null);
 	let loading = $state(true);
+	let page = $state(0);
+	let scrollContainer = $state<HTMLDivElement>();
+	let loadRequest = 0;
 	let showCreate = $state(false);
 	let newTitle = $state('');
 	let newDesc = $state('');
@@ -19,15 +31,11 @@
 	let formError = $state('');
 	let creating = $state(false);
 
-	let visibleTasks = $derived(taskList.filter((task) => {
-		if (filter === 'attention') return ['waiting_for_input', 'blocked'].includes(task.status);
-		if (filter === 'active') return ['pending', 'in_progress', 'waiting_for_input', 'blocked'].includes(task.status);
-		if (filter === 'done') return ['completed', 'cancelled'].includes(task.status);
-		return true;
-	}));
+	let totalTasks = $derived(countForFilter(filter, counts));
+	let totalPages = $derived(Math.max(1, Math.ceil(totalTasks / PAGE_SIZE)));
 
 	onMount(async () => {
-		await Promise.all([load(), loadAgents()]);
+		await Promise.all([load(), loadAgents(), loadDependencies()]);
 	});
 
 	async function loadAgents() {
@@ -35,16 +43,36 @@
 		if (!newAgentId && agentList.length > 0) newAgentId = agentList[0].id;
 	}
 
+	async function loadDependencies() {
+		const result = await tasks.list(undefined, undefined, {
+			limit: 100,
+			statuses: [...FILTER_STATUSES.active],
+		}).catch(() => null);
+		dependencyTasks = result?.tasks ?? [];
+	}
+
 	async function load() {
+		const request = ++loadRequest;
 		loading = true;
 		try {
-			const result = await tasks.list();
-			taskList = result.tasks;
+			const result = await tasks.list(undefined, undefined, {
+				limit: PAGE_SIZE,
+				offset: page * PAGE_SIZE,
+				statuses: [...FILTER_STATUSES[filter]],
+			});
+			if (request !== loadRequest) return;
 			counts = result.counts;
+			if (result.tasks.length === 0 && page > 0 && page * PAGE_SIZE >= countForFilter(filter, result.counts)) {
+				page -= 1;
+				await load();
+				return;
+			}
+			taskList = result.tasks;
 		} catch {
-			taskList = [];
+			if (request === loadRequest) taskList = [];
+		} finally {
+			if (request === loadRequest) loading = false;
 		}
-		loading = false;
 	}
 
 	function statusCount(key: keyof TaskCounts): number {
@@ -52,8 +80,35 @@
 		return counts[key];
 	}
 
+	function countForFilter(selectedFilter: typeof filter, taskCounts: TaskCounts | null): number {
+		if (!taskCounts) return 0;
+		if (selectedFilter === 'attention') return taskCounts.waiting_for_input + taskCounts.blocked;
+		if (selectedFilter === 'active') {
+			return taskCounts.pending + taskCounts.in_progress + taskCounts.waiting_for_input + taskCounts.blocked;
+		}
+		if (selectedFilter === 'done') return taskCounts.completed + taskCounts.cancelled;
+		return Object.values(taskCounts).reduce((total, count) => total + count, 0);
+	}
+
+	async function selectFilter(nextFilter: typeof filter) {
+		if (filter === nextFilter) return;
+		filter = nextFilter;
+		page = 0;
+		taskList = [];
+		await load();
+		scrollContainer?.scrollTo({ top: 0 });
+	}
+
+	async function goToPage(nextPage: number) {
+		if (loading || nextPage < 0 || nextPage >= totalPages || nextPage === page) return;
+		page = nextPage;
+		taskList = [];
+		await load();
+		scrollContainer?.scrollTo({ top: 0 });
+	}
+
 	/** Existing incomplete tasks that can be selected as dependencies. */
-	let availableDeps = $derived(taskList.filter(t => t.status !== 'completed' && t.status !== 'cancelled'));
+	let availableDeps = $derived(dependencyTasks);
 
 	function toggleDep(id: string) {
 		if (newDependsOn.includes(id)) {
@@ -93,22 +148,23 @@
 		}
 	}
 
-	function openCreate() {
+	async function openCreate() {
 		if (agentList.length === 0) return;
 		formError = '';
 		if (!newAgentId) newAgentId = agentList[0].id;
 		showCreate = !showCreate;
+		if (showCreate) await loadDependencies();
 	}
 
 	async function cancelTask(id: string) {
 		await tasks.updateStatus(id, 'cancelled');
-		await load();
+		await Promise.all([load(), loadDependencies()]);
 	}
 
 	async function deleteTask(id: string) {
 		if (!confirm('Delete this task?')) return;
 		await tasks.delete(id);
-		await load();
+		await Promise.all([load(), loadDependencies()]);
 	}
 
 	function agentName(agentId: string | null): string | null {
@@ -127,7 +183,8 @@
 	}
 </script>
 
-<div class="space-y-6 p-4 sm:p-6">
+<div bind:this={scrollContainer} data-tasks-scroll class="h-full min-h-0 overflow-y-auto">
+	<div class="space-y-6 p-4 sm:p-6">
 	<div class="flex items-center justify-between gap-3">
 		<div>
 			<h1 class="text-2xl font-bold">Tasks</h1>
@@ -242,40 +299,67 @@
 	<div class="flex gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1">
 		{#each [
 			{ id: 'attention', label: 'Needs you', count: statusCount('waiting_for_input') + statusCount('blocked') },
-			{ id: 'active', label: 'Active', count: statusCount('pending') + statusCount('in_progress') },
-			{ id: 'all', label: 'All', count: taskList.length },
-			{ id: 'done', label: 'Done', count: statusCount('completed') }
+			{ id: 'active', label: 'Active', count: countForFilter('active', counts) },
+			{ id: 'all', label: 'All', count: countForFilter('all', counts) },
+			{ id: 'done', label: 'Done', count: countForFilter('done', counts) }
 		] as item}
-			<button onclick={() => (filter = item.id as typeof filter)} class="shrink-0 rounded-lg px-3 py-2 text-xs font-medium {filter === item.id ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}">
+			<button onclick={() => selectFilter(item.id as typeof filter)} class="shrink-0 rounded-lg px-3 py-2 text-xs font-medium {filter === item.id ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}">
 				{item.label} <span class="ml-1 opacity-70">{item.count}</span>
 			</button>
 		{/each}
 	</div>
 
-	<div class="overflow-hidden rounded-xl border border-border bg-card">
-		{#each visibleTasks as task (task.id)}
-			{@const meta = statusMeta(task.status)}
-			<a href="/tasks/{task.id}" class="group flex items-start gap-3 border-b border-border px-4 py-4 last:border-b-0 hover:bg-accent/30">
-				<span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
-				<div class="min-w-0 flex-1">
-					<div class="flex items-start justify-between gap-3">
-						<h2 class="min-w-0 truncate text-sm font-medium group-hover:text-primary">{task.title}</h2>
-						<span class="shrink-0 text-[11px] {meta.tone}">{meta.label}</span>
-					</div>
-					{#if task.description}<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>{/if}
-					<div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
-						<span>{agentName(task.agent_id) ?? 'Unassigned'}</span><span>·</span><span>{timeAgo(task.updated_at)}</span>
-						{#if task.blocked_by && task.blocked_by.length > 0}<span class="text-amber-500">· Waiting on {task.blocked_by.length}</span>{/if}
-						{#if task.priority >= 5}<span class="text-orange-400">· High priority</span>{/if}
-					</div>
-				</div>
-				<div class="flex shrink-0 items-center gap-2">
-					{#if !['completed', 'cancelled'].includes(task.status)}<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); cancelTask(task.id); }} class="hidden text-xs text-muted-foreground hover:text-destructive sm:block">Cancel</button>{/if}
-					<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); deleteTask(task.id); }} aria-label="Delete task" class="hidden text-lg leading-none text-muted-foreground hover:text-destructive sm:block">×</button>
-				</div>
-			</a>
+	<div data-task-list class="overflow-hidden rounded-xl border border-border bg-card">
+		{#if loading && taskList.length === 0}
+			<div class="px-4 py-16 text-center text-sm text-muted-foreground">Loading tasks…</div>
 		{:else}
-			<div class="px-4 py-16 text-center text-sm text-muted-foreground">No tasks in this view.</div>
-		{/each}
+			{#each taskList as task (task.id)}
+				{@const meta = statusMeta(task.status)}
+				<a data-task-row href="/tasks/{task.id}" class="group flex items-start gap-3 border-b border-border px-4 py-4 last:border-b-0 hover:bg-accent/30">
+					<span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
+					<div class="min-w-0 flex-1">
+						<div class="flex items-start justify-between gap-3">
+							<h2 class="min-w-0 truncate text-sm font-medium group-hover:text-primary">{task.title}</h2>
+							<span class="shrink-0 text-[11px] {meta.tone}">{meta.label}</span>
+						</div>
+						{#if task.description}<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>{/if}
+						<div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+							<span>{agentName(task.agent_id) ?? 'Unassigned'}</span><span>·</span><span>{timeAgo(task.updated_at)}</span>
+							{#if task.blocked_by && task.blocked_by.length > 0}<span class="text-amber-500">· Waiting on {task.blocked_by.length}</span>{/if}
+							{#if task.priority >= 5}<span class="text-orange-400">· High priority</span>{/if}
+						</div>
+					</div>
+					<div class="flex shrink-0 items-center gap-2">
+						{#if !['completed', 'cancelled'].includes(task.status)}<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); cancelTask(task.id); }} class="hidden text-xs text-muted-foreground hover:text-destructive sm:block">Cancel</button>{/if}
+						<button onclick={(event) => { event.preventDefault(); event.stopPropagation(); deleteTask(task.id); }} aria-label="Delete task" class="hidden text-lg leading-none text-muted-foreground hover:text-destructive sm:block">×</button>
+					</div>
+				</a>
+			{:else}
+				<div class="px-4 py-16 text-center text-sm text-muted-foreground">No tasks in this view.</div>
+			{/each}
+		{/if}
+	</div>
+
+	{#if totalPages > 1}
+		<nav aria-label="Task pages" class="flex items-center justify-between gap-3 pb-2">
+			<button
+				type="button"
+				onclick={() => goToPage(page - 1)}
+				disabled={page === 0 || loading}
+				class="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+			>
+				Previous
+			</button>
+			<span class="text-xs text-muted-foreground">Page {page + 1} of {totalPages}</span>
+			<button
+				type="button"
+				onclick={() => goToPage(page + 1)}
+				disabled={page + 1 >= totalPages || loading}
+				class="rounded-md border border-border px-3 py-2 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+			>
+				Next
+			</button>
+		</nav>
+	{/if}
 	</div>
 </div>

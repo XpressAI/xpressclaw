@@ -57,6 +57,7 @@
 	}
 </script>
 
+<div data-workflows-scroll class="h-full min-h-0 overflow-y-auto">
 <div class="p-6 space-y-6">
 	<div class="flex items-center justify-between">
 		<div>
@@ -166,4 +167,5 @@
 			{/each}
 		</div>
 	{/if}
+</div>
 </div>

@@ -23,7 +23,9 @@
 		type WorkspaceTabKind,
 	} from '$lib/workspace';
 	import ContextMenu from '../ContextMenu.svelte';
+	import SidebarSettings from './SidebarSettings.svelte';
 	import SidebarTasks from './SidebarTasks.svelte';
+	import SidebarWorkflows from './SidebarWorkflows.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
 
 	let { children }: { children: Snippet } = $props();
@@ -71,7 +73,13 @@
 	let focusedTab = $derived(focusedPane?.tabs.find((tab) => tab.id === focusedPane.activeTabId) ?? focusedPane?.tabs[0] ?? null);
 	let openTabs = $derived(panes.flatMap((pane) => pane.tabs.map((tab) => ({ paneId: pane.id, tab }))));
 	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
+	let sidebarTitle = $derived(sidebarCategory === 'tasks'
+		? 'Tasks'
+		: sidebarCategory === 'workflows'
+			? 'Workflows'
+			: sidebarCategory === 'settings' ? 'Settings' : 'Projects');
 	let focusedTaskId = $derived(focusedTab?.kind === 'task' ? focusedTab.resourceId : null);
+	let focusedWorkflowId = $derived(focusedTab?.kind === 'workflow' ? focusedTab.resourceId : null);
 	let attentionTasks = $derived(taskList
 		.filter((task) => task.status === 'waiting_for_input' || task.status === 'blocked')
 		.sort((left, right) => statusPriority(right.status) - statusPriority(left.status)
@@ -559,10 +567,14 @@
 		</div>
 
 		{#if sidebarCollapsed}
-			<div class="flex flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-2">
+			<div class="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-2">
 				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} compact />
+				{:else if sidebarCategory === 'workflows'}
+					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} compact />
+				{:else if sidebarCategory === 'settings'}
+					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} compact />
 				{:else}
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
@@ -574,13 +586,17 @@
 				{/if}
 			</div>
 		{:else}
-			<div class="flex-1 overflow-y-auto px-2 pb-3">
+			<div class="min-h-0 flex-1 overflow-y-auto px-2 pb-3">
 				<a href="/" class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-primary-foreground hover:bg-primary/90">
 					<span class="text-base leading-none">+</span><span>New work</span>
 				</a>
 
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} />
+				{:else if sidebarCategory === 'workflows'}
+					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} />
+				{:else if sidebarCategory === 'settings'}
+					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} />
 				{:else}
 					{#if attentionTasks.length > 0}
 						<div class="mb-4">
@@ -686,11 +702,19 @@
 	<div class="fixed inset-0 z-50 md:hidden">
 		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close project switcher" onclick={() => (mobileMenuOpen = false)}></button>
 		<aside class="absolute inset-y-0 left-0 flex w-[min(88vw,22rem)] flex-col border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
-			<div class="mb-3 flex h-9 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarCategory === 'tasks' ? 'Tasks' : 'Projects'}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
+			<div class="mb-3 flex h-9 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
 			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
 				<div class="min-h-0 flex-1 overflow-y-auto">
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+				</div>
+			{:else if sidebarCategory === 'workflows'}
+				<div class="min-h-0 flex-1 overflow-y-auto">
+					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+				</div>
+			{:else if sidebarCategory === 'settings'}
+				<div class="min-h-0 flex-1 overflow-y-auto">
+					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else}
 				{#if attentionTasks.length > 0}

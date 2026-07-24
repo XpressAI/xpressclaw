@@ -67,6 +67,17 @@ async function mockApi(
 		multipleAgents?: boolean;
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 		projectTaskUpdates?: number[];
+		completedTaskCount?: number;
+		workflows?: {
+			id: string;
+			name: string;
+			description: string | null;
+			yaml_content: string;
+			enabled: boolean;
+			version: number;
+			created_at: string;
+			updated_at: string;
+		}[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -114,21 +125,34 @@ async function mockApi(
 		title: 'Secondary browser workspace',
 	};
 	const availableAgents = options.multipleAgents ? [agent, secondaryAgent] : [agent];
-	const listedTasks = options.projectTaskUpdates?.map((second, index) => ({
-		...task,
-		id: `project-task-${index}`,
-		title: `Work updated at ${second}`,
-		created_at: timestamp(index),
-		updated_at: timestamp(second),
-	})) ?? [task];
-	const counts = {
+	const listedTasks = options.completedTaskCount
+		? Array.from({ length: options.completedTaskCount }, (_, index) => ({
+			...task,
+			id: `completed-task-${index + 1}`,
+			title: `Completed task ${index + 1}`,
+			status: 'completed',
+			created_at: timestamp(index),
+			updated_at: timestamp(index),
+			completed_at: timestamp(index),
+		}))
+		: options.projectTaskUpdates?.map((second, index) => ({
+			...task,
+			id: `project-task-${index}`,
+			title: `Work updated at ${second}`,
+			created_at: timestamp(index),
+			updated_at: timestamp(second),
+		})) ?? [task];
+	const counts = listedTasks.reduce((result, listedTask) => {
+		result[listedTask.status as keyof typeof result] += 1;
+		return result;
+	}, {
 		pending: 0,
-		in_progress: options.live ? 1 : 0,
+		in_progress: 0,
 		waiting_for_input: 0,
 		blocked: 0,
-		completed: options.live ? 0 : 1,
+		completed: 0,
 		cancelled: 0,
-	};
+	});
 
 	await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
 	await page.route('**/api/**', async (route) => {
@@ -152,7 +176,7 @@ async function mockApi(
 		} else if (path === `/api/agents/${agentId}`) {
 			response = agent;
 		} else if (path === '/api/workflows') {
-			response = [];
+			response = options.workflows ?? [];
 		} else if (path === '/api/schedules') {
 			response = [];
 		} else if (path === '/api/setup/config') {
@@ -185,25 +209,37 @@ async function mockApi(
 		} else if (path === '/api/tasks') {
 			if (url.searchParams.has('parent_task_id')) {
 				response = { tasks: [], counts: { ...counts, completed: 0 } };
-			} else if (url.searchParams.get('sort') === 'recent') {
+			} else {
+				const includedStatuses = new Set((url.searchParams.get('statuses') ?? '').split(',').filter(Boolean));
 				const excludedStatuses = new Set((url.searchParams.get('exclude_statuses') ?? '').split(',').filter(Boolean));
 				const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
+				const offset = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
+				const filteredTasks = [...listedTasks]
+					.filter((listedTask) => includedStatuses.size === 0 || includedStatuses.has(listedTask.status))
+					.filter((listedTask) => !excludedStatuses.has(listedTask.status));
+				if (url.searchParams.get('sort') === 'recent') {
+					filteredTasks.sort((left, right) =>
+						Date.parse(right.updated_at) - Date.parse(left.updated_at)
+						|| Date.parse(right.created_at) - Date.parse(left.created_at)
+						|| right.id.localeCompare(left.id)
+					);
+				}
 				response = {
-					tasks: [...listedTasks]
-						.filter((listedTask) => !excludedStatuses.has(listedTask.status))
-						.sort((left, right) =>
-							Date.parse(right.updated_at) - Date.parse(left.updated_at)
-							|| Date.parse(right.created_at) - Date.parse(left.created_at)
-							|| right.id.localeCompare(left.id)
-						)
-						.slice(0, limit),
+					tasks: filteredTasks.slice(offset, offset + limit),
 					counts,
 				};
-			} else {
-				response = { tasks: listedTasks, counts };
 			}
 		} else if (path === '/api/tasks/recent-by-agent') {
-			response = { tasks: listedTasks };
+			const limit = Number.parseInt(url.searchParams.get('limit') ?? '5', 10);
+			response = {
+				tasks: [...listedTasks]
+					.sort((left, right) =>
+						Date.parse(right.updated_at) - Date.parse(left.updated_at)
+						|| Date.parse(right.created_at) - Date.parse(left.created_at)
+						|| right.id.localeCompare(left.id)
+					)
+					.slice(0, limit),
+			};
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
@@ -902,4 +938,105 @@ test('task pages show five recent tasks per project in the sidebar', async ({ pa
 	await sidebar.locator('a[href="/agents"]').click();
 	await expect(sidebar.locator('[data-sidebar-mode="tasks"]')).toHaveCount(0);
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toBeVisible();
+});
+
+test('task list scrolls and requests one filtered page at a time', async ({ page }) => {
+	await mockApi(page, { completedTaskCount: 45 });
+	await page.goto('/tasks');
+
+	const doneFilter = page.getByRole('button', { name: 'Done 45' });
+	await doneFilter.click();
+
+	const taskScroller = page.locator('[data-tasks-scroll]');
+	const taskRows = page.locator('[data-task-list] [data-task-row]');
+	await expect(taskScroller).toHaveCSS('overflow-y', 'auto');
+	await expect(taskRows).toHaveCount(20);
+	await expect(page.getByText('Page 1 of 3')).toBeVisible();
+	await expect.poll(() => taskScroller.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+
+	const secondPageRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks'
+			&& url.searchParams.get('statuses') === 'completed,cancelled'
+			&& url.searchParams.get('offset') === '20';
+	});
+	await page.getByRole('button', { name: 'Next' }).click();
+	const secondPageUrl = new URL((await secondPageRequest).url());
+	expect(secondPageUrl.searchParams.get('limit')).toBe('20');
+	await expect(taskRows).toHaveCount(20);
+	await expect(page.getByText('Page 2 of 3')).toBeVisible();
+
+	const finalPageRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks'
+			&& url.searchParams.get('statuses') === 'completed,cancelled'
+			&& url.searchParams.get('offset') === '40';
+	});
+	await page.getByRole('button', { name: 'Next' }).click();
+	await finalPageRequest;
+	await expect(taskRows).toHaveCount(5);
+	await expect(page.getByText('Page 3 of 3')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
+});
+
+test('workflow and settings pages show context-specific sidebar lists', async ({ page }) => {
+	await mockApi(page, {
+		workflows: [
+			{
+				id: 'workflow-older',
+				name: 'Nightly maintenance',
+				description: null,
+				yaml_content: 'flows: {}',
+				enabled: false,
+				version: 1,
+				created_at: timestamp(1),
+				updated_at: timestamp(10),
+			},
+			{
+				id: 'workflow-newer',
+				name: 'Review pull requests',
+				description: null,
+				yaml_content: 'flows: {}',
+				enabled: true,
+				version: 2,
+				created_at: timestamp(2),
+				updated_at: timestamp(20),
+			},
+		],
+	});
+	await page.goto('/workflows');
+
+	const sidebar = page.locator('aside').first();
+	const workflowSidebar = sidebar.locator('[data-sidebar-mode="workflows"]');
+	await expect(workflowSidebar).toBeVisible();
+	expect(await workflowSidebar.locator('[data-sidebar-workflow]').evaluateAll((items) =>
+		items.map((item) => item.getAttribute('href'))
+	)).toEqual(['/workflows/workflow-newer', '/workflows/workflow-older']);
+	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
+	await expect(page.locator('[data-workflows-scroll]')).toHaveCSS('overflow-y', 'auto');
+
+	await sidebar.locator('a[href="/settings"]').click();
+	await expect(page).toHaveURL('/settings');
+	const settingsSidebar = sidebar.locator('[data-sidebar-mode="settings"]');
+	await expect(settingsSidebar).toBeVisible();
+	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
+		'P Profile',
+		'M MCP servers',
+		'S Server',
+	]);
+	await expect(settingsSidebar.locator('[data-sidebar-setting="settings"]')).toHaveAttribute('aria-current', 'page');
+	await settingsSidebar.locator('a[href="/settings/mcp"]').click();
+	await expect(page).toHaveURL('/settings/mcp');
+	await expect(settingsSidebar.locator('[data-sidebar-setting="settings-mcp"]')).toHaveAttribute('aria-current', 'page');
+	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.goto('/workflows');
+	await page.getByRole('button', { name: 'Open project switcher' }).click();
+	await expect(page.locator('aside:visible [data-sidebar-mode="workflows"] [data-sidebar-workflow]')).toHaveCount(2);
+	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await page.locator('nav a[href="/settings"]:visible').click();
+	await page.getByRole('button', { name: 'Open project switcher' }).click();
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
