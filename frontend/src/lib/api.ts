@@ -302,6 +302,8 @@ export interface TaskActivity {
 
 export interface TaskListOptions {
 	limit?: number;
+	offset?: number;
+	statuses?: string[];
 	sort?: 'recent';
 	excludeStatuses?: string[];
 }
@@ -312,6 +314,8 @@ export const tasks = {
 		if (status) params.set('status', status);
 		if (agentId) params.set('agent_id', agentId);
 		if (options.limit !== undefined) params.set('limit', String(options.limit));
+		if (options.offset !== undefined) params.set('offset', String(options.offset));
+		if (options.statuses?.length) params.set('statuses', options.statuses.join(','));
 		if (options.sort) params.set('sort', options.sort);
 		if (options.excludeStatuses?.length) params.set('exclude_statuses', options.excludeStatuses.join(','));
 		const qs = params.toString();

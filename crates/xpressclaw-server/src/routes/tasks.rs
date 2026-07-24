@@ -21,9 +21,11 @@ use crate::state::AppState;
 #[derive(Deserialize)]
 pub struct ListParams {
     pub status: Option<String>,
+    pub statuses: Option<String>,
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     #[serde(default)]
     pub sort: TaskListSort,
     pub exclude_statuses: Option<String>,
@@ -111,33 +113,35 @@ async fn list_tasks(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let board = TaskBoard::new(state.db.clone());
-    let limit = params.limit.unwrap_or(100);
+    let limit = params.limit.unwrap_or(100).clamp(1, 100);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let tasks = if let Some(ref parent_id) = params.parent_task_id {
         board.list_subtasks(parent_id).map_err(internal_error)?
     } else {
+        let included_statuses = params
+            .status
+            .as_deref()
+            .map(|status| vec![status])
+            .unwrap_or_else(|| parse_comma_separated(params.statuses.as_deref()));
         match params.sort {
             TaskListSort::Scheduler => board
-                .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
+                .list_page(
+                    &included_statuses,
+                    params.agent_id.as_deref(),
+                    limit,
+                    offset,
+                )
                 .map_err(internal_error)?,
             TaskListSort::Recent => {
-                let excluded_statuses = params
-                    .exclude_statuses
-                    .as_deref()
-                    .map(|statuses| {
-                        statuses
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|status| !status.is_empty())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let excluded_statuses = parse_comma_separated(params.exclude_statuses.as_deref());
                 board
-                    .list_recent(
-                        params.status.as_deref(),
+                    .list_recent_page(
+                        &included_statuses,
                         params.agent_id.as_deref(),
                         &excluded_statuses,
                         limit,
+                        offset,
                     )
                     .map_err(internal_error)?
             }
@@ -150,6 +154,18 @@ async fn list_tasks(
         "tasks": enrich_tasks(&board, &tasks),
         "counts": counts,
     })))
+}
+
+fn parse_comma_separated(value: Option<&str>) -> Vec<&str> {
+    value
+        .map(|items| {
+            items
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn list_recent_tasks_by_agent(
@@ -931,6 +947,62 @@ mod tests {
             .map(|task| task["id"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(task_ids, vec![newest.id, second_newest.id]);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_filters_statuses_and_applies_offset() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let create_task = |title: &str| {
+            board
+                .create(&CreateTask {
+                    title: title.to_string(),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let pending = create_task("Pending");
+        let completed_first = create_task("Completed first");
+        let cancelled = create_task("Cancelled");
+        let completed_last = create_task("Completed last");
+
+        {
+            let conn = db.conn();
+            for (task, status, created_at) in [
+                (&pending, "pending", "2026-01-01 00:00:00"),
+                (&completed_first, "completed", "2026-01-02 00:00:00"),
+                (&cancelled, "cancelled", "2026-01-03 00:00:00"),
+                (&completed_last, "completed", "2026-01-04 00:00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE tasks SET status = ?1, created_at = ?2, updated_at = ?2 WHERE id = ?3",
+                    [status, created_at, task.id.as_str()],
+                )
+                .unwrap();
+            }
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks?statuses=completed%2Ccancelled&limit=2&offset=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let task_ids = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(task_ids, vec![cancelled.id, completed_last.id]);
+        assert_eq!(body["counts"]["completed"], 2);
+        assert_eq!(body["counts"]["cancelled"], 1);
     }
 
     #[tokio::test]
