@@ -674,7 +674,7 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 
 	await page.locator('aside a[href="/settings"]').click();
 	await expect(page).toHaveURL('/settings');
-	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toBeVisible();
+	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	await expect(page.getByText('Connections', { exact: true })).toHaveCount(0);
 
 	const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -1025,9 +1025,11 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 		'S Server',
 	]);
 	await expect(settingsSidebar.locator('[data-sidebar-setting="settings"]')).toHaveAttribute('aria-current', 'page');
+	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	await settingsSidebar.locator('a[href="/settings/mcp"]').click();
 	await expect(page).toHaveURL('/settings/mcp');
 	await expect(settingsSidebar.locator('[data-sidebar-setting="settings-mcp"]')).toHaveAttribute('aria-current', 'page');
+	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
 
 	await page.setViewportSize({ width: 390, height: 844 });
@@ -1038,5 +1040,6 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open project switcher' }).click();
 	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
+	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
