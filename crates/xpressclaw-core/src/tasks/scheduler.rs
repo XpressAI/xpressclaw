@@ -107,12 +107,7 @@ impl ScheduleManager {
             let task = TaskBoard::new(self.db.clone()).get(task_id).map_err(|_| {
                 Error::Schedule(format!("continuation task '{task_id}' was not found"))
             })?;
-            if task.agent_id.as_deref() != Some(req.agent_id.as_str()) {
-                return Err(Error::Schedule(format!(
-                    "continuation task '{task_id}' does not belong to project '{}'",
-                    req.agent_id
-                )));
-            }
+            validate_continuation_target(&task, &req.agent_id)?;
         }
 
         let run_at = resolve_one_shot_deadline(req)?.to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -365,12 +360,7 @@ impl ScheduleManager {
         let task = board
             .get(task_id)
             .map_err(|_| Error::Schedule(format!("continuation task '{task_id}' was not found")))?;
-        if task.agent_id.as_deref() != Some(schedule.agent_id.as_str()) {
-            return Err(Error::Schedule(format!(
-                "continuation task '{task_id}' does not belong to project '{}'",
-                schedule.agent_id
-            )));
-        }
+        validate_continuation_target(&task, &schedule.agent_id)?;
 
         let instruction = description
             .map(str::trim)
@@ -576,6 +566,22 @@ fn row_to_schedule(row: &rusqlite::Row) -> Schedule {
 fn validate_required(name: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::Schedule(format!("{name} cannot be empty")));
+    }
+    Ok(())
+}
+
+fn validate_continuation_target(task: &Task, agent_id: &str) -> Result<()> {
+    if task.agent_id.as_deref() != Some(agent_id) {
+        return Err(Error::Schedule(format!(
+            "continuation task '{}' does not belong to project '{agent_id}'",
+            task.id
+        )));
+    }
+    if task.hidden || task.task_type == "IDLE" {
+        return Err(Error::Schedule(format!(
+            "continuation task '{}' is hidden or idle",
+            task.id
+        )));
     }
     Ok(())
 }
@@ -871,6 +877,30 @@ mod tests {
         });
 
         assert!(matches!(result, Err(Error::Schedule(_))));
+        assert!(mgr.list(None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_one_shot_rejects_a_hidden_idle_continuation_task() {
+        let (_, mgr, board) = setup();
+        let task = board
+            .create_idle_task("atlas", "Check whether there is proactive work")
+            .unwrap();
+
+        let result = mgr.create_one_shot(&CreateOneShotSchedule {
+            name: "Idle wake-up".into(),
+            run_at: None,
+            delay_seconds: Some(60),
+            agent_id: "atlas".into(),
+            title: "Resume visible work".into(),
+            description: Some("This must become a standalone task instead.".into()),
+            continuation_task_id: Some(task.id),
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::Schedule(message)) if message.contains("hidden or idle")
+        ));
         assert!(mgr.list(None, false).unwrap().is_empty());
     }
 
