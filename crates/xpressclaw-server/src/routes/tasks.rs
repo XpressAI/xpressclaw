@@ -24,6 +24,17 @@ pub struct ListParams {
     pub agent_id: Option<String>,
     pub parent_task_id: Option<String>,
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub sort: TaskListSort,
+    pub exclude_statuses: Option<String>,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskListSort {
+    #[default]
+    Scheduler,
+    Recent,
 }
 
 #[derive(Deserialize)]
@@ -105,9 +116,32 @@ async fn list_tasks(
     let tasks = if let Some(ref parent_id) = params.parent_task_id {
         board.list_subtasks(parent_id).map_err(internal_error)?
     } else {
-        board
-            .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
-            .map_err(internal_error)?
+        match params.sort {
+            TaskListSort::Scheduler => board
+                .list(params.status.as_deref(), params.agent_id.as_deref(), limit)
+                .map_err(internal_error)?,
+            TaskListSort::Recent => {
+                let excluded_statuses = params
+                    .exclude_statuses
+                    .as_deref()
+                    .map(|statuses| {
+                        statuses
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|status| !status.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                board
+                    .list_recent(
+                        params.status.as_deref(),
+                        params.agent_id.as_deref(),
+                        &excluded_statuses,
+                        limit,
+                    )
+                    .map_err(internal_error)?
+            }
+        }
     };
 
     let counts = board.counts().map_err(internal_error)?;
@@ -837,6 +871,66 @@ mod tests {
                 unassigned_second.id,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_orders_recent_before_limiting() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let create_task = |title: &str, agent_id: &str, priority: i32| {
+            board
+                .create(&CreateTask {
+                    title: title.to_string(),
+                    agent_id: Some(agent_id.to_string()),
+                    priority: Some(priority),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        let old_high_priority = create_task("Old high priority", "atlas", 100);
+        let second_newest = create_task("Second newest", "atlas", 0);
+        let newest = create_task("Newest", "atlas", 0);
+        let waiting = create_task("Waiting", "atlas", 0);
+        let other_agent = create_task("Other agent", "zephyr", 0);
+
+        {
+            let conn = db.conn();
+            for (task, status, updated_at) in [
+                (&old_high_priority, "pending", "2026-01-01 00:00:00"),
+                (&second_newest, "completed", "2026-01-03 00:00:00"),
+                (&newest, "pending", "2026-01-04 00:00:00"),
+                (&waiting, "waiting_for_input", "2026-01-05 00:00:00"),
+                (&other_agent, "pending", "2026-01-06 00:00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                    [status, updated_at, task.id.as_str()],
+                )
+                .unwrap();
+            }
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/tasks?agent_id=atlas&sort=recent&exclude_statuses=waiting_for_input%2Cblocked&limit=2",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let task_ids = body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|task| task["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(task_ids, vec![newest.id, second_newest.id]);
     }
 
     #[tokio::test]

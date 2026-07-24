@@ -66,6 +66,7 @@ async function mockApi(
 		connection?: { online: boolean };
 		multipleAgents?: boolean;
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
+		projectTaskUpdates?: number[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -113,6 +114,13 @@ async function mockApi(
 		title: 'Secondary browser workspace',
 	};
 	const availableAgents = options.multipleAgents ? [agent, secondaryAgent] : [agent];
+	const listedTasks = options.projectTaskUpdates?.map((second, index) => ({
+		...task,
+		id: `project-task-${index}`,
+		title: `Work updated at ${second}`,
+		created_at: timestamp(index),
+		updated_at: timestamp(second),
+	})) ?? [task];
 	const counts = {
 		pending: 0,
 		in_progress: options.live ? 1 : 0,
@@ -175,11 +183,27 @@ async function mockApi(
 				mcp_servers: [],
 			};
 		} else if (path === '/api/tasks') {
-			response = url.searchParams.has('parent_task_id')
-				? { tasks: [], counts: { ...counts, completed: 0 } }
-				: { tasks: [task], counts };
+			if (url.searchParams.has('parent_task_id')) {
+				response = { tasks: [], counts: { ...counts, completed: 0 } };
+			} else if (url.searchParams.get('sort') === 'recent') {
+				const excludedStatuses = new Set((url.searchParams.get('exclude_statuses') ?? '').split(',').filter(Boolean));
+				const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
+				response = {
+					tasks: [...listedTasks]
+						.filter((listedTask) => !excludedStatuses.has(listedTask.status))
+						.sort((left, right) =>
+							Date.parse(right.updated_at) - Date.parse(left.updated_at)
+							|| Date.parse(right.created_at) - Date.parse(left.created_at)
+							|| right.id.localeCompare(left.id)
+						)
+						.slice(0, limit),
+					counts,
+				};
+			} else {
+				response = { tasks: listedTasks, counts };
+			}
 		} else if (path === '/api/tasks/recent-by-agent') {
-			response = { tasks: [task] };
+			response = { tasks: listedTasks };
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
@@ -272,6 +296,17 @@ async function mockApi(
 					has_more_after: false,
 				};
 			}
+		} else if (path === `/api/sessions/${agentId}`) {
+			response = {
+				session: { id: agentId, status: options.live ? 'running' : 'idle' },
+				active_attempts: [],
+				queued_attempts: [],
+				recent_attempts: [],
+				recent_events: [],
+				artifacts: [],
+			};
+		} else if (path === `/api/sessions/${agentId}/readiness`) {
+			response = { ready: true };
 		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
 			const targetAgentId = path.split('/')[3];
 			const payload = request.postDataJSON() as Record<string, unknown>;
@@ -544,6 +579,30 @@ test('new-work drafts restore the project they were written for', async ({ page 
 	await expect.poll(() => queuedSessionMessages.length).toBe(1);
 	expect(queuedSessionMessages[0].agentId).toBe('project-secondary-test');
 	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
+});
+
+test('project Work shows only the five most recently updated tasks', async ({ page }) => {
+	await mockApi(page, { projectTaskUpdates: [10, 70, 30, 90, 50, 110, 20] });
+	const recentRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks' && url.searchParams.get('sort') === 'recent';
+	});
+	await page.goto(`/agents/${agentId}`);
+
+	const recentUrl = new URL((await recentRequest).url());
+	expect(recentUrl.searchParams.get('agent_id')).toBe(agentId);
+	expect(recentUrl.searchParams.get('limit')).toBe('5');
+	expect(recentUrl.searchParams.get('exclude_statuses')).toBe('waiting_for_input,blocked');
+	const workItems = page.locator('[data-project-work-list] [data-project-work-item]');
+	await expect(workItems).toHaveCount(5);
+	expect(await workItems.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
+		'/tasks/project-task-5',
+		'/tasks/project-task-3',
+		'/tasks/project-task-1',
+		'/tasks/project-task-4',
+		'/tasks/project-task-2',
+	]);
+	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {

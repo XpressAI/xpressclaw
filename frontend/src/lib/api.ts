@@ -300,11 +300,20 @@ export interface TaskActivity {
 	has_more_after: boolean;
 }
 
+export interface TaskListOptions {
+	limit?: number;
+	sort?: 'recent';
+	excludeStatuses?: string[];
+}
+
 export const tasks = {
-	list: (status?: string, agentId?: string) => {
+	list: (status?: string, agentId?: string, options: TaskListOptions = {}) => {
 		const params = new URLSearchParams();
 		if (status) params.set('status', status);
 		if (agentId) params.set('agent_id', agentId);
+		if (options.limit !== undefined) params.set('limit', String(options.limit));
+		if (options.sort) params.set('sort', options.sort);
+		if (options.excludeStatuses?.length) params.set('exclude_statuses', options.excludeStatuses.join(','));
 		const qs = params.toString();
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},

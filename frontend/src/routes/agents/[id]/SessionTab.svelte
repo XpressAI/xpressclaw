@@ -27,9 +27,11 @@
 	})));
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-	let attentionTasks = $derived(taskList.filter((task) => ['waiting_for_input', 'blocked'].includes(task.status)));
+	const RECENT_WORK_LIMIT = 5;
+	const ATTENTION_STATUSES = ['waiting_for_input', 'blocked'];
+	let attentionTasks = $derived(taskList.filter((task) => ATTENTION_STATUSES.includes(task.status)));
 	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
-	let recentTasks = $derived(taskList.filter((task) => ['completed', 'cancelled'].includes(task.status)).slice(0, 8));
+	let recentWorkTasks = $state<Task[]>([]);
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
@@ -49,12 +51,18 @@
 
 	async function load() {
 		try {
-			const [nextOverview, result] = await Promise.all([
+			const [nextOverview, result, recentWork] = await Promise.all([
 				sessions.get(agentId),
 				tasks.list(undefined, agentId),
+				tasks.list(undefined, agentId, {
+					limit: RECENT_WORK_LIMIT,
+					sort: 'recent',
+					excludeStatuses: ATTENTION_STATUSES,
+				}),
 			]);
 			overview = nextOverview;
 			taskList = result.tasks;
+			recentWorkTasks = recentWork.tasks;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -241,13 +249,13 @@
 				</div>
 				<a href="/tasks" class="text-xs text-muted-foreground hover:text-foreground">All tasks</a>
 			</div>
-			{#if activeTasks.length === 0 && recentTasks.length === 0}
+			{#if recentWorkTasks.length === 0}
 				<div class="px-4 py-12 text-center text-sm text-muted-foreground">{attentionTasks.length > 0 ? 'No other work in this project.' : 'No work yet. Send the first task above.'}</div>
 			{:else}
-				<div class="divide-y divide-border">
-					{#each [...activeTasks, ...recentTasks] as task (task.id)}
+				<div data-project-work-list class="divide-y divide-border">
+					{#each recentWorkTasks as task (task.id)}
 						{@const meta = statusMeta(task.status)}
-						<a href="/tasks/{task.id}" class="group flex items-center gap-3 px-4 py-3.5 hover:bg-accent/40">
+						<a data-project-work-item href="/tasks/{task.id}" class="group flex items-center gap-3 px-4 py-3.5 hover:bg-accent/40">
 							<span class="h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
 							<div class="min-w-0 flex-1">
 								<div class="truncate text-sm font-medium group-hover:text-primary">{task.title}</div>
