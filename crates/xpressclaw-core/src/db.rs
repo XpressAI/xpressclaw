@@ -148,6 +148,7 @@ impl Database {
             (25, MIGRATION_V25),
             (26, MIGRATION_V26),
             (27, MIGRATION_V27),
+            (28, MIGRATION_V28),
         ];
 
         for &(target, sql) in migrations {
@@ -841,6 +842,15 @@ ALTER TABLE work_attempts ADD COLUMN context_used INTEGER;
 ALTER TABLE work_attempts ADD COLUMN context_size INTEGER;
 ";
 
+const MIGRATION_V28: &str = "
+-- One-shot wake-ups created by an active agent continue the task that armed
+-- them so their future turn remains in the original user-visible transcript.
+ALTER TABLE schedules ADD COLUMN continuation_task_id TEXT
+    REFERENCES tasks(id) ON DELETE CASCADE;
+CREATE INDEX idx_schedules_continuation_task
+    ON schedules(continuation_task_id);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,7 +868,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "27");
+        assert_eq!(version, "28");
     }
 
     #[test]

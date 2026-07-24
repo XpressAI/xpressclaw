@@ -23,7 +23,7 @@ use crate::db::Database;
 use crate::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
 use crate::error::{Error, Result};
 use crate::sessions::SessionManager;
-use crate::tasks::board::TaskBoard;
+use crate::tasks::board::{Task, TaskBoard};
 use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{
@@ -189,6 +189,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         );
     }
     let board = TaskBoard::new(db.clone());
+    let task = board.get(&item.task_id)?;
+    let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
     if let Some(native_session_id) = resume_session_id.as_deref() {
@@ -253,6 +255,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     {
         mcp_servers.push(xpressclaw_control_mcp_server(
             &agent.name,
+            control_task_id.as_deref(),
             control_plane_port,
             docker.runtime(),
         ));
@@ -763,8 +766,13 @@ fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<Mc
         .collect()
 }
 
+fn continuation_task_id(task: &Task) -> Option<&str> {
+    (!task.hidden && task.task_type != "IDLE").then_some(task.id.as_str())
+}
+
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
+    task_id: Option<&str>,
     control_plane_port: u16,
     container_runtime: &str,
 ) -> McpServer {
@@ -773,14 +781,18 @@ fn xpressclaw_control_mcp_server(
     } else {
         "host.docker.internal"
     };
+    let mut env = vec![
+        EnvVariable::new(
+            "XPRESSCLAW_URL",
+            format!("http://{host}:{control_plane_port}"),
+        ),
+        EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
+    ];
+    if let Some(task_id) = task_id {
+        env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
+    }
     McpServer::Stdio(
-        McpServerStdio::new("xpressclaw", "/opt/xpressclaw/mcp-xpressclaw.mjs").env(vec![
-            EnvVariable::new(
-                "XPRESSCLAW_URL",
-                format!("http://{host}:{control_plane_port}"),
-            ),
-            EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
-        ]),
+        McpServerStdio::new("xpressclaw", "/opt/xpressclaw/mcp-xpressclaw.mjs").env(env),
     )
 }
 
@@ -1273,7 +1285,7 @@ mod tests {
 
     #[test]
     fn scopes_the_bundled_control_mcp_to_the_current_project() {
-        let server = xpressclaw_control_mcp_server("dgx-codex", 9123, "docker");
+        let server = xpressclaw_control_mcp_server("dgx-codex", Some("task-123"), 9123, "docker");
         let McpServer::Stdio(server) = server else {
             panic!("expected stdio MCP configuration");
         };
@@ -1290,8 +1302,12 @@ mod tests {
         assert!(server.env.iter().any(|variable| {
             variable.name == "XPRESSCLAW_AGENT_ID" && variable.value == "dgx-codex"
         }));
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_TASK_ID" && variable.value == "task-123"
+        }));
 
-        let McpServer::Stdio(podman) = xpressclaw_control_mcp_server("dgx-codex", 9123, "podman")
+        let McpServer::Stdio(podman) =
+            xpressclaw_control_mcp_server("dgx-codex", Some("task-123"), 9123, "podman")
         else {
             panic!("expected stdio MCP configuration");
         };
@@ -1299,6 +1315,37 @@ mod tests {
             variable.name == "XPRESSCLAW_URL"
                 && variable.value == "http://host.containers.internal:9123"
         }));
+
+        let McpServer::Stdio(idle) =
+            xpressclaw_control_mcp_server("dgx-codex", None, 9123, "docker")
+        else {
+            panic!("expected stdio MCP configuration");
+        };
+        assert!(!idle
+            .env
+            .iter()
+            .any(|variable| variable.name == "XPRESSCLAW_TASK_ID"));
+    }
+
+    #[test]
+    fn hidden_idle_tasks_do_not_bind_scheduled_wakeups() {
+        use crate::tasks::board::CreateTask;
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        let board = TaskBoard::new(db);
+        let visible = board
+            .create(&CreateTask {
+                title: "Visible work".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let idle = board
+            .create_idle_task("atlas", "Look for proactive work")
+            .unwrap();
+
+        assert_eq!(continuation_task_id(&visible), Some(visible.id.as_str()));
+        assert_eq!(continuation_task_id(&idle), None);
     }
 
     #[test]
@@ -1663,6 +1710,7 @@ mod tests {
                 agent_id: "dgx-codex".into(),
                 title: "Resume the DGX experiment".into(),
                 description: Some("Inspect the results and continue the active goal.".into()),
+                continuation_task_id: Some(original.id.clone()),
             })
             .unwrap();
         let wakeup_task = schedules.trigger(&wakeup.id, &board).unwrap();
@@ -1673,10 +1721,19 @@ mod tests {
             .find(|item| item.task_id == wakeup_task.id)
             .unwrap();
 
+        assert_eq!(wakeup_task.id, original.id);
         assert_eq!(
             resume_session_id(&db, &wakeup_item, "codex").unwrap(),
             Some("codex-thread-1".into())
         );
+        let messages = TaskConversation::new(db)
+            .get_messages(&original.id)
+            .unwrap();
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .contains("Inspect the results and continue the active goal.")
+        }));
     }
 
     #[test]
