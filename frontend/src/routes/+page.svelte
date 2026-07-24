@@ -4,14 +4,17 @@
 	import { setup, sessions, agents as agentsApi } from '$lib/api';
 	import type { Agent, ImageAttachmentUpload } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { harnessMark } from '$lib/utils';
 
+	const messageDraftScope = 'new-work';
 	let status_text = $state('Connecting to server...');
 	let loading = $state(true);
 	let retries = 0;
 
 	let message = $state('');
+	let messageDraftReady = $state(false);
 	let agentList = $state<Agent[]>([]);
 	let selectedAgent = $state('');
 	let sending = $state(false);
@@ -51,7 +54,15 @@
 		}
 	}
 
-	onMount(checkReady);
+	$effect(() => {
+		if (messageDraftReady) saveComposerDraft(messageDraftScope, message);
+	});
+
+	onMount(() => {
+		message = loadComposerDraft(messageDraftScope);
+		messageDraftReady = true;
+		void checkReady();
+	});
 
 	function greeting(): string {
 		const hour = new Date().getHours();
@@ -72,8 +83,10 @@
 				newSession: startFresh,
 				attachments: imageAttachments,
 			});
+			message = '';
+			clearComposerDraft(messageDraftScope);
 			imageAttachments = [];
-			goto(`/tasks/${queued.task.id}`);
+			await goto(`/tasks/${queued.task.id}`);
 		} catch (e) {
 			sendError = e instanceof Error ? e.message : String(e);
 		} finally {

@@ -63,6 +63,7 @@ async function mockApi(
 		richToolActivity?: boolean;
 		postedMessages?: Record<string, unknown>[];
 		interruptedAttempts?: string[];
+		connection?: { online: boolean };
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -120,6 +121,10 @@ async function mockApi(
 		let response: unknown;
 
 		if (path === '/api/health') {
+			if (options.connection?.online === false) {
+				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ status: 'unavailable' }) });
+				return;
+			}
 			response = { status: 'ok', version: '0.2.0', build: 'dev', git_hash: 'test' };
 		} else if (path === '/api/setup/check-docker') {
 			response = { available: true, installed: true, can_start: false };
@@ -480,6 +485,45 @@ test('running agents can be guided at a safe break or interrupted immediately', 
 
 	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
 	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+});
+
+test('task drafts survive reloads and clear after a successful send', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, { postedMessages });
+	await page.goto(`/tasks/${taskId}`);
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep this draft through a reload');
+	await page.reload();
+	await expect(composer).toHaveValue('Keep this draft through a reload');
+
+	await page.getByRole('button', { name: 'Send message' }).click();
+	await expect.poll(() => postedMessages.length).toBe(1);
+	await expect(composer).toHaveValue('');
+	await page.reload();
+	await expect(composer).toHaveValue('');
+});
+
+test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {
+	const connection = { online: true };
+	await page.setViewportSize({ width: 390, height: 844 });
+	await mockApi(page, { connection });
+	await page.goto(`/tasks/${taskId}`);
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Do not lose this mobile draft');
+	await page.evaluate(() => ((window as typeof window & { disconnectTestMarker?: boolean }).disconnectTestMarker = true));
+	connection.online = false;
+
+	const connectionStatus = page.locator('[data-connection-status]');
+	await expect(connectionStatus).toBeVisible({ timeout: 20_000 });
+	await composer.fill('I can keep typing while disconnected');
+	await expect(composer).toHaveValue('I can keep typing while disconnected');
+
+	connection.online = true;
+	await expect(connectionStatus).toBeHidden({ timeout: 5_000 });
+	expect(await page.evaluate(() => (window as typeof window & { disconnectTestMarker?: boolean }).disconnectTestMarker)).toBe(true);
+	await expect(composer).toHaveValue('I can keep typing while disconnected');
 });
 
 test('workspace panes split on wide screens and collapse cleanly on mobile', async ({ page, browser }) => {

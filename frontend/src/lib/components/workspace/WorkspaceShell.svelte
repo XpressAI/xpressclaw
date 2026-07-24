@@ -60,9 +60,9 @@
 	let dockerCanStart = $state(false);
 	let dockerStarting = $state(false);
 	let serverConnected = $state(true);
-	let wasDisconnected = false;
-	let consecutiveFailures = 0;
-	const FAILURES_BEFORE_DISCONNECT = 2;
+	let connectionCheckInFlight = false;
+	let firstConnectionFailureAt: number | null = null;
+	const DISCONNECT_GRACE_MS = 12_000;
 	const HEALTH_TIMEOUT_MS = 8000;
 
 	let focusedPane = $derived(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
@@ -473,25 +473,25 @@
 	}
 
 	async function checkConnection() {
+		if (connectionCheckInFlight) return;
+		connectionCheckInFlight = true;
+		let connected = false;
 		try {
 			const response = await fetch('/api/health', { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-			if (response.ok) {
-				consecutiveFailures = 0;
-				if (wasDisconnected) {
-					wasDisconnected = false;
-					serverConnected = true;
-					window.location.reload();
-					return;
-				}
-				serverConnected = true;
-				return;
-			}
+			connected = response.ok;
 		} catch {}
-		consecutiveFailures += 1;
-		if (consecutiveFailures >= FAILURES_BEFORE_DISCONNECT) {
-			serverConnected = false;
-			wasDisconnected = true;
+		connectionCheckInFlight = false;
+
+		if (connected) {
+			const recovered = !serverConnected;
+			firstConnectionFailureAt = null;
+			serverConnected = true;
+			if (recovered) void loadWorkspaceSummary();
+			return;
 		}
+
+		firstConnectionFailureAt ??= Date.now();
+		if (Date.now() - firstConnectionFailureAt >= DISCONNECT_GRACE_MS) serverConnected = false;
 	}
 
 	onMount(() => {
@@ -526,12 +526,17 @@
 
 		loadWorkspaceSummary();
 		checkDocker();
+		const handleOnline = () => void checkConnection();
+		window.addEventListener('online', handleOnline);
 		const interval = setInterval(() => {
 			loadWorkspaceSummary();
 			checkConnection();
 			if (!dockerAvailable) checkDocker();
 		}, 3000);
-		return () => clearInterval(interval);
+		return () => {
+			clearInterval(interval);
+			window.removeEventListener('online', handleOnline);
+		};
 	});
 </script>
 
@@ -700,7 +705,15 @@
 {/if}
 
 {#if !serverConnected}
-	<div class="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 backdrop-blur-sm"><div class="mx-4 w-full max-w-xs space-y-3 rounded-xl border border-border bg-card p-6 text-center shadow-2xl"><div class="inline-flex h-10 w-10 items-center justify-center rounded-full bg-amber-500/10"><svg class="h-5 w-5 animate-pulse text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" /></svg></div><h3 class="text-sm font-semibold">Reconnecting…</h3><p class="text-xs text-muted-foreground">Lost connection to the server. XpressClaw will reconnect automatically.</p></div></div>
+	<div data-connection-status role="status" aria-live="polite" class="pointer-events-none fixed inset-x-0 top-14 z-[200] flex justify-center px-3">
+		<div class="flex max-w-md items-center gap-3 rounded-xl border border-amber-500/30 bg-card/95 px-4 py-3 shadow-xl backdrop-blur">
+			<svg class="h-5 w-5 shrink-0 animate-pulse text-amber-500" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12 20.25h.008v.008H12v-.008z" /></svg>
+			<div>
+				<div class="text-sm font-semibold">Connection interrupted</div>
+				<p class="text-xs text-muted-foreground">Retrying in the background. Your draft is saved and you can keep typing.</p>
+			</div>
+		</div>
+	</div>
 {/if}
 
 {#if !dockerAvailable}

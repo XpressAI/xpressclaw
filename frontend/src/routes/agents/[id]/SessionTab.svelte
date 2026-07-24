@@ -4,15 +4,18 @@
 	import { sessions, tasks } from '$lib/api';
 	import type { ImageAttachmentUpload, SessionOverview, RunnerReadiness, Task } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
+	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { timeAgo } from '$lib/utils';
 
 	let { agentId }: { agentId: string } = $props();
+	const messageDraftScope = () => `session.${agentId}`;
 	let overview = $state<SessionOverview | null>(null);
 	let readiness = $state<RunnerReadiness | null>(null);
 	let taskList = $state<Task[]>([]);
 	let error = $state<string | null>(null);
 	let message = $state('');
+	let messageDraftReady = $state(false);
 	let sending = $state(false);
 	let preparing = $state(false);
 	let startFresh = $state(false);
@@ -28,7 +31,13 @@
 	let activeTasks = $derived(taskList.filter((task) => ['pending', 'in_progress'].includes(task.status)));
 	let recentTasks = $derived(taskList.filter((task) => ['completed', 'cancelled'].includes(task.status)).slice(0, 8));
 
+	$effect(() => {
+		if (messageDraftReady) saveComposerDraft(messageDraftScope(), message);
+	});
+
 	onMount(() => {
+		message = loadComposerDraft(messageDraftScope());
+		messageDraftReady = true;
 		load();
 		loadReadiness();
 		pollTimer = setInterval(load, 2500);
@@ -83,6 +92,7 @@
 				attachments: imageAttachments,
 			});
 			message = '';
+			clearComposerDraft(messageDraftScope());
 			imageAttachments = [];
 			startFresh = false;
 			await goto(`/tasks/${queued.task.id}`);
