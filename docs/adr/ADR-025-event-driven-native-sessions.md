@@ -33,25 +33,31 @@ plane; execution contexts belong to workers.
 
 ## Decision
 
-### One project, one active native conversation, many tasks
+### One project, one active native conversation, many task branches
 
 Each configured workspace/runner pair is presented as a project and backed by
 one durable `logical_session`. Messages from a person, task, schedule, or
-workflow become durable tasks and are sent to the project's
-active native Codex, Claude Code, or OpenCode conversation. The project remains
-writable while work is queued or running. Future connector messages must use
-the same path once that runtime is restored.
+workflow become durable tasks. A task inherits the project's active native
+Codex, Claude Code, or OpenCode context as its own conversation branch when
+the runner supports it. The project remains writable while work is queued or
+running. Future connector messages must use the same path once that runtime is
+restored.
 
 The native conversation is resumed across short-lived worker containers. A
-task can explicitly request a fresh conversation. A dependent task instead
-continues the native conversation of its prerequisite when that prerequisite
-used the same project and runner. A follow-up message on an existing task
-always continues that task's conversation. The precedence is therefore:
+task can explicitly request a fresh conversation. A dependent task branches
+from the native conversation of its prerequisite when that prerequisite used
+the same project and runner. A follow-up message on the currently active task
+resumes its branch. Reopening an older task forks from that task's saved branch
+so new work does not rewrite its earlier context. The precedence is therefore:
 
-1. the conversation of a dependency;
-2. an earlier turn on the same task;
+1. an earlier turn on the same task;
+2. the conversation of a dependency;
 3. a requested fresh conversation;
 4. the project's most recent conversation.
+
+If a runner does not support conversation forks, XpressClaw continues the
+selected source conversation as a compatibility fallback and records that
+fallback in the task timeline.
 
 Executable work is represented by a `work_attempt`. An attempt records:
 

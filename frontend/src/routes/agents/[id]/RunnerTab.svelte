@@ -300,7 +300,7 @@
 	<div class="rounded-xl border border-border bg-card p-5">
 		<h2 class="text-sm font-semibold">ACP agent</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			XpressClaw talks to the agent over the Agent Client Protocol. Each task resumes this project's active conversation by default; the agent keeps ownership of its reasoning, tools, and subagents.
+			XpressClaw talks to the agent over the Agent Client Protocol. New tasks branch from this project's active conversation when the agent supports it, while follow-ups stay with their task; the agent keeps ownership of its reasoning, tools, and subagents.
 		</p>
 
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">

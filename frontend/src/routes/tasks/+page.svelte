@@ -268,14 +268,14 @@
 					</div>
 					{#if newDependsOn.length > 0}
 						<div class="text-xs text-muted-foreground mt-1">
-							This task will wait, then continue the conversation it depends on.
+							This task will wait, then branch from the conversation it depends on.
 						</div>
 					{/if}
 				</div>
 			{/if}
 			<label class="flex items-start gap-2 text-xs text-muted-foreground {newDependsOn.length > 0 ? 'opacity-50' : ''}">
 				<input type="checkbox" bind:checked={newSession} disabled={newDependsOn.length > 0} class="mt-0.5 h-3.5 w-3.5 accent-primary" />
-				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this continues the project’s active agent conversation.</span>
+				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this branches from the project’s active agent conversation when supported.</span>
 			</label>
 			{#if formError}<p class="text-xs text-destructive">{formError}</p>{/if}
 			<div class="flex gap-2">

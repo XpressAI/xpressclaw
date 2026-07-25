@@ -78,7 +78,10 @@ futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Agent Client Protocol
-agent-client-protocol = { version = "1.2.0", features = ["unstable_elicitation"] }
+agent-client-protocol = { version = "1.2.0", features = [
+    "unstable_elicitation",
+    "unstable_session_fork",
+] }
 
 open = "5"
 
