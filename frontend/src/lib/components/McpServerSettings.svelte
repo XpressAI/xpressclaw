@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { mcpServers } from '$lib/api';
-	import type { McpServerDefinition } from '$lib/api';
+	import type { McpServerDefinition, McpVerificationResult } from '$lib/api';
 
 	let servers = $state<McpServerDefinition[]>([]);
 	let loading = $state(true);
@@ -17,6 +17,8 @@
 	let deleting = $state<string | null>(null);
 	let confirmDelete = $state<string | null>(null);
 	let error = $state('');
+	let verifying = $state<string | null>(null);
+	let verification = $state<Record<string, McpVerificationResult>>({});
 
 	onMount(load);
 
@@ -80,8 +82,9 @@
 		saving = true;
 		error = '';
 		try {
+			const savedName = name.trim();
 			await mcpServers.upsert({
-				name: name.trim(),
+				name: savedName,
 				type: serverType,
 				command: serverType === 'stdio' ? commandOrUrl.trim() : null,
 				args: serverType === 'stdio' ? argsText.split('\n').map((line) => line.trim()).filter(Boolean) : [],
@@ -89,6 +92,7 @@
 				url: serverType === 'stdio' ? null : commandOrUrl.trim(),
 				headers: serverType === 'stdio' ? {} : parseKeyValueLines(headersText)
 			});
+			verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== savedName));
 			resetForm();
 			await load();
 		} catch (reason) {
@@ -108,12 +112,35 @@
 		try {
 			await mcpServers.delete(serverName);
 			confirmDelete = null;
+			verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== serverName));
 			await load();
 		} catch (reason) {
 			error = reason instanceof Error ? reason.message : 'Could not delete MCP server';
 		} finally {
 			deleting = null;
 		}
+	}
+
+	async function verifyServer(server: McpServerDefinition) {
+		if (verifying) return;
+		verifying = server.name;
+		error = '';
+		verification = Object.fromEntries(Object.entries(verification).filter(([key]) => key !== server.name));
+		try {
+			verification = { ...verification, [server.name]: await mcpServers.verify(server.name) };
+		} catch (reason) {
+			error = reason instanceof Error ? reason.message : 'Could not verify MCP server';
+		} finally {
+			verifying = null;
+		}
+	}
+
+	function verificationTone(result: McpVerificationResult): string {
+		if (result.ok) return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600';
+		if (result.status === 'authentication_required' || result.status === 'project_required') {
+			return 'border-amber-500/25 bg-amber-500/10 text-amber-600';
+		}
+		return 'border-destructive/25 bg-destructive/5 text-destructive';
 	}
 </script>
 
@@ -140,16 +167,27 @@
 		{:else}
 			<div class="divide-y divide-border">
 				{#each servers as server}
-					<div class="flex items-start gap-3 px-4 py-4">
-						<span class="rounded-md bg-muted px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground">{server.type}</span>
-						<div class="min-w-0 flex-1">
-							<p class="text-sm font-medium text-foreground">{server.name}</p>
-							<p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{server.command || server.url}</p>
+					<div class="px-4 py-4" data-mcp-server={server.name}>
+						<div class="flex items-start gap-3">
+							<span class="rounded-md bg-muted px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground">{server.type}</span>
+							<div class="min-w-0 flex-1">
+								<p class="text-sm font-medium text-foreground">{server.name}</p>
+								<p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{server.command || server.url}</p>
+							</div>
+							<button type="button" onclick={() => verifyServer(server)} disabled={verifying !== null} class="text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">
+								{verifying === server.name ? 'Verifying…' : 'Verify'}
+							</button>
+							<button type="button" onclick={() => editServer(server)} class="text-xs text-muted-foreground hover:text-foreground">Edit</button>
+							<button type="button" onclick={() => remove(server.name)} disabled={deleting === server.name} class="text-xs {confirmDelete === server.name ? 'font-medium text-destructive' : 'text-muted-foreground hover:text-destructive'} disabled:opacity-50">
+								{deleting === server.name ? 'Deleting…' : confirmDelete === server.name ? 'Confirm delete' : 'Delete'}
+							</button>
 						</div>
-						<button type="button" onclick={() => editServer(server)} class="text-xs text-muted-foreground hover:text-foreground">Edit</button>
-						<button type="button" onclick={() => remove(server.name)} disabled={deleting === server.name} class="text-xs {confirmDelete === server.name ? 'font-medium text-destructive' : 'text-muted-foreground hover:text-destructive'} disabled:opacity-50">
-							{deleting === server.name ? 'Deleting…' : confirmDelete === server.name ? 'Confirm delete' : 'Delete'}
-						</button>
+						{#if verification[server.name]}
+							{@const result = verification[server.name]}
+							<p aria-live="polite" class="mt-3 rounded-md border px-3 py-2 text-xs leading-relaxed {verificationTone(result)}">
+								{result.message}{#if result.suggestion} {result.suggestion}{/if}
+							</p>
+						{/if}
 					</div>
 				{/each}
 			</div>

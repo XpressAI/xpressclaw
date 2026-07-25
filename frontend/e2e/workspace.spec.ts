@@ -68,6 +68,22 @@ async function mockApi(
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 		projectTaskUpdates?: number[];
 		completedTaskCount?: number;
+		mcpServers?: {
+			name: string;
+			type: 'stdio' | 'http' | 'sse';
+			command: string | null;
+			args: string[];
+			url: string | null;
+			env: Record<string, string>;
+			headers: Record<string, string>;
+		}[];
+		mcpVerificationResults?: Record<string, {
+			ok: boolean;
+			status: string;
+			message: string;
+			suggestion: string | null;
+		}>;
+		mcpVerificationRequests?: { name: string; agent_id: string | null }[];
 		workflows?: {
 			id: string;
 			name: string;
@@ -171,6 +187,18 @@ async function mockApi(
 			response = { available: true, installed: true, can_start: false };
 		} else if (path === '/api/setup/status') {
 			response = { setup_complete: true };
+		} else if (path === '/api/setup/mcp-servers') {
+			response = { servers: options.mcpServers ?? [] };
+		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
+			const name = decodeURIComponent(path.split('/')[4]);
+			const payload = request.postDataJSON() as { agent_id: string | null };
+			options.mcpVerificationRequests?.push({ name, agent_id: payload.agent_id });
+			response = options.mcpVerificationResults?.[name] ?? {
+				ok: true,
+				status: 'ready',
+				message: 'The MCP endpoint accepted a protocol verification request.',
+				suggestion: null,
+			};
 		} else if (path === '/api/agents') {
 			response = availableAgents;
 		} else if (path === `/api/agents/${agentId}`) {
@@ -977,6 +1005,65 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 	await expect(taskRows).toHaveCount(5);
 	await expect(page.getByText('Page 3 of 3')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
+});
+
+test('MCP verification reports authentication and runner executable failures in context', async ({ page }) => {
+	const verificationRequests: { name: string; agent_id: string | null }[] = [];
+	await mockApi(page, {
+		mcpServers: [
+			{
+				name: 'JIRA',
+				type: 'http',
+				command: null,
+				args: [],
+				url: 'https://mcp.atlassian.com/v1/mcp/authv2',
+				env: {},
+				headers: {},
+			},
+			{
+				name: 'playwright',
+				type: 'stdio',
+				command: '/usr/bin/npx',
+				args: ['playwright', 'run-test-mcp-server'],
+				url: null,
+				env: {},
+				headers: {},
+			},
+		],
+		mcpVerificationRequests: verificationRequests,
+		mcpVerificationResults: {
+			JIRA: {
+				ok: false,
+				status: 'authentication_required',
+				message: 'The MCP endpoint responded with 401 Unauthorized; authentication is required.',
+				suggestion: 'Add a valid Authorization header, then verify again.',
+			},
+			playwright: {
+				ok: false,
+				status: 'command_path_incorrect',
+				message: "/usr/bin/npx is not executable in this project's runner image.",
+				suggestion: 'Use /usr/local/bin/npx instead.',
+			},
+		},
+	});
+
+	await page.goto('/settings/mcp');
+	const jira = page.locator('[data-mcp-server="JIRA"]');
+	await jira.getByRole('button', { name: 'Verify' }).click();
+	await expect(jira).toContainText('authentication is required');
+
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	const playwright = page.locator('[data-mcp-server="playwright"]');
+	await playwright.getByRole('button', { name: 'Verify' }).click();
+	await expect(playwright).toContainText('Use /usr/local/bin/npx instead.');
+
+	expect(verificationRequests).toEqual([
+		{ name: 'JIRA', agent_id: null },
+		{ name: 'playwright', agent_id: agentId },
+	]);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test('workflow and settings pages show context-specific sidebar lists', async ({ page }) => {
