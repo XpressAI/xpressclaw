@@ -51,7 +51,11 @@ For a `github.com` origin, Xpressclaw discovers the host's existing `gh`
 login and supplies Git credentials through `credential.helper`. The worker
 still has the complete Git CLI. GitHub PR, review, check, and Actions
 operations are exposed as one constrained, `gh`-shaped MCP tool; arbitrary
-`gh api` and direct `gh` shell access are intentionally unavailable.
+`gh api` and direct `gh` shell access are intentionally unavailable. Codex
+sessions that receive this MCP also receive developer-level runtime guidance
+that it satisfies generic skills' `gh` prerequisites, so a missing shell
+binary must not block pull-request work. The MCP server advertises the same
+substitution to other ACP agents.
 
 ## Customization
 

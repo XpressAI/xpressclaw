@@ -1,17 +1,34 @@
 //! Project-scoped Git and GitHub access for native ACP workers.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
+use serde_json::{json, Value};
 
 use crate::connectors::manager::ConnectorManager;
 use crate::db::Database;
+use crate::error::{Error, Result};
 
 const GITHUB_HOST: &str = "github.com";
 const GITHUB_MCP_COMMAND: &str = "/opt/xpressclaw/mcp-github.mjs";
+const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
+const GITHUB_GUIDANCE_MARKER: &str = "XpressClaw GitHub runtime:";
+const GITHUB_CODEX_DEVELOPER_INSTRUCTIONS: &str = "\
+XpressClaw GitHub runtime: An authenticated, project-scoped MCP server named \
+`github` is attached. Its `gh` tool is XpressClaw's replacement for the shell \
+GitHub CLI, which is intentionally absent from PATH. Do not run `gh --version` \
+or `gh auth status`, ask the user to install or authenticate `gh`, or treat its \
+absence as a blocker. When a skill or workflow requires `gh`, or bundles a \
+script that shells out to it, treat the attached `github` MCP tool as satisfying \
+that prerequisite and call the tool directly with the arguments that would \
+follow `gh`. Use shell `git` for branches, commits, fetches, pushes, rebases, \
+and other local Git operations. Use the MCP tool for pull requests, checks, \
+Actions, issues, and review threads. Repository selection and authentication \
+are already fixed by XpressClaw.";
 
 /// Credentials and repository context made available to one short-lived
 /// worker. Deliberately omit the token from `Debug` so future diagnostics do
@@ -111,6 +128,58 @@ pub fn extend_git_environment(environment: &mut Vec<String>, github: Option<&Git
         environment.push(format!("GIT_CONFIG_KEY_{index}={key}"));
         environment.push(format!("GIT_CONFIG_VALUE_{index}={value}"));
     }
+}
+
+/// Add environment-specific GitHub guidance at Codex's developer-instruction
+/// priority. Generic GitHub plugin skills assume a shell `gh` binary, while
+/// XpressClaw deliberately exposes the same supported operations only through
+/// its constrained MCP server.
+///
+/// Preserve all user-supplied CODEX_CONFIG values and append to existing
+/// developer instructions rather than replacing them.
+pub fn add_codex_mcp_guidance(environment: &mut HashMap<String, String>) -> Result<()> {
+    let mut config = match environment.get(CODEX_CONFIG_ENV) {
+        Some(raw) => serde_json::from_str::<Value>(raw).map_err(|error| {
+            Error::Backend(format!(
+                "{CODEX_CONFIG_ENV} must contain valid JSON before XpressClaw can add GitHub MCP guidance: {error}"
+            ))
+        })?,
+        None => json!({}),
+    };
+    let object = config.as_object_mut().ok_or_else(|| {
+        Error::Backend(format!(
+            "{CODEX_CONFIG_ENV} must be a JSON object before XpressClaw can add GitHub MCP guidance"
+        ))
+    })?;
+    let existing = match object.get("developer_instructions") {
+        Some(Value::String(instructions)) => instructions.as_str(),
+        Some(Value::Null) | None => "",
+        Some(_) => {
+            return Err(Error::Backend(format!(
+                "{CODEX_CONFIG_ENV}.developer_instructions must be a string"
+            )));
+        }
+    };
+    if !existing.contains(GITHUB_GUIDANCE_MARKER) {
+        let combined = if existing.trim().is_empty() {
+            GITHUB_CODEX_DEVELOPER_INSTRUCTIONS.to_string()
+        } else {
+            format!("{existing}\n\n{GITHUB_CODEX_DEVELOPER_INSTRUCTIONS}")
+        };
+        object.insert(
+            "developer_instructions".to_string(),
+            Value::String(combined),
+        );
+    }
+    environment.insert(
+        CODEX_CONFIG_ENV.to_string(),
+        serde_json::to_string(&config).map_err(|error| {
+            Error::Backend(format!(
+                "failed to serialize {CODEX_CONFIG_ENV} with GitHub MCP guidance: {error}"
+            ))
+        })?,
+    );
+    Ok(())
 }
 
 fn origin_repository(workspace: &Path) -> Option<(String, String)> {
@@ -277,5 +346,60 @@ mod tests {
         assert!(environment
             .iter()
             .any(|entry| entry == "GITHUB_PAT_TOKEN=secret"));
+    }
+
+    #[test]
+    fn codex_config_explains_that_github_mcp_replaces_shell_gh() {
+        let mut environment = HashMap::new();
+
+        add_codex_mcp_guidance(&mut environment).unwrap();
+
+        let config: Value =
+            serde_json::from_str(environment.get(CODEX_CONFIG_ENV).unwrap()).unwrap();
+        let instructions = config["developer_instructions"].as_str().unwrap();
+        assert!(instructions.contains("MCP server named `github`"));
+        assert!(instructions.contains("intentionally absent from PATH"));
+        assert!(instructions.contains("Do not run `gh --version`"));
+        assert!(instructions.contains("Use shell `git`"));
+    }
+
+    #[test]
+    fn codex_config_preserves_user_values_and_developer_instructions() {
+        let mut environment = HashMap::from([(
+            CODEX_CONFIG_ENV.to_string(),
+            json!({
+                "features": { "example": true },
+                "developer_instructions": "Keep responses concise."
+            })
+            .to_string(),
+        )]);
+
+        add_codex_mcp_guidance(&mut environment).unwrap();
+        add_codex_mcp_guidance(&mut environment).unwrap();
+
+        let config: Value =
+            serde_json::from_str(environment.get(CODEX_CONFIG_ENV).unwrap()).unwrap();
+        assert_eq!(config["features"]["example"], true);
+        let instructions = config["developer_instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("Keep responses concise."));
+        assert_eq!(instructions.matches(GITHUB_GUIDANCE_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn codex_config_rejects_shapes_the_adapter_cannot_use() {
+        let mut environment = HashMap::from([(CODEX_CONFIG_ENV.to_string(), "[]".to_string())]);
+        assert!(add_codex_mcp_guidance(&mut environment)
+            .unwrap_err()
+            .to_string()
+            .contains("must be a JSON object"));
+
+        let mut environment = HashMap::from([(
+            CODEX_CONFIG_ENV.to_string(),
+            json!({ "developer_instructions": 42 }).to_string(),
+        )]);
+        assert!(add_codex_mcp_guidance(&mut environment)
+            .unwrap_err()
+            .to_string()
+            .contains("must be a string"));
     }
 }

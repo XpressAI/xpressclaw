@@ -246,6 +246,13 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             BUILT_IN_RUNNER_PROTOCOL,
         )
         .await;
+    let github_mcp_attached = configure_bundled_github_mcp(
+        &agent.runner,
+        &kind,
+        github.is_some(),
+        bundled_control_tools,
+        &mut spec.environment,
+    )?;
     if bundled_control_tools
         && !agent
             .runner
@@ -261,11 +268,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         ));
     }
     if let Some(access) = github.as_ref() {
-        if bundled_control_tools {
-            if !agent.runner.mcp_servers.iter().any(|name| name == "github") {
-                mcp_servers.push(access.mcp_server());
-            }
-        } else {
+        if github_mcp_attached {
+            mcp_servers.push(access.mcp_server());
+        } else if !bundled_control_tools {
             warn!(
                 image = spec.image,
                 repository = access.repository(),
@@ -976,6 +981,42 @@ fn build_spec(
     })
 }
 
+fn configure_bundled_github_mcp(
+    runner: &NativeRunnerConfig,
+    kind: &str,
+    github_available: bool,
+    bundled_control_tools: bool,
+    environment: &mut Vec<String>,
+) -> Result<bool> {
+    let attached = github_available
+        && bundled_control_tools
+        && !runner.mcp_servers.iter().any(|name| name == "github");
+    if attached && kind == "codex" {
+        const PREFIX: &str = "CODEX_CONFIG=";
+        let existing_index = environment
+            .iter()
+            .position(|variable| variable.starts_with(PREFIX));
+        let mut codex_environment = std::collections::HashMap::new();
+        if let Some(index) = existing_index {
+            codex_environment.insert(
+                "CODEX_CONFIG".to_string(),
+                environment[index][PREFIX.len()..].to_string(),
+            );
+        }
+        github::add_codex_mcp_guidance(&mut codex_environment)?;
+        let config = codex_environment
+            .remove("CODEX_CONFIG")
+            .ok_or_else(|| Error::Backend("GitHub guidance did not produce CODEX_CONFIG".into()))?;
+        let variable = format!("{PREFIX}{config}");
+        if let Some(index) = existing_index {
+            environment[index] = variable;
+        } else {
+            environment.push(variable);
+        }
+    }
+    Ok(attached)
+}
+
 fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> Vec<String> {
     if startup_commands.is_empty() {
         return command;
@@ -1484,6 +1525,66 @@ mod tests {
             acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
         );
+    }
+
+    #[test]
+    fn codex_runner_gets_github_guidance_only_when_bundled_mcp_is_attached() {
+        let runner = NativeRunnerConfig::default();
+        let mut environment = vec!["HOME=/home/node".to_string()];
+
+        assert!(
+            configure_bundled_github_mcp(&runner, "codex", true, true, &mut environment).unwrap()
+        );
+        let config: Value = serde_json::from_str(
+            environment
+                .iter()
+                .find_map(|variable| variable.strip_prefix("CODEX_CONFIG="))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(config["developer_instructions"]
+            .as_str()
+            .unwrap()
+            .contains("GitHub runtime"));
+
+        let mut custom_image_environment = vec![
+            "HOME=/home/node".to_string(),
+            r#"CODEX_CONFIG={"developer_instructions":"Use the image's shell gh."}"#.to_string(),
+        ];
+        let original_custom_environment = custom_image_environment.clone();
+        assert!(!configure_bundled_github_mcp(
+            &runner,
+            "codex",
+            true,
+            false,
+            &mut custom_image_environment
+        )
+        .unwrap());
+        assert_eq!(custom_image_environment, original_custom_environment);
+
+        let mut missing_access_environment = Vec::new();
+        assert!(!configure_bundled_github_mcp(
+            &runner,
+            "codex",
+            false,
+            true,
+            &mut missing_access_environment
+        )
+        .unwrap());
+
+        let configured_runner = NativeRunnerConfig {
+            mcp_servers: vec!["github".to_string()],
+            ..Default::default()
+        };
+        let mut configured_environment = Vec::new();
+        assert!(!configure_bundled_github_mcp(
+            &configured_runner,
+            "codex",
+            true,
+            true,
+            &mut configured_environment
+        )
+        .unwrap());
     }
 
     #[test]
