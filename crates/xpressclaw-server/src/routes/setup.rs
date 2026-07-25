@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -1338,7 +1338,7 @@ async fn verify_remote_mcp_server(server: &McpServerConfig) -> McpVerificationRe
     };
 
     match request.send().await {
-        Ok(response) => remote_verification_from_status(response.status()),
+        Ok(response) => verify_remote_mcp_response(&server.server_type, response).await,
         Err(error) => {
             let message = if error.is_timeout() {
                 "The MCP server did not respond within 10 seconds."
@@ -1364,10 +1364,372 @@ async fn verify_remote_mcp_server(server: &McpServerConfig) -> McpVerificationRe
     }
 }
 
+const MCP_VERIFICATION_BODY_LIMIT: usize = 256 * 1024;
+const MCP_VERIFICATION_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn verify_remote_mcp_response(
+    server_type: &str,
+    response: reqwest::Response,
+) -> McpVerificationResult {
+    let status = response.status();
+    if !status.is_success() {
+        return remote_verification_from_status(status);
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    match server_type {
+        "http" => match content_type.as_deref() {
+            Some("application/json") => verify_json_initialize_response(response).await,
+            Some("text/event-stream") => verify_sse_initialize_response(response).await,
+            _ => McpVerificationResult::failed(
+                "invalid_response",
+                "The endpoint returned a successful HTTP status but not an MCP response.",
+                Some(
+                    "Check that the URL points to a Streamable HTTP MCP endpoint, not a login or web page."
+                        .to_string(),
+                ),
+            ),
+        },
+        "sse" if content_type.as_deref() == Some("text/event-stream") => {
+            verify_legacy_sse_handshake(response).await
+        }
+        "sse" => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint did not return an MCP SSE stream.",
+            Some(
+                "Check that the URL points to the server's SSE endpoint and does not redirect to a login page."
+                    .to_string(),
+            ),
+        ),
+        _ => McpVerificationResult::failed(
+            "invalid_configuration",
+            "The saved MCP transport is not supported.",
+            None,
+        ),
+    }
+}
+
+async fn verify_json_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let body = match tokio::time::timeout(
+        MCP_VERIFICATION_STREAM_TIMEOUT,
+        read_limited_response_body(response),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(ResponseBodyError::TooLarge)) => {
+            return McpVerificationResult::failed(
+                "invalid_response",
+                "The MCP initialize response was unexpectedly large.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Ok(Err(ResponseBodyError::ReadFailed)) => {
+            return McpVerificationResult::failed(
+                "connection_failed",
+                "XpressClaw could not read the MCP initialize response.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Err(_) => {
+            return McpVerificationResult::failed(
+                "verification_timeout",
+                "The MCP server did not finish its initialize response within 5 seconds.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+    };
+
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => initialize_verification_result(&value),
+        Err(_) => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+async fn verify_sse_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                            continue;
+                        };
+                        match validate_initialize_response(&value) {
+                            InitializeResponse::Ready => return SseInspection::Ready,
+                            InitializeResponse::ProtocolError => {
+                                return SseInspection::ProtocolError;
+                            }
+                            InitializeResponse::Invalid => {}
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid initialize response over SSE.",
+        ),
+        Ok(SseInspection::ProtocolError) => initialize_protocol_error_result(),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The MCP SSE response was unexpectedly large before initialization completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE response.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not return an MCP initialize response within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+async fn verify_legacy_sse_handshake(response: reqwest::Response) -> McpVerificationResult {
+    let base_url = response.url().clone();
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        if event.event.as_deref() != Some("endpoint") {
+                            continue;
+                        }
+                        let endpoint = event.data.trim();
+                        if endpoint.is_empty() {
+                            continue;
+                        }
+                        let Ok(endpoint_url) = base_url.join(endpoint) else {
+                            continue;
+                        };
+                        if matches!(endpoint_url.scheme(), "http" | "https") {
+                            return SseInspection::Ready;
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid SSE endpoint handshake.",
+        ),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE response was unexpectedly large before its MCP handshake completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE handshake.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid | SseInspection::ProtocolError) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP endpoint handshake.",
+            Some("Check that the URL points to a legacy MCP SSE endpoint.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not provide an MCP endpoint handshake within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ResponseBodyError::ReadFailed)?
+    {
+        if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+            return Err(ResponseBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InitializeResponse {
+    Ready,
+    ProtocolError,
+    Invalid,
+}
+
+fn validate_initialize_response(value: &Value) -> InitializeResponse {
+    let Some(response) = value.as_object() else {
+        return InitializeResponse::Invalid;
+    };
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || response.get("id").and_then(Value::as_u64) != Some(1)
+    {
+        return InitializeResponse::Invalid;
+    }
+    if response.get("error").is_some_and(Value::is_object) {
+        return InitializeResponse::ProtocolError;
+    }
+
+    let Some(result) = response.get("result").and_then(Value::as_object) else {
+        return InitializeResponse::Invalid;
+    };
+    let valid_protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty());
+    let valid_capabilities = result.get("capabilities").is_some_and(Value::is_object);
+    let valid_server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .is_some_and(|server_info| {
+            server_info
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+                && server_info
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.trim().is_empty())
+        });
+
+    if valid_protocol_version && valid_capabilities && valid_server_info {
+        InitializeResponse::Ready
+    } else {
+        InitializeResponse::Invalid
+    }
+}
+
+fn initialize_verification_result(value: &Value) -> McpVerificationResult {
+    match validate_initialize_response(value) {
+        InitializeResponse::Ready => {
+            McpVerificationResult::ready("The MCP endpoint returned a valid initialize response.")
+        }
+        InitializeResponse::ProtocolError => initialize_protocol_error_result(),
+        InitializeResponse::Invalid => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+fn initialize_protocol_error_result() -> McpVerificationResult {
+    McpVerificationResult::failed(
+        "protocol_error",
+        "The MCP endpoint returned a JSON-RPC error for the initialize request.",
+        Some("Check the MCP server configuration and authentication, then try again.".to_string()),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseInspection {
+    Ready,
+    ProtocolError,
+    Invalid,
+    TooLarge,
+    ReadFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+fn complete_sse_events(body: &[u8]) -> Vec<SseEvent> {
+    let normalized = String::from_utf8_lossy(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let complete_length = normalized
+        .rfind("\n\n")
+        .map_or(0, |event_end| event_end + 2);
+
+    normalized[..complete_length]
+        .split("\n\n")
+        .filter_map(|event| {
+            let mut event_type = None;
+            let mut data = Vec::new();
+            for line in event.lines() {
+                if line.starts_with(':') {
+                    continue;
+                }
+                let (field, value) = line.split_once(':').unwrap_or((line, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => event_type = Some(value.to_string()),
+                    "data" => data.push(value),
+                    _ => {}
+                }
+            }
+            (!data.is_empty()).then(|| SseEvent {
+                event: event_type,
+                data: data.join("\n"),
+            })
+        })
+        .collect()
+}
+
 fn remote_verification_from_status(status: StatusCode) -> McpVerificationResult {
     if status.is_success() {
-        return McpVerificationResult::ready(
-            "The MCP endpoint accepted a protocol verification request.",
+        return McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned a successful status without a verified MCP response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
         );
     }
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
@@ -1710,9 +2072,26 @@ mod tests {
                         .and_then(|value| value.to_str().ok())
                         == Some("Bearer test-token");
                     if authorized && body["method"] == "initialize" {
-                        StatusCode::OK
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {},
+                                    "serverInfo": {
+                                        "name": "test-server",
+                                        "version": "1.0.0"
+                                    }
+                                }
+                            })),
+                        )
                     } else {
-                        StatusCode::BAD_REQUEST
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "bad request" })),
+                        )
                     }
                 },
             ),
@@ -1735,6 +2114,193 @@ mod tests {
 
         assert!(result.ok);
         assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_a_successful_login_page() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                axum::response::Html("<!doctype html><html><body>Please sign in</body></html>")
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("login")));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_non_mcp_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/mcp", post(|| async { Json(json!({ "status": "ok" })) }));
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("initialize"));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_accepts_streamable_http_sse_initialize_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":",
+                        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+                        "\"serverInfo\":{\"name\":\"test-server\",\"version\":\"1.0.0\"}}}\n\n"
+                    ),
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_requires_a_valid_legacy_sse_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: endpoint\ndata: /messages?session=test\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_sse_without_an_endpoint_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: message\ndata: connected\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("handshake"));
+    }
+
+    #[test]
+    fn initialize_response_validation_requires_mcp_result_fields() {
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": "test-server",
+                        "version": "1.0.0"
+                    }
+                }
+            })),
+            InitializeResponse::Ready
+        );
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {}
+                }
+            })),
+            InitializeResponse::Invalid
+        );
+    }
+
+    #[test]
+    fn sse_parser_ignores_incomplete_events() {
+        assert!(complete_sse_events(b"event: endpoint\ndata: /messages").is_empty());
+        assert_eq!(
+            complete_sse_events(b": keepalive\n\nevent: endpoint\ndata: /messages\n\n"),
+            vec![SseEvent {
+                event: Some("endpoint".to_string()),
+                data: "/messages".to_string(),
+            }]
+        );
     }
 
     #[test]
