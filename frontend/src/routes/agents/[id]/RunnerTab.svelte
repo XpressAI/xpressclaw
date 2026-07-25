@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { mcpServers, sessions, setup } from '$lib/api';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
-	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, NativeRunnerConfig } from '$lib/api';
+	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
 		agentConfig: LiveConfig['agents'][0] | null;
@@ -39,6 +39,8 @@
 	let editingMcpName = $state<string | null>(null);
 	let confirmDeleteMcp = $state<string | null>(null);
 	let mcpError = $state('');
+	let verifyingMcp = $state<string | null>(null);
+	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
 	const fallbackAgents = [
 		{ kind: 'codex', name: 'Codex', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
@@ -234,6 +236,7 @@
 				headers: mcpType === 'stdio' ? {} : parseKeyValueLines(mcpHeaders)
 			};
 			await mcpServers.upsert(definition);
+			mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== definition.name));
 			serverCatalog = (await mcpServers.list()).servers;
 			if (!selectedMcpServers.includes(definition.name)) selectedMcpServers = [...selectedMcpServers, definition.name];
 			resetMcpForm();
@@ -251,12 +254,45 @@
 		try {
 			await mcpServers.delete(name);
 			selectedMcpServers = selectedMcpServers.filter((item) => item !== name);
+			mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== name));
 			serverCatalog = (await mcpServers.list()).servers;
 			confirmDeleteMcp = null;
 			if (editingMcpName === name) resetMcpForm();
 		} catch (error) {
 			mcpError = String(error);
 		}
+	}
+
+	async function verifyMcpServer(server: McpServerDefinition) {
+		if (verifyingMcp) return;
+		verifyingMcp = server.name;
+		mcpVerification = Object.fromEntries(Object.entries(mcpVerification).filter(([key]) => key !== server.name));
+		try {
+			mcpVerification = {
+				...mcpVerification,
+				[server.name]: await mcpServers.verify(server.name, agentId)
+			};
+		} catch (error) {
+			mcpVerification = {
+				...mcpVerification,
+				[server.name]: {
+					ok: false,
+					status: 'verification_failed',
+					message: error instanceof Error ? error.message : 'Could not verify MCP server',
+					suggestion: 'Check the saved server configuration and try again.'
+				}
+			};
+		} finally {
+			verifyingMcp = null;
+		}
+	}
+
+	function verificationTone(result: McpVerificationResult): string {
+		if (result.ok) return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600';
+		if (result.status === 'authentication_required' || result.status === 'command_path_incorrect') {
+			return 'border-amber-500/25 bg-amber-500/10 text-amber-600';
+		}
+		return 'border-destructive/25 bg-destructive/5 text-destructive';
 	}
 </script>
 
@@ -369,16 +405,27 @@
 		{:else}
 			<div class="mt-4 space-y-2">
 				{#each serverCatalog as server}
-					<div class="flex items-start gap-3 rounded-md border border-border/70 px-3 py-2.5 hover:bg-accent/30">
-						<input type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" checked={selectedMcpServers.includes(server.name)} onchange={() => toggleMcp(server.name)} />
-						<span class="min-w-0 flex-1">
-							<span class="block text-sm font-medium">{server.name} <span class="ml-1 text-[10px] font-normal uppercase text-muted-foreground">{server.type}</span></span>
-							<span class="block truncate font-mono text-[11px] text-muted-foreground">{server.command || server.url}</span>
-						</span>
-						<button type="button" onclick={() => editMcpServer(server)} class="text-[11px] text-muted-foreground hover:text-foreground">Edit</button>
-						<button type="button" onclick={() => deleteMcpServer(server.name)} class="text-[11px] {confirmDeleteMcp === server.name ? 'text-destructive' : 'text-muted-foreground hover:text-destructive'}">
-							{confirmDeleteMcp === server.name ? 'Confirm' : 'Delete'}
-						</button>
+					<div class="rounded-md border border-border/70 px-3 py-2.5 hover:bg-accent/30" data-mcp-server={server.name}>
+						<div class="flex items-start gap-3">
+							<input type="checkbox" class="mt-0.5 h-4 w-4 rounded border-input" checked={selectedMcpServers.includes(server.name)} onchange={() => toggleMcp(server.name)} />
+							<span class="min-w-0 flex-1">
+								<span class="block text-sm font-medium">{server.name} <span class="ml-1 text-[10px] font-normal uppercase text-muted-foreground">{server.type}</span></span>
+								<span class="block truncate font-mono text-[11px] text-muted-foreground">{server.command || server.url}</span>
+							</span>
+							<button type="button" onclick={() => verifyMcpServer(server)} disabled={verifyingMcp !== null} class="text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-50">
+								{verifyingMcp === server.name ? 'Verifying…' : 'Verify'}
+							</button>
+							<button type="button" onclick={() => editMcpServer(server)} class="text-[11px] text-muted-foreground hover:text-foreground">Edit</button>
+							<button type="button" onclick={() => deleteMcpServer(server.name)} class="text-[11px] {confirmDeleteMcp === server.name ? 'text-destructive' : 'text-muted-foreground hover:text-destructive'}">
+								{confirmDeleteMcp === server.name ? 'Confirm' : 'Delete'}
+							</button>
+						</div>
+						{#if mcpVerification[server.name]}
+							{@const result = mcpVerification[server.name]}
+							<p aria-live="polite" class="mt-2 rounded-md border px-3 py-2 text-[11px] leading-relaxed {verificationTone(result)}">
+								{result.message}{#if result.suggestion} {result.suggestion}{/if}
+							</p>
+						{/if}
 					</div>
 				{/each}
 			</div>

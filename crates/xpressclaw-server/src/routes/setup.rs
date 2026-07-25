@@ -1,11 +1,13 @@
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
@@ -15,12 +17,16 @@ use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
     ContainerEngineAccess, LlmConfig, McpServerConfig, NativeRunnerConfig,
 };
+use xpressclaw_core::docker::manager::ContainerSpec;
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::system;
-use xpressclaw_core::workers::native::subscription_auth_available;
+use xpressclaw_core::workers::native::{
+    local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    subscription_auth_available,
+};
 
 use crate::state::AppState;
 
@@ -41,6 +47,7 @@ pub fn routes() -> Router<AppState> {
         .route("/config", get(get_config))
         .route("/mcp-servers", get(list_mcp_servers))
         .route("/mcp-servers", post(upsert_mcp_server))
+        .route("/mcp-servers/{name}/verify", post(verify_mcp_server))
         .route(
             "/mcp-servers/{name}",
             axum::routing::delete(delete_mcp_server),
@@ -1032,6 +1039,43 @@ async fn add_session(
 // MCP server management
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Serialize)]
+struct McpVerificationResult {
+    ok: bool,
+    status: &'static str,
+    message: String,
+    suggestion: Option<String>,
+}
+
+impl McpVerificationResult {
+    fn ready(message: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            status: "ready",
+            message: message.into(),
+            suggestion: None,
+        }
+    }
+
+    fn failed(
+        status: &'static str,
+        message: impl Into<String>,
+        suggestion: Option<String>,
+    ) -> Self {
+        Self {
+            ok: false,
+            status,
+            message: message.into(),
+            suggestion,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VerifyMcpServerRequest {
+    agent_id: Option<String>,
+}
+
 /// List all configured MCP servers with full details.
 async fn list_mcp_servers(State(state): State<AppState>) -> Json<Value> {
     let config = state.config();
@@ -1176,6 +1220,748 @@ async fn upsert_mcp_server(
     Ok(Json(json!({ "success": true, "name": name })))
 }
 
+/// Verify a saved MCP server using the closest safe execution context.
+///
+/// Remote transports receive a live protocol request from the control plane.
+/// Stdio commands are checked inside the selected project's runner image,
+/// because host paths say nothing about what is installed in that container.
+async fn verify_mcp_server(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<VerifyMcpServerRequest>,
+) -> Result<Json<McpVerificationResult>, (StatusCode, Json<Value>)> {
+    let config = state.config();
+    let server = config.mcp_servers.get(&name).cloned().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("MCP server '{name}' not found") })),
+        )
+    })?;
+
+    let result = match server.server_type.as_str() {
+        "http" | "sse" => verify_remote_mcp_server(&server).await,
+        "stdio" => {
+            let Some(agent_id) = req
+                .agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                return Ok(Json(McpVerificationResult::failed(
+                    "project_required",
+                    "Stdio commands must be verified inside a project's runner image.",
+                    Some("Open the project's Agent page and verify this server there.".to_string()),
+                )));
+            };
+            verify_stdio_mcp_server(&state, &server, agent_id).await
+        }
+        _ => McpVerificationResult::failed(
+            "invalid_configuration",
+            "The saved MCP transport is not supported.",
+            Some("Edit the server and choose stdio, HTTP, or SSE.".to_string()),
+        ),
+    };
+
+    Ok(Json(result))
+}
+
+async fn verify_remote_mcp_server(server: &McpServerConfig) -> McpVerificationResult {
+    let Some(url) = server
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    else {
+        return McpVerificationResult::failed(
+            "invalid_configuration",
+            "The MCP server has no URL.",
+            Some("Edit the server and provide an HTTP or HTTPS URL.".to_string()),
+        );
+    };
+
+    let mut headers = HeaderMap::new();
+    for (name, value) in &server.headers {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            return McpVerificationResult::failed(
+                "invalid_configuration",
+                format!("HTTP header name '{name}' is invalid."),
+                Some("Edit the server's HTTP headers and verify again.".to_string()),
+            );
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            return McpVerificationResult::failed(
+                "invalid_configuration",
+                format!("HTTP header '{name}' has an invalid value."),
+                Some("Edit the server's HTTP headers and verify again.".to_string()),
+            );
+        };
+        headers.insert(header_name, header_value);
+    }
+    let default_accept = if server.server_type == "sse" {
+        HeaderValue::from_static("text/event-stream")
+    } else {
+        HeaderValue::from_static("application/json, text/event-stream")
+    };
+    headers.entry(ACCEPT).or_insert(default_accept);
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "failed to build MCP verification client");
+            return McpVerificationResult::failed(
+                "connection_failed",
+                "XpressClaw could not create an HTTP client for this verification.",
+                None,
+            );
+        }
+    };
+
+    let request = if server.server_type == "sse" {
+        client.get(url).headers(headers)
+    } else {
+        client.post(url).headers(headers).json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "xpressclaw-verifier",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        }))
+    };
+
+    match request.send().await {
+        Ok(response) => verify_remote_mcp_response(&server.server_type, response).await,
+        Err(error) => {
+            let message = if error.is_timeout() {
+                "The MCP server did not respond within 10 seconds."
+            } else if error.is_connect() {
+                "XpressClaw could not connect to the MCP server."
+            } else {
+                "The MCP verification request failed."
+            };
+            warn!(
+                timed_out = error.is_timeout(),
+                connection_error = error.is_connect(),
+                "remote MCP verification failed"
+            );
+            McpVerificationResult::failed(
+                "connection_failed",
+                message,
+                Some(
+                    "Check the URL, network access, and TLS configuration, then try again."
+                        .to_string(),
+                ),
+            )
+        }
+    }
+}
+
+const MCP_VERIFICATION_BODY_LIMIT: usize = 256 * 1024;
+const MCP_VERIFICATION_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn verify_remote_mcp_response(
+    server_type: &str,
+    response: reqwest::Response,
+) -> McpVerificationResult {
+    let status = response.status();
+    if !status.is_success() {
+        return remote_verification_from_status(status);
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    match server_type {
+        "http" => match content_type.as_deref() {
+            Some("application/json") => verify_json_initialize_response(response).await,
+            Some("text/event-stream") => verify_sse_initialize_response(response).await,
+            _ => McpVerificationResult::failed(
+                "invalid_response",
+                "The endpoint returned a successful HTTP status but not an MCP response.",
+                Some(
+                    "Check that the URL points to a Streamable HTTP MCP endpoint, not a login or web page."
+                        .to_string(),
+                ),
+            ),
+        },
+        "sse" if content_type.as_deref() == Some("text/event-stream") => {
+            verify_legacy_sse_handshake(response).await
+        }
+        "sse" => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint did not return an MCP SSE stream.",
+            Some(
+                "Check that the URL points to the server's SSE endpoint and does not redirect to a login page."
+                    .to_string(),
+            ),
+        ),
+        _ => McpVerificationResult::failed(
+            "invalid_configuration",
+            "The saved MCP transport is not supported.",
+            None,
+        ),
+    }
+}
+
+async fn verify_json_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let body = match tokio::time::timeout(
+        MCP_VERIFICATION_STREAM_TIMEOUT,
+        read_limited_response_body(response),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(ResponseBodyError::TooLarge)) => {
+            return McpVerificationResult::failed(
+                "invalid_response",
+                "The MCP initialize response was unexpectedly large.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Ok(Err(ResponseBodyError::ReadFailed)) => {
+            return McpVerificationResult::failed(
+                "connection_failed",
+                "XpressClaw could not read the MCP initialize response.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+        Err(_) => {
+            return McpVerificationResult::failed(
+                "verification_timeout",
+                "The MCP server did not finish its initialize response within 5 seconds.",
+                Some("Check the MCP server and verify again.".to_string()),
+            );
+        }
+    };
+
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => initialize_verification_result(&value),
+        Err(_) => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+async fn verify_sse_initialize_response(response: reqwest::Response) -> McpVerificationResult {
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
+                            continue;
+                        };
+                        match validate_initialize_response(&value) {
+                            InitializeResponse::Ready => return SseInspection::Ready,
+                            InitializeResponse::ProtocolError => {
+                                return SseInspection::ProtocolError;
+                            }
+                            InitializeResponse::Invalid => {}
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid initialize response over SSE.",
+        ),
+        Ok(SseInspection::ProtocolError) => initialize_protocol_error_result(),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The MCP SSE response was unexpectedly large before initialization completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE response.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not return an MCP initialize response within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+async fn verify_legacy_sse_handshake(response: reqwest::Response) -> McpVerificationResult {
+    let base_url = response.url().clone();
+    let inspection = tokio::time::timeout(MCP_VERIFICATION_STREAM_TIMEOUT, async move {
+        let mut response = response;
+        let mut body = Vec::new();
+
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+                        return SseInspection::TooLarge;
+                    }
+                    body.extend_from_slice(&chunk);
+
+                    for event in complete_sse_events(&body) {
+                        if event.event.as_deref() != Some("endpoint") {
+                            continue;
+                        }
+                        let endpoint = event.data.trim();
+                        if endpoint.is_empty() {
+                            continue;
+                        }
+                        let Ok(endpoint_url) = base_url.join(endpoint) else {
+                            continue;
+                        };
+                        if matches!(endpoint_url.scheme(), "http" | "https") {
+                            return SseInspection::Ready;
+                        }
+                    }
+                }
+                Ok(None) => return SseInspection::Invalid,
+                Err(_) => return SseInspection::ReadFailed,
+            }
+        }
+    })
+    .await;
+
+    match inspection {
+        Ok(SseInspection::Ready) => McpVerificationResult::ready(
+            "The MCP endpoint returned a valid SSE endpoint handshake.",
+        ),
+        Ok(SseInspection::TooLarge) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE response was unexpectedly large before its MCP handshake completed.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::ReadFailed) => McpVerificationResult::failed(
+            "connection_failed",
+            "XpressClaw could not read the MCP SSE handshake.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+        Ok(SseInspection::Invalid | SseInspection::ProtocolError) => McpVerificationResult::failed(
+            "invalid_response",
+            "The SSE stream ended without a valid MCP endpoint handshake.",
+            Some("Check that the URL points to a legacy MCP SSE endpoint.".to_string()),
+        ),
+        Err(_) => McpVerificationResult::failed(
+            "verification_timeout",
+            "The SSE stream did not provide an MCP endpoint handshake within 5 seconds.",
+            Some("Check the MCP server and verify again.".to_string()),
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+async fn read_limited_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| ResponseBodyError::ReadFailed)?
+    {
+        if body.len().saturating_add(chunk.len()) > MCP_VERIFICATION_BODY_LIMIT {
+            return Err(ResponseBodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InitializeResponse {
+    Ready,
+    ProtocolError,
+    Invalid,
+}
+
+fn validate_initialize_response(value: &Value) -> InitializeResponse {
+    let Some(response) = value.as_object() else {
+        return InitializeResponse::Invalid;
+    };
+    if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || response.get("id").and_then(Value::as_u64) != Some(1)
+    {
+        return InitializeResponse::Invalid;
+    }
+    if response.get("error").is_some_and(Value::is_object) {
+        return InitializeResponse::ProtocolError;
+    }
+
+    let Some(result) = response.get("result").and_then(Value::as_object) else {
+        return InitializeResponse::Invalid;
+    };
+    let valid_protocol_version = result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .is_some_and(|version| !version.trim().is_empty());
+    let valid_capabilities = result.get("capabilities").is_some_and(Value::is_object);
+    let valid_server_info = result
+        .get("serverInfo")
+        .and_then(Value::as_object)
+        .is_some_and(|server_info| {
+            server_info
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
+                && server_info
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.trim().is_empty())
+        });
+
+    if valid_protocol_version && valid_capabilities && valid_server_info {
+        InitializeResponse::Ready
+    } else {
+        InitializeResponse::Invalid
+    }
+}
+
+fn initialize_verification_result(value: &Value) -> McpVerificationResult {
+    match validate_initialize_response(value) {
+        InitializeResponse::Ready => {
+            McpVerificationResult::ready("The MCP endpoint returned a valid initialize response.")
+        }
+        InitializeResponse::ProtocolError => initialize_protocol_error_result(),
+        InitializeResponse::Invalid => McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned JSON that was not a valid MCP initialize response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        ),
+    }
+}
+
+fn initialize_protocol_error_result() -> McpVerificationResult {
+    McpVerificationResult::failed(
+        "protocol_error",
+        "The MCP endpoint returned a JSON-RPC error for the initialize request.",
+        Some("Check the MCP server configuration and authentication, then try again.".to_string()),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SseInspection {
+    Ready,
+    ProtocolError,
+    Invalid,
+    TooLarge,
+    ReadFailed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SseEvent {
+    event: Option<String>,
+    data: String,
+}
+
+fn complete_sse_events(body: &[u8]) -> Vec<SseEvent> {
+    let normalized = String::from_utf8_lossy(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let complete_length = normalized
+        .rfind("\n\n")
+        .map_or(0, |event_end| event_end + 2);
+
+    normalized[..complete_length]
+        .split("\n\n")
+        .filter_map(|event| {
+            let mut event_type = None;
+            let mut data = Vec::new();
+            for line in event.lines() {
+                if line.starts_with(':') {
+                    continue;
+                }
+                let (field, value) = line.split_once(':').unwrap_or((line, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match field {
+                    "event" => event_type = Some(value.to_string()),
+                    "data" => data.push(value),
+                    _ => {}
+                }
+            }
+            (!data.is_empty()).then(|| SseEvent {
+                event: event_type,
+                data: data.join("\n"),
+            })
+        })
+        .collect()
+}
+
+fn remote_verification_from_status(status: StatusCode) -> McpVerificationResult {
+    if status.is_success() {
+        return McpVerificationResult::failed(
+            "invalid_response",
+            "The endpoint returned a successful status without a verified MCP response.",
+            Some("Check that the URL and transport match the MCP server.".to_string()),
+        );
+    }
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return McpVerificationResult::failed(
+            "authentication_required",
+            format!("The MCP endpoint responded with {status}; authentication is required."),
+            Some(
+                "Add a valid Authorization header to this server configuration, then verify again."
+                    .to_string(),
+            ),
+        );
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return McpVerificationResult::failed(
+            "rate_limited",
+            "The MCP endpoint is reachable but rate-limited the verification request.",
+            Some("Wait briefly and verify again.".to_string()),
+        );
+    }
+    if status.is_server_error() {
+        return McpVerificationResult::failed(
+            "server_error",
+            format!("The MCP endpoint is reachable but returned {status}."),
+            Some("Check the MCP server and try again.".to_string()),
+        );
+    }
+    McpVerificationResult::failed(
+        "request_rejected",
+        format!("The MCP endpoint rejected the protocol request with {status}."),
+        Some("Check that the URL and transport match the MCP server.".to_string()),
+    )
+}
+
+async fn verify_stdio_mcp_server(
+    state: &AppState,
+    server: &McpServerConfig,
+    agent_id: &str,
+) -> McpVerificationResult {
+    let config = state.config();
+    let registry_name = AgentRegistry::new(state.db.clone())
+        .get(agent_id)
+        .ok()
+        .map(|record| record.name);
+    let agent = config.agents.iter().find(|agent| {
+        agent.name == agent_id || registry_name.as_deref() == Some(agent.name.as_str())
+    });
+    let Some(agent) = agent else {
+        return McpVerificationResult::failed(
+            "project_not_found",
+            "The selected project no longer has a runner configuration.",
+            Some("Reload the project and try again.".to_string()),
+        );
+    };
+
+    let kind = match resolve_runner_kind(agent) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return McpVerificationResult::failed(
+                "runner_unavailable",
+                format!("The project runner could not be resolved: {error}"),
+                Some("Save a valid ACP agent configuration first.".to_string()),
+            );
+        }
+    };
+    let image = match resolved_runner_image(&agent.runner, &kind) {
+        Ok(image) => image,
+        Err(error) => {
+            return McpVerificationResult::failed(
+                "runner_unavailable",
+                format!("The project runner image could not be resolved: {error}"),
+                Some("Save a valid runner image first.".to_string()),
+            );
+        }
+    };
+    let Some(docker) = state.docker().await else {
+        return McpVerificationResult::failed(
+            "runner_unavailable",
+            "Docker or Podman is not available, so the runner image could not be checked.",
+            Some("Start the configured container runtime and try again.".to_string()),
+        );
+    };
+    let runtime_image = if docker.has_image(&image).await {
+        Some(image)
+    } else if let Some(local_image) = local_runner_image_alias(&image) {
+        docker
+            .has_image(local_image)
+            .await
+            .then(|| local_image.to_string())
+    } else {
+        None
+    };
+    let Some(runtime_image) = runtime_image else {
+        return McpVerificationResult::failed(
+            "runner_image_missing",
+            "The selected project's runner image is not available locally.",
+            Some("Prepare the project runner, then verify the MCP server again.".to_string()),
+        );
+    };
+
+    let Some(command) = server
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    else {
+        return McpVerificationResult::failed(
+            "invalid_configuration",
+            "The stdio MCP server has no command.",
+            Some("Edit the server and provide an absolute command path.".to_string()),
+        );
+    };
+    let basename = FsPath::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let script = r#"configured="$1"
+name="$2"
+if [ -x "$configured" ]; then
+  printf 'FOUND:%s\n' "$configured"
+  exit 0
+fi
+if [ -n "$name" ]; then
+  alternative="$(command -v "$name" 2>/dev/null || true)"
+  if [ -n "$alternative" ]; then
+    printf 'ALTERNATIVE:%s\n' "$alternative"
+    exit 3
+  fi
+fi
+printf 'MISSING:%s\n' "$configured"
+exit 4
+"#;
+    let workload_id = format!("mcp-verify-{}", uuid::Uuid::new_v4().simple());
+    let spec = ContainerSpec {
+        image: runtime_image,
+        memory_limit: Some(256 * 1024 * 1024),
+        cpu_limit: None,
+        environment: Vec::new(),
+        volumes: Vec::new(),
+        network_mode: Some("none".to_string()),
+        expose_port: None,
+        cmd: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            script.to_string(),
+            "mcp-verify".to_string(),
+            command.to_string(),
+            basename.to_string(),
+        ]),
+        working_dir: None,
+        run_as_host_user: false,
+    };
+
+    if let Err(error) = docker.launch(&workload_id, &spec).await {
+        warn!(%error, "failed to launch stdio MCP verification container");
+        let _ = docker.stop(&workload_id).await;
+        return McpVerificationResult::failed(
+            "runner_unavailable",
+            "XpressClaw could not start the runner image to verify this command.",
+            Some(
+                "Check the project runner image and container runtime, then try again.".to_string(),
+            ),
+        );
+    }
+
+    let output =
+        match tokio::time::timeout(Duration::from_secs(15), docker.wait_for_exit(&workload_id))
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                warn!(%error, "stdio MCP verification container failed");
+                let _ = docker.stop(&workload_id).await;
+                return McpVerificationResult::failed(
+                    "runner_unavailable",
+                    "XpressClaw could not inspect the command in the runner image.",
+                    Some("Check the project runner image and try again.".to_string()),
+                );
+            }
+            Err(_) => {
+                let _ = docker.stop(&workload_id).await;
+                return McpVerificationResult::failed(
+                    "verification_timeout",
+                    "The runner image check did not finish within 15 seconds.",
+                    Some("Check the container runtime and try again.".to_string()),
+                );
+            }
+        };
+
+    stdio_verification_from_output(command, output.status_code, &output.output)
+}
+
+fn stdio_verification_from_output(
+    command: &str,
+    status_code: i64,
+    output: &str,
+) -> McpVerificationResult {
+    if status_code == 0 && output.lines().any(|line| line.starts_with("FOUND:")) {
+        return McpVerificationResult::ready(format!(
+            "The command {command} is executable in this project's base runner image."
+        ));
+    }
+    if let Some(alternative) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("ALTERNATIVE:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return McpVerificationResult::failed(
+            "command_path_incorrect",
+            format!("{command} is not executable in this project's base runner image."),
+            Some(format!("Use {alternative} instead.")),
+        );
+    }
+    if status_code == 4 || output.lines().any(|line| line.starts_with("MISSING:")) {
+        return McpVerificationResult::failed(
+            "command_missing",
+            format!("{command} is not executable in this project's base runner image."),
+            Some(
+                "Install it in the runner image, correct its path, or provide it with a project startup command."
+                    .to_string(),
+            ),
+        );
+    }
+    McpVerificationResult::failed(
+        "verification_failed",
+        "The runner could not verify the stdio command.",
+        Some(
+            "Check that the runner image contains /bin/sh and the configured command.".to_string(),
+        ),
+    )
+}
+
 /// Delete an MCP server from the global config.
 async fn delete_mcp_server(
     State(state): State<AppState>,
@@ -1259,6 +2045,283 @@ mod tests {
     async fn body_json(body: Body) -> Value {
         let bytes = body.collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn remote_mcp_verification_reports_authentication_failures() {
+        let result = remote_verification_from_status(StatusCode::UNAUTHORIZED);
+        assert!(!result.ok);
+        assert_eq!(result.status, "authentication_required");
+        assert!(result.message.contains("401"));
+        assert!(result
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("Authorization")));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_sends_headers_and_initialize_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(
+                |headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                    let authorized = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer test-token");
+                    if authorized && body["method"] == "initialize" {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": {},
+                                    "serverInfo": {
+                                        "name": "test-server",
+                                        "version": "1.0.0"
+                                    }
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": "bad request" })),
+                        )
+                    }
+                },
+            ),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            headers: std::collections::HashMap::from([(
+                "Authorization".to_string(),
+                "Bearer test-token".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_a_successful_login_page() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                axum::response::Html("<!doctype html><html><body>Please sign in</body></html>")
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result
+            .suggestion
+            .as_deref()
+            .is_some_and(|suggestion| suggestion.contains("login")));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_non_mcp_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/mcp", post(|| async { Json(json!({ "status": "ok" })) }));
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("initialize"));
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_accepts_streamable_http_sse_initialize_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/mcp",
+            post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    concat!(
+                        "event: message\n",
+                        "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":",
+                        "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},",
+                        "\"serverInfo\":{\"name\":\"test-server\",\"version\":\"1.0.0\"}}}\n\n"
+                    ),
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "http".to_string(),
+            url: Some(format!("http://{address}/mcp")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_requires_a_valid_legacy_sse_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: endpoint\ndata: /messages?session=test\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(result.ok);
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn remote_mcp_verification_rejects_sse_without_an_endpoint_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/events",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "event: message\ndata: connected\n\n",
+                )
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let server = McpServerConfig {
+            server_type: "sse".to_string(),
+            url: Some(format!("http://{address}/events")),
+            ..Default::default()
+        };
+
+        let result = verify_remote_mcp_server(&server).await;
+        server_task.abort();
+
+        assert!(!result.ok);
+        assert_eq!(result.status, "invalid_response");
+        assert!(result.message.contains("handshake"));
+    }
+
+    #[test]
+    fn initialize_response_validation_requires_mcp_result_fields() {
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {
+                        "name": "test-server",
+                        "version": "1.0.0"
+                    }
+                }
+            })),
+            InitializeResponse::Ready
+        );
+        assert_eq!(
+            validate_initialize_response(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {}
+                }
+            })),
+            InitializeResponse::Invalid
+        );
+    }
+
+    #[test]
+    fn sse_parser_ignores_incomplete_events() {
+        assert!(complete_sse_events(b"event: endpoint\ndata: /messages").is_empty());
+        assert_eq!(
+            complete_sse_events(b": keepalive\n\nevent: endpoint\ndata: /messages\n\n"),
+            vec![SseEvent {
+                event: Some("endpoint".to_string()),
+                data: "/messages".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_verification_suggests_the_executable_found_in_the_runner() {
+        let result =
+            stdio_verification_from_output("/usr/bin/npx", 3, "ALTERNATIVE:/usr/local/bin/npx\n");
+        assert!(!result.ok);
+        assert_eq!(result.status, "command_path_incorrect");
+        assert_eq!(
+            result.suggestion.as_deref(),
+            Some("Use /usr/local/bin/npx instead.")
+        );
+    }
+
+    #[test]
+    fn stdio_mcp_verification_reports_a_missing_executable() {
+        let result =
+            stdio_verification_from_output("/opt/mcp/server", 4, "MISSING:/opt/mcp/server\n");
+        assert!(!result.ok);
+        assert_eq!(result.status, "command_missing");
+        assert!(result.message.contains("/opt/mcp/server is not executable"));
     }
 
     #[test]

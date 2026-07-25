@@ -594,6 +594,18 @@ export interface McpServerDefinition {
 	headers?: Record<string, string>;
 }
 
+export interface McpVerificationResult {
+	ok: boolean;
+	status: 'ready'
+		| 'authentication_required'
+		| 'command_path_incorrect'
+		| 'command_missing'
+		| 'project_required'
+		| string;
+	message: string;
+	suggestion: string | null;
+}
+
 export const mcpServers = {
 	list: () => request<{ servers: McpServerDefinition[] }>('/api/setup/mcp-servers'),
 	upsert: (server: McpServerDefinition) =>
@@ -604,6 +616,11 @@ export const mcpServers = {
 	delete: (name: string) =>
 		request<{ success: boolean; deleted: string }>(`/api/setup/mcp-servers/${encodeURIComponent(name)}`, {
 			method: 'DELETE'
+		}),
+	verify: (name: string, agentId?: string) =>
+		request<McpVerificationResult>(`/api/setup/mcp-servers/${encodeURIComponent(name)}/verify`, {
+			method: 'POST',
+			body: JSON.stringify({ agent_id: agentId ?? null })
 		})
 };
 
