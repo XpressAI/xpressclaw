@@ -933,12 +933,13 @@ fn build_spec(
     if agent.runner.subscription_auth {
         volumes.extend(auth_mounts(kind));
     }
+    let runner_environment = configured_runner_environment(&agent.runner, kind, github.is_some())?;
     let mut environment = vec![
         "HOME=/home/node".to_string(),
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
-    for (name, value) in &agent.runner.environment {
+    for (name, value) in &runner_environment {
         if name.trim().is_empty() || name.contains('=') {
             return Err(Error::Backend(format!(
                 "invalid harness environment variable name: {name:?}"
@@ -974,6 +975,18 @@ fn build_spec(
         working_dir: Some(container_workspace),
         run_as_host_user: true,
     })
+}
+
+fn configured_runner_environment(
+    runner: &NativeRunnerConfig,
+    kind: &str,
+    github_available: bool,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut environment = runner.environment.clone();
+    if kind == "codex" && github_available {
+        github::add_codex_mcp_guidance(&mut environment)?;
+    }
+    Ok(environment)
 }
 
 fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> Vec<String> {
@@ -1484,6 +1497,25 @@ mod tests {
             acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
         );
+    }
+
+    #[test]
+    fn codex_runner_gets_github_mcp_guidance_only_when_access_is_attached() {
+        let runner = NativeRunnerConfig::default();
+
+        let codex = configured_runner_environment(&runner, "codex", true).unwrap();
+        let config: Value = serde_json::from_str(codex.get("CODEX_CONFIG").unwrap()).unwrap();
+        assert!(config["developer_instructions"]
+            .as_str()
+            .unwrap()
+            .contains("GitHub runtime"));
+
+        assert!(!configured_runner_environment(&runner, "codex", false)
+            .unwrap()
+            .contains_key("CODEX_CONFIG"));
+        assert!(!configured_runner_environment(&runner, "claude", true)
+            .unwrap()
+            .contains_key("CODEX_CONFIG"));
     }
 
     #[test]

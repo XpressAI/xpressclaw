@@ -5,6 +5,7 @@
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { pathToFileURL } from 'node:url';
 
 const GH = '/opt/xpressclaw/libexec/gh';
 const MAX_OUTPUT = 200_000;
@@ -16,7 +17,9 @@ const ALLOWED = new Map([
   ['issue', new Set(['list', 'view', 'comment'])],
 ]);
 
-const TOOL_DESCRIPTION = `Run a project-scoped subset of GitHub CLI commands using familiar gh arguments.
+export const TOOL_DESCRIPTION = `This is XpressClaw's authenticated, project-scoped replacement for the shell GitHub CLI.
+
+The shell \`gh\` binary is intentionally unavailable. Do not install it, run \`gh auth\`, or ask the user to authenticate it. Whenever instructions or skills require \`gh\`, call this tool and pass the arguments that would follow \`gh\`.
 
 Supported commands:
 - gh pr create|list|status|view|checks|diff|comment|review|ready|edit
@@ -277,12 +280,18 @@ async function handle(message) {
   error(id, -32601, `method not found: ${method}`);
 }
 
-const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
-for await (const line of input) {
-  if (!line.trim()) continue;
-  try {
-    await handle(JSON.parse(line));
-  } catch (cause) {
-    error(null, -32603, cause instanceof Error ? cause.message : String(cause));
+async function main() {
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of input) {
+    if (!line.trim()) continue;
+    try {
+      await handle(JSON.parse(line));
+    } catch (cause) {
+      error(null, -32603, cause instanceof Error ? cause.message : String(cause));
+    }
   }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
 }
