@@ -59,7 +59,7 @@ for runner in "${runners[@]}"; do
       ;;
     pi)
       dockerfile=npm
-      build_args=(--build-arg AGENT_KIND=pi --build-arg AGENT_PACKAGE=pi-acp@0.0.31 --build-arg AGENT_BINARY=pi-acp)
+      build_args=(--build-arg AGENT_KIND=pi --build-arg AGENT_PACKAGE=pi-acp@0.0.31 --build-arg AGENT_BINARY=pi-acp --build-arg AGENT_EXTRA_PACKAGES=@earendil-works/pi-coding-agent@0.82.0 --build-arg AGENT_EXTRA_BINARY=pi)
       ;;
     qwen)
       dockerfile=npm

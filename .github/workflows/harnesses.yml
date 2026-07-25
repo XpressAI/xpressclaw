@@ -96,6 +96,8 @@ jobs:
               AGENT_KIND=pi
               AGENT_PACKAGE=pi-acp@0.0.31
               AGENT_BINARY=pi-acp
+              AGENT_EXTRA_PACKAGES=@earendil-works/pi-coding-agent@0.82.0
+              AGENT_EXTRA_BINARY=pi
           - runner: qwen
             dockerfile: npm
             build_args: |

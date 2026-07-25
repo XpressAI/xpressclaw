@@ -5,6 +5,9 @@ FROM node:24-bookworm-slim AS runner-base
 ARG AGENT_KIND
 ARG AGENT_PACKAGE
 ARG AGENT_BINARY
+# Companion agent for bridge packages (e.g. pi-acp needs pi); binary verified on PATH.
+ARG AGENT_EXTRA_PACKAGES=""
+ARG AGENT_EXTRA_BINARY=""
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="${AGENT_KIND}"
 
@@ -16,9 +19,10 @@ RUN test -n "${AGENT_KIND}" \
     && rm -rf /var/lib/apt/lists/* \
     && install -d /opt/xpressclaw/libexec \
     && mv /usr/bin/gh /opt/xpressclaw/libexec/gh \
-    && npm install --global --omit=dev "${AGENT_PACKAGE}" \
+    && npm install --global --omit=dev "${AGENT_PACKAGE}" ${AGENT_EXTRA_PACKAGES} \
     && npm cache clean --force \
-    && command -v "${AGENT_BINARY}"
+    && command -v "${AGENT_BINARY}" \
+    && { [ -z "${AGENT_EXTRA_BINARY}" ] || command -v "${AGENT_EXTRA_BINARY}"; }
 
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
