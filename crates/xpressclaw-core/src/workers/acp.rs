@@ -9,13 +9,14 @@ pub use agent_client_protocol::schema::v1::CreateElicitationResponse;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
     ClientSessionCapabilities, ContentBlock, CreateElicitationRequest, ElicitationAction,
-    ElicitationCapabilities, ElicitationFormCapabilities, ImageContent, InitializeRequest,
-    LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind, PlanEntryStatus,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
-    SessionConfigSelectOptions, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, TextContent, ToolCallStatus,
+    ElicitationCapabilities, ElicitationFormCapabilities, ForkSessionRequest, ImageContent,
+    InitializeRequest, LoadSessionRequest, McpServer, NewSessionRequest, PermissionOptionKind,
+    PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigOptionsCapabilities, SessionConfigSelectOptions, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
+    TextContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
@@ -27,6 +28,7 @@ use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -266,7 +268,7 @@ impl AcpElicitationBroker {
 }
 
 /// Result of one ACP prompt turn. ACP session IDs remain opaque and are only
-/// used with `session/resume` or `session/load` on later attempts.
+/// used with ACP session lifecycle methods on later attempts.
 #[derive(Debug)]
 pub struct AcpTurnResult {
     pub session_id: String,
@@ -277,8 +279,19 @@ pub struct AcpTurnResult {
     pub interrupted: bool,
 }
 
-/// Per-turn client choices applied after the ACP session is created or
-/// resumed and before its prompt is sent.
+/// How a task should establish its ACP conversation before sending a prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpSessionStart {
+    /// Create a conversation without inherited agent context.
+    New,
+    /// Continue a conversation already owned by this task.
+    Resume(String),
+    /// Branch from another task's conversation when the agent supports it.
+    Fork(String),
+}
+
+/// Per-turn client choices applied after ACP session setup and before its
+/// prompt is sent.
 #[derive(Debug, Default)]
 pub struct AcpTurnOptions {
     pub model: Option<String>,
@@ -719,12 +732,13 @@ impl AcpEventRecorder {
 }
 
 /// Run one prompt against an ACP agent attached to an isolated container.
-/// Existing sessions are resumed without history replay when possible, then
-/// loaded as a compatibility fallback.
+/// Existing task sessions are resumed without history replay when possible.
+/// New tasks fork inherited context when the agent supports `session/fork`,
+/// falling back to today's resume/load behavior for older ACP agents.
 pub async fn run_turn(
     attached: AttachedContainer,
     runtime: AcpTurnRuntime,
-    existing_session_id: Option<&str>,
+    session_start: AcpSessionStart,
     cwd: &Path,
     prompt: &str,
     options: AcpTurnOptions,
@@ -784,7 +798,6 @@ pub async fn run_turn(
     let live_session_id = Arc::new(Mutex::new(None::<String>));
     let live_session_id_for_turn = live_session_id.clone();
     let prompt_recorder = recorder.clone();
-    let existing_session_id = existing_session_id.map(str::to_owned);
     let cwd = cwd.to_path_buf();
     let prompt = prompt.to_string();
 
@@ -898,56 +911,144 @@ pub async fn run_turn(
                 }
             }
 
-            let (session_id, mut config_options, mut modes) = if let Some(session_id) = existing_session_id {
-                if initialized
-                    .agent_capabilities
-                    .session_capabilities
-                    .resume
-                    .is_some()
-                {
+            let (prepared_session, session_to_resume) = match session_start {
+                AcpSessionStart::New => {
                     let response = connection
                         .send_request(
-                            ResumeSessionRequest::new(session_id.clone(), cwd.clone())
-                                .mcp_servers(mcp_servers.clone()),
+                            NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()),
                         )
                         .block_task()
                         .await?;
                     (
-                        session_id,
-                        response.config_options.unwrap_or_default(),
-                        response.modes,
+                        Some((
+                            response.session_id.to_string(),
+                            response.config_options.unwrap_or_default(),
+                            response.modes,
+                        )),
+                        None,
                     )
-                } else if initialized.agent_capabilities.load_session {
-                    let response = connection
-                        .send_request(
-                            LoadSessionRequest::new(session_id.clone(), cwd.clone())
-                                .mcp_servers(mcp_servers.clone()),
-                        )
-                        .block_task()
-                        .await?;
-                    (
-                        session_id,
-                        response.config_options.unwrap_or_default(),
-                        response.modes,
-                    )
-                } else {
-                    return Err(agent_client_protocol::util::internal_error(
-                        "ACP agent cannot resume or load an existing session",
-                    ));
                 }
-            } else {
-                let response = connection
-                    .send_request(
-                        NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()),
-                    )
-                    .block_task()
-                    .await?;
-                (
-                    response.session_id.to_string(),
-                    response.config_options.unwrap_or_default(),
-                    response.modes,
-                )
+                AcpSessionStart::Resume(session_id) => (None, Some(session_id)),
+                AcpSessionStart::Fork(source_session_id) => {
+                    if initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .fork
+                        .is_some()
+                    {
+                        match connection
+                            .send_request(
+                                ForkSessionRequest::new(source_session_id.clone(), cwd.clone())
+                                    .mcp_servers(mcp_servers.clone()),
+                            )
+                            .block_task()
+                            .await
+                        {
+                            Ok(response) => {
+                                let forked_session_id = response.session_id.to_string();
+                                prompt_recorder
+                                    .append_event(
+                                        "session_fork",
+                                        "Forked the inherited agent conversation for this task",
+                                        json!({
+                                            "source_session_id": source_session_id,
+                                            "session_id": forked_session_id,
+                                        }),
+                                    )
+                                    .map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                (
+                                    Some((
+                                        forked_session_id,
+                                        response.config_options.unwrap_or_default(),
+                                        response.modes,
+                                    )),
+                                    None,
+                                )
+                            }
+                            Err(error) => {
+                                warn!(
+                                    %error,
+                                    "ACP agent rejected session fork; continuing the source conversation"
+                                );
+                                prompt_recorder
+                                    .append_event(
+                                        "session_fork_fallback",
+                                        "The agent could not fork this conversation; continued it instead",
+                                        json!({
+                                            "source_session_id": source_session_id,
+                                            "reason": "fork_failed",
+                                        }),
+                                    )
+                                    .map_err(
+                                        agent_client_protocol::Error::into_internal_error,
+                                    )?;
+                                (None, Some(source_session_id))
+                            }
+                        }
+                    } else {
+                        prompt_recorder
+                            .append_event(
+                                "session_fork_fallback",
+                                "This agent does not support conversation forks; continued it instead",
+                                json!({
+                                    "source_session_id": source_session_id,
+                                    "reason": "unsupported",
+                                }),
+                            )
+                            .map_err(agent_client_protocol::Error::into_internal_error)?;
+                        (None, Some(source_session_id))
+                    }
+                }
             };
+
+            let (session_id, mut config_options, mut modes) =
+                if let Some(prepared_session) = prepared_session {
+                    prepared_session
+                } else {
+                    let Some(session_id) = session_to_resume else {
+                        return Err(agent_client_protocol::util::internal_error(
+                            "ACP session setup did not create or select a session",
+                        ));
+                    };
+                    if initialized
+                        .agent_capabilities
+                        .session_capabilities
+                        .resume
+                        .is_some()
+                    {
+                        let response = connection
+                            .send_request(
+                                ResumeSessionRequest::new(session_id.clone(), cwd.clone())
+                                    .mcp_servers(mcp_servers.clone()),
+                            )
+                            .block_task()
+                            .await?;
+                        (
+                            session_id,
+                            response.config_options.unwrap_or_default(),
+                            response.modes,
+                        )
+                    } else if initialized.agent_capabilities.load_session {
+                        let response = connection
+                            .send_request(
+                                LoadSessionRequest::new(session_id.clone(), cwd.clone())
+                                    .mcp_servers(mcp_servers.clone()),
+                            )
+                            .block_task()
+                            .await?;
+                        (
+                            session_id,
+                            response.config_options.unwrap_or_default(),
+                            response.modes,
+                        )
+                    } else {
+                        return Err(agent_client_protocol::util::internal_error(
+                            "ACP agent cannot resume or load an existing session",
+                        ));
+                    }
+                };
 
             let native_session_id = session_id.to_string();
             *live_session_id_for_turn.lock().unwrap() = Some(native_session_id.clone());
@@ -1291,10 +1392,11 @@ fn truncate_bytes(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{
-        AvailableCommand, AvailableCommandsUpdate, ContentChunk, EnvVariable, InitializeResponse,
-        McpServerStdio, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PromptResponse,
-        SessionConfigSelectOption, SessionMode, SessionModeState, SetSessionConfigOptionResponse,
-        StopReason, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
+        AvailableCommand, AvailableCommandsUpdate, ContentChunk, EnvVariable, ForkSessionResponse,
+        InitializeResponse, McpServerStdio, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority,
+        PromptResponse, ResumeSessionResponse, SessionConfigSelectOption, SessionMode,
+        SessionModeState, SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallUpdate,
+        ToolCallUpdateFields,
     };
     use bytes::Bytes;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1413,7 +1515,7 @@ mod tests {
                 output: Box::pin(ReceiverStream::new(output_rx)),
             },
             AcpTurnRuntime::new(recorder, Arc::new(AcpElicitationBroker::new()), controls),
-            None,
+            AcpSessionStart::New,
             Path::new("/workspace"),
             "Do the work",
             AcpTurnOptions::default(),
@@ -1590,7 +1692,7 @@ mod tests {
                 Arc::new(AcpElicitationBroker::new()),
                 Arc::new(AcpTurnControlBroker::new()),
             ),
-            None,
+            AcpSessionStart::New,
             Path::new("/workspace"),
             "Do the work",
             AcpTurnOptions {
@@ -1636,6 +1738,188 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "available_commands"));
+        mock_agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_turn_forks_an_inherited_session_when_advertised() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "initialize" => {
+                        let mut result =
+                            serde_json::to_value(InitializeResponse::new(ProtocolVersion::V1))
+                                .unwrap();
+                        result["agentCapabilities"] = json!({
+                            "sessionCapabilities": { "fork": {} }
+                        });
+                        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                    }
+                    "session/fork" => {
+                        assert_eq!(request["params"]["sessionId"], "source-session");
+                        assert_eq!(request["params"]["cwd"], "/workspace");
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": ForkSessionResponse::new("forked-session"),
+                        })
+                    }
+                    "session/prompt" => {
+                        assert_eq!(request["params"]["sessionId"], "forked-session");
+                        assert_eq!(
+                            request["params"]["prompt"][0]["text"],
+                            "Continue the old task"
+                        );
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": PromptResponse::new(StopReason::EndTurn),
+                        })
+                    }
+                    other => panic!("unexpected ACP method: {other}"),
+                };
+                send_json(&output_tx, response).await;
+                if method == "session/prompt" {
+                    break;
+                }
+            }
+        });
+
+        let result = run_turn(
+            AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "test-container".to_string(),
+                    agent_id: "test-attempt".to_string(),
+                    status: "running".to_string(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            },
+            AcpTurnRuntime::new(
+                recorder,
+                Arc::new(AcpElicitationBroker::new()),
+                Arc::new(AcpTurnControlBroker::new()),
+            ),
+            AcpSessionStart::Fork("source-session".into()),
+            Path::new("/workspace"),
+            "Continue the old task",
+            AcpTurnOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.session_id, "forked-session");
+        let events = SessionManager::new(db)
+            .list_events("session-1", None, 20)
+            .unwrap();
+        let fork = events
+            .iter()
+            .find(|event| event.event_type == "session_fork")
+            .unwrap();
+        assert_eq!(fork.payload["source_session_id"], "source-session");
+        assert_eq!(fork.payload["session_id"], "forked-session");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session_fork_fallback"));
+        mock_agent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_turn_resumes_when_the_agent_cannot_fork() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (recorder, _) = test_recorder(db.clone());
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                let method = request["method"].as_str().unwrap();
+                let response = match method {
+                    "initialize" => {
+                        let mut result =
+                            serde_json::to_value(InitializeResponse::new(ProtocolVersion::V1))
+                                .unwrap();
+                        result["agentCapabilities"] = json!({
+                            "sessionCapabilities": { "resume": {} }
+                        });
+                        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                    }
+                    "session/resume" => {
+                        assert_eq!(request["params"]["sessionId"], "source-session");
+                        assert_eq!(request["params"]["cwd"], "/workspace");
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": ResumeSessionResponse::new(),
+                        })
+                    }
+                    "session/prompt" => {
+                        assert_eq!(request["params"]["sessionId"], "source-session");
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": PromptResponse::new(StopReason::EndTurn),
+                        })
+                    }
+                    other => panic!("unexpected ACP method: {other}"),
+                };
+                send_json(&output_tx, response).await;
+                if method == "session/prompt" {
+                    break;
+                }
+            }
+        });
+
+        let result = run_turn(
+            AttachedContainer {
+                info: ContainerInfo {
+                    container_id: "test-container".to_string(),
+                    agent_id: "test-attempt".to_string(),
+                    status: "running".to_string(),
+                    host_port: None,
+                },
+                input: Box::pin(client_input),
+                output: Box::pin(ReceiverStream::new(output_rx)),
+            },
+            AcpTurnRuntime::new(
+                recorder,
+                Arc::new(AcpElicitationBroker::new()),
+                Arc::new(AcpTurnControlBroker::new()),
+            ),
+            AcpSessionStart::Fork("source-session".into()),
+            Path::new("/workspace"),
+            "Continue the old task",
+            AcpTurnOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.session_id, "source-session");
+        let events = SessionManager::new(db)
+            .list_events("session-1", None, 20)
+            .unwrap();
+        let fallback = events
+            .iter()
+            .find(|event| event.event_type == "session_fork_fallback")
+            .unwrap();
+        assert_eq!(fallback.payload["source_session_id"], "source-session");
+        assert_eq!(fallback.payload["reason"], "unsupported");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session_fork"));
         mock_agent.await.unwrap();
     }
 
@@ -1790,7 +2074,7 @@ mod tests {
             run_turn(
                 attached,
                 AcpTurnRuntime::new(recorder, broker, Arc::new(AcpTurnControlBroker::new())),
-                None,
+                AcpSessionStart::New,
                 Path::new("/workspace"),
                 "Choose the database",
                 AcpTurnOptions::default(),

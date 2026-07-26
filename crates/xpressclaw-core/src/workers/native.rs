@@ -27,8 +27,8 @@ use crate::tasks::board::{Task, TaskBoard};
 use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{
-    run_turn, AcpElicitationBroker, AcpEventRecorder, AcpTurnControlBroker, AcpTurnOptions,
-    AcpTurnRuntime,
+    run_turn, AcpElicitationBroker, AcpEventRecorder, AcpSessionStart, AcpTurnControlBroker,
+    AcpTurnOptions, AcpTurnRuntime,
 };
 use crate::workers::github;
 
@@ -156,10 +156,10 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let resume_session_id = resume_session_id(&db, &item, &kind)?;
+    let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
-    if resume_session_id.is_none() {
+    if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
     }
     db.with_conn(|conn| {
@@ -193,7 +193,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
-    if let Some(native_session_id) = resume_session_id.as_deref() {
+    if let AcpSessionStart::Resume(native_session_id) = &session_start {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
     let workspace = resolved_workspace(&config, agent);
@@ -304,7 +304,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let turn = run_turn(
         attached,
         AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls),
-        resume_session_id.as_deref(),
+        session_start,
         Path::new(&container_workspace),
         &prompt.content,
         AcpTurnOptions {
@@ -650,14 +650,55 @@ fn build_prompt(db: &Arc<Database>, item: &QueueItem, attempt_id: &str) -> Resul
     })
 }
 
-/// Pick the ACP conversation for this task turn. Explicit task
-/// dependencies are strongest, followed by an existing turn on the same task.
-/// A task marked `session_mode: new` then starts clean; all other work resumes
-/// the latest conversation in the project.
-fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<Option<String>> {
+/// Pick how this task enters its ACP conversation.
+///
+/// Follow-ups resume the task's branch while it is still active. Reopening an
+/// older task forks its saved branch, and first turns fork either their
+/// dependency or the project's active branch. Agents without `session/fork`
+/// support fall back to resuming the selected source inside `run_turn`.
+fn session_start(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Result<AcpSessionStart> {
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
-    let dependency_session = db.with_conn(|conn| {
+
+    let task_session: Option<(String, String)> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id, native_session_id FROM work_attempts
+             WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
+               AND native_session_id IS NOT NULL
+               AND status IN ('completed', 'interrupted')
+             ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
+            rusqlite::params![item.task_id, item.agent_id, runner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+
+    let project_session: Option<(String, String)> = db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id, native_session_id FROM work_attempts
+             WHERE session_id = ?1 AND runner = ?2
+               AND native_session_id IS NOT NULL
+               AND status IN ('completed', 'interrupted')
+             ORDER BY COALESCE(completed_at, created_at) DESC, rowid DESC LIMIT 1",
+            rusqlite::params![item.agent_id, runner],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Error::from)
+    })?;
+    if let Some((task_attempt_id, task_session_id)) = task_session {
+        return if project_session
+            .as_ref()
+            .is_some_and(|(project_attempt_id, _)| project_attempt_id != &task_attempt_id)
+        {
+            Ok(AcpSessionStart::Fork(task_session_id))
+        } else {
+            Ok(AcpSessionStart::Resume(task_session_id))
+        };
+    }
+
+    let dependency_session: Option<String> = db.with_conn(|conn| {
         conn.query_row(
             "SELECT a.native_session_id
              FROM task_dependencies d
@@ -665,32 +706,15 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
              WHERE d.task_id = ?1 AND a.session_id = ?2 AND a.runner = ?3
                AND a.native_session_id IS NOT NULL
                AND a.status IN ('completed', 'interrupted')
-             ORDER BY COALESCE(a.completed_at, a.created_at) DESC LIMIT 1",
+             ORDER BY COALESCE(a.completed_at, a.created_at) DESC, a.rowid DESC LIMIT 1",
             rusqlite::params![item.task_id, item.agent_id, runner],
             |row| row.get(0),
         )
         .optional()
         .map_err(Error::from)
     })?;
-    if dependency_session.is_some() {
-        return Ok(dependency_session);
-    }
-
-    let task_session = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT native_session_id FROM work_attempts
-             WHERE task_id = ?1 AND session_id = ?2 AND runner = ?3
-               AND native_session_id IS NOT NULL
-               AND status IN ('completed', 'interrupted')
-             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
-            rusqlite::params![item.task_id, item.agent_id, runner],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Error::from)
-    })?;
-    if task_session.is_some() {
-        return Ok(task_session);
+    if let Some(dependency_session) = dependency_session {
+        return Ok(AcpSessionStart::Fork(dependency_session));
     }
 
     let start_new = task
@@ -700,22 +724,14 @@ fn resume_session_id(db: &Arc<Database>, item: &QueueItem, runner: &str) -> Resu
         .and_then(Value::as_str)
         == Some("new");
     if start_new {
-        return Ok(None);
+        return Ok(AcpSessionStart::New);
     }
 
-    db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT native_session_id FROM work_attempts
-             WHERE session_id = ?1 AND runner = ?2
-               AND native_session_id IS NOT NULL
-               AND status IN ('completed', 'interrupted')
-             ORDER BY COALESCE(completed_at, created_at) DESC LIMIT 1",
-            rusqlite::params![item.agent_id, runner],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Error::from)
-    })
+    Ok(
+        project_session.map_or(AcpSessionStart::New, |(_, session_id)| {
+            AcpSessionStart::Fork(session_id)
+        }),
+    )
 }
 
 async fn runner_image_ready(
@@ -1663,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_project_dependency_and_fresh_conversation_contexts() {
+    fn selects_fork_resume_and_fresh_conversation_contexts() {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
@@ -1684,7 +1700,7 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "UPDATE work_attempts SET runner = 'codex', status = 'completed',
-                    completed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    completed_at = '2026-01-01 00:00:01' WHERE id = ?1",
                 [first_attempt],
             )
         })
@@ -1731,8 +1747,8 @@ mod tests {
             .unwrap();
         let regular_item = queue.enqueue(&regular.id, "atlas").unwrap();
         assert_eq!(
-            resume_session_id(&db, &regular_item, "codex").unwrap(),
-            Some("thread-1".into())
+            session_start(&db, &regular_item, "codex").unwrap(),
+            AcpSessionStart::Fork("thread-1".into())
         );
 
         let fresh = board
@@ -1744,7 +1760,10 @@ mod tests {
             })
             .unwrap();
         let fresh_item = queue.enqueue(&fresh.id, "atlas").unwrap();
-        assert_eq!(resume_session_id(&db, &fresh_item, "codex").unwrap(), None);
+        assert_eq!(
+            session_start(&db, &fresh_item, "codex").unwrap(),
+            AcpSessionStart::New
+        );
 
         let dependent = board
             .create(&CreateTask {
@@ -1757,13 +1776,40 @@ mod tests {
         board.add_dependency(&dependent.id, &first.id).unwrap();
         let dependent_item = queue.enqueue(&dependent.id, "atlas").unwrap();
         assert_eq!(
-            resume_session_id(&db, &dependent_item, "codex").unwrap(),
-            Some("thread-1".into())
+            session_start(&db, &dependent_item, "codex").unwrap(),
+            AcpSessionStart::Fork("thread-1".into())
+        );
+
+        let regular_attempt = regular_item.attempt_id.as_deref().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET runner = 'codex', status = 'completed',
+                    completed_at = '2026-01-01 00:00:01' WHERE id = ?1",
+                [regular_attempt],
+            )
+        })
+        .unwrap();
+        SessionManager::new(db.clone())
+            // Legacy attempts can share a mutable ACP session ID. Attempt
+            // identity still distinguishes the current task from an old one.
+            .set_native_session(regular_attempt, "thread-1")
+            .unwrap();
+
+        let active_follow_up = queue.enqueue(&regular.id, "atlas").unwrap();
+        assert_eq!(
+            session_start(&db, &active_follow_up, "codex").unwrap(),
+            AcpSessionStart::Resume("thread-1".into())
+        );
+
+        let old_task_follow_up = queue.enqueue(&first.id, "atlas").unwrap();
+        assert_eq!(
+            session_start(&db, &old_task_follow_up, "codex").unwrap(),
+            AcpSessionStart::Fork("thread-1".into())
         );
     }
 
     #[test]
-    fn scheduled_wakeup_resumes_the_projects_codex_conversation() {
+    fn scheduled_wakeup_resumes_the_armed_tasks_codex_conversation() {
         use crate::tasks::board::CreateTask;
         use crate::tasks::scheduler::{CreateOneShotSchedule, ScheduleManager};
 
@@ -1824,8 +1870,8 @@ mod tests {
 
         assert_eq!(wakeup_task.id, original.id);
         assert_eq!(
-            resume_session_id(&db, &wakeup_item, "codex").unwrap(),
-            Some("codex-thread-1".into())
+            session_start(&db, &wakeup_item, "codex").unwrap(),
+            AcpSessionStart::Resume("codex-thread-1".into())
         );
         let messages = TaskConversation::new(db)
             .get_messages(&original.id)

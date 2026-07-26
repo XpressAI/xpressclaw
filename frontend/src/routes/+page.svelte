@@ -174,7 +174,7 @@
 				></textarea>
 				<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
-					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not use this project's current Codex, Claude, or OpenCode conversation">
+					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this project's current agent conversation">
 						<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 						Start a fresh conversation
 					</label>

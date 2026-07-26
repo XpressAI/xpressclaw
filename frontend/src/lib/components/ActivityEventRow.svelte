@@ -32,6 +32,8 @@
 			runner_progress: itemType === 'agent_message' ? 'Update' : 'Progress',
 			agent_thought: 'Thought',
 			tool_call: 'Tool',
+			session_fork: 'Session',
+			session_fork_fallback: 'Session',
 			session_config_options: 'Session',
 			available_commands: 'Commands',
 			session_info: 'Session',
