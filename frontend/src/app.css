@@ -206,3 +206,11 @@
 	width: 0;
 	height: 0;
 }
+
+/* Nested workspace panes own scrolling because the shell itself is viewport-locked. */
+.workspace-scroll-y {
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior-y: contain;
+	-webkit-overflow-scrolling: touch;
+}

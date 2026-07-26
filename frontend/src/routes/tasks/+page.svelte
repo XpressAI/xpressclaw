@@ -183,7 +183,7 @@
 	}
 </script>
 
-<div bind:this={scrollContainer} data-tasks-scroll class="h-full min-h-0 overflow-y-auto">
+<div bind:this={scrollContainer} data-tasks-scroll class="workspace-scroll-y h-full">
 	<div class="space-y-6 p-4 sm:p-6">
 	<div class="flex items-center justify-between gap-3">
 		<div>
