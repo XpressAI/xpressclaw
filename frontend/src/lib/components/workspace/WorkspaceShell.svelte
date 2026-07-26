@@ -701,33 +701,33 @@
 {#if mobileMenuOpen}
 	<div class="fixed inset-0 z-50 md:hidden">
 		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close project switcher" onclick={() => (mobileMenuOpen = false)}></button>
-		<aside class="absolute inset-y-0 left-0 flex w-[min(88vw,22rem)] flex-col border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
-			<div class="mb-3 flex h-9 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
-			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
+		<aside class="absolute inset-y-0 left-0 flex min-h-0 w-[min(88vw,22rem)] flex-col overflow-hidden border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
+			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
+			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
-				<div class="min-h-0 flex-1 overflow-y-auto">
+				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else if sidebarCategory === 'workflows'}
-				<div class="min-h-0 flex-1 overflow-y-auto">
+				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
 					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else if sidebarCategory === 'settings'}
-				<div class="min-h-0 flex-1 overflow-y-auto">
+				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
 					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else}
 				{#if attentionTasks.length > 0}
-					<div class="mb-4"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
+					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
 				{/if}
-				<div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</div>
-				<div class="flex-1 space-y-1 overflow-y-auto">
+				<div class="mb-1 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</div>
+				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1 space-y-1">
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
 						<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
 					{/each}
 				</div>
-				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
+				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 shrink-0 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
 			{/if}
 		</aside>
 	</div>

@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
@@ -6,6 +6,14 @@ const startTime = Date.parse('2026-07-19T00:00:00.000Z');
 
 function timestamp(second: number): string {
 	return new Date(startTime + second * 1_000).toISOString();
+}
+
+async function expectVerticalScroll(scroller: Locator) {
+	await expect(scroller).toBeVisible();
+	await expect(scroller).toHaveCSS('overflow-y', 'auto');
+	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+	await scroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+	await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
 }
 
 function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Current activity') {
@@ -65,6 +73,7 @@ async function mockApi(
 		interruptedAttempts?: string[];
 		connection?: { online: boolean };
 		multipleAgents?: boolean;
+		projectCount?: number;
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 		projectTaskUpdates?: number[];
 		completedTaskCount?: number;
@@ -140,7 +149,14 @@ async function mockApi(
 		name: 'secondary-browser-workspace',
 		title: 'Secondary browser workspace',
 	};
-	const availableAgents = options.multipleAgents ? [agent, secondaryAgent] : [agent];
+	const availableAgents = options.projectCount
+		? Array.from({ length: options.projectCount }, (_, index) => index === 0 ? agent : {
+			...agent,
+			id: `project-mobile-${index + 1}`,
+			name: `mobile-workspace-${index + 1}`,
+			title: `Mobile workspace ${index + 1}`,
+		})
+		: options.multipleAgents ? [agent, secondaryAgent] : [agent];
 	const listedTasks = options.completedTaskCount
 		? Array.from({ length: options.completedTaskCount }, (_, index) => ({
 			...task,
@@ -1005,6 +1021,53 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 	await expect(taskRows).toHaveCount(5);
 	await expect(page.getByText('Page 3 of 3')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
+});
+
+test('project, task, and workflow lists remain scrollable on mobile', async ({ browser }) => {
+	const mobile = await browser.newPage({
+		viewport: { width: 390, height: 844 },
+		isMobile: true,
+		hasTouch: true,
+	});
+	const mobileWorkflows = Array.from({ length: 30 }, (_, index) => ({
+		id: `workflow-mobile-${index + 1}`,
+		name: `Mobile workflow ${index + 1}`,
+		description: `Workflow ${index + 1} verifies the mobile list can scroll.`,
+		yaml_content: 'flows: {}',
+		enabled: index % 2 === 0,
+		version: 1,
+		created_at: timestamp(index),
+		updated_at: timestamp(index),
+	}));
+	await mockApi(mobile, {
+		completedTaskCount: 45,
+		projectCount: 30,
+		workflows: mobileWorkflows,
+	});
+
+	await mobile.goto('/agents');
+	await expect(mobile.locator('[data-projects-scroll] [data-project-card]')).toHaveCount(30);
+	await expectVerticalScroll(mobile.locator('[data-projects-scroll]'));
+	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+
+	await mobile.goto('/tasks');
+	await mobile.getByRole('button', { name: 'Done 45' }).click();
+	await expect(mobile.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
+	await expectVerticalScroll(mobile.locator('[data-tasks-scroll]'));
+	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+
+	await mobile.goto('/workflows');
+	await expect(mobile.locator('[data-workflows-scroll] [data-workflow-card]')).toHaveCount(30);
+	await expectVerticalScroll(mobile.locator('[data-workflows-scroll]'));
+	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
+
+	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await mobile.close();
 });
 
 test('MCP verification reports authentication and runner executable failures in context', async ({ page }) => {

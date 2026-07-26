@@ -57,7 +57,7 @@
 	}
 </script>
 
-<div data-workflows-scroll class="h-full min-h-0 overflow-y-auto">
+<div data-workflows-scroll class="workspace-scroll-y h-full">
 <div class="p-6 space-y-6">
 	<div class="flex items-center justify-between">
 		<div>
@@ -103,7 +103,7 @@
 		<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 			{#each workflowList as wf}
 				{@const counts = parseYamlCounts(wf.yaml_content)}
-				<div class="rounded-lg border border-border bg-card p-4 space-y-3 group">
+				<div data-workflow-card class="rounded-lg border border-border bg-card p-4 space-y-3 group">
 					<div class="flex items-start justify-between">
 						<div class="min-w-0 flex-1">
 							<a href="/workflows/{wf.id}" class="text-sm font-semibold hover:underline text-[hsl(220,20%,92%)]">
