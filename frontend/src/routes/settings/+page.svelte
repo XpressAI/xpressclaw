@@ -4,6 +4,7 @@
 	import {
 		getThemePreference,
 		setThemePreference,
+		THEME_STORAGE_KEY,
 		type ThemePreference,
 	} from '$lib/theme';
 	import { setCachedProfile } from '$lib/utils';
@@ -99,19 +100,29 @@
 		setThemePreference(preference);
 	}
 
-	onMount(async () => {
+	onMount(() => {
 		selectedTheme = getThemePreference();
-		const [profile, info] = await Promise.all([
+		const syncSelectedTheme = (event: StorageEvent) => {
+			if (event.key === THEME_STORAGE_KEY || event.key === null) {
+				selectedTheme = getThemePreference();
+			}
+		};
+		window.addEventListener('storage', syncSelectedTheme);
+
+		void Promise.all([
 			settings.getProfile().catch(() => null),
 			health.check().catch(() => null),
-		]);
-		if (profile) {
-			userProfile = profile;
-			setCachedProfile(profile);
-		}
-		if (info) {
-			buildInfo = { version: info.version, build: info.build, git_hash: info.git_hash };
-		}
+		]).then(([profile, info]) => {
+			if (profile) {
+				userProfile = profile;
+				setCachedProfile(profile);
+			}
+			if (info) {
+				buildInfo = { version: info.version, build: info.build, git_hash: info.git_hash };
+			}
+		});
+
+		return () => window.removeEventListener('storage', syncSelectedTheme);
 	});
 </script>
 

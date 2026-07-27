@@ -508,6 +508,8 @@ test('context usage is stateful and tool completion details stay on one row', as
 	await expect(diff).toContainText('src/example.ts');
 	await expect(diff).toContainText('const state = "before";');
 	await expect(diff).toContainText('const state = "after";');
+	await expect(diff.locator('[data-diff-before-content]')).toHaveCSS('color', 'rgb(153, 27, 27)');
+	await expect(diff.locator('[data-diff-after-content]')).toHaveCSS('color', 'rgb(6, 95, 70)');
 	await expect(page.getByText('Applied patch.', { exact: true })).toBeVisible();
 });
 
@@ -1207,6 +1209,17 @@ test('appearance follows the saved light, dark, and system preference', async ({
 	await expect(system).toBeChecked();
 	await expect(root).not.toHaveClass(/dark/);
 	await expect(root).toHaveAttribute('data-theme', 'system');
+
+	const secondPage = await page.context().newPage();
+	await mockApi(secondPage);
+	await secondPage.goto('/settings');
+	await secondPage.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await secondPage.evaluate(() => localStorage.removeItem('xpressclaw.theme'));
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await secondPage.close();
 
 	await page.locator('[data-theme-option="dark"]').click();
 	await expect(dark).toBeChecked();
