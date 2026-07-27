@@ -1,6 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { settings } from '$lib/api';
+	import {
+		getThemePreference,
+		setThemePreference,
+		type ThemePreference,
+	} from '$lib/theme';
 	import { setCachedProfile } from '$lib/utils';
 
 	import { health } from '$lib/api';
@@ -10,7 +15,18 @@
 	let buildInfo = $state<{ version: string; build: string; git_hash: string } | null>(null);
 	let profileName = $state('');
 	let profileSaved = $state(false);
+	let selectedTheme = $state<ThemePreference>('system');
 	let fileInput: HTMLInputElement;
+	const themeOptions: {
+		value: ThemePreference;
+		label: string;
+		description: string;
+		icon: 'system' | 'light' | 'dark';
+	}[] = [
+		{ value: 'system', label: 'System', description: 'Match this device', icon: 'system' },
+		{ value: 'light', label: 'Light', description: 'Use the light theme', icon: 'light' },
+		{ value: 'dark', label: 'Dark', description: 'Use the dark theme', icon: 'dark' },
+	];
 
 	function startEditProfile() {
 		profileName = userProfile.name;
@@ -78,7 +94,13 @@
 		} catch {}
 	}
 
+	function chooseTheme(preference: ThemePreference) {
+		selectedTheme = preference;
+		setThemePreference(preference);
+	}
+
 	onMount(async () => {
+		selectedTheme = getThemePreference();
 		const [profile, info] = await Promise.all([
 			settings.getProfile().catch(() => null),
 			health.check().catch(() => null),
@@ -151,6 +173,47 @@
 					</div>
 				{/if}
 			</div>
+		</div>
+	</div>
+
+	<!-- Appearance -->
+	<div class="rounded-lg border border-border bg-card p-4 space-y-4">
+		<div>
+			<h2 class="text-sm font-semibold">Appearance</h2>
+			<p class="mt-1 text-xs text-muted-foreground">Choose how XpressClaw looks on this device.</p>
+		</div>
+		<div class="grid gap-2 sm:grid-cols-3" role="radiogroup" aria-label="Appearance">
+			{#each themeOptions as option (option.value)}
+				<label
+					data-theme-option={option.value}
+					class="flex cursor-pointer items-center gap-3 rounded-lg border p-3 transition-colors
+						{selectedTheme === option.value
+							? 'border-primary bg-primary/5 ring-1 ring-primary/20'
+							: 'border-border hover:bg-accent/50'}"
+				>
+					<input
+						class="sr-only"
+						type="radio"
+						name="appearance"
+						value={option.value}
+						checked={selectedTheme === option.value}
+						onchange={() => chooseTheme(option.value)}
+					/>
+					<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border bg-background text-foreground">
+						{#if option.icon === 'system'}
+							<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2"/><path stroke-linecap="round" d="M8 21h8m-4-4v4"/></svg>
+						{:else if option.icon === 'light'}
+							<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path stroke-linecap="round" d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+						{:else}
+							<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M20.5 15.3A8.5 8.5 0 0 1 8.7 3.5a8.5 8.5 0 1 0 11.8 11.8Z"/></svg>
+						{/if}
+					</span>
+					<span class="min-w-0">
+						<span class="block text-sm font-medium">{option.label}</span>
+						<span class="block text-xs text-muted-foreground">{option.description}</span>
+					</span>
+				</label>
+			{/each}
 		</div>
 	</div>
 

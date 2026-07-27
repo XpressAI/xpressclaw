@@ -1193,3 +1193,43 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
+
+test('appearance follows the saved light, dark, and system preference', async ({ page }) => {
+	await page.emulateMedia({ colorScheme: 'light' });
+	await mockApi(page);
+	await page.goto('/settings');
+
+	const root = page.locator('html');
+	const system = page.locator('[data-theme-option="system"] input');
+	const light = page.locator('[data-theme-option="light"] input');
+	const dark = page.locator('[data-theme-option="dark"] input');
+
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'system');
+
+	await page.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'dark');
+	expect(await page.evaluate(() => localStorage.getItem('xpressclaw.theme'))).toBe('dark');
+
+	await page.reload();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="light"]').click();
+	await expect(light).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'dark' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="system"]').click();
+	await expect(system).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'light' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
