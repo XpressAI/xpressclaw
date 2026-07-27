@@ -165,12 +165,12 @@
 							<div class="border-b border-border/50 bg-secondary/25 px-3 py-1.5 font-mono text-[11px] text-foreground/80">{diff.path}</div>
 							<div class="grid gap-px bg-border/40 lg:grid-cols-2">
 								<div class="min-w-0 bg-background/95">
-									<div class="border-b border-red-500/15 bg-red-500/5 px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-red-300/75">Before</div>
-									<pre class="max-h-96 overflow-auto whitespace-pre p-3 font-mono text-[11px] leading-relaxed text-red-100/75">{diff.oldText || '(empty)'}</pre>
+									<div class="border-b border-red-500/15 bg-red-500/5 px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-red-700 dark:text-red-300/75">Before</div>
+									<pre data-diff-before-content class="max-h-96 overflow-auto whitespace-pre p-3 font-mono text-[11px] leading-relaxed text-red-800 dark:text-red-100/75">{diff.oldText || '(empty)'}</pre>
 								</div>
 								<div class="min-w-0 bg-background/95">
-									<div class="border-b border-emerald-500/15 bg-emerald-500/5 px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-emerald-300/75">After</div>
-									<pre class="max-h-96 overflow-auto whitespace-pre p-3 font-mono text-[11px] leading-relaxed text-emerald-100/75">{diff.newText || '(empty)'}</pre>
+									<div class="border-b border-emerald-500/15 bg-emerald-500/5 px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300/75">After</div>
+									<pre data-diff-after-content class="max-h-96 overflow-auto whitespace-pre p-3 font-mono text-[11px] leading-relaxed text-emerald-800 dark:text-emerald-100/75">{diff.newText || '(empty)'}</pre>
 								</div>
 							</div>
 						</section>

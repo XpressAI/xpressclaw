@@ -508,6 +508,8 @@ test('context usage is stateful and tool completion details stay on one row', as
 	await expect(diff).toContainText('src/example.ts');
 	await expect(diff).toContainText('const state = "before";');
 	await expect(diff).toContainText('const state = "after";');
+	await expect(diff.locator('[data-diff-before-content]')).toHaveCSS('color', 'rgb(153, 27, 27)');
+	await expect(diff.locator('[data-diff-after-content]')).toHaveCSS('color', 'rgb(6, 95, 70)');
 	await expect(page.getByText('Applied patch.', { exact: true })).toBeVisible();
 });
 
@@ -1191,5 +1193,56 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await page.getByRole('button', { name: 'Open project switcher' }).click();
 	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('appearance follows the saved light, dark, and system preference', async ({ page }) => {
+	await page.emulateMedia({ colorScheme: 'light' });
+	await mockApi(page);
+	await page.goto('/settings');
+
+	const root = page.locator('html');
+	const system = page.locator('[data-theme-option="system"] input');
+	const light = page.locator('[data-theme-option="light"] input');
+	const dark = page.locator('[data-theme-option="dark"] input');
+
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'system');
+
+	const secondPage = await page.context().newPage();
+	await mockApi(secondPage);
+	await secondPage.goto('/settings');
+	await secondPage.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await secondPage.evaluate(() => localStorage.removeItem('xpressclaw.theme'));
+	await expect(system).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await secondPage.close();
+
+	await page.locator('[data-theme-option="dark"]').click();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await expect(root).toHaveAttribute('data-theme', 'dark');
+	expect(await page.evaluate(() => localStorage.getItem('xpressclaw.theme'))).toBe('dark');
+
+	await page.reload();
+	await expect(dark).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="light"]').click();
+	await expect(light).toBeChecked();
+	await expect(root).not.toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'dark' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.locator('[data-theme-option="system"]').click();
+	await expect(system).toBeChecked();
+	await expect(root).toHaveClass(/dark/);
+	await page.emulateMedia({ colorScheme: 'light' });
+	await expect(root).not.toHaveClass(/dark/);
+
+	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
