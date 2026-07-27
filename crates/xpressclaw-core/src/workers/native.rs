@@ -33,6 +33,11 @@ use crate::workers::acp::{
 use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
+const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
+const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
+    include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
+    "\nawait main();\n"
+);
 
 struct NativeAttemptRuntime {
     db: Arc<Database>,
@@ -812,8 +817,18 @@ fn xpressclaw_control_mcp_server(
     if let Some(task_id) = task_id {
         env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
     }
+    // The control MCP must move in lockstep with the control plane. Runner
+    // images are cached independently and can legitimately remain on an older
+    // build, so execute the source embedded in this XpressClaw binary instead
+    // of the image's compatibility copy.
     McpServer::Stdio(
-        McpServerStdio::new("xpressclaw", "/opt/xpressclaw/mcp-xpressclaw.mjs").env(env),
+        McpServerStdio::new("xpressclaw", BUNDLED_CONTROL_MCP_COMMAND)
+            .args(vec![
+                "--input-type=module".to_string(),
+                "--eval".to_string(),
+                BUNDLED_CONTROL_MCP_SOURCE.to_string(),
+            ])
+            .env(env),
     )
 }
 
@@ -1348,10 +1363,13 @@ mod tests {
         };
 
         assert_eq!(server.name, "xpressclaw");
+        assert_eq!(server.command, PathBuf::from(BUNDLED_CONTROL_MCP_COMMAND));
         assert_eq!(
-            server.command,
-            PathBuf::from("/opt/xpressclaw/mcp-xpressclaw.mjs")
+            &server.args[..2],
+            ["--input-type=module".to_string(), "--eval".to_string()]
         );
+        assert!(server.args[2].contains("continuation_task_id"));
+        assert!(server.args[2].ends_with("await main();\n"));
         assert!(server.env.iter().any(|variable| {
             variable.name == "XPRESSCLAW_URL"
                 && variable.value == "http://host.docker.internal:9123"
