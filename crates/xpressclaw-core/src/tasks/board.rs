@@ -1272,13 +1272,7 @@ mod tests {
             .unwrap();
 
         let unicode_matches = board
-            .list_page(
-                &[],
-                None,
-                Some("café プロジェクト STRASSE がく"),
-                100,
-                0,
-            )
+            .list_page(&[], None, Some("café プロジェクト STRASSE がく"), 100, 0)
             .unwrap();
         assert_eq!(unicode_matches.len(), 1);
         assert_eq!(unicode_matches[0].id, international.id);
