@@ -44,10 +44,13 @@
 		scheduleCreateRequested = true;
 		const consumedUrl = new URL($page.url);
 		consumedUrl.searchParams.delete('new');
-		void goto(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, {
-			replaceState: true,
-			keepFocus: true,
-			noScroll: true,
+		const target = `${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`;
+		queueMicrotask(() => {
+			void goto(target, {
+				replaceState: true,
+				keepFocus: true,
+				noScroll: true,
+			});
 		});
 	});
 
