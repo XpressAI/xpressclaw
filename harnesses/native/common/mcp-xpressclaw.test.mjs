@@ -135,9 +135,12 @@ test('advertises a note resource template and renders discoverable links', () =>
 
 test('advertises project memory tools with conservative MCP annotations', () => {
   const search = TOOLS.find((tool) => tool.name === 'search_project_memory');
+  const get = TOOLS.find((tool) => tool.name === 'get_project_memory');
   const archive = TOOLS.find((tool) => tool.name === 'archive_project_memory');
   assert.equal(search.annotations.readOnlyHint, true);
   assert.equal(search.annotations.openWorldHint, false);
+  assert.equal(get.annotations.readOnlyHint, false);
+  assert.equal(get.annotations.idempotentHint, false);
   assert.equal(archive.annotations.destructiveHint, true);
 });
 

@@ -124,7 +124,7 @@ export const TOOLS = [
   },
   {
     name: 'get_project_memory',
-    description: 'Read one durable project memory note, including provenance, tags, and incoming and outgoing typed links.',
+    description: 'Read one durable project memory note, including provenance, tags, and incoming and outgoing typed links. Reading records access metadata for future memory upkeep.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -135,9 +135,9 @@ export const TOOLS = [
     },
     annotations: {
       title: 'Read project memory note',
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
       openWorldHint: false,
     },
   },
