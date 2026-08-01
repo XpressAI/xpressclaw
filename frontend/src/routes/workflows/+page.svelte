@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
@@ -39,11 +40,23 @@
 
 	$effect(() => {
 		const requestKey = `${$page.url.pathname}${$page.url.search}`;
-		if ($page.url.searchParams.get('new') === 'schedule' && agentList.length > 0 && handledScheduleCreateRequest !== requestKey) {
-			handledScheduleCreateRequest = requestKey;
-			showScheduleCreate = true;
-			if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
+		if ($page.url.searchParams.get('new') !== 'schedule') {
+			handledScheduleCreateRequest = '';
+			return;
 		}
+		if (agentList.length === 0 || handledScheduleCreateRequest === requestKey) return;
+
+		handledScheduleCreateRequest = requestKey;
+		showScheduleCreate = true;
+		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
+
+		const consumedUrl = new URL($page.url);
+		consumedUrl.searchParams.delete('new');
+		void goto(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, {
+			replaceState: true,
+			keepFocus: true,
+			noScroll: true,
+		});
 	});
 
 	onMount(async () => {

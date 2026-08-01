@@ -1365,6 +1365,24 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
+test('the new-schedule sidebar shortcut remains reusable after cancellation', async ({ page }) => {
+	await mockApi(page);
+	await page.goto('/automations');
+
+	const sidebar = page.locator('aside').first();
+	const shortcut = sidebar.getByTitle('New schedule');
+	await shortcut.click();
+	await expect(page.locator('[data-schedule-form]')).toBeVisible();
+	await expect(page).toHaveURL('/automations#schedules');
+
+	await page.locator('[data-schedule-form]').getByRole('button', { name: 'Cancel' }).click();
+	await expect(page.locator('[data-schedule-form]')).toHaveCount(0);
+
+	await shortcut.click();
+	await expect(page.locator('[data-schedule-form]')).toBeVisible();
+	await expect(page).toHaveURL('/automations#schedules');
+});
+
 test('goal-loop workflow template is bounded and uses the selected agent', async ({ page }) => {
 	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
 	await mockApi(page, { workflowCreateRequests });
