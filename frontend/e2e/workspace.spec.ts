@@ -1384,7 +1384,7 @@ test('the new-schedule sidebar shortcut remains reusable after cancellation and 
 	await expect(reopenedForm).toBeVisible();
 	await expect(page).toHaveURL('/automations?new=schedule#schedules');
 	await reopenedForm.getByLabel('Name').fill('Reusable shortcut');
-	await reopenedForm.getByLabel('Cron').fill('0 9 * * 1');
+	await reopenedForm.getByRole('textbox', { name: 'Cron', exact: true }).fill('0 9 * * 1');
 	await reopenedForm.getByLabel('Task title').fill('Check the queue');
 	await reopenedForm.getByRole('button', { name: 'Create schedule' }).click();
 	await expect(reopenedForm).toHaveCount(0);
