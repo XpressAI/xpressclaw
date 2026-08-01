@@ -254,13 +254,32 @@ async function mockApi(
 			if (url.searchParams.has('parent_task_id')) {
 				response = { tasks: [], counts: { ...counts, completed: 0 } };
 			} else {
+				const searchTerms = (url.searchParams.get('search') ?? '')
+					.toLocaleLowerCase()
+					.split(/\s+/)
+					.filter(Boolean);
+				const searchedTasks = listedTasks.filter((listedTask) => {
+					const text = `${listedTask.title}\n${listedTask.description ?? ''}`.toLocaleLowerCase();
+					return searchTerms.every((term) => text.includes(term));
+				});
 				const includedStatuses = new Set((url.searchParams.get('statuses') ?? '').split(',').filter(Boolean));
 				const excludedStatuses = new Set((url.searchParams.get('exclude_statuses') ?? '').split(',').filter(Boolean));
 				const limit = Number.parseInt(url.searchParams.get('limit') ?? '100', 10);
 				const offset = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
-				const filteredTasks = [...listedTasks]
+				const filteredTasks = [...searchedTasks]
 					.filter((listedTask) => includedStatuses.size === 0 || includedStatuses.has(listedTask.status))
 					.filter((listedTask) => !excludedStatuses.has(listedTask.status));
+				const filteredCounts = searchedTasks.reduce((result, listedTask) => {
+					result[listedTask.status as keyof typeof result] += 1;
+					return result;
+				}, {
+					pending: 0,
+					in_progress: 0,
+					waiting_for_input: 0,
+					blocked: 0,
+					completed: 0,
+					cancelled: 0,
+				});
 				if (url.searchParams.get('sort') === 'recent') {
 					filteredTasks.sort((left, right) =>
 						Date.parse(right.updated_at) - Date.parse(left.updated_at)
@@ -270,7 +289,7 @@ async function mockApi(
 				}
 				response = {
 					tasks: filteredTasks.slice(offset, offset + limit),
-					counts,
+					counts: filteredCounts,
 				};
 			}
 		} else if (path === '/api/tasks/recent-by-agent') {
@@ -1023,6 +1042,30 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 	await expect(taskRows).toHaveCount(5);
 	await expect(page.getByText('Page 3 of 3')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
+});
+
+test('task search filters the full history with server-side counts', async ({ page }) => {
+	await mockApi(page, { completedTaskCount: 45 });
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 45' }).click();
+
+	const searchRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks' && url.searchParams.get('search') === 'COMPLETED 42';
+	});
+	await page.getByRole('searchbox', { name: 'Search tasks' }).fill('COMPLETED 42');
+	const searchUrl = new URL((await searchRequest).url());
+	expect(searchUrl.searchParams.get('statuses')).toBe('completed,cancelled');
+	expect(searchUrl.searchParams.get('sort')).toBe('recent');
+
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(1);
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveAttribute('href', '/tasks/completed-task-42');
+	await expect(page.getByText('1 matching task')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Done 1' })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Clear task search' }).click();
+	await expect(page.getByRole('button', { name: 'Done 45' })).toBeVisible();
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
 });
 
 test('project, task, and workflow lists remain scrollable on mobile', async ({ browser }) => {

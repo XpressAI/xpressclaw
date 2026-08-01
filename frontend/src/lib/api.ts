@@ -306,6 +306,7 @@ export interface TaskListOptions {
 	statuses?: string[];
 	sort?: 'recent';
 	excludeStatuses?: string[];
+	search?: string;
 }
 
 export const tasks = {
@@ -318,6 +319,7 @@ export const tasks = {
 		if (options.statuses?.length) params.set('statuses', options.statuses.join(','));
 		if (options.sort) params.set('sort', options.sort);
 		if (options.excludeStatuses?.length) params.set('exclude_statuses', options.excludeStatuses.join(','));
+		if (options.search) params.set('search', options.search);
 		const qs = params.toString();
 		return request<{ tasks: Task[]; counts: TaskCounts }>(`/api/tasks${qs ? `?${qs}` : ''}`);
 	},
