@@ -5,6 +5,7 @@ use crate::state::AppState;
 
 mod agents;
 mod health;
+mod memory;
 mod open_url;
 mod schedules;
 mod sessions;
@@ -18,6 +19,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/health", get(health::health_check))
         .route("/open-url", post(open_url::open_url))
         .nest("/agents", agents::routes())
+        .nest("/memory", memory::routes())
         .nest("/tasks", tasks::routes())
         .nest("/schedules", schedules::routes())
         .nest("/sessions", sessions::routes())
