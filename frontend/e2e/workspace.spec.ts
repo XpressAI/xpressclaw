@@ -1123,8 +1123,9 @@ test('task search waits for Japanese IME composition to finish', async ({ page }
 		}));
 	});
 	await searchRequest;
-	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(1);
-	await expect(page.getByText('日本語の検索を確認')).toBeVisible();
+	const resultRows = page.locator('[data-task-list] [data-task-row]');
+	await expect(resultRows).toHaveCount(1);
+	await expect(resultRows).toContainText('日本語の検索を確認');
 	expect(searches).toEqual(['検索']);
 });
 
