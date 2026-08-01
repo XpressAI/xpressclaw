@@ -179,6 +179,7 @@ impl Database {
             (26, MIGRATION_V26),
             (27, MIGRATION_V27),
             (28, MIGRATION_V28),
+            (29, MIGRATION_V29),
         ];
 
         for &(target, sql) in migrations {
@@ -881,6 +882,73 @@ CREATE INDEX idx_schedules_continuation_task
     ON schedules(continuation_task_id);
 ";
 
+const MIGRATION_V29: &str = "
+-- Project-scoped, structured knowledge notes exposed to native agents over MCP.
+-- This is intentionally separate from the legacy prompt-hook memory tables:
+-- agents choose when to read and write durable project knowledge.
+CREATE TABLE project_memory_notes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES logical_sessions(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    note_type TEXT NOT NULL DEFAULT 'fact'
+        CHECK (note_type IN ('decision', 'convention', 'procedure', 'fact', 'warning', 'question')),
+    state TEXT NOT NULL DEFAULT 'evergreen'
+        CHECK (state IN ('inbox', 'evergreen', 'archived')),
+    source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL DEFAULT 'agent'
+        CHECK (created_by IN ('user', 'agent', 'upkeep')),
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    search_key TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_project_memory_notes_project_updated
+    ON project_memory_notes(project_id, state, pinned DESC, updated_at DESC);
+CREATE INDEX idx_project_memory_notes_task
+    ON project_memory_notes(source_task_id);
+
+CREATE TABLE project_memory_tags (
+    note_id TEXT NOT NULL REFERENCES project_memory_notes(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    tag_key TEXT NOT NULL,
+    PRIMARY KEY (note_id, tag_key)
+);
+CREATE INDEX idx_project_memory_tags_key
+    ON project_memory_tags(tag_key, note_id);
+
+CREATE TABLE project_memory_links (
+    from_note_id TEXT NOT NULL REFERENCES project_memory_notes(id) ON DELETE CASCADE,
+    to_note_id TEXT NOT NULL REFERENCES project_memory_notes(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL DEFAULT 'related'
+        CHECK (link_type IN ('related', 'supports', 'contradicts', 'supersedes', 'depends_on', 'example_of')),
+    strength REAL NOT NULL DEFAULT 1.0 CHECK (strength >= 0.0 AND strength <= 1.0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (from_note_id, to_note_id, link_type),
+    CHECK (from_note_id <> to_note_id)
+);
+CREATE INDEX idx_project_memory_links_to
+    ON project_memory_links(to_note_id, link_type);
+
+-- Partition-key filtering keeps nearest-neighbour candidates inside a single
+-- project instead of retrieving globally and filtering after the fact.
+CREATE VIRTUAL TABLE project_memory_embeddings USING vec0(
+    note_id text primary key,
+    embedding float[384] distance_metric=cosine,
+    project_id text partition key
+);
+
+CREATE TRIGGER project_memory_notes_delete_embedding
+AFTER DELETE ON project_memory_notes
+BEGIN
+    DELETE FROM project_memory_embeddings WHERE note_id = OLD.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,7 +966,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "28");
+        assert_eq!(version, "29");
     }
 
     #[test]
@@ -928,5 +996,9 @@ mod tests {
         assert!(tables.contains(&"work_attempts".to_string()));
         assert!(tables.contains(&"attempt_artifacts".to_string()));
         assert!(tables.contains(&"task_message_attachments".to_string()));
+        assert!(tables.contains(&"project_memory_notes".to_string()));
+        assert!(tables.contains(&"project_memory_tags".to_string()));
+        assert!(tables.contains(&"project_memory_links".to_string()));
+        assert!(tables.contains(&"project_memory_embeddings".to_string()));
     }
 }
