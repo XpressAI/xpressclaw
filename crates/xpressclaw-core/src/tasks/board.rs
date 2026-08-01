@@ -125,6 +125,14 @@ impl TaskListPage {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TaskListFilter<'a> {
+    statuses: &'a [&'a str],
+    agent_id: Option<&'a str>,
+    excluded_statuses: &'a [&'a str],
+    search: Option<&'a str>,
+}
+
 /// Kanban task board with CRUD operations and status transitions.
 pub struct TaskBoard {
     db: Arc<Database>,
@@ -218,9 +226,12 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses: &[],
+                search: None,
+            },
             TaskListPage::first(limit),
             false,
             TaskListOrder::Scheduler,
@@ -232,13 +243,17 @@ impl TaskBoard {
         &self,
         statuses: &[&str],
         agent_id: Option<&str>,
+        search: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
         self.list_inner(
-            statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses,
+                agent_id,
+                excluded_statuses: &[],
+                search,
+            },
             TaskListPage { limit, offset },
             false,
             TaskListOrder::Scheduler,
@@ -256,9 +271,12 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            excluded_statuses,
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses,
+                search: None,
+            },
             TaskListPage::first(limit),
             false,
             TaskListOrder::Recent,
@@ -271,13 +289,17 @@ impl TaskBoard {
         statuses: &[&str],
         agent_id: Option<&str>,
         excluded_statuses: &[&str],
+        search: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Task>> {
         self.list_inner(
-            statuses,
-            agent_id,
-            excluded_statuses,
+            TaskListFilter {
+                statuses,
+                agent_id,
+                excluded_statuses,
+                search,
+            },
             TaskListPage { limit, offset },
             false,
             TaskListOrder::Recent,
@@ -321,9 +343,12 @@ impl TaskBoard {
     ) -> Result<Vec<Task>> {
         let statuses = status.into_iter().collect::<Vec<_>>();
         self.list_inner(
-            &statuses,
-            agent_id,
-            &[],
+            TaskListFilter {
+                statuses: &statuses,
+                agent_id,
+                excluded_statuses: &[],
+                search: None,
+            },
             TaskListPage::first(limit),
             true,
             TaskListOrder::Scheduler,
@@ -332,9 +357,7 @@ impl TaskBoard {
 
     fn list_inner(
         &self,
-        statuses: &[&str],
-        agent_id: Option<&str>,
-        excluded_statuses: &[&str],
+        filter: TaskListFilter<'_>,
         page: TaskListPage,
         include_hidden: bool,
         order: TaskListOrder,
@@ -350,9 +373,9 @@ impl TaskBoard {
         // Subtasks belong inside their parent, not the top-level list.
         sql.push_str(" AND parent_task_id IS NULL");
 
-        if !statuses.is_empty() {
+        if !filter.statuses.is_empty() {
             sql.push_str(" AND status IN (");
-            for (index, status) in statuses.iter().enumerate() {
+            for (index, status) in filter.statuses.iter().enumerate() {
                 if index > 0 {
                     sql.push_str(", ");
                 }
@@ -361,14 +384,15 @@ impl TaskBoard {
             }
             sql.push(')');
         }
-        if let Some(a) = agent_id {
+        if let Some(a) = filter.agent_id {
             sql.push_str(" AND agent_id = ?");
             params.push(Box::new(a.to_string()));
         }
-        for excluded_status in excluded_statuses {
+        for excluded_status in filter.excluded_statuses {
             sql.push_str(" AND status != ?");
             params.push(Box::new((*excluded_status).to_string()));
         }
+        append_task_search(&mut sql, &mut params, filter.search);
 
         match order {
             TaskListOrder::Scheduler => {
@@ -667,13 +691,24 @@ impl TaskBoard {
     }
 
     pub fn counts(&self) -> Result<TaskCounts> {
+        self.counts_for_search(None)
+    }
+
+    /// Count top-level tasks by status, optionally restricted to tasks whose
+    /// visible task text or conversation contains every search term.
+    pub fn counts_for_search(&self, search: Option<&str>) -> Result<TaskCounts> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT status, COUNT(*) as count FROM tasks
-             WHERE hidden = 0 AND parent_task_id IS NULL GROUP BY status",
-        )?;
+        let mut sql = "SELECT status, COUNT(*) as count FROM tasks
+             WHERE hidden = 0 AND parent_task_id IS NULL"
+            .to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        append_task_search(&mut sql, &mut params, search);
+        sql.push_str(" GROUP BY status");
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?
             .filter_map(|r| r.ok())
@@ -849,6 +884,43 @@ impl TaskBoard {
         }
 
         Ok(created)
+    }
+}
+
+fn append_task_search(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    search: Option<&str>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let terms = search
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .map(crate::db::task_search_key)
+        .filter(|term| !term.is_empty())
+        .filter(|term| seen.insert(term.clone()));
+
+    for term in terms {
+        sql.push_str(
+            " AND (
+                instr(xpressclaw_task_search_key(tasks.title), ?) > 0
+                OR instr(xpressclaw_task_search_key(COALESCE(tasks.description, '')), ?) > 0
+                OR EXISTS (
+                    SELECT 1 FROM task_messages
+                    WHERE task_messages.task_id = tasks.id
+                      AND instr(xpressclaw_task_search_key(task_messages.content), ?) > 0
+                )
+                OR EXISTS (
+                    SELECT 1 FROM session_events
+                    WHERE session_events.task_id = tasks.id
+                      AND session_events.event_type IN ('runner_progress', 'agent_thought')
+                      AND instr(xpressclaw_task_search_key(session_events.summary), ?) > 0
+                )
+            )",
+        );
+        for _ in 0..4 {
+            params.push(Box::new(term.clone()));
+        }
     }
 }
 
@@ -1111,6 +1183,120 @@ mod tests {
 
         let counts = board.counts().unwrap();
         assert_eq!(counts.pending, 2);
+    }
+
+    #[test]
+    fn task_search_matches_all_terms_across_task_conversations() {
+        let (db, board) = setup();
+        let described = board
+            .create(&CreateTask {
+                title: "Review connection handling".to_string(),
+                description: Some("Preserve the mobile draft during reconnects".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let discussed = board
+            .create(&CreateTask {
+                title: "Investigate the integration".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        crate::tasks::conversation::TaskConversation::new(db.clone())
+            .add_message(
+                &discussed.id,
+                "user",
+                "The JIRA connector cannot authenticate",
+            )
+            .unwrap();
+        let sessions = crate::sessions::SessionManager::new(db.clone());
+        sessions
+            .ensure("search-session", Some("Search test"))
+            .unwrap();
+        sessions
+            .append_event(
+                "search-session",
+                crate::sessions::NewEvent {
+                    attempt_id: None,
+                    task_id: Some(&discussed.id),
+                    source_type: "acp",
+                    source_id: Some("codex"),
+                    event_type: "runner_progress",
+                    summary: "Checking the OAuth callback",
+                    payload: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "JIRA callback subtask".to_string(),
+                parent_task_id: Some(parent.id),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create_idle_task("developer", "JIRA callback maintenance")
+            .unwrap();
+
+        let description_matches = board
+            .list_page(&[], None, Some("MOBILE draft"), 100, 0)
+            .unwrap();
+        assert_eq!(description_matches.len(), 1);
+        assert_eq!(description_matches[0].id, described.id);
+
+        let conversation_matches = board
+            .list_recent_page(&[], None, &[], Some("jira CALLBACK"), 100, 0)
+            .unwrap();
+        assert_eq!(conversation_matches.len(), 1);
+        assert_eq!(conversation_matches[0].id, discussed.id);
+
+        let counts = board.counts_for_search(Some("jira callback")).unwrap();
+        assert_eq!(counts.pending, 1);
+    }
+
+    #[test]
+    fn task_search_normalizes_unicode_and_keeps_every_term() {
+        let (_, board) = setup();
+        let international = board
+            .create(&CreateTask {
+                title: "CAFÉ と ﾌﾟﾛｼﾞｪｸﾄ".to_string(),
+                description: Some("Straße か\u{3099}く".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let unicode_matches = board
+            .list_page(&[], None, Some("café プロジェクト STRASSE がく"), 100, 0)
+            .unwrap();
+        assert_eq!(unicode_matches.len(), 1);
+        assert_eq!(unicode_matches[0].id, international.id);
+
+        let terms = (1..=21).map(|index| format!("語{index}"));
+        let all_terms = terms.clone().collect::<Vec<_>>().join(" ");
+        let complete = board
+            .create(&CreateTask {
+                title: all_terms.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: terms.take(20).collect::<Vec<_>>().join(" "),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let every_term_matches = board
+            .list_page(&[], None, Some(&all_terms), 100, 0)
+            .unwrap();
+        assert_eq!(every_term_matches.len(), 1);
+        assert_eq!(every_term_matches[0].id, complete.id);
     }
 
     #[test]

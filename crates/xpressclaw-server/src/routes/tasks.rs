@@ -29,6 +29,7 @@ pub struct ListParams {
     #[serde(default)]
     pub sort: TaskListSort,
     pub exclude_statuses: Option<String>,
+    pub search: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
@@ -115,6 +116,17 @@ async fn list_tasks(
     let board = TaskBoard::new(state.db.clone());
     let limit = params.limit.unwrap_or(100).clamp(1, 100);
     let offset = params.offset.unwrap_or(0).max(0);
+    let search = params
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty());
+    if search.is_some_and(|search| search.chars().count() > 200) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "task search must be 200 characters or fewer" })),
+        ));
+    }
 
     let tasks = if let Some(ref parent_id) = params.parent_task_id {
         board.list_subtasks(parent_id).map_err(internal_error)?
@@ -129,6 +141,7 @@ async fn list_tasks(
                 .list_page(
                     &included_statuses,
                     params.agent_id.as_deref(),
+                    search,
                     limit,
                     offset,
                 )
@@ -140,6 +153,7 @@ async fn list_tasks(
                         &included_statuses,
                         params.agent_id.as_deref(),
                         &excluded_statuses,
+                        search,
                         limit,
                         offset,
                     )
@@ -148,7 +162,12 @@ async fn list_tasks(
         }
     };
 
-    let counts = board.counts().map_err(internal_error)?;
+    let counts = if params.parent_task_id.is_some() {
+        board.counts()
+    } else {
+        board.counts_for_search(search)
+    }
+    .map_err(internal_error)?;
 
     Ok(Json(json!({
         "tasks": enrich_tasks(&board, &tasks),
@@ -1003,6 +1022,59 @@ mod tests {
         assert_eq!(task_ids, vec![cancelled.id, completed_last.id]);
         assert_eq!(body["counts"]["completed"], 2);
         assert_eq!(body["counts"]["cancelled"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_tasks_searches_task_text_and_conversation_history() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db.clone());
+        let conversation_match = board
+            .create(&CreateTask {
+                title: "Investigate the browser".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        TaskConversation::new(db.clone())
+            .add_message(
+                &conversation_match.id,
+                "user",
+                "The MOBILE connection erased my draft",
+            )
+            .unwrap();
+        let completed_match = board
+            .create(&CreateTask {
+                title: "Reconnect safely".to_string(),
+                description: Some("Keep the mobile draft intact".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .update_status(&completed_match.id, "completed", None)
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: "Unrelated task".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tasks?search=mobile%20DRAFT&statuses=completed&sort=recent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        let tasks = body["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], completed_match.id);
+        assert_eq!(body["counts"]["pending"], 1);
+        assert_eq!(body["counts"]["completed"], 1);
     }
 
     #[tokio::test]

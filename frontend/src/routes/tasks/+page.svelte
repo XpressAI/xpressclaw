@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
 	import { agents, tasks } from '$lib/api';
 	import type { Agent, Task, TaskCounts } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
@@ -28,6 +28,10 @@
 	let newDependsOn = $state<string[]>([]);
 	let newSession = $state(false);
 	let filter = $state<'attention' | 'active' | 'all' | 'done'>('active');
+	let searchText = $state('');
+	let searchQuery = $state('');
+	let searchComposing = $state(false);
+	let searchTimer: ReturnType<typeof setTimeout> | undefined;
 	let formError = $state('');
 	let creating = $state(false);
 
@@ -37,6 +41,7 @@
 	onMount(async () => {
 		await Promise.all([load(), loadAgents(), loadDependencies()]);
 	});
+	onDestroy(() => clearTimeout(searchTimer));
 
 	async function loadAgents() {
 		agentList = await agents.list().catch(() => []);
@@ -59,6 +64,8 @@
 				limit: PAGE_SIZE,
 				offset: page * PAGE_SIZE,
 				statuses: [...FILTER_STATUSES[filter]],
+				sort: searchQuery ? 'recent' : undefined,
+				search: searchQuery || undefined,
 			});
 			if (request !== loadRequest) return;
 			counts = result.counts;
@@ -105,6 +112,61 @@
 		taskList = [];
 		await load();
 		scrollContainer?.scrollTo({ top: 0 });
+	}
+
+	function handleSearchInput(event: Event) {
+		searchText = (event.currentTarget as HTMLInputElement).value;
+		if (searchComposing || (event as InputEvent).isComposing) return;
+		scheduleSearch();
+	}
+
+	function scheduleSearch() {
+		clearTimeout(searchTimer);
+		searchTimer = setTimeout(applySearch, 250);
+	}
+
+	function handleSearchKeydown(event: KeyboardEvent) {
+		if (event.key !== 'Enter' || event.isComposing || searchComposing || event.keyCode === 229) return;
+		event.preventDefault();
+		clearTimeout(searchTimer);
+		applySearch();
+	}
+
+	function handleSearchCompositionStart() {
+		searchComposing = true;
+		clearTimeout(searchTimer);
+	}
+
+	function handleSearchCompositionEnd(event: CompositionEvent) {
+		const input = event.currentTarget as HTMLInputElement;
+		clearTimeout(searchTimer);
+		// Some browsers end composition before dispatching the final input event.
+		// Deferring one tick reads the committed value and also keeps the Enter
+		// used to accept an IME candidate from submitting the search.
+		searchTimer = setTimeout(() => {
+			searchComposing = false;
+			searchText = input.value;
+			scheduleSearch();
+		}, 0);
+	}
+
+	function applySearch() {
+		const nextSearch = searchText.trim();
+		if (nextSearch === searchQuery && page === 0) return;
+		searchQuery = nextSearch;
+		page = 0;
+		taskList = [];
+		void load().then(() => scrollContainer?.scrollTo({ top: 0 }));
+	}
+
+	function clearSearch() {
+		clearTimeout(searchTimer);
+		searchComposing = false;
+		searchText = '';
+		searchQuery = '';
+		page = 0;
+		taskList = [];
+		void load().then(() => scrollContainer?.scrollTo({ top: 0 }));
 	}
 
 	/** Existing incomplete tasks that can be selected as dependencies. */
@@ -188,7 +250,11 @@
 	<div class="flex items-center justify-between gap-3">
 		<div>
 			<h1 class="text-2xl font-bold">Tasks</h1>
-			{#if counts}
+			{#if counts && searchQuery}
+				<p class="text-sm text-muted-foreground mt-1">
+					{countForFilter('all', counts)} matching {countForFilter('all', counts) === 1 ? 'task' : 'tasks'}
+				</p>
+			{:else if counts}
 				<p class="text-sm text-muted-foreground mt-1">
 					{statusCount('pending')} pending, {statusCount('in_progress')} in progress, {statusCount('completed')} completed
 				</p>
@@ -296,6 +362,33 @@
 		</div>
 	{/if}
 
+	<div class="relative">
+		<svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+			<circle cx="11" cy="11" r="7" />
+			<path d="m20 20-3.5-3.5" />
+		</svg>
+		<input
+			type="search"
+			value={searchText}
+			oninput={handleSearchInput}
+			onkeydown={handleSearchKeydown}
+			oncompositionstart={handleSearchCompositionStart}
+			oncompositionend={handleSearchCompositionEnd}
+			maxlength="200"
+			aria-label="Search tasks"
+			placeholder="Search task titles, descriptions, and conversations…"
+			class="w-full rounded-lg border border-input bg-background py-2.5 pl-9 pr-10 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+		/>
+		{#if searchText}
+			<button
+				type="button"
+				onclick={clearSearch}
+				aria-label="Clear task search"
+				class="absolute right-2 top-1/2 -translate-y-1/2 rounded-md px-2 py-1 text-lg leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
+			>×</button>
+		{/if}
+	</div>
+
 	<div class="flex gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1">
 		{#each [
 			{ id: 'attention', label: 'Needs you', count: statusCount('waiting_for_input') + statusCount('blocked') },
@@ -335,7 +428,9 @@
 					</div>
 				</a>
 			{:else}
-				<div class="px-4 py-16 text-center text-sm text-muted-foreground">No tasks in this view.</div>
+				<div class="px-4 py-16 text-center text-sm text-muted-foreground">
+					{searchQuery ? `No tasks match “${searchQuery}”.` : 'No tasks in this view.'}
+				</div>
 			{/each}
 		{/if}
 	</div>
