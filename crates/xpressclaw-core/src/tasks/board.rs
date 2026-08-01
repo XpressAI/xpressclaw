@@ -896,29 +896,30 @@ fn append_task_search(
     let terms = search
         .into_iter()
         .flat_map(str::split_whitespace)
-        .filter(|term| seen.insert(term.to_lowercase()))
-        .take(20);
+        .map(crate::db::task_search_key)
+        .filter(|term| !term.is_empty())
+        .filter(|term| seen.insert(term.clone()));
 
     for term in terms {
         sql.push_str(
             " AND (
-                instr(lower(tasks.title), lower(?)) > 0
-                OR instr(lower(COALESCE(tasks.description, '')), lower(?)) > 0
+                instr(xpressclaw_task_search_key(tasks.title), ?) > 0
+                OR instr(xpressclaw_task_search_key(COALESCE(tasks.description, '')), ?) > 0
                 OR EXISTS (
                     SELECT 1 FROM task_messages
                     WHERE task_messages.task_id = tasks.id
-                      AND instr(lower(task_messages.content), lower(?)) > 0
+                      AND instr(xpressclaw_task_search_key(task_messages.content), ?) > 0
                 )
                 OR EXISTS (
                     SELECT 1 FROM session_events
                     WHERE session_events.task_id = tasks.id
                       AND session_events.event_type IN ('runner_progress', 'agent_thought')
-                      AND instr(lower(session_events.summary), lower(?)) > 0
+                      AND instr(xpressclaw_task_search_key(session_events.summary), ?) > 0
                 )
             )",
         );
         for _ in 0..4 {
-            params.push(Box::new(term.to_string()));
+            params.push(Box::new(term.clone()));
         }
     }
 }
@@ -1257,6 +1258,51 @@ mod tests {
 
         let counts = board.counts_for_search(Some("jira callback")).unwrap();
         assert_eq!(counts.pending, 1);
+    }
+
+    #[test]
+    fn task_search_normalizes_unicode_and_keeps_every_term() {
+        let (_, board) = setup();
+        let international = board
+            .create(&CreateTask {
+                title: "CAFÉ と ﾌﾟﾛｼﾞｪｸﾄ".to_string(),
+                description: Some("Straße か\u{3099}く".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let unicode_matches = board
+            .list_page(
+                &[],
+                None,
+                Some("café プロジェクト STRASSE がく"),
+                100,
+                0,
+            )
+            .unwrap();
+        assert_eq!(unicode_matches.len(), 1);
+        assert_eq!(unicode_matches[0].id, international.id);
+
+        let terms = (1..=21).map(|index| format!("語{index}"));
+        let all_terms = terms.clone().collect::<Vec<_>>().join(" ");
+        let complete = board
+            .create(&CreateTask {
+                title: all_terms.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .create(&CreateTask {
+                title: terms.take(20).collect::<Vec<_>>().join(" "),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let every_term_matches = board
+            .list_page(&[], None, Some(&all_terms), 100, 0)
+            .unwrap();
+        assert_eq!(every_term_matches.len(), 1);
+        assert_eq!(every_term_matches[0].id, complete.id);
     }
 
     #[test]

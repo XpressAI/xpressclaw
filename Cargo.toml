@@ -29,9 +29,11 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

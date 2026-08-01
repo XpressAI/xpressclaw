@@ -77,6 +77,8 @@ async function mockApi(
 		queuedSessionMessages?: { agentId: string; payload: Record<string, unknown> }[];
 		projectTaskUpdates?: number[];
 		completedTaskCount?: number;
+		taskTitle?: string;
+		taskDescription?: string;
 		mcpServers?: {
 			name: string;
 			type: 'stdio' | 'http' | 'sse';
@@ -111,8 +113,8 @@ async function mockApi(
 	const attemptStatus = options.live ? 'running' : 'completed';
 	const task = {
 		id: taskId,
-		title: 'Browser-tested workspace',
-		description: 'Inspect the project and report what you find.',
+		title: options.taskTitle ?? 'Browser-tested workspace',
+		description: options.taskDescription ?? 'Inspect the project and report what you find.',
 		status,
 		priority: 0,
 		agent_id: agentId,
@@ -1066,6 +1068,64 @@ test('task search filters the full history with server-side counts', async ({ pa
 	await page.getByRole('button', { name: 'Clear task search' }).click();
 	await expect(page.getByRole('button', { name: 'Done 45' })).toBeVisible();
 	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
+});
+
+test('task search waits for Japanese IME composition to finish', async ({ page }) => {
+	await mockApi(page, {
+		taskTitle: '日本語の検索を確認',
+		taskDescription: '入力メソッドで見つけるタスク',
+	});
+	const searches: string[] = [];
+	page.on('request', (request) => {
+		const url = new URL(request.url());
+		if (url.pathname === '/api/tasks' && url.searchParams.has('search')) {
+			searches.push(url.searchParams.get('search') ?? '');
+		}
+	});
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 1' }).click();
+	const search = page.getByRole('searchbox', { name: 'Search tasks' });
+
+	await search.dispatchEvent('compositionstart', { data: '' });
+	await search.evaluate((element) => {
+		const input = element as HTMLInputElement;
+		input.value = 'けんさく';
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: 'けんさく',
+			inputType: 'insertCompositionText',
+			isComposing: true,
+		}));
+	});
+	await search.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, isComposing: true });
+	await page.waitForTimeout(350);
+	expect(searches).toEqual([]);
+
+	const searchRequest = page.waitForRequest((request) => {
+		const url = new URL(request.url());
+		return url.pathname === '/api/tasks' && url.searchParams.get('search') === '検索';
+	});
+	await search.evaluate((element) => {
+		const input = element as HTMLInputElement;
+		input.value = '検索';
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: '検索',
+			inputType: 'insertCompositionText',
+			isComposing: true,
+		}));
+		input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '検索' }));
+		input.dispatchEvent(new InputEvent('input', {
+			bubbles: true,
+			data: '検索',
+			inputType: 'insertText',
+			isComposing: false,
+		}));
+	});
+	await searchRequest;
+	await expect(page.locator('[data-task-list] [data-task-row]')).toHaveCount(1);
+	await expect(page.getByText('日本語の検索を確認')).toBeVisible();
+	expect(searches).toEqual(['検索']);
 });
 
 test('project, task, and workflow lists remain scrollable on mobile', async ({ browser }) => {

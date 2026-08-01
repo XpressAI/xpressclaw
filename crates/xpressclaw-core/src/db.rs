@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex, Once};
 
 use rusqlite::Connection;
 use tracing::info;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, Result};
 
@@ -20,6 +22,32 @@ fn ensure_sqlite_vec() {
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
+}
+
+/// Build the normalized, case-insensitive representation used by task search.
+///
+/// NFKC makes canonically equivalent and compatibility forms compare the same,
+/// including composed kana and full-/half-width Japanese text. Full Unicode
+/// case folding handles non-ASCII case mappings such as `É` and `ß`.
+pub(crate) fn task_search_key(text: &str) -> String {
+    text.nfkc().case_fold().nfkc().collect()
+}
+
+fn register_sql_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+
+    conn.create_scalar_function(
+        "xpressclaw_task_search_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            let text = context.get::<String>(0)?;
+            Ok(task_search_key(&text))
+        },
+    )?;
+    Ok(())
 }
 
 /// Database manager for xpressclaw.
@@ -51,6 +79,7 @@ impl Database {
              PRAGMA cache_size = -64000;
              PRAGMA temp_store = MEMORY;",
         )?;
+        register_sql_functions(&conn)?;
 
         let db = Self {
             path: path.to_path_buf(),
@@ -67,6 +96,7 @@ impl Database {
 
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        register_sql_functions(&conn)?;
 
         let db = Self {
             path: PathBuf::from(":memory:"),

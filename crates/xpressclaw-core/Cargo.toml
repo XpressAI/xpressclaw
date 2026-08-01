@@ -12,6 +12,8 @@ reqwest = { workspace = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
+unicode-casefold = { workspace = true }
+unicode-normalization = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

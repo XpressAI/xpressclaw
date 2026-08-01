@@ -30,6 +30,7 @@
 	let filter = $state<'attention' | 'active' | 'all' | 'done'>('active');
 	let searchText = $state('');
 	let searchQuery = $state('');
+	let searchComposing = $state(false);
 	let searchTimer: ReturnType<typeof setTimeout> | undefined;
 	let formError = $state('');
 	let creating = $state(false);
@@ -115,15 +116,38 @@
 
 	function handleSearchInput(event: Event) {
 		searchText = (event.currentTarget as HTMLInputElement).value;
+		if (searchComposing || (event as InputEvent).isComposing) return;
+		scheduleSearch();
+	}
+
+	function scheduleSearch() {
 		clearTimeout(searchTimer);
 		searchTimer = setTimeout(applySearch, 250);
 	}
 
 	function handleSearchKeydown(event: KeyboardEvent) {
-		if (event.key !== 'Enter') return;
+		if (event.key !== 'Enter' || event.isComposing || searchComposing || event.keyCode === 229) return;
 		event.preventDefault();
 		clearTimeout(searchTimer);
 		applySearch();
+	}
+
+	function handleSearchCompositionStart() {
+		searchComposing = true;
+		clearTimeout(searchTimer);
+	}
+
+	function handleSearchCompositionEnd(event: CompositionEvent) {
+		const input = event.currentTarget as HTMLInputElement;
+		clearTimeout(searchTimer);
+		// Some browsers end composition before dispatching the final input event.
+		// Deferring one tick reads the committed value and also keeps the Enter
+		// used to accept an IME candidate from submitting the search.
+		searchTimer = setTimeout(() => {
+			searchComposing = false;
+			searchText = input.value;
+			scheduleSearch();
+		}, 0);
 	}
 
 	function applySearch() {
@@ -137,6 +161,7 @@
 
 	function clearSearch() {
 		clearTimeout(searchTimer);
+		searchComposing = false;
 		searchText = '';
 		searchQuery = '';
 		page = 0;
@@ -347,6 +372,8 @@
 			value={searchText}
 			oninput={handleSearchInput}
 			onkeydown={handleSearchKeydown}
+			oncompositionstart={handleSearchCompositionStart}
+			oncompositionend={handleSearchCompositionEnd}
 			maxlength="200"
 			aria-label="Search tasks"
 			placeholder="Search task titles, descriptions, and conversations…"
