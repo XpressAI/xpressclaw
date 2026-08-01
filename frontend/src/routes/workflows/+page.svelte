@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { afterNavigate, goto } from '$app/navigation';
+	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
@@ -24,7 +24,7 @@
 	});
 	let scheduleFormError = $state('');
 	let creatingSchedule = $state(false);
-	let scheduleCreateRequested = $state(false);
+	let handledScheduleCreateRequest = '';
 
 	let sortedWorkflows = $derived([...workflowList].sort((left, right) =>
 		Date.parse(right.updated_at) - Date.parse(left.updated_at)
@@ -38,25 +38,15 @@
 	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled).length);
 	let activeScheduleCount = $derived(scheduleList.filter((schedule) => scheduleEnabled(schedule)).length);
 
-	afterNavigate(() => {
-		if ($page.url.searchParams.get('new') !== 'schedule') return;
-
-		scheduleCreateRequested = true;
-		const consumedUrl = new URL($page.url);
-		consumedUrl.searchParams.delete('new');
-		const target = `${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`;
-		queueMicrotask(() => {
-			void goto(target, {
-				replaceState: true,
-				keepFocus: true,
-				noScroll: true,
-			});
-		});
-	});
-
 	$effect(() => {
-		if (!scheduleCreateRequested || agentList.length === 0) return;
-		scheduleCreateRequested = false;
+		const requestKey = `${$page.url.pathname}${$page.url.search}`;
+		if ($page.url.searchParams.get('new') !== 'schedule') {
+			handledScheduleCreateRequest = '';
+			return;
+		}
+		if (agentList.length === 0 || handledScheduleCreateRequest === requestKey) return;
+
+		handledScheduleCreateRequest = requestKey;
 		showScheduleCreate = true;
 		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
 	});
@@ -116,9 +106,26 @@
 
 	function openScheduleCreate() {
 		if (agentList.length === 0) return;
+		if (showScheduleCreate) {
+			void closeScheduleCreate();
+			return;
+		}
 		scheduleFormError = '';
 		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
-		showScheduleCreate = !showScheduleCreate;
+		showScheduleCreate = true;
+	}
+
+	async function closeScheduleCreate() {
+		showScheduleCreate = false;
+		if ($page.url.searchParams.get('new') !== 'schedule') return;
+
+		const consumedUrl = new URL($page.url);
+		consumedUrl.searchParams.delete('new');
+		await goto(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, {
+			replaceState: true,
+			keepFocus: true,
+			noScroll: true,
+		});
 	}
 
 	async function createSchedule() {
@@ -147,7 +154,7 @@
 				title: '',
 				description: '',
 			};
-			showScheduleCreate = false;
+			await closeScheduleCreate();
 			await loadAutomations();
 		} catch (error) {
 			scheduleFormError = error instanceof Error ? error.message : String(error);
@@ -291,7 +298,7 @@
 					<label class="block space-y-1"><span class="text-xs text-muted-foreground">Description <span class="text-muted-foreground/70">(optional)</span></span><textarea bind:value={scheduleForm.description} rows="2" class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"></textarea></label>
 					<p class="text-[11px] text-muted-foreground">{scheduleForm.schedule_type === 'once' ? 'One-off follow-ups resume the agent conversation once, even after a restart.' : "Cron uses the server's local time. Example: 0 9 * * 1 runs every Monday at 09:00."}</p>
 					{#if scheduleFormError}<p class="text-xs text-destructive">{scheduleFormError}</p>{/if}
-					<div class="flex flex-wrap gap-2"><button type="submit" disabled={!scheduleForm.name.trim() || !(scheduleForm.schedule_type === 'once' ? scheduleForm.run_at : scheduleForm.cron.trim()) || !scheduleForm.agent_id || !scheduleForm.title.trim() || creatingSchedule} class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{creatingSchedule ? 'Creating…' : 'Create schedule'}</button><button type="button" onclick={() => (showScheduleCreate = false)} class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">Cancel</button></div>
+					<div class="flex flex-wrap gap-2"><button type="submit" disabled={!scheduleForm.name.trim() || !(scheduleForm.schedule_type === 'once' ? scheduleForm.run_at : scheduleForm.cron.trim()) || !scheduleForm.agent_id || !scheduleForm.title.trim() || creatingSchedule} class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{creatingSchedule ? 'Creating…' : 'Create schedule'}</button><button type="button" onclick={() => void closeScheduleCreate()} class="rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-accent">Cancel</button></div>
 				</form>
 			{/if}
 

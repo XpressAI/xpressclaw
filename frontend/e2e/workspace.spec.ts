@@ -1365,7 +1365,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('the new-schedule sidebar shortcut remains reusable after cancellation', async ({ page }) => {
+test('the new-schedule sidebar shortcut remains reusable after cancellation and creation', async ({ page }) => {
 	await mockApi(page);
 	await page.goto('/automations');
 
@@ -1373,13 +1373,21 @@ test('the new-schedule sidebar shortcut remains reusable after cancellation', as
 	const shortcut = sidebar.getByTitle('New schedule');
 	await shortcut.click();
 	await expect(page.locator('[data-schedule-form]')).toBeVisible();
-	await expect(page).toHaveURL('/automations#schedules');
+	await expect(page).toHaveURL('/automations?new=schedule#schedules');
 
 	await page.locator('[data-schedule-form]').getByRole('button', { name: 'Cancel' }).click();
 	await expect(page.locator('[data-schedule-form]')).toHaveCount(0);
+	await expect(page).toHaveURL('/automations#schedules');
 
 	await shortcut.click();
-	await expect(page.locator('[data-schedule-form]')).toBeVisible();
+	const reopenedForm = page.locator('[data-schedule-form]');
+	await expect(reopenedForm).toBeVisible();
+	await expect(page).toHaveURL('/automations?new=schedule#schedules');
+	await reopenedForm.getByLabel('Name').fill('Reusable shortcut');
+	await reopenedForm.getByLabel('Cron').fill('0 9 * * 1');
+	await reopenedForm.getByLabel('Task title').fill('Check the queue');
+	await reopenedForm.getByRole('button', { name: 'Create schedule' }).click();
+	await expect(reopenedForm).toHaveCount(0);
 	await expect(page).toHaveURL('/automations#schedules');
 });
 
