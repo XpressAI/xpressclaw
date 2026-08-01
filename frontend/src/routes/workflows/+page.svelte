@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { replaceState } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
@@ -24,7 +24,7 @@
 	});
 	let scheduleFormError = $state('');
 	let creatingSchedule = $state(false);
-	let handledScheduleCreateRequest = '';
+	let scheduleCreateRequested = $state(false);
 
 	let sortedWorkflows = $derived([...workflowList].sort((left, right) =>
 		Date.parse(right.updated_at) - Date.parse(left.updated_at)
@@ -38,21 +38,24 @@
 	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled).length);
 	let activeScheduleCount = $derived(scheduleList.filter((schedule) => scheduleEnabled(schedule)).length);
 
-	$effect(() => {
-		const requestKey = `${$page.url.pathname}${$page.url.search}`;
-		if ($page.url.searchParams.get('new') !== 'schedule') {
-			handledScheduleCreateRequest = '';
-			return;
-		}
-		if (agentList.length === 0 || handledScheduleCreateRequest === requestKey) return;
+	afterNavigate(() => {
+		if ($page.url.searchParams.get('new') !== 'schedule') return;
 
-		handledScheduleCreateRequest = requestKey;
-		showScheduleCreate = true;
-		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
-
+		scheduleCreateRequested = true;
 		const consumedUrl = new URL($page.url);
 		consumedUrl.searchParams.delete('new');
-		replaceState(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, $page.state);
+		void goto(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, {
+			replaceState: true,
+			keepFocus: true,
+			noScroll: true,
+		});
+	});
+
+	$effect(() => {
+		if (!scheduleCreateRequested || agentList.length === 0) return;
+		scheduleCreateRequested = false;
+		showScheduleCreate = true;
+		if (!scheduleForm.agent_id) scheduleForm.agent_id = agentList[0].id;
 	});
 
 	onMount(async () => {
