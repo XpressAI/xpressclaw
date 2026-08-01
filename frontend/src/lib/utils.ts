@@ -35,13 +35,84 @@ export async function openExternal(url: string): Promise<void> {
 	}
 }
 
-/** Compact product mark for an ACP-backed project. */
+/** Compact product mark for an ACP-backed agent. */
 export function harnessMark(backend: string): string {
 	const normalized = backend.toLowerCase();
 	if (normalized.includes('claude')) return 'A';
 	if (normalized.includes('opencode')) return 'O';
 	if (normalized.includes('codex')) return 'C';
+	if (normalized.includes('copilot')) return 'GH';
+	if (normalized.includes('cursor')) return 'CU';
+	if (normalized.includes('cline')) return 'CL';
+	if (normalized.includes('glm')) return 'G';
+	if (normalized.includes('grok')) return 'X';
+	if (normalized.includes('junie')) return 'J';
+	if (normalized.includes('kilo')) return 'KI';
+	if (normalized.includes('kimi')) return 'K';
+	if (normalized.includes('mistral')) return 'M';
+	if (normalized.includes('qwen')) return 'Q';
+	if (normalized === 'pi' || normalized.includes('pi-acp')) return 'π';
+	if (normalized.includes('custom')) return '+';
 	return 'R';
+}
+
+/** User-facing product name for an ACP harness identifier. */
+export function harnessName(backend: string): string {
+	const normalized = backend.trim().toLowerCase();
+	const names: Record<string, string> = {
+		claude: 'Claude Agent',
+		'claude-code': 'Claude Agent',
+		'claude-sdk': 'Claude Agent',
+		codex: 'Codex',
+		'github-copilot': 'GitHub Copilot',
+		junie: 'Junie',
+		kimi: 'Kimi CLI',
+		opencode: 'OpenCode',
+		pi: 'pi ACP',
+		qwen: 'Qwen Code',
+		cursor: 'Cursor',
+		cline: 'Cline',
+		glm: 'GLM Agent',
+		grok: 'Grok Build',
+		kilo: 'Kilo Code',
+		'mistral-vibe': 'Mistral Vibe',
+		custom: 'Custom ACP',
+	};
+	if (names[normalized]) return names[normalized];
+	return normalized
+		.split(/[-_\s]+/)
+		.filter(Boolean)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(' ') || 'ACP harness';
+}
+
+/** Compact folder label for an agent workspace. */
+export function workspaceFolder(workspace: string | null | undefined): string {
+	const normalized = workspace?.trim().replace(/[\\/]+$/, '') ?? '';
+	if (!normalized) return 'No folder yet';
+	return normalized.split(/[\\/]/).filter(Boolean).pop() ?? normalized;
+}
+
+interface AgentRuntimeSummaryInput {
+	backend: string;
+	config?: {
+		runner?: {
+			kind?: string | null;
+			workspace?: string | null;
+		};
+	};
+}
+
+/** Harness and folder metadata shown beneath a durable agent name. */
+export function agentRuntimeSummary(agent: AgentRuntimeSummaryInput): string {
+	const runner = agent.config?.runner;
+	return `${harnessName(runner?.kind || agent.backend)} · ${workspaceFolder(runner?.workspace)}`;
+}
+
+/** Expanded runtime metadata for hover text. */
+export function agentRuntimeTitle(agent: AgentRuntimeSummaryInput): string {
+	const runner = agent.config?.runner;
+	return `${harnessName(runner?.kind || agent.backend)} · ${runner?.workspace?.trim() || 'No workspace folder yet'}`;
 }
 
 /** Get cached user profile (loaded from server, cached in memory). */

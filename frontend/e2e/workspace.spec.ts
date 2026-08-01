@@ -105,10 +105,27 @@ async function mockApi(
 			created_at: string;
 			updated_at: string;
 		}[];
+		schedules?: {
+			id: string;
+			name: string;
+			cron: string;
+			agent_id: string;
+			title: string;
+			description: string | null;
+			enabled: boolean;
+			last_run: string | null;
+			run_count: number;
+			created_at: string;
+			schedule_type: 'cron' | 'once';
+			run_at: string | null;
+			continuation_task_id: string | null;
+		}[];
+		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
 	} = {},
 ) {
 	let liveEvent = 0;
 	let contextUsed = 128_000;
+	let createdWorkflow: Record<string, unknown> | null = null;
 	const status = options.live ? 'in_progress' : 'completed';
 	const attemptStatus = options.live ? 'running' : 'completed';
 	const task = {
@@ -138,7 +155,14 @@ async function mockApi(
 		desired_status: options.live ? 'running' : 'stopped',
 		observed_status: options.live ? 'running' : 'stopped',
 		container_id: options.live ? 'container-browser-test' : null,
-		config: { runner: { session_config: {} } },
+		config: {
+			runner: {
+				kind: 'codex',
+				workspace: '/srv/repos/xpressclaw',
+				project_name: 'Browser-tested workspace',
+				session_config: {},
+			},
+		},
 		created_at: timestamp(0),
 		started_at: options.live ? timestamp(1) : null,
 		stopped_at: options.live ? null : timestamp(61),
@@ -222,9 +246,30 @@ async function mockApi(
 		} else if (path === `/api/agents/${agentId}`) {
 			response = agent;
 		} else if (path === '/api/workflows') {
-			response = options.workflows ?? [];
-		} else if (path === '/api/schedules') {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as { name: string; description?: string; yaml_content: string };
+				options.workflowCreateRequests?.push(payload);
+				createdWorkflow = {
+					id: 'workflow-created',
+					...payload,
+					enabled: true,
+					version: 1,
+					created_at: timestamp(100),
+					updated_at: timestamp(100),
+				};
+				response = createdWorkflow;
+			} else {
+				response = options.workflows ?? [];
+			}
+		} else if (/^\/api\/workflows\/[^/]+\/instances$/.test(path)) {
 			response = [];
+		} else if (/^\/api\/workflows\/[^/]+$/.test(path)) {
+			const id = path.split('/')[3];
+			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
+				error: `Unknown workflow: ${id}`,
+			};
+		} else if (path === '/api/schedules') {
+			response = options.schedules ?? [];
 		} else if (path === '/api/setup/config') {
 			response = {
 				llm: { providers: [] },
@@ -665,7 +710,7 @@ test('task drafts survive reloads and clear after a successful send', async ({ p
 	await expect(composer).toHaveValue('');
 });
 
-test('new-work drafts restore the project they were written for', async ({ page }) => {
+test('new-work drafts restore the agent they were written for', async ({ page }) => {
 	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
 	await mockApi(page, { multipleAgents: true, queuedSessionMessages });
 	await page.goto('/');
@@ -684,7 +729,7 @@ test('new-work drafts restore the project they were written for', async ({ page 
 	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
 });
 
-test('project Work shows only the five most recently updated tasks', async ({ page }) => {
+test('agent Work shows only the five most recently updated tasks', async ({ page }) => {
 	await mockApi(page, { projectTaskUpdates: [10, 70, 30, 90, 50, 110, 20] });
 	const recentRequest = page.waitForRequest((request) => {
 		const url = new URL(request.url());
@@ -751,14 +796,14 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobile.getByRole('button', { name: 'Interrupt agent now' })).toBeVisible();
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	let mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
 	await mobileProject.click();
 	await expect(mobile).toHaveURL(`/agents/${agentId}`);
 	await mobile.getByRole('tab', { name: 'Automations' }).click();
 	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=schedules`);
 
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
 	await mobileProject.evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
 		bubbles: true,
@@ -816,7 +861,7 @@ test('workspace renders when session storage is unavailable', async ({ page }) =
 	await expect.poll(() => page.evaluate(() => localStorage.getItem('xpressclaw.workspace.v1') !== null)).toBe(true);
 });
 
-test('project context menus open sections and separate windows', async ({ page }) => {
+test('agent context menus open sections and separate windows', async ({ page }) => {
 	await mockApi(page);
 	await page.goto('/');
 
@@ -828,7 +873,7 @@ test('project context menus open sections and separate windows', async ({ page }
 		'Open in New Window',
 		'Open Tasks',
 		'Open Automations',
-		'Open Agent',
+		'Open Harness',
 		'Open Environment',
 	]);
 	await projectMenu.getByRole('menuitem', { name: 'Open Automations' }).click();
@@ -854,10 +899,10 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	await sidebar.locator('a[href="/settings"]').click();
 	await expect(tabs).toHaveCount(3);
 
-	await tabs.filter({ has: page.locator('[title="Projects"]') }).click({ button: 'right' });
+	await tabs.filter({ has: page.locator('[title="Agents"]') }).click({ button: 'right' });
 	await page.getByRole('menuitem', { name: 'Close Other Tabs' }).click();
 	await expect(tabs).toHaveCount(1);
-	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Projects');
+	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Agents');
 	await expect(page).toHaveURL('/agents');
 
 	await tabs.click({ button: 'right' });
@@ -921,7 +966,7 @@ test('tab context menus create native webview windows in the desktop app', async
 	expect(new URL(call.args.options.url).searchParams.get('_xpressclaw_window')).toBe(call.args.options.label);
 });
 
-test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
+test('task pages show five recent tasks per agent in the sidebar', async ({ page }) => {
 	await mockApi(page, { multipleAgents: true });
 	const sidebarTasks = [
 		{ id: 'primary-oldest', title: 'Primary oldest', agentId, updatedAt: 10, status: 'completed' },
@@ -1129,7 +1174,7 @@ test('task search waits for Japanese IME composition to finish', async ({ page }
 	expect(searches).toEqual(['検索']);
 });
 
-test('project, task, and workflow lists remain scrollable on mobile', async ({ browser }) => {
+test('agent, task, and automation lists remain scrollable on mobile', async ({ browser }) => {
 	const mobile = await browser.newPage({
 		viewport: { width: 390, height: 844 },
 		isMobile: true,
@@ -1153,8 +1198,9 @@ test('project, task, and workflow lists remain scrollable on mobile', async ({ b
 
 	await mobile.goto('/agents');
 	await expect(mobile.locator('[data-projects-scroll] [data-project-card]')).toHaveCount(30);
+	await expect(mobile.locator('[data-project-card]').first()).toContainText('Codex · xpressclaw');
 	await expectVerticalScroll(mobile.locator('[data-projects-scroll]'));
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
 	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 
@@ -1162,14 +1208,14 @@ test('project, task, and workflow lists remain scrollable on mobile', async ({ b
 	await mobile.getByRole('button', { name: 'Done 45' }).click();
 	await expect(mobile.locator('[data-task-list] [data-task-row]')).toHaveCount(20);
 	await expectVerticalScroll(mobile.locator('[data-tasks-scroll]'));
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
 	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 
-	await mobile.goto('/workflows');
+	await mobile.goto('/automations');
 	await expect(mobile.locator('[data-workflows-scroll] [data-workflow-card]')).toHaveCount(30);
 	await expectVerticalScroll(mobile.locator('[data-workflows-scroll]'));
-	await mobile.getByRole('button', { name: 'Open project switcher' }).click();
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expectVerticalScroll(mobile.locator('aside:visible [data-mobile-sidebar-scroll]'));
 
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
@@ -1235,7 +1281,7 @@ test('MCP verification reports authentication and runner executable failures in 
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('workflow and settings pages show context-specific sidebar lists', async ({ page }) => {
+test('automation and settings pages show context-specific sidebar lists', async ({ page }) => {
 	await mockApi(page, {
 		workflows: [
 			{
@@ -1259,17 +1305,35 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 				updated_at: timestamp(20),
 			},
 		],
+		schedules: [{
+			id: 'schedule-nightly',
+			name: 'Nightly task sweep',
+			cron: '0 2 * * *',
+			agent_id: agentId,
+			title: 'Sweep queued tasks',
+			description: null,
+			enabled: true,
+			last_run: null,
+			run_count: 0,
+			created_at: timestamp(30),
+			schedule_type: 'cron',
+			run_at: null,
+			continuation_task_id: null,
+		}],
 	});
-	await page.goto('/workflows');
+	await page.goto('/automations');
 
 	const sidebar = page.locator('aside').first();
-	const workflowSidebar = sidebar.locator('[data-sidebar-mode="workflows"]');
-	await expect(workflowSidebar).toBeVisible();
-	expect(await workflowSidebar.locator('[data-sidebar-workflow]').evaluateAll((items) =>
+	const automationSidebar = sidebar.locator('[data-sidebar-mode="automations"]');
+	await expect(automationSidebar).toBeVisible();
+	expect(await automationSidebar.locator('[data-sidebar-workflow]').evaluateAll((items) =>
 		items.map((item) => item.getAttribute('href'))
 	)).toEqual(['/workflows/workflow-newer', '/workflows/workflow-older']);
+	await expect(automationSidebar.locator('[data-sidebar-schedule]')).toContainText('Nightly task sweep');
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
-	await expect(page.locator('[data-workflows-scroll]')).toHaveCSS('overflow-y', 'auto');
+	await expect(page.locator('[data-automations-scroll]')).toHaveCSS('overflow-y', 'auto');
+	await expect(page.locator('[data-workflow-card]')).toHaveCount(2);
+	await expect(page.locator('[data-schedule-card]')).toHaveCount(1);
 
 	await sidebar.locator('a[href="/settings"]').click();
 	await expect(page).toHaveURL('/settings');
@@ -1289,15 +1353,35 @@ test('workflow and settings pages show context-specific sidebar lists', async ({
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toHaveCount(0);
 
 	await page.setViewportSize({ width: 390, height: 844 });
-	await page.goto('/workflows');
-	await page.getByRole('button', { name: 'Open project switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="workflows"] [data-sidebar-workflow]')).toHaveCount(2);
+	await page.goto('/automations');
+	await page.getByRole('button', { name: 'Open agent switcher' }).click();
+	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-workflow]')).toHaveCount(2);
+	await expect(page.locator('aside:visible [data-sidebar-mode="automations"] [data-sidebar-schedule]')).toHaveCount(1);
 	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
-	await page.getByRole('button', { name: 'Open project switcher' }).click();
+	await page.getByRole('button', { name: 'Open agent switcher' }).click();
 	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('goal-loop workflow template is bounded and uses the selected agent', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: /Goal loop/ }).click();
+	await expect(page.getByLabel('Working agent')).toHaveValue(agentId);
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const created = workflowCreateRequests[0];
+	expect(created.name).toBe('Goal Loop');
+	expect(created.description).toContain('bounded loop');
+	expect(created.yaml_content).toContain(`agent: ${JSON.stringify(agentId)}`);
+	expect(created.yaml_content).toContain('switch: "@pursue_goal.status"');
+	expect(created.yaml_content).toContain('goto: step pursue_goal');
+	await expect(page).toHaveURL('/workflows/workflow-created');
 });
 
 test('appearance follows the saved light, dark, and system preference', async ({ page }) => {

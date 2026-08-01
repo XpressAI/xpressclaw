@@ -6,7 +6,7 @@
 	import ContextMenu from '$lib/components/ContextMenu.svelte';
 	import { PROJECT_CONTEXT_MENU_ITEMS } from '$lib/contextMenu';
 	import { openWorkspaceWindow } from '$lib/openWorkspaceWindow';
-	import { harnessMark, statusColor, timeAgo } from '$lib/utils';
+	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor, timeAgo } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	let agentList = $state<Agent[]>([]);
@@ -36,7 +36,7 @@
 	function selectProjectMenuItem(agent: Agent, action: string) {
 		if (action === 'open-new-window') {
 			void openWorkspaceWindow(projectPath(agent.id), agent.title || agent.name).catch((error) => {
-				console.error('failed to open project window', error);
+				console.error('failed to open agent window', error);
 				window.alert(error instanceof Error ? error.message : 'Could not open the window.');
 			});
 			return;
@@ -58,12 +58,12 @@
 	<div class="space-y-6 p-4 sm:p-6">
 		<div class="flex items-center justify-between gap-3">
 			<div>
-				<h1 class="text-2xl font-bold">Projects</h1>
-				<p class="text-sm text-muted-foreground mt-1">{agentList.length} workspace{agentList.length === 1 ? '' : 's'} connected</p>
+				<h1 class="text-2xl font-bold">Agents</h1>
+				<p class="text-sm text-muted-foreground mt-1">{agentList.length} agent{agentList.length === 1 ? '' : 's'} configured</p>
 			</div>
 			<a href="/setup?mode=add-session"
 				class="shrink-0 rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground hover:bg-primary/90 sm:px-4">
-				+ Add <span class="hidden sm:inline">Project</span>
+				+ Add <span class="hidden sm:inline">Agent</span>
 			</a>
 		</div>
 
@@ -71,9 +71,9 @@
 			<div class="text-sm text-muted-foreground">Loading...</div>
 		{:else if agentList.length === 0}
 			<div class="rounded-lg border border-border bg-card p-8 text-center">
-				<p class="text-muted-foreground">No projects configured.</p>
-				<p class="text-sm text-muted-foreground mt-2">Connect a workspace to a native coding agent.</p>
-				<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create project</a>
+				<p class="text-muted-foreground">No agents configured.</p>
+				<p class="text-sm text-muted-foreground mt-2">Give a durable work context a harness and workspace.</p>
+				<a href="/setup?mode=add-session" class="mt-4 inline-flex rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create agent</a>
 			</div>
 		{:else}
 			<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -83,9 +83,9 @@
 						<div class="flex items-start justify-between">
 							<div class="flex items-center gap-3">
 								<span class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted text-sm font-semibold">{harnessMark(agent.backend)}</span>
-								<div>
+								<div class="min-w-0" title={agentRuntimeTitle(agent)}>
 									<a href="/agents/{agent.id}" class="text-sm font-semibold hover:underline">{agent.title || agent.name}</a>
-									<div class="text-xs text-muted-foreground mt-0.5">{agent.backend}</div>
+									<div class="mt-0.5 truncate text-xs text-muted-foreground">{agentRuntimeSummary(agent)}</div>
 								</div>
 							</div>
 							<span class="inline-flex items-center gap-1.5 text-xs {statusColor(agent.status)}">
@@ -105,7 +105,7 @@
 								href="/agents/{agent.id}"
 								class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
 							>
-								Open project
+								Open agent
 							</a>
 						</div>
 					</div>

@@ -298,38 +298,38 @@
 
 <div class="mx-auto max-w-3xl space-y-6">
 	<div class="rounded-xl border border-border bg-card p-5">
-		<h2 class="text-sm font-semibold">ACP agent</h2>
+		<h2 class="text-sm font-semibold">ACP harness</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			XpressClaw talks to the agent over the Agent Client Protocol. New tasks branch from this project's active conversation when the agent supports it, while follow-ups stay with their task; the agent keeps ownership of its reasoning, tools, and subagents.
+			XpressClaw talks to this coding harness over the Agent Client Protocol. New tasks branch from this agent's active conversation when the harness supports it, while follow-ups stay with their task; the harness keeps ownership of its reasoning, tools, and subagents.
 		</p>
 
 		<div class="mt-5 grid gap-4 sm:grid-cols-2">
 			<div class={modelOptions.length > 0 ? 'sm:col-span-2' : ''}>
-				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Agent</label>
+				<label for="runner-kind" class="mb-1 block text-xs font-medium text-muted-foreground">Harness</label>
 				<select id="runner-kind" bind:value={kind} onchange={selectDefaultImage} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 					{#each agentOptions as agent}
 						<option value={agent.kind}>{agent.name}</option>
 					{/each}
-					<option value="custom">Other ACP agent</option>
+					<option value="custom">Other ACP harness</option>
 				</select>
 			</div>
 			{#if modelOptions.length === 0}<div>
 				<label for="runner-model" class="mb-1 block text-xs font-medium text-muted-foreground">Model</label>
-				<input id="runner-model" list="runner-model-options" bind:value={model} placeholder="Agent default" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
+				<input id="runner-model" list="runner-model-options" bind:value={model} placeholder="Harness default" class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				<datalist id="runner-model-options">
 					{#each modelOptions as option}
 						<option value={option.value}>{option.name}</option>
 					{/each}
 				</datalist>
 				<p class="mt-1 text-[11px] text-muted-foreground">
-					{modelOptions.length > 0 ? `${modelOptions.length} choices reported by the agent. ` : 'Choices appear after the agent starts its first session. '}
-					Leave blank to use the agent's default.
+					{modelOptions.length > 0 ? `${modelOptions.length} choices reported by the harness. ` : 'Choices appear after the harness starts its first session. '}
+					Leave blank to use the harness default.
 				</p>
 			</div>{/if}
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-workspace" class="mb-1 block text-xs font-medium text-muted-foreground">Project workspace</label>
+			<label for="runner-workspace" class="mb-1 block text-xs font-medium text-muted-foreground">Workspace folder</label>
 			<div class="flex gap-2">
 				<input id="runner-workspace" bind:value={workspace} placeholder="~/projects/my-app" class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus:ring-1 focus:ring-ring" />
 				<button type="button" onclick={() => (showWorkspacePicker = true)} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Browse…</button>
@@ -342,7 +342,7 @@
 		</div>
 
 		<div class="mt-4">
-			<label for="runner-project-name" class="mb-1 block text-xs font-medium text-muted-foreground">Project name</label>
+			<label for="runner-project-name" class="mb-1 block text-xs font-medium text-muted-foreground">Agent name</label>
 			<input id="runner-project-name" bind:value={projectName} placeholder="Derived from workspace folder" class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
 		</div>
 
@@ -356,7 +356,7 @@
 	<div class="rounded-xl border border-border bg-card p-5">
 		<h2 class="text-sm font-semibold">Harness capabilities</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
-			These controls come directly from this ACP agent. They become available after its first turn and are applied before every new task turn.
+			These controls come directly from this ACP harness. They become available after its first turn and are applied before every new task turn.
 		</p>
 		{#if configOptions.length === 0}
 			<div class="mt-4 rounded-md border border-dashed border-border px-3 py-4 text-center text-xs text-muted-foreground">
@@ -485,7 +485,7 @@
 				</p>
 				{#if containerEngine === 'host'}
 					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
-						This grants the agent control of host containers, images, volumes, and any paths the engine can mount. Use only with agents and images you trust.
+						This grants the harness control of host containers, images, volumes, and any paths the engine can mount. Use only with harnesses and images you trust.
 					</p>
 				{/if}
 			</div>
@@ -499,8 +499,8 @@
 				<label for="subscription-auth" class="text-sm font-medium">Use host login and harness configuration</label>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
-						? 'Custom agents manage their own authentication; add any required directories in the Volumes tab.'
-						: "Mount the selected agent's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. SSH keys still require an explicit mount."}
+						? 'Custom harnesses manage their own authentication; add any required directories in the mounts above.'
+						: "Mount the selected harness's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. SSH keys still require an explicit mount."}
 				</p>
 				{#if subscriptionAuth}
 					<p class="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">
@@ -513,14 +513,14 @@
 
 	<div class="rounded-xl border border-border bg-card p-5">
 		<h2 class="text-sm font-semibold">ACP server command</h2>
-		<p class="mt-1 text-xs text-muted-foreground">{kind === 'custom' ? 'Required for custom agents.' : 'Optional override for the built-in adapter.'} Enter one argument per line. Available placeholder: <code>{'{workspace}'}</code>.</p>
+		<p class="mt-1 text-xs text-muted-foreground">{kind === 'custom' ? 'Required for custom harnesses.' : 'Optional override for the built-in adapter.'} Enter one argument per line. Available placeholder: <code>{'{workspace}'}</code>.</p>
 		<textarea bind:value={commandText} rows="7" placeholder={'my-agent\nacp\n--cwd\n{workspace}'} class="mt-3 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
 	</div>
 </div>
 
 {#if showWorkspacePicker}
 	<DirectoryPicker
-		title="Choose project workspace"
+		title="Choose workspace folder"
 		initialPath={workspace}
 		onclose={() => (showWorkspacePicker = false)}
 		onselect={(path) => {

@@ -49,7 +49,7 @@
 
 <div class="mx-auto max-w-3xl space-y-6">
 	<div class="rounded-xl border border-border bg-card p-5">
-		<h2 class="text-sm font-semibold">Primary project</h2>
+		<h2 class="text-sm font-semibold">Primary workspace</h2>
 		<p class="mt-1 text-xs text-muted-foreground">Configured in the Runner tab and mounted read-write at <code>/workspace</code>.</p>
 		<div class="mt-3 rounded-md border border-border bg-background px-3 py-2 font-mono text-sm">
 			{agentConfig?.runner.workspace || 'Using the server default workspace'}

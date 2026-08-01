@@ -271,7 +271,7 @@
 
 	{#if agentList.length === 0}
 		<div class="rounded-lg border border-dashed border-border bg-card p-5 text-sm text-muted-foreground">
-			Tasks need a project so they know which workspace and agent to use. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create a project</a> first.
+			Tasks need an agent so they know which workspace and harness to use. <a href="/setup?mode=add-session" class="font-medium text-primary hover:underline">Create an agent</a> first.
 		</div>
 	{/if}
 
@@ -291,7 +291,7 @@
 			></textarea>
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<label class="block text-xs text-muted-foreground mb-1">Project
+					<label class="block text-xs text-muted-foreground mb-1">Agent
 					<select
 						bind:value={newAgentId}
 						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -341,7 +341,7 @@
 			{/if}
 			<label class="flex items-start gap-2 text-xs text-muted-foreground {newDependsOn.length > 0 ? 'opacity-50' : ''}">
 				<input type="checkbox" bind:checked={newSession} disabled={newDependsOn.length > 0} class="mt-0.5 h-3.5 w-3.5 accent-primary" />
-				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this branches from the project’s active agent conversation when supported.</span>
+				<span><strong class="font-medium text-foreground">Start a fresh conversation</strong><br />Otherwise this branches from the agent’s active conversation when supported.</span>
 			</label>
 			{#if formError}<p class="text-xs text-destructive">{formError}</p>{/if}
 			<div class="flex gap-2">

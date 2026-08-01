@@ -5,7 +5,7 @@
 <h3 align="center">Control Plane for Native Agent Work</h3>
 
 <p align="center">
-Run Codex, Claude Code, OpenCode, and other native agents as isolated workers. Queue tasks, schedule recurring work, coordinate multi-agent workflows, and follow everything through one structured session UI.
+Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers. Queue tasks, schedule recurring work, coordinate multi-agent workflows, and follow everything through one structured Agent UI.
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@ xpressclaw init
 xpressclaw up
 ```
 
-Open `http://localhost:8935`, create a project, choose its workspace,
+Open `http://localhost:8935`, create an agent, choose its harness and workspace,
 and send it work. The matching runner image is pulled automatically. To build
 the Codex runner locally instead:
 
@@ -41,25 +41,25 @@ docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-ru
 
 Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
-- **One logical session** — People, schedules, workflows, and ACP agents contribute to one event history.
-- **Agent-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
+- **One durable agent** — People, schedules, workflows, and ACP harnesses contribute to one event history and memory context.
+- **Harness-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
 - **Isolated by default** — Every agent turn runs in a short-lived Docker/Podman container.
-- **Container-aware projects** — Opt trusted projects into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
+- **Container-aware workspaces** — Opt trusted agents into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
 
 ## Features
 
-### Persistent Sessions
+### Persistent Agents
 
-The primary interface is a durable event timeline labeled by project context. It accepts a new message while work is running and records where every event came from. Xpressclaw does not invent an agent identity or persona.
+The primary interface is a durable Agent timeline. Each agent has a name, workspace, memory, and replaceable ACP harness. It accepts a new message while work is running and records where every event came from. The name organizes work; Xpressclaw does not invent a persona or system prompt.
 
 ### Autonomous Task Execution
 
-ACP agents pick up tasks from a queue and publish standard progress, plans, tool activity, and results. Schedule recurring work with cron expressions. Workflows coordinate different products—for example, Codex implementing and Claude reviewing in a loop.
+ACP harnesses pick up tasks from a queue and publish standard progress, plans, tool activity, and results. Schedule recurring work with cron expressions. Workflows coordinate different agents—for example, one using Codex to implement and another using Claude to review in a loop.
 
-### Multiple ACP Agents
+### Multiple ACP Harnesses
 
 - **Codex:** reuses an eligible host ChatGPT/Codex login
 - **Claude Code:** reuses an eligible host Claude subscription login
@@ -67,9 +67,9 @@ ACP agents pick up tasks from a queue and publish standard progress, plans, tool
 - **Custom:** any image and command that speaks ACP over stdin/stdout
 
 Codex and Claude use ACP Registry adapters. Each built-in runner image contains
-one agent product and its ACP server. Language SDKs and
+one harness product and its ACP server. Language SDKs and
 project services belong in a separate development environment rather than in
-the runner image. Projects that need existing Compose-based development and
+the runner image. Agents whose workspaces need existing Compose-based development and
 test workflows can explicitly enable trusted host-engine access.
 
 ### Privacy & Safety
@@ -107,39 +107,39 @@ See [Building](#building) below.
 ### Requirements
 
 - Docker or Podman (required for worker isolation)
-- At least one supported agent login on the host
+- At least one supported harness login on the host
 - A built-in ACP runner image, or your own ACP-compatible image
 
 ## What Can It Do?
 
-**Send work from the session UI:**
+**Send work from the Agent UI:**
 
-Open a persistent session and describe the outcome. The request becomes a task and native work attempt while the UI remains available.
+Open a persistent agent and describe the outcome. The request becomes a task and native work attempt while the UI remains available.
 
 **Schedule recurring tasks or one-off follow-ups:**
 
-Create a task in **Work → Tasks**, select its session, then add a cron schedule
-in **Work → Schedules**. Scheduled work enters the same queue and timeline as a
-message sent by a person. Native agents can arm a durable `schedule_wakeup`
+Create a task in **Tasks**, select its agent, then add a cron schedule
+in **Automations → Schedules**. Scheduled work enters the same queue and timeline as a
+message sent by a person. Native harnesses can arm a durable `schedule_wakeup`
 when a long-running external job needs to be checked hours later; the future
-turn resumes the same project conversation.
+turn resumes the same agent conversation.
 
 **Review what happened while you were away:**
 
-Open the session timeline for attempt status, results, artifacts, provenance,
+Open the agent timeline for attempt status, results, artifacts, provenance,
 and errors. `xpressclaw status` remains available as a small health check for
 the local control plane.
 
 **Coordinate multiple products:**
 
-Use **Workflows** for implementation/review loops and other work that moves
-between sessions. The CLI deliberately does not duplicate these product
+Use **Automations → Workflows** for implementation/review loops, goal loops,
+and other work that moves between agents. The CLI deliberately does not duplicate these product
 surfaces.
 
 ## Configuration
 
-`xpressclaw init` creates a minimal `xpressclaw.yaml`. Sessions are added in the
-web UI, which records the selected product image and workspace:
+`xpressclaw init` creates a minimal `xpressclaw.yaml`. Agents are added in the
+web UI, which records the selected harness image and workspace:
 
 ```yaml
 system:
@@ -156,7 +156,7 @@ agents: []
 - [Rust](https://rustup.rs/) stable toolchain
 - [Node.js](https://nodejs.org/) 20+
 - The [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your platform when building the desktop app
-- Docker or Podman (for isolated ACP agents)
+- Docker or Podman (for isolated ACP harnesses)
 
 ### Build Everything
 
@@ -236,7 +236,7 @@ The default images stay minimal. Add `--target runner-host` and use the
 corresponding `xpressclaw-runner-<product>-docker:latest` tag to build an
 opt-in image containing Docker CLI, Compose, and Buildx. Enabling host-engine
 access mounts the control plane's Docker or rootless Podman socket; this gives
-the runner control over that engine and is intended only for trusted agents.
+the runner control over that engine and is intended only for trusted harnesses.
 
 Use `podman build` with the `localhost/` tags when Podman is your runtime. The ACP
 compatibility label on current images prevents an older pre-ACP local tag from
@@ -247,7 +247,7 @@ and the separation between agent runners and development environments.
 
 ### Native harness capabilities
 
-Each project session keeps the selected native product's own configuration.
+Each Agent keeps the selected native harness's own configuration.
 When host login is enabled, XpressClaw mounts the complete Codex, Claude Code,
 or OpenCode configuration directory—not just its token—so native skills,
 plugins, hooks, custom agents, and user settings remain available. Project
@@ -260,7 +260,7 @@ need to be installed in the image. ACP supplies the selected servers when a
 session is created, resumed, or loaded.
 
 After the first turn, the task composer and workflow editor show the commands,
-modes, models, reasoning levels, and other controls that the ACP agent actually
+modes, models, reasoning levels, and other controls that the ACP harness actually
 advertises. A workflow step can combine all of them:
 
 ```yaml
@@ -342,7 +342,7 @@ xpressclaw
 - **Single binary** — server, API, frontend, and CLI in one executable
 - **Container runtime required** — Docker and Podman are detected automatically; worker isolation is not optional
 - **Durable local state** — sessions, task queues, schedules, and workflow runs survive restarts
-- **ACP boundary** — Agents own their instructions, tools, reasoning loop, and subagents; xpressclaw owns tasks, orchestration, and presentation
+- **ACP boundary** — Harnesses own their instructions, tools, reasoning loop, and subagents; xpressclaw owns durable Agents, tasks, orchestration, and presentation
 
 ## CLI Reference
 

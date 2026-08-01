@@ -13,13 +13,14 @@ opens first-session setup when no configuration exists.
 
 Use `xpressclaw up --detach` to keep the server in the background.
 
-## 2. Connect an ACP agent
+## 2. Create an agent
 
-The session creator asks for:
+The agent creator asks for:
 
-- Codex, Claude Code, OpenCode, or another ACP-compatible agent;
+- a durable agent name;
+- Codex, Claude Code, OpenCode, or another ACP-compatible harness;
 - the host project folder mounted at `/workspace`;
-- whether to reuse a built-in agent's host subscription login;
+- whether to reuse a built-in harness's host subscription login;
 - optional image, ACP server command, and extra folder overrides.
 
 Each built-in product selects a separate minimal image. Xpressclaw never uses
@@ -27,7 +28,7 @@ an all-in-one `xpressclaw-native-runner` image.
 
 ## 3. Check readiness
 
-Open the project. Its readiness panel checks the container runtime, ACP agent
+Open the agent. Its readiness panel checks the container runtime, ACP harness
 image, project folder, server command, and subscription credentials. Use
 **Prepare runner** to pull a missing published image. A locally built
 `xpressclaw-runner-<product>:latest` image is accepted as a development
@@ -39,22 +40,23 @@ before falling back to the platform Docker endpoint. Readiness and server
 settings show the selected runtime and socket so local images are always
 looked up in the same image store used to launch workers.
 
-The project folder name becomes the session's context label. There is no agent
-name, persona, role, or Xpressclaw-authored system prompt.
+The chosen agent name labels its durable context. Legacy or manually edited
+configuration without a name falls back to the workspace folder. The label is
+not a persona, role, or Xpressclaw-authored system prompt.
 
 ## 4. Send work
 
-Describe an outcome in the project. Xpressclaw queues it, launches a
+Describe an outcome for the agent. Xpressclaw queues it, launches a
 short-lived ACP server, sends `session/prompt`, and writes standard progress,
-plans, tool activity, and results back to the durable timeline. The project
+plans, tool activity, and results back to the durable timeline. The agent
 remains available while an attempt runs.
 
 ## 5. Automate work
 
-- **Tasks** queue explicit work for a selected session.
-- **Schedules** send work to a session on a cron schedule.
-- **Workflows** coordinate multiple sessions, including implementation/review
-  loops.
+- **Tasks** queue explicit work for a selected agent.
+- **Automations → Schedules** send work to an agent once or on a cron schedule.
+- **Automations → Workflows** coordinate agents through implementation/review,
+  goal, and custom loops.
 
 ## Lifecycle commands
 

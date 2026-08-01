@@ -90,7 +90,7 @@
 		{/if}
 
 		{#if taskGroups.length === 0}
-			<div class="px-2 py-4 text-xs text-muted-foreground">Create a project to start adding tasks.</div>
+			<div class="px-2 py-4 text-xs text-muted-foreground">Create an agent to start adding tasks.</div>
 		{:else}
 			<div class="space-y-3">
 				{#each taskGroups as group (group.id)}
