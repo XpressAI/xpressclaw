@@ -148,7 +148,7 @@
 	<div class="flex items-start justify-between gap-4">
 		<div>
 			<h1 class="text-2xl font-bold">MCP servers</h1>
-			<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Create a shared catalog of tools that can be attached to any project from its Agent tab. Servers are never attached automatically.</p>
+			<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Create a shared catalog of tools that can be attached to any agent from its Harness tab. Servers are never attached automatically.</p>
 		</div>
 		<button type="button" onclick={createServer} class="shrink-0 rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Add server</button>
 	</div>
@@ -220,7 +220,7 @@
 			{:else}
 				<div class="mt-4"><label for="mcp-headers" class="mb-1 block text-xs font-medium text-muted-foreground">HTTP headers</label><textarea id="mcp-headers" bind:value={headersText} rows="4" placeholder={'One Name=value per line\nAuthorization=Bearer …'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea></div>
 			{/if}
-			<p class="mt-3 text-[11px] leading-relaxed text-muted-foreground">Credentials are stored in the local XpressClaw configuration and supplied only to projects that explicitly attach this server.</p>
+			<p class="mt-3 text-[11px] leading-relaxed text-muted-foreground">Credentials are stored in the local XpressClaw configuration and supplied only to agents that explicitly attach this server.</p>
 			{#if error}<p class="mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">{error}</p>{/if}
 			<div class="mt-4 flex justify-end gap-2">
 				<button type="button" onclick={resetForm} class="rounded-md border border-border px-3 py-2 text-xs hover:bg-accent">Cancel</button>

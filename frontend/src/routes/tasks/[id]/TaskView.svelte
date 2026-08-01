@@ -227,7 +227,7 @@
 	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
 	let messagePlaceholder = $derived(
 		!task?.agent_id
-			? 'Assign a project to chat about this task'
+			? 'Assign an agent to chat about this task'
 			: pendingElicitation
 				? 'Answer the agent’s question above...'
 			: task.status === 'waiting_for_input'
@@ -1020,7 +1020,7 @@
 				class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-none"></textarea>
 			<div class="flex flex-col gap-3 sm:flex-row">
 				<div class="flex-1">
-					<div class="text-xs text-muted-foreground mb-1">Project</div>
+					<div class="text-xs text-muted-foreground mb-1">Agent</div>
 					<select bind:value={editAgentId}
 						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring">
 						<option value="">Unassigned</option>
@@ -1084,7 +1084,7 @@
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh conversation' : 'Continues project conversation'}</span>
+						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh conversation' : 'Continues agent conversation'}</span>
 						{#if task.depends_on && task.depends_on.length > 0}<span>Continues its dependency</span>{/if}
 					</div>
 
@@ -1344,7 +1344,7 @@
 					{#if task.status === 'waiting_for_input'}
 						<div class="text-xs text-orange-400 mb-2">The agent needs additional input</div>
 					{:else if !task.agent_id}
-						<div class="text-xs text-muted-foreground mb-2">Assign a project before sending a message</div>
+						<div class="text-xs text-muted-foreground mb-2">Assign an agent before sending a message</div>
 					{/if}
 					<div bind:this={composerEl} class="relative rounded-xl border border-border bg-secondary/35 transition-all focus-within:border-primary/45 focus-within:ring-1 focus-within:ring-primary/20">
 						{#if slashMenuOpen}
@@ -1523,7 +1523,7 @@
 						</div>
 						{#if task.agent_id}
 							<div class="flex justify-between">
-								<dt class="text-muted-foreground">Project</dt>
+								<dt class="text-muted-foreground">Agent</dt>
 								<dd><a href="/agents/{task.agent_id}" class="underline hover:text-foreground">{sessionLabel(task.agent_id)}</a></dd>
 							</div>
 						{/if}
@@ -1593,8 +1593,8 @@
 
 				{#if task.agent_id}
 					<div class="space-y-2">
-						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Project</h3>
-						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open project</a>
+						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Agent</h3>
+						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open agent</a>
 					</div>
 				{/if}
 			</div>

@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { agents, setup } from '$lib/api';
 	import type { Agent, LiveConfig } from '$lib/api';
-	import { harnessMark, statusColor } from '$lib/utils';
+	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, statusColor } from '$lib/utils';
 	import { projectPath, type ProjectSection } from '$lib/workspace';
 
 	import SessionTab from './SessionTab.svelte';
@@ -31,7 +31,7 @@
 		{ id: 'session', label: 'Work' },
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Automations' },
-		{ id: 'runner', label: 'Agent' },
+		{ id: 'runner', label: 'Harness' },
 		{ id: 'workspace', label: 'Environment' },
 	];
 
@@ -122,7 +122,7 @@
 	<!-- Header -->
 	<div class="shrink-0 space-y-3 border-b border-border px-4 py-3 sm:px-6 sm:py-4">
 		<div class="flex items-center gap-2 text-sm text-muted-foreground">
-			<a href="/agents" class="hover:text-foreground">Projects</a>
+			<a href="/agents" class="hover:text-foreground">Agents</a>
 			<span>/</span>
 			<span class="text-foreground">{sessionTitle()}</span>
 		</div>
@@ -137,9 +137,9 @@
 					</div>
 					<div class="min-w-0">
 						<h1 class="truncate text-lg font-bold sm:text-xl">{sessionTitle()}</h1>
-						<p class="text-sm text-muted-foreground">
+						<p class="truncate text-sm text-muted-foreground" title={agentRuntimeTitle(agent)}>
 							<span class="{statusColor(agent.status)}">{agent.status === 'waiting_for_input' ? 'waiting for you' : agent.status.replaceAll('_', ' ')}</span>
-							&middot; {agent.backend}
+							&middot; {agentRuntimeSummary(agent)}
 						</p>
 					</div>
 				</div>
@@ -147,7 +147,7 @@
 					{#if saveMessage}
 						<span class="text-xs {saveMessage.startsWith('Error') ? 'text-destructive' : 'text-emerald-500'}">{saveMessage}</span>
 					{/if}
-					<button onclick={() => { showDeleteConfirm = true; }} aria-label="Delete project"
+					<button onclick={() => { showDeleteConfirm = true; }} aria-label="Delete agent"
 						class="rounded-md border border-destructive/50 px-3 py-1.5 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors">
 						<span class="hidden sm:inline">Delete</span><span class="sm:hidden">×</span>
 					</button>
@@ -163,7 +163,7 @@
 	<!-- Tab bar -->
 	{#if agent}
 		<div class="shrink-0 border-b border-border px-4">
-			<div class="flex gap-0 -mb-px overflow-x-auto scrollbar-hide" role="tablist" aria-label="Project sections">
+			<div class="flex gap-0 -mb-px overflow-x-auto scrollbar-hide" role="tablist" aria-label="Agent sections">
 				{#each tabs as tab}
 					<button
 						type="button"
@@ -216,7 +216,7 @@
 		<div class="rounded-lg border border-border bg-card p-6 space-y-4 max-w-md mx-4">
 			<h2 class="text-lg font-semibold">Delete {sessionTitle()}?</h2>
 			<p class="text-sm text-muted-foreground">
-				This removes the project and its agent configuration. Existing task history may still reference it. This action cannot be undone.
+				This removes the agent, its harness configuration, and its workspace association. Existing task history may still reference it. This action cannot be undone.
 			</p>
 			<div class="flex justify-end gap-2">
 				<button onclick={() => { showDeleteConfirm = false; }}

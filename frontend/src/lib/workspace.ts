@@ -4,6 +4,7 @@ export type WorkspaceTabKind =
 	| 'project'
 	| 'tasks'
 	| 'task'
+	| 'automations'
 	| 'schedules'
 	| 'workflows'
 	| 'workflow'
@@ -68,6 +69,7 @@ export function workspacePath(route: string): boolean {
 		|| pathname.startsWith('/agents/')
 		|| pathname === '/tasks'
 		|| pathname.startsWith('/tasks/')
+		|| pathname === '/automations'
 		|| pathname === '/schedules'
 		|| pathname === '/workflows'
 		|| pathname.startsWith('/workflows/')
@@ -78,12 +80,11 @@ export function workspacePath(route: string): boolean {
 export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
-	if (pathname === '/agents') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
-	if (pathname.startsWith('/agents/')) return { path: route, kind: 'project', title: 'Project', resourceId: pathname.slice('/agents/'.length) };
+	if (pathname === '/agents') return { path: route, kind: 'projects', title: 'Agents', resourceId: null };
+	if (pathname.startsWith('/agents/')) return { path: route, kind: 'project', title: 'Agent', resourceId: pathname.slice('/agents/'.length) };
 	if (pathname === '/tasks') return { path: route, kind: 'tasks', title: 'Tasks', resourceId: null };
 	if (pathname.startsWith('/tasks/')) return { path: route, kind: 'task', title: 'Task', resourceId: pathname.slice('/tasks/'.length) };
-	if (pathname === '/schedules') return { path: route, kind: 'schedules', title: 'Schedules', resourceId: null };
-	if (pathname === '/workflows') return { path: route, kind: 'workflows', title: 'Workflows', resourceId: null };
+	if (pathname === '/automations' || pathname === '/schedules' || pathname === '/workflows') return { path: route, kind: 'automations', title: 'Automations', resourceId: null };
 	if (pathname === '/workflows/new') return { path: route, kind: 'workflow-new', title: 'New workflow', resourceId: null };
 	if (pathname.startsWith('/workflows/')) return { path: route, kind: 'workflow', title: 'Workflow', resourceId: pathname.slice('/workflows/'.length) };
 	if (pathname === '/settings/server') return { path: route, kind: 'settings-server', title: 'Settings', resourceId: null };
@@ -94,7 +95,9 @@ export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 
 export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 	const next = describeWorkspacePath(route);
 	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-mcp', 'settings-server'];
+	const automationKinds: WorkspaceTabKind[] = ['automations', 'schedules', 'workflows'];
 	if (settingsKinds.includes(tab.kind) && settingsKinds.includes(next.kind)) return true;
+	if (automationKinds.includes(tab.kind) && automationKinds.includes(next.kind)) return true;
 	if (tab.kind === 'project' && next.kind === 'project') return tab.resourceId === next.resourceId;
 	return tab.path === route;
 }

@@ -149,14 +149,14 @@
 			<!-- Greeting -->
 			<div class="text-center">
 				<h1 class="text-2xl font-semibold text-foreground sm:text-3xl">{greeting()}</h1>
-				<p class="mt-2 text-sm text-muted-foreground">Send work to one of your projects.</p>
+				<p class="mt-2 text-sm text-muted-foreground">Send work to one of your agents.</p>
 			</div>
 
 			{#if agentList.length === 0}
 				<div class="rounded-2xl border border-dashed border-border bg-card p-8 text-center">
-					<h2 class="text-base font-semibold">Create a project first</h2>
-					<p class="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Connect a workspace to Codex, Claude Code, OpenCode, or your own runner.</p>
-					<a href="/setup?mode=add-session" class="mt-5 inline-flex rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create project</a>
+					<h2 class="text-base font-semibold">Create an agent first</h2>
+					<p class="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Give a durable context a workspace and a Codex, Claude, OpenCode, or custom harness.</p>
+					<a href="/setup?mode=add-session" class="mt-5 inline-flex rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create agent</a>
 				</div>
 			{:else}
 			<!-- Queue work directly into the selected logical session. -->
@@ -174,7 +174,7 @@
 				></textarea>
 				<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
-					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this project's current agent conversation">
+					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this agent's current conversation">
 						<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 						Start a fresh conversation
 					</label>
@@ -215,7 +215,7 @@
 				</div>
 			</div>
 			{#if sendError}<p class="text-center text-sm text-destructive">{sendError}</p>{/if}
-			<div class="text-center"><a href="/agents" class="text-xs text-muted-foreground hover:text-foreground hover:underline">Manage projects</a></div>
+			<div class="text-center"><a href="/agents" class="text-xs text-muted-foreground hover:text-foreground hover:underline">Manage agents</a></div>
 			{/if}
 		</div>
 	</div>

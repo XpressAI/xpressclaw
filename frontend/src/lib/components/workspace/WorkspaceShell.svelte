@@ -3,11 +3,11 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { agents, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
-	import type { Agent, Task, Workflow } from '$lib/api';
+	import { agents, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
+	import type { Agent, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
-	import { harnessMark, timeAgo } from '$lib/utils';
+	import { agentRuntimeSummary, agentRuntimeTitle, harnessMark, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
 		describeWorkspacePath,
@@ -25,7 +25,7 @@
 	import ContextMenu from '../ContextMenu.svelte';
 	import SidebarSettings from './SidebarSettings.svelte';
 	import SidebarTasks from './SidebarTasks.svelte';
-	import SidebarWorkflows from './SidebarWorkflows.svelte';
+	import SidebarAutomations from './SidebarAutomations.svelte';
 	import WorkspacePane from './WorkspacePane.svelte';
 
 	let { children }: { children: Snippet } = $props();
@@ -57,6 +57,7 @@
 	let taskList = $state<Task[]>([]);
 	let sidebarTaskList = $state<Task[]>([]);
 	let workflowList = $state<Workflow[]>([]);
+	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 
 	let dockerAvailable = $state(true);
@@ -75,9 +76,9 @@
 	let sidebarCategory = $derived(tabCategory(focusedTab?.kind));
 	let sidebarTitle = $derived(sidebarCategory === 'tasks'
 		? 'Tasks'
-		: sidebarCategory === 'workflows'
-			? 'Workflows'
-			: sidebarCategory === 'settings' ? 'Settings' : 'Projects');
+		: sidebarCategory === 'automations'
+			? 'Automations'
+			: sidebarCategory === 'settings' ? 'Settings' : 'Agents');
 	let focusedTaskId = $derived(focusedTab?.kind === 'task' ? focusedTab.resourceId : null);
 	let focusedWorkflowId = $derived(focusedTab?.kind === 'workflow' ? focusedTab.resourceId : null);
 	let attentionTasks = $derived(taskList
@@ -96,9 +97,9 @@
 	})());
 
 	const utilityTabs: { kind: WorkspaceTabKind; label: string; href: string; icon: string }[] = [
-		{ kind: 'projects', label: 'Projects', href: '/agents', icon: 'M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772M15 6.75a3 3 0 11-6 0 3 3 0 016 0z' },
+		{ kind: 'projects', label: 'Agents', href: '/agents', icon: 'M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772M15 6.75a3 3 0 11-6 0 3 3 0 016 0z' },
 		{ kind: 'tasks', label: 'Tasks', href: '/tasks', icon: 'M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4' },
-		{ kind: 'workflows', label: 'Workflows', href: '/workflows', icon: 'M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5' },
+		{ kind: 'automations', label: 'Automations', href: '/automations', icon: 'M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5' },
 		{ kind: 'settings', label: 'Settings', href: '/settings', icon: 'M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.281z M15 12a3 3 0 11-6 0 3 3 0 016 0z' },
 	];
 
@@ -159,7 +160,7 @@
 		}
 		if (description.kind === 'project') {
 			const agent = agentList.find((candidate) => candidate.id === description.resourceId);
-			return { ...tab, ...description, title: agent?.title || agent?.name || tab.title || 'Project', status: agent ? projectStatus(agent) : tab.status };
+			return { ...tab, ...description, title: agent?.title || agent?.name || tab.title || 'Agent', status: agent ? projectStatus(agent) : tab.status };
 		}
 		if (description.kind === 'workflow') {
 			const workflow = workflowList.find((candidate) => candidate.id === description.resourceId);
@@ -412,10 +413,10 @@
 		document.addEventListener('pointerup', stop);
 	}
 
-	function tabCategory(kind: WorkspaceTabKind | undefined): 'projects' | 'tasks' | 'workflows' | 'settings' {
+	function tabCategory(kind: WorkspaceTabKind | undefined): 'projects' | 'tasks' | 'automations' | 'settings' {
 		if (kind === 'home' || kind === 'projects' || kind === 'project') return 'projects';
-		if (kind === 'tasks' || kind === 'task' || kind === 'schedules') return 'tasks';
-		if (kind === 'workflows' || kind === 'workflow' || kind === 'workflow-new') return 'workflows';
+		if (kind === 'tasks' || kind === 'task') return 'tasks';
+		if (kind === 'automations' || kind === 'schedules' || kind === 'workflows' || kind === 'workflow' || kind === 'workflow-new') return 'automations';
 		return 'settings';
 	}
 
@@ -451,16 +452,18 @@
 
 	async function loadWorkspaceSummary() {
 		try {
-			const [nextAgents, taskResult, sidebarTaskResult, nextWorkflows] = await Promise.all([
+			const [nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules] = await Promise.all([
 				agents.list().catch(() => agentList),
 				tasksApi.list().catch(() => ({ tasks: taskList })),
 				tasksApi.recentByAgent().catch(() => null),
 				workflowsApi.list().catch(() => workflowList),
+				schedulesApi.list().catch(() => scheduleList),
 			]);
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
 			sidebarTaskList = sidebarTaskResult?.tasks ?? taskResult.tasks;
 			workflowList = nextWorkflows;
+			scheduleList = nextSchedules;
 			refreshTabMetadata();
 		} catch {}
 	}
@@ -571,14 +574,14 @@
 				<a href="/" class="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground" title="New work">+</a>
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} compact />
-				{:else if sidebarCategory === 'workflows'}
-					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} compact />
+				{:else if sidebarCategory === 'automations'}
+					<SidebarAutomations {workflowList} {scheduleList} activeWorkflowId={focusedWorkflowId} compact />
 				{:else if sidebarCategory === 'settings'}
 					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} compact />
 				{:else}
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
-						<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {statusLabel(status)}">
+						<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {projectFocused(agent) ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}" title="{agent.title || agent.name} — {agentRuntimeTitle(agent)} — {statusLabel(status)}">
 							{harnessMark(agent.backend)}
 							<span class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(status)}"></span>
 						</a>
@@ -593,8 +596,8 @@
 
 				{#if sidebarCategory === 'tasks'}
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} />
-				{:else if sidebarCategory === 'workflows'}
-					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} />
+				{:else if sidebarCategory === 'automations'}
+					<SidebarAutomations {workflowList} {scheduleList} activeWorkflowId={focusedWorkflowId} />
 				{:else if sidebarCategory === 'settings'}
 					<SidebarSettings activeKind={focusedTab?.kind ?? 'settings'} />
 				{:else}
@@ -616,15 +619,15 @@
 					{/if}
 
 					<div class="mb-1.5 flex items-center justify-between px-2">
-						<span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</span>
-						<a href="/setup?mode=add-session" class="flex h-5 w-5 items-center justify-center rounded text-sm text-muted-foreground hover:bg-accent hover:text-foreground" title="Add project">+</a>
+						<span class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Agents</span>
+						<a href="/setup?mode=add-session" class="flex h-5 w-5 items-center justify-center rounded text-sm text-muted-foreground hover:bg-accent hover:text-foreground" title="Add agent">+</a>
 					</div>
 					<div class="space-y-0.5">
 						{#each agentList as agent (agent.id)}
 							{@const status = projectStatus(agent)}
 							<a href="/agents/{agent.id}" oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}>
 								<span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-muted text-[10px] font-semibold">{harnessMark(agent.backend)}</span>
-								<span class="min-w-0 flex-1"><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block text-[10px] font-normal text-muted-foreground">{statusLabel(status)}</span></span>
+								<span class="min-w-0 flex-1" title={agentRuntimeTitle(agent)}><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{agentRuntimeSummary(agent)}</span></span>
 								<span class="h-2 w-2 shrink-0 rounded-full {statusDot(status)}"></span>
 							</a>
 						{/each}
@@ -647,10 +650,10 @@
 
 	<main class="flex min-w-0 flex-1 flex-col overflow-hidden pb-16 md:pb-0">
 		<div class="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background/95 px-3 backdrop-blur md:hidden">
-			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open project switcher" class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
+			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open agent switcher" class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
 				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
 			</button>
-			<div class="min-w-0 flex-1"><div class="truncate text-sm font-semibold">{focusedTab?.title || focusedProject?.title || focusedProject?.name || 'xpressclaw'}</div>{#if focusedProject}<div class="flex items-center gap-1.5 text-[10px] text-muted-foreground"><span class="h-1.5 w-1.5 rounded-full {statusDot(projectStatus(focusedProject))}"></span>{statusLabel(projectStatus(focusedProject))}</div>{/if}</div>
+			<div class="min-w-0 flex-1"><div class="truncate text-sm font-semibold">{focusedTab?.title || focusedProject?.title || focusedProject?.name || 'xpressclaw'}</div>{#if focusedProject}<div class="flex min-w-0 items-center gap-1.5 text-[10px] text-muted-foreground" title={agentRuntimeTitle(focusedProject)}><span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(projectStatus(focusedProject))}"></span><span class="truncate">{agentRuntimeSummary(focusedProject)}</span></div>{/if}</div>
 			<a href="/" aria-label="New work" class="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-lg text-primary-foreground">+</a>
 		</div>
 
@@ -700,7 +703,7 @@
 
 {#if mobileMenuOpen}
 	<div class="fixed inset-0 z-50 md:hidden">
-		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close project switcher" onclick={() => (mobileMenuOpen = false)}></button>
+		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close agent switcher" onclick={() => (mobileMenuOpen = false)}></button>
 		<aside class="absolute inset-y-0 left-0 flex min-h-0 w-[min(88vw,22rem)] flex-col overflow-hidden border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
 			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
 			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
@@ -708,9 +711,9 @@
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
 					<SidebarTasks {agentList} taskList={sidebarTaskList} activeTaskId={focusedTaskId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
-			{:else if sidebarCategory === 'workflows'}
+			{:else if sidebarCategory === 'automations'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
-					<SidebarWorkflows {workflowList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
+					<SidebarAutomations {workflowList} {scheduleList} activeWorkflowId={focusedWorkflowId} showHeading={false} onnavigate={() => (mobileMenuOpen = false)} />
 				</div>
 			{:else if sidebarCategory === 'settings'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">
@@ -720,14 +723,14 @@
 				{#if attentionTasks.length > 0}
 					<div class="mb-4 shrink-0"><div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-400">Needs you</div>{#each attentionTasks.slice(0, 5) as task (task.id)}<a href="/tasks/{task.id}" onclick={() => (mobileMenuOpen = false)} class="flex items-center gap-2 rounded-lg px-2 py-2 hover:bg-accent"><span class="h-2 w-2 rounded-full {task.status === 'blocked' ? 'bg-red-500' : 'bg-orange-500'}"></span><span class="min-w-0 flex-1 truncate text-sm">{task.title}</span></a>{/each}</div>
 				{/if}
-				<div class="mb-1 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Projects</div>
+				<div class="mb-1 shrink-0 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Agents</div>
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1 space-y-1">
 					{#each agentList as agent (agent.id)}
 						{@const status = projectStatus(agent)}
-						<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1 truncate">{agent.title || agent.name}</span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
+						<a href="/agents/{agent.id}" onclick={() => (mobileMenuOpen = false)} oncontextmenu={(event) => showProjectContextMenu(event, agent)} class={linkClass(projectFocused(agent))}><span class="flex h-7 w-7 items-center justify-center rounded-lg bg-muted text-xs font-semibold">{harnessMark(agent.backend)}</span><span class="min-w-0 flex-1" title={agentRuntimeTitle(agent)}><span class="block truncate">{agent.title || agent.name}</span><span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{agentRuntimeSummary(agent)}</span></span><span class="h-2 w-2 rounded-full {statusDot(status)}"></span></a>
 					{/each}
 				</div>
-				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 shrink-0 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add project</a>
+				<a href="/setup?mode=add-session" onclick={() => (mobileMenuOpen = false)} class="mt-3 shrink-0 rounded-lg border border-dashed border-border px-3 py-3 text-center text-sm text-muted-foreground">+ Add agent</a>
 			{/if}
 		</aside>
 	</div>
