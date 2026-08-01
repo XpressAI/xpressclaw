@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { replaceState } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
@@ -52,11 +52,7 @@
 
 		const consumedUrl = new URL($page.url);
 		consumedUrl.searchParams.delete('new');
-		void goto(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, {
-			replaceState: true,
-			keepFocus: true,
-			noScroll: true,
-		});
+		replaceState(`${consumedUrl.pathname}${consumedUrl.search}${consumedUrl.hash}`, $page.state);
 	});
 
 	onMount(async () => {
