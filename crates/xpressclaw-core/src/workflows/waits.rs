@@ -85,7 +85,10 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
 
     for execution in waiting {
         let Some(raw_state) = execution.input_context.as_deref() else {
-            warn!(execution_id = execution.id, "workflow wait has no persisted state");
+            warn!(
+                execution_id = execution.id,
+                "workflow wait has no persisted state"
+            );
             continue;
         };
         let mut state = match serde_json::from_str::<WaitState>(raw_state) {
@@ -119,9 +122,22 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
             continue;
         }
 
-        let Some(agent) = config.agents.iter().find(|agent| agent.name == state.agent_id) else {
-            warn!(execution_id = execution.id, agent_id = state.agent_id, "workflow wait agent is no longer configured");
-            defer_wait(&instances, &execution.id, &mut state, Some("the bound agent is no longer configured"))?;
+        let Some(agent) = config
+            .agents
+            .iter()
+            .find(|agent| agent.name == state.agent_id)
+        else {
+            warn!(
+                execution_id = execution.id,
+                agent_id = state.agent_id,
+                "workflow wait agent is no longer configured"
+            );
+            defer_wait(
+                &instances,
+                &execution.id,
+                &mut state,
+                Some("the bound agent is no longer configured"),
+            )?;
             continue;
         };
         let workspace = agent
@@ -132,14 +148,24 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
             .unwrap_or_else(|| config.system.workspace_dir.clone());
         let Some(access) = github::discover(db, &workspace) else {
             warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), "workflow wait cannot discover project-scoped GitHub access");
-            defer_wait(&instances, &execution.id, &mut state, Some("project-scoped GitHub access is unavailable"))?;
+            defer_wait(
+                &instances,
+                &execution.id,
+                &mut state,
+                Some("project-scoped GitHub access is unavailable"),
+            )?;
             continue;
         };
         let pull_request = match parse_pull_request(&state.resource) {
             Ok(pull_request) => pull_request,
             Err(error) => {
                 warn!(execution_id = execution.id, error = %error, "workflow wait pull-request resource is invalid");
-                defer_wait(&instances, &execution.id, &mut state, Some(&error.to_string()))?;
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some(&error.to_string()),
+                )?;
                 continue;
             }
         };
@@ -164,8 +190,16 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
         let since = match parse_timestamp(&state.started_at) {
             Some(since) => since,
             None => {
-                warn!(execution_id = execution.id, "workflow wait start timestamp is invalid");
-                defer_wait(&instances, &execution.id, &mut state, Some("the wait cursor is invalid"))?;
+                warn!(
+                    execution_id = execution.id,
+                    "workflow wait start timestamp is invalid"
+                );
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some("the wait cursor is invalid"),
+                )?;
                 continue;
             }
         };
@@ -190,7 +224,12 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
             }
             Err(error) => {
                 warn!(execution_id = execution.id, error = %error, "GitHub workflow wait poll failed");
-                defer_wait(&instances, &execution.id, &mut state, Some(&error.to_string()))?;
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some(&error.to_string()),
+                )?;
             }
         }
     }
@@ -272,10 +311,7 @@ async fn pull_request_activity(
     }
 
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    Ok(candidates
-        .into_iter()
-        .next()
-        .map(|(_, _, value)| value))
+    Ok(candidates.into_iter().next().map(|(_, _, value)| value))
 }
 
 fn push_activity(
@@ -340,9 +376,9 @@ fn parse_pull_request(value: &str) -> Result<PullRequestRef> {
         .unwrap_or(value);
     let parts: Vec<&str> = path.split('/').collect();
     if let [owner, repo, "pull", number] = parts.as_slice() {
-        let number = number.parse::<u64>().map_err(|_| {
-            Error::Workflow(format!("invalid GitHub pull-request URL '{value}'"))
-        })?;
+        let number = number
+            .parse::<u64>()
+            .map_err(|_| Error::Workflow(format!("invalid GitHub pull-request URL '{value}'")))?;
         if !owner.is_empty() && !repo.is_empty() {
             return Ok(PullRequestRef {
                 owner: (*owner).to_string(),

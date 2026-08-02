@@ -412,9 +412,8 @@ impl WorkflowDefinition {
                     }
                     // Validate nested steps in loop body
                     if let Some(ref body) = step.body {
-                        if let Some(unsupported) = body
-                            .iter()
-                            .find(|body_step| body_step.step_type != "step")
+                        if let Some(unsupported) =
+                            body.iter().find(|body_step| body_step.step_type != "step")
                         {
                             return Err(Error::Workflow(format!(
                                 "loop step '{}' in flow '{flow_name}' contains unsupported '{}' step '{}'; loop bodies currently accept agent task steps only",
@@ -462,11 +461,7 @@ impl WorkflowDefinition {
                     }
                     if let Some(target) = step.on_timeout.as_deref() {
                         self.validate_goto_target(
-                            target,
-                            step_ids,
-                            flow_names,
-                            &step.id,
-                            flow_name,
+                            target, step_ids, flow_names, &step.id, flow_name,
                         )?;
                     }
                     if let Some(timeout) = step.timeout.as_deref() {
@@ -502,12 +497,7 @@ impl WorkflowDefinition {
         Ok(())
     }
 
-    fn validate_agent_reference(
-        &self,
-        step: &Step,
-        flow_name: &str,
-        required: bool,
-    ) -> Result<()> {
+    fn validate_agent_reference(&self, step: &Step, flow_name: &str, required: bool) -> Result<()> {
         let agent = step
             .agent
             .as_deref()
@@ -652,9 +642,9 @@ impl WorkflowInput {
             WorkflowInputType::String => value.is_string(),
             WorkflowInputType::Number => value.is_number(),
             WorkflowInputType::Boolean => value.is_boolean(),
-            WorkflowInputType::Agent => value
-                .as_str()
-                .is_some_and(|agent| !agent.trim().is_empty()),
+            WorkflowInputType::Agent => {
+                value.as_str().is_some_and(|agent| !agent.trim().is_empty())
+            }
             WorkflowInputType::Json => true,
         };
         if valid {

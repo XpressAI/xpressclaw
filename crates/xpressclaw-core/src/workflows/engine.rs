@@ -168,9 +168,9 @@ impl WorkflowEngine {
                 .get_instance(instance_id)
                 .is_ok_and(|instance| matches!(instance.status.as_str(), "running" | "waiting"))
             {
-                let _ = self
-                    .instances
-                    .update_status(instance_id, "failed", Some(&error.to_string()));
+                let _ =
+                    self.instances
+                        .update_status(instance_id, "failed", Some(&error.to_string()));
             }
         }
         result
@@ -449,10 +449,8 @@ impl WorkflowEngine {
     ) -> Result<()> {
         let agent_id = self.resolve_step_agent(step, ctx)?;
         let event = step.event.as_deref().unwrap_or_default().trim().to_string();
-        let resource = context::render_template(
-            step.resource.as_deref().unwrap_or_default().trim(),
-            ctx,
-        );
+        let resource =
+            context::render_template(step.resource.as_deref().unwrap_or_default().trim(), ctx);
         if resource.starts_with('@') || resource.contains("{{") || resource.trim().is_empty() {
             return Err(Error::Workflow(format!(
                 "wait step '{}' could not resolve resource '{}'",
@@ -506,12 +504,9 @@ impl WorkflowEngine {
         };
         let state_json = serde_json::to_string(&state)
             .map_err(|error| Error::Workflow(format!("failed to persist wait state: {error}")))?;
-        let execution = self.instances.create_wait_execution(
-            instance_id,
-            flow_name,
-            &step.id,
-            &state_json,
-        )?;
+        let execution =
+            self.instances
+                .create_wait_execution(instance_id, flow_name, &step.id, &state_json)?;
         info!(
             instance_id,
             flow_name,
@@ -525,10 +520,7 @@ impl WorkflowEngine {
     }
 
     fn initial_wait_boundary(&self, instance_id: &str) -> Option<chrono::DateTime<Utc>> {
-        let executions = self
-            .instances
-            .list_step_executions(instance_id)
-            .ok()?;
+        let executions = self.instances.list_step_executions(instance_id).ok()?;
         executions
             .iter()
             .rev()
@@ -816,8 +808,7 @@ impl WorkflowEngine {
         )?;
 
         let body_step = &body[state.body_index];
-        let body_context =
-            context::build_context(trigger_data, &definition.variables, &variables);
+        let body_context = context::build_context(trigger_data, &definition.variables, &variables);
         let body_context_json =
             serde_json::to_string(&body_context).unwrap_or_else(|_| "{}".to_string());
         let execution = self.execute_task_step(
@@ -1164,11 +1155,9 @@ impl WorkflowEngine {
                 next_state.active_execution_id = None;
                 self.instances.update_loop_state(
                     &exec.instance_id,
-                    Some(
-                        &serde_json::to_string(&next_state).map_err(|error| {
-                            Error::Workflow(format!("failed to persist loop: {error}"))
-                        })?,
-                    ),
+                    Some(&serde_json::to_string(&next_state).map_err(|error| {
+                        Error::Workflow(format!("failed to persist loop: {error}"))
+                    })?),
                 )?;
                 return self.continue_loop(
                     &exec.instance_id,
@@ -1289,13 +1278,7 @@ impl WorkflowEngine {
             "completed",
             execution.output.as_deref(),
         )?;
-        self.advance_completed_wait(
-            &execution,
-            step,
-            &definition,
-            &trigger_data,
-            &variables,
-        )
+        self.advance_completed_wait(&execution, step, &definition, &trigger_data, &variables)
     }
 
     /// Advance a wait that is already durably completed. Recovery calls this
@@ -1388,7 +1371,10 @@ impl WorkflowEngine {
         for instance in &running {
             // Find the latest running step execution
             let execs = self.instances.list_step_executions(&instance.id)?;
-            if let Some(execution) = execs.iter().rfind(|execution| execution.status == "resuming") {
+            if let Some(execution) = execs
+                .iter()
+                .rfind(|execution| execution.status == "resuming")
+            {
                 if let Err(error) = self.finish_wait_execution(&execution.id) {
                     error!(instance_id = instance.id, execution_id = execution.id, error = %error, "failed to recover workflow wait");
                 }
@@ -1439,7 +1425,10 @@ impl WorkflowEngine {
                     if let Some(active_execution_id) = loop_state.active_execution_id.as_deref() {
                         match self.instances.get_step_execution(active_execution_id) {
                             Ok(body_execution)
-                                if matches!(body_execution.status.as_str(), "completed" | "failed") =>
+                                if matches!(
+                                    body_execution.status.as_str(),
+                                    "completed" | "failed"
+                                ) =>
                             {
                                 if let Some(task_id) = body_execution.task_id.as_deref() {
                                     let output = body_execution
@@ -1511,9 +1500,16 @@ impl WorkflowEngine {
                     continue;
                 }
             };
-            let current_step = usize::try_from(instance.current_step_index)
-                .ok()
-                .and_then(|index| definition.flows.get(&instance.current_flow)?.steps.get(index));
+            let current_step =
+                usize::try_from(instance.current_step_index)
+                    .ok()
+                    .and_then(|index| {
+                        definition
+                            .flows
+                            .get(&instance.current_flow)?
+                            .steps
+                            .get(index)
+                    });
             let Some(step) = current_step.filter(|step| step.step_type == "wait") else {
                 continue;
             };
@@ -1530,13 +1526,9 @@ impl WorkflowEngine {
                 .and_then(|value| serde_json::from_str(value).ok())
                 .unwrap_or(Value::Null);
             let variables = self.load_variable_store(&instance.id)?;
-            if let Err(error) = self.advance_completed_wait(
-                execution,
-                step,
-                &definition,
-                &trigger_data,
-                &variables,
-            ) {
+            if let Err(error) =
+                self.advance_completed_wait(execution, step, &definition, &trigger_data, &variables)
+            {
                 error!(
                     instance_id = instance.id.as_str(),
                     execution_id = execution.id.as_str(),
@@ -2730,9 +2722,13 @@ flows:
             .find(|execution| execution.step_id == "wait_for_review")
             .unwrap();
         assert_eq!(wait.status, "waiting");
-        let state: WaitState = serde_json::from_str(wait.input_context.as_deref().unwrap()).unwrap();
+        let state: WaitState =
+            serde_json::from_str(wait.input_context.as_deref().unwrap()).unwrap();
         assert_eq!(state.agent_id, "project-a");
-        assert_eq!(state.resource, "https://github.com/XpressAI/xpressclaw/pull/143");
+        assert_eq!(
+            state.resource,
+            "https://github.com/XpressAI/xpressclaw/pull/143"
+        );
 
         assert!(engine
             .instances
@@ -2876,8 +2872,14 @@ flows:
             .unwrap();
         let first_review = running_task("review");
         let first_review_task = TaskBoard::new(db.clone()).get(&first_review).unwrap();
-        assert_eq!(first_review_task.agent_id.as_deref(), Some("review-context"));
-        assert_eq!(first_review_task.context.as_ref().unwrap()["session_mode"], "new");
+        assert_eq!(
+            first_review_task.agent_id.as_deref(),
+            Some("review-context")
+        );
+        assert_eq!(
+            first_review_task.context.as_ref().unwrap()["session_mode"],
+            "new"
+        );
         assert!(first_review_task
             .description
             .as_deref()
@@ -2943,7 +2945,10 @@ flows:
             .and_then(|execution| execution.started_at)
             .and_then(|timestamp| parse_database_timestamp(&timestamp))
             .unwrap();
-        assert_eq!(first_wait_state.started_at, mark_ready_started_at.to_rfc3339());
+        assert_eq!(
+            first_wait_state.started_at,
+            mark_ready_started_at.to_rfc3339()
+        );
         let event = json!({
             "kind": "review_comment",
             "id": 42,
@@ -3013,7 +3018,9 @@ flows:
         // committed but immediately before the downstream task was created.
         let mut variables = engine.load_variable_store(&instance_id).unwrap();
         variables.insert(wait.step_id.clone(), payload);
-        engine.save_variable_store(&instance_id, &variables).unwrap();
+        engine
+            .save_variable_store(&instance_id, &variables)
+            .unwrap();
         engine
             .instances
             .update_step_status(&wait.id, "completed", Some(&payload_json))
@@ -3034,7 +3041,10 @@ flows:
         let task = TaskBoard::new(db)
             .get(response.task_id.as_deref().unwrap())
             .unwrap();
-        assert_eq!(task.description.as_deref(), Some("Respond to Please add coverage"));
+        assert_eq!(
+            task.description.as_deref(),
+            Some("Respond to Please add coverage")
+        );
     }
 
     #[test]
@@ -3123,7 +3133,11 @@ flows:
             .unwrap();
         assert_eq!(first_task.description.as_deref(), Some("Handle: a"));
         engine
-            .on_task_completed(first_handle.task_id.as_deref().unwrap(), "completed", "a done")
+            .on_task_completed(
+                first_handle.task_id.as_deref().unwrap(),
+                "completed",
+                "a done",
+            )
             .unwrap();
 
         let second_handle = engine
