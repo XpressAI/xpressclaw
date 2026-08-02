@@ -12,12 +12,16 @@ use crate::error::{Error, Result};
 pub struct WorkflowInstance {
     pub id: String,
     pub workflow_id: String,
-    pub status: String, // running, completed, failed, cancelled
+    pub status: String, // running, waiting, completed, failed, cancelled
     pub current_flow: String,
     pub current_step_index: i32,
     pub trigger_data: Option<String>, // JSON
     pub variable_store: String,       // JSON
     pub loop_state: Option<String>,   // JSON
+    /// Immutable definition snapshot for this run. Older instances created
+    /// before schema v31 fall back to the workflow's current definition.
+    #[serde(skip_serializing)]
+    pub definition_yaml: Option<String>,
     pub started_at: String,
     pub completed_at: Option<String>,
     pub error_message: Option<String>,
@@ -31,7 +35,7 @@ pub struct StepExecution {
     pub flow_name: String,
     pub step_id: String,
     pub task_id: Option<String>,
-    pub status: String, // pending, running, completed, failed, skipped
+    pub status: String, // pending, running, waiting, resuming, completed, failed, skipped
     pub input_context: Option<String>,
     pub output: Option<String>,
     pub attempt: i32,
@@ -56,6 +60,17 @@ impl InstanceManager {
         trigger_data: Option<&str>,
         variables_json: Option<&str>,
     ) -> Result<WorkflowInstance> {
+        self.create_instance_with_definition(workflow_id, trigger_data, variables_json, None)
+    }
+
+    /// Create a workflow run pinned to an immutable definition snapshot.
+    pub fn create_instance_with_definition(
+        &self,
+        workflow_id: &str,
+        trigger_data: Option<&str>,
+        variables_json: Option<&str>,
+        definition_yaml: Option<&str>,
+    ) -> Result<WorkflowInstance> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -65,9 +80,9 @@ impl InstanceManager {
 
         self.db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO workflow_instances (id, workflow_id, status, current_flow, current_step_index, trigger_data, variable_store, started_at)
-                 VALUES (?1, ?2, 'running', 'main', 0, ?3, ?4, ?5)",
-                rusqlite::params![id, workflow_id, trigger_data, var_store, now],
+                "INSERT INTO workflow_instances (id, workflow_id, status, current_flow, current_step_index, trigger_data, variable_store, started_at, definition_yaml)
+                 VALUES (?1, ?2, 'running', 'main', 0, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, workflow_id, trigger_data, var_store, now, definition_yaml],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -108,11 +123,11 @@ impl InstanceManager {
         })
     }
 
-    /// List all running workflow instances.
+    /// List all active workflow instances, including durable event waits.
     pub fn list_running_instances(&self) -> Result<Vec<WorkflowInstance>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn
-                .prepare("SELECT * FROM workflow_instances WHERE status = 'running' ORDER BY started_at ASC")
+                .prepare("SELECT * FROM workflow_instances WHERE status IN ('running', 'waiting') ORDER BY started_at ASC")
                 .map_err(|e| Error::Database(e.to_string()))?;
 
             let records = stmt
@@ -123,6 +138,19 @@ impl InstanceManager {
 
             Ok(records)
         })
+    }
+
+    /// Change between non-terminal runtime states without recording a
+    /// completion timestamp.
+    pub fn set_active_status(&self, id: &str, status: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET status = ?1, completed_at = NULL, error_message = NULL WHERE id = ?2",
+                rusqlite::params![status, id],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
     }
 
     /// Update the status of a workflow instance.
@@ -236,8 +264,58 @@ impl InstanceManager {
         self.get_step_execution(&id)
     }
 
+    /// Atomically persist a durable wait and put its instance to sleep. This
+    /// avoids a crash window where a pending execution exists but neither the
+    /// worker recovery path nor the wait poller owns it.
+    pub fn create_wait_execution(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        wait_state: &str,
+    ) -> Result<StepExecution> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        self.db.with_conn(|conn| -> Result<()> {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|error| Error::Database(error.to_string()))?;
+            let attempt = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
+                    rusqlite::params![instance_id, step_id],
+                    |row| row.get::<_, i32>(0),
+                )
+                .map_err(|error| Error::Database(error.to_string()))?
+                + 1;
+            transaction
+                .execute(
+                    "INSERT INTO workflow_step_executions (id, instance_id, flow_name, step_id, status, input_context, attempt, started_at)
+                     VALUES (?1, ?2, ?3, ?4, 'waiting', ?5, ?6, ?7)",
+                    rusqlite::params![id, instance_id, flow_name, step_id, wait_state, attempt, now],
+                )
+                .map_err(|error| Error::Database(error.to_string()))?;
+            transaction
+                .execute(
+                    "UPDATE workflow_instances SET status = 'waiting', completed_at = NULL, error_message = NULL WHERE id = ?1",
+                    [instance_id],
+                )
+                .map_err(|error| Error::Database(error.to_string()))?;
+            transaction
+                .commit()
+                .map_err(|error| Error::Database(error.to_string()))?;
+            Ok(())
+        })?;
+
+        self.get_step_execution(&id)
+    }
+
     /// Get a step execution by ID.
-    fn get_step_execution(&self, id: &str) -> Result<StepExecution> {
+    pub fn get_step_execution(&self, id: &str) -> Result<StepExecution> {
         self.db.with_conn(|conn| {
             let mut stmt = conn
                 .prepare("SELECT * FROM workflow_step_executions WHERE id = ?1")
@@ -281,6 +359,35 @@ impl InstanceManager {
         Ok(())
     }
 
+    /// Atomically claim a wait for resumption and persist the event before
+    /// advancing the workflow. A `resuming` execution is replayed by recovery
+    /// after a crash, while competing pollers can no longer claim it twice.
+    pub fn claim_wait(&self, id: &str, output: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_step_executions SET status = 'resuming', output = ?1
+                 WHERE id = ?2 AND status = 'waiting'",
+                rusqlite::params![output, id],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|e| Error::Database(e.to_string()))
+        })
+    }
+
+    /// Persist wait-provider cursor, health, and adaptive polling state while
+    /// leaving a concurrently claimed execution untouched.
+    pub fn update_wait_state(&self, id: &str, wait_state: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_step_executions SET input_context = ?1
+                 WHERE id = ?2 AND status = 'waiting'",
+                rusqlite::params![wait_state, id],
+            )
+            .map_err(|error| Error::Database(error.to_string()))
+        })?;
+        Ok(())
+    }
+
     /// Link a step execution to a task.
     pub fn set_step_task(&self, execution_id: &str, task_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
@@ -294,12 +401,23 @@ impl InstanceManager {
         Ok(())
     }
 
+    pub fn mark_step_running(&self, execution_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_step_executions SET status = 'running' WHERE id = ?1",
+                [execution_id],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
+    }
+
     /// List all step executions for a workflow instance.
     pub fn list_step_executions(&self, instance_id: &str) -> Result<Vec<StepExecution>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT * FROM workflow_step_executions WHERE instance_id = ?1 ORDER BY started_at ASC",
+                    "SELECT * FROM workflow_step_executions WHERE instance_id = ?1 ORDER BY started_at ASC, rowid ASC",
                 )
                 .map_err(|e| Error::Database(e.to_string()))?;
 
@@ -309,6 +427,26 @@ impl InstanceManager {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            Ok(records)
+        })
+    }
+
+    /// List durable waits across all running workflow instances.
+    pub fn list_waiting_step_executions(&self) -> Result<Vec<StepExecution>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT e.* FROM workflow_step_executions e
+                     JOIN workflow_instances i ON i.id = e.instance_id
+                     WHERE e.status = 'waiting' AND i.status IN ('running', 'waiting')
+                     ORDER BY e.started_at ASC",
+                )
+                .map_err(|e| Error::Database(e.to_string()))?;
+            let records = stmt
+                .query_map([], |row| Ok(row_to_step_execution(row)))
+                .map_err(|e| Error::Database(e.to_string()))?
+                .filter_map(|record| record.ok())
+                .collect();
             Ok(records)
         })
     }
@@ -342,6 +480,7 @@ fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
             .get("variable_store")
             .unwrap_or_else(|_| "{}".to_string()),
         loop_state: row.get("loop_state").unwrap_or_default(),
+        definition_yaml: row.get("definition_yaml").unwrap_or_default(),
         started_at: row.get("started_at").unwrap_or_default(),
         completed_at: row.get("completed_at").unwrap_or_default(),
         error_message: row.get("error_message").unwrap_or_default(),

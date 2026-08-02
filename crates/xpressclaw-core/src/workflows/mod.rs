@@ -5,3 +5,4 @@ pub mod engine;
 pub mod instance;
 pub mod manager;
 pub mod scheduler;
+pub mod waits;

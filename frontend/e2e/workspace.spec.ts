@@ -743,7 +743,7 @@ test('new-work drafts restore the agent they were written for', async ({ page })
 	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
 });
 
-test('new work can run a compatible workflow for the selected agent', async ({ page }) => {
+test('new work binds reusable workflow agent roles across projects', async ({ page }) => {
 	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
 	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
 	await mockApi(page, {
@@ -759,14 +759,21 @@ inputs:
   goal:
     type: string
     required: true
+  implementer:
+    type: agent
+    required: true
+    primary: true
+  reviewer:
+    type: agent
+    required: true
 flows:
   main:
     steps:
       - id: implement
-        agent: ${agentId}
+        agent: "@implementer"
         prompt: "Implement @goal"
       - id: review
-        agent: project-secondary-test
+        agent: "@reviewer"
         prompt: "Review @goal"
 `,
 			enabled: true,
@@ -786,13 +793,14 @@ flows:
 	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);
 
 	await workflowPicker.selectOption('workflow-review-loop');
-	await expect(page.getByText("The workflow controls each step's agent and conversation context.")).toBeVisible();
+	await expect(page.getByText('Bind each workflow role for this run. The definition is reusable across projects.')).toBeVisible();
+	await expect(page.getByLabel('Agent role reviewer')).toHaveValue('project-secondary-test');
 	await agentPicker.selectOption('project-secondary-test');
-	await expect(workflowPicker).toHaveValue('');
-	await expect(workflowPicker.locator('option')).toHaveText(['No workflow']);
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);
 
 	await agentPicker.selectOption(agentId);
-	await workflowPicker.selectOption('workflow-review-loop');
+	await page.getByLabel('Agent role reviewer').selectOption('project-secondary-test');
 	await page.getByPlaceholder('Describe the outcome you want…').fill('Add workflow selection to New Work');
 	await page.reload();
 	await expect(agentPicker).toHaveValue(agentId);
@@ -802,7 +810,11 @@ flows:
 
 	await expect.poll(() => workflowRunRequests).toEqual([{
 		id: 'workflow-review-loop',
-		inputs: { goal: 'Add workflow selection to New Work' },
+		inputs: {
+			goal: 'Add workflow selection to New Work',
+			implementer: agentId,
+			reviewer: 'project-secondary-test',
+		},
 	}]);
 	expect(queuedSessionMessages).toEqual([]);
 	await expect(page).toHaveURL(`/tasks/${taskId}`);
@@ -1470,25 +1482,52 @@ test('the new-schedule sidebar shortcut remains reusable after cancellation and 
 	await expect(page).toHaveURL('/automations#schedules');
 });
 
-test('goal-loop workflow template is bounded and uses the selected agent', async ({ page }) => {
+test('goal-loop workflow template is bounded and reusable across agents', async ({ page }) => {
 	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
 	await mockApi(page, { workflowCreateRequests });
 	await page.goto('/workflows/new');
 
 	await page.getByRole('button', { name: /Goal loop/ }).click();
-	await expect(page.getByLabel('Working agent')).toHaveValue(agentId);
+	await expect(page.getByText('Each run chooses the worker agent, so this definition can be reused with any project context.')).toBeVisible();
 	await page.getByRole('button', { name: 'Create workflow' }).click();
 
 	await expect.poll(() => workflowCreateRequests.length).toBe(1);
 	const created = workflowCreateRequests[0];
 	expect(created.name).toBe('Goal Loop');
 	expect(created.description).toContain('bounded loop');
-	expect(created.yaml_content).toContain(`agent: ${JSON.stringify(agentId)}`);
+	expect(created.yaml_content).toContain('type: agent');
+	expect(created.yaml_content).toContain('primary: true');
+	expect(created.yaml_content).toContain('agent: "@worker"');
 	expect(created.yaml_content).toContain('switch: "@pursue_goal.status"');
 	expect(created.yaml_content).toContain('goto: step pursue_goal');
 	expect(created.yaml_content).toContain('inputs:');
 	expect(created.yaml_content).toContain('required: true');
 	await expect(page).toHaveURL('/workflows/workflow-created');
+});
+
+test('code-review template waits durably for human GitHub activity', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const yaml = workflowCreateRequests[0].yaml_content;
+	expect(yaml).toContain('implementer:\n    type: agent');
+	expect(yaml).toContain('reviewer:\n    type: agent');
+	expect(yaml).toContain('agent: "@implementer"');
+	expect(yaml).toContain('agent: "@reviewer"');
+	expect(yaml).toContain('new_session: true');
+	expect(yaml).toContain('create or\n          update a DRAFT GitHub pull request');
+	expect(yaml).toContain('Independently review the actual pull request at:');
+	expect(yaml).toContain('@implement.pull_request_url');
+	expect(yaml).toContain('id: revise');
+	expect(yaml).toContain('target: step review');
+	expect(yaml).toContain('type: wait');
+	expect(yaml).toContain('event: github.pull_request.activity');
+	expect(yaml).toContain('resource: "@mark_ready.pull_request_url"');
+	expect(yaml).toContain('on_timeout: flow timed_out');
+	expect(yaml).toContain('goto: step wait_for_review');
 });
 
 test('workflows can be run with typed inputs and show their automatic trigger', async ({ page }) => {
@@ -1510,17 +1549,22 @@ inputs:
     default: 2
   options:
     type: json
+  worker:
+    type: agent
+    required: true
+    primary: true
 variables:
   internal_retry_delay: 30
 schedule:
   cron: "0 9 * * 1"
   inputs:
     goal: Weekly release report
+    worker: ${agentId}
 flows:
   main:
     steps:
       - id: report
-        agent: ${agentId}
+        agent: "@worker"
         prompt: "Build @goal with @options"
 `,
 			enabled: true,
@@ -1536,7 +1580,7 @@ flows:
 	await page.goto('/automations');
 	const card = page.locator('[data-workflow-card]');
 	await expect(card).toContainText('Scheduled · 0 9 * * 1');
-	await expect(card).toContainText('3 inputs');
+	await expect(card).toContainText('4 inputs');
 	await expect(card).toContainText('1 flow');
 	await card.getByRole('link', { name: 'Run' }).click();
 
@@ -1546,11 +1590,12 @@ flows:
 	await page.getByLabel(/goal/i).fill('Prepare version 0.3');
 	await expect(page.getByLabel(/retries/i)).toHaveValue('2');
 	await page.getByLabel(/options/i).fill('{"include_ci":true}');
+	await expect(page.getByLabel(/worker/i)).toHaveValue(agentId);
 	await page.getByRole('button', { name: 'Start workflow' }).click();
 
 	await expect.poll(() => workflowRunRequests).toEqual([{
 		id: 'workflow-report',
-		inputs: { goal: 'Prepare version 0.3', retries: 2, options: { include_ci: true } },
+		inputs: { goal: 'Prepare version 0.3', retries: 2, options: { include_ci: true }, worker: agentId },
 	}]);
 });
 

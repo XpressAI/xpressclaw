@@ -67,6 +67,47 @@ impl GithubSessionAccess {
             EnvVariable::new("NO_COLOR", "1"),
         ]))
     }
+
+    /// Read every page of one repository-relative GitHub REST collection.
+    /// The path is joined beneath the already-scoped owner/repository, and
+    /// credentials never leave this module.
+    pub async fn api_get_pages(&self, path: &str) -> Result<Vec<Value>> {
+        let path = path.trim_start_matches('/');
+        if path.contains("..") || path.contains("//") {
+            return Err(Error::Backend("invalid GitHub API path".into()));
+        }
+        let client = reqwest::Client::new();
+        let mut values = Vec::new();
+        // Pull-request review threads can exceed one page. A high finite cap
+        // avoids an unbounded poll if GitHub returns a malformed response.
+        for page in 1..=100 {
+            let url = format!(
+                "https://api.github.com/repos/{}/{}/{path}?per_page=100&page={page}",
+                self.owner, self.repo
+            );
+            let response = client
+                .get(url)
+                .bearer_auth(&self.token)
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header(reqwest::header::USER_AGENT, "xpressclaw-workflow-wait")
+                .send()
+                .await
+                .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?
+                .error_for_status()
+                .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?;
+            let page_values = response
+                .json::<Vec<Value>>()
+                .await
+                .map_err(|error| Error::Backend(format!("invalid GitHub response: {error}")))?;
+            let page_len = page_values.len();
+            values.extend(page_values);
+            if page_len < 100 {
+                break;
+            }
+        }
+        Ok(values)
+    }
 }
 
 /// Discover GitHub access for the repository mounted into a worker.

@@ -719,6 +719,10 @@ export interface WorkflowInstance {
 	started_at: string;
 	completed_at: string | null;
 	error_message: string | null;
+	wait_event?: string | null;
+	wait_resource?: string | null;
+	wait_next_poll_at?: string | null;
+	wait_error?: string | null;
 	step_executions?: StepExecution[];
 }
 

@@ -7,6 +7,7 @@
 	import WhenBlock from '$lib/components/blocks/WhenBlock.svelte';
 	import LoopBlock from '$lib/components/blocks/LoopBlock.svelte';
 	import JumpBlock from '$lib/components/blocks/JumpBlock.svelte';
+	import WaitBlock from '$lib/components/blocks/WaitBlock.svelte';
 	import BlockConnector from '$lib/components/blocks/BlockConnector.svelte';
 	import WorkflowConfiguration from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import type { WorkflowInputDefinition, WorkflowScheduleDefinition } from '$lib/components/blocks/WorkflowConfiguration.svelte';
@@ -23,7 +24,7 @@
 
 	interface Block {
 		id: string;
-		type: 'trigger' | 'step' | 'when' | 'loop' | 'sink' | 'jump';
+		type: 'trigger' | 'step' | 'when' | 'loop' | 'sink' | 'jump' | 'wait';
 		label: string;
 		agent?: string; prompt?: string; command?: string; procedure?: string;
 		sessionConfig?: Record<string, string | boolean>; newSession?: boolean;
@@ -37,6 +38,7 @@
 		overVar?: string; asVar?: string;
 		children?: Block[];
 		target?: string;
+		resource?: string; timeout?: string; onTimeout?: string;
 		expanded: boolean;
 	}
 
@@ -76,6 +78,9 @@
 	let runFieldNames = $derived(
 		Object.keys(inputDefs).length > 0 ? Object.keys(inputDefs) : Object.keys(globalVars)
 	);
+	let agentRoles = $derived(Object.entries(inputDefs)
+		.filter(([, definition]) => definition.type === 'agent')
+		.map(([name, definition]) => ({ name, description: definition.description })));
 	let hasDisabledConnectorAutomation = $derived(
 		Boolean(triggerConfig) || Object.values(flows).some((flow) => blocksUseConnectors(flow.blocks))
 	);
@@ -134,6 +139,10 @@
 		if (type === 'when') { block.switchVar = s.switch; block.arms = s.arms; }
 		if (type === 'loop') { block.overVar = s.over; block.asVar = s.as; block.children = (s.steps || s.body || []).map(stepToBlock); }
 		if (type === 'jump') { block.target = s.target; }
+		if (type === 'wait') {
+			block.agent = s.agent; block.event = s.event; block.resource = s.resource;
+			block.timeout = s.timeout; block.onTimeout = s.on_timeout;
+		}
 		return block;
 	}
 
@@ -178,6 +187,13 @@
 		if (b.type === 'when') { s.switch = b.switchVar ?? ''; s.arms = b.arms ?? []; }
 		if (b.type === 'loop') { s.over = b.overVar ?? ''; s.as = b.asVar ?? 'item'; s.steps = (b.children ?? []).map(blockToStep); }
 		if (b.type === 'jump') s.target = b.target ?? '';
+		if (b.type === 'wait') {
+			s.agent = b.agent ?? '';
+			s.event = b.event ?? 'github.pull_request.activity';
+			s.resource = b.resource ?? '';
+			if (b.timeout) s.timeout = b.timeout;
+			if (b.onTimeout) s.on_timeout = b.onTimeout;
+		}
 		return s;
 	}
 
@@ -296,7 +312,8 @@
 	function initialRunInputs(definitions: Record<string, WorkflowInputDefinition>, variables: Record<string, unknown>): Record<string, string> {
 		const values: Record<string, string> = {};
 		for (const [name, definition] of Object.entries(definitions)) {
-			values[name] = displayRunValue(definition.default, definition.type);
+			const initial = definition.default ?? (definition.type === 'agent' && definition.required ? agentList[0]?.id : undefined);
+			values[name] = displayRunValue(initial, definition.type);
 		}
 		if (Object.keys(definitions).length === 0) {
 			for (const [name, value] of Object.entries(variables)) {
@@ -418,6 +435,7 @@
 			case 'when': label = 'Condition'; break;
 			case 'loop': label = 'For Each'; break;
 			case 'jump': label = 'Jump'; break;
+			case 'wait': label = 'Wait for review'; break;
 			default: return;
 		}
 		id = slugify(label);
@@ -432,6 +450,7 @@
 				arms: [{ match: 'approved', continue: true }, { match: 'rejected', goto: 'step ' }] }; break;
 			case 'loop': block = { id, type, label, overVar: '', asVar: 'item', children: [], expanded: true }; break;
 			case 'jump': block = { id, type, label, target: '', expanded: true }; break;
+			case 'wait': block = { id, type, label, agent: '', event: 'github.pull_request.activity', resource: '', timeout: '14d', expanded: true }; break;
 			default: return;
 		}
 		const blocks = [...(flows[currentFlow]?.blocks ?? [])];
@@ -444,6 +463,18 @@
 		const blocks = [...(flows[flowName]?.blocks ?? [])];
 		blocks[idx] = { ...blocks[idx], ...updates } as Block;
 		flows = { ...flows, [flowName]: { ...flows[flowName], blocks } };
+	}
+
+	function renameInputReferences(oldName: string, newName: string) {
+		const replace = (blocks: Block[]): Block[] => blocks.map((block) => ({
+			...block,
+			agent: block.agent === `@${oldName}` ? `@${newName}` : block.agent,
+			children: block.children ? replace(block.children) : block.children,
+		}));
+		flows = Object.fromEntries(Object.entries(flows).map(([name, flow]) => [
+			name,
+			{ ...flow, blocks: replace(flow.blocks) },
+		]));
 	}
 
 	function removeBlock(flowName: string, idx: number) {
@@ -503,6 +534,11 @@
 			if (b.outputs) {
 				for (const [name, schema] of Object.entries(b.outputs)) {
 					vars.push({ name: `${b.id}.${name}`, type: schema.type || 'any', source: b.label });
+				}
+			}
+			if (b.type === 'wait') {
+				for (const name of ['kind', 'author', 'state', 'body', 'url', 'created_at', 'cursor']) {
+					vars.push({ name: `${b.id}.${name}`, type: 'string', source: b.label });
 				}
 			}
 			// Include loop iteration variable if this block is the loop we're inside
@@ -739,7 +775,9 @@
 				<WorkflowConfiguration
 					inputs={inputDefs}
 					schedule={scheduleConfig}
+					{agentList}
 					onupdate={(inputs, schedule) => { inputDefs = inputs; scheduleConfig = schedule; }}
+					onrename={renameInputReferences}
 					onvalidationchange={(message) => { configurationError = message; }}
 				/>
 				<div class="flex"><div class="w-10"></div><BlockConnector /></div>
@@ -790,6 +828,7 @@
 								outputs={block.outputs || {}}
 								expanded={block.expanded} compact={compactView}
 								{agentList}
+								{agentRoles}
 								capabilities={harnessCapabilities[block.agent || '']}
 								onupdate={(u) => updateBlock(currentFlow, idx, u)}
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
@@ -839,7 +878,7 @@
 							<StepBlock label={child.label} agent={child.agent || ''} prompt={child.prompt || ''} command={child.command || ''} outputs={child.outputs || {}}
 								sessionConfig={child.sessionConfig || {}} newSession={child.newSession || false}
 								mcpServer={child.mcpServer || ''} mcpTool={child.mcpTool || ''} mcpArguments={child.mcpArguments || ''}
-													expanded={child.expanded} compact={compactView} {agentList}
+											expanded={child.expanded} compact={compactView} {agentList} {agentRoles}
 													capabilities={harnessCapabilities[child.agent || '']}
 														onupdate={childUpdate} ontoggle={childToggle} onremove={childRemove}
 													/>
@@ -891,6 +930,15 @@
 								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
 								onremove={() => removeBlock(currentFlow, idx)}
 							/>
+						{:else if block.type === 'wait'}
+							<WaitBlock
+								label={block.label} agent={block.agent || ''} event={block.event || 'github.pull_request.activity'}
+								resource={block.resource || ''} timeout={block.timeout || ''} onTimeout={block.onTimeout || ''}
+								expanded={block.expanded} compact={compactView} {agentList} {agentRoles} {flowNames}
+								onupdate={(u) => updateBlock(currentFlow, idx, u)}
+								ontoggle={() => updateBlock(currentFlow, idx, { expanded: !block.expanded })}
+								onremove={() => removeBlock(currentFlow, idx)}
+							/>
 						{/if}
 					</div>
 				</div>
@@ -927,6 +975,10 @@
 						class="rounded-lg border border-dashed border-border hover:border-indigo-500/50 hover:bg-indigo-950/20 px-3 py-2 text-xs text-muted-foreground hover:text-indigo-300 transition-all flex items-center gap-1.5">
 						<svg class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" /></svg>
 						Jump
+					</button>
+					<button onclick={() => addBlock('wait')}
+						class="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground transition-all hover:border-cyan-500/50 hover:bg-cyan-950/20 hover:text-cyan-300">
+						Wait for event
 					</button>
 				</div>
 			</div>
@@ -967,10 +1019,15 @@
 							<tr class="border-b border-border/20 hover:bg-accent/30">
 								<td class="px-4 py-1.5 font-mono text-muted-foreground">{inst.id.slice(0, 8)}</td>
 								<td class="px-4 py-1.5">
-									<span class="inline-flex items-center gap-1">
-										<span class="h-1.5 w-1.5 rounded-full {inst.status === 'running' ? 'bg-blue-400 animate-pulse' : inst.status === 'completed' ? 'bg-emerald-400' : inst.status === 'failed' ? 'bg-red-400' : 'bg-muted-foreground'}"></span>
+									<span class="inline-flex items-center gap-1" title={inst.wait_resource || undefined}>
+										<span class="h-1.5 w-1.5 rounded-full {inst.status === 'running' ? 'bg-blue-400 animate-pulse' : inst.status === 'waiting' ? 'bg-cyan-400' : inst.status === 'completed' ? 'bg-emerald-400' : inst.status === 'failed' ? 'bg-red-400' : 'bg-muted-foreground'}"></span>
 										{inst.status}
 									</span>
+									{#if inst.wait_error}
+										<div class="max-w-64 truncate text-[9px] text-red-400" title={inst.wait_error}>{inst.wait_error}</div>
+									{:else if inst.status === 'waiting' && inst.wait_event}
+										<div class="max-w-64 truncate text-[9px] text-muted-foreground">{inst.wait_event.replace('github.pull_request.', 'PR ')}</div>
+									{/if}
 								</td>
 								<td class="px-4 py-1.5">
 									<span class="inline-flex items-center gap-1">
@@ -981,7 +1038,7 @@
 								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_step_index}</td>
 								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
 								<td class="px-4 py-1.5 text-right">
-									{#if inst.status === 'running'}
+									{#if inst.status === 'running' || inst.status === 'waiting'}
 										<button onclick={async () => { await workflows.cancelInstance(inst.id); loadInstances(); }}
 											class="text-[10px] text-muted-foreground hover:text-destructive">Cancel</button>
 									{/if}
@@ -1009,7 +1066,12 @@
 								{#if definition}<span class="ml-auto font-mono text-[10px] font-normal">{definition.type}</span>{/if}
 							</label>
 							{#if definition?.description}<p class="mb-1 text-[10px] text-muted-foreground">{definition.description}</p>{/if}
-							{#if definition?.type === 'boolean'}
+							{#if definition?.type === 'agent'}
+								<select id="run-input-{key}" value={runInputs[key] ?? ''} onchange={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+									<option value="">{definition.required ? 'Select an agent…' : 'Use default'}</option>
+									{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+								</select>
+							{:else if definition?.type === 'boolean'}
 								<select id="run-input-{key}" value={runInputs[key] ?? ''} onchange={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
 									<option value="">Use default</option><option value="true">Yes</option><option value="false">No</option>
 								</select>
