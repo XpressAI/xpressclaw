@@ -701,6 +701,9 @@ export interface Workflow {
 	version: number;
 	created_at: string;
 	updated_at: string;
+	last_triggered_at: string | null;
+	trigger_count: number;
+	trigger_error: string | null;
 }
 
 export interface WorkflowInstance {

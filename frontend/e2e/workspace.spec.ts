@@ -104,6 +104,9 @@ async function mockApi(
 			version: number;
 			created_at: string;
 			updated_at: string;
+			last_triggered_at?: string | null;
+			trigger_count?: number;
+			trigger_error?: string | null;
 		}[];
 		schedules?: {
 			id: string;
@@ -121,6 +124,7 @@ async function mockApi(
 			continuation_task_id: string | null;
 		}[];
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
+		workflowRunRequests?: { id: string; inputs: Record<string, unknown> }[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -263,6 +267,15 @@ async function mockApi(
 			}
 		} else if (/^\/api\/workflows\/[^/]+\/instances$/.test(path)) {
 			response = [];
+		} else if (/^\/api\/workflows\/[^/]+\/run$/.test(path)) {
+			const id = path.split('/')[3];
+			const inputs = request.postDataJSON() as Record<string, unknown>;
+			options.workflowRunRequests?.push({ id, inputs });
+			response = {
+				id: 'workflow-instance', workflow_id: id, status: 'running', current_flow: 'main', current_step_index: 0,
+				trigger_data: JSON.stringify(inputs), variable_store: '{}', loop_state: null,
+				started_at: timestamp(200), completed_at: null, error_message: null,
+			};
 		} else if (/^\/api\/workflows\/[^/]+$/.test(path)) {
 			const id = path.split('/')[3];
 			response = createdWorkflow ?? options.workflows?.find((workflow) => workflow.id === id) ?? {
@@ -1407,7 +1420,72 @@ test('goal-loop workflow template is bounded and uses the selected agent', async
 	expect(created.yaml_content).toContain(`agent: ${JSON.stringify(agentId)}`);
 	expect(created.yaml_content).toContain('switch: "@pursue_goal.status"');
 	expect(created.yaml_content).toContain('goto: step pursue_goal');
+	expect(created.yaml_content).toContain('inputs:');
+	expect(created.yaml_content).toContain('required: true');
 	await expect(page).toHaveURL('/workflows/workflow-created');
+});
+
+test('workflows can be run with typed inputs and show their automatic trigger', async ({ page }) => {
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		workflowRunRequests,
+		workflows: [{
+			id: 'workflow-report',
+			name: 'Release report',
+			description: 'Build a release-readiness report.',
+			yaml_content: `name: release-report
+inputs:
+  goal:
+    type: string
+    description: What should the report investigate?
+    required: true
+  retries:
+    type: number
+    default: 2
+  options:
+    type: json
+variables:
+  internal_retry_delay: 30
+schedule:
+  cron: "0 9 * * 1"
+  inputs:
+    goal: Weekly release report
+flows:
+  main:
+    steps:
+      - id: report
+        agent: ${agentId}
+        prompt: "Build @goal with @options"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+
+	await page.goto('/automations');
+	const card = page.locator('[data-workflow-card]');
+	await expect(card).toContainText('Scheduled · 0 9 * * 1');
+	await expect(card).toContainText('3 inputs');
+	await expect(card).toContainText('1 flow');
+	await card.getByRole('link', { name: 'Run' }).click();
+
+	await expect(page).toHaveURL('/workflows/workflow-report');
+	await expect(page.locator('[data-workflow-configuration]')).toContainText('0 9 * * 1');
+	await expect(page.getByLabel(/internal retry delay/i)).toHaveCount(0);
+	await page.getByLabel(/goal/i).fill('Prepare version 0.3');
+	await expect(page.getByLabel(/retries/i)).toHaveValue('2');
+	await page.getByLabel(/options/i).fill('{"include_ci":true}');
+	await page.getByRole('button', { name: 'Start workflow' }).click();
+
+	await expect.poll(() => workflowRunRequests).toEqual([{
+		id: 'workflow-report',
+		inputs: { goal: 'Prepare version 0.3', retries: 2, options: { include_ci: true } },
+	}]);
 });
 
 test('appearance follows the saved light, dark, and system preference', async ({ page }) => {

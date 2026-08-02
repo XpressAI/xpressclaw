@@ -8,6 +8,8 @@
 	import LoopBlock from '$lib/components/blocks/LoopBlock.svelte';
 	import JumpBlock from '$lib/components/blocks/JumpBlock.svelte';
 	import BlockConnector from '$lib/components/blocks/BlockConnector.svelte';
+	import WorkflowConfiguration from '$lib/components/blocks/WorkflowConfiguration.svelte';
+	import type { WorkflowInputDefinition, WorkflowScheduleDefinition } from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
 	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
 
@@ -54,12 +56,16 @@
 	let showInstances = $state(false);
 	let showRunDialog = $state(false);
 	let runInputs = $state<Record<string, string>>({});
+	let runInputError = $state('');
+	let configurationError = $state('');
 	let toast = $state<{ message: string; type: 'success' | 'error' } | null>(null);
 	let compactView = $state(false);
 
 	let flows = $state<Record<string, FlowDef>>({});
 	let currentFlow = $state('main');
 	let triggerConfig = $state<{ connector: string; channel: string; event: string; filter?: Record<string, unknown> } | null>(null);
+	let scheduleConfig = $state<WorkflowScheduleDefinition | null>(null);
+	let inputDefs = $state<Record<string, WorkflowInputDefinition>>({});
 	let globalVars = $state<Record<string, unknown>>({});
 
 	let variablePopup = $state<{ x: number; y: number; filter: string; target: HTMLTextAreaElement | null; blockIdx?: number; loopContext?: { asVar: string; overVar: string } } | null>(null);
@@ -67,6 +73,9 @@
 	let currentBlocks = $derived(flows[currentFlow]?.blocks ?? []);
 	let flowNames = $derived(Object.keys(flows));
 	let flowColors = $derived(Object.fromEntries(Object.entries(flows).map(([k, v]) => [k, v.color])));
+	let runFieldNames = $derived(
+		Object.keys(inputDefs).length > 0 ? Object.keys(inputDefs) : Object.keys(globalVars)
+	);
 	let hasDisabledConnectorAutomation = $derived(
 		Boolean(triggerConfig) || Object.values(flows).some((flow) => blocksUseConnectors(flow.blocks))
 	);
@@ -84,14 +93,16 @@
 	interface YamlDef {
 		name?: string; description?: string; version?: number;
 		trigger?: { connector: string; channel: string; event: string; filter?: Record<string, unknown> };
+		schedule?: { cron: string; inputs?: Record<string, unknown> };
+		inputs?: Record<string, WorkflowInputDefinition>;
 		variables?: Record<string, unknown>;
 		flows?: Record<string, { color?: string; steps?: any[] }>;
 	}
 
-	function yamlToFlows(yamlStr: string): { flows: Record<string, FlowDef>; trigger: typeof triggerConfig; variables: Record<string, unknown> } {
+	function yamlToFlows(yamlStr: string): { flows: Record<string, FlowDef>; trigger: typeof triggerConfig; schedule: WorkflowScheduleDefinition | null; inputs: Record<string, WorkflowInputDefinition>; variables: Record<string, unknown> } {
 		let def: YamlDef;
-		try { def = yaml.load(yamlStr) as YamlDef; } catch { return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} }; }
-		if (!def?.flows) return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, variables: {} };
+		try { def = yaml.load(yamlStr) as YamlDef; } catch { return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, schedule: null, inputs: {}, variables: {} }; }
+		if (!def?.flows) return { flows: { main: { color: '#22c55e', blocks: [] } }, trigger: null, schedule: null, inputs: {}, variables: {} };
 
 		const result: Record<string, FlowDef> = {};
 		for (const [name, flow] of Object.entries(def.flows)) {
@@ -100,7 +111,13 @@
 				blocks: (flow.steps || []).map(stepToBlock)
 			};
 		}
-		return { flows: result, trigger: def.trigger || null, variables: def.variables || {} };
+		return {
+			flows: result,
+			trigger: def.trigger || null,
+			schedule: def.schedule ? { cron: def.schedule.cron || '', inputs: def.schedule.inputs || {} } : null,
+			inputs: def.inputs || {},
+			variables: def.variables || {},
+		};
 	}
 
 	function stepToBlock(s: any): Block {
@@ -127,6 +144,8 @@
 			version: 1,
 		};
 		if (triggerConfig) def.trigger = triggerConfig;
+		if (scheduleConfig) def.schedule = scheduleConfig;
+		if (Object.keys(inputDefs).length > 0) def.inputs = inputDefs;
 		if (Object.keys(globalVars).length > 0) def.variables = globalVars;
 
 		const flowsOut: Record<string, unknown> = {};
@@ -208,10 +227,14 @@
 			}));
 			harnessCapabilities = Object.fromEntries(capabilities);
 			const parsed = yamlToFlows(wf.yaml_content);
-			flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
-			runInputs = Object.fromEntries(Object.entries(parsed.variables).map(([key, value]) => [key, String(value ?? '')]));
+			flows = parsed.flows; triggerConfig = parsed.trigger; scheduleConfig = parsed.schedule; inputDefs = parsed.inputs; globalVars = parsed.variables;
+			runInputs = initialRunInputs(parsed.inputs, parsed.variables);
 			if (!flows.main) { flows = { main: { color: '#22c55e', blocks: [] }, ...flows }; }
 			instances = await workflows.instances(id).catch(() => []);
+			if (new URLSearchParams(window.location.search).get('run') === '1') {
+				window.history.replaceState(window.history.state, '', window.location.pathname);
+				requestRun();
+			}
 		} catch (e) { showToast(`Failed to load: ${e}`, 'error'); }
 	});
 
@@ -223,6 +246,10 @@
 
 	async function save() {
 		if (!workflow) return;
+		if (configurationError) {
+			showToast(configurationError, 'error');
+			return;
+		}
 		saving = true;
 		try {
 			const y = flowsToYaml();
@@ -249,15 +276,77 @@
 			showToast('Remove disabled connector blocks before running this workflow', 'error');
 			return;
 		}
-		if (Object.keys(globalVars).length === 0) {
+		if (Object.keys(inputDefs).length === 0 && Object.keys(globalVars).length === 0) {
 			runWorkflow({});
 			return;
 		}
-		runInputs = Object.fromEntries(Object.entries(globalVars).map(([key, value]) => [key, String(value ?? '')]));
+		runInputError = '';
+		runInputs = initialRunInputs(inputDefs, globalVars);
 		showRunDialog = true;
 	}
 
-	async function runWorkflow(inputs: Record<string, string>) {
+	function displayRunValue(value: unknown, type: WorkflowInputDefinition['type'] = 'string'): string {
+		if (value === undefined || value === null) return '';
+		if (type === 'json') {
+			try { return JSON.stringify(value, null, 2); } catch { return ''; }
+		}
+		return String(value);
+	}
+
+	function initialRunInputs(definitions: Record<string, WorkflowInputDefinition>, variables: Record<string, unknown>): Record<string, string> {
+		const values: Record<string, string> = {};
+		for (const [name, definition] of Object.entries(definitions)) {
+			values[name] = displayRunValue(definition.default, definition.type);
+		}
+		if (Object.keys(definitions).length === 0) {
+			for (const [name, value] of Object.entries(variables)) {
+				values[name] = String(value ?? '');
+			}
+		}
+		return values;
+	}
+
+	function typedRunInputs(): Record<string, unknown> | null {
+		const values: Record<string, unknown> = {};
+		try {
+			for (const [name, definition] of Object.entries(inputDefs)) {
+				const raw = runInputs[name]?.trim() ?? '';
+				if (!raw) {
+					if (definition.required && definition.default === undefined) throw new Error(`${name} is required`);
+					continue;
+				}
+				if (definition.type === 'number') {
+					const number = Number(raw);
+					if (!Number.isFinite(number)) throw new Error(`${name} must be a number`);
+					values[name] = number;
+				} else if (definition.type === 'boolean') {
+					if (raw !== 'true' && raw !== 'false') throw new Error(`${name} must be yes or no`);
+					values[name] = raw === 'true';
+				} else if (definition.type === 'json') {
+					values[name] = JSON.parse(runInputs[name]);
+				} else {
+					values[name] = runInputs[name];
+				}
+			}
+			if (Object.keys(inputDefs).length === 0) {
+				for (const name of Object.keys(globalVars)) {
+					if (runInputs[name]?.trim()) values[name] = runInputs[name];
+				}
+			}
+			runInputError = '';
+			return values;
+		} catch (error) {
+			runInputError = error instanceof Error ? error.message : String(error);
+			return null;
+		}
+	}
+
+	function submitRun() {
+		const inputs = typedRunInputs();
+		if (inputs) void runWorkflow(inputs);
+	}
+
+	async function runWorkflow(inputs: Record<string, unknown>) {
 		if (!workflow) return;
 		running = true;
 		try {
@@ -276,7 +365,7 @@
 
 	function applyYaml() {
 		const parsed = yamlToFlows(yamlContent);
-		flows = parsed.flows; triggerConfig = parsed.trigger; globalVars = parsed.variables;
+		flows = parsed.flows; triggerConfig = parsed.trigger; scheduleConfig = parsed.schedule; inputDefs = parsed.inputs; globalVars = parsed.variables;
 		showYaml = false;
 	}
 
@@ -401,9 +490,12 @@
 
 	function availableVariables(upToIdx: number, loopContext?: { asVar: string; overVar: string }): { name: string; type?: string; source?: string }[] {
 		const vars: { name: string; type?: string; source?: string }[] = [];
-		if (triggerConfig) vars.push({ name: 'trigger.payload', type: 'object', source: 'Trigger' });
+		if (triggerConfig || scheduleConfig || Object.keys(inputDefs).length > 0) vars.push({ name: 'trigger.payload', type: 'object', source: 'Run payload' });
+		for (const [name, definition] of Object.entries(inputDefs)) {
+			vars.push({ name, type: definition.type, source: 'Input' });
+		}
 		for (const [k, v] of Object.entries(globalVars)) {
-			vars.push({ name: k, type: typeof v, source: 'Global' });
+			if (!inputDefs[k]) vars.push({ name: k, type: typeof v, source: 'Global' });
 		}
 		const blocks = flows[currentFlow]?.blocks ?? [];
 		for (let i = 0; i <= upToIdx && i < blocks.length; i++) {
@@ -547,7 +639,7 @@
 			class="border-none text-sm font-semibold text-foreground focus:outline-none w-48" style="background: transparent;" placeholder="Workflow name" />
 		<div class="flex-1"></div>
 
-		{#if workflow}
+		{#if workflow && scheduleConfig}
 			<label class="relative inline-flex items-center cursor-pointer shrink-0" title={workflow.enabled ? 'Disable' : 'Enable'}>
 				<input type="checkbox" checked={workflow.enabled} onchange={toggleEnabled} class="sr-only peer" />
 				<div class="w-8 h-[18px] bg-muted rounded-full peer peer-checked:bg-emerald-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:after:translate-x-full"></div>
@@ -567,7 +659,7 @@
 			<svg class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>
 			{running ? 'Running...' : 'Run'}
 		</button>
-		<button onclick={save} disabled={saving}
+		<button onclick={save} disabled={saving || Boolean(configurationError)}
 			class="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving ? 'Saving...' : 'Save'}</button>
 	</div>
 
@@ -643,6 +735,15 @@
 
 		<!-- Block list -->
 		<div class="max-w-3xl mx-auto px-4 pb-6">
+			{#if currentFlow === 'main'}
+				<WorkflowConfiguration
+					inputs={inputDefs}
+					schedule={scheduleConfig}
+					onupdate={(inputs, schedule) => { inputDefs = inputs; scheduleConfig = schedule; }}
+					onvalidationchange={(message) => { configurationError = message; }}
+				/>
+				<div class="flex"><div class="w-10"></div><BlockConnector /></div>
+			{/if}
 			{#if hasDisabledConnectorAutomation}
 				<div class="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs leading-relaxed text-amber-200/80">
 					Connector triggers and notification sinks are disabled in this beta. Existing definitions are preserved read-only and will not receive events; remove them through the YAML editor before running this workflow.
@@ -897,18 +998,33 @@
 		<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
 			<div class="w-full max-w-lg rounded-xl border border-border bg-card p-5 shadow-2xl">
 				<h2 class="text-base font-semibold">Run {workflowName}</h2>
-				<p class="mt-1 text-xs text-muted-foreground">Set this run's inputs. They override the workflow defaults without changing the saved definition.</p>
-				<div class="mt-4 space-y-3">
-					{#each Object.keys(globalVars) as key}
+				<p class="mt-1 text-xs text-muted-foreground">Set this run's inputs. Saved defaults are used when an optional field is left empty.</p>
+				<div class="mt-4 max-h-[60vh] space-y-3 overflow-y-auto pr-1">
+					{#each runFieldNames as key}
+						{@const definition = inputDefs[key]}
 						<div>
-							<label for="run-input-{key}" class="mb-1 block text-xs font-medium capitalize text-muted-foreground">{key.replaceAll('_', ' ')}</label>
-							<textarea id="run-input-{key}" rows={key === 'goal' ? 3 : 2} value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"></textarea>
+							<label for="run-input-{key}" class="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+								<span>{key.replaceAll('_', ' ')}</span>
+								{#if definition?.required}<span class="text-destructive">required</span>{/if}
+								{#if definition}<span class="ml-auto font-mono text-[10px] font-normal">{definition.type}</span>{/if}
+							</label>
+							{#if definition?.description}<p class="mb-1 text-[10px] text-muted-foreground">{definition.description}</p>{/if}
+							{#if definition?.type === 'boolean'}
+								<select id="run-input-{key}" value={runInputs[key] ?? ''} onchange={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring">
+									<option value="">Use default</option><option value="true">Yes</option><option value="false">No</option>
+								</select>
+							{:else if definition?.type === 'number'}
+								<input id="run-input-{key}" type="number" value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring" />
+							{:else}
+								<textarea id="run-input-{key}" rows={key === 'goal' || definition?.type === 'json' ? 4 : 2} value={runInputs[key] ?? ''} oninput={(event) => { runInputs = { ...runInputs, [key]: event.currentTarget.value }; }} class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 {definition?.type === 'json' ? 'font-mono' : ''} text-sm outline-none focus:ring-1 focus:ring-ring"></textarea>
+							{/if}
 						</div>
 					{/each}
 				</div>
+				{#if runInputError}<p class="mt-3 text-xs text-destructive">{runInputError}</p>{/if}
 				<div class="mt-5 flex justify-end gap-2">
 					<button onclick={() => (showRunDialog = false)} disabled={running} class="rounded-md border border-border px-4 py-2 text-sm hover:bg-accent disabled:opacity-50">Cancel</button>
-					<button onclick={() => runWorkflow(runInputs)} disabled={running || Object.values(runInputs).some((value) => !value.trim())} class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">{running ? 'Starting…' : 'Start workflow'}</button>
+					<button onclick={submitRun} disabled={running} class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50">{running ? 'Starting…' : 'Start workflow'}</button>
 				</div>
 			</div>
 		</div>

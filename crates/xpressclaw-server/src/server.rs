@@ -117,6 +117,16 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Start automatic cron triggers for multi-step workflows.
+    let workflow_scheduler_db = state.db.clone();
+    let workflow_scheduler_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workflows::scheduler::start_schedule_runner(workflow_scheduler_db) => {}
+            _ = workflow_scheduler_shutdown.cancelled() => { info!("workflow scheduler stopped"); }
+        }
+    });
+
     let app = create_router(state.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

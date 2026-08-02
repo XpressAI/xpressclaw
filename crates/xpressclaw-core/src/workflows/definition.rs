@@ -13,6 +13,13 @@ pub struct WorkflowDefinition {
     pub version: u32,
     #[serde(default)]
     pub trigger: Option<WorkflowTrigger>,
+    /// Optional recurring schedule. Manual runs are always available; this
+    /// adds an automatic cron trigger without depending on connector channels.
+    #[serde(default)]
+    pub schedule: Option<WorkflowSchedule>,
+    /// Values callers may provide when starting this workflow.
+    #[serde(default)]
+    pub inputs: HashMap<String, WorkflowInput>,
     #[serde(default)]
     pub variables: HashMap<String, Value>,
     pub flows: HashMap<String, SubWorkflow>,
@@ -29,6 +36,38 @@ pub struct WorkflowTrigger {
     pub event: String,
     #[serde(default)]
     pub filter: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowSchedule {
+    /// Standard five-field cron expressions use server-local time.
+    pub cron: String,
+    /// Input overrides supplied to every scheduled run.
+    #[serde(default)]
+    pub inputs: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowInput {
+    #[serde(rename = "type", default)]
+    pub input_type: WorkflowInputType,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowInputType {
+    #[default]
+    String,
+    Number,
+    Boolean,
+    /// Any JSON value, including objects and arrays.
+    Json,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +210,48 @@ impl WorkflowDefinition {
             ));
         }
 
+        for (name, input) in &self.inputs {
+            if name.trim().is_empty() {
+                return Err(Error::Workflow(
+                    "workflow input names cannot be empty".into(),
+                ));
+            }
+            if !name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                return Err(Error::Workflow(format!(
+                    "workflow input name '{name}' may contain only ASCII letters, numbers, and underscores"
+                )));
+            }
+            if name == "trigger" {
+                return Err(Error::Workflow(
+                    "workflow input name 'trigger' is reserved".into(),
+                ));
+            }
+            if let Some(default) = input.default.as_ref() {
+                input.validate_value(name, default)?;
+            }
+        }
+
+        if let Some(schedule) = self.schedule.as_ref() {
+            if schedule.cron.trim().is_empty() {
+                return Err(Error::Workflow(
+                    "workflow schedule cron cannot be empty".into(),
+                ));
+            }
+            croner::Cron::new(schedule.cron.trim())
+                .parse()
+                .map_err(|e| Error::Workflow(format!("invalid workflow schedule cron: {e}")))?;
+            self.resolve_inputs(&Value::Object(
+                schedule
+                    .inputs
+                    .clone()
+                    .into_iter()
+                    .collect::<serde_json::Map<String, Value>>(),
+            ))?;
+        }
+
         let flow_names: HashSet<&str> = self.flows.keys().map(|k| k.as_str()).collect();
 
         for (flow_name, sub) in &self.flows {
@@ -183,6 +264,42 @@ impl WorkflowDefinition {
         }
 
         Ok(())
+    }
+
+    /// Validate caller-provided input values, apply defaults, and return the
+    /// exact payload made available to templates. Workflows without an input
+    /// schema retain the legacy behavior of accepting any JSON payload.
+    pub fn resolve_inputs(&self, provided: &Value) -> Result<Value> {
+        if self.inputs.is_empty() {
+            return Ok(provided.clone());
+        }
+
+        let provided = provided
+            .as_object()
+            .ok_or_else(|| Error::Workflow("workflow inputs must be a JSON object".to_string()))?;
+
+        for name in provided.keys() {
+            if !self.inputs.contains_key(name) {
+                return Err(Error::Workflow(format!("unknown workflow input '{name}'")));
+            }
+        }
+
+        let mut resolved = serde_json::Map::new();
+        for (name, input) in &self.inputs {
+            match provided.get(name).or(input.default.as_ref()) {
+                Some(value) => {
+                    input.validate_value(name, value)?;
+                    resolved.insert(name.clone(), value.clone());
+                }
+                None if input.required => {
+                    return Err(Error::Workflow(format!(
+                        "required workflow input '{name}' is missing"
+                    )));
+                }
+                None => {}
+            }
+        }
+        Ok(Value::Object(resolved))
     }
 
     /// Recursively collect step IDs, detecting duplicates.
@@ -353,6 +470,36 @@ impl WorkflowDefinition {
     pub fn step_index(&self, flow: &str, step_id: &str) -> Option<usize> {
         let sub = self.flows.get(flow)?;
         sub.steps.iter().position(|s| s.id == step_id)
+    }
+}
+
+impl WorkflowInput {
+    fn validate_value(&self, name: &str, value: &Value) -> Result<()> {
+        let valid = match self.input_type {
+            WorkflowInputType::String => value.is_string(),
+            WorkflowInputType::Number => value.is_number(),
+            WorkflowInputType::Boolean => value.is_boolean(),
+            WorkflowInputType::Json => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::Workflow(format!(
+                "workflow input '{name}' must be {}",
+                self.input_type.label()
+            )))
+        }
+    }
+}
+
+impl WorkflowInputType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::String => "a string",
+            Self::Number => "a number",
+            Self::Boolean => "a boolean",
+            Self::Json => "valid JSON",
+        }
     }
 }
 
@@ -846,5 +993,161 @@ flows:
         let def = WorkflowDefinition::parse(yaml).unwrap();
         let err = def.validate().unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn resolves_typed_inputs_with_defaults_and_overrides() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: typed-inputs
+inputs:
+  goal:
+    type: string
+    required: true
+  retries:
+    type: number
+    default: 2
+  publish:
+    type: boolean
+    default: false
+flows:
+  main:
+    steps:
+      - id: work
+        prompt: "@goal"
+"#,
+        )
+        .unwrap();
+        definition.validate().unwrap();
+
+        let resolved = definition
+            .resolve_inputs(&serde_json::json!({"goal": "Ship it", "retries": 4}))
+            .unwrap();
+        assert_eq!(
+            resolved,
+            serde_json::json!({"goal": "Ship it", "retries": 4, "publish": false})
+        );
+    }
+
+    #[test]
+    fn rejects_missing_unknown_and_mistyped_inputs() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: typed-inputs
+inputs:
+  goal:
+    type: string
+    required: true
+flows:
+  main:
+    steps:
+      - id: work
+        prompt: "@goal"
+"#,
+        )
+        .unwrap();
+
+        assert!(definition
+            .resolve_inputs(&serde_json::json!({}))
+            .unwrap_err()
+            .to_string()
+            .contains("required"));
+        assert!(definition
+            .resolve_inputs(&serde_json::json!({"goal": "ok", "typo": true}))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+        assert!(definition
+            .resolve_inputs(&serde_json::json!({"goal": 42}))
+            .unwrap_err()
+            .to_string()
+            .contains("string"));
+
+        let invalid_name = WorkflowDefinition::parse(
+            r#"
+name: invalid-input-name
+inputs:
+  release-goal:
+    type: string
+flows:
+  main:
+    steps:
+      - id: work
+        prompt: "@release-goal"
+"#,
+        )
+        .unwrap();
+        assert!(invalid_name
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("letters, numbers, and underscores"));
+    }
+
+    #[test]
+    fn validates_scheduled_inputs_and_cron() {
+        let valid = WorkflowDefinition::parse(
+            r#"
+name: scheduled
+inputs:
+  topic:
+    type: string
+    required: true
+schedule:
+  cron: "0 9 * * 1"
+  inputs:
+    topic: weekly-report
+flows:
+  main:
+    steps:
+      - id: report
+        prompt: "@topic"
+"#,
+        )
+        .unwrap();
+        valid.validate().unwrap();
+        assert!(!valid.uses_connector_automation());
+
+        let missing = WorkflowDefinition::parse(
+            r#"
+name: scheduled
+inputs:
+  topic:
+    type: string
+    required: true
+schedule:
+  cron: "0 9 * * 1"
+flows:
+  main:
+    steps:
+      - id: report
+        prompt: "@topic"
+"#,
+        )
+        .unwrap();
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("topic"));
+
+        let invalid_cron = WorkflowDefinition::parse(
+            r#"
+name: scheduled
+schedule:
+  cron: definitely-not-cron
+flows:
+  main:
+    steps:
+      - id: report
+        prompt: report
+"#,
+        )
+        .unwrap();
+        assert!(invalid_cron
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cron"));
     }
 }

@@ -159,6 +159,7 @@ async fn run_workflow(
         .start_instance(&id, trigger_data)
         .map_err(|e| match &e {
             xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
+            xpressclaw_core::error::Error::Workflow(_) => bad_request(&e),
             _ => internal_error(e),
         })?;
 
@@ -250,4 +251,135 @@ fn reject_connector_execution(yaml_content: &str) -> Result<(), (StatusCode, Jso
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use xpressclaw_core::config::Config;
+    use xpressclaw_core::db::Database;
+
+    use super::*;
+
+    const TYPED_WORKFLOW: &str = r#"
+name: release-report
+inputs:
+  goal:
+    type: string
+    required: true
+  retries:
+    type: number
+    default: 2
+schedule:
+  cron: "0 9 * * 1"
+  inputs:
+    goal: Weekly release report
+flows:
+  main:
+    steps:
+      - id: report
+        agent: atlas
+        prompt: "Build @goal"
+"#;
+
+    fn test_app() -> Router {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(
+            config,
+            db,
+            None,
+            std::path::PathBuf::from("test.yaml"),
+            true,
+        );
+        Router::new().nest("/workflows", routes()).with_state(state)
+    }
+
+    async fn body_json(body: Body) -> Value {
+        let bytes = body.collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn create_workflow(app: &Router) -> Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "release-report",
+                            "description": "A typed, scheduled workflow",
+                            "yaml_content": TYPED_WORKFLOW,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        body_json(response.into_body()).await
+    }
+
+    #[tokio::test]
+    async fn creates_a_scheduled_workflow_with_trigger_state() {
+        let app = test_app();
+        let workflow = create_workflow(&app).await;
+
+        assert_eq!(workflow["enabled"], true);
+        assert_eq!(workflow["trigger_count"], 0);
+        assert!(workflow["last_triggered_at"].is_null());
+        assert!(workflow["trigger_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn manual_run_validates_and_persists_typed_inputs() {
+        let app = test_app();
+        let workflow = create_workflow(&app).await;
+        let id = workflow["id"].as_str().unwrap();
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workflows/{id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(missing.into_body()).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("goal"));
+
+        let started = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workflows/{id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"goal":"Prepare 0.3"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::CREATED);
+        let instance = body_json(started.into_body()).await;
+        let inputs: Value =
+            serde_json::from_str(instance["trigger_data"].as_str().unwrap()).unwrap();
+        assert_eq!(inputs, json!({"goal": "Prepare 0.3", "retries": 2}));
+    }
 }

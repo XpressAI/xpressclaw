@@ -133,8 +133,10 @@ the local control plane.
 **Coordinate multiple products:**
 
 Use **Automations → Workflows** for implementation/review loops, goal loops,
-and other work that moves between agents. The CLI deliberately does not duplicate these product
-surfaces.
+and other work that moves between agents. Run them on demand with typed inputs
+or attach a recurring cron trigger. See [Workflows](docs/workflows.md) for the
+definition format and execution behavior. The CLI deliberately does not
+duplicate these product surfaces.
 
 ## Configuration
 
