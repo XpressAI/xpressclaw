@@ -1063,25 +1063,27 @@ flows:
             .to_string()
             .contains("string"));
 
-        let invalid_name = WorkflowDefinition::parse(
-            r#"
+        for name in ["release-goal", "release.goal"] {
+            let invalid_name = WorkflowDefinition::parse(&format!(
+                r#"
 name: invalid-input-name
 inputs:
-  release-goal:
+  {name}:
     type: string
 flows:
   main:
     steps:
       - id: work
-        prompt: "@release-goal"
+        prompt: "@{name}"
 "#,
-        )
-        .unwrap();
-        assert!(invalid_name
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("letters, numbers, and underscores"));
+            ))
+            .unwrap();
+            assert!(invalid_name
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("letters, numbers, and underscores"));
+        }
     }
 
     #[test]

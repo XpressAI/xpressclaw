@@ -11,6 +11,9 @@ use super::definition::{WorkflowDefinition, WorkflowSchedule};
 use super::engine::WorkflowEngine;
 use super::manager::{WorkflowManager, WorkflowRecord};
 
+const CONNECTOR_AUTOMATION_DISABLED: &str =
+    "connector triggers and notification sinks cannot run on a schedule in this beta";
+
 /// Start the recurring workflow trigger loop.
 ///
 /// Due occurrences are found from persisted timestamps, so a short process
@@ -44,6 +47,17 @@ fn check_scheduled_workflows_at(db: &Arc<Database>, now: DateTime<Utc>) -> Resul
         let Some(schedule) = definition.schedule.as_ref() else {
             continue;
         };
+
+        if definition.uses_connector_automation() {
+            if workflow.trigger_error.as_deref() != Some(CONNECTOR_AUTOMATION_DISABLED) {
+                manager.record_trigger_error(&workflow.id, CONNECTOR_AUTOMATION_DISABLED)?;
+            }
+            debug!(
+                workflow_id = workflow.id,
+                "skipping scheduled workflow that uses disabled connector automation"
+            );
+            continue;
+        }
 
         if !should_trigger(workflow, schedule, now) {
             continue;
@@ -107,7 +121,7 @@ fn should_trigger(
         .last_triggered_at
         .as_deref()
         .and_then(parse_db_timestamp)
-        .or_else(|| parse_db_timestamp(&workflow.updated_at))
+        .max(parse_db_timestamp(&workflow.updated_at))
         .unwrap_or_else(|| now - chrono::Duration::minutes(2))
         .with_timezone(&Local);
     let now_local = now.with_timezone(&Local);
@@ -145,6 +159,21 @@ flows:
       - id: report
         agent: atlas
         prompt: "Report on @topic"
+"#;
+
+    const CONNECTOR_SCHEDULED_WORKFLOW: &str = r#"
+name: scheduled-notification
+schedule:
+  cron: "* * * * *"
+flows:
+  main:
+    steps:
+      - id: notify
+        type: sink
+        sinks:
+          - connector: webhook
+            channel: release-notifications
+            template: "Release ready"
 "#;
 
     #[test]
@@ -208,5 +237,79 @@ flows:
             .list_instances(&workflow.id, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn connector_backed_workflow_never_fires_on_a_schedule() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = WorkflowManager::new(db.clone());
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "scheduled-notification".into(),
+                description: None,
+                yaml_content: CONNECTOR_SCHEDULED_WORKFLOW.into(),
+            })
+            .unwrap();
+        db.with_conn(|connection| {
+            connection
+                .execute(
+                    "UPDATE workflows SET updated_at = '2026-08-02 11:59:58' WHERE id = ?1",
+                    [&workflow.id],
+                )
+                .unwrap();
+        });
+        let now = DateTime::parse_from_rfc3339("2026-08-02T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(check_scheduled_workflows_at(&db, now).unwrap(), 0);
+        let updated = manager.get(&workflow.id).unwrap();
+        assert_eq!(updated.trigger_count, 0);
+        assert!(updated.last_triggered_at.is_none());
+        assert_eq!(
+            updated.trigger_error.as_deref(),
+            Some(CONNECTOR_AUTOMATION_DISABLED)
+        );
+        assert!(InstanceManager::new(db)
+            .list_instances(&workflow.id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn resumed_schedule_skips_occurrences_from_before_it_was_enabled() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = WorkflowManager::new(db.clone());
+        let workflow = manager
+            .create(&CreateWorkflow {
+                name: "scheduled-report".into(),
+                description: None,
+                yaml_content: SCHEDULED_WORKFLOW.into(),
+            })
+            .unwrap();
+        db.with_conn(|connection| {
+            connection
+                .execute(
+                    "UPDATE workflows
+                     SET last_triggered_at = '2026-08-02 11:58:00',
+                         updated_at = '2026-08-02 12:00:00'
+                     WHERE id = ?1",
+                    [&workflow.id],
+                )
+                .unwrap();
+        });
+
+        let just_resumed = DateTime::parse_from_rfc3339("2026-08-02T12:00:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(check_scheduled_workflows_at(&db, just_resumed).unwrap(), 0);
+
+        let next_occurrence = DateTime::parse_from_rfc3339("2026-08-02T12:01:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            check_scheduled_workflows_at(&db, next_occurrence).unwrap(),
+            1
+        );
     }
 }
