@@ -273,6 +273,7 @@ async function mockApi(
 			options.workflowRunRequests?.push({ id, inputs });
 			response = {
 				id: 'workflow-instance', workflow_id: id, status: 'running', current_flow: 'main', current_step_index: 0,
+				current_task_id: taskId,
 				trigger_data: JSON.stringify(inputs), variable_store: '{}', loop_state: null,
 				started_at: timestamp(200), completed_at: null, error_message: null,
 			};
@@ -729,7 +730,7 @@ test('new-work drafts restore the agent they were written for', async ({ page })
 	await page.goto('/');
 
 	const composer = page.getByPlaceholder('Describe the outcome you want…');
-	const projectPicker = page.getByRole('combobox');
+	const projectPicker = page.getByLabel('Agent', { exact: true });
 	await projectPicker.selectOption('project-secondary-test');
 	await composer.fill('Keep this work with the secondary project');
 	await page.reload();
@@ -740,6 +741,71 @@ test('new-work drafts restore the agent they were written for', async ({ page })
 	await expect.poll(() => queuedSessionMessages.length).toBe(1);
 	expect(queuedSessionMessages[0].agentId).toBe('project-secondary-test');
 	expect(queuedSessionMessages[0].payload.content).toBe('Keep this work with the secondary project');
+});
+
+test('new work can run a compatible workflow for the selected agent', async ({ page }) => {
+	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		multipleAgents: true,
+		queuedSessionMessages,
+		workflowRunRequests,
+		workflows: [{
+			id: 'workflow-review-loop',
+			name: 'Code Review Loop',
+			description: 'Implement, review, and repeat until approved.',
+			yaml_content: `name: code-review-loop
+inputs:
+  goal:
+    type: string
+    required: true
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: ${agentId}
+        prompt: "Implement @goal"
+      - id: review
+        agent: project-secondary-test
+        prompt: "Review @goal"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+	await page.goto('/');
+
+	const agentPicker = page.getByLabel('Agent', { exact: true });
+	const workflowPicker = page.getByLabel('Workflow');
+	await expect(workflowPicker).toHaveValue('');
+	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);
+
+	await workflowPicker.selectOption('workflow-review-loop');
+	await expect(page.getByText("The workflow controls each step's agent and conversation context.")).toBeVisible();
+	await agentPicker.selectOption('project-secondary-test');
+	await expect(workflowPicker).toHaveValue('');
+	await expect(workflowPicker.locator('option')).toHaveText(['No workflow']);
+
+	await agentPicker.selectOption(agentId);
+	await workflowPicker.selectOption('workflow-review-loop');
+	await page.getByPlaceholder('Describe the outcome you want…').fill('Add workflow selection to New Work');
+	await page.reload();
+	await expect(agentPicker).toHaveValue(agentId);
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(page.getByPlaceholder('Describe the outcome you want…')).toHaveValue('Add workflow selection to New Work');
+	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
+
+	await expect.poll(() => workflowRunRequests).toEqual([{
+		id: 'workflow-review-loop',
+		inputs: { goal: 'Add workflow selection to New Work' },
+	}]);
+	expect(queuedSessionMessages).toEqual([]);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
 });
 
 test('agent Work shows only the five most recently updated tasks', async ({ page }) => {

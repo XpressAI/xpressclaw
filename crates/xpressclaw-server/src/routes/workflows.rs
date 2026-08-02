@@ -165,7 +165,17 @@ async fn run_workflow(
 
     let im = InstanceManager::new(state.db.clone());
     let instance = im.get_instance(&instance_id).map_err(internal_error)?;
-    Ok((StatusCode::CREATED, Json(json!(instance))))
+    let current_task_id = im
+        .list_step_executions(&instance_id)
+        .map_err(internal_error)?
+        .into_iter()
+        .rev()
+        .find_map(|execution| execution.task_id);
+    let mut response = serde_json::to_value(instance).map_err(internal_error)?;
+    if let Some(object) = response.as_object_mut() {
+        object.insert("current_task_id".into(), json!(current_task_id));
+    }
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn list_instances(
@@ -378,6 +388,7 @@ flows:
             .unwrap();
         assert_eq!(started.status(), StatusCode::CREATED);
         let instance = body_json(started.into_body()).await;
+        assert!(instance["current_task_id"].as_str().is_some());
         let inputs: Value =
             serde_json::from_str(instance["trigger_data"].as_str().unwrap()).unwrap();
         assert_eq!(inputs, json!({"goal": "Prepare 0.3", "retries": 2}));

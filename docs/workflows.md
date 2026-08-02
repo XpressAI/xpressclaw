@@ -37,6 +37,19 @@ available directly as `@input_name` and in the original run payload as
 workflow. The older `variables` field remains available for internal workflow
 defaults and existing definitions.
 
+### Start new work through a workflow
+
+The **New Work** composer has an optional workflow picker beside the agent
+picker. Choosing **No workflow** sends an ordinary task directly to that
+agent. Choosing a workflow sends the composer text as its `goal` input and
+opens the first task created by the workflow.
+
+A workflow appears in this picker when its `main` flow starts with the selected
+agent, it declares a string `goal` input, and every other required input has a
+default. Later steps still use the agents and conversation settings saved in
+the workflow. Workflows with additional required inputs remain available from
+**Automations**, where the full typed run form can collect them.
+
 ## Trigger a workflow automatically
 
 Choose **Cron schedule** in the workflow's **Inputs & trigger** block, or add a

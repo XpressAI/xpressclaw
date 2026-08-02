@@ -709,6 +709,7 @@ export interface Workflow {
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
+	current_task_id?: string | null;
 	status: string;
 	current_flow: string;
 	current_step_index: number;
