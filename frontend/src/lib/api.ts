@@ -701,11 +701,15 @@ export interface Workflow {
 	version: number;
 	created_at: string;
 	updated_at: string;
+	last_triggered_at: string | null;
+	trigger_count: number;
+	trigger_error: string | null;
 }
 
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
+	current_task_id?: string | null;
 	status: string;
 	current_flow: string;
 	current_step_index: number;

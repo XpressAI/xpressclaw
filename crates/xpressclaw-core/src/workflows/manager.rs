@@ -20,6 +20,9 @@ pub struct WorkflowRecord {
     pub version: u32,
     pub created_at: String,
     pub updated_at: String,
+    pub last_triggered_at: Option<String>,
+    pub trigger_count: i64,
+    pub trigger_error: Option<String>,
 }
 
 /// Request to create a new workflow.
@@ -95,6 +98,9 @@ impl WorkflowManager {
     pub fn update(&self, id: &str, yaml_content: &str) -> Result<WorkflowRecord> {
         let def = WorkflowDefinition::parse(yaml_content)?;
         def.validate()?;
+        let previous = self.get(id)?;
+        let previous_schedule = WorkflowDefinition::parse(&previous.yaml_content)?.schedule;
+        let schedule_changed = previous_schedule != def.schedule;
 
         let now = Utc::now()
             .naive_utc()
@@ -103,8 +109,24 @@ impl WorkflowManager {
 
         let affected = self.db.with_conn(|conn| {
             conn.execute(
-                "UPDATE workflows SET yaml_content = ?1, version = ?2, name = ?3, description = ?4, updated_at = ?5 WHERE id = ?6",
-                rusqlite::params![yaml_content, def.version, def.name, def.description, now, id],
+                "UPDATE workflows
+                 SET yaml_content = ?1,
+                     version = ?2,
+                     name = ?3,
+                     description = ?4,
+                     updated_at = ?5,
+                     last_triggered_at = CASE WHEN ?6 THEN NULL ELSE last_triggered_at END,
+                     trigger_error = CASE WHEN ?6 THEN NULL ELSE trigger_error END
+                 WHERE id = ?7",
+                rusqlite::params![
+                    yaml_content,
+                    def.version,
+                    def.name,
+                    def.description,
+                    now,
+                    schedule_changed,
+                    id
+                ],
             )
             .map_err(|e| Error::Database(e.to_string()))
         })?;
@@ -150,6 +172,42 @@ impl WorkflowManager {
 
         self.get(id)
     }
+
+    /// Atomically claim a due scheduled run. Comparing the previously observed
+    /// timestamp prevents duplicate starts if multiple runners overlap.
+    pub fn claim_scheduled_run(
+        &self,
+        id: &str,
+        previous_triggered_at: Option<&str>,
+        triggered_at: &str,
+    ) -> Result<bool> {
+        let affected = self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows
+                 SET last_triggered_at = ?1,
+                     trigger_count = trigger_count + 1,
+                     trigger_error = NULL
+                 WHERE id = ?2
+                   AND enabled = 1
+                   AND ((last_triggered_at IS NULL AND ?3 IS NULL) OR last_triggered_at = ?3)",
+                rusqlite::params![triggered_at, id, previous_triggered_at],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(affected == 1)
+    }
+
+    /// Record why the latest automatic trigger could not start an instance.
+    pub fn record_trigger_error(&self, id: &str, message: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflows SET trigger_error = ?1 WHERE id = ?2",
+                rusqlite::params![message, id],
+            )
+            .map_err(|e| Error::Database(e.to_string()))
+        })?;
+        Ok(())
+    }
 }
 
 fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
@@ -162,6 +220,9 @@ fn row_to_workflow(row: &rusqlite::Row) -> WorkflowRecord {
         version: row.get::<_, u32>("version").unwrap_or(1),
         created_at: row.get("created_at").unwrap_or_default(),
         updated_at: row.get("updated_at").unwrap_or_default(),
+        last_triggered_at: row.get("last_triggered_at").unwrap_or_default(),
+        trigger_count: row.get("trigger_count").unwrap_or(0),
+        trigger_error: row.get("trigger_error").unwrap_or_default(),
     }
 }
 
@@ -320,6 +381,41 @@ flows: {}
 
         let enabled = mgr.set_enabled(&record.id, true).unwrap();
         assert!(enabled.enabled);
+    }
+
+    #[test]
+    fn scheduled_run_claims_are_atomic_and_schedule_edits_reset_the_cursor() {
+        let (_, mgr) = setup();
+        let scheduled_yaml =
+            VALID_YAML.replace("flows:", "schedule:\n  cron: \"0 9 * * 1\"\n\nflows:");
+        let record = mgr
+            .create(&CreateWorkflow {
+                name: "test-workflow".into(),
+                description: None,
+                yaml_content: scheduled_yaml.clone(),
+            })
+            .unwrap();
+
+        assert!(mgr
+            .claim_scheduled_run(&record.id, None, "2026-08-02 09:00:00")
+            .unwrap());
+        assert!(!mgr
+            .claim_scheduled_run(&record.id, None, "2026-08-02 09:00:00")
+            .unwrap());
+        let claimed = mgr.get(&record.id).unwrap();
+        assert_eq!(claimed.trigger_count, 1);
+
+        let renamed = scheduled_yaml.replace("A test workflow", "An updated workflow");
+        let unchanged_schedule = mgr.update(&record.id, &renamed).unwrap();
+        assert_eq!(
+            unchanged_schedule.last_triggered_at.as_deref(),
+            Some("2026-08-02 09:00:00")
+        );
+
+        let changed_cron = renamed.replace("0 9 * * 1", "0 10 * * 1");
+        let changed_schedule = mgr.update(&record.id, &changed_cron).unwrap();
+        assert!(changed_schedule.last_triggered_at.is_none());
+        assert_eq!(changed_schedule.trigger_count, 1);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 	import { agents, schedules, workflows } from '$lib/api';
 	import type { Agent, Schedule, Workflow } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import yaml from 'js-yaml';
 
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
@@ -35,7 +36,7 @@
 		|| Date.parse(right.last_run ?? right.created_at) - Date.parse(left.last_run ?? left.created_at)
 		|| right.id.localeCompare(left.id)
 	));
-	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled).length);
+	let enabledWorkflowCount = $derived(workflowList.filter((workflow) => workflow.enabled && workflowMetadata(workflow.yaml_content).cron).length);
 	let activeScheduleCount = $derived(scheduleList.filter((schedule) => scheduleEnabled(schedule)).length);
 
 	$effect(() => {
@@ -79,12 +80,15 @@
 		if (!scheduleForm.agent_id && agentList.length > 0) scheduleForm.agent_id = agentList[0].id;
 	}
 
-	function parseYamlCounts(yaml: string): { steps: number; flows: number } {
-		const stepMatches = yaml.match(/^\s+- id:/gm);
-		const flowMatches = yaml.match(/^\s{2}\w+:\s*$/gm);
+	function workflowMetadata(yamlContent: string): { steps: number; flows: number; inputs: number; cron: string | null } {
+		const stepMatches = yamlContent.match(/^\s+- id:/gm);
+		let definition: { inputs?: Record<string, unknown>; schedule?: { cron?: string }; flows?: Record<string, unknown> } = {};
+		try { definition = yaml.load(yamlContent) as typeof definition; } catch {}
 		return {
 			steps: stepMatches?.length ?? 0,
-			flows: Math.max(1, (flowMatches?.length ?? 1) - 1),
+			flows: Math.max(1, Object.keys(definition?.flows ?? {}).length),
+			inputs: Object.keys(definition?.inputs ?? {}).length,
+			cron: definition?.schedule?.cron?.trim() || null,
 		};
 	}
 
@@ -212,7 +216,7 @@
 			<div>
 				<h1 class="text-2xl font-bold">Automations</h1>
 				<p class="mt-1 text-sm text-muted-foreground">
-					{enabledWorkflowCount} enabled workflow{enabledWorkflowCount !== 1 ? 's' : ''} · {activeScheduleCount} active schedule{activeScheduleCount !== 1 ? 's' : ''}
+					{workflowList.length} workflow{workflowList.length !== 1 ? 's' : ''} · {enabledWorkflowCount} automatic trigger{enabledWorkflowCount !== 1 ? 's' : ''} · {activeScheduleCount} task schedule{activeScheduleCount !== 1 ? 's' : ''}
 				</p>
 			</div>
 			<div class="flex flex-wrap gap-2">
@@ -238,22 +242,29 @@
 			{:else}
 				<div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
 					{#each sortedWorkflows as workflow (workflow.id)}
-						{@const counts = parseYamlCounts(workflow.yaml_content)}
+						{@const metadata = workflowMetadata(workflow.yaml_content)}
 						<article data-workflow-card class="group space-y-3 rounded-lg border border-border bg-card p-4">
 							<div class="flex items-start justify-between gap-3">
 								<div class="min-w-0 flex-1">
 									<a href="/workflows/{workflow.id}" class="text-sm font-semibold text-foreground hover:underline">{workflow.name}</a>
 									{#if workflow.description}<p class="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{workflow.description}</p>{/if}
 								</div>
-								<label class="relative inline-flex shrink-0 cursor-pointer items-center" title={workflow.enabled ? 'Disable' : 'Enable'}>
-									<input type="checkbox" checked={workflow.enabled} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
-									<span class="h-[18px] w-8 rounded-full bg-muted transition-colors after:absolute after:start-[2px] after:top-[2px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-emerald-600 peer-checked:after:translate-x-full"></span>
-								</label>
+								{#if metadata.cron}
+									<label class="relative inline-flex shrink-0 cursor-pointer items-center" title={workflow.enabled ? 'Disable schedule' : 'Enable schedule'}>
+										<input type="checkbox" checked={workflow.enabled} onchange={() => toggleWorkflow(workflow)} class="peer sr-only" />
+										<span class="h-[18px] w-8 rounded-full bg-muted transition-colors after:absolute after:start-[2px] after:top-[2px] after:h-3.5 after:w-3.5 after:rounded-full after:bg-white after:transition-all after:content-[''] peer-checked:bg-emerald-600 peer-checked:after:translate-x-full"></span>
+									</label>
+								{:else}
+									<span class="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">Manual</span>
+								{/if}
 							</div>
-							<div class="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground"><span>{counts.steps} step{counts.steps !== 1 ? 's' : ''}</span><span>{counts.flows} flow{counts.flows !== 1 ? 's' : ''}</span><span>v{workflow.version}</span></div>
+							<div class="flex flex-wrap items-center gap-3 text-[10px] text-muted-foreground"><span>{metadata.steps} step{metadata.steps !== 1 ? 's' : ''}</span><span>{metadata.flows} flow{metadata.flows !== 1 ? 's' : ''}</span><span>{metadata.inputs} input{metadata.inputs !== 1 ? 's' : ''}</span><span>v{workflow.version}</span></div>
+							{#if metadata.cron}<div class="rounded bg-muted/50 px-2 py-1 font-mono text-[10px] text-muted-foreground">{workflow.enabled ? 'Scheduled' : 'Schedule paused'} · {metadata.cron}</div>{/if}
+							{#if workflow.trigger_error}<div class="line-clamp-2 text-[10px] text-destructive" title={workflow.trigger_error}>Last trigger failed: {workflow.trigger_error}</div>{/if}
 							<div class="flex flex-wrap items-center justify-between gap-2">
 								<span class="text-[10px] text-muted-foreground">Updated {timeAgo(workflow.updated_at)}</span>
 								<div class="flex items-center gap-1.5">
+									<a href="/workflows/{workflow.id}?run=1" class="rounded-md bg-emerald-600 px-2.5 py-1 text-[10px] font-medium text-white transition-colors hover:bg-emerald-700">Run</a>
 									<a href="/workflows/{workflow.id}" class="rounded-md border border-border bg-secondary px-2.5 py-1 text-[10px] font-medium transition-colors hover:bg-accent">View</a>
 									{#if confirmDeleteId === workflow.id}
 										<button type="button" onclick={() => deleteWorkflow(workflow.id)} class="rounded border border-destructive/50 bg-destructive/10 px-2.5 py-1 text-[10px] font-medium text-destructive hover:bg-destructive/20">Delete</button>

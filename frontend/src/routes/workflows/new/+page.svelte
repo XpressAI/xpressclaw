@@ -51,8 +51,11 @@
 description: A reusable native-agent workflow.
 version: 1
 
-variables:
-  goal: "Describe the requested outcome here"
+inputs:
+  goal:
+    type: string
+    description: The outcome this workflow should produce.
+    required: true
 
 flows:
   main:
@@ -78,8 +81,11 @@ flows:
 description: One agent implements, another reviews, and the loop continues until approval.
 version: 1
 
-variables:
-  goal: "Describe the requested code change here"
+inputs:
+  goal:
+    type: string
+    description: The code change to implement and review.
+    required: true
 
 flows:
   main:
@@ -155,8 +161,11 @@ flows:
 description: One agent pursues a goal in bounded iterations and stops when it reports completion.
 version: 1
 
-variables:
-  goal: "Describe the outcome to pursue here"
+inputs:
+  goal:
+    type: string
+    description: The outcome the agent should pursue.
+    required: true
 
 flows:
   main:

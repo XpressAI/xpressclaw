@@ -180,6 +180,7 @@ impl Database {
             (27, MIGRATION_V27),
             (28, MIGRATION_V28),
             (29, MIGRATION_V29),
+            (30, MIGRATION_V30),
         ];
 
         for &(target, sql) in migrations {
@@ -949,6 +950,16 @@ BEGIN
 END;
 ";
 
+const MIGRATION_V30: &str = "
+-- Persist automatic workflow trigger state so cron schedules fire exactly
+-- once across process restarts and can report their latest error in the UI.
+ALTER TABLE workflows ADD COLUMN last_triggered_at TIMESTAMP;
+ALTER TABLE workflows ADD COLUMN trigger_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflows ADD COLUMN trigger_error TEXT;
+CREATE INDEX idx_workflows_scheduled
+    ON workflows(enabled, last_triggered_at);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,7 +977,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "29");
+        assert_eq!(version, "30");
     }
 
     #[test]

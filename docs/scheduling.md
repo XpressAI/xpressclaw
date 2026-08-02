@@ -56,7 +56,9 @@ returns `armed`, the current turn can end.
 Use a schedule with a single agent for recurring work such as SEO analysis,
 dependency checks, or weekly metrics review. Schedule a workflow when the job
 needs multiple products—for example, Codex implementing changes and Claude
-Code reviewing until approval.
+Code reviewing until approval. Workflow schedules and their input values are
+configured in the workflow's **Inputs & trigger** block; see
+[Workflows](workflows.md).
 
 ## Operational behavior
 

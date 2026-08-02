@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { setup, sessions, agents as agentsApi } from '$lib/api';
-	import type { Agent, ImageAttachmentUpload } from '$lib/api';
+	import yaml from 'js-yaml';
+	import { setup, sessions, agents as agentsApi, workflows as workflowsApi } from '$lib/api';
+	import type { Agent, ImageAttachmentUpload, Workflow } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
@@ -18,6 +19,9 @@
 	let agentList = $state<Agent[]>([]);
 	let selectedAgent = $state('');
 	let selectedAgentReady = $state(false);
+	let workflowList = $state<Workflow[]>([]);
+	let selectedWorkflow = $state('');
+	let selectedWorkflowReady = $state(false);
 	let sending = $state(false);
 	let composing = $state(false);
 	let sendError = $state('');
@@ -38,13 +42,18 @@
 				return;
 			}
 
-			const [agts] = await Promise.all([
-				agentsApi.list().catch(() => [])
+			const [agts, workflowRecords] = await Promise.all([
+				agentsApi.list().catch(() => []),
+				workflowsApi.list().catch(() => []),
 			]);
 			agentList = agts;
+			workflowList = workflowRecords;
 			const savedAgent = loadComposerTarget(messageDraftScope);
 			selectedAgent = agts.find((agent) => agent.id === savedAgent)?.id ?? agts[0]?.id ?? '';
 			selectedAgentReady = true;
+			const savedWorkflow = loadComposerTarget(`${messageDraftScope}-workflow`);
+			selectedWorkflow = workflowRecords.some((workflow) => workflow.id === savedWorkflow) ? savedWorkflow : '';
+			selectedWorkflowReady = true;
 			loading = false;
 		} catch {
 			retries++;
@@ -65,6 +74,10 @@
 		if (selectedAgentReady) saveComposerTarget(messageDraftScope, selectedAgent);
 	});
 
+	$effect(() => {
+		if (selectedWorkflowReady) saveComposerTarget(`${messageDraftScope}-workflow`, selectedWorkflow);
+	});
+
 	onMount(() => {
 		message = loadComposerDraft(messageDraftScope);
 		messageDraftReady = true;
@@ -78,14 +91,87 @@
 		return 'Good evening';
 	}
 
+	interface WorkflowInputSummary {
+		type?: string;
+		required?: boolean;
+		default?: unknown;
+	}
+
+	interface WorkflowStepSummary {
+		type?: string;
+		agent?: string;
+		steps?: WorkflowStepSummary[];
+		body?: WorkflowStepSummary[];
+	}
+
+	interface WorkflowDefinitionSummary {
+		trigger?: unknown;
+		inputs?: Record<string, WorkflowInputSummary>;
+		flows?: Record<string, { steps?: WorkflowStepSummary[] }>;
+	}
+
+	function workflowDefinition(workflow: Workflow): WorkflowDefinitionSummary | null {
+		try {
+			return yaml.load(workflow.yaml_content) as WorkflowDefinitionSummary;
+		} catch {
+			return null;
+		}
+	}
+
+	function firstStepAgent(steps: WorkflowStepSummary[]): string | null {
+		for (const step of steps) {
+			if ((step.type ?? 'step') === 'step' && step.agent) return step.agent;
+			const nested = firstStepAgent(step.steps ?? step.body ?? []);
+			if (nested) return nested;
+		}
+		return null;
+	}
+
+	function usesConnectorSink(steps: WorkflowStepSummary[]): boolean {
+		return steps.some((step) => step.type === 'sink' || usesConnectorSink(step.steps ?? step.body ?? []));
+	}
+
+	function supportsNewWork(workflow: Workflow, agentId: string): boolean {
+		const definition = workflowDefinition(workflow);
+		if (!definition || definition.trigger) return false;
+		const mainSteps = definition.flows?.main?.steps ?? [];
+		if (Object.values(definition.flows ?? {}).some((flow) => usesConnectorSink(flow.steps ?? [])) || firstStepAgent(mainSteps) !== agentId) return false;
+		const inputs = definition.inputs ?? {};
+		if ((inputs.goal?.type ?? 'string') !== 'string' || !inputs.goal) return false;
+		return Object.entries(inputs).every(([name, input]) =>
+			name === 'goal' || !input.required || input.default !== undefined && input.default !== null
+		);
+	}
+
 	let selectedAgentObj = $derived(agentList.find(a => a.id === selectedAgent));
+	let compatibleWorkflows = $derived(workflowList.filter((workflow) => supportsNewWork(workflow, selectedAgent)));
+	let selectedWorkflowObj = $derived(compatibleWorkflows.find((workflow) => workflow.id === selectedWorkflow));
+	let canSend = $derived(Boolean(selectedAgent) && !sending && (
+		selectedWorkflow
+			? Boolean(message.trim()) && imageAttachments.length === 0 && Boolean(selectedWorkflowObj)
+			: Boolean(message.trim()) || imageAttachments.length > 0
+	));
+
+	$effect(() => {
+		if (selectedWorkflowReady && selectedWorkflow && !compatibleWorkflows.some((workflow) => workflow.id === selectedWorkflow)) {
+			selectedWorkflow = '';
+		}
+	});
 
 	async function send() {
-		if ((!message.trim() && imageAttachments.length === 0) || !selectedAgent || sending) return;
+		if (!canSend) return;
 		sending = true;
 		sendError = '';
 
 		try {
+			if (selectedWorkflowObj) {
+				const instance = await workflowsApi.run(selectedWorkflowObj.id, { goal: message.trim() });
+				message = '';
+				clearComposerDraft(messageDraftScope);
+				imageAttachments = [];
+				await goto(instance.current_task_id ? `/tasks/${instance.current_task_id}` : `/workflows/${selectedWorkflowObj.id}`);
+				return;
+			}
 			const queued = await sessions.sendMessage(selectedAgent, message.trim(), {
 				newSession: startFresh,
 				attachments: imageAttachments,
@@ -149,7 +235,7 @@
 			<!-- Greeting -->
 			<div class="text-center">
 				<h1 class="text-2xl font-semibold text-foreground sm:text-3xl">{greeting()}</h1>
-				<p class="mt-2 text-sm text-muted-foreground">Send work to one of your agents.</p>
+				<p class="mt-2 text-sm text-muted-foreground">Send work directly to an agent or run it through a workflow.</p>
 			</div>
 
 			{#if agentList.length === 0}
@@ -174,13 +260,17 @@
 				></textarea>
 				<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
-					<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this agent's current conversation">
-						<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
-						Start a fresh conversation
-					</label>
-					<div class="flex min-w-0 items-center justify-end gap-2 sm:gap-3">
+					{#if selectedWorkflowObj}
+						<p class="text-xs text-muted-foreground">The workflow controls each step's agent and conversation context.</p>
+					{:else}
+						<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this agent's current conversation">
+							<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
+							Start a fresh conversation
+						</label>
+					{/if}
+					<div class="flex min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
 						<input bind:this={imageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleImageInput} class="hidden" />
-						<button type="button" onclick={() => imageInput?.click()} disabled={sending || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title="Attach images (you can also paste)"
+						<button type="button" onclick={() => imageInput?.click()} disabled={sending || Boolean(selectedWorkflow) || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title={selectedWorkflow ? 'Workflow runs currently accept text input only' : 'Attach images (you can also paste)'}
 							class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 						</button>
@@ -191,7 +281,8 @@
 								{/if}
 								<select
 									bind:value={selectedAgent}
-									class="min-w-0 max-w-40 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none"
+									aria-label="Agent"
+									class="min-w-0 max-w-28 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-40"
 								>
 									{#each agentList as agent}
 										<option value={agent.id}>
@@ -200,9 +291,18 @@
 									{/each}
 								</select>
 						</div>
+						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
+							<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">W</span>
+							<select bind:value={selectedWorkflow} aria-label="Workflow" class="min-w-0 max-w-28 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-44">
+								<option value="">No workflow</option>
+								{#each compatibleWorkflows as workflow}
+									<option value={workflow.id}>{workflow.name}</option>
+								{/each}
+							</select>
+						</div>
 						<button
 							onclick={send}
-							disabled={(!message.trim() && imageAttachments.length === 0) || sending}
+							disabled={!canSend}
 							class="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-colors shadow-lg shadow-primary/20"
 						>
 							{#if sending}
@@ -214,6 +314,9 @@
 					</div>
 				</div>
 			</div>
+			{#if selectedWorkflow && imageAttachments.length > 0}
+				<p class="text-center text-xs text-amber-600">Workflow runs currently accept text input only. Remove the attachments or choose No workflow.</p>
+			{/if}
 			{#if sendError}<p class="text-center text-sm text-destructive">{sendError}</p>{/if}
 			<div class="text-center"><a href="/agents" class="text-xs text-muted-foreground hover:text-foreground hover:underline">Manage agents</a></div>
 			{/if}

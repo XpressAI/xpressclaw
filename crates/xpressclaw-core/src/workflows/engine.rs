@@ -47,6 +47,7 @@ impl WorkflowEngine {
     pub fn start_instance(&self, workflow_id: &str, trigger_data: Value) -> Result<String> {
         let record = self.manager.get(workflow_id)?;
         let definition = WorkflowDefinition::parse(&record.yaml_content)?;
+        let trigger_data = definition.resolve_inputs(&trigger_data)?;
 
         let trigger_json = serde_json::to_string(&trigger_data)
             .map_err(|e| Error::Workflow(format!("failed to serialize trigger data: {e}")))?;
