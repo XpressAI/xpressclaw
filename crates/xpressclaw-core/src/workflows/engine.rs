@@ -42,6 +42,11 @@ struct LoopState {
     active_execution_id: Option<String>,
 }
 
+struct PreparedTaskStep {
+    task_id: String,
+    agent_id: String,
+}
+
 /// The workflow runtime engine.
 ///
 /// Manages the lifecycle of workflow instances: starting them from triggers,
@@ -287,6 +292,28 @@ impl WorkflowEngine {
         ctx: &Value,
         ctx_json: &str,
     ) -> Result<StepExecution> {
+        let prepared = self.prepare_task_step(instance_id, flow_name, step, ctx)?;
+        let execution = self.instances.create_task_execution(
+            instance_id,
+            flow_name,
+            &step.id,
+            Some(ctx_json),
+            &prepared.task_id,
+        )?;
+        self.dispatch_task_step(step, &prepared, &execution)?;
+        Ok(execution)
+    }
+
+    /// Render and persist a task without making it visible to the dispatcher.
+    /// The workflow execution (and loop cursor, where applicable) must own the
+    /// task before `dispatch_task_step` is called.
+    fn prepare_task_step(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step: &Step,
+        ctx: &Value,
+    ) -> Result<PreparedTaskStep> {
         let agent_id = self.resolve_step_agent(step, ctx)?;
         let rendered_prompt = match &step.prompt {
             Some(tmpl) => context::render_template(tmpl, ctx),
@@ -391,35 +418,44 @@ impl WorkflowEngine {
             })),
         })?;
 
-        // Enqueue for the dispatcher
+        Ok(PreparedTaskStep {
+            task_id: task.id,
+            agent_id,
+        })
+    }
+
+    fn dispatch_task_step(
+        &self,
+        step: &Step,
+        prepared: &PreparedTaskStep,
+        execution: &StepExecution,
+    ) -> Result<()> {
         let queue = TaskQueue::new(self.db.clone());
-        if let Err(error) = queue.enqueue(&task.id, &agent_id) {
-            let _ = board.update_status(&task.id, "cancelled", None);
+        if let Err(error) = queue.ensure_enqueued(&prepared.task_id, &prepared.agent_id) {
+            let _ = TaskBoard::new(self.db.clone()).update_status(
+                &prepared.task_id,
+                "cancelled",
+                None,
+            );
+            let _ = self.instances.update_step_status(
+                &execution.id,
+                "failed",
+                Some(&error.to_string()),
+            );
             return Err(Error::Workflow(format!(
                 "failed to enqueue workflow step '{}' for agent '{}': {error}",
-                step.id, agent_id
+                step.id, prepared.agent_id
             )));
         }
 
-        // Create step execution and link to task
-        let exec = self.instances.create_step_execution(
-            instance_id,
-            flow_name,
-            &step.id,
-            Some(ctx_json),
-        )?;
-        self.instances.set_step_task(&exec.id, &task.id)?;
-
         info!(
-            instance_id,
-            flow_name,
+            instance_id = execution.instance_id.as_str(),
+            flow_name = execution.flow_name.as_str(),
             step_id = step.id.as_str(),
-            task_id = task.id.as_str(),
+            task_id = prepared.task_id.as_str(),
             "executing task step"
         );
-
-        // Wait for dispatcher to call on_task_completed
-        Ok(exec)
+        Ok(())
     }
 
     fn resolve_step_agent(&self, step: &Step, ctx: &Value) -> Result<String> {
@@ -483,13 +519,19 @@ impl WorkflowEngine {
         let started_at = previous_timestamp
             .or_else(|| self.initial_wait_boundary(instance_id))
             .unwrap_or_else(|| Utc::now() - chrono::Duration::minutes(5));
+        let now = Utc::now();
         let timeout_at = step
             .timeout
             .as_deref()
             .map(parse_wait_duration)
             .transpose()
             .map_err(Error::Workflow)?
-            .map(|duration| (Utc::now() + duration).to_rfc3339());
+            .map(|duration| {
+                now.checked_add_signed(duration)
+                    .ok_or_else(|| Error::Workflow("wait timeout exceeds timestamp range".into()))
+                    .map(|timestamp| timestamp.to_rfc3339())
+            })
+            .transpose()?;
         let state = WaitState {
             event,
             resource,
@@ -811,21 +853,26 @@ impl WorkflowEngine {
         let body_context = context::build_context(trigger_data, &definition.variables, &variables);
         let body_context_json =
             serde_json::to_string(&body_context).unwrap_or_else(|_| "{}".to_string());
-        let execution = self.execute_task_step(
+        let prepared = self.prepare_task_step(
             instance_id,
             &state.flow_name,
             body_step,
             &body_context,
-            &body_context_json,
         )?;
-        state.active_execution_id = Some(execution.id);
-        self.instances.update_loop_state(
+        let flow_name = state.flow_name.clone();
+        let execution = self.instances.create_loop_task_execution(
             instance_id,
-            Some(
-                &serde_json::to_string(&state)
-                    .map_err(|error| Error::Workflow(format!("failed to persist loop: {error}")))?,
-            ),
+            &flow_name,
+            &body_step.id,
+            Some(&body_context_json),
+            &prepared.task_id,
+            |execution_id| {
+                state.active_execution_id = Some(execution_id.to_string());
+                serde_json::to_string(&state)
+                    .map_err(|error| Error::Workflow(format!("failed to persist loop: {error}")))
+            },
         )?;
+        self.dispatch_task_step(body_step, &prepared, &execution)?;
         Ok(())
     }
 
@@ -1409,6 +1456,35 @@ impl WorkflowEngine {
                                         error = %e,
                                         "failed to recover workflow task"
                                     );
+                                }
+                            } else if status == "pending" {
+                                match task.agent_id.as_deref() {
+                                    Some(agent_id) => {
+                                        match TaskQueue::new(self.db.clone())
+                                            .ensure_enqueued(task_id, agent_id)
+                                        {
+                                            Ok(Some(_)) => info!(
+                                                instance_id = instance.id.as_str(),
+                                                execution_id = exec.id.as_str(),
+                                                task_id = task_id.as_str(),
+                                                "recovered workflow task dispatch"
+                                            ),
+                                            Ok(None) => {}
+                                            Err(error) => error!(
+                                                instance_id = instance.id.as_str(),
+                                                execution_id = exec.id.as_str(),
+                                                task_id = task_id.as_str(),
+                                                error = %error,
+                                                "failed to recover workflow task dispatch"
+                                            ),
+                                        }
+                                    }
+                                    None => error!(
+                                        instance_id = instance.id.as_str(),
+                                        execution_id = exec.id.as_str(),
+                                        task_id = task_id.as_str(),
+                                        "cannot recover workflow task without an agent"
+                                    ),
                                 }
                             }
                         }
@@ -3242,6 +3318,89 @@ flows:
             .get(second.task_id.as_deref().unwrap())
             .unwrap();
         assert_eq!(task.description.as_deref(), Some("Handle: b"));
+    }
+
+    #[test]
+    fn loop_recovery_dispatches_a_persisted_body_owner_once() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: recover-loop-dispatch
+flows:
+  main:
+    steps:
+      - id: prep
+        agent: atlas
+        prompt: Prepare
+        outputs:
+          items: { type: array }
+      - id: process
+        type: loop
+        over: "@prep.items"
+        as: item
+        steps:
+          - id: handle
+            agent: atlas
+            prompt: "Handle: @item"
+"#,
+        );
+        let instance_id = engine.start_instance(&workflow_id, json!({})).unwrap();
+        let prep = engine.instances.list_step_executions(&instance_id).unwrap()[0]
+            .task_id
+            .clone()
+            .unwrap();
+        engine
+            .on_task_completed(&prep, "completed", r#"{"items":["a"]}"#)
+            .unwrap();
+        let handle = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .find(|execution| execution.step_id == "handle")
+            .unwrap();
+        let task_id = handle.task_id.clone().unwrap();
+        let loop_state: LoopState = serde_json::from_str(
+            engine
+                .instances
+                .get_instance(&instance_id)
+                .unwrap()
+                .loop_state
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(loop_state.active_execution_id.as_deref(), Some(handle.id.as_str()));
+
+        // Recreate the crash boundary after task ownership commits but before
+        // dispatch. Recovery must enqueue that exact task without creating a
+        // second body execution, even when recovery itself runs twice.
+        db.with_conn(|conn| conn.execute("DELETE FROM task_queue WHERE task_id = ?1", [&task_id]))
+            .unwrap();
+        WorkflowEngine::new(db.clone()).recover().unwrap();
+        WorkflowEngine::new(db.clone()).recover().unwrap();
+
+        let handles = engine
+            .instances
+            .list_step_executions(&instance_id)
+            .unwrap()
+            .into_iter()
+            .filter(|execution| execution.step_id == "handle")
+            .collect::<Vec<_>>();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].id, handle.id);
+        let active_dispatches: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue
+                     WHERE task_id = ?1 AND status IN ('queued', 'running')",
+                    [&task_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(active_dispatches, 1);
     }
 
     #[test]

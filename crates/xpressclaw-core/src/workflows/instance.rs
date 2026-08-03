@@ -264,6 +264,124 @@ impl InstanceManager {
         self.get_step_execution(&id)
     }
 
+    /// Create a running task-backed execution before its task is made
+    /// dispatchable. Recovery can safely enqueue the linked task if the
+    /// process exits before dispatch.
+    pub fn create_task_execution(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        input_context: Option<&str>,
+        task_id: &str,
+    ) -> Result<StepExecution> {
+        let id = Uuid::new_v4().to_string();
+        self.insert_task_execution(
+            &id,
+            instance_id,
+            flow_name,
+            step_id,
+            input_context,
+            task_id,
+            None,
+        )?;
+        self.get_step_execution(&id)
+    }
+
+    /// Atomically link a loop body task to its execution and persist that
+    /// execution as the loop cursor's owner. The caller may only enqueue the
+    /// task after this transaction commits.
+    pub fn create_loop_task_execution<F>(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        input_context: Option<&str>,
+        task_id: &str,
+        loop_state_for_execution: F,
+    ) -> Result<StepExecution>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
+        let id = Uuid::new_v4().to_string();
+        let loop_state = loop_state_for_execution(&id)?;
+        self.insert_task_execution(
+            &id,
+            instance_id,
+            flow_name,
+            step_id,
+            input_context,
+            task_id,
+            Some(&loop_state),
+        )?;
+        self.get_step_execution(&id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_task_execution(
+        &self,
+        id: &str,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        input_context: Option<&str>,
+        task_id: &str,
+        loop_state: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        self.db.with_conn(|conn| -> Result<()> {
+            let transaction = conn
+                .unchecked_transaction()
+                .map_err(|error| Error::Database(error.to_string()))?;
+            let attempt = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
+                    rusqlite::params![instance_id, step_id],
+                    |row| row.get::<_, i32>(0),
+                )
+                .map_err(|error| Error::Database(error.to_string()))?
+                + 1;
+            transaction
+                .execute(
+                    "INSERT INTO workflow_step_executions
+                     (id, instance_id, flow_name, step_id, task_id, status, input_context, attempt, started_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
+                    rusqlite::params![
+                        id,
+                        instance_id,
+                        flow_name,
+                        step_id,
+                        task_id,
+                        input_context,
+                        attempt,
+                        now
+                    ],
+                )
+                .map_err(|error| Error::Database(error.to_string()))?;
+            if let Some(loop_state) = loop_state {
+                let changed = transaction
+                    .execute(
+                        "UPDATE workflow_instances SET loop_state = ?1 WHERE id = ?2",
+                        rusqlite::params![loop_state, instance_id],
+                    )
+                    .map_err(|error| Error::Database(error.to_string()))?;
+                if changed != 1 {
+                    return Err(Error::WorkflowInstanceNotFound {
+                        id: instance_id.to_string(),
+                    });
+                }
+            }
+            transaction
+                .commit()
+                .map_err(|error| Error::Database(error.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Atomically persist a durable wait and put its instance to sleep. This
     /// avoids a crash window where a pending execution exists but neither the
     /// worker recovery path nor the wait poller owns it.

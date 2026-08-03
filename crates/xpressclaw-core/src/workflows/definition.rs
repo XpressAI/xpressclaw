@@ -626,14 +626,19 @@ pub(crate) fn parse_wait_duration(value: &str) -> std::result::Result<chrono::Du
     if amount <= 0 {
         return Err("duration must be greater than zero".into());
     }
-    match unit {
-        "s" => Ok(chrono::Duration::seconds(amount)),
-        "m" => Ok(chrono::Duration::minutes(amount)),
-        "h" => Ok(chrono::Duration::hours(amount)),
-        "d" => Ok(chrono::Duration::days(amount)),
-        "w" => Ok(chrono::Duration::weeks(amount)),
-        _ => Err("unit must be s, m, h, d, or w".into()),
+    let duration = match unit {
+        "s" => chrono::Duration::try_seconds(amount),
+        "m" => chrono::Duration::try_minutes(amount),
+        "h" => chrono::Duration::try_hours(amount),
+        "d" => chrono::Duration::try_days(amount),
+        "w" => chrono::Duration::try_weeks(amount),
+        _ => return Err("unit must be s, m, h, d, or w".into()),
     }
+    .ok_or_else(|| "duration is too large".to_string())?;
+    if chrono::Utc::now().checked_add_signed(duration).is_none() {
+        return Err("duration exceeds the supported timestamp range".into());
+    }
+    Ok(duration)
 }
 
 impl WorkflowInput {
@@ -1406,6 +1411,44 @@ flows:
         invalid.flows.get_mut("main").unwrap().steps[0].timeout = Some("eventually".into());
         assert!(invalid
             .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid timeout"));
+    }
+
+    #[test]
+    fn rejects_overflowing_wait_durations_without_panicking() {
+        let constructor_overflow = std::panic::catch_unwind(|| {
+            parse_wait_duration("9223372036854775807w")
+        });
+        assert!(constructor_overflow.is_ok());
+        assert!(constructor_overflow
+            .unwrap()
+            .unwrap_err()
+            .contains("too large"));
+
+        let timestamp_overflow = parse_wait_duration("1000000000d").unwrap_err();
+        assert!(timestamp_overflow.contains("timestamp range"));
+
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: invalid-review-wait
+flows:
+  main:
+    steps:
+      - id: wait_for_review
+        type: wait
+        agent: project-a
+        event: github.pull_request.activity
+        resource: https://github.com/XpressAI/xpressclaw/pull/144
+        timeout: 9223372036854775807w
+"#,
+        )
+        .unwrap();
+        let validation = std::panic::catch_unwind(|| definition.validate());
+        assert!(validation.is_ok());
+        assert!(validation
+            .unwrap()
             .unwrap_err()
             .to_string()
             .contains("invalid timeout"));

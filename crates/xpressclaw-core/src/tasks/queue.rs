@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -42,6 +43,34 @@ impl TaskQueue {
         })?;
 
         self.create_attempt_for_item(id, task_id, agent_id)
+    }
+
+    /// Ensure a task has exactly one dispatchable queue item. Workflow
+    /// recovery uses this after persisting task ownership but before (or after
+    /// an interrupted) initial dispatch.
+    pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
+        let id = self.db.with_conn(|conn| {
+            let active = conn
+                .query_row(
+                    "SELECT id, attempt_id FROM task_queue
+                     WHERE task_id = ?1 AND status IN ('queued', 'running')
+                     ORDER BY id DESC LIMIT 1",
+                    [task_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            if let Some((id, attempt_id)) = active {
+                return Ok::<_, Error>(attempt_id.is_none().then_some(id));
+            }
+            conn.execute(
+                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+                rusqlite::params![task_id, agent_id],
+            )?;
+            Ok(Some(conn.last_insert_rowid()))
+        })?;
+
+        id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
+            .transpose()
     }
 
     /// Enqueue one continuation turn unless the task already has a queued
@@ -429,6 +458,47 @@ mod tests {
 
         // No more items to claim
         assert!(queue.claim("atlas").unwrap().is_none());
+    }
+
+    #[test]
+    fn ensure_enqueued_does_not_duplicate_active_dispatch() {
+        let (db, queue) = setup();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Owned workflow task".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+
+        let first = queue
+            .ensure_enqueued(&task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        assert!(queue
+            .ensure_enqueued(&task.id, "atlas")
+            .unwrap()
+            .is_none());
+        assert_eq!(queue.claim("atlas").unwrap().unwrap().id, first.id);
+        assert!(queue
+            .ensure_enqueued(&task.id, "atlas")
+            .unwrap()
+            .is_none());
+        let dispatches: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(dispatches, 1);
     }
 
     #[test]
