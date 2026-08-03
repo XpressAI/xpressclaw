@@ -787,7 +787,7 @@ flows:
 	});
 	await page.goto('/');
 
-	const agentPicker = page.getByLabel('Agent', { exact: true });
+	const agentPicker = page.getByLabel(/Agent(?: role implementer)?$/);
 	const workflowPicker = page.getByLabel('Workflow');
 	await expect(workflowPicker).toHaveValue('');
 	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);

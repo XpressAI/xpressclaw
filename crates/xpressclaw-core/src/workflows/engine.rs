@@ -929,14 +929,21 @@ impl WorkflowEngine {
                     variable_store,
                 )
             }
-            ["flow", flow_name] => self.execute_step(
-                instance_id,
-                flow_name,
-                0,
-                definition,
-                trigger_data,
-                variable_store,
-            ),
+            ["flow", flow_name] => {
+                // Empty terminal flows complete before `execute_step_inner`
+                // reaches a concrete step, so persist the transition here as
+                // well as in the normal non-empty path.
+                self.instances
+                    .set_current_position(instance_id, flow_name, 0)?;
+                self.execute_step(
+                    instance_id,
+                    flow_name,
+                    0,
+                    definition,
+                    trigger_data,
+                    variable_store,
+                )
+            }
             ["flow", flow_name, "step", step_id] => {
                 let idx = definition.step_index(flow_name, step_id).ok_or_else(|| {
                     Error::Workflow(format!(
