@@ -9,6 +9,7 @@ use xpressclaw_core::workflows::definition::WorkflowDefinition;
 use xpressclaw_core::workflows::engine::WorkflowEngine;
 use xpressclaw_core::workflows::instance::InstanceManager;
 use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
+use xpressclaw_core::workflows::waits::WaitState;
 
 use crate::state::AppState;
 
@@ -186,7 +187,36 @@ async fn list_instances(
     let list = im
         .list_instances(&workflow_id, 50)
         .map_err(internal_error)?;
-    Ok(Json(json!(list)))
+    let values = list
+        .into_iter()
+        .map(|instance| instance_with_wait_details(&im, instance))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!(values)))
+}
+
+fn instance_with_wait_details(
+    instances: &InstanceManager,
+    instance: xpressclaw_core::workflows::instance::WorkflowInstance,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let mut value = serde_json::to_value(&instance).map_err(internal_error)?;
+    if instance.status != "waiting" {
+        return Ok(value);
+    }
+    let wait = instances
+        .list_step_executions(&instance.id)
+        .map_err(internal_error)?
+        .into_iter()
+        .rev()
+        .find(|execution| execution.status == "waiting")
+        .and_then(|execution| execution.input_context)
+        .and_then(|state| serde_json::from_str::<WaitState>(&state).ok());
+    if let (Some(object), Some(wait)) = (value.as_object_mut(), wait) {
+        object.insert("wait_event".into(), json!(wait.event));
+        object.insert("wait_resource".into(), json!(wait.resource));
+        object.insert("wait_next_poll_at".into(), json!(wait.next_poll_at));
+        object.insert("wait_error".into(), json!(wait.last_error));
+    }
+    Ok(value)
 }
 
 async fn get_instance(

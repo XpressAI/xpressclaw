@@ -57,6 +57,10 @@ pub struct WorkflowInput {
     pub required: bool,
     #[serde(default)]
     pub default: Option<Value>,
+    /// Marks the agent role controlled by the primary agent picker on New
+    /// Work. At most one agent input may be primary.
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +70,10 @@ pub enum WorkflowInputType {
     String,
     Number,
     Boolean,
+    /// A configured XpressClaw agent/session ID. Agent inputs make a workflow
+    /// reusable across project contexts instead of baking concrete IDs into
+    /// every task step.
+    Agent,
     /// Any JSON value, including objects and arrays.
     Json,
 }
@@ -135,6 +143,22 @@ pub struct Step {
     // Jump fields
     #[serde(default)]
     pub target: Option<String>,
+    // Wait fields
+    /// Durable event name. The first built-in events are GitHub pull-request
+    /// review, comment, and combined activity.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Event resource, normally a rendered pull-request URL from an earlier
+    /// step output.
+    #[serde(default)]
+    pub resource: Option<String>,
+    /// Optional human duration such as `30m`, `24h`, or `14d`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Optional goto target used when the wait times out. Without one the
+    /// workflow fails with a useful timeout error.
+    #[serde(default)]
+    pub on_timeout: Option<String>,
 }
 
 fn default_step_type() -> String {
@@ -210,6 +234,7 @@ impl WorkflowDefinition {
             ));
         }
 
+        let mut primary_agent = None;
         for (name, input) in &self.inputs {
             if name.trim().is_empty() {
                 return Err(Error::Workflow(
@@ -231,6 +256,19 @@ impl WorkflowDefinition {
             }
             if let Some(default) = input.default.as_ref() {
                 input.validate_value(name, default)?;
+            }
+            if input.primary {
+                if input.input_type != WorkflowInputType::Agent {
+                    return Err(Error::Workflow(format!(
+                        "workflow input '{name}' can be primary only when its type is agent"
+                    )));
+                }
+                if let Some(existing) = primary_agent {
+                    return Err(Error::Workflow(format!(
+                        "workflow agent inputs '{existing}' and '{name}' are both primary; choose one"
+                    )));
+                }
+                primary_agent = Some(name.as_str());
             }
         }
 
@@ -374,7 +412,65 @@ impl WorkflowDefinition {
                     }
                     // Validate nested steps in loop body
                     if let Some(ref body) = step.body {
+                        if let Some(unsupported) =
+                            body.iter().find(|body_step| body_step.step_type != "step")
+                        {
+                            return Err(Error::Workflow(format!(
+                                "loop step '{}' in flow '{flow_name}' contains unsupported '{}' step '{}'; loop bodies currently accept agent task steps only",
+                                step.id, unsupported.step_type, unsupported.id
+                            )));
+                        }
                         self.validate_steps(body, step_ids, flow_names, flow_name)?;
+                    }
+                }
+                "step" => self.validate_agent_reference(step, flow_name, false)?,
+                "wait" => {
+                    self.validate_agent_reference(step, flow_name, true)?;
+                    let event = step
+                        .event
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|event| !event.is_empty())
+                        .ok_or_else(|| {
+                            Error::Workflow(format!(
+                                "wait step '{}' in flow '{flow_name}' is missing 'event'",
+                                step.id
+                            ))
+                        })?;
+                    if !matches!(
+                        event,
+                        "github.pull_request.review"
+                            | "github.pull_request.comment"
+                            | "github.pull_request.activity"
+                    ) {
+                        return Err(Error::Workflow(format!(
+                            "wait step '{}' in flow '{flow_name}' uses unsupported event '{event}'",
+                            step.id
+                        )));
+                    }
+                    if step
+                        .resource
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(Error::Workflow(format!(
+                            "wait step '{}' in flow '{flow_name}' is missing 'resource'",
+                            step.id
+                        )));
+                    }
+                    if let Some(target) = step.on_timeout.as_deref() {
+                        self.validate_goto_target(
+                            target, step_ids, flow_names, &step.id, flow_name,
+                        )?;
+                    }
+                    if let Some(timeout) = step.timeout.as_deref() {
+                        parse_wait_duration(timeout).map_err(|message| {
+                            Error::Workflow(format!(
+                                "wait step '{}' in flow '{flow_name}' has invalid timeout: {message}",
+                                step.id
+                            ))
+                        })?;
                     }
                 }
                 "jump" => {
@@ -389,10 +485,54 @@ impl WorkflowDefinition {
                         )));
                     }
                 }
-                _ => {} // "step" and "sink" don't need structural validation
+                "sink" => {}
+                other => {
+                    return Err(Error::Workflow(format!(
+                        "step '{}' in flow '{flow_name}' has unsupported type '{other}'",
+                        step.id
+                    )));
+                }
             }
         }
         Ok(())
+    }
+
+    fn validate_agent_reference(&self, step: &Step, flow_name: &str, required: bool) -> Result<()> {
+        let agent = step
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty());
+        let Some(agent) = agent else {
+            return if required {
+                Err(Error::Workflow(format!(
+                    "{} step '{}' in flow '{flow_name}' is missing 'agent'",
+                    step.step_type, step.id
+                )))
+            } else {
+                Ok(())
+            };
+        };
+        let Some(name) = agent.strip_prefix('@') else {
+            return Ok(());
+        };
+        if name.contains('.') || name.is_empty() {
+            return Err(Error::Workflow(format!(
+                "step '{}' in flow '{flow_name}' must reference an agent input as '@role'",
+                step.id
+            )));
+        }
+        match self.inputs.get(name) {
+            Some(input) if input.input_type == WorkflowInputType::Agent => Ok(()),
+            Some(_) => Err(Error::Workflow(format!(
+                "step '{}' in flow '{flow_name}' references '@{name}', but that input is not type agent",
+                step.id
+            ))),
+            None => Err(Error::Workflow(format!(
+                "step '{}' in flow '{flow_name}' references undeclared agent input '@{name}'",
+                step.id
+            ))),
+        }
     }
 
     /// Validate a goto/jump target string.
@@ -473,12 +613,43 @@ impl WorkflowDefinition {
     }
 }
 
+/// Parse the compact duration syntax used by durable wait steps.
+pub(crate) fn parse_wait_duration(value: &str) -> std::result::Result<chrono::Duration, String> {
+    let value = value.trim();
+    if value.len() < 2 {
+        return Err("use a positive duration such as 30m, 24h, or 14d".into());
+    }
+    let (amount, unit) = value.split_at(value.len() - 1);
+    let amount = amount
+        .parse::<i64>()
+        .map_err(|_| "use a whole number followed by s, m, h, d, or w".to_string())?;
+    if amount <= 0 {
+        return Err("duration must be greater than zero".into());
+    }
+    let duration = match unit {
+        "s" => chrono::Duration::try_seconds(amount),
+        "m" => chrono::Duration::try_minutes(amount),
+        "h" => chrono::Duration::try_hours(amount),
+        "d" => chrono::Duration::try_days(amount),
+        "w" => chrono::Duration::try_weeks(amount),
+        _ => return Err("unit must be s, m, h, d, or w".into()),
+    }
+    .ok_or_else(|| "duration is too large".to_string())?;
+    if chrono::Utc::now().checked_add_signed(duration).is_none() {
+        return Err("duration exceeds the supported timestamp range".into());
+    }
+    Ok(duration)
+}
+
 impl WorkflowInput {
     fn validate_value(&self, name: &str, value: &Value) -> Result<()> {
         let valid = match self.input_type {
             WorkflowInputType::String => value.is_string(),
             WorkflowInputType::Number => value.is_number(),
             WorkflowInputType::Boolean => value.is_boolean(),
+            WorkflowInputType::Agent => {
+                value.as_str().is_some_and(|agent| !agent.trim().is_empty())
+            }
             WorkflowInputType::Json => true,
         };
         if valid {
@@ -498,6 +669,7 @@ impl WorkflowInputType {
             Self::String => "a string",
             Self::Number => "a number",
             Self::Boolean => "a boolean",
+            Self::Agent => "a configured agent ID",
             Self::Json => "valid JSON",
         }
     }
@@ -1151,5 +1323,133 @@ flows:
             .unwrap_err()
             .to_string()
             .contains("cron"));
+    }
+
+    #[test]
+    fn validates_reusable_agent_inputs_and_primary_role() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: reusable-review
+inputs:
+  implementer:
+    type: agent
+    required: true
+    primary: true
+  reviewer:
+    type: agent
+    required: true
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: "@implementer"
+        prompt: implement
+      - id: review
+        agent: "@reviewer"
+        prompt: review
+"#,
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert!(definition
+            .resolve_inputs(&serde_json::json!({
+                "implementer": "project-a",
+                "reviewer": "project-b"
+            }))
+            .is_ok());
+
+        let invalid = WorkflowDefinition::parse(
+            r#"
+name: invalid-role
+inputs:
+  goal:
+    type: string
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@goal"
+        prompt: work
+"#,
+        )
+        .unwrap();
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not type agent"));
+    }
+
+    #[test]
+    fn validates_durable_pull_request_waits() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: review-wait
+inputs:
+  implementer:
+    type: agent
+    required: true
+flows:
+  main:
+    steps:
+      - id: wait_for_review
+        type: wait
+        agent: "@implementer"
+        event: github.pull_request.activity
+        resource: "@publish.pull_request_url"
+        timeout: 14d
+        on_timeout: flow timed_out
+  timed_out:
+    steps: []
+"#,
+        )
+        .unwrap();
+        definition.validate().unwrap();
+        assert_eq!(parse_wait_duration("90m").unwrap().num_minutes(), 90);
+
+        let mut invalid = definition.clone();
+        invalid.flows.get_mut("main").unwrap().steps[0].timeout = Some("eventually".into());
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid timeout"));
+    }
+
+    #[test]
+    fn rejects_overflowing_wait_durations_without_panicking() {
+        let constructor_overflow =
+            std::panic::catch_unwind(|| parse_wait_duration("9223372036854775807w"));
+        assert!(constructor_overflow.is_ok());
+        assert!(constructor_overflow
+            .unwrap()
+            .unwrap_err()
+            .contains("too large"));
+
+        let timestamp_overflow = parse_wait_duration("1000000000d").unwrap_err();
+        assert!(timestamp_overflow.contains("timestamp range"));
+
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: invalid-review-wait
+flows:
+  main:
+    steps:
+      - id: wait_for_review
+        type: wait
+        agent: project-a
+        event: github.pull_request.activity
+        resource: https://github.com/XpressAI/xpressclaw/pull/144
+        timeout: 9223372036854775807w
+"#,
+        )
+        .unwrap();
+        let validation = std::panic::catch_unwind(|| definition.validate());
+        assert!(validation.is_ok());
+        assert!(validation
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid timeout"));
     }
 }

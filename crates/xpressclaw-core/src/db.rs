@@ -181,6 +181,7 @@ impl Database {
             (28, MIGRATION_V28),
             (29, MIGRATION_V29),
             (30, MIGRATION_V30),
+            (31, MIGRATION_V31),
         ];
 
         for &(target, sql) in migrations {
@@ -960,6 +961,12 @@ CREATE INDEX idx_workflows_scheduled
     ON workflows(enabled, last_triggered_at);
 ";
 
+const MIGRATION_V31: &str = "
+-- Long-running workflow instances must keep executing the definition they
+-- started with, even if the reusable workflow is edited while they wait.
+ALTER TABLE workflow_instances ADD COLUMN definition_yaml TEXT;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,7 +984,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "30");
+        assert_eq!(version, "31");
     }
 
     #[test]

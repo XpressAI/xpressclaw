@@ -22,6 +22,7 @@
 	let workflowList = $state<Workflow[]>([]);
 	let selectedWorkflow = $state('');
 	let selectedWorkflowReady = $state(false);
+	let roleAgents = $state<Record<string, string>>({});
 	let sending = $state(false);
 	let composing = $state(false);
 	let sendError = $state('');
@@ -95,6 +96,8 @@
 		type?: string;
 		required?: boolean;
 		default?: unknown;
+		primary?: boolean;
+		description?: string;
 	}
 
 	interface WorkflowStepSummary {
@@ -110,7 +113,8 @@
 		flows?: Record<string, { steps?: WorkflowStepSummary[] }>;
 	}
 
-	function workflowDefinition(workflow: Workflow): WorkflowDefinitionSummary | null {
+	function workflowDefinition(workflow: Workflow | undefined): WorkflowDefinitionSummary | null {
+		if (!workflow) return null;
 		try {
 			return yaml.load(workflow.yaml_content) as WorkflowDefinitionSummary;
 		} catch {
@@ -135,20 +139,27 @@
 		const definition = workflowDefinition(workflow);
 		if (!definition || definition.trigger) return false;
 		const mainSteps = definition.flows?.main?.steps ?? [];
-		if (Object.values(definition.flows ?? {}).some((flow) => usesConnectorSink(flow.steps ?? [])) || firstStepAgent(mainSteps) !== agentId) return false;
+		if (Object.values(definition.flows ?? {}).some((flow) => usesConnectorSink(flow.steps ?? []))) return false;
 		const inputs = definition.inputs ?? {};
 		if ((inputs.goal?.type ?? 'string') !== 'string' || !inputs.goal) return false;
+		const agentInputs = Object.entries(inputs).filter(([, input]) => input.type === 'agent');
+		if (agentInputs.length === 0 && firstStepAgent(mainSteps) !== agentId) return false;
 		return Object.entries(inputs).every(([name, input]) =>
-			name === 'goal' || !input.required || input.default !== undefined && input.default !== null
+			name === 'goal' || input.type === 'agent' || !input.required || input.default !== undefined && input.default !== null
 		);
 	}
 
 	let selectedAgentObj = $derived(agentList.find(a => a.id === selectedAgent));
 	let compatibleWorkflows = $derived(workflowList.filter((workflow) => supportsNewWork(workflow, selectedAgent)));
 	let selectedWorkflowObj = $derived(compatibleWorkflows.find((workflow) => workflow.id === selectedWorkflow));
+	let selectedWorkflowInputs = $derived(workflowDefinition(selectedWorkflowObj)?.inputs ?? {});
+	let workflowAgentInputs = $derived(Object.entries(selectedWorkflowInputs).filter(([, input]) => input.type === 'agent'));
+	let primaryAgentRole = $derived(workflowAgentInputs.find(([, input]) => input.primary)?.[0] ?? workflowAgentInputs[0]?.[0] ?? null);
+	let secondaryAgentRoles = $derived(workflowAgentInputs.filter(([name]) => name !== primaryAgentRole));
 	let canSend = $derived(Boolean(selectedAgent) && !sending && (
 		selectedWorkflow
 			? Boolean(message.trim()) && imageAttachments.length === 0 && Boolean(selectedWorkflowObj)
+				&& secondaryAgentRoles.every(([name, input]) => !input.required || Boolean(roleAgents[name] || input.default))
 			: Boolean(message.trim()) || imageAttachments.length > 0
 	));
 
@@ -158,6 +169,24 @@
 		}
 	});
 
+	$effect(() => {
+		if (!selectedWorkflowObj) {
+			roleAgents = {};
+			return;
+		}
+		const next: Record<string, string> = {};
+		for (const [name, input] of secondaryAgentRoles) {
+			const configured = typeof input.default === 'string' ? input.default : '';
+			const saved = loadComposerTarget(`${messageDraftScope}-workflow-${selectedWorkflowObj.id}-role-${name}`);
+			const alternative = agentList.find((agent) => agent.id !== selectedAgent)?.id ?? selectedAgent;
+			next[name] = agentList.some((agent) => agent.id === roleAgents[name])
+				? roleAgents[name]
+				: agentList.some((agent) => agent.id === saved) ? saved
+					: agentList.some((agent) => agent.id === configured) ? configured : alternative;
+		}
+		if (JSON.stringify(next) !== JSON.stringify(roleAgents)) roleAgents = next;
+	});
+
 	async function send() {
 		if (!canSend) return;
 		sending = true;
@@ -165,7 +194,13 @@
 
 		try {
 			if (selectedWorkflowObj) {
-				const instance = await workflowsApi.run(selectedWorkflowObj.id, { goal: message.trim() });
+				const inputs: Record<string, unknown> = { goal: message.trim() };
+				if (primaryAgentRole) inputs[primaryAgentRole] = selectedAgent;
+				for (const [name, input] of secondaryAgentRoles) {
+					const value = roleAgents[name] || input.default;
+					if (value) inputs[name] = value;
+				}
+				const instance = await workflowsApi.run(selectedWorkflowObj.id, inputs);
 				message = '';
 				clearComposerDraft(messageDraftScope);
 				imageAttachments = [];
@@ -259,9 +294,26 @@
 					class="w-full resize-none rounded-t-2xl bg-transparent px-5 pt-5 pb-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none disabled:opacity-50"
 				></textarea>
 				<ImageAttachmentPreviews attachments={imagePreviews} onremove={(index) => (imageAttachments = imageAttachments.filter((_, itemIndex) => itemIndex !== index))} />
+				{#if selectedWorkflowObj && secondaryAgentRoles.length > 0}
+					<div class="mx-4 mb-3 grid gap-2 rounded-lg border border-border/70 bg-background/40 p-3 sm:grid-cols-2">
+						{#each secondaryAgentRoles as [name, input]}
+							<label class="text-[10px] font-medium text-muted-foreground">
+								{name.replaceAll('_', ' ').toUpperCase()}{input.required ? ' · REQUIRED' : ''}
+								<select aria-label="Agent role {name}" value={roleAgents[name] ?? ''} onchange={(event) => {
+									roleAgents = { ...roleAgents, [name]: event.currentTarget.value };
+									saveComposerTarget(`${messageDraftScope}-workflow-${selectedWorkflowObj.id}-role-${name}`, event.currentTarget.value);
+								}} class="mt-1 w-full rounded border border-input bg-secondary px-2.5 py-1.5 text-xs text-foreground">
+									<option value="">Select agent…</option>
+									{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+								</select>
+								{#if input.description}<span class="mt-1 block font-normal normal-case leading-relaxed">{input.description}</span>{/if}
+							</label>
+						{/each}
+					</div>
+				{/if}
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
 					{#if selectedWorkflowObj}
-						<p class="text-xs text-muted-foreground">The workflow controls each step's agent and conversation context.</p>
+						<p class="text-xs text-muted-foreground">Bind each workflow role for this run. The definition is reusable across projects.</p>
 					{:else}
 						<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this agent's current conversation">
 							<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
@@ -281,7 +333,7 @@
 								{/if}
 								<select
 									bind:value={selectedAgent}
-									aria-label="Agent"
+									aria-label={primaryAgentRole ? `Agent role ${primaryAgentRole}` : 'Agent'}
 									class="min-w-0 max-w-28 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-40"
 								>
 									{#each agentList as agent}
@@ -290,6 +342,7 @@
 										</option>
 									{/each}
 								</select>
+								{#if primaryAgentRole}<span class="hidden text-[9px] text-muted-foreground sm:inline">as {primaryAgentRole}</span>{/if}
 						</div>
 						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
 							<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">W</span>

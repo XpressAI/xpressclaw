@@ -127,6 +127,19 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Resume durable workflow event waits (for example PR review activity).
+    // The bound agent selects the project workspace and scoped GitHub access;
+    // no worker container remains alive while the workflow is sleeping.
+    let workflow_wait_db = state.db.clone();
+    let workflow_wait_config = state.config.clone();
+    let workflow_wait_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workflows::waits::start_wait_runner(workflow_wait_db, workflow_wait_config) => {}
+            _ = workflow_wait_shutdown.cancelled() => { info!("workflow wait runner stopped"); }
+        }
+    });
+
     let app = create_router(state.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

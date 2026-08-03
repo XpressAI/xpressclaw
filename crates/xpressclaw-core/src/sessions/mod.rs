@@ -250,26 +250,28 @@ impl SessionManager {
         self.ensure(session_id, None)?;
         let id = Uuid::new_v4().to_string();
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
                 "INSERT INTO work_attempts
                  (id, session_id, task_id, queue_id, kind, runner, status, prompt)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
                 rusqlite::params![id, session_id, task_id, queue_id, kind, runner, prompt],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
                 rusqlite::params![id, queue_id],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
                 rusqlite::params![session_id, id, task_id],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?1 AND status != 'running'",
                 [session_id],
             )?;
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
         self.append_event(

@@ -1,10 +1,13 @@
 <script lang="ts">
-	export type WorkflowInputType = 'string' | 'number' | 'boolean' | 'json';
+	import type { Agent } from '$lib/api';
+
+	export type WorkflowInputType = 'string' | 'number' | 'boolean' | 'json' | 'agent';
 	export interface WorkflowInputDefinition {
 		type: WorkflowInputType;
 		description?: string;
 		required?: boolean;
 		default?: unknown;
+		primary?: boolean;
 	}
 	export interface WorkflowScheduleDefinition {
 		cron: string;
@@ -16,11 +19,15 @@
 		schedule = null,
 		onupdate = (_inputs: Record<string, WorkflowInputDefinition>, _schedule: WorkflowScheduleDefinition | null) => {},
 		onvalidationchange = (_message: string) => {},
+		onrename = (_oldName: string, _newName: string) => {},
+		agentList = [],
 	}: {
 		inputs?: Record<string, WorkflowInputDefinition>;
 		schedule?: WorkflowScheduleDefinition | null;
 		onupdate?: (inputs: Record<string, WorkflowInputDefinition>, schedule: WorkflowScheduleDefinition | null) => void;
 		onvalidationchange?: (message: string) => void;
+		onrename?: (oldName: string, newName: string) => void;
+		agentList?: Agent[];
 	} = $props();
 
 	let expanded = $state(true);
@@ -57,6 +64,7 @@
 			message,
 		]));
 		onupdate(nextInputs, nextSchedule);
+		onrename(oldName, name);
 	}
 
 	function updateInput(name: string, update: Partial<WorkflowInputDefinition>) {
@@ -66,10 +74,19 @@
 	function changeInputType(name: string, type: WorkflowInputType) {
 		const next = { ...inputs[name], type };
 		delete next.default;
+		if (type !== 'agent') delete next.primary;
 		const nextSchedule = schedule ? { ...schedule, inputs: { ...schedule.inputs } } : null;
 		if (nextSchedule) delete nextSchedule.inputs[name];
 		clearValueErrors(name);
 		onupdate({ ...inputs, [name]: next }, nextSchedule);
+	}
+
+	function setPrimaryAgent(name: string) {
+		const next = Object.fromEntries(Object.entries(inputs).map(([key, definition]) => [
+			key,
+			definition.type === 'agent' ? { ...definition, primary: key === name } : definition,
+		]));
+		onupdate(next, schedule);
 	}
 
 	function removeInput(name: string) {
@@ -193,13 +210,19 @@
 								</label>
 								<label class="text-[9px] font-medium text-muted-foreground">TYPE
 									<select aria-label="Workflow input type" value={definition.type} onchange={(event) => changeInputType(name, event.currentTarget.value as WorkflowInputType)} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs">
-										<option value="string">Text</option><option value="number">Number</option><option value="boolean">Yes / no</option><option value="json">JSON</option>
+										<option value="string">Text</option><option value="number">Number</option><option value="boolean">Yes / no</option><option value="json">JSON</option><option value="agent">Agent role</option>
 									</select>
 								</label>
 								<label class="mt-4 flex items-center gap-1.5 text-[10px] text-muted-foreground"><input type="checkbox" checked={definition.required ?? false} onchange={(event) => updateInput(name, { required: event.currentTarget.checked })} /> Required</label>
 								<button type="button" onclick={() => removeInput(name)} aria-label="Remove workflow input" class="mt-4 text-xs text-muted-foreground hover:text-destructive">Remove</button>
 							</div>
 							<input aria-label="Workflow input description" type="text" value={definition.description ?? ''} oninput={(event) => updateInput(name, { description: event.currentTarget.value || undefined })} placeholder="What should the caller provide?" class="w-full rounded border border-input bg-background px-2 py-1 text-xs" />
+							{#if definition.type === 'agent'}
+								<label class="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+									<input type="radio" name="primary-agent-input" checked={definition.primary ?? false} onchange={() => setPrimaryAgent(name)} />
+									Use this role as the primary Agent picker on New Work
+								</label>
+							{/if}
 
 							<div class="grid gap-2 {schedule ? 'sm:grid-cols-2' : ''}">
 								<label class="text-[9px] font-medium text-muted-foreground">DEFAULT (OPTIONAL)
@@ -207,6 +230,11 @@
 										<select aria-label="Workflow input default" value={definition.default === undefined ? '' : String(definition.default)} onchange={(event) => updateInput(name, { default: event.currentTarget.value === '' ? undefined : event.currentTarget.value === 'true' })} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs"><option value="">No default</option><option value="true">Yes</option><option value="false">No</option></select>
 									{:else if definition.type === 'json'}
 										<textarea aria-label="Workflow input default" rows="2" value={displayValue(definition.default, definition.type)} onchange={(event) => setJsonDefault(name, event.currentTarget.value)} placeholder={'{"key":"value"}'} class="mt-1 w-full resize-y rounded border border-input bg-background px-2 py-1 font-mono text-xs"></textarea>
+									{:else if definition.type === 'agent'}
+										<select aria-label="Workflow input default" value={displayValue(definition.default, definition.type)} onchange={(event) => updateInput(name, { default: event.currentTarget.value || undefined })} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs">
+											<option value="">Choose at run time</option>
+											{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+										</select>
 									{:else}
 										<input aria-label="Workflow input default" type={definition.type === 'number' ? 'number' : 'text'} value={displayValue(definition.default, definition.type)} onchange={(event) => updateInput(name, { default: event.currentTarget.value === '' ? undefined : definition.type === 'number' ? Number(event.currentTarget.value) : event.currentTarget.value })} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs" />
 									{/if}
@@ -218,6 +246,11 @@
 											<select aria-label="Scheduled workflow input" value={Object.hasOwn(schedule.inputs, name) ? String(schedule.inputs[name]) : ''} onchange={(event) => setScheduleInput(name, event.currentTarget.value === 'true', event.currentTarget.value !== '')} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs"><option value="">Use default</option><option value="true">Yes</option><option value="false">No</option></select>
 										{:else if definition.type === 'json'}
 											<textarea aria-label="Scheduled workflow input" rows="2" value={displayValue(schedule.inputs[name], definition.type)} onchange={(event) => setScheduledJson(name, event.currentTarget.value)} placeholder="Use default" class="mt-1 w-full resize-y rounded border border-input bg-background px-2 py-1 font-mono text-xs"></textarea>
+										{:else if definition.type === 'agent'}
+											<select aria-label="Scheduled workflow input" value={displayValue(schedule.inputs[name], definition.type)} onchange={(event) => setScheduleInput(name, event.currentTarget.value, event.currentTarget.value !== '')} class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs">
+												<option value="">Use default</option>
+												{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+											</select>
 										{:else}
 											<input aria-label="Scheduled workflow input" type={definition.type === 'number' ? 'number' : 'text'} value={displayValue(schedule.inputs[name], definition.type)} onchange={(event) => setScheduleInput(name, definition.type === 'number' ? Number(event.currentTarget.value) : event.currentTarget.value, event.currentTarget.value !== '')} placeholder="Use default" class="mt-1 w-full rounded border border-input bg-background px-2 py-1 text-xs" />
 										{/if}

@@ -1,3 +1,3 @@
 pub mod acp;
-mod github;
+pub(crate) mod github;
 pub mod native;
