@@ -1418,9 +1418,8 @@ flows:
 
     #[test]
     fn rejects_overflowing_wait_durations_without_panicking() {
-        let constructor_overflow = std::panic::catch_unwind(|| {
-            parse_wait_duration("9223372036854775807w")
-        });
+        let constructor_overflow =
+            std::panic::catch_unwind(|| parse_wait_duration("9223372036854775807w"));
         assert!(constructor_overflow.is_ok());
         assert!(constructor_overflow
             .unwrap()

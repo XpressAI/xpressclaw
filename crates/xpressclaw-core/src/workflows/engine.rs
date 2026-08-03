@@ -432,11 +432,8 @@ impl WorkflowEngine {
     ) -> Result<()> {
         let queue = TaskQueue::new(self.db.clone());
         if let Err(error) = queue.ensure_enqueued(&prepared.task_id, &prepared.agent_id) {
-            let _ = TaskBoard::new(self.db.clone()).update_status(
-                &prepared.task_id,
-                "cancelled",
-                None,
-            );
+            let _ =
+                TaskBoard::new(self.db.clone()).update_status(&prepared.task_id, "cancelled", None);
             let _ = self.instances.update_step_status(
                 &execution.id,
                 "failed",
@@ -853,12 +850,8 @@ impl WorkflowEngine {
         let body_context = context::build_context(trigger_data, &definition.variables, &variables);
         let body_context_json =
             serde_json::to_string(&body_context).unwrap_or_else(|_| "{}".to_string());
-        let prepared = self.prepare_task_step(
-            instance_id,
-            &state.flow_name,
-            body_step,
-            &body_context,
-        )?;
+        let prepared =
+            self.prepare_task_step(instance_id, &state.flow_name, body_step, &body_context)?;
         let flow_name = state.flow_name.clone();
         let execution = self.instances.create_loop_task_execution(
             instance_id,
@@ -3371,7 +3364,10 @@ flows:
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(loop_state.active_execution_id.as_deref(), Some(handle.id.as_str()));
+        assert_eq!(
+            loop_state.active_execution_id.as_deref(),
+            Some(handle.id.as_str())
+        );
 
         // Recreate the crash boundary after task ownership commits but before
         // dispatch. Recovery must enqueue that exact task without creating a

@@ -476,19 +476,10 @@ mod tests {
             })
             .unwrap();
 
-        let first = queue
-            .ensure_enqueued(&task.id, "atlas")
-            .unwrap()
-            .unwrap();
-        assert!(queue
-            .ensure_enqueued(&task.id, "atlas")
-            .unwrap()
-            .is_none());
+        let first = queue.ensure_enqueued(&task.id, "atlas").unwrap().unwrap();
+        assert!(queue.ensure_enqueued(&task.id, "atlas").unwrap().is_none());
         assert_eq!(queue.claim("atlas").unwrap().unwrap().id, first.id);
-        assert!(queue
-            .ensure_enqueued(&task.id, "atlas")
-            .unwrap()
-            .is_none());
+        assert!(queue.ensure_enqueued(&task.id, "atlas").unwrap().is_none());
         let dispatches: i64 = db
             .with_conn(|conn| {
                 conn.query_row(
