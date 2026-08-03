@@ -388,9 +388,9 @@ async function mockApi(
 				response = {
 					attempts: [attempt(attemptStatus)],
 					events: [
-						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.", { item_type: 'agent_message', message_id: 'status-1' }),
+						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.\n\nI'm starting with the timeline component so this update remains readable even when it spans multiple lines.", { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
-						timelineEvent(3, 20, 'runner_progress', 'Tests are running.', { item_type: 'agent_message', message_id: 'status-2' }),
+						timelineEvent(3, 20, 'runner_progress', 'Tests are running.\n\nI’m checking the timeline in both light and dark themes before I wrap up.', { item_type: 'agent_message', message_id: 'status-2' }),
 						timelineEvent(4, 24, 'runner_progress', 'First answer', { item_type: 'agent_message', message_id: 'final-1' }),
 					],
 					has_more_before: false,
@@ -555,7 +555,33 @@ test('agent updates stay beside their tools while the final reply is shown once'
 
 	const transcript = page.locator('[data-task-transcript]');
 	await expect(transcript).toBeVisible();
-	await expect(page.getByRole('button', { name: /Yes, I'll inspect the project\./ })).toBeVisible();
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(2);
+	const firstUpdate = updates.first();
+	await expect(firstUpdate).toHaveAttribute('aria-label', 'Agent update');
+	await expect(firstUpdate.getByText('agent', { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText('Update', { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText("Yes, I'll inspect the project.", { exact: true })).toBeVisible();
+	await expect(firstUpdate.getByText("I'm starting with the timeline component so this update remains readable even when it spans multiple lines.", { exact: true })).toBeVisible();
+	await expect(firstUpdate.locator('button')).toHaveCount(0);
+	await expect(page.getByRole('button', { name: /Read the project/ })).toBeVisible();
+
+	const updateContent = firstUpdate.locator('[data-agent-update-content]');
+	const updateTextStyle = await updateContent.evaluate((element) => {
+		const style = getComputedStyle(element);
+		return { overflow: style.overflow, textOverflow: style.textOverflow, whiteSpace: style.whiteSpace };
+	});
+	expect(updateTextStyle.overflow).not.toBe('hidden');
+	expect(updateTextStyle.textOverflow).not.toBe('ellipsis');
+	expect(updateTextStyle.whiteSpace).not.toBe('nowrap');
+
+	const finalMessage = transcript.locator('[data-message-role="assistant"]').first();
+	const [updateBackground, finalBackground] = await Promise.all([
+		updateContent.evaluate((element) => getComputedStyle(element).backgroundColor),
+		finalMessage.locator('.rounded-lg').evaluate((element) => getComputedStyle(element).backgroundColor),
+	]);
+	expect(updateBackground).not.toBe(finalBackground);
+
 	const entries = await transcript.locator('[data-transcript-kind]').allTextContents();
 	const statusIndex = entries.findIndex((entry) => entry.includes("Yes, I'll inspect the project."));
 	const toolIndex = entries.findIndex((entry) => entry.includes('Read the project'));
