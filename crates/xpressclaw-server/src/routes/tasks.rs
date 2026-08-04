@@ -348,10 +348,7 @@ async fn update_task_status(
             state.elicitations.cancel_attempt(&attempt_id);
             let mut container_stopped = cancelled.container_id.is_none();
             if let Some(docker) = state.docker().await {
-                container_stopped = docker
-                    .stop_preserving(&cancelled.session_id)
-                    .await
-                    .is_ok();
+                container_stopped = docker.stop_preserving(&cancelled.session_id).await.is_ok();
             }
             if container_stopped {
                 let _ = sessions.clear_container(&attempt_id);

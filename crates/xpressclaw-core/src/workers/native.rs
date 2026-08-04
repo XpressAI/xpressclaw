@@ -1080,13 +1080,8 @@ fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> V
         initializer.update(startup_command.len().to_le_bytes());
         initializer.update(startup_command.as_bytes());
     }
-    let marker = format!(
-        "/tmp/.xpressclaw-environment-{:x}",
-        initializer.finalize()
-    );
-    let mut script = format!(
-        "set -eu\nmarker={marker}\nif [ ! -e \"$marker\" ]; then\n"
-    );
+    let marker = format!("/tmp/.xpressclaw-environment-{:x}", initializer.finalize());
+    let mut script = format!("set -eu\nmarker={marker}\nif [ ! -e \"$marker\" ]; then\n");
     for startup_command in startup_commands {
         script.push_str("  ");
         script.push_str(startup_command);

@@ -318,9 +318,7 @@ impl DockerManager {
                     .start_container::<String>(&container_id, None)
                     .await
                     .map_err(|error| {
-                        Error::Container(format!(
-                            "failed to restart project container: {error}"
-                        ))
+                        Error::Container(format!("failed to restart project container: {error}"))
                     })?;
                 let host_port = self.get_host_port(&container_id, spec.expose_port).await;
                 info!(
@@ -342,20 +340,12 @@ impl DockerManager {
                     "recreating project container after runner configuration changed"
                 );
                 self.remove(&container_name).await?;
-                self.create_and_start(
-                    agent_id,
-                    spec,
-                    Some(project_container_labels(&fingerprint)),
-                )
-                .await?
+                self.create_and_start(agent_id, spec, Some(project_container_labels(&fingerprint)))
+                    .await?
             }
         } else {
-            self.create_and_start(
-                agent_id,
-                spec,
-                Some(project_container_labels(&fingerprint)),
-            )
-            .await?
+            self.create_and_start(agent_id, spec, Some(project_container_labels(&fingerprint)))
+                .await?
         };
 
         match self.attach(info).await {
@@ -1081,19 +1071,13 @@ fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
 fn project_container_labels(fingerprint: &str) -> HashMap<String, String> {
     HashMap::from([
         (LIFECYCLE_LABEL.to_string(), PROJECT_LIFECYCLE.to_string()),
-        (
-            SPEC_FINGERPRINT_LABEL.to_string(),
-            fingerprint.to_string(),
-        ),
+        (SPEC_FINGERPRINT_LABEL.to_string(), fingerprint.to_string()),
     ])
 }
 
 fn project_labels_match(labels: &HashMap<String, String>, fingerprint: &str) -> bool {
     labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE)
-        && labels
-            .get(SPEC_FINGERPRINT_LABEL)
-            .map(String::as_str)
-            == Some(fingerprint)
+        && labels.get(SPEC_FINGERPRINT_LABEL).map(String::as_str) == Some(fingerprint)
 }
 
 #[cfg(test)]
@@ -1194,10 +1178,8 @@ mod tests {
         assert!(project_labels_match(&labels, "expected"));
         assert!(!project_labels_match(&labels, "changed"));
 
-        let transient = HashMap::from([(
-            SPEC_FINGERPRINT_LABEL.to_string(),
-            "expected".to_string(),
-        )]);
+        let transient =
+            HashMap::from([(SPEC_FINGERPRINT_LABEL.to_string(), "expected".to_string())]);
         assert!(!project_labels_match(&transient, "expected"));
     }
 }
