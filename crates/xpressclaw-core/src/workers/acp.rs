@@ -854,6 +854,7 @@ async fn serve_process(
     let (mut stdout_writer, stdout_reader) = tokio::io::duplex(256 * 1024);
     let stderr = Arc::new(Mutex::new(String::new()));
     let stderr_for_task = stderr.clone();
+    let (output_closed_sender, mut output_closed_receiver) = oneshot::channel();
     let output_task = tokio::spawn(async move {
         while let Some(frame) = output.next().await {
             match frame {
@@ -876,6 +877,7 @@ async fn serve_process(
                 }
             }
         }
+        let _ = output_closed_sender.send(());
     });
 
     let transport = ByteStreams::new(input.compat_write(), stdout_reader.compat());
@@ -993,7 +995,17 @@ async fn serve_process(
             }
 
             let mut sessions = HashMap::new();
-            while let Some(turn) = turns.recv().await {
+            loop {
+                let turn = tokio::select! {
+                    biased;
+                    _ = &mut output_closed_receiver => break,
+                    turn = turns.recv() => {
+                        let Some(turn) = turn else {
+                            break;
+                        };
+                        turn
+                    }
+                };
                 let AcpProcessTurn {
                     runtime,
                     session_start,
@@ -2056,12 +2068,9 @@ mod tests {
             .unwrap();
         assert_eq!(second.session_id, "shared-session");
         mock_agent.await.unwrap();
-        for _ in 0..100 {
-            if !process.is_alive() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), process.wait_for_exit())
+            .await
+            .expect("ACP process should observe the closed container stream");
         assert!(!process.is_alive());
     }
 
