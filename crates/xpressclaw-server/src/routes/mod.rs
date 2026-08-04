@@ -13,6 +13,7 @@ mod settings;
 mod setup;
 mod tasks;
 mod workflows;
+mod workspace;
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
@@ -26,4 +27,5 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/settings", settings::routes())
         .nest("/setup", setup::routes())
         .nest("/workflows", workflows::routes())
+        .nest("/workspaces", workspace::routes())
 }

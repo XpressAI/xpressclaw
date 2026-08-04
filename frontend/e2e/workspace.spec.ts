@@ -126,11 +126,14 @@ async function mockApi(
 		}[];
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown> }[];
+		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 	} = {},
 ) {
 	let liveEvent = 0;
 	let contextUsed = 128_000;
 	let createdWorkflow: Record<string, unknown> | null = null;
+	let workspaceFileContent = 'export const greeting = "hello";\n';
+	let workspaceFileRevision = 'revision-before-save';
 	const status = options.live ? 'in_progress' : 'completed';
 	const attemptStatus = options.live ? 'running' : 'completed';
 	const firstAnswer = options.agentResponseLinks
@@ -323,6 +326,64 @@ async function mockApi(
 				}],
 				system: { budget: { daily: '0', monthly: null, on_exceeded: 'warn' } },
 				mcp_servers: [],
+			};
+		} else if (path === `/api/workspaces/${agentId}`) {
+			response = {
+				agent_id: agentId,
+				root: '/srv/repos/xpressclaw',
+				container_exists: true,
+				container_running: true,
+				terminal_available: true,
+			};
+		} else if (path === `/api/workspaces/${agentId}/tree`) {
+			const directory = url.searchParams.get('path') ?? '';
+			response = directory === 'src'
+				? {
+					path: 'src',
+					entries: [{ name: 'main.ts', path: 'src/main.ts', kind: 'file', size: workspaceFileContent.length }],
+					truncated: false,
+				}
+				: {
+					path: '',
+					entries: [
+						{ name: 'src', path: 'src', kind: 'directory', size: null },
+						{ name: 'README.md', path: 'README.md', kind: 'file', size: 32 },
+					],
+					truncated: false,
+				};
+		} else if (path === `/api/workspaces/${agentId}/file`) {
+			if (request.method() === 'PUT') {
+				const payload = request.postDataJSON() as { path: string; content: string; expected_revision: string };
+				options.workspaceSaveRequests?.push(payload);
+				workspaceFileContent = payload.content;
+				workspaceFileRevision = 'revision-after-save';
+				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
+			} else {
+				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				response = {
+					path: filePath,
+					content: filePath === 'src/main.ts' ? workspaceFileContent : '# Browser-tested workspace\n',
+					revision: workspaceFileRevision,
+					size: workspaceFileContent.length,
+				};
+			}
+		} else if (path === `/api/workspaces/${agentId}/git/status`) {
+			response = {
+				repository: true,
+				branch: 'feature/workspace-browser',
+				files: [
+					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
+					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
+				],
+			};
+		} else if (path === `/api/workspaces/${agentId}/git/diff`) {
+			const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+			response = {
+				path: filePath,
+				diff: filePath === 'src/main.ts'
+					? 'diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-export const greeting = "hi";\n+export const greeting = "hello";\n'
+					: '',
+				truncated: false,
 			};
 		} else if (path === '/api/tasks') {
 			if (url.searchParams.has('parent_task_id')) {
@@ -899,6 +960,59 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 		'/tasks/project-task-2',
 	]);
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
+});
+
+test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {
+	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
+	await mockApi(page, { workspaceSaveRequests });
+	await page.goto(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+
+	await expect(page.locator('[data-workspace-files]')).toBeVisible();
+	await expect(page.getByText('feature/workspace-browser · 2 changed')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'src/main.ts' })).toBeVisible();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+
+	const editor = page.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.type('export const greeting = "edited";');
+	const saveButton = page.getByRole('button', { name: 'Save' });
+	await expect(saveButton).toBeEnabled();
+	await saveButton.click();
+
+	await expect.poll(() => workspaceSaveRequests).toEqual([{
+		path: 'src/main.ts',
+		content: 'export const greeting = "edited";',
+		expected_revision: 'revision-before-save',
+	}]);
+	await expect(page.getByText('Saved')).toBeVisible();
+
+	await page.getByRole('button', { name: 'Diff' }).click();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible();
+	const tree = page.locator('[data-workspace-tree]');
+	await tree.locator('button[title="src"]').click();
+	await expect(tree.locator('button[title="src/main.ts"]')).toBeVisible();
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(tree).toBeVisible();
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('task details deep-link current Git changes into the workspace editor', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFiles = page.locator('[data-task-changed-files]');
+	await expect(changedFiles.getByRole('heading', { name: 'Changed files' })).toBeVisible();
+	await expect(changedFiles.getByRole('link', { name: 'src/main.ts' })).toHaveAttribute(
+		'href',
+		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
+	);
+	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {

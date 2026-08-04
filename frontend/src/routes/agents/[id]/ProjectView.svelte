@@ -11,6 +11,7 @@
 	import WorkspaceTab from './WorkspaceTab.svelte';
 	import TasksTab from './TasksTab.svelte';
 	import SchedulesTab from './SchedulesTab.svelte';
+	import FilesTab from './FilesTab.svelte';
 
 	let { agentId, section = 'session' }: { agentId: string; section?: ProjectSection } = $props();
 
@@ -31,6 +32,7 @@
 		{ id: 'session', label: 'Work' },
 		{ id: 'tasks', label: 'Tasks' },
 		{ id: 'schedules', label: 'Automations' },
+		{ id: 'files', label: 'Files' },
 		{ id: 'runner', label: 'Harness' },
 		{ id: 'workspace', label: 'Environment' },
 	];
@@ -180,7 +182,7 @@
 		</div>
 
 		<!-- Tab content -->
-		<div class="flex-1 overflow-y-auto px-3 py-4 sm:px-6">
+		<div class="flex-1 min-h-0 {activeTab === 'files' ? 'overflow-hidden' : 'overflow-y-auto px-3 py-4 sm:px-6'}">
 			{#if activeTab === 'session'}
 				<SessionTab agentId={agent.id} />
 			{:else if activeTab === 'runner'}
@@ -191,6 +193,8 @@
 				<TasksTab agentId={agent.id} />
 			{:else if activeTab === 'schedules'}
 				<SchedulesTab agentId={agent.id} />
+			{:else if activeTab === 'files'}
+				<FilesTab agentId={agent.id} />
 			{/if}
 		</div>
 

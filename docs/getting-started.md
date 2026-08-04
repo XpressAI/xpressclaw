@@ -52,6 +52,12 @@ initializes an ACP server inside the agent's retained project container, sends
 results back to the durable timeline. Later turns reuse that process and its
 live ACP sessions along with installed tools, caches, `/home/node`, and `/tmp`.
 
+Open an Agent's **Files** tab to browse and edit its configured workspace with
+Monaco, inspect current Git changes and diffs, or open a terminal in its
+retained container. The terminal becomes available after the Agent has run its
+first task. Task details also show the workspace's current changed files and
+link directly to them in the editor.
+
 ## 5. Automate work
 
 - **Tasks** queue explicit work for a selected agent.
