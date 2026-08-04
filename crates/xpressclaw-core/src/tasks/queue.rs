@@ -233,6 +233,14 @@ impl TaskQueue {
                                      'preparing', 'running', 'waiting_for_input', 'review'
                                  )
                            )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_queue active_dispatch
+                               JOIN work_attempts active_owner
+                                 ON active_owner.id = active_dispatch.attempt_id
+                               WHERE active_dispatch.agent_id = q.agent_id
+                                 AND active_dispatch.status = 'running'
+                                 AND active_owner.container_id IS NOT NULL
+                           )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
                         [],
                         |row| row.get(0),
@@ -254,10 +262,46 @@ impl TaskQueue {
     }
 
     /// Requeue work that was in flight when the control plane stopped. Any
-    /// corresponding containers are cleaned up by the server before dispatch
-    /// begins, so the same logical attempt can be safely resumed from queued
-    /// state without leaving a task permanently stuck as in-progress.
+    /// corresponding project containers are stopped by the server before
+    /// dispatch begins, so the same logical attempt can be safely resumed from
+    /// queued state without leaving a task permanently stuck as in-progress.
     pub fn recover_in_progress(&self) -> Result<usize> {
+        let finalized = self.db.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let finalized = tx.execute(
+                "UPDATE task_queue
+                 SET status = CASE
+                     WHEN (SELECT status FROM work_attempts WHERE id = task_queue.attempt_id) = 'completed'
+                         THEN 'completed'
+                     ELSE 'failed'
+                 END,
+                 completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                 harness_response = COALESCE(
+                     harness_response,
+                     (SELECT COALESCE(result, error_message, status)
+                      FROM work_attempts WHERE id = task_queue.attempt_id)
+                 )
+                 WHERE status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM work_attempts terminal
+                       WHERE terminal.id = task_queue.attempt_id
+                         AND terminal.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                   )",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE work_attempts SET container_id = NULL
+                 WHERE container_id IS NOT NULL
+                   AND status IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                [],
+            )?;
+            tx.commit()?;
+            Ok::<_, Error>(finalized)
+        })?;
+        if finalized > 0 {
+            debug!(finalized, "recovered terminal queue dispatches");
+        }
+
         let orphaned: Vec<(i64, String, String, String)> = self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT q.id, a.id, a.session_id, q.task_id
@@ -531,6 +575,41 @@ mod tests {
     }
 
     #[test]
+    fn recovery_finalizes_terminal_dispatch_and_releases_container_lease() {
+        let (db, queue) = setup();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Finished before restart".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let queued = queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db);
+        sessions
+            .set_container(attempt_id, "retained-project-container")
+            .unwrap();
+        sessions
+            .transition_attempt(attempt_id, "completed", "Done", Some("result"), None)
+            .unwrap();
+
+        assert_eq!(queue.recover_in_progress().unwrap(), 0);
+        assert_eq!(queue.get(queued.id).unwrap().status, "completed");
+        assert!(sessions
+            .get_attempt(attempt_id)
+            .unwrap()
+            .container_id
+            .is_none());
+    }
+
+    #[test]
     fn waiting_attempt_serializes_the_logical_session() {
         let (db, queue) = setup();
         let board = TaskBoard::new(db.clone());
@@ -591,6 +670,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(queue.claim_next().unwrap().unwrap().id, unclaimed_id);
+    }
+
+    #[test]
+    fn running_dispatch_holds_project_lease_until_container_cleanup_finishes() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let first_task = board
+            .create(&CreateTask {
+                title: "Cancel this turn".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let second_task = board
+            .create(&CreateTask {
+                title: "Run after cleanup".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let first = queue.enqueue(&first_task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        assert_eq!(claimed.id, first.id);
+        let second = queue.enqueue(&second_task.id, "atlas").unwrap();
+
+        let sessions = SessionManager::new(db);
+        sessions
+            .set_container(
+                claimed.attempt_id.as_deref().unwrap(),
+                "retained-project-container",
+            )
+            .unwrap();
+        sessions
+            .transition_attempt(
+                claimed.attempt_id.as_deref().unwrap(),
+                "cancelled",
+                "Cancellation requested",
+                None,
+                None,
+            )
+            .unwrap();
+
+        // The terminal attempt no longer provides the ordinary session lock,
+        // but its running dispatch keeps the shared project container leased
+        // until the cancellation path has stopped it.
+        assert!(queue.claim_next().unwrap().is_none());
+        sessions
+            .clear_container(claimed.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, second.id);
     }
 
     #[test]

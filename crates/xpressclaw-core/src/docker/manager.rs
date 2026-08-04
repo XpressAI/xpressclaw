@@ -13,11 +13,16 @@ use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use tokio::io::AsyncWrite;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
+
+const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
+const PROJECT_LIFECYCLE: &str = "project";
+const SPEC_FINGERPRINT_LABEL: &str = "io.xpressclaw.spec-fingerprint";
 
 /// Specification for an agent container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +283,98 @@ impl DockerManager {
         // Remove existing container if present
         let _ = self.remove(&container_name).await;
 
+        self.create_and_start(agent_id, spec, None).await
+    }
+
+    /// Start a project-owned ACP container, retaining and reusing its writable
+    /// layer between attempts. A changed runner specification or local image
+    /// replaces the environment so stale mounts, credentials, and commands
+    /// are never silently reused.
+    pub async fn launch_project_attached(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> Result<AttachedContainer> {
+        let container_name = format!("xpressclaw-{agent_id}");
+        let fingerprint = container_spec_fingerprint(spec)?;
+        let existing = self.inspect_by_name(&container_name).await;
+        let info = if let Some(existing) = existing {
+            let labels_match = existing
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .is_some_and(|labels| project_labels_match(labels, &fingerprint));
+            let image_matches = self
+                .container_image_matches(&container_name, &spec.image)
+                .await;
+            if labels_match && image_matches {
+                self.stop_preserving(agent_id).await?;
+                let container_id = existing.id.ok_or_else(|| {
+                    Error::Container(format!(
+                        "project container {container_name} has no container ID"
+                    ))
+                })?;
+                self.docker
+                    .start_container::<String>(&container_id, None)
+                    .await
+                    .map_err(|error| {
+                        Error::Container(format!(
+                            "failed to restart project container: {error}"
+                        ))
+                    })?;
+                let host_port = self.get_host_port(&container_id, spec.expose_port).await;
+                info!(
+                    agent_id,
+                    container_id = &container_id[..12.min(container_id.len())],
+                    "restarted retained project container"
+                );
+                ContainerInfo {
+                    container_id,
+                    agent_id: agent_id.to_string(),
+                    status: "running".to_string(),
+                    host_port,
+                }
+            } else {
+                info!(
+                    agent_id,
+                    labels_match,
+                    image_matches,
+                    "recreating project container after runner configuration changed"
+                );
+                self.remove(&container_name).await?;
+                self.create_and_start(
+                    agent_id,
+                    spec,
+                    Some(project_container_labels(&fingerprint)),
+                )
+                .await?
+            }
+        } else {
+            self.create_and_start(
+                agent_id,
+                spec,
+                Some(project_container_labels(&fingerprint)),
+            )
+            .await?
+        };
+
+        match self.attach(info).await {
+            Ok(attached) => Ok(attached),
+            Err(error) => {
+                let _ = self.stop_preserving(agent_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn create_and_start(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+        labels: Option<HashMap<String, String>>,
+    ) -> Result<ContainerInfo> {
+        let container_name = format!("xpressclaw-{agent_id}");
+
         // Build mounts — detect named volumes vs bind mounts
         let mounts: Vec<Mount> = spec
             .volumes
@@ -359,6 +456,7 @@ impl DockerManager {
             },
             cmd: spec.cmd.clone(),
             working_dir: spec.working_dir.clone(),
+            labels,
             ..Default::default()
         };
 
@@ -406,6 +504,10 @@ impl DockerManager {
         spec: &ContainerSpec,
     ) -> Result<AttachedContainer> {
         let info = self.launch(agent_id, spec).await?;
+        self.attach(info).await
+    }
+
+    async fn attach(&self, info: ContainerInfo) -> Result<AttachedContainer> {
         let attached = self
             .docker
             .attach_container(
@@ -427,6 +529,41 @@ impl DockerManager {
             input: attached.input,
             output: attached.output,
         })
+    }
+
+    /// Stop a project container without deleting its writable layer.
+    pub async fn stop_preserving(&self, agent_id: &str) -> Result<()> {
+        if !self.is_running(agent_id).await {
+            return Ok(());
+        }
+        let container_name = format!("xpressclaw-{agent_id}");
+        let stop_opts = StopContainerOptions { t: 2 };
+        if let Err(error) = self
+            .docker
+            .stop_container(&container_name, Some(stop_opts))
+            .await
+        {
+            warn!(agent_id, %error, "error stopping retained project container");
+            if self.is_running(agent_id).await {
+                return Err(Error::Container(format!(
+                    "failed to stop retained project container: {error}"
+                )));
+            }
+        }
+        info!(agent_id, "stopped and retained project container");
+        Ok(())
+    }
+
+    /// Whether this named container is a retained project environment.
+    pub async fn is_project_container(&self, agent_id: &str) -> bool {
+        let container_name = format!("xpressclaw-{agent_id}");
+        self.inspect_by_name(&container_name)
+            .await
+            .and_then(|container| container.config)
+            .and_then(|config| config.labels)
+            .is_some_and(|labels| {
+                labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE)
+            })
     }
 
     /// Stop and remove an agent container.
@@ -455,6 +592,23 @@ impl DockerManager {
         for info in containers {
             if let Err(e) = self.stop(&info.agent_id).await {
                 warn!(agent_id = info.agent_id, error = %e, "error stopping container");
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop all XpressClaw containers during control-plane shutdown, retaining
+    /// project environments while removing transient workloads.
+    pub async fn stop_all_for_shutdown(&self) -> Result<()> {
+        let containers = self.list().await?;
+        for info in containers {
+            let result = if self.is_project_container(&info.agent_id).await {
+                self.stop_preserving(&info.agent_id).await
+            } else {
+                self.stop(&info.agent_id).await
+            };
+            if let Err(error) = result {
+                warn!(agent_id = info.agent_id, %error, "error stopping container");
             }
         }
         Ok(())
@@ -915,6 +1069,33 @@ fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
     }
 }
 
+fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
+    let encoded = serde_json::to_vec(spec).map_err(|error| {
+        Error::Container(format!(
+            "failed to fingerprint project container specification: {error}"
+        ))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn project_container_labels(fingerprint: &str) -> HashMap<String, String> {
+    HashMap::from([
+        (LIFECYCLE_LABEL.to_string(), PROJECT_LIFECYCLE.to_string()),
+        (
+            SPEC_FINGERPRINT_LABEL.to_string(),
+            fingerprint.to_string(),
+        ),
+    ])
+}
+
+fn project_labels_match(labels: &HashMap<String, String>, fingerprint: &str) -> bool {
+    labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE)
+        && labels
+            .get(SPEC_FINGERPRINT_LABEL)
+            .map(String::as_str)
+            == Some(fingerprint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,5 +1171,33 @@ mod tests {
         #[cfg(unix)]
         assert!(socket_mount_groups(&spec).is_some());
         std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn project_container_fingerprint_changes_with_runner_configuration() {
+        let mut spec = ContainerSpec::default();
+        spec.environment
+            .push("PRIVATE_TOKEN=first-secret".to_string());
+        let first = container_spec_fingerprint(&spec).unwrap();
+        let same = container_spec_fingerprint(&spec).unwrap();
+        assert_eq!(first, same);
+        assert!(!first.contains("first-secret"));
+
+        spec.environment[0] = "PRIVATE_TOKEN=rotated-secret".to_string();
+        let rotated = container_spec_fingerprint(&spec).unwrap();
+        assert_ne!(first, rotated);
+    }
+
+    #[test]
+    fn only_matching_project_labels_are_reusable() {
+        let labels = project_container_labels("expected");
+        assert!(project_labels_match(&labels, "expected"));
+        assert!(!project_labels_match(&labels, "changed"));
+
+        let transient = HashMap::from([(
+            SPEC_FINGERPRINT_LABEL.to_string(),
+            "expected".to_string(),
+        )]);
+        assert!(!project_labels_match(&transient, "expected"));
     }
 }

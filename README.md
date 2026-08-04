@@ -46,7 +46,7 @@ Codex, Claude Code, and OpenCode already supply excellent agent loops. xpresscla
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
-- **Isolated by default** — Every agent turn runs in a short-lived Docker/Podman container.
+- **Isolated and continuous** — Every agent has a Docker/Podman environment that is stopped while idle and retained between turns.
 - **Container-aware workspaces** — Opt trusted agents into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
 
 ## Features
@@ -67,18 +67,18 @@ ACP harnesses pick up tasks from a queue and publish standard progress, plans, t
 - **Custom:** any image and command that speaks ACP over stdin/stdout
 
 Codex and Claude use ACP Registry adapters. Each built-in runner image contains
-one harness product and its ACP server. Language SDKs and
-project services belong in a separate development environment rather than in
-the runner image. Agents whose workspaces need existing Compose-based development and
-test workflows can explicitly enable trusted host-engine access.
+one harness product and its ACP server. Its project-owned writable layer keeps
+language SDKs, tools, and caches installed during earlier turns without baking
+them into the runner image. Agents whose workspaces need existing Compose-based
+development and test workflows can explicitly enable trusted host-engine access.
 
 ### Privacy & Safety
 
-- **Container isolation** — each work attempt runs in its own short-lived container
+- **Project isolation** — each agent runs in its own retained container, stopped while idle
 - **Explicit resources** — workers receive the configured workspace and volume mounts
 - **Visible provenance** — every queued request records whether it came from a person, schedule, task, or workflow
 - **Local control data** — timelines and task state remain local; agent traffic follows the selected provider's terms
-- **Credential boundary** — subscription auth is mounted only into short-lived workers built from an image you trust
+- **Credential boundary** — subscription auth is mounted only into the configured project container built from an image you trust
 
 ### Full Observability
 
@@ -337,7 +337,7 @@ xpressclaw
 +-- Session event log (messages, attempts, provenance, artifacts)
 +-- SQLite (sessions, events, tasks, workflows, and schedules)
 +-- ACP client + task dispatcher (Codex / Claude Code / OpenCode / custom)
-+-- Docker Manager (short-lived attempt containers)
++-- Docker Manager (retained per-agent project containers)
 ```
 
 **Key design decisions:**

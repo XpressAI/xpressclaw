@@ -43,7 +43,8 @@ xpressclaw status --port 9000
 
 ## `xpressclaw down`
 
-Stop a detached control plane and its active short-lived worker containers.
+Stop a detached control plane and its active worker processes. Retained project
+containers remain stopped on disk for the next launch.
 
 ```bash
 xpressclaw down

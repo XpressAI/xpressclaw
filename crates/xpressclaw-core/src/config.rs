@@ -329,8 +329,8 @@ pub struct AgentConfig {
     /// Per-agent LLM configuration (provider, model, api_key, base_url).
     #[serde(default)]
     pub llm: Option<AgentLlmConfig>,
-    /// Short-lived ACP worker configuration. This supersedes the old in-house
-    /// harness for task execution.
+    /// ACP runner and retained project-environment configuration. This
+    /// supersedes the old in-house harness for task execution.
     #[serde(default)]
     pub runner: NativeRunnerConfig,
     #[serde(default)]

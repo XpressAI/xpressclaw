@@ -150,10 +150,10 @@ impl AppState {
                     "cannot stop the active agent container".to_string(),
                 )
             })?;
-            let workload_id = format!("attempt-{attempt_id}");
-            if docker.is_running(&workload_id).await {
-                docker.stop(&workload_id).await?;
+            if docker.is_running(&current.session_id).await {
+                docker.stop_preserving(&current.session_id).await?;
             }
+            sessions.clear_container(attempt_id)?;
         }
 
         // The worker may have completed while its container was stopping.

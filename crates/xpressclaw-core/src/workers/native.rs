@@ -1,4 +1,5 @@
-//! Dispatcher and adapters for short-lived native coding-agent CLIs.
+//! Dispatcher and adapters for native coding-agent CLIs running in retained
+//! project environments.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -9,6 +10,7 @@ use agent_client_protocol::schema::v1::{
 };
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
@@ -50,8 +52,8 @@ struct NativeAttemptRuntime {
 }
 
 /// Consume the durable task queue as an Agent Client Protocol client. Each
-/// queue item gets its own short-lived ACP server container and publishes
-/// standard protocol events and artifacts to the logical session.
+/// project gets one retained container whose ACP process is restarted for a
+/// turn while its writable filesystem survives between turns.
 pub async fn start_dispatcher(
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
@@ -283,18 +285,31 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             );
         }
     }
-    let workload_id = format!("attempt-{attempt_id}");
-    let attached = docker.launch_attached(&workload_id, &spec).await?;
-    sessions.set_container(attempt_id, &attached.info.container_id)?;
-    let running = sessions.transition_attempt(
+    let workload_id = agent.name.as_str();
+    let attached = docker.launch_project_attached(workload_id, &spec).await?;
+    if let Err(error) = sessions.set_container(attempt_id, &attached.info.container_id) {
+        let _ = docker.stop_preserving(workload_id).await;
+        return Err(error);
+    }
+    let running = match sessions.transition_attempt(
         attempt_id,
         "running",
         &format!("{kind} is working over ACP"),
         None,
         None,
-    )?;
+    ) {
+        Ok(running) => running,
+        Err(error) => {
+            if docker.stop_preserving(workload_id).await.is_ok() {
+                let _ = sessions.clear_container(attempt_id);
+            }
+            return Err(error);
+        }
+    };
     if attempt_is_terminal(&running.status) {
-        let _ = docker.stop(&workload_id).await;
+        if docker.stop_preserving(workload_id).await.is_ok() {
+            let _ = sessions.clear_container(attempt_id);
+        }
         return Ok(());
     }
 
@@ -320,7 +335,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         },
     )
     .await;
-    let _ = docker.stop(&workload_id).await;
+    docker.stop_preserving(workload_id).await?;
+    sessions.clear_container(attempt_id)?;
     let turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
     if matches!(current.status.as_str(), "cancelled" | "interrupted") {
@@ -974,7 +990,9 @@ fn build_spec(
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
-    for (name, value) in &agent.runner.environment {
+    let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
+    runner_environment.sort_by(|left, right| left.0.cmp(right.0));
+    for (name, value) in runner_environment {
         if name.trim().is_empty() || name.contains('=') {
             return Err(Error::Backend(format!(
                 "invalid harness environment variable name: {name:?}"
@@ -1052,15 +1070,29 @@ fn with_startup_commands(command: Vec<String>, startup_commands: &[String]) -> V
     if startup_commands.is_empty() {
         return command;
     }
-    let mut script = String::from("set -eu\n");
-    for startup_command in startup_commands {
-        let startup_command = startup_command.trim();
-        if !startup_command.is_empty() {
-            script.push_str(startup_command);
-            script.push('\n');
-        }
+    let startup_commands = startup_commands
+        .iter()
+        .map(|command| command.trim())
+        .filter(|command| !command.is_empty())
+        .collect::<Vec<_>>();
+    let mut initializer = Sha256::new();
+    for startup_command in &startup_commands {
+        initializer.update(startup_command.len().to_le_bytes());
+        initializer.update(startup_command.as_bytes());
     }
-    script.push_str("exec \"$@\"");
+    let marker = format!(
+        "/tmp/.xpressclaw-environment-{:x}",
+        initializer.finalize()
+    );
+    let mut script = format!(
+        "set -eu\nmarker={marker}\nif [ ! -e \"$marker\" ]; then\n"
+    );
+    for startup_command in startup_commands {
+        script.push_str("  ");
+        script.push_str(startup_command);
+        script.push('\n');
+    }
+    script.push_str("  touch \"$marker\"\nfi\nexec \"$@\"");
     let mut wrapped = vec![
         "/bin/sh".to_string(),
         "-lc".to_string(),
@@ -1533,13 +1565,15 @@ mod tests {
     }
 
     #[test]
-    fn wraps_acp_command_with_opt_in_workspace_startup() {
+    fn wraps_acp_command_with_one_time_project_environment_startup() {
         let wrapped = with_startup_commands(
             vec!["qwen".into(), "--acp".into()],
             &["npm ci".into(), "docker compose up -d".into()],
         );
         assert_eq!(&wrapped[..2], ["/bin/sh", "-lc"]);
-        assert!(wrapped[2].contains("npm ci\ndocker compose up -d"));
+        assert!(wrapped[2].contains("/tmp/.xpressclaw-environment-"));
+        assert!(wrapped[2].contains("  npm ci\n  docker compose up -d"));
+        assert!(wrapped[2].contains("touch \"$marker\""));
         assert!(wrapped[2].ends_with("exec \"$@\""));
         assert_eq!(&wrapped[4..], ["qwen", "--acp"]);
     }

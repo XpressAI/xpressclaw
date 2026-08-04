@@ -333,36 +333,44 @@ async fn update_task_status(
             .map_err(internal_error)?;
         if let Some(attempt_id) = active_attempt_id {
             let sessions = SessionManager::new(state.db.clone());
-            if sessions.get_attempt(&attempt_id).is_ok() {
-                let cancelled = sessions
-                    .transition_attempt(
-                        &attempt_id,
-                        "cancelled",
-                        "Work cancelled by user",
-                        None,
-                        None,
-                    )
-                    .map_err(internal_error)?;
-                if cancelled.status != "cancelled" {
-                    return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
-                }
-                if let Some(queue_id) = cancelled.queue_id {
-                    state
-                        .db
-                        .with_conn(|conn| {
-                            conn.execute(
-                                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                                    harness_response = 'cancelled by user' WHERE id = ?1",
-                                [queue_id],
-                            )?;
-                            Ok::<_, xpressclaw_core::error::Error>(())
-                        })
-                        .map_err(internal_error)?;
-                }
+            let cancelled = sessions
+                .transition_attempt(
+                    &attempt_id,
+                    "cancelled",
+                    "Work cancelled by user",
+                    None,
+                    None,
+                )
+                .map_err(internal_error)?;
+            if cancelled.status != "cancelled" {
+                return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
             }
             state.elicitations.cancel_attempt(&attempt_id);
+            let mut container_stopped = cancelled.container_id.is_none();
             if let Some(docker) = state.docker().await {
-                let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
+                container_stopped = docker
+                    .stop_preserving(&cancelled.session_id)
+                    .await
+                    .is_ok();
+            }
+            if container_stopped {
+                let _ = sessions.clear_container(&attempt_id);
+            }
+            // Keep this dispatch marked running until the shared project
+            // container is stopped. That prevents a queued turn from
+            // restarting it just before this cancellation path kills it.
+            if let Some(queue_id) = cancelled.queue_id {
+                state
+                    .db
+                    .with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                                harness_response = 'cancelled by user' WHERE id = ?1",
+                            [queue_id],
+                        )?;
+                        Ok::<_, xpressclaw_core::error::Error>(())
+                    })
+                    .map_err(internal_error)?;
             }
         } else {
             state.elicitations.cancel_task(&id);

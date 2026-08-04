@@ -396,6 +396,18 @@ async fn cancel_attempt(
     }
 
     state.elicitations.cancel_attempt(&attempt_id);
+    let mut container_stopped = cancelled.container_id.is_none();
+    if let Some(docker) = state.docker().await {
+        container_stopped = docker
+            .stop_preserving(&cancelled.session_id)
+            .await
+            .is_ok();
+    }
+    if container_stopped {
+        let _ = sessions.clear_container(&attempt_id);
+    }
+    // The running queue row is the lease on the shared project container.
+    // Release it only after the retained environment has stopped.
     state
         .db
         .with_conn(|conn| {
@@ -416,10 +428,6 @@ async fn cancel_attempt(
             Ok::<_, xpressclaw_core::error::Error>(())
         })
         .map_err(internal_error)?;
-
-    if let Some(docker) = state.docker().await {
-        let _ = docker.stop(&format!("attempt-{attempt_id}")).await;
-    }
     Ok(Json(json!(cancelled)))
 }
 
