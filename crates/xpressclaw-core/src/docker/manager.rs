@@ -723,11 +723,9 @@ impl DockerManager {
                 None => continue,
             };
             let labels = c.labels.as_ref().cloned().unwrap_or_default();
-            let Some(agent_id) = listed_container_agent_id(
-                &name,
-                &labels,
-                self.installation_id.as_deref(),
-            ) else {
+            let Some(agent_id) =
+                listed_container_agent_id(&name, &labels, self.installation_id.as_deref())
+            else {
                 continue;
             };
             let container_id = c.id.unwrap_or_default();
@@ -1181,10 +1179,7 @@ fn project_container_labels(
     HashMap::from([
         (LIFECYCLE_LABEL.to_string(), PROJECT_LIFECYCLE.to_string()),
         (SPEC_FINGERPRINT_LABEL.to_string(), fingerprint.to_string()),
-        (
-            INSTALLATION_LABEL.to_string(),
-            installation_id.to_string(),
-        ),
+        (INSTALLATION_LABEL.to_string(), installation_id.to_string()),
         (AGENT_ID_LABEL.to_string(), agent_id.to_string()),
     ])
 }
@@ -1406,10 +1401,7 @@ mod tests {
         assert_eq!(
             listed_container_agent_id(
                 "xpressclaw-attempt-123",
-                &HashMap::from([(
-                    INSTALLATION_LABEL.to_string(),
-                    "installation-a".to_string()
-                )]),
+                &HashMap::from([(INSTALLATION_LABEL.to_string(), "installation-a".to_string())]),
                 Some("installation-a")
             )
             .as_deref(),
