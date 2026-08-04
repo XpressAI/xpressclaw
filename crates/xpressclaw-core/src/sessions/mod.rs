@@ -503,6 +503,19 @@ impl SessionManager {
         })
     }
 
+    /// Release this attempt's lease on its project container after the
+    /// process has stopped. The container itself remains available for a
+    /// later attempt.
+    pub fn clear_container(&self, attempt_id: &str) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET container_id = NULL WHERE id = ?1",
+                [attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn set_native_session(&self, attempt_id: &str, native_session_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(

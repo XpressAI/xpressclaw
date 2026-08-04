@@ -45,20 +45,25 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // A process restart severs ownership of in-flight worker containers.
-    // Remove any leftovers, restore their durable queue records, and let the
-    // normal dispatcher retry them from a known state.
+    // A process restart severs ownership of in-flight ACP processes. Stop
+    // retained project containers without deleting their writable layers,
+    // remove obsolete containers owned by this installation, then retry
+    // durable work. Foreign and unlabelled containers are not enumerated.
     let dispatcher_docker = state.docker().await;
     if let Some(docker) = dispatcher_docker.as_ref() {
         match docker.list().await {
             Ok(containers) => {
                 for container in containers {
                     let is_attempt = container.agent_id.starts_with("attempt-");
-                    let is_legacy_session = config
+                    let is_configured_project = config
                         .agents
                         .iter()
                         .any(|agent| agent.name == container.agent_id);
-                    if is_attempt || is_legacy_session {
+                    let is_project_container =
+                        docker.is_project_container(&container.agent_id).await;
+                    if is_project_container && is_configured_project {
+                        let _ = docker.stop_preserving(&container.agent_id).await;
+                    } else if is_attempt || is_project_container || is_configured_project {
                         let _ = docker.stop(&container.agent_id).await;
                     }
                 }
@@ -83,9 +88,10 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     }
 
-    // Consume tasks with short-lived ACP agent workers. The former harness
-    // dispatcher and desired-state agent reconciler are intentionally not
-    // started: runtime contexts are durable sessions, not long-running loops.
+    // Consume tasks with ACP agent processes inside retained project
+    // containers. The former harness dispatcher and desired-state agent
+    // reconciler remain disabled: runtime contexts are durable sessions, not
+    // long-running autonomous loops.
     let dispatcher_db = state.db.clone();
     let dispatcher_config = state.config.clone();
     let dispatcher_event_bus = state.event_bus.clone();
@@ -158,8 +164,8 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     info!("shutting down — stopping containers (Ctrl+C again to force quit)");
 
     let shutdown_task = async {
-        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
-            let _ = docker.stop_all().await;
+        if let Some(docker) = state.docker().await {
+            let _ = docker.stop_all_for_shutdown().await;
             info!("all containers stopped");
         }
     };

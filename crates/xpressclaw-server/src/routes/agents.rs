@@ -132,7 +132,8 @@ async fn delete_agent(
         }) {
             let _ = docker.stop(&format!("attempt-{}", attempt.id)).await;
         }
-        // Clean up a legacy long-running container from pre-ADR-025 installs.
+        // Project deletion is the explicit cleanup boundary for the retained
+        // environment (and also removes a pre-ADR-025 legacy container).
         let _ = docker.stop(&id).await;
     }
     registry.delete(&id).map_err(internal_error)?;

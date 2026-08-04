@@ -200,7 +200,29 @@ impl Database {
             }
         }
 
+        // Container ownership must survive control-plane restarts while still
+        // distinguishing separate XpressClaw data stores that share one
+        // Docker/Podman engine. The config table is available before every
+        // schema migration, so this identity does not require a schema bump.
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES ('installation_id', ?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+
         Ok(())
+    }
+
+    /// Stable identity for the XpressClaw installation backed by this
+    /// database. It scopes retained runtime resources on a shared engine.
+    pub fn installation_id(&self) -> Result<String> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT value FROM config WHERE key = 'installation_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
     }
 
     /// Path to the database file.
@@ -985,6 +1007,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, "31");
+    }
+
+    #[test]
+    fn installation_id_survives_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xpressclaw.db");
+        let first = Database::open(&path).unwrap().installation_id().unwrap();
+        let second = Database::open(&path).unwrap().installation_id().unwrap();
+
+        assert_eq!(first, second);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
     }
 
     #[test]

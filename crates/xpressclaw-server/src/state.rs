@@ -87,7 +87,8 @@ impl AppState {
             }
         }
         // Slow path: try to connect
-        match DockerManager::connect().await {
+        let installation_id = self.db.installation_id().ok()?;
+        match DockerManager::connect_for_installation(&installation_id).await {
             Ok(d) => {
                 let d = Arc::new(d);
                 *self.docker.write().unwrap() = Some(d.clone());
@@ -150,10 +151,10 @@ impl AppState {
                     "cannot stop the active agent container".to_string(),
                 )
             })?;
-            let workload_id = format!("attempt-{attempt_id}");
-            if docker.is_running(&workload_id).await {
-                docker.stop(&workload_id).await?;
+            if docker.is_running(&current.session_id).await {
+                docker.stop_preserving(&current.session_id).await?;
             }
+            sessions.clear_container(attempt_id)?;
         }
 
         // The worker may have completed while its container was stopping.

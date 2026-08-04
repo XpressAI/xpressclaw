@@ -2,11 +2,11 @@
 
 ## Status
 
-Partially superseded by ADR-026
+Partially superseded by ADR-026 and ADR-033
 
 The runtime adapter section is superseded by ADR-026. The project/task UX,
-short-lived attempt isolation, and development-environment decisions remain
-in force.
+task dispatch, and development-environment separation remain in force. ADR-033
+supersedes the disposable-container lifetime with retained project containers.
 
 ## Context
 
@@ -43,12 +43,14 @@ the runner supports it. The project remains writable while work is queued or
 running. Future connector messages must use the same path once that runtime is
 restored.
 
-The native conversation is resumed across short-lived worker containers. A
-task can explicitly request a fresh conversation. A dependent task branches
-from the native conversation of its prerequisite when that prerequisite used
-the same project and runner. A follow-up message on the currently active task
-resumes its branch. Reopening an older task forks from that task's saved branch
-so new work does not rewrite its earlier context. The precedence is therefore:
+The native conversation remains live in the retained project ACP process and is
+resumed from its persisted identifier after unavoidable process restarts. A
+task can explicitly request a fresh conversation.
+A dependent task branches from the native conversation of its prerequisite
+when that prerequisite used the same project and runner. A follow-up message on
+the currently active task resumes its branch. Reopening an older task forks
+from that task's saved branch so new work does not rewrite its earlier context.
+The precedence is therefore:
 
 1. an earlier turn on the same task;
 2. the conversation of a dependency;
@@ -63,7 +65,7 @@ Executable work is represented by a `work_attempt`. An attempt records:
 
 - the task and queue item that caused it;
 - provenance and kind (`interactive`, `scheduled`, `workflow`, or `task`);
-- native runner, native session ID, and ephemeral container ID;
+- native runner, native session ID, and active project-container lease;
 - lifecycle (`queued`, `preparing`, `running`, `waiting_for_input`, `review`,
   `completed`, `failed`, or `cancelled`);
 - structured results, errors, and artifacts.
@@ -75,7 +77,7 @@ is deliberately excluded from the primary artifact view.
 
 ### Native products own the agent loop
 
-The durable task queue is consumed by short-lived native CLI workers. The
+The durable task queue is consumed by project-scoped native ACP processes. The
 initial adapters are:
 
 - Codex via `codex exec --json`;
@@ -206,8 +208,8 @@ would belong to the workflow runtime rather than the ACP client.
 - Users can choose the native agent product that best fits each workflow step.
 - The project differentiates on orchestration, isolation, devices, and UX
   instead of maintaining another agent framework.
-- Session history remains coherent even though native execution contexts are
-  disposable.
+- Session history remains coherent in a live project process and across its
+  unavoidable restarts.
 - Schedules, task dependencies, and workflows share one dispatch path and one
   audit model. Future connector sources must enter through that same path.
 - The UI can be designed around intent, progress, evidence, and decisions
@@ -221,8 +223,7 @@ would belong to the workflow runtime rather than the ACP client.
   message can be queued behind current work even though the session UI remains
   responsive.
 - Commands and control changes selected while a native turn is already running
-  apply to the next turn because attempt containers and ACP connections are
-  short-lived.
+  apply to the next turn through the retained ACP connection.
 - Existing conversation and legacy harness code remains temporarily for data
   compatibility, but it is no longer the server's task execution path. It can
   be deleted after configuration and CLI migration are complete.
@@ -261,7 +262,7 @@ boundary: use only runner images you control or have audited.
 ## Related ADRs
 
 - ADR-002: Agent Backend Abstraction (superseded for task execution)
-- ADR-003: Container Isolation (retained, changed to per-attempt containers)
+- ADR-003: Container Isolation (retained, changed to per-project containers)
 - ADR-018: Desired-State Controller (superseded for agent execution)
 - ADR-019: Background Conversations (event durability retained)
 - ADR-020: Task Dependencies (retained)

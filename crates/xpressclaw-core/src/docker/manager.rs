@@ -13,11 +13,18 @@ use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::pin::Pin;
 use tokio::io::AsyncWrite;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
+
+const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
+const PROJECT_LIFECYCLE: &str = "project";
+const SPEC_FINGERPRINT_LABEL: &str = "io.xpressclaw.spec-fingerprint";
+const INSTALLATION_LABEL: &str = "io.xpressclaw.installation";
+const AGENT_ID_LABEL: &str = "io.xpressclaw.agent-id";
 
 /// Specification for an agent container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +105,7 @@ pub struct DockerManager {
     socket_path: Option<PathBuf>,
     runtime: &'static str,
     runtime_version: Option<String>,
+    installation_id: Option<String>,
 }
 
 impl DockerManager {
@@ -145,6 +153,15 @@ impl DockerManager {
         ))
     }
 
+    /// Connect to the engine on behalf of one durable XpressClaw
+    /// installation. Owned containers are labelled and isolated from other
+    /// control planes that happen to use the same Docker/Podman daemon.
+    pub async fn connect_for_installation(installation_id: &str) -> Result<Self> {
+        let mut manager = Self::connect().await?;
+        manager.installation_id = Some(installation_id.to_string());
+        Ok(manager)
+    }
+
     async fn connect_default() -> Result<Self> {
         let docker = Docker::connect_with_defaults()
             .map_err(|e| Error::DockerNotAvailable(e.to_string()))?;
@@ -178,6 +195,7 @@ impl DockerManager {
             socket_path,
             runtime,
             runtime_version,
+            installation_id: None,
         })
     }
 
@@ -278,6 +296,158 @@ impl DockerManager {
         // Remove existing container if present
         let _ = self.remove(&container_name).await;
 
+        self.create_and_start(&container_name, agent_id, spec, None)
+            .await
+    }
+
+    fn installation_id(&self) -> Result<&str> {
+        self.installation_id.as_deref().ok_or_else(|| {
+            Error::Container(
+                "retained project containers require an XpressClaw installation identity"
+                    .to_string(),
+            )
+        })
+    }
+
+    fn owned_project_container_name(&self, agent_id: &str) -> Result<String> {
+        Ok(project_container_name(self.installation_id()?, agent_id))
+    }
+
+    /// Start a project-owned ACP container, retaining and reusing its writable
+    /// layer between attempts. A changed runner specification or local image
+    /// replaces the environment so stale mounts, credentials, and commands
+    /// are never silently reused.
+    pub async fn launch_project_attached(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> Result<AttachedContainer> {
+        let installation_id = self.installation_id()?;
+        let container_name = project_container_name(installation_id, agent_id);
+        let fingerprint = container_spec_fingerprint(spec)?;
+        let existing = self.inspect_by_name(&container_name).await;
+        let info = if let Some(existing) = existing {
+            let labels = existing
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref())
+                .cloned()
+                .unwrap_or_default();
+            if !project_ownership_matches(&labels, installation_id, agent_id) {
+                return Err(Error::Container(format!(
+                    "refusing to replace project container {container_name} owned by another XpressClaw installation"
+                )));
+            }
+            let labels_match =
+                project_labels_match(&labels, &fingerprint, installation_id, agent_id);
+            let image_matches = self
+                .container_image_matches(&container_name, &spec.image)
+                .await;
+            if labels_match && image_matches {
+                self.stop_preserving(agent_id).await?;
+                let container_id = existing.id.ok_or_else(|| {
+                    Error::Container(format!(
+                        "project container {container_name} has no container ID"
+                    ))
+                })?;
+                self.docker
+                    .start_container::<String>(&container_id, None)
+                    .await
+                    .map_err(|error| {
+                        Error::Container(format!("failed to restart project container: {error}"))
+                    })?;
+                let host_port = self.get_host_port(&container_id, spec.expose_port).await;
+                info!(
+                    agent_id,
+                    container_id = &container_id[..12.min(container_id.len())],
+                    "restarted retained project container"
+                );
+                ContainerInfo {
+                    container_id,
+                    agent_id: agent_id.to_string(),
+                    status: "running".to_string(),
+                    host_port,
+                }
+            } else {
+                info!(
+                    agent_id,
+                    labels_match,
+                    image_matches,
+                    "recreating project container after runner configuration changed"
+                );
+                self.remove(&container_name).await?;
+                self.create_and_start(
+                    &container_name,
+                    agent_id,
+                    spec,
+                    Some(project_container_labels(
+                        &fingerprint,
+                        installation_id,
+                        agent_id,
+                    )),
+                )
+                .await?
+            }
+        } else {
+            self.create_and_start(
+                &container_name,
+                agent_id,
+                spec,
+                Some(project_container_labels(
+                    &fingerprint,
+                    installation_id,
+                    agent_id,
+                )),
+            )
+            .await?
+        };
+
+        match self.attach(info).await {
+            Ok(attached) => Ok(attached),
+            Err(error) => {
+                let _ = self.stop_preserving(agent_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether a retained project container still represents the requested
+    /// runner specification and the image currently available under its tag.
+    pub async fn project_container_matches(&self, agent_id: &str, spec: &ContainerSpec) -> bool {
+        let Ok(installation_id) = self.installation_id() else {
+            return false;
+        };
+        let Ok(fingerprint) = container_spec_fingerprint(spec) else {
+            return false;
+        };
+        let container_name = project_container_name(installation_id, agent_id);
+        let labels_match = self
+            .inspect_by_name(&container_name)
+            .await
+            .and_then(|container| container.config)
+            .and_then(|config| config.labels)
+            .is_some_and(|labels| {
+                project_labels_match(&labels, &fingerprint, installation_id, agent_id)
+            });
+        labels_match
+            && self
+                .container_image_matches(&container_name, &spec.image)
+                .await
+    }
+
+    async fn create_and_start(
+        &self,
+        container_name: &str,
+        agent_id: &str,
+        spec: &ContainerSpec,
+        mut labels: Option<HashMap<String, String>>,
+    ) -> Result<ContainerInfo> {
+        if let Some(installation_id) = self.installation_id.as_deref() {
+            labels
+                .get_or_insert_with(HashMap::new)
+                .insert(INSTALLATION_LABEL.to_string(), installation_id.to_string());
+        }
+
         // Build mounts — detect named volumes vs bind mounts
         let mounts: Vec<Mount> = spec
             .volumes
@@ -359,11 +529,12 @@ impl DockerManager {
             },
             cmd: spec.cmd.clone(),
             working_dir: spec.working_dir.clone(),
+            labels,
             ..Default::default()
         };
 
         let opts = CreateContainerOptions {
-            name: &container_name,
+            name: container_name,
             platform: None,
         };
 
@@ -406,6 +577,10 @@ impl DockerManager {
         spec: &ContainerSpec,
     ) -> Result<AttachedContainer> {
         let info = self.launch(agent_id, spec).await?;
+        self.attach(info).await
+    }
+
+    async fn attach(&self, info: ContainerInfo) -> Result<AttachedContainer> {
         let attached = self
             .docker
             .attach_container(
@@ -429,9 +604,49 @@ impl DockerManager {
         })
     }
 
+    /// Stop a project container without deleting its writable layer.
+    pub async fn stop_preserving(&self, agent_id: &str) -> Result<()> {
+        let container_name = self.owned_project_container_name(agent_id)?;
+        if !self.is_container_running(&container_name).await {
+            return Ok(());
+        }
+        let stop_opts = StopContainerOptions { t: 2 };
+        if let Err(error) = self
+            .docker
+            .stop_container(&container_name, Some(stop_opts))
+            .await
+        {
+            warn!(agent_id, %error, "error stopping retained project container");
+            if self.is_container_running(&container_name).await {
+                return Err(Error::Container(format!(
+                    "failed to stop retained project container: {error}"
+                )));
+            }
+        }
+        info!(agent_id, "stopped and retained project container");
+        Ok(())
+    }
+
+    /// Whether this named container is a retained project environment.
+    pub async fn is_project_container(&self, agent_id: &str) -> bool {
+        let Ok(installation_id) = self.installation_id() else {
+            return false;
+        };
+        let container_name = project_container_name(installation_id, agent_id);
+        self.inspect_by_name(&container_name)
+            .await
+            .and_then(|container| container.config)
+            .and_then(|config| config.labels)
+            .is_some_and(|labels| project_ownership_matches(&labels, installation_id, agent_id))
+    }
+
     /// Stop and remove an agent container.
     pub async fn stop(&self, agent_id: &str) -> Result<()> {
-        let container_name = format!("xpressclaw-{agent_id}");
+        let retained_name = self.owned_project_container_name(agent_id).ok();
+        let container_name = match retained_name {
+            Some(name) if self.inspect_by_name(&name).await.is_some() => name,
+            _ => format!("xpressclaw-{agent_id}"),
+        };
 
         // Short timeout — containers will be restarted on next boot.
         // Node.js/Python processes that don't handle SIGTERM get SIGKILL after this.
@@ -449,7 +664,8 @@ impl DockerManager {
         Ok(())
     }
 
-    /// Stop all xpressclaw containers.
+    /// Stop all XpressClaw containers visible to this manager. Installation-
+    /// scoped managers never enumerate another control plane's containers.
     pub async fn stop_all(&self) -> Result<()> {
         let containers = self.list().await?;
         for info in containers {
@@ -460,7 +676,26 @@ impl DockerManager {
         Ok(())
     }
 
-    /// List running xpressclaw containers.
+    /// Stop all XpressClaw containers during control-plane shutdown, retaining
+    /// project environments while removing transient workloads.
+    pub async fn stop_all_for_shutdown(&self) -> Result<()> {
+        let containers = self.list().await?;
+        for info in containers {
+            let result = if self.is_project_container(&info.agent_id).await {
+                self.stop_preserving(&info.agent_id).await
+            } else {
+                self.stop(&info.agent_id).await
+            };
+            if let Err(error) = result {
+                warn!(agent_id = info.agent_id, %error, "error stopping container");
+            }
+        }
+        Ok(())
+    }
+
+    /// List XpressClaw containers owned by this manager's installation.
+    /// Unscoped managers retain legacy behavior for unlabelled containers but
+    /// never enumerate containers explicitly owned by an installation.
     pub async fn list(&self) -> Result<Vec<ContainerInfo>> {
         let mut filters = HashMap::new();
         filters.insert("name", vec!["xpressclaw-"]);
@@ -487,9 +722,11 @@ impl DockerManager {
                 Some(n) => n.trim_start_matches('/').to_string(),
                 None => continue,
             };
-            let agent_id = match name.strip_prefix("xpressclaw-") {
-                Some(id) => id.to_string(),
-                None => continue,
+            let labels = c.labels.as_ref().cloned().unwrap_or_default();
+            let Some(agent_id) =
+                listed_container_agent_id(&name, &labels, self.installation_id.as_deref())
+            else {
+                continue;
             };
             let container_id = c.id.unwrap_or_default();
             let status = c.state.unwrap_or_default();
@@ -630,7 +867,9 @@ impl DockerManager {
 
     /// Check if a container is running.
     pub async fn is_running(&self, agent_id: &str) -> bool {
-        let container_name = format!("xpressclaw-{agent_id}");
+        let container_name = self
+            .owned_project_container_name(agent_id)
+            .unwrap_or_else(|_| format!("xpressclaw-{agent_id}"));
         match self.docker.inspect_container(&container_name, None).await {
             Ok(info) => info.state.and_then(|s| s.running).unwrap_or(false),
             Err(_) => false,
@@ -915,6 +1154,80 @@ fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
     }
 }
 
+pub(crate) fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
+    let encoded = serde_json::to_vec(spec).map_err(|error| {
+        Error::Container(format!(
+            "failed to fingerprint project container specification: {error}"
+        ))
+    })?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn project_container_name(installation_id: &str, agent_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(installation_id.as_bytes());
+    digest.update([0]);
+    digest.update(agent_id.as_bytes());
+    let digest = digest.finalize();
+    format!("xpressclaw-project-{digest:x}")
+}
+
+fn project_container_labels(
+    fingerprint: &str,
+    installation_id: &str,
+    agent_id: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (LIFECYCLE_LABEL.to_string(), PROJECT_LIFECYCLE.to_string()),
+        (SPEC_FINGERPRINT_LABEL.to_string(), fingerprint.to_string()),
+        (INSTALLATION_LABEL.to_string(), installation_id.to_string()),
+        (AGENT_ID_LABEL.to_string(), agent_id.to_string()),
+    ])
+}
+
+fn project_ownership_matches(
+    labels: &HashMap<String, String>,
+    installation_id: &str,
+    agent_id: &str,
+) -> bool {
+    labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE)
+        && labels.get(INSTALLATION_LABEL).map(String::as_str) == Some(installation_id)
+        && labels.get(AGENT_ID_LABEL).map(String::as_str) == Some(agent_id)
+}
+
+fn project_labels_match(
+    labels: &HashMap<String, String>,
+    fingerprint: &str,
+    installation_id: &str,
+    agent_id: &str,
+) -> bool {
+    project_ownership_matches(labels, installation_id, agent_id)
+        && labels.get(SPEC_FINGERPRINT_LABEL).map(String::as_str) == Some(fingerprint)
+}
+
+fn listed_container_agent_id(
+    container_name: &str,
+    labels: &HashMap<String, String>,
+    installation_id: Option<&str>,
+) -> Option<String> {
+    match (installation_id, labels.get(INSTALLATION_LABEL)) {
+        (Some(expected), Some(owner)) if owner == expected => {}
+        (None, None) => {}
+        _ => return None,
+    }
+
+    if labels.get(LIFECYCLE_LABEL).map(String::as_str) == Some(PROJECT_LIFECYCLE) {
+        let installation_id = installation_id?;
+        let agent_id = labels.get(AGENT_ID_LABEL)?;
+        return project_ownership_matches(labels, installation_id, agent_id)
+            .then(|| agent_id.clone());
+    }
+
+    container_name
+        .strip_prefix("xpressclaw-")
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,5 +1303,110 @@ mod tests {
         #[cfg(unix)]
         assert!(socket_mount_groups(&spec).is_some());
         std::fs::remove_file(source).unwrap();
+    }
+
+    #[test]
+    fn project_container_fingerprint_changes_with_runner_configuration() {
+        let mut spec = ContainerSpec::default();
+        spec.environment
+            .push("PRIVATE_TOKEN=first-secret".to_string());
+        let first = container_spec_fingerprint(&spec).unwrap();
+        let same = container_spec_fingerprint(&spec).unwrap();
+        assert_eq!(first, same);
+        assert!(!first.contains("first-secret"));
+
+        spec.environment[0] = "PRIVATE_TOKEN=rotated-secret".to_string();
+        let rotated = container_spec_fingerprint(&spec).unwrap();
+        assert_ne!(first, rotated);
+    }
+
+    #[test]
+    fn only_matching_project_labels_are_reusable() {
+        let labels = project_container_labels("expected", "installation-a", "agent-a");
+        assert!(project_labels_match(
+            &labels,
+            "expected",
+            "installation-a",
+            "agent-a"
+        ));
+        assert!(!project_labels_match(
+            &labels,
+            "changed",
+            "installation-a",
+            "agent-a"
+        ));
+        assert!(!project_labels_match(
+            &labels,
+            "expected",
+            "installation-b",
+            "agent-a"
+        ));
+
+        let transient =
+            HashMap::from([(SPEC_FINGERPRINT_LABEL.to_string(), "expected".to_string())]);
+        assert!(!project_labels_match(
+            &transient,
+            "expected",
+            "installation-a",
+            "agent-a"
+        ));
+    }
+
+    #[test]
+    fn project_container_names_are_deterministic_docker_safe_and_unicode_agnostic() {
+        let japanese = project_container_name("installation-a", "エリ-codex");
+        assert_eq!(
+            japanese,
+            project_container_name("installation-a", "エリ-codex")
+        );
+        assert_ne!(
+            japanese,
+            project_container_name("installation-a", "別のエージェント")
+        );
+        assert_ne!(
+            japanese,
+            project_container_name("installation-b", "エリ-codex")
+        );
+        assert!(japanese.len() <= 255);
+        assert!(japanese
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character)));
+    }
+
+    #[test]
+    fn container_listing_ignores_projects_owned_by_another_installation() {
+        let ours = project_container_labels("fingerprint", "installation-a", "エリ-codex");
+        let theirs = project_container_labels("fingerprint", "installation-b", "エリ-codex");
+        let name = project_container_name("installation-a", "エリ-codex");
+
+        assert_eq!(
+            listed_container_agent_id(&name, &ours, Some("installation-a")).as_deref(),
+            Some("エリ-codex")
+        );
+        assert_eq!(
+            listed_container_agent_id(&name, &theirs, Some("installation-a")),
+            None
+        );
+        assert_eq!(
+            listed_container_agent_id("xpressclaw-attempt-123", &HashMap::new(), None).as_deref(),
+            Some("attempt-123")
+        );
+        assert_eq!(
+            listed_container_agent_id(
+                "xpressclaw-attempt-123",
+                &HashMap::new(),
+                Some("installation-a")
+            ),
+            None
+        );
+        assert_eq!(
+            listed_container_agent_id(
+                "xpressclaw-attempt-123",
+                &HashMap::from([(INSTALLATION_LABEL.to_string(), "installation-a".to_string())]),
+                Some("installation-a")
+            )
+            .as_deref(),
+            Some("attempt-123")
+        );
     }
 }
