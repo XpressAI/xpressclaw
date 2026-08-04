@@ -429,10 +429,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             },
         )
         .await;
-    if turn.is_err() {
-        if processes.invalidate(workload_id, &live.process).await {
-            docker.stop_preserving(workload_id).await?;
-        }
+    if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
+        docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
     let turn = turn?;
