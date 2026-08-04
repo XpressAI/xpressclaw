@@ -1,5 +1,5 @@
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::ffi::{OsStr, OsString};
+use std::io::{Read, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::process::Output;
 use std::time::Duration;
@@ -10,6 +10,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -119,17 +121,12 @@ async fn list_directory(
     require_same_origin(&headers)?;
     let root = workspace_root(&state, &agent_id)?;
     let relative = normalize_relative_path(&query.path)?;
-    let directory = resolve_existing_path(&root, &relative)?;
-    if !directory.is_dir() {
-        return Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "path is not a directory",
-        ));
-    }
+    let workspace = open_workspace_dir(&root)?;
 
     let mut entries = Vec::new();
     let mut truncated = false;
-    let directory_entries = std::fs::read_dir(&directory)
+    let directory_entries = workspace
+        .read_dir(cap_path(&relative))
         .map_err(|error| internal_error(format!("failed to list directory: {error}")))?;
     for (index, entry) in directory_entries.enumerate() {
         if index == MAX_DIRECTORY_ENTRIES {
@@ -138,20 +135,14 @@ async fn list_directory(
         }
         let entry = entry
             .map_err(|error| internal_error(format!("failed to read directory entry: {error}")))?;
-        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+        let file_type = entry.file_type().map_err(|error| {
             internal_error(format!("failed to inspect directory entry: {error}"))
         })?;
-        let symlink = metadata.file_type().is_symlink();
-        let effective_metadata = if symlink {
-            entry
-                .path()
-                .canonicalize()
-                .ok()
-                .filter(|target| target.starts_with(&root))
-                .and_then(|target| std::fs::metadata(target).ok())
-        } else {
-            Some(metadata.clone())
-        };
+        let symlink = file_type.is_symlink();
+        // Do not follow symlinks while describing the tree. File reads and
+        // writes are capability-relative too, but keeping symlinks visibly
+        // distinct avoids implying that they are ordinary editable files.
+        let effective_metadata = if symlink { None } else { entry.metadata().ok() };
         let kind = match effective_metadata.as_ref() {
             Some(metadata) if metadata.is_dir() => "directory",
             Some(metadata) if metadata.is_file() => "file",
@@ -163,6 +154,7 @@ async fn list_directory(
         let modified_at = effective_metadata
             .as_ref()
             .and_then(|metadata| metadata.modified().ok())
+            .map(cap_std::time::SystemTime::into_std)
             .map(chrono::DateTime::<chrono::Utc>::from)
             .map(|value| value.to_rfc3339());
         entries.push(WorkspaceEntry {
@@ -173,7 +165,7 @@ async fn list_directory(
             size: effective_metadata
                 .as_ref()
                 .filter(|metadata| metadata.is_file())
-                .map(std::fs::Metadata::len),
+                .map(|metadata| metadata.len()),
             modified_at,
         });
     }
@@ -202,8 +194,12 @@ async fn read_file(
     require_same_origin(&headers)?;
     let root = workspace_root(&state, &agent_id)?;
     let relative = normalize_relative_path(&query.path)?;
-    let file = resolve_existing_path(&root, &relative)?;
-    let metadata = std::fs::metadata(&file)
+    let workspace = open_workspace_dir(&root)?;
+    let mut file = workspace
+        .open(&relative)
+        .map_err(|error| workspace_path_error("open file", error))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| internal_error(format!("failed to inspect file: {error}")))?;
     if !metadata.is_file() {
         return Err(api_error(StatusCode::BAD_REQUEST, "path is not a file"));
@@ -217,8 +213,20 @@ async fn read_file(
             ),
         ));
     }
-    let bytes = std::fs::read(&file)
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| internal_error(format!("failed to read file: {error}")))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "files larger than {} MiB cannot be edited",
+                MAX_FILE_BYTES / 1024 / 1024
+            ),
+        ));
+    }
     let content = String::from_utf8(bytes.clone()).map_err(|_| {
         api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -251,14 +259,34 @@ async fn write_file(
     }
     let root = workspace_root(&state, &agent_id)?;
     let relative = normalize_relative_path(&input.path)?;
-    let file = resolve_existing_path(&root, &relative)?;
-    let metadata = std::fs::metadata(&file)
+    let workspace = open_workspace_dir(&root)?;
+    let (parent, file_name) = open_parent_dir(&workspace, &relative)?;
+    let mut file = parent
+        .open(&file_name)
+        .map_err(|error| workspace_path_error("open file", error))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| internal_error(format!("failed to inspect file: {error}")))?;
     if !metadata.is_file() {
         return Err(api_error(StatusCode::BAD_REQUEST, "path is not a file"));
     }
-    let current = std::fs::read(&file)
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the file grew beyond the editable size limit; reload it before saving",
+        ));
+    }
+    let mut current = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut current)
         .map_err(|error| internal_error(format!("failed to read file before saving: {error}")))?;
+    if current.len() as u64 > MAX_FILE_BYTES {
+        return Err(api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the file grew beyond the editable size limit; reload it before saving",
+        ));
+    }
     let current_revision = content_revision(&current);
     if input.expected_revision != current_revision {
         return Err((
@@ -269,8 +297,13 @@ async fn write_file(
             })),
         ));
     }
-    atomic_write(&file, input.content.as_bytes(), metadata.permissions())
-        .map_err(|error| internal_error(format!("failed to save file: {error}")))?;
+    atomic_write(
+        &parent,
+        &file_name,
+        input.content.as_bytes(),
+        metadata.permissions(),
+    )
+    .map_err(|error| internal_error(format!("failed to save file: {error}")))?;
     let revision = content_revision(input.content.as_bytes());
     Ok(Json(json!({
         "path": relative_path_string(&relative),
@@ -578,20 +611,48 @@ fn normalize_relative_path(raw: &str) -> ApiResult<PathBuf> {
     Ok(normalized)
 }
 
-fn resolve_existing_path(root: &FsPath, relative: &FsPath) -> ApiResult<PathBuf> {
-    let resolved = root.join(relative).canonicalize().map_err(|error| {
+fn open_workspace_dir(root: &FsPath) -> ApiResult<Dir> {
+    Dir::open_ambient_dir(root, ambient_authority()).map_err(|error| {
         api_error(
             StatusCode::NOT_FOUND,
-            format!("workspace path was not found: {error}"),
+            format!("workspace {} is unavailable: {error}", root.display()),
         )
-    })?;
-    if !resolved.starts_with(root) {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "workspace path resolves outside the configured workspace",
-        ));
+    })
+}
+
+fn cap_path(path: &FsPath) -> &FsPath {
+    if path.as_os_str().is_empty() {
+        FsPath::new(".")
+    } else {
+        path
     }
-    Ok(resolved)
+}
+
+fn open_parent_dir(workspace: &Dir, relative: &FsPath) -> ApiResult<(Dir, OsString)> {
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "a file path is required"))?
+        .to_os_string();
+    let parent = relative.parent().unwrap_or_else(|| FsPath::new(""));
+    let directory = if parent.as_os_str().is_empty() {
+        workspace
+            .try_clone()
+            .map_err(|error| internal_error(format!("failed to clone workspace handle: {error}")))?
+    } else {
+        workspace
+            .open_dir(parent)
+            .map_err(|error| workspace_path_error("open parent directory", error))?
+    };
+    Ok((directory, file_name))
+}
+
+fn workspace_path_error(operation: &str, error: std::io::Error) -> ApiError {
+    let status = match error.kind() {
+        std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    api_error(status, format!("failed to {operation}: {error}"))
 }
 
 fn relative_path_string(path: &FsPath) -> String {
@@ -609,31 +670,24 @@ fn content_revision(bytes: &[u8]) -> String {
 }
 
 fn atomic_write(
-    path: &FsPath,
+    parent: &Dir,
+    file_name: &OsStr,
     content: &[u8],
-    permissions: std::fs::Permissions,
+    permissions: cap_std::fs::Permissions,
 ) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "file has no parent directory",
-        )
-    })?;
-    let temporary = parent.join(format!(".xpressclaw-save-{}", Uuid::new_v4()));
+    let temporary = OsString::from(format!(".xpressclaw-save-{}", Uuid::new_v4()));
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = parent.open_with(&temporary, &options)?;
         file.write_all(content)?;
         file.sync_all()?;
-        std::fs::set_permissions(&temporary, permissions)?;
-        #[cfg(windows)]
-        std::fs::remove_file(path)?;
-        std::fs::rename(&temporary, path)
+        file.set_permissions(permissions)?;
+        drop(file);
+        parent.rename(&temporary, parent, file_name)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+        let _ = parent.remove_file(&temporary);
     }
     result
 }
@@ -763,9 +817,8 @@ mod tests {
             )
             .unwrap();
             let root = workspace.path().canonicalize().unwrap();
-            let result = resolve_existing_path(&root, FsPath::new("link"));
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().0, StatusCode::FORBIDDEN);
+            let directory = open_workspace_dir(&root).unwrap();
+            assert!(directory.open("link").is_err());
         }
     }
 
@@ -778,8 +831,57 @@ mod tests {
         let revision = content_revision(&std::fs::read(&file).unwrap());
         std::fs::write(&file, "agent edit").unwrap();
         assert_ne!(revision, content_revision(&std::fs::read(&file).unwrap()));
-        atomic_write(&file, b"saved", metadata.permissions()).unwrap();
+        let root = open_workspace_dir(workspace.path()).unwrap();
+        let permissions = root
+            .open("hello.rs")
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions();
+        atomic_write(&root, OsStr::new("hello.rs"), b"saved", permissions).unwrap();
         assert_eq!(std::fs::read_to_string(file).unwrap(), "saved");
+        assert_eq!(
+            std::fs::metadata(workspace.path().join("hello.rs"))
+                .unwrap()
+                .permissions(),
+            metadata.permissions()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_stays_on_open_parent_when_path_is_replaced_by_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/main.rs"), "workspace").unwrap();
+        std::fs::write(outside.path().join("main.rs"), "outside").unwrap();
+
+        let root = open_workspace_dir(workspace.path()).unwrap();
+        let (parent, file_name) = open_parent_dir(&root, FsPath::new("src/main.rs")).unwrap();
+        let permissions = parent
+            .open(&file_name)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions();
+
+        std::fs::rename(
+            workspace.path().join("src"),
+            workspace.path().join("src-original"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("src")).unwrap();
+        atomic_write(&parent, &file_name, b"saved", permissions).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src-original/main.rs")).unwrap(),
+            "saved"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("main.rs")).unwrap(),
+            "outside"
+        );
     }
 
     #[test]

@@ -46,8 +46,10 @@ access. They therefore:
 - accept browser requests only when `Origin` matches `Host` (or the first
   forwarded host); origin-less calls remain available to the desktop shell and
   trusted API clients;
-- resolve only normalized relative paths, canonicalize targets, and reject
-  traversal, absolute paths, and symlinks that escape the configured root;
+- resolve only normalized relative paths through a capability directory handle
+  rooted at the workspace. Reads, listings, temporary saves, and atomic renames
+  stay relative to that handle, so a container cannot redirect a checked path
+  outside the workspace by swapping an ancestor for a symlink;
 - edit existing regular UTF-8 files only, with a 4 MiB file limit;
 - cap directory listings at 2,000 entries and displayed Git output at 4 MiB;
 - attach terminals only to retained containers bearing this installation and

@@ -11,6 +11,7 @@
 	let git = $state<WorkspaceGitStatus | null>(null);
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
 	let expanded = $state<string[]>(['']);
+	let selectedPath = $state('');
 	let selectedFile = $state<WorkspaceFile | null>(null);
 	let editorValue = $state('');
 	let fileDiff = $state<WorkspaceGitDiff | null>(null);
@@ -85,18 +86,23 @@
 		error = '';
 		saveMessage = '';
 		try {
-			const [file, diff] = await Promise.all([
-				workspaces.readFile(agentId, path),
+			const [fileResult, diff] = await Promise.all([
+				workspaces.readFile(agentId, path)
+					.then((file) => ({ file, error: null }))
+					.catch((cause: unknown) => ({ file: null, error: cause })),
 				workspaces.gitDiff(agentId, path).catch(() => null),
 			]);
-			selectedFile = file;
-			editorValue = file.content;
+			const deleted = changeByPath.get(path)?.status.includes('D') ?? false;
+			if (!fileResult.file && !(deleted && diff)) throw fileResult.error;
+			selectedPath = path;
+			selectedFile = fileResult.file;
+			editorValue = fileResult.file?.content ?? '';
 			fileDiff = diff;
-			viewMode = 'code';
+			viewMode = fileResult.file ? 'code' : 'diff';
 			if (navigate) {
 				const url = new URL(window.location.href);
 				url.searchParams.set('tab', 'files');
-				url.searchParams.set('path', file.path);
+				url.searchParams.set('path', path);
 				await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
 			}
 		} catch (cause) {
@@ -108,20 +114,25 @@
 
 	async function saveFile() {
 		if (!selectedFile || !dirty || saving) return;
+		const fileAtStart = selectedFile;
+		const submittedContent = editorValue;
 		saving = true;
 		error = '';
 		saveMessage = '';
 		try {
-			const saved = await workspaces.saveFile(agentId, { ...selectedFile, content: editorValue });
-			selectedFile = {
-				...selectedFile,
-				content: editorValue,
-				revision: saved.revision,
-				size: saved.size,
-			};
-			saveMessage = 'Saved';
+			const saved = await workspaces.saveFile(agentId, { ...fileAtStart, content: submittedContent });
+			if (selectedPath === fileAtStart.path && selectedFile?.path === fileAtStart.path) {
+				selectedFile = {
+					...selectedFile,
+					content: submittedContent,
+					revision: saved.revision,
+					size: saved.size,
+				};
+				saveMessage = 'Saved';
+			}
 			await refreshGit();
-			fileDiff = await workspaces.gitDiff(agentId, selectedFile.path).catch(() => fileDiff);
+			const refreshedDiff = await workspaces.gitDiff(agentId, fileAtStart.path).catch(() => null);
+			if (selectedPath === fileAtStart.path && refreshedDiff) fileDiff = refreshedDiff;
 			setTimeout(() => (saveMessage = ''), 2000);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
@@ -171,7 +182,7 @@
 	{#if error}
 		<div class="shrink-0 border-b border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
 			{error}
-			{#if selectedFile}<button type="button" onclick={() => openFile(selectedFile!.path, true, false)} class="ml-2 underline">Reload file</button>{/if}
+			{#if selectedPath}<button type="button" onclick={() => openFile(selectedPath, true, false)} class="ml-2 underline">Reload file</button>{/if}
 		</div>
 	{/if}
 
@@ -186,7 +197,7 @@
 						<div class="max-h-32 overflow-y-auto pb-1">
 							{#each git.files as change (change.path)}
 								<button type="button" onclick={() => openFile(change.path)} title={change.path}
-									class="flex w-full items-center gap-2 px-3 py-1 text-left text-xs hover:bg-accent {selectedFile?.path === change.path ? 'bg-accent' : ''}">
+									class="flex w-full items-center gap-2 px-3 py-1 text-left text-xs hover:bg-accent {selectedPath === change.path ? 'bg-accent' : ''}">
 									<span class="w-3 shrink-0 font-mono text-[10px] text-amber-500">{statusLabel(change)}</span>
 									<span class="truncate">{change.path}</span>
 								</button>
@@ -203,7 +214,7 @@
 							onclick={() => row.entry.kind === 'directory' ? toggleDirectory(row.entry.path) : row.entry.kind === 'file' ? openFile(row.entry.path) : undefined}
 							disabled={row.entry.kind === 'other' || row.entry.kind === 'symlink'}
 							title={row.entry.path}
-							class="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-xs hover:bg-accent disabled:cursor-default disabled:opacity-60 {selectedFile?.path === row.entry.path ? 'bg-accent text-foreground' : 'text-muted-foreground'}"
+							class="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-xs hover:bg-accent disabled:cursor-default disabled:opacity-60 {selectedPath === row.entry.path ? 'bg-accent text-foreground' : 'text-muted-foreground'}"
 							style:padding-left={`${8 + row.depth * 14}px`}
 						>
 							{#if row.entry.kind === 'directory'}
@@ -219,15 +230,15 @@
 			</div>
 
 			<div class="flex min-h-[20rem] min-w-0 flex-1 flex-col">
-				{#if selectedFile}
+				{#if selectedPath}
 					<div class="flex h-9 shrink-0 items-center justify-between gap-2 border-b border-border px-3">
 						<div class="flex min-w-0 items-center gap-2">
-							<span class="truncate text-xs" title={selectedFile.path}>{basename(selectedFile.path)}</span>
+							<span class="truncate text-xs" title={selectedPath}>{basename(selectedPath)}</span>
 							{#if dirty}<span class="h-1.5 w-1.5 rounded-full bg-amber-500" title="Unsaved changes"></span>{/if}
 						</div>
 						<div class="flex items-center gap-1.5">
 							<div class="flex rounded-md border border-border p-0.5">
-								<button type="button" onclick={() => (viewMode = 'code')} class="rounded px-2 py-0.5 text-[10px] {viewMode === 'code' ? 'bg-accent text-foreground' : 'text-muted-foreground'}">Code</button>
+								<button type="button" onclick={() => (viewMode = 'code')} disabled={!selectedFile} class="rounded px-2 py-0.5 text-[10px] disabled:opacity-40 {viewMode === 'code' ? 'bg-accent text-foreground' : 'text-muted-foreground'}">Code</button>
 								<button type="button" onclick={() => (viewMode = 'diff')} class="rounded px-2 py-0.5 text-[10px] {viewMode === 'diff' ? 'bg-accent text-foreground' : 'text-muted-foreground'}">Diff</button>
 							</div>
 							{#if saveMessage}<span class="text-[10px] text-emerald-500">{saveMessage}</span>{/if}
@@ -240,12 +251,12 @@
 					<div class="min-h-0 flex-1">
 						{#if loadingFile}
 							<div class="flex h-full items-center justify-center text-xs text-muted-foreground">Loading file…</div>
-						{:else if viewMode === 'code'}
-							{#key selectedFile.path}
-								<MonacoEditor value={editorValue} path={selectedFile.path} onChange={(value) => (editorValue = value)} onSave={saveFile} />
+						{:else if viewMode === 'code' && selectedFile}
+							{#key selectedPath}
+								<MonacoEditor value={editorValue} path={selectedPath} onChange={(value) => (editorValue = value)} onSave={saveFile} />
 							{/key}
 						{:else}
-							<MonacoEditor value={fileDiff?.diff || 'No tracked diff is available for this file.'} path={`${selectedFile.path}.diff`} language="diff" readOnly />
+							<MonacoEditor value={fileDiff?.diff || 'No tracked diff is available for this file.'} path={`${selectedPath}.diff`} language="diff" readOnly />
 						{/if}
 					</div>
 				{:else}

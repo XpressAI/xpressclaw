@@ -127,6 +127,8 @@ async function mockApi(
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown> }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
+		workspaceSaveDelayMs?: number;
+		includeDeletedWorkspaceFile?: boolean;
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -355,11 +357,18 @@ async function mockApi(
 			if (request.method() === 'PUT') {
 				const payload = request.postDataJSON() as { path: string; content: string; expected_revision: string };
 				options.workspaceSaveRequests?.push(payload);
+				if (options.workspaceSaveDelayMs) {
+					await new Promise((resolve) => setTimeout(resolve, options.workspaceSaveDelayMs));
+				}
 				workspaceFileContent = payload.content;
 				workspaceFileRevision = 'revision-after-save';
 				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
 			} else {
 				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
+					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
+					return;
+				}
 				response = {
 					path: filePath,
 					content: filePath === 'src/main.ts' ? workspaceFileContent : '# Browser-tested workspace\n',
@@ -374,6 +383,9 @@ async function mockApi(
 				files: [
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
+					...(options.includeDeletedWorkspaceFile
+						? [{ path: 'src/removed.ts', original_path: null, status: ' D', index_status: ' ', worktree_status: 'D' }]
+						: []),
 				],
 			};
 		} else if (path === `/api/workspaces/${agentId}/git/diff`) {
@@ -382,7 +394,9 @@ async function mockApi(
 				path: filePath,
 				diff: filePath === 'src/main.ts'
 					? 'diff --git a/src/main.ts b/src/main.ts\n--- a/src/main.ts\n+++ b/src/main.ts\n@@ -1 +1 @@\n-export const greeting = "hi";\n+export const greeting = "hello";\n'
-					: '',
+					: filePath === 'src/removed.ts'
+						? 'diff --git a/src/removed.ts b/src/removed.ts\ndeleted file mode 100644\n--- a/src/removed.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export const removed = true;\n'
+						: '',
 				truncated: false,
 			};
 		} else if (path === '/api/tasks') {
@@ -998,6 +1012,52 @@ test('agent files browse Git changes and save Monaco edits with a revision', asy
 	await expect(tree).toBeVisible();
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible();
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('workspace save preserves edits typed while the request is in flight', async ({ page }) => {
+	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
+	await mockApi(page, { workspaceSaveRequests, workspaceSaveDelayMs: 400 });
+	await page.goto(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+
+	const editor = page.locator('[data-monaco-editor]');
+	await expect(editor).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const greeting = "submitted";');
+	await page.getByRole('button', { name: 'Save' }).click();
+	await expect.poll(() => workspaceSaveRequests.length).toBe(1);
+
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+End');
+	await page.keyboard.insertText('\nexport const typedDuringSave = true;');
+	await expect(page.getByText('Saved')).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	await page.getByRole('button', { name: 'Save' }).click();
+	await expect.poll(() => workspaceSaveRequests).toHaveLength(2);
+	expect(workspaceSaveRequests[0]).toEqual({
+		path: 'src/main.ts',
+		content: 'export const greeting = "submitted";',
+		expected_revision: 'revision-before-save',
+	});
+	expect(workspaceSaveRequests[1]).toEqual({
+		path: 'src/main.ts',
+		content: 'export const greeting = "submitted";\nexport const typedDuringSave = true;',
+		expected_revision: 'revision-after-save',
+	});
+});
+
+test('deleted workspace changes remain available as diff-only selections', async ({ page }) => {
+	await mockApi(page, { includeDeletedWorkspaceFile: true });
+	await page.goto(`/agents/${agentId}?tab=files`);
+
+	await expect(page.getByText('feature/workspace-browser · 3 changed')).toBeVisible();
+	await page.getByRole('button', { name: 'src/removed.ts' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fremoved.ts`);
+	await expect(page.getByRole('button', { name: 'Code' })).toBeDisabled();
+	await expect(page.locator('[data-monaco-editor]')).toContainText('deleted file mode', { timeout: 20_000 });
+	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
 test('task details deep-link current Git changes into the workspace editor', async ({ page }) => {

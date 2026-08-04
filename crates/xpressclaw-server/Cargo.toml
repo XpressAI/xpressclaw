@@ -25,6 +25,7 @@ tokio-stream = { workspace = true }
 futures-util = { workspace = true }
 sha2 = { workspace = true }
 bollard = { workspace = true }
+cap-std = "4.0.2"
 async-stream = "0.3"
 rust-embed = { workspace = true }
 open = { workspace = true }
