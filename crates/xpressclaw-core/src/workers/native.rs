@@ -101,11 +101,8 @@ impl ProjectAcpProcesses {
         let previous = entry.take();
         docker.stop_preserving(agent_id).await?;
         if let Some(previous) = previous {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                previous.process.wait_for_exit(),
-            )
-            .await;
+            let _ = tokio::time::timeout(Duration::from_secs(2), previous.process.wait_for_exit())
+                .await;
         }
         let attached = docker.launch_project_attached(agent_id, spec).await?;
         let container_id = attached.info.container_id.clone();

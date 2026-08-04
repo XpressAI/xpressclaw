@@ -359,11 +359,7 @@ impl DockerManager {
 
     /// Whether a retained project container still represents the requested
     /// runner specification and the image currently available under its tag.
-    pub async fn project_container_matches(
-        &self,
-        agent_id: &str,
-        spec: &ContainerSpec,
-    ) -> bool {
+    pub async fn project_container_matches(&self, agent_id: &str, spec: &ContainerSpec) -> bool {
         let Ok(fingerprint) = container_spec_fingerprint(spec) else {
             return false;
         };

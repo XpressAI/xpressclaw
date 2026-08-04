@@ -817,7 +817,9 @@ impl AcpProcess {
         options: AcpTurnOptions,
     ) -> Result<AcpTurnResult> {
         if !self.is_alive() {
-            return Err(Error::Backend("ACP process is no longer running".to_string()));
+            return Err(Error::Backend(
+                "ACP process is no longer running".to_string(),
+            ));
         }
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -830,7 +832,9 @@ impl AcpProcess {
                 response,
             })
             .await
-            .map_err(|_| Error::Backend("ACP process stopped before the turn started".to_string()))?;
+            .map_err(|_| {
+                Error::Backend("ACP process stopped before the turn started".to_string())
+            })?;
         receiver
             .await
             .map_err(|_| Error::Backend("ACP process stopped during the turn".to_string()))?
@@ -953,9 +957,9 @@ async fn serve_process(
                     return Err(agent_client_protocol::Error::into_internal_error(error));
                 }
 
-                let response = receiver.await.unwrap_or_else(|_| {
-                    CreateElicitationResponse::new(ElicitationAction::Cancel)
-                });
+                let response = receiver
+                    .await
+                    .unwrap_or_else(|_| CreateElicitationResponse::new(ElicitationAction::Cancel));
                 active
                     .recorder
                     .record_elicitation_response(&elicitation_id, &response)
@@ -969,10 +973,12 @@ async fn serve_process(
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
                         ClientCapabilities::new()
-                            .session(ClientSessionCapabilities::new().config_options(
-                                SessionConfigOptionsCapabilities::new()
-                                    .boolean(BooleanConfigOptionCapabilities::new()),
-                            ))
+                            .session(
+                                ClientSessionCapabilities::new().config_options(
+                                    SessionConfigOptionsCapabilities::new()
+                                        .boolean(BooleanConfigOptionCapabilities::new()),
+                                ),
+                            )
                             .elicitation(
                                 ElicitationCapabilities::new()
                                     .form(ElicitationFormCapabilities::new()),
@@ -1055,9 +1061,8 @@ async fn serve_process(
                         } else {
                             format!("{error}: {}", turn_stderr.trim())
                         };
-                        let _ = response.send(Err(Error::Backend(format!(
-                            "ACP turn failed: {detail}"
-                        ))));
+                        let _ = response
+                            .send(Err(Error::Backend(format!("ACP turn failed: {detail}"))));
                         return Err(error);
                     }
                 }
@@ -1104,9 +1109,7 @@ async fn run_connected_turn(
         image_attachments,
     } = options;
 
-    if !image_attachments.is_empty()
-        && !initialized.agent_capabilities.prompt_capabilities.image
-    {
+    if !image_attachments.is_empty() && !initialized.agent_capabilities.prompt_capabilities.image {
         return Err(agent_client_protocol::util::internal_error(
             "the selected ACP agent does not support image prompts",
         ));
@@ -1114,17 +1117,13 @@ async fn run_connected_turn(
 
     for server in &mcp_servers {
         match server {
-            McpServer::Http(server)
-                if !initialized.agent_capabilities.mcp_capabilities.http =>
-            {
+            McpServer::Http(server) if !initialized.agent_capabilities.mcp_capabilities.http => {
                 return Err(agent_client_protocol::util::internal_error(format!(
                     "ACP agent does not support HTTP MCP server '{}'",
                     server.name
                 )));
             }
-            McpServer::Sse(server)
-                if !initialized.agent_capabilities.mcp_capabilities.sse =>
-            {
+            McpServer::Sse(server) if !initialized.agent_capabilities.mcp_capabilities.sse => {
                 return Err(agent_client_protocol::util::internal_error(format!(
                     "ACP agent does not support SSE MCP server '{}'",
                     server.name
