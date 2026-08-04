@@ -87,7 +87,8 @@ impl AppState {
             }
         }
         // Slow path: try to connect
-        match DockerManager::connect().await {
+        let installation_id = self.db.installation_id().ok()?;
+        match DockerManager::connect_for_installation(&installation_id).await {
             Ok(d) => {
                 let d = Arc::new(d);
                 *self.docker.write().unwrap() = Some(d.clone());

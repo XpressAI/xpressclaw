@@ -47,7 +47,8 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
     // A process restart severs ownership of in-flight ACP processes. Stop
     // retained project containers without deleting their writable layers,
-    // remove obsolete attempt/legacy containers, then retry durable work.
+    // remove obsolete containers owned by this installation, then retry
+    // durable work. Foreign and unlabelled containers are not enumerated.
     let dispatcher_docker = state.docker().await;
     if let Some(docker) = dispatcher_docker.as_ref() {
         match docker.list().await {
@@ -163,7 +164,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     info!("shutting down — stopping containers (Ctrl+C again to force quit)");
 
     let shutdown_task = async {
-        if let Ok(docker) = xpressclaw_core::docker::manager::DockerManager::connect().await {
+        if let Some(docker) = state.docker().await {
             let _ = docker.stop_all_for_shutdown().await;
             info!("all containers stopped");
         }

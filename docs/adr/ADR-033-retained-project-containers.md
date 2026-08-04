@@ -20,13 +20,16 @@ multi-turn protocol, so those costs are not an inherent turn boundary.
 
 ## Decision
 
-Each configured project agent owns one retained container named
-`xpressclaw-<agent-id>`. It is allocated lazily by the first task. XpressClaw
-starts and initializes the ACP command once, then keeps that process and its
-stdio connection alive across ordinary turns. The same process may own several
-ACP sessions: a follow-up uses its already-live task session, while new work
-creates or forks a session through the same connection. The container's
-writable layer, including `/home/node` and `/tmp`, remains available throughout.
+Each configured project agent owns one retained container whose engine name is
+a deterministic SHA-256 encoding of the installation and logical Agent IDs.
+This keeps names within Docker's ASCII grammar even when an Agent is named in
+Japanese or another non-ASCII script, while labels retain the human-readable
+logical ID. It is allocated lazily by the first task. XpressClaw starts and
+initializes the ACP command once, then keeps that process and its stdio
+connection alive across ordinary turns. The same process may own several ACP
+sessions: a follow-up uses its already-live task session, while new work creates
+or forks a session through the same connection. The container's writable layer,
+including `/home/node` and `/tmp`, remains available throughout.
 
 ACP session identifiers are persisted before each prompt is dispatched. If the
 process or control plane crashes, the next task restarts the retained container
@@ -39,7 +42,10 @@ lease on the shared process, including the short cancellation interval after an
 attempt becomes terminal but before a hard stop has completed. This prevents a
 new turn from entering a process that an older cancellation path is stopping.
 
-Retained containers carry lifecycle and runner-specification labels. The
+Retained containers carry lifecycle, installation-owner, logical-Agent, and
+runner-specification labels. The installation ID is generated once and stored
+with the database. Container enumeration ignores resources labelled for another
+installation, so two control planes can safely share an engine. The
 specification fingerprint covers the image reference, command, environment,
 mounts, limits, working directory, and network configuration. XpressClaw
 recreates the container when that fingerprint changes or its image no longer
@@ -52,9 +58,10 @@ on the next process start. Changing a startup command changes the container
 specification and therefore creates a clean environment and process.
 
 Control-plane shutdown and startup stop configured project containers but
-retain them. Deleting a project agent removes its container and writable
-layer. Containers belonging to deleted configuration and old attempt-scoped
-or pre-ADR-025 layouts are removed during startup cleanup.
+retain them. Deleting a project agent removes its container and writable layer.
+Startup cleanup operates only on containers carrying this installation's owner
+label. Containers owned by another installation—and unlabelled legacy
+containers whose ownership cannot be proven—are never included in that cleanup.
 
 ## Consequences
 

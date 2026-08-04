@@ -150,6 +150,13 @@ pub async fn start_dispatcher(
     control_plane_port: u16,
 ) {
     info!("native attempt dispatcher started");
+    let installation_id = match db.installation_id() {
+        Ok(installation_id) => installation_id,
+        Err(error) => {
+            warn!(%error, "native dispatcher could not load its installation identity");
+            return;
+        }
+    };
     let concurrency = Arc::new(Semaphore::new(4));
     let processes = Arc::new(ProjectAcpProcesses::default());
     let mut docker = initial_docker;
@@ -157,7 +164,7 @@ pub async fn start_dispatcher(
     loop {
         let docker = match docker.clone() {
             Some(docker) => docker,
-            None => match DockerManager::connect().await {
+            None => match DockerManager::connect_for_installation(&installation_id).await {
                 Ok(connected) => {
                     let connected = Arc::new(connected);
                     docker = Some(connected.clone());
