@@ -8,6 +8,7 @@ use bollard::container::{
     WaitContainerOptions,
 };
 use bollard::errors::Error as BollardError;
+use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{HostConfig, Mount, MountTypeEnum};
 use bollard::Docker;
@@ -87,6 +88,15 @@ pub struct ContainerInfo {
 /// terminal or an HTTP control port.
 pub struct AttachedContainer {
     pub info: ContainerInfo,
+    pub input: Pin<Box<dyn AsyncWrite + Send>>,
+    pub output: Pin<Box<dyn Stream<Item = std::result::Result<LogOutput, BollardError>> + Send>>,
+}
+
+/// An interactive pseudo-terminal started inside a retained project
+/// container. The control plane bridges these streams to one browser
+/// WebSocket and resizes the Docker exec session as the browser changes size.
+pub struct TerminalSession {
+    pub exec_id: String,
     pub input: Pin<Box<dyn AsyncWrite + Send>>,
     pub output: Pin<Box<dyn Stream<Item = std::result::Result<LogOutput, BollardError>> + Send>>,
 }
@@ -638,6 +648,117 @@ impl DockerManager {
             .and_then(|container| container.config)
             .and_then(|config| config.labels)
             .is_some_and(|labels| project_ownership_matches(&labels, installation_id, agent_id))
+    }
+
+    /// Start an interactive shell inside this installation's retained project
+    /// container. A stopped retained container is restarted on demand so a
+    /// user can repair credentials after a control-plane restart without
+    /// first dispatching another agent turn.
+    pub async fn open_project_terminal(
+        &self,
+        agent_id: &str,
+        columns: u16,
+        rows: u16,
+    ) -> Result<TerminalSession> {
+        let installation_id = self.installation_id()?;
+        let container_name = project_container_name(installation_id, agent_id);
+        let container = self.inspect_by_name(&container_name).await.ok_or_else(|| {
+            Error::ContainerNotFound {
+                id: format!(
+                    "retained environment for {agent_id}; run a task once to initialize it"
+                ),
+            }
+        })?;
+        let labels = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        if !project_ownership_matches(&labels, installation_id, agent_id) {
+            return Err(Error::Container(format!(
+                "refusing terminal access to project container {container_name} with mismatched ownership"
+            )));
+        }
+        let running = container
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if !running {
+            self.docker
+                .start_container::<String>(&container_name, None)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!(
+                        "failed to restart retained project container: {error}"
+                    ))
+                })?;
+        }
+
+        let exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions::<String> {
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(true),
+                    env: Some(vec![
+                        "HOME=/home/node".to_string(),
+                        "TERM=xterm-256color".to_string(),
+                        "COLORTERM=truecolor".to_string(),
+                    ]),
+                    cmd: Some(vec![
+                        "/bin/sh".to_string(),
+                        "-lc".to_string(),
+                        "if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi"
+                            .to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| Error::Container(format!("failed to create terminal: {error}")))?;
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    tty: true,
+                    output_capacity: Some(1024 * 1024),
+                }),
+            )
+            .await
+            .map_err(|error| Error::Container(format!("failed to start terminal: {error}")))?;
+        let StartExecResults::Attached { output, input } = started else {
+            return Err(Error::Container(
+                "interactive terminal unexpectedly started detached".to_string(),
+            ));
+        };
+        let session = TerminalSession {
+            exec_id: exec.id,
+            input,
+            output,
+        };
+        let _ = self.resize_terminal(&session.exec_id, columns, rows).await;
+        Ok(session)
+    }
+
+    /// Resize an interactive terminal created by [`open_project_terminal`].
+    pub async fn resize_terminal(&self, exec_id: &str, columns: u16, rows: u16) -> Result<()> {
+        self.docker
+            .resize_exec(
+                exec_id,
+                ResizeExecOptions {
+                    width: columns.clamp(20, 500),
+                    height: rows.clamp(5, 300),
+                },
+            )
+            .await
+            .map_err(|error| Error::Container(format!("failed to resize terminal: {error}")))
     }
 
     /// Stop and remove an agent container.

@@ -29,7 +29,7 @@ export interface WorkspacePaneState {
 	width: number;
 }
 
-export const projectSections = ['session', 'tasks', 'schedules', 'runner', 'workspace'] as const;
+export const projectSections = ['session', 'tasks', 'schedules', 'files', 'runner', 'workspace'] as const;
 export type ProjectSection = typeof projectSections[number];
 
 let idCounter = 0;

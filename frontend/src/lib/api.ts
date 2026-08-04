@@ -263,6 +263,83 @@ export const sessions = {
 		})
 };
 
+// -- Project workspaces --
+
+export interface WorkspaceStatus {
+	agent_id: string;
+	root: string;
+	container_exists: boolean;
+	container_running: boolean;
+	terminal_available: boolean;
+}
+
+export interface WorkspaceEntry {
+	name: string;
+	path: string;
+	kind: 'directory' | 'file' | 'symlink' | 'other';
+	symlink: boolean;
+	size: number | null;
+	modified_at: string | null;
+}
+
+export interface WorkspaceDirectory {
+	path: string;
+	entries: WorkspaceEntry[];
+	truncated: boolean;
+}
+
+export interface WorkspaceFile {
+	path: string;
+	content: string;
+	revision: string;
+	size: number;
+}
+
+export interface GitChange {
+	path: string;
+	original_path: string | null;
+	status: string;
+	index_status: string;
+	worktree_status: string;
+}
+
+export interface WorkspaceGitStatus {
+	repository: boolean;
+	branch: string | null;
+	files: GitChange[];
+}
+
+export interface WorkspaceGitDiff {
+	path: string;
+	diff: string;
+	truncated: boolean;
+}
+
+export const workspaces = {
+	status: (agentId: string) =>
+		request<WorkspaceStatus>(`/api/workspaces/${encodeURIComponent(agentId)}`),
+	tree: (agentId: string, path = '') =>
+		request<WorkspaceDirectory>(`/api/workspaces/${encodeURIComponent(agentId)}/tree?path=${encodeURIComponent(path)}`),
+	readFile: (agentId: string, path: string) =>
+		request<WorkspaceFile>(`/api/workspaces/${encodeURIComponent(agentId)}/file?path=${encodeURIComponent(path)}`),
+	saveFile: (agentId: string, file: WorkspaceFile) =>
+		request<{ path: string; revision: string; size: number }>(
+			`/api/workspaces/${encodeURIComponent(agentId)}/file`,
+			{
+				method: 'PUT',
+				body: JSON.stringify({
+					path: file.path,
+					content: file.content,
+					expected_revision: file.revision,
+				}),
+			}
+		),
+	gitStatus: (agentId: string) =>
+		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`),
+	gitDiff: (agentId: string, path: string) =>
+		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
+};
+
 // -- Tasks --
 
 export interface Task {

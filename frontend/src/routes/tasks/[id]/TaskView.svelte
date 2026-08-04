@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { tasks, agents, sessions } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload } from '$lib/api';
+	import { tasks, agents, sessions, workspaces } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
@@ -75,6 +75,7 @@
 	let subtaskList = $state<Task[]>([]);
 	let agentList = $state<Agent[]>([]);
 	let allTasks = $state<Task[]>([]);
+	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
 	let loading = $state(true);
 	let editing = $state(false);
@@ -119,6 +120,7 @@
 	let followLatest = $state(true);
 	let showJumpToLatest = $state(false);
 	let lastTranscriptScrollTop = 0;
+	let lastWorkspaceGitRefresh = 0;
 
 	$effect(() => {
 		if (messageDraftReady) saveComposerDraft(messageDraftScope(), messageInput);
@@ -624,10 +626,16 @@
 			prevMessageCount = messages.length;
 			lastActivityEventId = activityEvents.at(-1)?.id ?? 0;
 			if (loadedTask.agent_id) {
-				sessionEvents = await sessions.events(loadedTask.agent_id).catch(() => []);
+				const [events, git] = await Promise.all([
+					sessions.events(loadedTask.agent_id).catch(() => []),
+					workspaces.gitStatus(loadedTask.agent_id).catch(() => null),
+				]);
+				sessionEvents = events;
+				workspaceGit = git;
+				lastWorkspaceGitRefresh = Date.now();
 				refreshHarnessControls(sessionEvents, loadedTask.agent_id);
 			} else {
-				sessionEvents = []; configOptions = []; availableCommands = [];
+				sessionEvents = []; configOptions = []; availableCommands = []; workspaceGit = null;
 			}
 			try {
 				const sub = await tasks.subtasks(id);
@@ -679,6 +687,10 @@
 				if (latestSessionEvents.length !== sessionEvents.length || latestSessionEvents.at(-1)?.id !== sessionEvents.at(-1)?.id) {
 					sessionEvents = latestSessionEvents;
 					refreshHarnessControls(sessionEvents, newTask.agent_id);
+				}
+				if (Date.now() - lastWorkspaceGitRefresh >= 10_000) {
+					workspaceGit = await workspaces.gitStatus(newTask.agent_id).catch(() => workspaceGit);
+					lastWorkspaceGitRefresh = Date.now();
 				}
 			}
 			if (shouldScroll) scrollToBottom();
@@ -942,6 +954,20 @@
 
 	function taskLabel(id: string): string {
 		return allTasks.find((candidate) => candidate.id === id)?.title ?? id;
+	}
+
+	function changedFileStatus(change: GitChange): string {
+		if (change.status === '??') return 'U';
+		if (change.status.includes('R')) return 'R';
+		if (change.status.includes('A')) return 'A';
+		if (change.status.includes('D')) return 'D';
+		if (change.status.includes('C')) return 'C';
+		return 'M';
+	}
+
+	function workspaceFileUrl(agentId: string, path?: string): string {
+		const base = `/agents/${encodeURIComponent(agentId)}?tab=files`;
+		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
 	function startsFreshConversation(): boolean {
@@ -1553,6 +1579,38 @@
 							<span class="text-foreground">{formatTokens(contextUsage.used)}</span>
 							<span> / {formatTokens(contextUsage.size)} tokens</span>
 						</div>
+					</div>
+				{/if}
+
+				{#if task.agent_id && workspaceGit}
+					<div class="space-y-2" data-task-changed-files>
+						<div class="flex items-center justify-between gap-2">
+							<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Changed files</h3>
+							<a href={workspaceFileUrl(task.agent_id)} class="text-[11px] text-muted-foreground hover:text-foreground">Open files</a>
+						</div>
+						{#if workspaceGit.repository && workspaceGit.files.length > 0}
+							<div class="space-y-0.5">
+								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
+									<a
+										href={workspaceFileUrl(task.agent_id, change.path)}
+										title={change.path}
+										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+									>
+										<span class="w-3 shrink-0 font-mono text-[10px] text-amber-500">{changedFileStatus(change)}</span>
+										<span class="truncate">{change.path}</span>
+									</a>
+								{/each}
+								{#if workspaceGit.files.length > 12}
+									<a href={workspaceFileUrl(task.agent_id)} class="block px-1.5 pt-1 text-[11px] text-muted-foreground hover:text-foreground">
+										+{workspaceGit.files.length - 12} more
+									</a>
+								{/if}
+							</div>
+						{:else if workspaceGit.repository}
+							<p class="text-xs text-muted-foreground">Working tree clean</p>
+						{:else}
+							<p class="text-xs text-muted-foreground">Not a Git repository</p>
+						{/if}
 					</div>
 				{/if}
 
