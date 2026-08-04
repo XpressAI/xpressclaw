@@ -68,6 +68,7 @@ async function mockApi(
 	options: {
 		live?: boolean;
 		agentTimeline?: boolean;
+		agentResponseLinks?: boolean;
 		richToolActivity?: boolean;
 		postedMessages?: Record<string, unknown>[];
 		interruptedAttempts?: string[];
@@ -132,6 +133,18 @@ async function mockApi(
 	let createdWorkflow: Record<string, unknown> | null = null;
 	const status = options.live ? 'in_progress' : 'completed';
 	const attemptStatus = options.live ? 'running' : 'completed';
+	const firstAnswer = options.agentResponseLinks
+		? 'First answer with [agent docs](https://example.com/agent-docs).'
+		: 'First answer';
+	const userFollowUp = options.agentResponseLinks
+		? 'Please continue using [my reference](https://example.com/user-reference).'
+		: 'Please continue';
+	const secondAnswer = options.agentResponseLinks
+		? 'Second answer with <a href="https://example.com/raw-agent-link" target="_self" rel="opener">a raw agent link</a>.'
+		: 'Second answer';
+	const firstAgentUpdate = options.agentResponseLinks
+		? "Yes, I'll inspect the project.\n\nI'm starting with the [timeline component](https://example.com/timeline) so this update remains readable even when it spans multiple lines."
+		: "Yes, I'll inspect the project.\n\nI'm starting with the timeline component so this update remains readable even when it spans multiple lines.";
 	const task = {
 		id: taskId,
 		title: options.taskTitle ?? 'Browser-tested workspace',
@@ -378,9 +391,9 @@ async function mockApi(
 				};
 			} else {
 				response = [
-					{ id: 1, task_id: taskId, role: 'assistant', content: 'First answer', attachments: [], timestamp: timestamp(25) },
-					{ id: 2, task_id: taskId, role: 'user', content: 'Please continue', attachments: [], timestamp: timestamp(40) },
-					{ id: 3, task_id: taskId, role: 'assistant', content: 'Second answer', attachments: [], timestamp: timestamp(55) },
+					{ id: 1, task_id: taskId, role: 'assistant', content: firstAnswer, attachments: [], timestamp: timestamp(25) },
+					{ id: 2, task_id: taskId, role: 'user', content: userFollowUp, attachments: [], timestamp: timestamp(40) },
+					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
 				];
 			}
 		} else if (path === `/api/tasks/${taskId}/activity`) {
@@ -388,10 +401,10 @@ async function mockApi(
 				response = {
 					attempts: [attempt(attemptStatus)],
 					events: [
-						timelineEvent(1, 10, 'runner_progress', "Yes, I'll inspect the project.\n\nI'm starting with the timeline component so this update remains readable even when it spans multiple lines.", { item_type: 'agent_message', message_id: 'status-1' }),
+						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
 						timelineEvent(3, 20, 'runner_progress', 'Tests are running.\n\nI’m checking the timeline in both light and dark themes before I wrap up.', { item_type: 'agent_message', message_id: 'status-2' }),
-						timelineEvent(4, 24, 'runner_progress', 'First answer', { item_type: 'agent_message', message_id: 'final-1' }),
+						timelineEvent(4, 24, 'runner_progress', firstAnswer, { item_type: 'agent_message', message_id: 'final-1' }),
 					],
 					has_more_before: false,
 					has_more_after: false,
@@ -595,6 +608,24 @@ test('agent updates stay beside their tools while the final reply is shown once'
 	expect(toolIndex).toBeLessThan(testIndex);
 	expect(finalIndexes).toHaveLength(1);
 	expect(testIndex).toBeLessThan(finalIndexes[0]);
+});
+
+test('links in agent responses open in new windows without changing user links', async ({ page }) => {
+	await mockApi(page, { agentTimeline: true, agentResponseLinks: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const responseLinks = transcript.locator('[data-message-role="assistant"] a, [data-agent-update] a');
+	await expect(responseLinks).toHaveCount(3);
+	for (const link of await responseLinks.all()) {
+		await expect(link).toHaveAttribute('target', '_blank');
+		await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+	}
+
+	const userLink = transcript.locator('[data-message-role="user"] a', { hasText: 'my reference' });
+	await expect(userLink).toBeVisible();
+	await expect(userLink).not.toHaveAttribute('target', '_blank');
+	await expect(userLink).not.toHaveAttribute('rel', /noopener|noreferrer/);
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {

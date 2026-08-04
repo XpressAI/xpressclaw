@@ -3,11 +3,25 @@ import DOMPurify from 'dompurify';
 
 marked.setOptions({ breaks: true, gfm: true });
 
+interface RenderContentOptions {
+	openLinksInNewWindow?: boolean;
+}
+
+function openLinksInNewWindow(html: string): string {
+	const template = document.createElement('template');
+	template.innerHTML = html;
+	for (const link of template.content.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+		link.target = '_blank';
+		link.rel = 'noopener noreferrer';
+	}
+	return template.innerHTML;
+}
+
 /**
  * Render agent message content to safe HTML.
  * Handles <think> blocks, <tool_call> blocks, @mentions, and markdown.
  */
-export function renderContent(content: string): string {
+export function renderContent(content: string, options: RenderContentOptions = {}): string {
 	let result = content;
 
 	// Extract <think>...</think> blocks (complete)
@@ -73,5 +87,5 @@ export function renderContent(content: string): string {
 		);
 	}
 
-	return result;
+	return options.openLinksInNewWindow ? openLinksInNewWindow(result) : result;
 }

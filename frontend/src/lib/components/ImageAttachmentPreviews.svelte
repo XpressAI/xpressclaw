@@ -20,7 +20,7 @@
 	<div class="flex flex-wrap gap-2 {message ? 'mt-2' : 'px-4 pb-2'}" data-image-attachments>
 		{#each attachments as attachment, index (attachment.id ?? `${attachment.name}-${index}`)}
 			<div class="group relative overflow-hidden rounded-lg border border-border/70 bg-background/50">
-				<a href={attachment.src} target="_blank" rel="noreferrer" aria-label="Open {attachment.name || `image ${index + 1}`}" class="block">
+				<a href={attachment.src} target="_blank" rel="noopener noreferrer" aria-label="Open {attachment.name || `image ${index + 1}`}" class="block">
 					<img
 						src={attachment.src}
 						alt={attachment.name || `Attached image ${index + 1}`}
