@@ -1142,7 +1142,7 @@
 											{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
 											 isAssistant ? 'bg-accent text-accent-foreground' :
 											 'bg-primary text-primary-foreground'}">
-											{@html renderContent(item.content)}
+											{@html renderContent(item.content, { openLinksInNewWindow: isAssistant })}
 											<ImageAttachmentPreviews attachments={item.attachments} message />
 										</div>
 										</div>
@@ -1173,7 +1173,7 @@
 								<span class="h-2 w-2 rounded-full bg-emerald-400"></span>
 								Result
 							</div>
-							<div class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult)}</div>
+							<div class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true })}</div>
 						</section>
 					{:else if latestError}
 						<section class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">

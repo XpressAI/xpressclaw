@@ -143,7 +143,7 @@
 			</div>
 			<div class="rounded-lg border border-primary/15 bg-accent/35 px-3 py-2 text-sm text-foreground shadow-sm" data-agent-update-content>
 				<div class="prose-chat max-w-none break-words">
-					{@html renderContent(event.summary)}
+					{@html renderContent(event.summary, { openLinksInNewWindow: true })}
 				</div>
 			</div>
 		</div>
@@ -175,7 +175,7 @@
 			<div class="mb-1 ml-[5.25rem] mr-2 border-l border-border/40 py-1.5 pl-3 text-xs sm:ml-[6rem]">
 				{#if richText}
 					<div class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
-						{@html renderContent(event.summary)}
+						{@html renderContent(event.summary, { openLinksInNewWindow: true })}
 					</div>
 				{:else if !isTool}
 					<div class="whitespace-pre-wrap text-foreground/75">{event.summary}</div>
