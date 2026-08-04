@@ -46,11 +46,11 @@ not a persona, role, or Xpressclaw-authored system prompt.
 
 ## 4. Send work
 
-Describe an outcome for the agent. Xpressclaw queues it, starts an ACP server
-inside the agent's retained project container, sends `session/prompt`, and
-writes standard progress, plans, tool activity, and results back to the durable
-timeline. The ACP process stops after the turn, while installed tools, caches,
-`/home/node`, and `/tmp` remain available to later turns.
+Describe an outcome for the agent. Xpressclaw queues it, lazily starts and
+initializes an ACP server inside the agent's retained project container, sends
+`session/prompt`, and writes standard progress, plans, tool activity, and
+results back to the durable timeline. Later turns reuse that process and its
+live ACP sessions along with installed tools, caches, `/home/node`, and `/tmp`.
 
 ## 5. Automate work
 

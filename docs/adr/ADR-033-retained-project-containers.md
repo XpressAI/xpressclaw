@@ -1,4 +1,4 @@
-# ADR-033: Retained Project Containers
+# ADR-033: Retained Project Runtimes
 
 ## Status
 
@@ -14,23 +14,30 @@ turn. Agents repeatedly rediscovered and rebuilt the same environment, which
 wasted time and model context and made follow-up turns observe a different
 machine from the one they had just configured.
 
-ACP processes should remain bounded to a turn, but process lifetime and
-development-environment lifetime do not need to be the same.
+Restarting only the ACP process still repeats its handshake, adapter startup,
+authentication discovery, MCP startup, and in-memory session setup. ACP is a
+multi-turn protocol, so those costs are not an inherent turn boundary.
 
 ## Decision
 
 Each configured project agent owns one retained container named
 `xpressclaw-<agent-id>`. It is allocated lazily by the first task. XpressClaw
-starts the ACP command and attaches it for a turn, then stops the container
-without removing it. The next turn restarts the same container, preserving its
-writable layer, including `/home/node` and `/tmp`, while still establishing a
-fresh ACP transport and resuming or forking the durable ACP session normally.
+starts and initializes the ACP command once, then keeps that process and its
+stdio connection alive across ordinary turns. The same process may own several
+ACP sessions: a follow-up uses its already-live task session, while new work
+creates or forks a session through the same connection. The container's
+writable layer, including `/home/node` and `/tmp`, remains available throughout.
+
+ACP session identifiers are persisted before each prompt is dispatched. If the
+process or control plane crashes, the next task restarts the retained container
+and resumes or loads the persisted session. A hard cancellation, runner
+configuration or image change, project deletion, and control-plane shutdown are
+also explicit process boundaries. Normal successful turns are not.
 
 Project queue dispatch remains serialized. A running queue row is also the
-lease on the shared container, including the short cancellation interval after
-an attempt becomes terminal but before its process has stopped. This prevents
-a new turn from restarting the environment immediately before an older
-cancellation path stops it.
+lease on the shared process, including the short cancellation interval after an
+attempt becomes terminal but before a hard stop has completed. This prevents a
+new turn from entering a process that an older cancellation path is stopping.
 
 Retained containers carry lifecycle and runner-specification labels. The
 specification fingerprint covers the image reference, command, environment,
@@ -39,10 +46,10 @@ recreates the container when that fingerprint changes or its image no longer
 matches the current local image. The fingerprint is SHA-256 so secrets in the
 environment are not written directly to container labels or logs.
 
-Configured startup commands initialize a retained environment once. A marker
-is written only after every command succeeds; a failed initialization is
-retried on the next start. Changing a startup command changes the container
-specification and therefore creates a clean environment.
+Configured startup commands initialize a retained environment once. A marker is
+written only after every command succeeds; a failed initialization is retried
+on the next process start. Changing a startup command changes the container
+specification and therefore creates a clean environment and process.
 
 Control-plane shutdown and startup stop configured project containers but
 retain them. Deleting a project agent removes its container and writable
@@ -51,15 +58,16 @@ or pre-ADR-025 layouts are removed during startup cleanup.
 
 ## Consequences
 
-- Follow-up turns see tools, caches, and files installed outside the mounted
-  workspace instead of rebuilding them.
-- Idle projects consume disk but no CPU or memory. Docker/Podman administrators
-  can still inspect the stopped containers directly.
+- Follow-up turns reuse the initialized ACP adapter, MCP processes, live
+  sessions, tools, caches, and files instead of rebuilding them.
+- An initialized idle project consumes the runner process's baseline memory in
+  addition to disk. It should consume negligible CPU while waiting on stdio.
+  Projects that have never run a task allocate no container.
 - Updating runner mounts, credentials, environment, image, or command creates
   a clean container. Workspace and explicitly mounted host or named-volume
   data remain governed by those mounts.
 - Project deletion is destructive for unmounted container state. The existing
   deletion confirmation is therefore the user-visible cleanup boundary.
-- ACP sessions remain durable independently of the container. A retained
-  container improves environment continuity; it does not replace ACP
-  `session/resume`, `session/load`, or `session/fork`.
+- ACP sessions remain durable independently of the live process. Persistence
+  and `session/resume`, `session/load`, or `session/fork` provide recovery after
+  the unavoidable restart boundaries above.

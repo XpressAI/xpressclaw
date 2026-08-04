@@ -43,8 +43,9 @@ the runner supports it. The project remains writable while work is queued or
 running. Future connector messages must use the same path once that runtime is
 restored.
 
-The native conversation is resumed across restarts of the ACP process in the
-retained project container. A task can explicitly request a fresh conversation.
+The native conversation remains live in the retained project ACP process and is
+resumed from its persisted identifier after unavoidable process restarts. A
+task can explicitly request a fresh conversation.
 A dependent task branches from the native conversation of its prerequisite
 when that prerequisite used the same project and runner. A follow-up message on
 the currently active task resumes its branch. Reopening an older task forks
@@ -76,7 +77,7 @@ is deliberately excluded from the primary artifact view.
 
 ### Native products own the agent loop
 
-The durable task queue is consumed by turn-scoped native CLI processes. The
+The durable task queue is consumed by project-scoped native ACP processes. The
 initial adapters are:
 
 - Codex via `codex exec --json`;
@@ -207,8 +208,8 @@ would belong to the workflow runtime rather than the ACP client.
 - Users can choose the native agent product that best fits each workflow step.
 - The project differentiates on orchestration, isolation, devices, and UX
   instead of maintaining another agent framework.
-- Session history remains coherent across turn-scoped native processes and
-  retained project environments.
+- Session history remains coherent in a live project process and across its
+  unavoidable restarts.
 - Schedules, task dependencies, and workflows share one dispatch path and one
   audit model. Future connector sources must enter through that same path.
 - The UI can be designed around intent, progress, evidence, and decisions
@@ -222,7 +223,7 @@ would belong to the workflow runtime rather than the ACP client.
   message can be queued behind current work even though the session UI remains
   responsive.
 - Commands and control changes selected while a native turn is already running
-  apply to the next turn because ACP processes and connections are turn-scoped.
+  apply to the next turn through the retained ACP connection.
 - Existing conversation and legacy harness code remains temporarily for data
   compatibility, but it is no longer the server's task execution path. It can
   be deleted after configuration and CLI migration are complete.

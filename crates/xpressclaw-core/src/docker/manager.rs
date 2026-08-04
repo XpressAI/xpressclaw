@@ -357,6 +357,29 @@ impl DockerManager {
         }
     }
 
+    /// Whether a retained project container still represents the requested
+    /// runner specification and the image currently available under its tag.
+    pub async fn project_container_matches(
+        &self,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> bool {
+        let Ok(fingerprint) = container_spec_fingerprint(spec) else {
+            return false;
+        };
+        let container_name = format!("xpressclaw-{agent_id}");
+        let labels_match = self
+            .inspect_by_name(&container_name)
+            .await
+            .and_then(|container| container.config)
+            .and_then(|config| config.labels)
+            .is_some_and(|labels| project_labels_match(&labels, &fingerprint));
+        labels_match
+            && self
+                .container_image_matches(&container_name, &spec.image)
+                .await
+    }
+
     async fn create_and_start(
         &self,
         agent_id: &str,
@@ -1059,7 +1082,7 @@ fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
     }
 }
 
-fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
+pub(crate) fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| {
         Error::Container(format!(
             "failed to fingerprint project container specification: {error}"

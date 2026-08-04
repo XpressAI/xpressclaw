@@ -46,7 +46,7 @@ Codex, Claude Code, and OpenCode already supply excellent agent loops. xpresscla
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
 - **Automation-first** — Queue tasks, run recurring schedules, and express implementation/review loops as workflows.
-- **Isolated and continuous** — Every agent has a Docker/Podman environment that is stopped while idle and retained between turns.
+- **Isolated and continuous** — Every agent reuses one initialized Docker/Podman environment and ACP process across turns.
 - **Container-aware workspaces** — Opt trusted agents into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
 
 ## Features
@@ -74,7 +74,7 @@ development and test workflows can explicitly enable trusted host-engine access.
 
 ### Privacy & Safety
 
-- **Project isolation** — each agent runs in its own retained container, stopped while idle
+- **Project isolation** — each agent runs in its own retained container and long-lived ACP process
 - **Explicit resources** — workers receive the configured workspace and volume mounts
 - **Visible provenance** — every queued request records whether it came from a person, schedule, task, or workflow
 - **Local control data** — timelines and task state remain local; agent traffic follows the selected provider's terms

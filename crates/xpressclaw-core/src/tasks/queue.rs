@@ -208,8 +208,8 @@ impl TaskQueue {
 
     /// Claim the oldest queued item across all logical sessions.
     ///
-    /// Native runners are short-lived workers, so dispatch is no longer tied
-    /// to a long-running per-agent harness process.
+    /// Dispatch is serialized per project even though several retained ACP
+    /// project processes may run concurrently.
     pub fn claim_next(&self) -> Result<Option<QueueItem>> {
         self.db
             .with_conn(|conn| {
@@ -239,7 +239,12 @@ impl TaskQueue {
                                  ON active_owner.id = active_dispatch.attempt_id
                                WHERE active_dispatch.agent_id = q.agent_id
                                  AND active_dispatch.status = 'running'
-                                 AND active_owner.container_id IS NOT NULL
+                                 AND (
+                                     active_owner.status NOT IN (
+                                         'completed', 'failed', 'cancelled', 'interrupted'
+                                     )
+                                     OR active_owner.container_id IS NOT NULL
+                                 )
                            )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
                         [],
@@ -730,6 +735,32 @@ mod tests {
             .clear_container(claimed.attempt_id.as_deref().unwrap())
             .unwrap();
         assert_eq!(queue.claim_next().unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn claimed_dispatch_serializes_project_before_container_startup() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db);
+        for title in ["First turn", "Second turn"] {
+            let task = board
+                .create(&CreateTask {
+                    title: title.into(),
+                    description: None,
+                    agent_id: Some("atlas".into()),
+                    parent_task_id: None,
+                    sop_id: None,
+                    conversation_id: None,
+                    priority: None,
+                    context: None,
+                })
+                .unwrap();
+            queue.enqueue(&task.id, "atlas").unwrap();
+        }
+
+        // The first claim changes the dispatch row before its worker has time
+        // to transition the attempt or attach the shared project container.
+        assert!(queue.claim_next().unwrap().is_some());
+        assert!(queue.claim_next().unwrap().is_none());
     }
 
     #[test]

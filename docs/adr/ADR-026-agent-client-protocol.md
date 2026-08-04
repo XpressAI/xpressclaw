@@ -44,29 +44,29 @@ flag. An invalid value fails with the choices reported by that agent.
 
 ### Session lifecycle
 
-> **Updated by ADR-033:** ACP processes are still bounded to one turn, but the
-> project-owned container is now stopped and retained between attempts instead
-> of being removed.
+> **Updated by ADR-033:** Each project now retains its initialized ACP process
+> and connection as well as its container across ordinary turns.
 
-Each work attempt starts a short-lived, attached ACP process in the project's
-container. Xpressclaw performs the ACP handshake, then creates a session for
-fresh work, resumes the current task's branch, or uses `session/fork` to branch
-an older task, dependency, or the project's active context. Forking is
-capability-gated because it is an unstable ACP extension. If unavailable or
-rejected, XpressClaw continues the selected source with `session/resume` when
-advertised and `session/load` otherwise. The returned ACP session ID is stored
-on the attempt and selected using the precedence from ADR-025: earlier turn on
-the same task, dependency, explicit fresh conversation, then the project's
-latest conversation.
+The first work attempt starts and initializes an attached ACP process in the
+project's container. Later attempts are serialized through that connection.
+Xpressclaw creates a session for fresh work, continues an already-live task
+session, or uses `session/fork` to branch an older task, dependency, or the
+project's active context. Forking is capability-gated because it is an unstable
+ACP extension. If unavailable or rejected, XpressClaw continues the selected
+source with `session/resume` when advertised and `session/load` otherwise. The
+returned ACP session ID is stored on the attempt and selected using the
+precedence from ADR-025: earlier turn on the same task, dependency, explicit
+fresh conversation, then the project's latest conversation.
 
 Attempts created before task branches were introduced can share one mutable
 ACP session ID, so their exact historical context cannot be reconstructed.
 Reopening one still forks the shared session's current tip to isolate future
 turns on that task.
 
-The ACP process remains disposable. Session durability belongs to the agent's
-data and the ACP session identifier; ADR-033 separately retains the project
-container's writable layer for development-environment continuity.
+Session durability still belongs to the agent's data and persisted ACP session
+identifier. The long-lived process is an optimization and continuity feature;
+after a crash, hard cancellation, reconfiguration, or control-plane restart,
+Xpressclaw starts a new process and resumes the durable session.
 
 ### Events and tasks
 
@@ -133,9 +133,8 @@ templates.
 ### Negative
 
 - Products without native ACP support require an adapter.
-- The control plane must keep a bidirectional container attachment open for a
-  turn instead of consuming one-way logs after process exit. Structured
-  questions extend that lifetime until the user answers or cancels.
+- The control plane must supervise a bidirectional container attachment for the
+  project's lifetime instead of consuming one-way logs after process exit.
 - Session continuation depends on the server implementing `session/resume` or
   `session/load` and retaining the referenced session state.
 - Automatically approving permissions is suitable only for trusted images and

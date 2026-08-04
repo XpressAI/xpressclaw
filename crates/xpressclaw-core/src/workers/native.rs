@@ -1,8 +1,9 @@
 //! Dispatcher and adapters for native coding-agent CLIs running in retained
 //! project environments.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
@@ -11,7 +12,7 @@ use agent_client_protocol::schema::v1::{
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::acp::{agent_definition, local_runner_image};
@@ -22,14 +23,16 @@ use crate::config::{
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
-use crate::docker::manager::{ContainerSpec, DockerManager, VolumeMount};
+use crate::docker::manager::{
+    container_spec_fingerprint, ContainerSpec, DockerManager, VolumeMount,
+};
 use crate::error::{Error, Result};
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
 use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::workers::acp::{
-    run_turn, AcpElicitationBroker, AcpEventRecorder, AcpSessionStart, AcpTurnControlBroker,
+    AcpElicitationBroker, AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnControlBroker,
     AcpTurnOptions, AcpTurnRuntime,
 };
 use crate::workers::github;
@@ -48,12 +51,98 @@ struct NativeAttemptRuntime {
     event_bus: Arc<ConversationEventBus>,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    processes: Arc<ProjectAcpProcesses>,
     control_plane_port: u16,
 }
 
+#[derive(Clone)]
+struct ProjectAcpProcess {
+    fingerprint: String,
+    container_id: String,
+    process: AcpProcess,
+}
+
+#[derive(Default)]
+struct ProjectAcpProcesses {
+    slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ProjectAcpProcess>>>>>,
+}
+
+impl ProjectAcpProcesses {
+    fn slot(&self, agent_id: &str) -> Arc<AsyncMutex<Option<ProjectAcpProcess>>> {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+            .clone()
+    }
+
+    async fn get_or_start(
+        &self,
+        docker: &DockerManager,
+        agent_id: &str,
+        spec: &ContainerSpec,
+    ) -> Result<ProjectAcpProcess> {
+        let fingerprint = container_spec_fingerprint(spec)?;
+        let slot = self.slot(agent_id);
+        let mut entry = slot.lock().await;
+        let reusable = if let Some(current) = entry.as_ref() {
+            current.fingerprint == fingerprint
+                && current.process.is_alive()
+                && docker.is_running(agent_id).await
+                && docker.project_container_matches(agent_id, spec).await
+        } else {
+            false
+        };
+        if reusable {
+            return Ok(entry.as_ref().unwrap().clone());
+        }
+
+        let previous = entry.take();
+        docker.stop_preserving(agent_id).await?;
+        if let Some(previous) = previous {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                previous.process.wait_for_exit(),
+            )
+            .await;
+        }
+        let attached = docker.launch_project_attached(agent_id, spec).await?;
+        let container_id = attached.info.container_id.clone();
+        let process = match AcpProcess::start(attached).await {
+            Ok(process) => process,
+            Err(error) => {
+                let _ = docker.stop_preserving(agent_id).await;
+                return Err(error);
+            }
+        };
+        let started = ProjectAcpProcess {
+            fingerprint,
+            container_id,
+            process,
+        };
+        *entry = Some(started.clone());
+        Ok(started)
+    }
+
+    async fn invalidate(&self, agent_id: &str, process: &AcpProcess) -> bool {
+        let slot = self.slot(agent_id);
+        let mut entry = slot.lock().await;
+        if entry
+            .as_ref()
+            .is_some_and(|current| current.process.same_process(process))
+        {
+            entry.take();
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Consume the durable task queue as an Agent Client Protocol client. Each
-/// project gets one retained container whose ACP process is restarted for a
-/// turn while its writable filesystem survives between turns.
+/// project gets one retained container and initialized ACP process that are
+/// reused across ordinary prompt turns.
 pub async fn start_dispatcher(
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
@@ -65,6 +154,7 @@ pub async fn start_dispatcher(
 ) {
     info!("native attempt dispatcher started");
     let concurrency = Arc::new(Semaphore::new(4));
+    let processes = Arc::new(ProjectAcpProcesses::default());
     let mut docker = initial_docker;
 
     loop {
@@ -96,6 +186,7 @@ pub async fn start_dispatcher(
                 let event_bus = event_bus.clone();
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
+                let processes = processes.clone();
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
                 }
@@ -109,6 +200,7 @@ pub async fn start_dispatcher(
                             event_bus: event_bus.clone(),
                             elicitation_broker,
                             turn_controls: turn_controls.clone(),
+                            processes,
                             control_plane_port,
                         },
                         item.clone(),
@@ -149,6 +241,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         event_bus,
         elicitation_broker,
         turn_controls,
+        processes,
         control_plane_port,
     } = runtime;
     let attempt_id = item
@@ -286,8 +379,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         }
     }
     let workload_id = agent.name.as_str();
-    let attached = docker.launch_project_attached(workload_id, &spec).await?;
-    if let Err(error) = sessions.set_container(attempt_id, &attached.info.container_id) {
+    let live = processes.get_or_start(&docker, workload_id, &spec).await?;
+    if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
+        processes.invalidate(workload_id, &live.process).await;
         let _ = docker.stop_preserving(workload_id).await;
         return Err(error);
     }
@@ -300,6 +394,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     ) {
         Ok(running) => running,
         Err(error) => {
+            processes.invalidate(workload_id, &live.process).await;
             if docker.stop_preserving(workload_id).await.is_ok() {
                 let _ = sessions.clear_container(attempt_id);
             }
@@ -307,6 +402,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         }
     };
     if attempt_is_terminal(&running.status) {
+        processes.invalidate(workload_id, &live.process).await;
         if docker.stop_preserving(workload_id).await.is_ok() {
             let _ = sessions.clear_container(attempt_id);
         }
@@ -321,21 +417,26 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         item.task_id.clone(),
         kind.clone(),
     );
-    let turn = run_turn(
-        attached,
-        AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls),
-        session_start,
-        Path::new(&container_workspace),
-        &prompt.content,
-        AcpTurnOptions {
-            model: agent.runner.model.clone(),
-            session_config: requested_session_config,
-            mcp_servers,
-            image_attachments: prompt.attachments,
-        },
-    )
-    .await;
-    docker.stop_preserving(workload_id).await?;
+    let turn = live
+        .process
+        .run_turn(
+            AcpTurnRuntime::new(recorder, elicitation_broker, turn_controls),
+            session_start,
+            Path::new(&container_workspace),
+            &prompt.content,
+            AcpTurnOptions {
+                model: agent.runner.model.clone(),
+                session_config: requested_session_config,
+                mcp_servers,
+                image_attachments: prompt.attachments,
+            },
+        )
+        .await;
+    if turn.is_err() {
+        if processes.invalidate(workload_id, &live.process).await {
+            docker.stop_preserving(workload_id).await?;
+        }
+    }
     sessions.clear_container(attempt_id)?;
     let turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
