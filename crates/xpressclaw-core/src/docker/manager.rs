@@ -1168,6 +1168,7 @@ fn project_container_name(installation_id: &str, agent_id: &str) -> String {
     digest.update(installation_id.as_bytes());
     digest.update([0]);
     digest.update(agent_id.as_bytes());
+    let digest = digest.finalize();
     format!("xpressclaw-project-{digest:x}")
 }
 
