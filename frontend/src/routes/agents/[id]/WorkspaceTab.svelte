@@ -16,16 +16,21 @@
 	let rawVolumes = $derived(agentConfig?.volumes ?? []);
 
 	function volumeParts(volume: string): { host: string; container: string } {
-		const separator = volume.indexOf(':');
+		const lastSeparator = volume.lastIndexOf(':');
+		const suffix = lastSeparator >= 0 ? volume.slice(lastSeparator + 1) : '';
+		const mount = /^(?:ro|rw|z|Z)(?:,(?:ro|rw|z|Z))*$/.test(suffix)
+			? volume.slice(0, lastSeparator)
+			: volume;
+		const separator = mount.lastIndexOf(':');
 		if (separator < 0) return { host: volume, container: '' };
-		return { host: volume.slice(0, separator), container: volume.slice(separator + 1) };
+		return { host: mount.slice(0, separator), container: mount.slice(separator + 1) };
 	}
 
 	async function addVolume() {
 		const path = newVolumePath.trim();
 		if (!path || saving) return;
 		const basename = path.split(/[\\/]/).filter(Boolean).pop() || 'resource';
-		await saveVolumes([...rawVolumes, `${path}:/workspace/resources/${basename}`]);
+		await saveVolumes([...rawVolumes, `${path}:/workspace/resources/${basename}:z`]);
 		newVolumePath = '';
 	}
 

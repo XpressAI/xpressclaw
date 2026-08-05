@@ -55,6 +55,75 @@ pub struct VolumeMount {
     pub source: String,
     pub target: String,
     pub read_only: bool,
+    /// Optional SELinux relabeling for host bind mounts. Named volumes ignore
+    /// this setting. Shared labels are appropriate for workspaces and login
+    /// directories that may be mounted by more than one retained agent.
+    #[serde(default)]
+    pub selinux_relabel: SelinuxRelabel,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelinuxRelabel {
+    #[default]
+    None,
+    Shared,
+    Private,
+}
+
+impl VolumeMount {
+    /// Parse Docker-style `source:target[:options]` syntax. Supported options
+    /// are `ro`, `rw`, `z` (shared SELinux label), and `Z` (private label).
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (source_or_target, target_or_options) = raw.rsplit_once(':')?;
+        let parsed_options = parse_mount_options(target_or_options);
+        let (source, target, read_only, selinux_relabel) =
+            if let Some((read_only, selinux_relabel)) = parsed_options {
+                let (source, target) = source_or_target.rsplit_once(':')?;
+                (source, target, read_only, selinux_relabel)
+            } else {
+                (
+                    source_or_target,
+                    target_or_options,
+                    false,
+                    SelinuxRelabel::None,
+                )
+            };
+        Some(Self {
+            source: source.to_string(),
+            target: target.to_string(),
+            read_only,
+            selinux_relabel,
+        })
+    }
+}
+
+fn parse_mount_options(options: &str) -> Option<(bool, SelinuxRelabel)> {
+    let mut read_only = false;
+    let mut selinux_relabel = SelinuxRelabel::None;
+    let mut recognized = false;
+    for option in options.split(',') {
+        match option.trim() {
+            "ro" => {
+                read_only = true;
+                recognized = true;
+            }
+            "rw" => {
+                read_only = false;
+                recognized = true;
+            }
+            "z" => {
+                selinux_relabel = SelinuxRelabel::Shared;
+                recognized = true;
+            }
+            "Z" => {
+                selinux_relabel = SelinuxRelabel::Private;
+                recognized = true;
+            }
+            _ => return None,
+        }
+    }
+    recognized.then_some((read_only, selinux_relabel))
 }
 
 impl Default for ContainerSpec {
@@ -115,6 +184,7 @@ pub struct DockerManager {
     socket_path: Option<PathBuf>,
     runtime: &'static str,
     runtime_version: Option<String>,
+    selinux: bool,
     installation_id: Option<String>,
 }
 
@@ -186,17 +256,20 @@ impl DockerManager {
         let version = docker.version().await.ok();
         let runtime = runtime_from_version(version.as_ref());
         let runtime_version = version.and_then(|version| version.version);
-        let rootless = docker
+        let security_options = docker
             .info()
             .await
             .ok()
             .and_then(|info| info.security_options)
-            .is_some_and(|options| options.iter().any(|option| option.contains("rootless")));
+            .unwrap_or_default();
+        let rootless = has_security_option(&security_options, "rootless");
+        let selinux = has_security_option(&security_options, "selinux");
         info!(
             socket = socket_path.as_ref().map(|path| path.display().to_string()),
             runtime,
             version = runtime_version.as_deref(),
             rootless,
+            selinux,
             "connected to container runtime"
         );
         Ok(Self {
@@ -205,6 +278,7 @@ impl DockerManager {
             socket_path,
             runtime,
             runtime_version,
+            selinux,
             installation_id: None,
         })
     }
@@ -458,30 +532,7 @@ impl DockerManager {
                 .insert(INSTALLATION_LABEL.to_string(), installation_id.to_string());
         }
 
-        // Build mounts — detect named volumes vs bind mounts
-        let mounts: Vec<Mount> = spec
-            .volumes
-            .iter()
-            .map(|v| {
-                // Docker volume names allow only [a-zA-Z0-9][a-zA-Z0-9_.-], so a separator,
-                // drive-letter colon (Windows C:\...), or leading ~ marks a host path → bind.
-                let is_named_volume = !v.source.contains('/')
-                    && !v.source.contains('\\')
-                    && !v.source.contains(':')
-                    && !v.source.starts_with('~');
-                Mount {
-                    target: Some(v.target.clone()),
-                    source: Some(v.source.clone()),
-                    typ: Some(if is_named_volume {
-                        MountTypeEnum::VOLUME
-                    } else {
-                        MountTypeEnum::BIND
-                    }),
-                    read_only: Some(v.read_only),
-                    ..Default::default()
-                }
-            })
-            .collect();
+        let runtime_mounts = runtime_mounts(&spec.volumes, self.selinux)?;
 
         // Build environment
         let mut env = spec.environment.clone();
@@ -508,10 +559,15 @@ impl DockerManager {
             group_add: socket_mount_groups(spec),
             extra_hosts: (self.runtime == "docker")
                 .then(|| vec!["host.docker.internal:host-gateway".to_string()]),
-            mounts: if mounts.is_empty() {
+            binds: if runtime_mounts.binds.is_empty() {
                 None
             } else {
-                Some(mounts)
+                Some(runtime_mounts.binds)
+            },
+            mounts: if runtime_mounts.mounts.is_empty() {
+                None
+            } else {
+                Some(runtime_mounts.mounts)
             },
             network_mode: spec.network_mode.clone(),
             port_bindings: if port_bindings.is_empty() {
@@ -1218,6 +1274,65 @@ fn runtime_from_version(version: Option<&bollard::system::Version>) -> &'static 
     }
 }
 
+fn has_security_option(options: &[String], expected: &str) -> bool {
+    options.iter().any(|option| {
+        option
+            .split(['=', ',', ':'])
+            .any(|part| part.eq_ignore_ascii_case(expected))
+    })
+}
+
+#[derive(Debug, Default)]
+struct RuntimeMounts {
+    mounts: Vec<Mount>,
+    binds: Vec<String>,
+}
+
+fn runtime_mounts(volumes: &[VolumeMount], selinux_enabled: bool) -> Result<RuntimeMounts> {
+    let mut result = RuntimeMounts::default();
+    for volume in volumes {
+        // Docker volume names allow only [a-zA-Z0-9][a-zA-Z0-9_.-], so a separator,
+        // drive-letter colon (Windows C:\...), or leading ~ marks a host path → bind.
+        let is_named_volume = !volume.source.contains('/')
+            && !volume.source.contains('\\')
+            && !volume.source.contains(':')
+            && !volume.source.starts_with('~');
+        let relabel = match volume.selinux_relabel {
+            SelinuxRelabel::Shared => Some("z"),
+            SelinuxRelabel::Private => Some("Z"),
+            SelinuxRelabel::None => None,
+        };
+        if selinux_enabled && !is_named_volume {
+            if let Some(relabel) = relabel {
+                if volume.source.contains(':') || volume.target.contains(':') {
+                    return Err(Error::Container(format!(
+                        "SELinux relabeling cannot represent a mount path containing ':' ({} -> {})",
+                        volume.source, volume.target
+                    )));
+                }
+                let access = if volume.read_only { "ro" } else { "rw" };
+                result.binds.push(format!(
+                    "{}:{}:{access},{relabel}",
+                    volume.source, volume.target
+                ));
+                continue;
+            }
+        }
+        result.mounts.push(Mount {
+            target: Some(volume.target.clone()),
+            source: Some(volume.source.clone()),
+            typ: Some(if is_named_volume {
+                MountTypeEnum::VOLUME
+            } else {
+                MountTypeEnum::BIND
+            }),
+            read_only: Some(volume.read_only),
+            ..Default::default()
+        });
+    }
+    Ok(result)
+}
+
 #[cfg(unix)]
 fn fallback_unix_sockets() -> Vec<PathBuf> {
     let mut sockets = Vec::new();
@@ -1409,6 +1524,71 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_runtime_selinux_security_option() {
+        assert!(has_security_option(
+            &["name=seccomp,profile=default".into(), "name=selinux".into()],
+            "selinux"
+        ));
+        assert!(has_security_option(&["NAME=ROOTLESS".into()], "rootless"));
+        assert!(!has_security_option(
+            &["name=seccomp,profile=default".into()],
+            "selinux"
+        ));
+    }
+
+    #[test]
+    fn parses_docker_mount_access_and_selinux_options() {
+        let shared = VolumeMount::parse("/srv/project:/workspace:ro,z").unwrap();
+        assert!(shared.read_only);
+        assert_eq!(shared.selinux_relabel, SelinuxRelabel::Shared);
+
+        let private = VolumeMount::parse("/srv/login:/home/node/.pi:rw,Z").unwrap();
+        assert!(!private.read_only);
+        assert_eq!(private.selinux_relabel, SelinuxRelabel::Private);
+
+        let ordinary = VolumeMount::parse("/srv/reference:/reference").unwrap();
+        assert!(!ordinary.read_only);
+        assert_eq!(ordinary.selinux_relabel, SelinuxRelabel::None);
+
+        let legacy: VolumeMount = serde_json::from_value(serde_json::json!({
+            "source": "/srv/legacy",
+            "target": "/legacy",
+            "read_only": false
+        }))
+        .unwrap();
+        assert_eq!(legacy.selinux_relabel, SelinuxRelabel::None);
+    }
+
+    #[test]
+    fn selinux_bind_mounts_use_relabel_options_without_touching_sockets() {
+        let volumes = vec![
+            VolumeMount::parse("/srv/project:/workspace:rw,z").unwrap(),
+            VolumeMount::parse("/home/user/.pi:/home/node/.pi:ro,z").unwrap(),
+            VolumeMount::parse("/run/user/1000/podman.sock:/var/run/docker.sock").unwrap(),
+            VolumeMount::parse("agent-cache:/cache:Z").unwrap(),
+        ];
+        let rendered = runtime_mounts(&volumes, true).unwrap();
+        assert_eq!(
+            rendered.binds,
+            vec![
+                "/srv/project:/workspace:rw,z",
+                "/home/user/.pi:/home/node/.pi:ro,z"
+            ]
+        );
+        assert_eq!(rendered.mounts.len(), 2);
+        assert_eq!(rendered.mounts[0].typ, Some(MountTypeEnum::BIND));
+        assert_eq!(
+            rendered.mounts[0].target.as_deref(),
+            Some("/var/run/docker.sock")
+        );
+        assert_eq!(rendered.mounts[1].typ, Some(MountTypeEnum::VOLUME));
+
+        let without_selinux = runtime_mounts(&volumes, false).unwrap();
+        assert!(without_selinux.binds.is_empty());
+        assert_eq!(without_selinux.mounts.len(), volumes.len());
+    }
+
+    #[test]
     fn socket_mounts_add_the_host_socket_group() {
         let source = std::env::temp_dir().join(format!(
             "xpressclaw-socket-group-test-{}",
@@ -1420,6 +1600,7 @@ mod tests {
             source: source.display().to_string(),
             target: "/var/run/docker.sock".to_string(),
             read_only: false,
+            selinux_relabel: SelinuxRelabel::None,
         });
         #[cfg(unix)]
         assert!(socket_mount_groups(&spec).is_some());

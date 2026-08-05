@@ -8,7 +8,7 @@ use crate::agents::state::AgentStatus;
 use crate::config::Config;
 use crate::db::Database;
 use crate::docker::images::build_container_spec;
-use crate::docker::manager::{DockerManager, VolumeMount};
+use crate::docker::manager::{DockerManager, SelinuxRelabel, VolumeMount};
 use crate::error::{Error, Result};
 use crate::tasks::board::TaskBoard;
 use crate::tasks::queue::TaskQueue;
@@ -125,6 +125,7 @@ impl Runtime {
             source: workspace,
             target: "/workspace".to_string(),
             read_only: false,
+            selinux_relabel: SelinuxRelabel::Shared,
         });
 
         // Mount the agent's documents directory into the container so files
@@ -136,6 +137,7 @@ impl Runtime {
             source: docs_dir.display().to_string(),
             target: "/workspace/Documents".to_string(),
             read_only: false,
+            selinux_relabel: SelinuxRelabel::Shared,
         });
         spec.environment
             .push("DOCUMENTS_DIR=/workspace/Documents".to_string());
@@ -336,6 +338,7 @@ mod tests {
             source: parts[0].to_string(),
             target: parts[1].to_string(),
             read_only,
+            selinux_relabel: crate::docker::manager::SelinuxRelabel::None,
         })
     }
     use super::*;
