@@ -1082,9 +1082,12 @@ fn build_spec(
         selinux_relabel: SelinuxRelabel::Shared,
     }];
     for volume in &agent.volumes {
-        if let Some(mount) = parse_volume(volume) {
-            volumes.push(mount);
-        }
+        let mount = parse_volume(volume).ok_or_else(|| {
+            Error::Backend(format!(
+                "invalid additional mount {volume:?}; expected source:absolute-container-path[:options] with ro, rw, z, or Z options"
+            ))
+        })?;
+        volumes.push(mount);
     }
     if agent.runner.subscription_auth {
         volumes.extend(auth_mounts(kind));
@@ -2101,6 +2104,8 @@ mod tests {
         let selinux_private = parse_volume("/tmp/private:/workspace/private:Z").unwrap();
         assert!(!selinux_private.read_only);
         assert_eq!(selinux_private.selinux_relabel, SelinuxRelabel::Private);
+
+        assert!(parse_volume("/tmp/cache:/workspace/cache:cached").is_none());
     }
 
     #[test]

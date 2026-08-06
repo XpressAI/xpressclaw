@@ -82,6 +82,14 @@ impl VolumeMount {
                 let (source, target) = source_or_target.rsplit_once(':')?;
                 (source, target, read_only, selinux_relabel)
             } else {
+                // A container target must be absolute. If the final field is
+                // not an absolute target or a supported option list, reject
+                // it instead of reinterpreting `source:target:unknown` as a
+                // different source and relative target. This still preserves
+                // Windows drive-letter sources such as C:\code:/workspace.
+                if !target_or_options.starts_with('/') {
+                    return None;
+                }
                 (
                     source_or_target,
                     target_or_options,
@@ -89,6 +97,9 @@ impl VolumeMount {
                     SelinuxRelabel::None,
                 )
             };
+        if source.trim().is_empty() || target.trim().is_empty() {
+            return None;
+        }
         Some(Self {
             source: source.to_string(),
             target: target.to_string(),
@@ -1549,6 +1560,13 @@ mod tests {
         let ordinary = VolumeMount::parse("/srv/reference:/reference").unwrap();
         assert!(!ordinary.read_only);
         assert_eq!(ordinary.selinux_relabel, SelinuxRelabel::None);
+
+        let windows_source = VolumeMount::parse(r"C:\Users\me\project:/workspace").unwrap();
+        assert_eq!(windows_source.source, r"C:\Users\me\project");
+        assert_eq!(windows_source.target, "/workspace");
+
+        assert!(VolumeMount::parse("/srv/cache:/workspace/cache:cached").is_none());
+        assert!(VolumeMount::parse("/srv/cache:/workspace/cache:ro,cached").is_none());
 
         let legacy: VolumeMount = serde_json::from_value(serde_json::json!({
             "source": "/srv/legacy",
