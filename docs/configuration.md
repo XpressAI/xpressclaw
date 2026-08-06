@@ -48,7 +48,13 @@ agents:
 | `container_engine` | `none` (default) or trusted `host` Docker/Podman socket access |
 | `command` | ACP server argument list; required for custom harnesses and supports `{workspace}` |
 
-Additional `volumes` use `host:container` or `host:container:ro` syntax.
+Additional `volumes` use Docker-style `host:container[:options]` syntax. Options
+may combine `ro` or `rw` with `z` (a shared SELinux label) or `Z` (a private
+label), for example `/srv/shared:/workspace/shared:ro,z`. Xpressclaw
+automatically requests a shared label for the managed workspace and built-in
+harness login/configuration mounts when the Docker-compatible runtime reports
+SELinux support. Explicit mounts are never relabeled unless they include `z` or
+`Z`; in particular, Xpressclaw never relabels the Docker or Podman socket.
 
 The UI label uses `runner.project_name`, falling back to the workspace folder.
 The top-level `name` field is only a stable internal reference used by tasks,

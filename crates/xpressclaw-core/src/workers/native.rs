@@ -24,7 +24,7 @@ use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::{
-    container_spec_fingerprint, ContainerSpec, DockerManager, VolumeMount,
+    container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::error::{Error, Result};
 use crate::sessions::SessionManager;
@@ -1079,11 +1079,15 @@ fn build_spec(
         source: workspace.display().to_string(),
         target: container_workspace.clone(),
         read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
     }];
     for volume in &agent.volumes {
-        if let Some(mount) = parse_volume(volume) {
-            volumes.push(mount);
-        }
+        let mount = parse_volume(volume).ok_or_else(|| {
+            Error::Backend(format!(
+                "invalid additional mount {volume:?}; expected source:absolute-container-path[:options] with ro, rw, z, or Z options"
+            ))
+        })?;
+        volumes.push(mount);
     }
     if agent.runner.subscription_auth {
         volumes.extend(auth_mounts(kind));
@@ -1115,6 +1119,7 @@ fn build_spec(
             source: socket.display().to_string(),
             target: "/var/run/docker.sock".to_string(),
             read_only: false,
+            selinux_relabel: SelinuxRelabel::None,
         });
         environment.push("DOCKER_HOST=unix:///var/run/docker.sock".to_string());
     }
@@ -1314,6 +1319,7 @@ fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
             // Native agent OAuth directories must be writable so their CLIs
             // can refresh credentials; common Git/GitHub config is read-only.
             read_only,
+            selinux_relabel: SelinuxRelabel::Shared,
         })
         .collect()
 }
@@ -1325,20 +1331,9 @@ fn host_home() -> Option<PathBuf> {
 }
 
 fn parse_volume(raw: &str) -> Option<VolumeMount> {
-    let (source_or_target, target_or_mode) = raw.rsplit_once(':')?;
-    if target_or_mode == "ro" || target_or_mode == "rw" {
-        let (source, target) = source_or_target.rsplit_once(':')?;
-        return Some(VolumeMount {
-            source: expand_home(source),
-            target: target.to_string(),
-            read_only: target_or_mode == "ro",
-        });
-    }
-    Some(VolumeMount {
-        source: expand_home(source_or_target),
-        target: target_or_mode.to_string(),
-        read_only: false,
-    })
+    let mut mount = VolumeMount::parse(raw)?;
+    mount.source = expand_home(&mount.source);
+    Some(mount)
 }
 
 fn expand_home(path: &str) -> String {
@@ -2101,6 +2096,16 @@ mod tests {
         assert_eq!(read_write.source, "/tmp/project");
         assert_eq!(read_write.target, "/workspace/project");
         assert!(!read_write.read_only);
+
+        let selinux_shared = parse_volume("/tmp/shared:/workspace/shared:ro,z").unwrap();
+        assert!(selinux_shared.read_only);
+        assert_eq!(selinux_shared.selinux_relabel, SelinuxRelabel::Shared);
+
+        let selinux_private = parse_volume("/tmp/private:/workspace/private:Z").unwrap();
+        assert!(!selinux_private.read_only);
+        assert_eq!(selinux_private.selinux_relabel, SelinuxRelabel::Private);
+
+        assert!(parse_volume("/tmp/cache:/workspace/cache:cached").is_none());
     }
 
     #[test]

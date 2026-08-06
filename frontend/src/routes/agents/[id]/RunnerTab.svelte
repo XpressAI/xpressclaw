@@ -457,8 +457,8 @@
 			With host login enabled, the harness's normal configuration directory is mounted read-write, so its installed skills, plugins, hooks, custom agents, and settings load normally. Project-local configuration is loaded from the workspace. Add explicit mounts for any other configuration directories.
 		</p>
 		<label for="customization-volumes" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Additional mounts</label>
-		<textarea id="customization-volumes" bind:value={volumesText} rows="4" placeholder={'~/my-claude-plugin:/home/node/.claude/plugins/my-plugin:ro\n~/shared-skills:/home/node/.codex/skills:ro'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
-		<p class="mt-1 text-[11px] text-muted-foreground">One <code>host-path:container-path[:ro]</code> mount per line. These are trusted harness inputs and may execute code through hooks or plugins.</p>
+		<textarea id="customization-volumes" bind:value={volumesText} rows="4" placeholder={'~/my-claude-plugin:/home/node/.claude/plugins/my-plugin:ro,z\n~/shared-skills:/home/node/.codex/skills:ro'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
+		<p class="mt-1 text-[11px] text-muted-foreground">One <code>host-path:container-path[:options]</code> mount per line. Options are <code>ro</code>, <code>rw</code>, <code>z</code> (shared SELinux label), or <code>Z</code> (private label), separated by commas. These are trusted harness inputs and may execute code through hooks or plugins.</p>
 
 		<label for="harness-environment" class="mt-4 mb-1 block text-xs font-medium text-muted-foreground">Harness environment</label>
 		<textarea id="harness-environment" bind:value={environmentText} rows="4" placeholder={'CODEX_CONFIG={"features":{"example":true}}\nCLAUDE_CONFIG_DIR=/home/node/.claude'} class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>

@@ -1,6 +1,6 @@
 use tracing::info;
 
-use super::manager::{ContainerSpec, DockerManager, VolumeMount};
+use super::manager::{ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount};
 use crate::config::AgentConfig;
 use crate::error::Result;
 
@@ -91,22 +91,14 @@ pub fn build_container_spec_with_mcp(
         }
     }
 
-    // Volume mounts from agent config (format: "host_path:container_path" or "host_path:container_path:ro")
+    // Volume mounts from agent config (Docker-style source:target[:options]).
     let mut volumes: Vec<VolumeMount> = agent
         .volumes
         .iter()
         .filter_map(|v| {
-            let parts: Vec<&str> = v.split(':').collect();
-            if parts.len() >= 2 {
-                let source = expand_tilde(parts[0]);
-                Some(VolumeMount {
-                    source,
-                    target: parts[1].to_string(),
-                    read_only: parts.get(2).is_some_and(|&s| s == "ro"),
-                })
-            } else {
-                None
-            }
+            let mut mount = VolumeMount::parse(v)?;
+            mount.source = expand_tilde(&mount.source);
+            Some(mount)
         })
         .collect();
 
@@ -119,6 +111,7 @@ pub fn build_container_spec_with_mcp(
             source: workspace_vol,
             target: "/workspace".to_string(),
             read_only: false,
+            selinux_relabel: SelinuxRelabel::None,
         });
     }
 
@@ -254,6 +247,7 @@ mod tests {
             volumes: vec![
                 "/home/user/code:/workspace".to_string(),
                 "/tmp/data:/data:ro".to_string(),
+                "/tmp/shared:/shared:ro,z".to_string(),
             ],
             ..Default::default()
         };
@@ -261,13 +255,14 @@ mod tests {
         let spec = build_container_spec(&agent, 6969);
 
         assert_eq!(spec.image, HARNESS_CLAUDE_SDK);
-        assert_eq!(spec.volumes.len(), 2);
+        assert_eq!(spec.volumes.len(), 3);
         assert_eq!(spec.volumes[0].source, "/home/user/code");
         assert_eq!(spec.volumes[0].target, "/workspace");
         assert!(!spec.volumes[0].read_only);
         assert_eq!(spec.volumes[1].source, "/tmp/data");
         assert_eq!(spec.volumes[1].target, "/data");
         assert!(spec.volumes[1].read_only);
+        assert_eq!(spec.volumes[2].selinux_relabel, SelinuxRelabel::Shared);
         // Real API keys never leave the server — even when the agent has them
         // configured. The container only sees agent-id-encoded placeholders.
         assert!(spec

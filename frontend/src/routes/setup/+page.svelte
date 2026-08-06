@@ -189,9 +189,9 @@
 
 	function additionalVolumes(): string[] {
 		return workspaceFolders.map((folder) => {
-			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}`;
+			if (containerEngine === 'host' && hostOs !== 'windows') return `${folder}:${folder}:z`;
 			const basename = folder.split(/[\\/]/).filter(Boolean).pop() || 'shared';
-			return `${folder}:/workspace/${basename}`;
+			return `${folder}:/workspace/${basename}:z`;
 		});
 	}
 

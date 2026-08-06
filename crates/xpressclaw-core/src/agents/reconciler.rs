@@ -13,7 +13,7 @@ use crate::agents::registry::AgentRegistry;
 use crate::config::Config;
 use crate::db::Database;
 use crate::docker::images::build_container_spec;
-use crate::docker::manager::{DockerManager, VolumeMount};
+use crate::docker::manager::{DockerManager, SelinuxRelabel, VolumeMount};
 use crate::tasks::board::TaskBoard;
 use crate::tasks::queue::TaskQueue;
 
@@ -301,6 +301,7 @@ async fn reconcile_agents(
                         source: workspace,
                         target: "/workspace".to_string(),
                         read_only: false,
+                        selinux_relabel: SelinuxRelabel::Shared,
                     });
                 }
 
@@ -316,6 +317,7 @@ async fn reconcile_agents(
                         source: docs_dir.display().to_string(),
                         target: "/workspace/Documents".to_string(),
                         read_only: false,
+                        selinux_relabel: SelinuxRelabel::Shared,
                     });
                 }
                 if !spec
@@ -486,6 +488,7 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
                 source: volume_name,
                 target: "/workspace".to_string(),
                 read_only: true,
+                selinux_relabel: SelinuxRelabel::None,
             }],
             network_mode: Some("bridge".to_string()),
             expose_port: Some(app_port),
