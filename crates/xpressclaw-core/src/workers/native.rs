@@ -1073,7 +1073,9 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
             },
         )?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    set_windows_owner_only_acl(path, true)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
 }
@@ -1142,9 +1144,135 @@ fn set_private_file_permissions(path: &Path) -> Result<()> {
             },
         )?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    set_windows_owner_only_acl(path, false)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsLocalAllocation(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for WindowsLocalAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: The pointer was returned by a Windows security API that
+            // documents LocalFree as its matching deallocator.
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::LocalFree(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+        TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide_path.contains(&0) {
+        return Err(Error::Backend(format!(
+            "failed to protect Pi MCP path {}: path contains a NUL character",
+            path.display()
+        )));
+    }
+    wide_path.push(0);
+
+    let mut owner: PSID = null_mut();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `wide_path` is NUL-terminated and all output pointers remain
+    // valid for the duration of the call. The returned descriptor is released
+    // by `WindowsLocalAllocation` below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("read owner for", path, status));
+    }
+    let _security_descriptor = WindowsLocalAllocation(security_descriptor);
+    if owner.is_null() {
+        return Err(Error::Backend(format!(
+            "failed to protect Pi MCP path {}: Windows returned no owner",
+            path.display()
+        )));
+    }
+
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: if directory {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            NO_INHERITANCE
+        },
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: owner.cast(),
+        },
+    };
+    let mut acl: *mut ACL = null_mut();
+    // SAFETY: `access` points at the owner SID held alive by
+    // `_security_descriptor`; `acl` is an out pointer released below.
+    let status = unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("build ACL for", path, status));
+    }
+    let _acl = WindowsLocalAllocation(acl.cast());
+
+    // SAFETY: The path and ACL remain valid for this call. A protected DACL
+    // removes inherited access and leaves one full-control ACE for the owner.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("set ACL on", path, status));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_acl_error(action: &str, path: &Path, status: u32) -> Error {
+    Error::Backend(format!(
+        "failed to {action} Pi MCP path {}: {}",
+        path.display(),
+        std::io::Error::from_raw_os_error(status as i32)
+    ))
 }
 
 fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<McpServer>> {
@@ -1840,6 +1968,103 @@ mod tests {
                 0o600
             );
         }
+        #[cfg(windows)]
+        {
+            assert_windows_owner_only_acl(&config_dir, true);
+            assert_windows_owner_only_acl(&config_path, false);
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_owner_only_acl(path: &Path, directory: bool) {
+        use std::mem::size_of;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{addr_of, null_mut};
+
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+            DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let wide_path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut owner: PSID = null_mut();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `wide_path` is NUL-terminated and the output pointers are
+        // valid. The returned descriptor owns `owner` and `dacl` and is kept
+        // alive until all assertions finish.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let _descriptor = WindowsLocalAllocation(descriptor);
+        assert!(!owner.is_null());
+        assert!(!dacl.is_null());
+
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: `descriptor` remains valid through `_descriptor`.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+
+        let mut information = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` remains valid through `_descriptor` and the output
+        // buffer has the exact type and size requested.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(information.AceCount, 1);
+
+        let mut raw_ace = null_mut();
+        // SAFETY: The DACL has one ACE, as asserted above, and `raw_ace` is a
+        // valid output pointer.
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+        // SAFETY: `SetEntriesInAclW` created this sole ACE from an
+        // `EXPLICIT_ACCESS_W`, so it is an ACCESS_ALLOWED_ACE.
+        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Header.AceType, 0);
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+        assert_eq!(
+            u32::from(ace.Header.AceFlags),
+            if directory {
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            } else {
+                0
+            }
+        );
+        // SAFETY: `SidStart` is the variable-length SID at the end of the ACE,
+        // and both it and `owner` remain valid through `_descriptor`.
+        let ace_sid = addr_of!(ace.SidStart).cast_mut().cast();
+        assert_ne!(unsafe { EqualSid(owner, ace_sid) }, 0);
     }
 
     #[test]
