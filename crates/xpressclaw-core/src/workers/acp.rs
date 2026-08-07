@@ -297,6 +297,11 @@ pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
     pub mcp_servers: Vec<McpServer>,
+    /// Optional fingerprint for an out-of-band MCP bridge. ACP agents normally
+    /// receive their MCP configuration in `session/*`; adapters such as Pi's
+    /// load it in the underlying agent process instead. The fingerprint still
+    /// makes a changed configuration reload the native session.
+    pub mcp_signature: Option<String>,
     pub image_attachments: Vec<PromptImageAttachment>,
 }
 
@@ -1118,6 +1123,7 @@ async fn run_connected_turn(
         model,
         session_config: requested_config,
         mcp_servers,
+        mcp_signature,
         image_attachments,
     } = options;
 
@@ -1145,11 +1151,14 @@ async fn run_connected_turn(
         }
     }
 
-    let mcp_signature = serde_json::to_string(&mcp_servers).map_err(|error| {
-        agent_client_protocol::util::internal_error(format!(
-            "failed to fingerprint ACP MCP configuration: {error}"
-        ))
-    })?;
+    let mcp_signature = match mcp_signature {
+        Some(signature) => signature,
+        None => serde_json::to_string(&mcp_servers).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "failed to fingerprint ACP MCP configuration: {error}"
+            ))
+        })?,
+    };
     let (prepared_session, session_to_resume) = match session_start {
         AcpSessionStart::New => {
             let response = connection
@@ -1930,6 +1939,7 @@ mod tests {
                     McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
                         .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
                 )],
+                mcp_signature: None,
                 image_attachments: vec![PromptImageAttachment {
                     name: "screen.png".into(),
                     mime_type: "image/png".into(),
@@ -2072,6 +2082,134 @@ mod tests {
             .await
             .expect("ACP process should observe the closed container stream");
         assert!(!process.is_alive());
+    }
+
+    #[tokio::test]
+    async fn out_of_band_mcp_signature_reloads_a_live_session_without_acp_servers() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (first_recorder, _) = test_recorder(db.clone());
+        let (second_recorder, _) = test_recorder(db);
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            let mut prompt_count = 0;
+            let mut resume_count = 0;
+            while let Some(line) = requests.next_line().await.unwrap() {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].clone();
+                match request["method"].as_str().unwrap() {
+                    "initialize" => {
+                        let mut result =
+                            serde_json::to_value(InitializeResponse::new(ProtocolVersion::V1))
+                                .unwrap();
+                        result["agentCapabilities"] = json!({
+                            "sessionCapabilities": { "resume": {} }
+                        });
+                        send_json(
+                            &output_tx,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        let mcp_servers = &request["params"]["mcpServers"];
+                        assert!(
+                            mcp_servers.is_null()
+                                || mcp_servers.as_array().is_some_and(Vec::is_empty)
+                        );
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": NewSessionResponse::new("pi-session"),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/resume" => {
+                        resume_count += 1;
+                        assert_eq!(request["params"]["sessionId"], "pi-session");
+                        let mcp_servers = &request["params"]["mcpServers"];
+                        assert!(
+                            mcp_servers.is_null()
+                                || mcp_servers.as_array().is_some_and(Vec::is_empty)
+                        );
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": ResumeSessionResponse::new(),
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        prompt_count += 1;
+                        send_json(
+                            &output_tx,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": PromptResponse::new(StopReason::EndTurn),
+                            }),
+                        )
+                        .await;
+                        if prompt_count == 2 {
+                            break;
+                        }
+                    }
+                    other => panic!("unexpected ACP method: {other}"),
+                }
+            }
+            assert_eq!(resume_count, 1);
+        });
+
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "test-container".to_string(),
+                agent_id: "test-project".to_string(),
+                status: "running".to_string(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        })
+        .await
+        .unwrap();
+        let broker = Arc::new(AcpElicitationBroker::new());
+        let controls = Arc::new(AcpTurnControlBroker::new());
+        let first = process
+            .run_turn(
+                AcpTurnRuntime::new(first_recorder, broker.clone(), controls.clone()),
+                AcpSessionStart::New,
+                Path::new("/workspace"),
+                "First prompt",
+                AcpTurnOptions {
+                    mcp_signature: Some("pi-mcp:first".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        process
+            .run_turn(
+                AcpTurnRuntime::new(second_recorder, broker, controls),
+                AcpSessionStart::Resume(first.session_id),
+                Path::new("/workspace"),
+                "Second prompt",
+                AcpTurnOptions {
+                    mcp_signature: Some("pi-mcp:second".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        mock_agent.await.unwrap();
     }
 
     #[tokio::test]

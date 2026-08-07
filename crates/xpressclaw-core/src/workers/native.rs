@@ -2,6 +2,8 @@
 //! project environments.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
@@ -38,6 +40,10 @@ use crate::workers::acp::{
 use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
+const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
+const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
+const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
+const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
@@ -382,6 +388,22 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             );
         }
     }
+    let pi_mcp_bridge = kind == "pi"
+        && docker
+            .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+            .await;
+    let mcp_signature = if pi_mcp_bridge {
+        let signature = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        Some(signature)
+    } else {
+        None
+    };
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
@@ -432,6 +454,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 model: agent.runner.model.clone(),
                 session_config: requested_session_config,
                 mcp_servers,
+                mcp_signature,
                 image_attachments: prompt.attachments,
             },
         )
@@ -869,6 +892,7 @@ async fn runner_image_ready(
         image,
         built_in_image,
         built_in_image && agent.runner.container_engine == ContainerEngineAccess::Host,
+        built_in_image && resolve_runner_kind(agent).is_ok_and(|kind| kind == "pi"),
     )
     .await
 }
@@ -883,6 +907,7 @@ pub async fn runner_image_compatible(
     image: &str,
     built_in_image: bool,
     host_engine_image: bool,
+    pi_mcp_image: bool,
 ) -> bool {
     docker.has_image(image).await
         && (!built_in_image
@@ -893,6 +918,233 @@ pub async fn runner_image_compatible(
             || docker
                 .image_has_label(image, "io.xpressclaw.container-engine", "host")
                 .await)
+        && (!pi_mcp_image
+            || docker
+                .image_has_label(image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+                .await)
+}
+
+fn configure_pi_mcp_bridge(
+    data_dir: &Path,
+    agent_id: &str,
+    mcp_servers: &[McpServer],
+    spec: &mut ContainerSpec,
+) -> Result<String> {
+    if spec
+        .volumes
+        .iter()
+        .any(|mount| container_paths_overlap(&mount.target, PI_MCP_CONFIG_DIR_TARGET))
+    {
+        return Err(Error::Backend(format!(
+            "the Pi MCP bridge reserves container mount target {PI_MCP_CONFIG_DIR_TARGET}"
+        )));
+    }
+    let encoded = pi_mcp_config(mcp_servers)?;
+    let config_dir = pi_mcp_config_dir(data_dir, agent_id);
+    std::fs::create_dir_all(&config_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create Pi MCP runtime directory {}: {error}",
+            config_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&config_dir)?;
+    write_private_atomic(&config_dir.join("config.json"), &encoded)?;
+
+    spec.volumes.push(VolumeMount {
+        source: config_dir.display().to_string(),
+        target: PI_MCP_CONFIG_DIR_TARGET.to_string(),
+        read_only: true,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+    spec.environment.retain(|variable| {
+        !variable.starts_with("PI_ACP_PI_COMMAND=")
+            && !variable.starts_with("XPRESSCLAW_PI_MCP_CONFIG=")
+    });
+    spec.environment
+        .push(format!("PI_ACP_PI_COMMAND={PI_MCP_WRAPPER}"));
+    spec.environment
+        .push(format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}"));
+
+    Ok(format!("pi-mcp:{:x}", Sha256::digest(&encoded)))
+}
+
+fn container_paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    data_dir.join("runtime").join("pi-mcp").join(agent_hash)
+}
+
+fn pi_mcp_config(mcp_servers: &[McpServer]) -> Result<Vec<u8>> {
+    let mut servers = serde_json::Map::new();
+    for server in mcp_servers {
+        let (name, mut definition) = pi_mcp_server(server)?;
+        if matches!(name.as_str(), "xpressclaw" | "github") {
+            definition.insert("directTools".to_string(), Value::Bool(true));
+        }
+        if servers
+            .insert(name.clone(), Value::Object(definition))
+            .is_some()
+        {
+            return Err(Error::Backend(format!(
+                "Pi MCP configuration contains duplicate server name '{name}'"
+            )));
+        }
+    }
+    serde_json::to_vec_pretty(&json!({ "mcpServers": servers })).map_err(Error::from)
+}
+
+fn pi_mcp_server(server: &McpServer) -> Result<(String, serde_json::Map<String, Value>)> {
+    let mut definition = serde_json::Map::new();
+    let name = match server {
+        McpServer::Stdio(server) => {
+            let command = server.command.to_str().ok_or_else(|| {
+                Error::Backend(format!(
+                    "Pi MCP server '{}' command is not valid UTF-8",
+                    server.name
+                ))
+            })?;
+            definition.insert("command".to_string(), json!(command));
+            if !server.args.is_empty() {
+                definition.insert("args".to_string(), json!(server.args));
+            }
+            if !server.env.is_empty() {
+                let env = server
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.clone(), json!(variable.value)))
+                    .collect::<serde_json::Map<_, _>>();
+                definition.insert("env".to_string(), Value::Object(env));
+            }
+            server.name.clone()
+        }
+        McpServer::Http(server) => {
+            definition.insert("url".to_string(), json!(server.url));
+            definition.insert("httpTransport".to_string(), json!("streamable-http"));
+            add_pi_mcp_headers(&mut definition, &server.headers);
+            server.name.clone()
+        }
+        McpServer::Sse(server) => {
+            definition.insert("url".to_string(), json!(server.url));
+            definition.insert("httpTransport".to_string(), json!("sse"));
+            add_pi_mcp_headers(&mut definition, &server.headers);
+            server.name.clone()
+        }
+        _ => {
+            return Err(Error::Backend(
+                "Pi MCP bridge received an unsupported ACP MCP transport".to_string(),
+            ));
+        }
+    };
+    Ok((name, definition))
+}
+
+fn add_pi_mcp_headers(definition: &mut serde_json::Map<String, Value>, headers: &[HttpHeader]) {
+    if headers.is_empty() {
+        return;
+    }
+    let headers = headers
+        .iter()
+        .map(|header| (header.name.clone(), json!(header.value)))
+        .collect::<serde_json::Map<_, _>>();
+    definition.insert("headers".to_string(), Value::Object(headers));
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                Error::Backend(format!(
+                    "failed to protect Pi MCP runtime directory {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    if std::fs::read(path).ok().as_deref() == Some(contents) {
+        set_private_file_permissions(path)?;
+        return Ok(());
+    }
+    let temporary = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create private Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    set_private_file_permissions(&temporary)?;
+    file.write_all(contents).map_err(|error| {
+        Error::Backend(format!(
+            "failed to write Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        Error::Backend(format!(
+            "failed to sync Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|error| {
+            Error::Backend(format!(
+                "failed to replace Pi MCP configuration {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        Error::Backend(format!(
+            "failed to publish Pi MCP configuration {}: {error}",
+            path.display()
+        ))
+    })?;
+    set_private_file_permissions(path)
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                Error::Backend(format!(
+                    "failed to protect Pi MCP configuration {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<McpServer>> {
@@ -1478,6 +1730,136 @@ mod tests {
         assert!(error
             .to_string()
             .contains("absolute path inside the harness container"));
+    }
+
+    #[test]
+    fn converts_acp_servers_to_pi_proxy_and_script_configuration() {
+        let encoded = pi_mcp_config(&[
+            McpServer::Stdio(
+                McpServerStdio::new("xpressclaw", "/usr/local/bin/node")
+                    .args(vec!["control.mjs".into()])
+                    .env(vec![EnvVariable::new("XPRESSCLAW_TASK_ID", "task-123")]),
+            ),
+            McpServer::Http(
+                McpServerHttp::new("github", "https://github.example.test/mcp")
+                    .headers(vec![HttpHeader::new("Authorization", "Bearer secret")]),
+            ),
+            McpServer::Sse(McpServerSse::new(
+                "project-search",
+                "https://search.example.test/sse",
+            )),
+        ])
+        .unwrap();
+        let config: Value = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            config["mcpServers"]["xpressclaw"]["command"],
+            "/usr/local/bin/node"
+        );
+        assert_eq!(
+            config["mcpServers"]["xpressclaw"]["env"]["XPRESSCLAW_TASK_ID"],
+            "task-123"
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["httpTransport"],
+            "streamable-http"
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["headers"]["Authorization"],
+            "Bearer secret"
+        );
+        assert_eq!(
+            config["mcpServers"]["project-search"]["httpTransport"],
+            "sse"
+        );
+        assert_eq!(config["mcpServers"]["xpressclaw"]["directTools"], true);
+        assert_eq!(config["mcpServers"]["github"]["directTools"], true);
+        assert!(config["mcpServers"]["project-search"]["directTools"].is_null());
+    }
+
+    #[test]
+    fn pi_mcp_bridge_uses_private_unicode_safe_runtime_configuration() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut spec = ContainerSpec {
+            environment: vec![
+                "PI_ACP_PI_COMMAND=/custom/pi".into(),
+                "XPRESSCLAW_PI_MCP_CONFIG=/custom/config.json".into(),
+            ],
+            ..Default::default()
+        };
+        let servers = [McpServer::Stdio(McpServerStdio::new(
+            "xpressclaw",
+            "/usr/local/bin/node",
+        ))];
+
+        let signature =
+            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", &servers, &mut spec).unwrap();
+        let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
+        let leaf = config_dir.file_name().unwrap().to_string_lossy();
+        assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!config_dir.display().to_string().contains("エリ"));
+        assert!(signature.starts_with("pi-mcp:"));
+
+        let mount = spec
+            .volumes
+            .iter()
+            .find(|mount| mount.target == PI_MCP_CONFIG_DIR_TARGET)
+            .unwrap();
+        assert_eq!(mount.source, config_dir.display().to_string());
+        assert!(mount.read_only);
+        assert_eq!(mount.selinux_relabel, SelinuxRelabel::Shared);
+        assert!(spec
+            .environment
+            .contains(&format!("PI_ACP_PI_COMMAND={PI_MCP_WRAPPER}")));
+        assert!(spec
+            .environment
+            .contains(&format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}")));
+        assert_eq!(
+            spec.environment
+                .iter()
+                .filter(|variable| variable.starts_with("PI_ACP_PI_COMMAND="))
+                .count(),
+            1
+        );
+
+        let config_path = config_dir.join("config.json");
+        assert!(config_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&config_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn pi_mcp_bridge_rejects_mounts_overlapping_its_reserved_target() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut spec = ContainerSpec {
+            volumes: vec![VolumeMount {
+                source: "/tmp/custom".into(),
+                target: "/run/xpressclaw".into(),
+                read_only: false,
+                selinux_relabel: SelinuxRelabel::None,
+            }],
+            ..Default::default()
+        };
+
+        let error = configure_pi_mcp_bridge(data_dir.path(), "pi", &[], &mut spec).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserves container mount target"));
+        assert!(!pi_mcp_config_dir(data_dir.path(), "pi").exists());
     }
 
     #[test]

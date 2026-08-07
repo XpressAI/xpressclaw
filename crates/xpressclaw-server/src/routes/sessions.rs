@@ -133,7 +133,10 @@ async fn prepare_runner(
             "host container-engine access requires a local Docker-compatible Unix socket",
         ));
     }
-    if available_runner_image(&docker, &image).await.is_none() {
+    if available_runner_image(&docker, &image, &kind)
+        .await
+        .is_none()
+    {
         docker.pull_image(&image).await.map_err(internal_error)?;
     }
     let readiness = readiness(&state, &agent).await?;
@@ -168,7 +171,7 @@ async fn readiness(
             .as_ref()
             .is_some_and(|docker| docker.host_engine_socket().is_some());
     let runtime_image = match docker.as_ref() {
-        Some(docker) => available_runner_image(docker, &image).await,
+        Some(docker) => available_runner_image(docker, &image, &kind).await,
         None => None,
     };
     let image_present = runtime_image.is_some();
@@ -229,14 +232,23 @@ async fn readiness(
     }))
 }
 
-async fn available_runner_image(docker: &DockerManager, image: &str) -> Option<String> {
+async fn available_runner_image(docker: &DockerManager, image: &str, kind: &str) -> Option<String> {
     let host_engine_image = is_host_runner_image(image);
     let built_in = is_builtin_runner_image(image);
-    if runner_image_compatible(docker, image, built_in, host_engine_image).await {
+    let pi_mcp_image = built_in && kind == "pi";
+    if runner_image_compatible(docker, image, built_in, host_engine_image, pi_mcp_image).await {
         return Some(image.to_string());
     }
     if let Some(local_image) = local_runner_image_alias(image) {
-        if runner_image_compatible(docker, local_image, built_in, host_engine_image).await {
+        if runner_image_compatible(
+            docker,
+            local_image,
+            built_in,
+            host_engine_image,
+            pi_mcp_image,
+        )
+        .await
+        {
             return Some(local_image.to_string());
         }
     }
