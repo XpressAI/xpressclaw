@@ -28,6 +28,18 @@ test('ordinary task lifecycle overrides generic draft defaults', () => {
   assert.match(toolDescription(environment), /only after approval or merge/);
 });
 
+test('ordinary task lifecycle rejects converting a ready PR back to draft', () => {
+  const environment = { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' };
+  assert.throws(
+    () => managedCommandArguments(['pr', 'ready', '--undo'], environment),
+    /cannot convert a ready pull request back to draft/,
+  );
+  assert.deepEqual(
+    managedCommandArguments(['pr', 'ready', '--undo'], {}),
+    ['pr', 'ready', '--undo'],
+  );
+});
+
 test('workflow-managed PR creation preserves an explicit draft', () => {
   assert.deepEqual(
     managedCommandArguments(['pr', 'create', '--draft'], {}),

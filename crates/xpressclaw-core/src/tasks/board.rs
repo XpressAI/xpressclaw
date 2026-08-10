@@ -434,9 +434,10 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
+            let transaction = conn.unchecked_transaction()?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -451,7 +452,7 @@ impl TaskBoard {
             // Update status. Reopening a completed task must also clear its
             // old completion timestamp so the API does not report two
             // conflicting states.
-            conn.execute(
+            transaction.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2,
                     completed_at = CASE WHEN ?1 = 'completed' THEN ?2 ELSE NULL END
                  WHERE id = ?3",
@@ -461,12 +462,14 @@ impl TaskBoard {
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
-                    conn.execute(
+                    synchronize_pull_request_agent(&transaction, task_id, aid)?;
+                    transaction.execute(
                         "UPDATE tasks SET agent_id = ?1 WHERE id = ?2",
                         rusqlite::params![aid, task_id],
                     )?;
                 }
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
@@ -480,9 +483,10 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
+            let transaction = conn.unchecked_transaction()?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -495,32 +499,34 @@ impl TaskBoard {
             }
 
             if let Some(ref title) = req.title {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![title, now, task_id],
                 )?;
             }
 
             if let Some(ref desc) = req.description {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET description = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![desc, now, task_id],
                 )?;
             }
 
             if let Some(ref agent_id) = req.agent_id {
-                conn.execute(
+                synchronize_pull_request_agent(&transaction, task_id, agent_id)?;
+                transaction.execute(
                     "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![agent_id, now, task_id],
                 )?;
             }
 
             if let Some(priority) = req.priority {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![priority, now, task_id],
                 )?;
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
@@ -945,6 +951,35 @@ impl TaskBoard {
     }
 }
 
+fn synchronize_pull_request_agent(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let has_active_pull_request: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_pull_requests
+            WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if !has_active_pull_request {
+        return Ok(());
+    }
+    if agent_id.trim().is_empty() {
+        return Err(Error::Task(
+            "cannot unassign a task while pull-request review monitoring is active".into(),
+        ));
+    }
+    conn.execute(
+        "UPDATE task_pull_requests SET agent_id = ?1
+         WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    Ok(())
+}
+
 fn append_task_search(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -1093,6 +1128,78 @@ mod tests {
         let reopened = board.update_status(&task.id, "pending", None).unwrap();
         assert_eq!(reopened.status, TaskStatus::Pending);
         assert!(reopened.completed_at.is_none());
+    }
+
+    #[test]
+    fn task_reassignment_transfers_active_pull_request_monitoring() {
+        let (db, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Review ownership".to_string(),
+                agent_id: Some("project-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'project-codex', 'XpressAI', 'xpressclaw', 151,
+                         'https://github.com/XpressAI/xpressclaw/pull/151', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&task.id],
+            )
+            .unwrap();
+        });
+
+        let reassigned = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(reassigned.agent_id.as_deref(), Some("reviewer-codex"));
+        let monitored_agent = || {
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id FROM task_pull_requests WHERE task_id = ?1",
+                    [&task.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(monitored_agent(), "reviewer-codex");
+
+        board
+            .update_status(&task.id, "in_progress", Some("final-codex"))
+            .unwrap();
+        assert_eq!(monitored_agent(), "final-codex");
+
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some(String::new()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot unassign"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
     }
 
     #[test]

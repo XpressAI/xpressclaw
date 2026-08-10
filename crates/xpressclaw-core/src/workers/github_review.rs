@@ -331,6 +331,38 @@ impl GithubReviewManager {
         })
     }
 
+    /// Refresh a possibly stale polling snapshot from the task's current
+    /// assignment before any queue or session work is attributed to an agent.
+    fn synchronize_assignment(&self, item: &TaskPullRequest) -> Result<Option<String>> {
+        self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let agent_id: Option<String> = transaction.query_row(
+                "SELECT agent_id FROM tasks WHERE id = ?1",
+                [&item.task_id],
+                |row| row.get(0),
+            )?;
+            let agent_id = agent_id.filter(|agent_id| !agent_id.trim().is_empty());
+            if agent_id.as_deref() != Some(&item.agent_id) {
+                if let Some(ref agent_id) = agent_id {
+                    transaction.execute(
+                        "UPDATE task_pull_requests SET agent_id = ?1
+                         WHERE task_id = ?2 AND owner = ?3 AND repo = ?4 AND number = ?5
+                           AND status IN ('waiting', 'attention')",
+                        rusqlite::params![
+                            agent_id,
+                            item.task_id,
+                            item.owner,
+                            item.repo,
+                            item.number as i64,
+                        ],
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(agent_id)
+        })
+    }
+
     fn mark_terminal(&self, item: &TaskPullRequest, outcome: ReviewOutcome) -> Result<()> {
         let status = match outcome {
             ReviewOutcome::Approved => "approved",
@@ -490,7 +522,7 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
     let manager = GithubReviewManager::new(db.clone());
     let mut changes = 0;
     let now = Utc::now();
-    for item in manager.waiting()? {
+    for mut item in manager.waiting()? {
         if item
             .next_poll_at
             .as_deref()
@@ -510,6 +542,11 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
             manager.cancel(&item)?;
             continue;
         }
+        let Some(agent_id) = manager.synchronize_assignment(&item)? else {
+            manager.defer(&item, Some("the task no longer has an assigned agent"))?;
+            continue;
+        };
+        item.agent_id = agent_id;
         if parse_timestamp(&item.expires_at).is_some_and(|expires| now >= expires) {
             let reason = format!(
                 "XpressClaw monitored {} for {} days without approval or merge.",
@@ -1141,6 +1178,44 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn stale_polling_snapshot_refreshes_to_the_tasks_current_agent() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let stale = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        TaskBoard::new(db)
+            .update(
+                &task_id,
+                &crate::tasks::board::UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".into()),
+                    priority: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(stale.agent_id, "project-codex");
+        assert_eq!(
+            manager.synchronize_assignment(&stale).unwrap().as_deref(),
+            Some("reviewer-codex")
+        );
+        assert_eq!(
+            manager
+                .get(&task_id, "XpressAI", "xpressclaw", 151)
+                .unwrap()
+                .agent_id,
+            "reviewer-codex"
         );
     }
 

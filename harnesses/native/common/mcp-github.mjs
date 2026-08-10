@@ -117,9 +117,16 @@ function optionValue(args, longName, shortName) {
 }
 
 export function managedCommandArguments(args, environment = process.env) {
-  if (!reviewLifecycleEnabled(environment) || args[0] !== 'pr' || args[1] !== 'create') {
+  if (!reviewLifecycleEnabled(environment)) {
     return [...args];
   }
+  if (args[0] === 'pr' && args[1] === 'ready' &&
+      args.some((argument) => argument === '--undo' || argument.startsWith('--undo='))) {
+    throw new Error(
+      'managed pull-request review lifecycle cannot convert a ready pull request back to draft',
+    );
+  }
+  if (args[0] !== 'pr' || args[1] !== 'create') return [...args];
   return args.filter((argument) =>
     argument !== '--draft' && argument !== '-d' &&
     argument !== '--draft=true' && argument !== '-d=true'

@@ -389,6 +389,10 @@ async fn update_task(
             StatusCode::NOT_FOUND,
             Json(json!({ "error": e.to_string() })),
         ),
+        xpressclaw_core::error::Error::Task(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
         _ => internal_error(e),
     })?;
 
