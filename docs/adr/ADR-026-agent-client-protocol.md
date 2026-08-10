@@ -109,7 +109,15 @@ The initial client chooses an affirmative permission option when an ACP agent
 requests approval. This preserves the previous autonomous-worker behavior and
 is limited by the attempt container, workspace mounts, network policy, and
 resource limits. Permission requests and the selected option are recorded.
-A configurable interactive/autonomous permission policy is future work.
+
+The built-in Codex runner also defaults its ACP adapter to
+`agent-full-access`. Codex's normal workspace sandbox would otherwise create a
+second, product-specific restriction inside the retained project container and
+make common development tools fail despite already being isolated from the
+host. This does not grant host access: the outer container, its mounts, network,
+limits, and the separately opt-in host container-engine socket remain the
+security boundary. An explicit `INITIAL_AGENT_MODE` runner environment value or
+an ACP mode selected by the user overrides the default.
 
 ### Compatibility
 

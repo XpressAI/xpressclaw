@@ -39,6 +39,8 @@ use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
+const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
+const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
     "\nawait main();\n"
@@ -1128,6 +1130,7 @@ fn build_spec(
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
+    apply_codex_mode_default(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
     runner_environment.sort_by(|left, right| left.0.cmp(right.0));
     for (name, value) in runner_environment {
@@ -1167,6 +1170,22 @@ fn build_spec(
         working_dir: Some(container_workspace),
         run_as_host_user: true,
     })
+}
+
+/// Codex normally applies its own workspace sandbox inside the retained
+/// XpressClaw container. The container is already the project security
+/// boundary, so the nested sandbox only makes ordinary development tools less
+/// reliable. Keep the adapter's explicit environment override authoritative.
+fn apply_codex_mode_default(
+    kind: &str,
+    runner: &NativeRunnerConfig,
+    environment: &mut Vec<String>,
+) {
+    if kind == "codex" && !runner.environment.contains_key(CODEX_INITIAL_AGENT_MODE) {
+        environment.push(format!(
+            "{CODEX_INITIAL_AGENT_MODE}={CODEX_FULL_ACCESS_MODE}"
+        ));
+    }
 }
 
 fn configure_bundled_github_mcp(
@@ -1718,6 +1737,57 @@ mod tests {
             acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
         );
+    }
+
+    #[test]
+    fn codex_defaults_to_full_access_inside_its_project_container() {
+        let runner = NativeRunnerConfig::default();
+        let mut environment = vec!["HOME=/home/node".to_string()];
+
+        apply_codex_mode_default("codex", &runner, &mut environment);
+
+        assert!(environment
+            .iter()
+            .any(|value| value == "INITIAL_AGENT_MODE=agent-full-access"));
+    }
+
+    #[test]
+    fn explicit_codex_mode_overrides_the_container_default() {
+        let runner = NativeRunnerConfig {
+            environment: [("INITIAL_AGENT_MODE".into(), "agent".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let mut environment = vec!["HOME=/home/node".to_string()];
+
+        apply_codex_mode_default("codex", &runner, &mut environment);
+        environment.extend(
+            runner
+                .environment
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|value| value.starts_with("INITIAL_AGENT_MODE="))
+                .collect::<Vec<_>>(),
+            ["INITIAL_AGENT_MODE=agent"]
+        );
+    }
+
+    #[test]
+    fn other_harnesses_do_not_receive_a_codex_mode() {
+        let runner = NativeRunnerConfig::default();
+        let mut environment = vec!["HOME=/home/node".to_string()];
+
+        apply_codex_mode_default("claude", &runner, &mut environment);
+
+        assert!(!environment
+            .iter()
+            .any(|value| value.starts_with("INITIAL_AGENT_MODE=")));
     }
 
     #[test]
