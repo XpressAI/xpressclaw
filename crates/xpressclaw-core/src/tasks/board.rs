@@ -441,6 +441,7 @@ impl TaskBoard {
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        let checked_at = Utc::now().to_rfc3339();
 
         {
             let conn = self.db.conn();
@@ -468,6 +469,17 @@ impl TaskBoard {
                  WHERE id = ?3",
                 rusqlite::params![status, now, task_id],
             )?;
+
+            // Release the external review gate in the same transaction as
+            // cancellation so a stale poll cannot revive it after a reopen.
+            if parsed == TaskStatus::Cancelled {
+                transaction.execute(
+                    "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                        last_checked_at = ?1, last_error = NULL
+                     WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+                    rusqlite::params![checked_at, task_id],
+                )?;
+            }
 
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
@@ -734,52 +746,84 @@ impl TaskBoard {
     pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
         let mut completed = Vec::new();
         let mut current_id = Some(task_id.to_string());
-        let mut first = true;
 
         while let Some(id) = current_id {
-            if !self.pull_request_gate_satisfied(&id)? {
+            let Some(task) = self.complete_if_ready(&id)? else {
                 break;
-            }
-            if !self.subtasks_complete(&id)? {
-                break;
-            }
-            if self.has_open_attempt(&id)? {
-                break;
-            }
-            let task = self.update_status(&id, "completed", if first { agent_id } else { None })?;
+            };
             current_id = task.parent_task_id.clone();
             completed.push(task);
-            first = false;
         }
+
+        // Completion does not change assignment. Keep this argument for API
+        // compatibility with callers that refresh the first task's session.
+        let _ = agent_id;
 
         Ok(completed)
     }
 
-    fn pull_request_gate_satisfied(&self, task_id: &str) -> Result<bool> {
+    /// Complete one task only while every precondition and the nonterminal
+    /// status still hold in the same transaction.
+    fn complete_if_ready(&self, task_id: &str) -> Result<Option<Task>> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         self.db.with_conn(|conn| {
-            conn.query_row(
+            let transaction = conn.unchecked_transaction()?;
+            let status: String = transaction.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let pull_request_gate_satisfied: bool = transaction.query_row(
                 "SELECT NOT EXISTS(
                     SELECT 1 FROM task_pull_requests
                     WHERE task_id = ?1 AND status NOT IN ('approved', 'merged', 'cancelled')
                  )",
                 [task_id],
                 |row| row.get(0),
-            )
-            .map_err(Error::from)
-        })
-    }
-
-    fn has_open_attempt(&self, task_id: &str) -> Result<bool> {
-        self.db.with_conn(|conn| {
-            conn.query_row(
+            )?;
+            let subtasks_complete: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM tasks
+                    WHERE parent_task_id = ?1 AND status != 'completed'
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_attempts WHERE task_id = ?1
                     AND status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
                 )",
                 [task_id],
                 |row| row.get(0),
-            )
-            .map_err(Error::from)
+            )?;
+            if !pull_request_gate_satisfied || !subtasks_complete || has_open_attempt {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
+                 WHERE id = ?2 AND status NOT IN ('completed', 'cancelled')",
+                rusqlite::params![now, task_id],
+            )?;
+            if changed != 1 {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let task = transaction.query_row(
+                "SELECT * FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok(row_to_task(row)),
+            )??;
+            transaction.commit()?;
+            Ok(Some(task))
         })
     }
 
@@ -1617,6 +1661,30 @@ mod tests {
             .unwrap();
         assert_eq!(completed.len(), 1);
         assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn roll_up_never_overwrites_a_cancelled_task() {
+        let (_, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Cancelled work".to_string(),
+                description: None,
+                agent_id: Some("developer".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        board.update_status(&task.id, "cancelled", None).unwrap();
+
+        assert!(board
+            .complete_and_roll_up(&task.id, Some("developer"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
     }
 
     #[test]

@@ -21,7 +21,6 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::sessions::SessionManager;
 use crate::tasks::board::{TaskBoard, TaskStatus};
-use crate::tasks::conversation::TaskConversation;
 use crate::tasks::queue::TaskQueue;
 use crate::workers::{github, native};
 
@@ -341,29 +340,6 @@ impl GithubReviewManager {
         })
     }
 
-    fn mark_terminal(&self, item: &TaskPullRequest, outcome: ReviewOutcome) -> Result<()> {
-        let status = match outcome {
-            ReviewOutcome::Approved => "approved",
-            ReviewOutcome::Merged => "merged",
-        };
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE task_pull_requests SET status = ?1, next_poll_at = NULL,
-                    last_checked_at = ?2, last_error = NULL
-                 WHERE task_id = ?3 AND owner = ?4 AND repo = ?5 AND number = ?6",
-                rusqlite::params![
-                    status,
-                    Utc::now().to_rfc3339(),
-                    item.task_id,
-                    item.owner,
-                    item.repo,
-                    item.number as i64,
-                ],
-            )?;
-            Ok::<_, Error>(())
-        })
-    }
-
     fn cancel(&self, item: &TaskPullRequest) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
@@ -615,8 +591,7 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
         match fetch_snapshot(&access, &item).await {
             Ok(snapshot) => {
                 if let Some(outcome) = snapshot.outcome {
-                    manager.mark_terminal(&item, outcome)?;
-                    finalize_if_satisfied(db, &manager, &item, outcome)?;
+                    finalize_if_satisfied(db, &item, outcome)?;
                     changes += 1;
                     continue;
                 }
@@ -772,33 +747,169 @@ fn format_activity(activity: &ReviewActivity) -> String {
 
 fn finalize_if_satisfied(
     db: &Arc<Database>,
-    manager: &GithubReviewManager,
     item: &TaskPullRequest,
     outcome: ReviewOutcome,
 ) -> Result<()> {
-    if manager.gate(&item.task_id)? != GithubReviewGate::Satisfied {
-        return Ok(());
-    }
-    let board = TaskBoard::new(db.clone());
-    let task = board.get(&item.task_id)?;
-    if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
-        return Ok(());
-    }
+    let status = match outcome {
+        ReviewOutcome::Approved => "approved",
+        ReviewOutcome::Merged => "merged",
+    };
     let verb = match outcome {
         ReviewOutcome::Approved => "approved",
         ReviewOutcome::Merged => "merged",
     };
-    TaskConversation::new(db.clone()).add_message(
-        &item.task_id,
-        "assistant",
-        &format!(
-            "GitHub review complete: all pull requests for this task are approved or merged ({} was {verb}).",
-            item.url
-        ),
-    )?;
-    board.complete_reported_subtasks(&item.task_id)?;
-    let _ = board.complete_and_roll_up(&item.task_id, Some(&item.agent_id))?;
-    SessionManager::new(db.clone()).refresh_status(&item.agent_id)?;
+    let message = format!(
+        "GitHub review complete: all pull requests for this task are approved or merged ({} was {verb}).",
+        item.url
+    );
+    let completion = db.with_conn(|conn| {
+        let transaction = conn.unchecked_transaction()?;
+        let task = transaction
+            .query_row(
+                "SELECT status, agent_id, parent_task_id FROM tasks WHERE id = ?1",
+                [&item.task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_status, agent_id, parent_task_id)) = task else {
+            transaction.commit()?;
+            return Ok::<_, Error>(None);
+        };
+        if matches!(task_status.as_str(), "completed" | "cancelled") {
+            transaction.execute(
+                "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                    last_checked_at = ?1, last_error = NULL
+                 WHERE task_id = ?2 AND owner = ?3 AND repo = ?4 AND number = ?5
+                   AND status IN ('waiting', 'attention')",
+                rusqlite::params![
+                    Utc::now().to_rfc3339(),
+                    item.task_id,
+                    item.owner,
+                    item.repo,
+                    item.number as i64,
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        transaction.execute(
+            "UPDATE task_pull_requests SET status = ?1, next_poll_at = NULL,
+                last_checked_at = ?2, last_error = NULL
+             WHERE task_id = ?3 AND owner = ?4 AND repo = ?5 AND number = ?6
+               AND status = 'waiting'",
+            rusqlite::params![
+                status,
+                Utc::now().to_rfc3339(),
+                item.task_id,
+                item.owner,
+                item.repo,
+                item.number as i64,
+            ],
+        )?;
+        let item_satisfied: bool = transaction.query_row(
+            "SELECT status IN ('approved', 'merged') FROM task_pull_requests
+             WHERE task_id = ?1 AND owner = ?2 AND repo = ?3 AND number = ?4",
+            rusqlite::params![item.task_id, item.owner, item.repo, item.number as i64],
+            |row| row.get(0),
+        )?;
+        let gate_satisfied: bool = transaction.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM task_pull_requests
+                WHERE task_id = ?1 AND status NOT IN ('approved', 'merged', 'cancelled')
+             )",
+            [&item.task_id],
+            |row| row.get(0),
+        )?;
+        if !item_satisfied || !gate_satisfied {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let mut statement = transaction.prepare(
+            "SELECT id, context FROM tasks
+             WHERE parent_task_id = ?1 AND status != 'completed'",
+        )?;
+        let reported_subtask_ids = statement
+            .query_map([&item.task_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(id, context)| {
+                context
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|value| {
+                        (value.get("origin").and_then(Value::as_str) == Some("native_plan"))
+                            .then_some(id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        drop(statement);
+        let completed_at = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        for subtask_id in reported_subtask_ids {
+            transaction.execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
+                 WHERE id = ?2",
+                rusqlite::params![completed_at, subtask_id],
+            )?;
+        }
+        let subtasks_complete: bool = transaction.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM tasks
+                WHERE parent_task_id = ?1 AND status != 'completed'
+             )",
+            [&item.task_id],
+            |row| row.get(0),
+        )?;
+        let has_open_attempt: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM work_attempts WHERE task_id = ?1
+                AND status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
+             )",
+            [&item.task_id],
+            |row| row.get(0),
+        )?;
+        if !subtasks_complete || has_open_attempt {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        transaction.execute(
+            "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'assistant', ?2)",
+            rusqlite::params![item.task_id, message],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
+             WHERE id = ?2 AND status NOT IN ('completed', 'cancelled')",
+            rusqlite::params![completed_at, item.task_id],
+        )?;
+        if changed != 1 {
+            return Err(Error::Task(
+                "review completion lost ownership of the task status transition".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(Some((agent_id, parent_task_id)))
+    })?;
+    let Some((agent_id, parent_task_id)) = completion else {
+        return Ok(());
+    };
+    if let Some(parent_task_id) = parent_task_id {
+        let _ = TaskBoard::new(db.clone()).complete_and_roll_up(&parent_task_id, None)?;
+    }
+    if let Some(agent_id) = agent_id.filter(|agent_id| !agent_id.trim().is_empty()) {
+        SessionManager::new(db.clone()).refresh_status(&agent_id)?;
+    }
     Ok(())
 }
 
@@ -1207,6 +1318,7 @@ fn truncate(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::tasks::board::CreateTask;
+    use crate::tasks::conversation::TaskConversation;
 
     fn setup_task(context: Option<Value>) -> (Arc<Database>, String) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -1248,17 +1360,20 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        manager
-            .mark_terminal(&registered, ReviewOutcome::Approved)
-            .unwrap();
+        finalize_if_satisfied(&manager.db, &registered, ReviewOutcome::Approved).unwrap();
         assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Satisfied);
         assert_eq!(
             TaskBoard::new(manager.db.clone())
-                .complete_and_roll_up(&task_id, Some("project-codex"))
+                .get(&task_id)
                 .unwrap()
-                .len(),
-            1
+                .status,
+            TaskStatus::Completed
         );
+        let messages = TaskConversation::new(manager.db.clone())
+            .get_messages(&task_id)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("GitHub review complete"));
     }
 
     #[test]
@@ -1438,6 +1553,83 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert!(messages[0].content.contains("The pull request was closed."));
+    }
+
+    #[test]
+    fn task_cancellation_atomically_retires_an_attention_monitor() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let item = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        require_user_attention(&db, &item, "The pull request was closed.").unwrap();
+
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "cancelled", None)
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get(&task_id, "XpressAI", "xpressclaw", 151)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::None);
+    }
+
+    #[test]
+    fn approval_finalization_does_not_mutate_a_cancelled_task_or_plan() {
+        let (db, task_id) = setup_task(None);
+        let board = TaskBoard::new(db.clone());
+        let manager = GithubReviewManager::new(db.clone());
+        let item = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        let plan_step = board
+            .create(&CreateTask {
+                title: "Run the tests".into(),
+                description: None,
+                agent_id: Some("project-codex".into()),
+                parent_task_id: Some(task_id.clone()),
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: Some(serde_json::json!({"origin": "native_plan"})),
+            })
+            .unwrap();
+
+        // Models cancellation after the poll captured `item` but before the
+        // approval response returned from GitHub.
+        board.update_status(&task_id, "cancelled", None).unwrap();
+        finalize_if_satisfied(&db, &item, ReviewOutcome::Approved).unwrap();
+
+        assert_eq!(board.get(&task_id).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(
+            board.get(&plan_step.id).unwrap().status,
+            TaskStatus::Pending
+        );
+        assert_eq!(
+            manager
+                .get(&task_id, "XpressAI", "xpressclaw", 151)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
