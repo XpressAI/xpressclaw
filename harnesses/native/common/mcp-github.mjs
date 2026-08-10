@@ -589,6 +589,40 @@ export async function collectReviewThreads(fetchPage) {
   }
 }
 
+export async function collectReviewThreadComments(threads, fetchPage) {
+  const complete = [];
+  for (const thread of threads) {
+    let connection = thread?.comments;
+    if (!connection || !Array.isArray(connection.nodes)) {
+      throw new Error('GitHub returned invalid pull-request review-thread comments');
+    }
+    const comments = [...connection.nodes];
+    const seenCursors = new Set();
+    while (connection.pageInfo?.hasNextPage === true) {
+      const cursor = connection.pageInfo?.endCursor;
+      if (typeof cursor !== 'string' || !cursor || seenCursors.has(cursor)) {
+        throw new Error('GitHub returned an invalid or repeated review-thread comment page cursor');
+      }
+      seenCursors.add(cursor);
+
+      const response = await fetchPage(thread.id, cursor);
+      if (Array.isArray(response.errors) && response.errors.length > 0) {
+        throw new Error(`GitHub GraphQL returned errors: ${JSON.stringify(response.errors)}`);
+      }
+      connection = response.data?.node?.comments;
+      if (!connection || !Array.isArray(connection.nodes)) {
+        throw new Error('GitHub returned invalid pull-request review-thread comments');
+      }
+      comments.push(...connection.nodes);
+    }
+    complete.push({
+      ...thread,
+      comments: { ...connection, nodes: comments },
+    });
+  }
+  return complete;
+}
+
 async function reviewThreads(args) {
   const command = args[2];
   if (command === 'list') {
@@ -605,7 +639,10 @@ async function reviewThreads(args) {
               id path line originalLine startLine diffSide isResolved isOutdated
               viewerCanReply viewerCanResolve viewerCanUnresolve
               resolvedBy{login}
-              comments(first:100){nodes{id databaseId author{login} body createdAt updatedAt url replyTo{id}}}
+              comments(first:100){
+                nodes{id databaseId author{login} body createdAt updatedAt url replyTo{id}}
+                pageInfo{hasNextPage endCursor}
+              }
             }
             pageInfo{hasNextPage endCursor}
           }
@@ -621,10 +658,24 @@ async function reviewThreads(args) {
       if (after !== undefined) fields.push(['after', after]);
       return graphql(query, fields);
     });
+    const commentsQuery = `query($threadId:ID!,$after:String!){
+      node(id:$threadId){
+        ... on PullRequestReviewThread{
+          comments(first:100,after:$after){
+            nodes{id databaseId author{login} body createdAt updatedAt url replyTo{id}}
+            pageInfo{hasNextPage endCursor}
+          }
+        }
+      }
+    }`;
+    const completeThreads = await collectReviewThreadComments(
+      threads,
+      (threadId, after) => graphql(commentsQuery, [['threadId', threadId], ['after', after]]),
+    );
     return {
       exit_code: 0,
       pull_request: number,
-      threads,
+      threads: completeThreads,
     };
   }
 

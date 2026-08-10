@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  collectReviewThreadComments,
   collectReviewThreads,
   commandResultIsError,
   executeCommandWithReviewLifecycle,
@@ -64,6 +65,73 @@ test('rejects repeated pull-request review-thread cursors', async () => {
       },
     })),
     /invalid or repeated review-thread page cursor/,
+  );
+});
+
+test('paginates comments within every pull-request review thread', async () => {
+  const pages = [];
+  const threads = await collectReviewThreadComments(
+    [
+      {
+        id: 'thread-1',
+        comments: {
+          nodes: [{ id: 'comment-1' }],
+          pageInfo: { hasNextPage: true, endCursor: 'comment-cursor-1' },
+        },
+      },
+      {
+        id: 'thread-2',
+        comments: {
+          nodes: [{ id: 'comment-3' }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    ],
+    async (threadId, after) => {
+      pages.push([threadId, after]);
+      return {
+        data: {
+          node: {
+            comments: {
+              nodes: [{ id: 'comment-2' }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      };
+    },
+  );
+
+  assert.deepEqual(pages, [['thread-1', 'comment-cursor-1']]);
+  assert.deepEqual(threads[0].comments.nodes, [
+    { id: 'comment-1' },
+    { id: 'comment-2' },
+  ]);
+  assert.deepEqual(threads[1].comments.nodes, [{ id: 'comment-3' }]);
+});
+
+test('rejects repeated pull-request review-thread comment cursors', async () => {
+  await assert.rejects(
+    collectReviewThreadComments(
+      [{
+        id: 'thread-1',
+        comments: {
+          nodes: [],
+          pageInfo: { hasNextPage: true, endCursor: 'same-cursor' },
+        },
+      }],
+      async () => ({
+        data: {
+          node: {
+            comments: {
+              nodes: [],
+              pageInfo: { hasNextPage: true, endCursor: 'same-cursor' },
+            },
+          },
+        },
+      }),
+    ),
+    /invalid or repeated review-thread comment page cursor/,
   );
 });
 
