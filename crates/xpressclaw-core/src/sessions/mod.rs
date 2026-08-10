@@ -493,6 +493,115 @@ impl SessionManager {
         self.get_attempt(attempt_id)
     }
 
+    /// Cancel every live attempt for a task before any asynchronous container
+    /// cleanup begins. Selecting the attempts and transitioning the attempts,
+    /// queued dispatches, task, active-attempt pointer, logical sessions, and
+    /// pull-request review gates happen together so work enqueued immediately
+    /// before cancellation cannot survive it.
+    ///
+    /// `None` means the task already completed in another path, so the caller
+    /// must preserve that terminal state. Otherwise the returned attempts are
+    /// the ones whose containers and running dispatch leases need cleanup.
+    pub fn cancel_task_attempts(
+        &self,
+        task_id: &str,
+        summary: &str,
+    ) -> Result<Option<Vec<WorkAttempt>>> {
+        let attempts = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let task_status: String = transaction.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if task_status == "completed" {
+                transaction.commit()?;
+                return Ok::<_, Error>(None);
+            }
+
+            let mut statement = transaction.prepare(
+                "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                        native_session_id, container_id, result, error_message,
+                        created_at, started_at, completed_at, context_used, context_size
+                 FROM work_attempts
+                 WHERE task_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 ORDER BY created_at ASC",
+            )?;
+            let attempts = statement
+                .query_map([task_id], row_to_attempt)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+
+            transaction.execute(
+                "UPDATE work_attempts SET status = 'cancelled',
+                    completed_at = CURRENT_TIMESTAMP, error_message = NULL
+                 WHERE task_id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                [task_id],
+            )?;
+            // Queued dispatches are safe to release immediately because their
+            // attempts are now terminal. Running rows remain the retained
+            // container lease until the caller finishes asynchronous cleanup.
+            transaction.execute(
+                "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                    harness_response = 'cancelled by user'
+                 WHERE task_id = ?1 AND status = 'queued'",
+                [task_id],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET status = 'cancelled', completed_at = NULL,
+                    active_attempt_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'completed'",
+                [task_id],
+            )?;
+            transaction.execute(
+                "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                    last_checked_at = CURRENT_TIMESTAMP, last_error = NULL
+                WHERE task_id = ?1 AND status IN ('waiting', 'attention')",
+                [task_id],
+            )?;
+            let mut session_ids = attempts
+                .iter()
+                .map(|attempt| attempt.session_id.as_str())
+                .collect::<Vec<_>>();
+            session_ids.sort_unstable();
+            session_ids.dedup();
+            for session_id in session_ids {
+                let session_status = self.derive_status_with_conn(&transaction, session_id)?;
+                transaction.execute(
+                    "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                    rusqlite::params![session_status, summary, session_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(Some(attempts))
+        })?;
+
+        let Some(attempts) = attempts else {
+            return Ok(None);
+        };
+        let mut cancelled = Vec::with_capacity(attempts.len());
+        for attempt in attempts {
+            self.append_event(
+                &attempt.session_id,
+                NewEvent {
+                    attempt_id: Some(&attempt.id),
+                    task_id: Some(task_id),
+                    source_type: "runner",
+                    source_id: Some(&attempt.runner),
+                    event_type: "attempt_cancelled",
+                    summary,
+                    payload: json!({ "status": "cancelled", "error": Value::Null }),
+                },
+            )?;
+            cancelled.push(self.get_attempt(&attempt.id)?);
+        }
+        Ok(Some(cancelled))
+    }
+
     pub fn set_container(&self, attempt_id: &str, container_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(

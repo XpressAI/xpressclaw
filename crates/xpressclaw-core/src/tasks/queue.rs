@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
@@ -91,6 +92,158 @@ impl TaskQueue {
 
         id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
             .transpose()
+    }
+
+    /// Add GitHub review feedback and enqueue a continuation for the task's
+    /// current assignment as one atomic unit.
+    ///
+    /// GitHub review polling performs network I/O before it knows a follow-up
+    /// is necessary. The task may be reassigned or cancelled during that
+    /// await, so callers must not reuse the agent or status from their older
+    /// polling snapshot here. A terminal task returns `None` without adding a
+    /// message or creating work.
+    pub(crate) fn enqueue_review_follow_up_for_current_agent(
+        &self,
+        task_id: &str,
+        message: &str,
+    ) -> Result<Option<(String, Option<QueueItem>)>> {
+        let outcome = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let (agent_id, title, description, context, status): (
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+            ) = transaction.query_row(
+                "SELECT agent_id, title, description, context, status
+                 FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok::<_, Error>(None);
+            }
+            let agent_id = agent_id
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Task("cannot queue review feedback for an unassigned task".into())
+                })?;
+            transaction.execute(
+                "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'user', ?2)",
+                rusqlite::params![task_id, message],
+            )?;
+            let already_queued: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if already_queued {
+                transaction.execute(
+                    "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [task_id],
+                )?;
+                transaction.commit()?;
+                return Ok::<_, Error>(Some((agent_id, None)));
+            }
+
+            transaction.execute(
+                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+                rusqlite::params![task_id, agent_id],
+            )?;
+            let queue_id = transaction.last_insert_rowid();
+            let context = context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+            let kind = context
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_type = context
+                .as_ref()
+                .and_then(|value| value.get("origin"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_id = context
+                .as_ref()
+                .and_then(|value| value.get("source_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(task_id);
+            let prompt = match description {
+                Some(description) if !description.trim().is_empty() => {
+                    format!("{title}\n\n{description}")
+                }
+                _ => title,
+            };
+            let attempt_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO work_attempts
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6)",
+                rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
+            )?;
+            transaction.execute(
+                "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+                rusqlite::params![attempt_id, queue_id],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                    status = 'in_progress', completed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![agent_id, attempt_id, task_id],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'running'",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO session_events
+                 (session_id, attempt_id, task_id, source_type, source_id,
+                  event_type, summary, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'attempt_queued', 'Work queued', ?6)",
+                rusqlite::params![
+                    agent_id,
+                    attempt_id,
+                    task_id,
+                    source_type,
+                    source_id,
+                    serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
+                        .to_string(),
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions
+                 SET latest_summary = 'Work queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [&agent_id],
+            )?;
+            transaction.commit()?;
+            Ok(Some((agent_id, Some(queue_id))))
+        })?;
+
+        let Some((agent_id, queue_id)) = outcome else {
+            return Ok(None);
+        };
+        let item = queue_id.map(|queue_id| self.get(queue_id)).transpose()?;
+        Ok(Some((agent_id, item)))
     }
 
     fn create_attempt_for_item(&self, id: i64, task_id: &str, agent_id: &str) -> Result<QueueItem> {
@@ -245,6 +398,15 @@ impl TaskQueue {
                                      )
                                      OR active_owner.container_id IS NOT NULL
                                  )
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_pull_requests monitored_pr
+                               JOIN tasks monitored_task
+                                 ON monitored_task.id = monitored_pr.task_id
+                               WHERE monitored_pr.agent_id = q.agent_id
+                                 AND monitored_pr.task_id != q.task_id
+                                 AND monitored_pr.status IN ('waiting', 'attention')
+                                 AND monitored_task.status NOT IN ('completed', 'cancelled')
                            )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
                         [],
@@ -467,7 +629,7 @@ fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::board::{CreateTask, TaskBoard};
+    use crate::tasks::board::{CreateTask, TaskBoard, TaskStatus};
 
     fn setup() -> (Arc<Database>, TaskQueue) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -738,6 +900,131 @@ mod tests {
     }
 
     #[test]
+    fn atomic_attempt_cancellation_blocks_review_enqueue_before_cleanup() {
+        use crate::workers::github_review::{GithubReviewGate, GithubReviewManager};
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Cancel while GitHub is polling".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let reviews = GithubReviewManager::new(db.clone());
+        reviews
+            .register(
+                &task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+
+        let cancelled = sessions
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, attempt_id);
+        assert_eq!(cancelled[0].status, "cancelled");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::None);
+        assert!(queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .is_none());
+        let queued_follow_ups: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1 AND status = 'queued'",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(queued_follow_ups, 0);
+    }
+
+    #[test]
+    fn task_cancellation_retires_feedback_enqueued_before_the_transaction() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Cancel after a stale active-attempt read".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        let running_attempt = running.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(running_attempt, "running", "Working", None, None)
+            .unwrap();
+
+        // This is the interleaving from the review: cancellation previously
+        // read the running attempt, then feedback replaced active_attempt_id
+        // with a newly queued continuation before cancellation committed.
+        let (_, queued) = queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .unwrap();
+        let queued = queued.unwrap();
+        let queued_attempt = queued.attempt_id.as_deref().unwrap();
+
+        let cancelled = sessions
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(
+            sessions.get_attempt(running_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            sessions.get_attempt(queued_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(queue.get(running.id).unwrap().status, "running");
+        assert_eq!(queue.get(queued.id).unwrap().status, "failed");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        let active_attempt_id: Option<String> = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(active_attempt_id.is_none());
+        assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
     fn claimed_dispatch_serializes_project_before_container_startup() {
         let (db, queue) = setup();
         let board = TaskBoard::new(db);
@@ -761,6 +1048,110 @@ mod tests {
         // to transition the attempt or attach the shared project container.
         assert!(queue.claim_next().unwrap().is_some());
         assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_pr_review_reserves_agent_lane_but_allows_same_task_follow_up() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                title: "Must wait for review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db.clone())
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let waiting = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+
+        let follow_up = queue
+            .enqueue_continuation(&review_task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, follow_up.id);
+        assert_eq!(queue.get(waiting.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn terminal_pull_request_releases_lane_while_task_has_remaining_work() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                title: "Run after review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db.clone())
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let next = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_pull_requests SET status = 'approved' WHERE task_id = ?1",
+                [&review_task.id],
+            )?;
+            Ok::<_, crate::error::Error>(())
+        })
+        .unwrap();
+        assert_eq!(
+            board.get(&review_task.id).unwrap().status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, next.id);
     }
 
     #[test]

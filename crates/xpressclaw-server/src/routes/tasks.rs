@@ -15,6 +15,7 @@ use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
+use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
 
 use crate::state::AppState;
 
@@ -85,6 +86,25 @@ pub struct ElicitationResponseInput {
     pub message: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct PullRequestInput {
+    pub url: Option<String>,
+    pub agent_id: String,
+    pub registration_id: Option<String>,
+    pub registration_key: Option<String>,
+    #[serde(default)]
+    pub phase: PullRequestRegistrationPhase,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestRegistrationPhase {
+    Begin,
+    #[default]
+    Register,
+    Cancel,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
@@ -102,11 +122,133 @@ pub fn routes() -> Router<AppState> {
             get(get_message_attachment),
         )
         .route("/{id}/activity", get(get_activity))
+        .route("/{id}/pull-requests", post(register_pull_request))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",
             post(respond_to_elicitation),
         )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
+}
+
+async fn register_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PullRequestInput>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let config = state.config();
+    let agent = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == request.agent_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "the assigned agent is not configured" })),
+            )
+        })?;
+    let workspace = native::resolved_workspace(&config, agent);
+    let access = github::discover(&state.db, &workspace).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+        )
+    })?;
+    let manager = GithubReviewManager::new(state.db.clone());
+    match request.phase {
+        PullRequestRegistrationPhase::Begin => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            let (registration_id, reused) = manager
+                .begin_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "status": "registration_pending",
+                    "registration_id": registration_id,
+                    "reused": reused,
+                })),
+            ))
+        }
+        PullRequestRegistrationPhase::Register => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            let url = request.url.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "pull-request registration requires a URL" })),
+                )
+            })?;
+            let pull_request = manager
+                .register_pending(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    url,
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((StatusCode::CREATED, Json(json!(pull_request))))
+        }
+        PullRequestRegistrationPhase::Cancel => {
+            let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
+            manager
+                .cancel_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                    registration_key,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "status": "registration_cancelled" })),
+            ))
+        }
+    }
+}
+
+fn registration_id(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_id.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration ID" })),
+        )
+    })
+}
+
+fn registration_key(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_key.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration key" })),
+        )
+    })
+}
+
+fn pull_request_registration_error(
+    error: xpressclaw_core::error::Error,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Task(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        _ => internal_error(error),
+    }
 }
 
 async fn list_tasks(
@@ -268,14 +410,29 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
+    let agent_repository = new_agent
+        .as_deref()
+        .and_then(|agent_id| github_access_for_agent(&state, agent_id));
 
-    let task = board.update(&id, &req).map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e.to_string() })),
-        ),
-        _ => internal_error(e),
-    })?;
+    let task = board
+        .update_with_agent_repository(
+            &id,
+            &req,
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
+        .map_err(|e| match &e {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            xpressclaw_core::error::Error::Task(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            _ => internal_error(e),
+        })?;
 
     // If agent was assigned and task is actionable, enqueue for dispatcher
     if let Some(ref agent_id) = new_agent {
@@ -320,58 +477,62 @@ async fn update_task_status(
         ));
     }
     if req.status == "cancelled" {
-        let active_attempt_id = state
+        let sessions = SessionManager::new(state.db.clone());
+        let Some(cancelled) = sessions
+            .cancel_task_attempts(&id, "Work cancelled by user")
+            .map_err(internal_error)?
+        else {
+            return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
+        };
+        state.elicitations.cancel_task(&id);
+
+        let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
+        for attempt in &cancelled {
+            state.elicitations.cancel_attempt(&attempt.id);
+            sessions_to_stop
+                .entry(attempt.session_id.clone())
+                .and_modify(|has_container| {
+                    *has_container |= attempt.container_id.is_some();
+                })
+                .or_insert(attempt.container_id.is_some());
+        }
+        let docker = state.docker().await;
+        let mut stopped_sessions = std::collections::BTreeSet::new();
+        for (session_id, has_container) in sessions_to_stop {
+            let stopped = if !has_container {
+                true
+            } else if let Some(docker) = docker.as_ref() {
+                docker.stop_preserving(&session_id).await.is_ok()
+            } else {
+                false
+            };
+            if stopped {
+                stopped_sessions.insert(session_id);
+            }
+        }
+        for attempt in &cancelled {
+            if stopped_sessions.contains(&attempt.session_id) {
+                let _ = sessions.clear_container(&attempt.id);
+            }
+        }
+        // Running dispatch rows are the lease on a retained project
+        // container. Release them only after every affected session has had
+        // its stop attempt; queued rows were failed in the atomic transition.
+        state
             .db
             .with_conn(|conn| {
-                let attempt_id = conn.query_row(
-                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
-                    [&id],
-                    |row| row.get::<_, Option<String>>(0),
-                )?;
-                Ok::<_, xpressclaw_core::error::Error>(attempt_id)
+                for queue_id in cancelled.iter().filter_map(|attempt| attempt.queue_id) {
+                    conn.execute(
+                        "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                            harness_response = 'cancelled by user'
+                         WHERE id = ?1 AND status = 'running'",
+                        [queue_id],
+                    )?;
+                }
+                Ok::<_, xpressclaw_core::error::Error>(())
             })
             .map_err(internal_error)?;
-        if let Some(attempt_id) = active_attempt_id {
-            let sessions = SessionManager::new(state.db.clone());
-            let cancelled = sessions
-                .transition_attempt(
-                    &attempt_id,
-                    "cancelled",
-                    "Work cancelled by user",
-                    None,
-                    None,
-                )
-                .map_err(internal_error)?;
-            if cancelled.status != "cancelled" {
-                return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
-            }
-            state.elicitations.cancel_attempt(&attempt_id);
-            let mut container_stopped = cancelled.container_id.is_none();
-            if let Some(docker) = state.docker().await {
-                container_stopped = docker.stop_preserving(&cancelled.session_id).await.is_ok();
-            }
-            if container_stopped {
-                let _ = sessions.clear_container(&attempt_id);
-            }
-            // Keep this dispatch marked running until the shared project
-            // container is stopped. That prevents a queued turn from
-            // restarting it just before this cancellation path kills it.
-            if let Some(queue_id) = cancelled.queue_id {
-                state
-                    .db
-                    .with_conn(|conn| {
-                        conn.execute(
-                            "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                                harness_response = 'cancelled by user' WHERE id = ?1",
-                            [queue_id],
-                        )?;
-                        Ok::<_, xpressclaw_core::error::Error>(())
-                    })
-                    .map_err(internal_error)?;
-            }
-        } else {
-            state.elicitations.cancel_task(&id);
-        }
+        return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
     }
     let updated = if req.status == "completed" {
         board
@@ -383,7 +544,18 @@ async fn update_task_status(
                     .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
             })
     } else {
-        board.update_status(&id, &req.status, req.agent_id.as_deref())
+        let agent_repository = req
+            .agent_id
+            .as_deref()
+            .and_then(|agent_id| github_access_for_agent(&state, agent_id));
+        board.update_status_with_agent_repository(
+            &id,
+            &req.status,
+            req.agent_id.as_deref(),
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
     };
     let task = updated.map_err(|e| match &e {
         xpressclaw_core::error::Error::TaskNotFound { .. } => (
@@ -397,6 +569,16 @@ async fn update_task_status(
         _ => internal_error(e),
     })?;
     Ok(Json(json!(task)))
+}
+
+fn github_access_for_agent(
+    state: &AppState,
+    agent_id: &str,
+) -> Option<github::GithubSessionAccess> {
+    let config = state.config();
+    let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
+    let workspace = native::resolved_workspace(&config, agent);
+    github::discover(&state.db, &workspace)
 }
 
 async fn task_counts(

@@ -14,7 +14,11 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 
 const GITHUB_HOST: &str = "github.com";
-const GITHUB_MCP_COMMAND: &str = "/opt/xpressclaw/mcp-github.mjs";
+const GITHUB_MCP_COMMAND: &str = "/usr/local/bin/node";
+const BUNDLED_GITHUB_MCP_SOURCE: &str = concat!(
+    include_str!("../../../../harnesses/native/common/mcp-github.mjs"),
+    "\nawait main();\n"
+);
 const CODEX_CONFIG_ENV: &str = "CODEX_CONFIG";
 const GITHUB_GUIDANCE_MARKER: &str = "XpressClaw GitHub runtime:";
 const GITHUB_CODEX_DEVELOPER_INSTRUCTIONS: &str = "\
@@ -29,6 +33,24 @@ follow `gh`. Use shell `git` for branches, commits, fetches, pushes, rebases, \
 and other local Git operations. Use the MCP tool for pull requests, checks, \
 Actions, issues, and review threads. Repository selection and authentication \
 are already fixed by XpressClaw.";
+const GITHUB_REVIEW_LIFECYCLE_INSTRUCTIONS: &str = "\
+For ordinary XpressClaw tasks, a pull request that is ready for a person to \
+review must be published as ready for review, not left as a draft. This \
+instruction overrides generic publishing guidance that defaults to draft pull \
+requests. After publishing, do not declare the task complete: XpressClaw keeps \
+the task active and will resume this same conversation when review feedback \
+arrives. Address every actionable review comment, reply and resolve threads \
+after the corresponding fix is pushed, keep CI green, and leave the pull \
+request ready for review. XpressClaw completes the task only after approval or \
+merge.";
+
+#[derive(Debug, Clone)]
+pub struct GithubTaskContext {
+    pub control_plane_url: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub review_lifecycle: bool,
+}
 
 /// Credentials and repository context made available to one short-lived
 /// worker. Deliberately omit the token from `Debug` so future diagnostics do
@@ -59,32 +81,84 @@ impl GithubSessionAccess {
     /// ACP requires every agent to support stdio MCP servers. The real `gh`
     /// binary is kept out of the worker PATH and is only reachable through
     /// this argument-validating MCP process.
-    pub fn mcp_server(&self) -> McpServer {
-        McpServer::Stdio(McpServerStdio::new("github", GITHUB_MCP_COMMAND).env(vec![
+    pub fn mcp_server(&self, task: Option<&GithubTaskContext>) -> McpServer {
+        let mut env = vec![
             EnvVariable::new("GH_TOKEN", self.token.clone()),
             EnvVariable::new("GH_HOST", GITHUB_HOST),
             EnvVariable::new("GH_REPO", self.repository()),
             EnvVariable::new("NO_COLOR", "1"),
-        ]))
+        ];
+        if let Some(task) = task {
+            env.extend([
+                EnvVariable::new("XPRESSCLAW_URL", &task.control_plane_url),
+                EnvVariable::new("XPRESSCLAW_TASK_ID", &task.task_id),
+                EnvVariable::new("XPRESSCLAW_AGENT_ID", &task.agent_id),
+            ]);
+            if task.review_lifecycle {
+                env.push(EnvVariable::new("XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE", "1"));
+            }
+        }
+        McpServer::Stdio(
+            McpServerStdio::new("github", GITHUB_MCP_COMMAND)
+                .args(vec![
+                    "--input-type=module".to_string(),
+                    "--eval".to_string(),
+                    BUNDLED_GITHUB_MCP_SOURCE.to_string(),
+                ])
+                .env(env),
+        )
+    }
+
+    /// Read one repository-relative GitHub REST resource.
+    pub(crate) async fn api_get(&self, path: &str) -> Result<Value> {
+        let url = self.api_url(path)?;
+        reqwest::Client::new()
+            .get(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header(reqwest::header::USER_AGENT, "xpressclaw-review-lifecycle")
+            .send()
+            .await
+            .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?
+            .error_for_status()
+            .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?
+            .json::<Value>()
+            .await
+            .map_err(|error| Error::Backend(format!("invalid GitHub response: {error}")))
+    }
+
+    /// Run a project-scoped GraphQL query. Variables still contain the fixed
+    /// owner/repository; callers cannot replace credentials or the host.
+    pub(crate) async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        reqwest::Client::new()
+            .post("https://api.github.com/graphql")
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header(reqwest::header::USER_AGENT, "xpressclaw-review-lifecycle")
+            .json(&json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?
+            .error_for_status()
+            .map_err(|error| Error::Backend(format!("GitHub request failed: {error}")))?
+            .json::<Value>()
+            .await
+            .map_err(|error| Error::Backend(format!("invalid GitHub response: {error}")))
     }
 
     /// Read every page of one repository-relative GitHub REST collection.
     /// The path is joined beneath the already-scoped owner/repository, and
     /// credentials never leave this module.
     pub async fn api_get_pages(&self, path: &str) -> Result<Vec<Value>> {
-        let path = path.trim_start_matches('/');
-        if path.contains("..") || path.contains("//") {
-            return Err(Error::Backend("invalid GitHub API path".into()));
-        }
         let client = reqwest::Client::new();
         let mut values = Vec::new();
         // Pull-request review threads can exceed one page. A high finite cap
         // avoids an unbounded poll if GitHub returns a malformed response.
         for page in 1..=100 {
-            let url = format!(
-                "https://api.github.com/repos/{}/{}/{path}?per_page=100&page={page}",
-                self.owner, self.repo
-            );
+            let separator = if path.contains('?') { '&' } else { '?' };
+            let url = format!("{}{separator}per_page=100&page={page}", self.api_url(path)?);
             let response = client
                 .get(url)
                 .bearer_auth(&self.token)
@@ -107,6 +181,17 @@ impl GithubSessionAccess {
             }
         }
         Ok(values)
+    }
+
+    fn api_url(&self, path: &str) -> Result<String> {
+        let path = path.trim_start_matches('/');
+        if path.contains("..") || path.contains("//") {
+            return Err(Error::Backend("invalid GitHub API path".into()));
+        }
+        Ok(format!(
+            "https://api.github.com/repos/{}/{}/{path}",
+            self.owner, self.repo
+        ))
     }
 }
 
@@ -178,7 +263,10 @@ pub fn extend_git_environment(environment: &mut Vec<String>, github: Option<&Git
 ///
 /// Preserve all user-supplied CODEX_CONFIG values and append to existing
 /// developer instructions rather than replacing them.
-pub fn add_codex_mcp_guidance(environment: &mut HashMap<String, String>) -> Result<()> {
+pub fn add_codex_mcp_guidance(
+    environment: &mut HashMap<String, String>,
+    review_lifecycle: bool,
+) -> Result<()> {
     let mut config = match environment.get(CODEX_CONFIG_ENV) {
         Some(raw) => serde_json::from_str::<Value>(raw).map_err(|error| {
             Error::Backend(format!(
@@ -202,10 +290,17 @@ pub fn add_codex_mcp_guidance(environment: &mut HashMap<String, String>) -> Resu
         }
     };
     if !existing.contains(GITHUB_GUIDANCE_MARKER) {
-        let combined = if existing.trim().is_empty() {
-            GITHUB_CODEX_DEVELOPER_INSTRUCTIONS.to_string()
+        let instructions = if review_lifecycle {
+            format!(
+                "{GITHUB_CODEX_DEVELOPER_INSTRUCTIONS}\n\n{GITHUB_REVIEW_LIFECYCLE_INSTRUCTIONS}"
+            )
         } else {
-            format!("{existing}\n\n{GITHUB_CODEX_DEVELOPER_INSTRUCTIONS}")
+            GITHUB_CODEX_DEVELOPER_INSTRUCTIONS.to_string()
+        };
+        let combined = if existing.trim().is_empty() {
+            instructions
+        } else {
+            format!("{existing}\n\n{instructions}")
         };
         object.insert(
             "developer_instructions".to_string(),
@@ -347,7 +442,7 @@ mod tests {
             repo: "xpressclaw".into(),
             token: "secret".into(),
         };
-        let value = serde_json::to_value(access.mcp_server()).unwrap();
+        let value = serde_json::to_value(access.mcp_server(None)).unwrap();
         assert!(value.get("type").is_none());
         assert_eq!(value["name"], "github");
         assert_eq!(value["command"], GITHUB_MCP_COMMAND);
@@ -356,6 +451,35 @@ mod tests {
             .unwrap()
             .iter()
             .any(|entry| entry["name"] == "GH_REPO" && entry["value"] == "XpressAI/xpressclaw"));
+        assert_eq!(value["args"][0], "--input-type=module");
+        assert_eq!(value["args"][1], "--eval");
+        assert!(value["args"][2].as_str().unwrap().contains("await main();"));
+    }
+
+    #[test]
+    fn ordinary_task_context_enables_review_registration_without_exposing_other_tasks() {
+        let access = GithubSessionAccess {
+            owner: "XpressAI".into(),
+            repo: "xpressclaw".into(),
+            token: "secret".into(),
+        };
+        let value = serde_json::to_value(access.mcp_server(Some(&GithubTaskContext {
+            control_plane_url: "http://host.docker.internal:8935".into(),
+            task_id: "task-123".into(),
+            agent_id: "xpressclaw-codex".into(),
+            review_lifecycle: true,
+        })))
+        .unwrap();
+        let env = value["env"].as_array().unwrap();
+        for (name, expected) in [
+            ("XPRESSCLAW_TASK_ID", "task-123"),
+            ("XPRESSCLAW_AGENT_ID", "xpressclaw-codex"),
+            ("XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE", "1"),
+        ] {
+            assert!(env
+                .iter()
+                .any(|entry| entry["name"] == name && entry["value"] == expected));
+        }
     }
 
     #[test]
@@ -393,7 +517,7 @@ mod tests {
     fn codex_config_explains_that_github_mcp_replaces_shell_gh() {
         let mut environment = HashMap::new();
 
-        add_codex_mcp_guidance(&mut environment).unwrap();
+        add_codex_mcp_guidance(&mut environment, true).unwrap();
 
         let config: Value =
             serde_json::from_str(environment.get(CODEX_CONFIG_ENV).unwrap()).unwrap();
@@ -402,6 +526,8 @@ mod tests {
         assert!(instructions.contains("intentionally absent from PATH"));
         assert!(instructions.contains("Do not run `gh --version`"));
         assert!(instructions.contains("Use shell `git`"));
+        assert!(instructions.contains("must be published as ready for review"));
+        assert!(instructions.contains("only after approval or merge"));
     }
 
     #[test]
@@ -415,8 +541,8 @@ mod tests {
             .to_string(),
         )]);
 
-        add_codex_mcp_guidance(&mut environment).unwrap();
-        add_codex_mcp_guidance(&mut environment).unwrap();
+        add_codex_mcp_guidance(&mut environment, true).unwrap();
+        add_codex_mcp_guidance(&mut environment, true).unwrap();
 
         let config: Value =
             serde_json::from_str(environment.get(CODEX_CONFIG_ENV).unwrap()).unwrap();
@@ -429,7 +555,7 @@ mod tests {
     #[test]
     fn codex_config_rejects_shapes_the_adapter_cannot_use() {
         let mut environment = HashMap::from([(CODEX_CONFIG_ENV.to_string(), "[]".to_string())]);
-        assert!(add_codex_mcp_guidance(&mut environment)
+        assert!(add_codex_mcp_guidance(&mut environment, false)
             .unwrap_err()
             .to_string()
             .contains("must be a JSON object"));
@@ -438,7 +564,7 @@ mod tests {
             CODEX_CONFIG_ENV.to_string(),
             json!({ "developer_instructions": 42 }).to_string(),
         )]);
-        assert!(add_codex_mcp_guidance(&mut environment)
+        assert!(add_codex_mcp_guidance(&mut environment, false)
             .unwrap_err()
             .to_string()
             .contains("must be a string"));

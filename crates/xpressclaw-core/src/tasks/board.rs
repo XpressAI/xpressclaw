@@ -426,17 +426,29 @@ impl TaskBoard {
         status: &str,
         agent_id: Option<&str>,
     ) -> Result<Task> {
+        self.update_status_with_agent_repository(task_id, status, agent_id, None)
+    }
+
+    pub fn update_status_with_agent_repository(
+        &self,
+        task_id: &str,
+        status: &str,
+        agent_id: Option<&str>,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let parsed = TaskStatus::parse(status)?;
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
+        let checked_at = Utc::now().to_rfc3339();
 
         {
             let conn = self.db.conn();
+            let transaction = conn.unchecked_transaction()?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -451,28 +463,61 @@ impl TaskBoard {
             // Update status. Reopening a completed task must also clear its
             // old completion timestamp so the API does not report two
             // conflicting states.
-            conn.execute(
+            transaction.execute(
                 "UPDATE tasks SET status = ?1, updated_at = ?2,
                     completed_at = CASE WHEN ?1 = 'completed' THEN ?2 ELSE NULL END
                  WHERE id = ?3",
                 rusqlite::params![status, now, task_id],
             )?;
 
+            // Release the external review gate in the same transaction as
+            // cancellation so a stale poll cannot revive it after a reopen.
+            if parsed == TaskStatus::Cancelled {
+                transaction.execute(
+                    "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                        last_checked_at = ?1, last_error = NULL
+                     WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+                    rusqlite::params![checked_at, task_id],
+                )?;
+            }
+
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
-                    conn.execute(
+                    let previous = synchronize_pull_request_agent(
+                        &transaction,
+                        task_id,
+                        aid,
+                        agent_repository,
+                    )?;
+                    transaction.execute(
                         "UPDATE tasks SET agent_id = ?1 WHERE id = ?2",
                         rusqlite::params![aid, task_id],
                     )?;
+                    if let Some(previous) = previous {
+                        refresh_logical_session_status(&transaction, &previous)?;
+                        if previous != aid {
+                            refresh_logical_session_status(&transaction, aid)?;
+                        }
+                    }
                 }
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
     }
 
     pub fn update(&self, task_id: &str, req: &UpdateTask) -> Result<Task> {
+        self.update_with_agent_repository(task_id, req, None)
+    }
+
+    pub fn update_with_agent_repository(
+        &self,
+        task_id: &str,
+        req: &UpdateTask,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
@@ -480,9 +525,10 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
+            let transaction = conn.unchecked_transaction()?;
 
             // Verify task exists
-            let exists: bool = conn.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT COUNT(*) FROM tasks WHERE id = ?1",
                 [task_id],
                 |row| row.get::<_, i64>(0).map(|c| c > 0),
@@ -495,32 +541,45 @@ impl TaskBoard {
             }
 
             if let Some(ref title) = req.title {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![title, now, task_id],
                 )?;
             }
 
             if let Some(ref desc) = req.description {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET description = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![desc, now, task_id],
                 )?;
             }
 
             if let Some(ref agent_id) = req.agent_id {
-                conn.execute(
+                let previous = synchronize_pull_request_agent(
+                    &transaction,
+                    task_id,
+                    agent_id,
+                    agent_repository,
+                )?;
+                transaction.execute(
                     "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![agent_id, now, task_id],
                 )?;
+                if let Some(previous) = previous {
+                    refresh_logical_session_status(&transaction, &previous)?;
+                    if previous != *agent_id {
+                        refresh_logical_session_status(&transaction, agent_id)?;
+                    }
+                }
             }
 
             if let Some(priority) = req.priority {
-                conn.execute(
+                transaction.execute(
                     "UPDATE tasks SET priority = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![priority, now, task_id],
                 )?;
             }
+            transaction.commit()?;
         }
 
         self.get(task_id)
@@ -641,40 +700,130 @@ impl TaskBoard {
                 .all(|subtask| subtask.status == TaskStatus::Completed))
     }
 
+    /// Complete the current ACP plan after an external lifecycle gate (such
+    /// as PR approval) finishes. Only ephemeral native-plan children are
+    /// affected; user-created and workflow subtasks retain their own state.
+    pub fn complete_reported_subtasks(&self, parent_task_id: &str) -> Result<usize> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, context FROM tasks
+                 WHERE parent_task_id = ?1 AND status != 'completed'",
+            )?;
+            let ids = statement
+                .query_map([parent_task_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .filter_map(|row| row.ok())
+                .filter_map(|(id, context)| {
+                    context
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|value| {
+                            (value.get("origin").and_then(|value| value.as_str())
+                                == Some("native_plan"))
+                            .then_some(id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            drop(statement);
+            for id in &ids {
+                conn.execute(
+                    "UPDATE tasks SET status = 'completed', updated_at = ?1,
+                        completed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, id],
+                )?;
+            }
+            Ok::<_, Error>(ids.len())
+        })
+    }
+
     /// Complete a task whose steps are done, then roll that completion through
     /// any ready parents. Parents with queued/running work are left active.
     pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
         let mut completed = Vec::new();
         let mut current_id = Some(task_id.to_string());
-        let mut first = true;
 
         while let Some(id) = current_id {
-            if !self.subtasks_complete(&id)? {
+            let Some(task) = self.complete_if_ready(&id)? else {
                 break;
-            }
-            if self.has_open_attempt(&id)? {
-                break;
-            }
-            let task = self.update_status(&id, "completed", if first { agent_id } else { None })?;
+            };
             current_id = task.parent_task_id.clone();
             completed.push(task);
-            first = false;
         }
+
+        // Completion does not change assignment. Keep this argument for API
+        // compatibility with callers that refresh the first task's session.
+        let _ = agent_id;
 
         Ok(completed)
     }
 
-    fn has_open_attempt(&self, task_id: &str) -> Result<bool> {
+    /// Complete one task only while every precondition and the nonterminal
+    /// status still hold in the same transaction.
+    fn complete_if_ready(&self, task_id: &str) -> Result<Option<Task>> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
         self.db.with_conn(|conn| {
-            conn.query_row(
+            let transaction = conn.unchecked_transaction()?;
+            let status: String = transaction.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let pull_request_gate_satisfied: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM task_pull_requests
+                    WHERE task_id = ?1 AND status NOT IN ('approved', 'merged', 'cancelled')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let subtasks_complete: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM tasks
+                    WHERE parent_task_id = ?1 AND status != 'completed'
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            let has_open_attempt: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM work_attempts WHERE task_id = ?1
                     AND status IN ('queued', 'preparing', 'running', 'waiting_for_input', 'review')
                 )",
                 [task_id],
                 |row| row.get(0),
-            )
-            .map_err(Error::from)
+            )?;
+            if !pull_request_gate_satisfied || !subtasks_complete || has_open_attempt {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
+                 WHERE id = ?2 AND status NOT IN ('completed', 'cancelled')",
+                rusqlite::params![now, task_id],
+            )?;
+            if changed != 1 {
+                transaction.commit()?;
+                return Ok(None);
+            }
+            let task = transaction.query_row(
+                "SELECT * FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok(row_to_task(row)),
+            )??;
+            transaction.commit()?;
+            Ok(Some(task))
         })
     }
 
@@ -887,6 +1036,177 @@ impl TaskBoard {
     }
 }
 
+fn synchronize_pull_request_agent(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+    agent_repository: Option<(&str, &str)>,
+) -> Result<Option<String>> {
+    let has_active_pull_request: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_pull_requests
+            WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if !has_active_pull_request {
+        return Ok(None);
+    }
+    if agent_id.trim().is_empty() {
+        return Err(Error::Task(
+            "cannot unassign a task while pull-request review monitoring is active".into(),
+        ));
+    }
+    let previous_agent_id: String = conn.query_row(
+        "SELECT agent_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let running_dispatch: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_queue
+            WHERE task_id = ?1 AND status = 'running'
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if previous_agent_id != agent_id && running_dispatch {
+        return Err(Error::Task(
+            "cannot reassign a task while its agent turn is running; stop it first".into(),
+        ));
+    }
+    if previous_agent_id != agent_id {
+        let Some((owner, repo)) = agent_repository else {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent's project-scoped GitHub repository could not be verified".into(),
+            ));
+        };
+        let incompatible_repository: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests
+                WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+                  AND (owner != ?2 COLLATE NOCASE OR repo != ?3 COLLATE NOCASE)
+             )",
+            rusqlite::params![task_id, owner, repo],
+            |row| row.get(0),
+        )?;
+        if incompatible_repository {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request to an agent using a different GitHub repository".into(),
+            ));
+        }
+        let destination_lane_reserved: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests destination_pr
+                JOIN tasks destination_task ON destination_task.id = destination_pr.task_id
+                WHERE destination_pr.agent_id = ?1
+                  AND destination_pr.task_id != ?2
+                  AND destination_pr.status IN ('waiting', 'attention')
+                  AND destination_task.status NOT IN ('completed', 'cancelled')
+             )",
+            rusqlite::params![agent_id, task_id],
+            |row| row.get(0),
+        )?;
+        if destination_lane_reserved {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent is already reserved by another active pull-request review task".into(),
+            ));
+        }
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+        [agent_id],
+    )?;
+    conn.execute(
+        "UPDATE task_pull_requests SET agent_id = ?1
+         WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE session_events SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE attempt_artifacts SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE work_attempts SET session_id = ?1
+         WHERE id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         ) AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE task_queue SET agent_id = ?1
+         WHERE task_id = ?2 AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE tasks SET session_id = ?1 WHERE id = ?2",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    Ok(Some(previous_agent_id))
+}
+
+fn refresh_logical_session_status(conn: &rusqlite::Connection, session_id: &str) -> Result<()> {
+    let active_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts
+            WHERE session_id = ?1 AND status IN ('preparing', 'running', 'review')
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let queued_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts WHERE session_id = ?1 AND status = 'queued'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let waiting_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'waiting_for_input'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let blocked_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'blocked'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let status = if active_attempt {
+        "running"
+    } else if queued_attempt {
+        "queued"
+    } else if waiting_task {
+        "waiting_for_input"
+    } else if blocked_task {
+        "blocked"
+    } else {
+        "idle"
+    };
+    conn.execute(
+        "UPDATE logical_sessions SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        rusqlite::params![status, session_id],
+    )?;
+    Ok(())
+}
+
 fn append_task_search(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -1038,6 +1358,250 @@ mod tests {
     }
 
     #[test]
+    fn task_reassignment_transfers_active_pull_request_monitoring() {
+        let (db, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Review ownership".to_string(),
+                agent_id: Some("project-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'project-codex', 'XpressAI', 'xpressclaw', 151,
+                         'https://github.com/XpressAI/xpressclaw/pull/151', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&task.id],
+            )
+            .unwrap();
+        });
+        let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+        let queued = queue
+            .enqueue_continuation(&task.id, "project-codex")
+            .unwrap()
+            .unwrap();
+        let attempt_id = queued.attempt_id.clone().unwrap();
+
+        let unavailable_error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("unverified-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(unavailable_error
+            .to_string()
+            .contains("could not be verified"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let incompatible_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("other-project-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "different-repository")),
+            )
+            .unwrap_err();
+        assert!(incompatible_error
+            .to_string()
+            .contains("different GitHub repository"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let destination_task = board
+            .create(&CreateTask {
+                title: "Existing destination review".to_string(),
+                agent_id: Some("reviewer-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'reviewer-codex', 'XpressAI', 'xpressclaw', 152,
+                         'https://github.com/XpressAI/xpressclaw/pull/152', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&destination_task.id],
+            )
+            .unwrap();
+        });
+        let reserved_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap_err();
+        assert!(reserved_error
+            .to_string()
+            .contains("already reserved by another active pull-request review task"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+        board
+            .update_status(&destination_task.id, "cancelled", None)
+            .unwrap();
+
+        let reassigned = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+                Some(("xpressai", "XPRESSCLAW")),
+            )
+            .unwrap();
+        assert_eq!(reassigned.agent_id.as_deref(), Some("reviewer-codex"));
+        let monitored_agent = || {
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id FROM task_pull_requests WHERE task_id = ?1",
+                    [&task.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+        };
+        assert_eq!(monitored_agent(), "reviewer-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "reviewer-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "reviewer-codex"
+        );
+        assert!(queue
+            .enqueue_continuation(&task.id, "reviewer-codex")
+            .unwrap()
+            .is_none());
+        let (task_session, event_session, previous_status, current_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = db
+            .with_conn(|conn| {
+                let task_session = conn.query_row(
+                    "SELECT session_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )?;
+                let event_session = conn.query_row(
+                    "SELECT session_id FROM session_events WHERE attempt_id = ?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )?;
+                let previous_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'project-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let current_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'reviewer-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok::<_, rusqlite::Error>((
+                    task_session,
+                    event_session,
+                    previous_status,
+                    current_status,
+                ))
+            })
+            .unwrap();
+        assert_eq!(task_session, "reviewer-codex");
+        assert_eq!(event_session, "reviewer-codex");
+        assert_eq!(previous_status, "idle");
+        assert_eq!(current_status, "queued");
+
+        board
+            .update_status_with_agent_repository(
+                &task.id,
+                "in_progress",
+                Some("final-codex"),
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap();
+        assert_eq!(monitored_agent(), "final-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "final-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "final-codex"
+        );
+
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some(String::new()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot unassign"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
+
+        assert_eq!(queue.claim("final-codex").unwrap().unwrap().id, queued.id);
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("late-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("turn is running"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
+    }
+
+    #[test]
     fn syncs_native_plan_steps_and_rolls_up_completion() {
         let (_, board) = setup();
         let parent = board
@@ -1097,6 +1661,30 @@ mod tests {
             .unwrap();
         assert_eq!(completed.len(), 1);
         assert_eq!(board.get(&parent.id).unwrap().status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn roll_up_never_overwrites_a_cancelled_task() {
+        let (_, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Cancelled work".to_string(),
+                description: None,
+                agent_id: Some("developer".to_string()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        board.update_status(&task.id, "cancelled", None).unwrap();
+
+        assert!(board
+            .complete_and_roll_up(&task.id, Some("developer"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
     }
 
     #[test]

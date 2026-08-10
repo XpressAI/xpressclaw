@@ -1,3 +1,4 @@
 pub mod acp;
-pub(crate) mod github;
+pub mod github;
+pub mod github_review;
 pub mod native;

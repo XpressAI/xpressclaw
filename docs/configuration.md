@@ -98,6 +98,15 @@ agent and runner image are trusted. It is not a security boundary.
 The retired `xpressclaw-native-runner:latest` tag is migrated to the image for
 the configured product when an older file is loaded.
 
+Codex starts in its `agent-full-access` mode by default. This disables Codex's
+nested filesystem sandbox and approval prompts **inside the Agent's retained
+project container**; Docker or Podman remains the security boundary, and the
+host container engine remains unavailable unless `container_engine: host` is
+explicitly selected. Set `runner.environment.INITIAL_AGENT_MODE` to another
+Codex ACP mode (for example, `agent`) when a project needs the additional inner
+sandbox. A mode selected through the Agent or task controls remains
+authoritative for that session.
+
 ## Multiple agents and control planes
 
 Use a separate working directory and `xpressclaw.yaml` for each independent
