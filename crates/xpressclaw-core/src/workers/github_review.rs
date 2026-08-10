@@ -7,7 +7,7 @@
 //! excluded because reusable workflows already model draft and wait steps
 //! explicitly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -98,6 +98,69 @@ impl GithubReviewManager {
         Self { db }
     }
 
+    /// Arm a fail-closed completion gate before the GitHub command publishes
+    /// or readies a pull request. The real PR registration atomically replaces
+    /// this sentinel; if that follow-up request is interrupted, the task stays
+    /// waiting for input instead of completing with an unmonitored PR.
+    pub fn begin_registration(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        repository: &str,
+        registration_id: &str,
+    ) -> Result<()> {
+        self.validate_registration_task(task_id, agent_id)?;
+        validate_registration_id(registration_id)?;
+        let (owner, repo) = parse_repository(repository)?;
+        let now = Utc::now();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds, last_error)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, 'attention', ?6, ?7, NULL, ?8, ?9)
+                 ON CONFLICT(task_id, owner, repo, number) DO NOTHING",
+                rusqlite::params![
+                    task_id,
+                    agent_id,
+                    owner,
+                    repo,
+                    registration_id,
+                    now.to_rfc3339(),
+                    (now + ChronoDuration::days(MONITOR_FOR_DAYS)).to_rfc3339(),
+                    MIN_POLL_INTERVAL_SECONDS,
+                    "pull-request publication began, but durable registration has not completed",
+                ],
+            )?;
+            Ok::<_, Error>(())
+        })?;
+        TaskBoard::new(self.db.clone()).update_status(task_id, "in_progress", Some(agent_id))?;
+        Ok(())
+    }
+
+    /// Remove a pre-publication sentinel when the GitHub command itself
+    /// failed, so a command that created no PR does not hold the task open.
+    pub fn cancel_registration(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        repository: &str,
+        registration_id: &str,
+    ) -> Result<()> {
+        self.validate_registration_task(task_id, agent_id)?;
+        validate_registration_id(registration_id)?;
+        let (owner, repo) = parse_repository(repository)?;
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM task_pull_requests
+                 WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
+                   AND number = 0 AND url = ?5",
+                rusqlite::params![task_id, agent_id, owner, repo, registration_id],
+            )?;
+            Ok::<_, Error>(())
+        })
+    }
+
     /// Register a PR published through XpressClaw's bundled GitHub MCP.
     /// Registration is idempotent and re-arms a PR that previously needed
     /// attention (for example after the agent reopened it).
@@ -108,34 +171,14 @@ impl GithubReviewManager {
         repository: &str,
         url: &str,
     ) -> Result<TaskPullRequest> {
-        let task = TaskBoard::new(self.db.clone()).get(task_id)?;
-        if task.hidden
-            || task
-                .context
-                .as_ref()
-                .and_then(|context| context.get("origin"))
-                .and_then(Value::as_str)
-                == Some("workflow")
-        {
-            return Err(Error::Task(
-                "workflow and hidden tasks manage pull-request waits explicitly".into(),
-            ));
-        }
-        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
-            return Err(Error::Task(
-                "cannot register a pull request for a finished task".into(),
-            ));
-        }
-        if task.agent_id.as_deref() != Some(agent_id) {
-            return Err(Error::Task(
-                "the pull request was not created by this task's assigned agent".into(),
-            ));
-        }
-
+        self.validate_registration_task(task_id, agent_id)?;
         let pull_request = parse_pull_request(url)?;
-        let expected = repository.trim().trim_end_matches(".git");
-        let actual = format!("{}/{}", pull_request.owner, pull_request.repo);
-        if !actual.eq_ignore_ascii_case(expected) {
+        let (expected_owner, expected_repo) = parse_repository(repository)?;
+        if !pull_request.owner.eq_ignore_ascii_case(&expected_owner)
+            || !pull_request.repo.eq_ignore_ascii_case(&expected_repo)
+        {
+            let actual = format!("{}/{}", pull_request.owner, pull_request.repo);
+            let expected = format!("{expected_owner}/{expected_repo}");
             return Err(Error::Task(format!(
                 "pull request {actual} does not belong to the task repository {expected}"
             )));
@@ -146,7 +189,8 @@ impl GithubReviewManager {
         let expires_at = (now + ChronoDuration::days(MONITOR_FOR_DAYS)).to_rfc3339();
         let next_poll_at = now.to_rfc3339();
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
                 "INSERT INTO task_pull_requests
                     (task_id, agent_id, owner, repo, number, url, status,
                      started_at, expires_at, next_poll_at, poll_interval_seconds)
@@ -174,8 +218,8 @@ impl GithubReviewManager {
                 rusqlite::params![
                     task_id,
                     agent_id,
-                    pull_request.owner,
-                    pull_request.repo,
+                    expected_owner,
+                    expected_repo,
                     pull_request.number as i64,
                     url,
                     started_at,
@@ -184,15 +228,49 @@ impl GithubReviewManager {
                     MIN_POLL_INTERVAL_SECONDS,
                 ],
             )?;
+            transaction.execute(
+                "DELETE FROM task_pull_requests
+                 WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
+                   AND number = 0",
+                rusqlite::params![task_id, agent_id, expected_owner, expected_repo],
+            )?;
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
         TaskBoard::new(self.db.clone()).update_status(task_id, "in_progress", Some(agent_id))?;
         self.get(
             task_id,
-            &pull_request.owner,
-            &pull_request.repo,
+            &expected_owner,
+            &expected_repo,
             pull_request.number,
         )
+    }
+
+    fn validate_registration_task(&self, task_id: &str, agent_id: &str) -> Result<()> {
+        let task = TaskBoard::new(self.db.clone()).get(task_id)?;
+        if task.hidden
+            || task
+                .context
+                .as_ref()
+                .and_then(|context| context.get("origin"))
+                .and_then(Value::as_str)
+                == Some("workflow")
+        {
+            return Err(Error::Task(
+                "workflow and hidden tasks manage pull-request waits explicitly".into(),
+            ));
+        }
+        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
+            return Err(Error::Task(
+                "cannot register a pull request for a finished task".into(),
+            ));
+        }
+        if task.agent_id.as_deref() != Some(agent_id) {
+            return Err(Error::Task(
+                "the pull request was not created by this task's assigned agent".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn gate(&self, task_id: &str) -> Result<GithubReviewGate> {
@@ -667,7 +745,7 @@ fn review_snapshot_from_values(
                 })
     });
 
-    let mut latest_review_by_author = HashMap::<String, (&str, DateTime<Utc>)>::new();
+    let mut latest_review_by_author = HashMap::<String, (&str, DateTime<Utc>, &str)>::new();
     let mut activities = Vec::new();
     for review in reviews {
         let reviewer = review
@@ -675,14 +753,18 @@ fn review_snapshot_from_values(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let submitted = value_timestamp(review, "submitted_at");
+        let body = review
+            .get("body")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         match (review.get("state").and_then(Value::as_str), submitted) {
             (Some(state), Some(submitted)) if !reviewer.is_empty() => {
                 let key = reviewer.to_ascii_lowercase();
                 if latest_review_by_author
                     .get(&key)
-                    .is_none_or(|(_, previous)| submitted >= *previous)
+                    .is_none_or(|(_, previous, _)| submitted >= *previous)
                 {
-                    latest_review_by_author.insert(key, (state, submitted));
+                    latest_review_by_author.insert(key, (state, submitted, body));
                 }
             }
             _ => {}
@@ -708,14 +790,17 @@ fn review_snapshot_from_values(
         );
     }
 
-    let formal_approval = latest_review_by_author
-        .iter()
-        .any(|(reviewer, (state, _))| {
-            reviewer != &author && state.eq_ignore_ascii_case("approved")
-        });
+    let latest_review_approval =
+        latest_review_by_author
+            .iter()
+            .any(|(reviewer, (state, _, body))| {
+                reviewer != &author
+                    && (state.eq_ignore_ascii_case("approved")
+                        || (state.eq_ignore_ascii_case("commented") && is_approval_text(body)))
+            });
     let approval_comment = activities
         .iter()
-        .any(|activity| is_approval_text(&activity.body));
+        .any(|activity| activity.kind != "review" && is_approval_text(&activity.body));
     activities.sort_by(|left, right| {
         left.at
             .cmp(&right.at)
@@ -725,7 +810,7 @@ fn review_snapshot_from_values(
     ReviewSnapshot {
         outcome: if merged {
             Some(ReviewOutcome::Merged)
-        } else if thumbs_up || formal_approval || approval_comment {
+        } else if thumbs_up || latest_review_approval || approval_comment {
             Some(ReviewOutcome::Approved)
         } else {
             None
@@ -740,19 +825,46 @@ async fn fetch_unresolved_thread_count(
     access: &github::GithubSessionAccess,
     number: u64,
 ) -> Result<usize> {
-    let query = r#"query($owner:String!,$repo:String!,$number:Int!){
+    let query = r#"query($owner:String!,$repo:String!,$number:Int!,$after:String){
       repository(owner:$owner,name:$repo){
         pullRequest(number:$number){
-          reviewThreads(first:100){nodes{id isResolved}}
+          reviewThreads(first:100,after:$after){
+            nodes{id isResolved}
+            pageInfo{hasNextPage endCursor}
+          }
         }
       }
     }"#;
-    let response = access
-        .graphql(
-            query,
-            json!({ "owner": access.owner, "repo": access.repo, "number": number }),
-        )
-        .await?;
+    let mut after = None;
+    let mut seen_cursors = HashSet::new();
+    let mut unresolved = 0;
+    loop {
+        let response = access
+            .graphql(
+                query,
+                json!({
+                    "owner": &access.owner,
+                    "repo": &access.repo,
+                    "number": number,
+                    "after": after.clone(),
+                }),
+            )
+            .await?;
+        let (page_unresolved, next_cursor) = unresolved_thread_page(&response)?;
+        unresolved += page_unresolved;
+        let Some(next_cursor) = next_cursor else {
+            return Ok(unresolved);
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Err(Error::Backend(
+                "GitHub returned a repeated review-thread page cursor".into(),
+            ));
+        }
+        after = Some(next_cursor);
+    }
+}
+
+fn unresolved_thread_page(response: &Value) -> Result<(usize, Option<String>)> {
     if let Some(errors) = response.get("errors").and_then(Value::as_array) {
         if !errors.is_empty() {
             return Err(Error::Backend(format!(
@@ -761,8 +873,11 @@ async fn fetch_unresolved_thread_count(
             )));
         }
     }
-    Ok(response
-        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+    let connection = response
+        .pointer("/data/repository/pullRequest/reviewThreads")
+        .ok_or_else(|| Error::Backend("GitHub omitted the pull-request review threads".into()))?;
+    let unresolved = connection
+        .get("nodes")
         .and_then(Value::as_array)
         .map(|threads| {
             threads
@@ -770,7 +885,28 @@ async fn fetch_unresolved_thread_count(
                 .filter(|thread| thread.get("isResolved").and_then(Value::as_bool) == Some(false))
                 .count()
         })
-        .unwrap_or(0))
+        .ok_or_else(|| Error::Backend("GitHub returned invalid review-thread nodes".into()))?;
+    let has_next_page = connection
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::Backend("GitHub omitted review-thread page information".into()))?;
+    let next_cursor = if has_next_page {
+        Some(
+            connection
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .ok_or_else(|| {
+                    Error::Backend(
+                        "GitHub reported another review-thread page without a cursor".into(),
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    Ok((unresolved, next_cursor))
 }
 
 fn push_activity(
@@ -860,6 +996,34 @@ fn is_approval_text(body: &str) -> bool {
         .trim_matches(|character: char| !character.is_alphanumeric())
         .to_ascii_lowercase();
     matches!(normalized.as_str(), "lgtm" | "approved")
+}
+
+fn validate_registration_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(Error::Task(
+            "pull-request registration ID must contain only ASCII letters, numbers, '-' or '_'"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_repository(value: &str) -> Result<(String, String)> {
+    let value = value.trim().trim_end_matches('/').trim_end_matches(".git");
+    let mut parts = value.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let repo = parts.next().unwrap_or_default();
+    if owner.is_empty() || repo.is_empty() || parts.next().is_some() {
+        return Err(Error::Task(format!(
+            "expected a GitHub repository in owner/repo form, got '{value}'"
+        )));
+    }
+    Ok((owner.to_string(), repo.to_string()))
 }
 
 fn parse_pull_request(value: &str) -> Result<PullRequestRef> {
@@ -981,6 +1145,90 @@ mod tests {
     }
 
     #[test]
+    fn prepublication_gate_blocks_completion_until_registration_is_durable() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-1",
+            )
+            .unwrap();
+        assert_eq!(
+            manager.gate(&task_id).unwrap(),
+            GithubReviewGate::NeedsInput
+        );
+        assert!(TaskBoard::new(db.clone())
+            .complete_and_roll_up(&task_id, Some("project-codex"))
+            .unwrap()
+            .is_empty());
+
+        manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Waiting);
+        let sentinel_count: i64 = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_pull_requests WHERE task_id = ?1 AND number = 0",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(sentinel_count, 0);
+    }
+
+    #[test]
+    fn failed_github_command_can_cancel_prepublication_gate() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db);
+        manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-1",
+            )
+            .unwrap();
+        manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-2",
+            )
+            .unwrap();
+        manager
+            .cancel_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-2",
+            )
+            .unwrap();
+        assert_eq!(
+            manager.gate(&task_id).unwrap(),
+            GithubReviewGate::NeedsInput
+        );
+        manager
+            .cancel_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-1",
+            )
+            .unwrap();
+        assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::None);
+    }
+
+    #[test]
     fn tasks_without_pull_requests_have_no_review_gate() {
         let (db, task_id) = setup_task(None);
         assert_eq!(
@@ -1039,6 +1287,19 @@ mod tests {
             Some(ReviewOutcome::Approved)
         );
 
+        let approval_review_comment = json!({
+            "id": 2,
+            "state": "COMMENTED",
+            "submitted_at": "2026-08-10T12:00:00Z",
+            "user": { "login": "reviewer" },
+            "body": "LGTM!"
+        });
+        assert_eq!(
+            review_snapshot_from_values(&open_pr, &[], &[approval_review_comment], &[], &[], 0,)
+                .outcome,
+            Some(ReviewOutcome::Approved)
+        );
+
         let reaction = json!({
             "content": "+1",
             "user": { "login": "reviewer" }
@@ -1083,7 +1344,7 @@ mod tests {
                 "state": "APPROVED",
                 "submitted_at": "2026-08-10T12:00:00Z",
                 "user": { "login": "reviewer" },
-                "body": ""
+                "body": "LGTM"
             }),
             json!({
                 "id": 2,
@@ -1114,6 +1375,42 @@ mod tests {
         assert_eq!(snapshot.outcome, None);
         assert_eq!(snapshot.unresolved_threads, 1);
         assert_eq!(snapshot.activities.len(), 2);
+    }
+
+    #[test]
+    fn parses_review_thread_pages_and_requires_a_next_cursor() {
+        let first_page = json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "nodes": [
+                    { "id": "one", "isResolved": false },
+                    { "id": "two", "isResolved": true }
+                ],
+                "pageInfo": { "hasNextPage": true, "endCursor": "cursor-1" }
+            }}}}
+        });
+        assert_eq!(
+            unresolved_thread_page(&first_page).unwrap(),
+            (1, Some("cursor-1".into()))
+        );
+
+        let final_page = json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "nodes": [{ "id": "three", "isResolved": false }],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            }}}}
+        });
+        assert_eq!(unresolved_thread_page(&final_page).unwrap(), (1, None));
+
+        let missing_cursor = json!({
+            "data": { "repository": { "pullRequest": { "reviewThreads": {
+                "nodes": [],
+                "pageInfo": { "hasNextPage": true, "endCursor": null }
+            }}}}
+        });
+        assert!(unresolved_thread_page(&missing_cursor)
+            .unwrap_err()
+            .to_string()
+            .contains("without a cursor"));
     }
 
     #[test]

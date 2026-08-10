@@ -4,6 +4,7 @@
 // kept outside PATH and this process is the only supported entry point.
 
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
@@ -202,19 +203,31 @@ async function currentPullRequestUrl() {
   return url;
 }
 
-async function registerPullRequest(url) {
-  const controlPlane = process.env.XPRESSCLAW_URL?.replace(/\/$/, '');
-  const taskId = process.env.XPRESSCLAW_TASK_ID;
-  const agentId = process.env.XPRESSCLAW_AGENT_ID;
+export async function updatePullRequestRegistration(
+  phase,
+  url,
+  registrationId,
+  environment = process.env,
+  fetchImplementation = globalThis.fetch,
+) {
+  const controlPlane = environment.XPRESSCLAW_URL?.replace(/\/$/, '');
+  const taskId = environment.XPRESSCLAW_TASK_ID;
+  const agentId = environment.XPRESSCLAW_AGENT_ID;
   if (!controlPlane || !taskId || !agentId) {
     throw new Error('XpressClaw did not provide task review-lifecycle context');
   }
-  const response = await fetch(`${controlPlane}/api/tasks/${encodeURIComponent(taskId)}/pull-requests`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ url, agent_id: agentId }),
-    signal: AbortSignal.timeout(15_000),
-  });
+  const body = { phase, agent_id: agentId };
+  if (url) body.url = url;
+  if (registrationId) body.registration_id = registrationId;
+  const response = await fetchImplementation(
+    `${controlPlane}/api/tasks/${encodeURIComponent(taskId)}/pull-requests`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
   const text = await response.text();
   let payload;
   try {
@@ -226,6 +239,64 @@ async function registerPullRequest(url) {
     throw new Error(payload.error ?? payload.message ?? `XpressClaw returned HTTP ${response.status}`);
   }
   return payload;
+}
+
+export async function executeCommandWithReviewLifecycle(args, dependencies = {}) {
+  const environment = dependencies.environment ?? process.env;
+  const execute = dependencies.execute ?? commandOutput;
+  const currentUrl = dependencies.currentPullRequestUrl ?? currentPullRequestUrl;
+  const registrationId = dependencies.registrationId ?? randomUUID();
+  const updateRegistration = dependencies.updateRegistration ?? ((phase, url) =>
+    updatePullRequestRegistration(phase, url, registrationId, environment));
+  const managed = reviewLifecycleEnabled(environment) &&
+    args[0] === 'pr' && ['create', 'ready'].includes(args[1]);
+  if (!managed) return execute(args);
+
+  try {
+    await updateRegistration('begin', undefined, registrationId);
+  } catch (cause) {
+    return {
+      exit_code: 1,
+      stdout: '',
+      stderr: '',
+      review_lifecycle: {
+        registered: false,
+        error: cause instanceof Error ? cause.message : String(cause),
+        message: 'XpressClaw could not arm durable review monitoring, so the GitHub command was not run. Retry after correcting the error.',
+      },
+    };
+  }
+
+  const output = await execute(args);
+  if (output.exit_code !== 0) {
+    try {
+      await updateRegistration('cancel', undefined, registrationId);
+    } catch (cause) {
+      output.review_lifecycle = {
+        registered: false,
+        error: cause instanceof Error ? cause.message : String(cause),
+        message: 'The GitHub command failed and XpressClaw could not clear its durable pre-publication gate. Retry the command or ask the user to intervene.',
+      };
+    }
+    return output;
+  }
+
+  try {
+    const url = pullRequestUrl(output.stdout) ?? await currentUrl();
+    output.review_lifecycle = {
+      registered: true,
+      pull_request: url,
+      state: await updateRegistration('register', url, registrationId),
+      message: 'XpressClaw will keep this task active and address review feedback until approval or merge.',
+    };
+  } catch (cause) {
+    output.review_lifecycle = {
+      registered: false,
+      error: cause instanceof Error ? cause.message : String(cause),
+      message: 'The pull request was published, but automatic review monitoring did not finish registering. A durable task gate remains armed; do not declare the task complete, and retry `gh pr ready` after correcting the error.',
+    };
+  }
+  return output;
 }
 
 async function reviewThreads(args) {
@@ -289,28 +360,7 @@ async function callTool(argumentsValue) {
   validateArguments(requestedArgs);
   const args = managedCommandArguments(requestedArgs);
   if (args[0] === 'pr' && args[1] === 'thread') return reviewThreads(args);
-  const output = await commandOutput(args);
-  if (
-    output.exit_code === 0 && reviewLifecycleEnabled() &&
-    args[0] === 'pr' && ['create', 'ready'].includes(args[1])
-  ) {
-    try {
-      const url = pullRequestUrl(output.stdout) ?? await currentPullRequestUrl();
-      output.review_lifecycle = {
-        registered: true,
-        pull_request: url,
-        state: await registerPullRequest(url),
-        message: 'XpressClaw will keep this task active and address review feedback until approval or merge.',
-      };
-    } catch (cause) {
-      output.review_lifecycle = {
-        registered: false,
-        error: cause instanceof Error ? cause.message : String(cause),
-        message: 'The pull request was created, but automatic review monitoring could not be registered. Do not declare the task complete; retry `gh pr ready` after correcting the error.',
-      };
-    }
-  }
-  return output;
+  return executeCommandWithReviewLifecycle(args);
 }
 
 async function handle(message) {

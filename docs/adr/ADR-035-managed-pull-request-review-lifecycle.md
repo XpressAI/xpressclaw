@@ -21,7 +21,10 @@ The bundled, project-scoped GitHub MCP manages pull requests created by
 ordinary tasks:
 
 - `pr create` ignores an inherited draft flag and publishes a ready pull
-  request. `pr create` and `pr ready` register the PR with the current task.
+  request. Before `pr create` or `pr ready` runs, the MCP durably arms a
+  fail-closed completion gate; successful registration atomically replaces it
+  with the real PR. A control-plane timeout therefore cannot leave a published
+  PR unmonitored.
 - Registration is accepted only for the task's assigned agent and configured
   repository. Hidden tasks and workflow-owned tasks are excluded.
 - XpressClaw polls GitHub durably, starting at 15 seconds and backing off to
@@ -30,13 +33,16 @@ ordinary tasks:
   conversation. The prompt requires inspection of the whole PR, all unresolved
   threads, and CI; addressed threads are replied to and resolved, and an
   explicit re-review is requested when the configured reviewer requires one.
-- Unresolved threads are rechecked and can trigger an hourly reminder after an
-  agent turn, rather than being silently abandoned.
+- Every page of unresolved threads is rechecked and can trigger an hourly
+  reminder after an agent turn, rather than later pages being silently
+  abandoned.
 - The task and that agent's queue lane remain active until every registered PR
   is merged or approved. Approval means a formal approved review, an
   unambiguous `+1`, `LGTM`, or `approved` review/comment, or a thumbs-up
   reaction on the PR summary, in every case from someone other than the PR
-  author.
+  author. Submitted-review text follows each reviewer's latest review state, so
+  an earlier `LGTM` cannot override a later change request; standalone comments
+  remain independent signals.
 - Monitoring expires after 14 days. A timeout or a PR closed without merge
   moves the task to waiting for input; it does not count as completion.
 

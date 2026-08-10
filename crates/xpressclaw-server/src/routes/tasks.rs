@@ -88,8 +88,20 @@ pub struct ElicitationResponseInput {
 
 #[derive(Deserialize)]
 pub struct PullRequestInput {
-    pub url: String,
+    pub url: Option<String>,
     pub agent_id: String,
+    pub registration_id: Option<String>,
+    #[serde(default)]
+    pub phase: PullRequestRegistrationPhase,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestRegistrationPhase {
+    Begin,
+    #[default]
+    Register,
+    Cancel,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -140,20 +152,76 @@ async fn register_pull_request(
             Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
         )
     })?;
-    let pull_request = GithubReviewManager::new(state.db.clone())
-        .register(&id, &request.agent_id, &access.repository(), &request.url)
-        .map_err(|error| match error {
-            xpressclaw_core::error::Error::TaskNotFound { .. } => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": error.to_string() })),
-            ),
-            xpressclaw_core::error::Error::Task(_) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": error.to_string() })),
-            ),
-            _ => internal_error(error),
-        })?;
-    Ok((StatusCode::CREATED, Json(json!(pull_request))))
+    let manager = GithubReviewManager::new(state.db.clone());
+    match request.phase {
+        PullRequestRegistrationPhase::Begin => {
+            let registration_id = registration_id(&request)?;
+            manager
+                .begin_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({ "status": "registration_pending" })),
+            ))
+        }
+        PullRequestRegistrationPhase::Register => {
+            let url = request.url.as_deref().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "pull-request registration requires a URL" })),
+                )
+            })?;
+            let pull_request = manager
+                .register(&id, &request.agent_id, &access.repository(), url)
+                .map_err(pull_request_registration_error)?;
+            Ok((StatusCode::CREATED, Json(json!(pull_request))))
+        }
+        PullRequestRegistrationPhase::Cancel => {
+            let registration_id = registration_id(&request)?;
+            manager
+                .cancel_registration(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    registration_id,
+                )
+                .map_err(pull_request_registration_error)?;
+            Ok((
+                StatusCode::OK,
+                Json(json!({ "status": "registration_cancelled" })),
+            ))
+        }
+    }
+}
+
+fn registration_id(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_id.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration ID" })),
+        )
+    })
+}
+
+fn pull_request_registration_error(
+    error: xpressclaw_core::error::Error,
+) -> (StatusCode, Json<Value>) {
+    match error {
+        xpressclaw_core::error::Error::TaskNotFound { .. } => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Task(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        _ => internal_error(error),
+    }
 }
 
 async fn list_tasks(
