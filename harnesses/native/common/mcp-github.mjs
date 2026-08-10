@@ -280,11 +280,39 @@ function repositoryParts(environment = process.env) {
 }
 
 function commandOptionValue(args, longName, shortName) {
-  const value = optionValue(args, longName, shortName);
-  if (value !== undefined) return value;
-  const attached = args.find((argument) => argument.startsWith(shortName) && argument.length > 2);
-  const attachedValue = attached?.slice(2);
-  return attachedValue?.startsWith('=') ? attachedValue.slice(1) : attachedValue;
+  const target = shortName.slice(1);
+  let optionsEnded = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (optionsEnded) continue;
+    if (argument === '--') {
+      optionsEnded = true;
+      continue;
+    }
+    if (argument === longName || argument === shortName) return args[index + 1];
+    if (argument.startsWith(`${longName}=`)) return argument.slice(longName.length + 1);
+    if (argument.startsWith('--')) {
+      if (!argument.includes('=') && PR_CREATE_LONG_VALUE_OPTIONS.has(argument)) index += 1;
+      continue;
+    }
+    if (!argument.startsWith('-') || argument === '-') continue;
+
+    const shorthands = argument.slice(1);
+    for (let shorthandIndex = 0; shorthandIndex < shorthands.length; shorthandIndex += 1) {
+      const shorthand = shorthands[shorthandIndex];
+      if (PR_CREATE_SHORT_VALUE_OPTIONS.has(shorthand)) {
+        const attached = shorthands.slice(shorthandIndex + 1);
+        if (shorthand === target) {
+          const value = attached || args[index + 1];
+          return value?.startsWith('=') ? value.slice(1) : value;
+        }
+        if (!attached) index += 1;
+        break;
+      }
+      if (!PR_CREATE_SHORT_BOOLEAN_OPTIONS.has(shorthand)) break;
+    }
+  }
+  return undefined;
 }
 
 function registrationKey(owner, head, base, environment = process.env) {

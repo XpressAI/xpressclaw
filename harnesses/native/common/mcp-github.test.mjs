@@ -202,6 +202,25 @@ test('registration keys normalize equals-attached short option values', async ()
   assert.equal(created, readied);
 });
 
+test('registration keys parse value options bundled after Boolean shorthands', async () => {
+  const environment = { GH_REPO: 'XpressAI/xpressclaw' };
+  const created = await pullRequestRegistrationKey(
+    ['pr', 'create', '-fHfeature/review', '-fBmain'],
+    { environment },
+  );
+  const readied = await pullRequestRegistrationKey(
+    ['pr', 'ready', '151'],
+    {
+      environment,
+      currentPullRequestIdentity: async () => ({
+        owner: 'xpressai', head: 'feature/review', base: 'main',
+      }),
+    },
+  );
+
+  assert.equal(created, readied);
+});
+
 test('registration keys honor the branch-configured gh merge base', async () => {
   const environment = { GH_REPO: 'XpressAI/xpressclaw' };
   const created = await pullRequestRegistrationKey(
