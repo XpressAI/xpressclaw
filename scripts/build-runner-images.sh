@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+all_runners=(
+  codex claude github-copilot junie kimi opencode pi qwen
+  cline cursor glm grok kilo mistral-vibe
+)
+
+if [[ $# -gt 0 ]]; then
+  runners=("$@")
+  for runner in "${runners[@]}"; do
+    supported=false
+    for known_runner in "${all_runners[@]}"; do
+      if [[ "$runner" == "$known_runner" ]]; then
+        supported=true
+        break
+      fi
+    done
+    if [[ "$supported" == false ]]; then
+      echo "Unknown runner: $runner" >&2
+      echo "Supported runners: ${all_runners[*]}" >&2
+      exit 2
+    fi
+  done
+else
+  runners=("${all_runners[@]}")
+fi
+
 runtime="${CONTAINER_RUNTIME:-}"
 if [[ -z "$runtime" ]]; then
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
@@ -27,11 +52,6 @@ if [[ "$runtime" == docker ]] && docker buildx version >/dev/null 2>&1; then
 fi
 
 echo "Building runner images with ${build_command[*]}"
-
-runners=(
-  codex claude github-copilot junie kimi opencode pi qwen
-  cline cursor glm grok kilo mistral-vibe
-)
 
 for runner in "${runners[@]}"; do
   dockerfile="$runner"
