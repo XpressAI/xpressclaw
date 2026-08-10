@@ -462,11 +462,17 @@ impl TaskBoard {
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
-                    synchronize_pull_request_agent(&transaction, task_id, aid)?;
+                    let previous = synchronize_pull_request_agent(&transaction, task_id, aid)?;
                     transaction.execute(
                         "UPDATE tasks SET agent_id = ?1 WHERE id = ?2",
                         rusqlite::params![aid, task_id],
                     )?;
+                    if let Some(previous) = previous {
+                        refresh_logical_session_status(&transaction, &previous)?;
+                        if previous != aid {
+                            refresh_logical_session_status(&transaction, aid)?;
+                        }
+                    }
                 }
             }
             transaction.commit()?;
@@ -513,11 +519,17 @@ impl TaskBoard {
             }
 
             if let Some(ref agent_id) = req.agent_id {
-                synchronize_pull_request_agent(&transaction, task_id, agent_id)?;
+                let previous = synchronize_pull_request_agent(&transaction, task_id, agent_id)?;
                 transaction.execute(
                     "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![agent_id, now, task_id],
                 )?;
+                if let Some(previous) = previous {
+                    refresh_logical_session_status(&transaction, &previous)?;
+                    if previous != *agent_id {
+                        refresh_logical_session_status(&transaction, agent_id)?;
+                    }
+                }
             }
 
             if let Some(priority) = req.priority {
@@ -955,7 +967,7 @@ fn synchronize_pull_request_agent(
     conn: &rusqlite::Connection,
     task_id: &str,
     agent_id: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let has_active_pull_request: bool = conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM task_pull_requests
@@ -965,17 +977,120 @@ fn synchronize_pull_request_agent(
         |row| row.get(0),
     )?;
     if !has_active_pull_request {
-        return Ok(());
+        return Ok(None);
     }
     if agent_id.trim().is_empty() {
         return Err(Error::Task(
             "cannot unassign a task while pull-request review monitoring is active".into(),
         ));
     }
+    let previous_agent_id: String = conn.query_row(
+        "SELECT agent_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let running_dispatch: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM task_queue
+            WHERE task_id = ?1 AND status = 'running'
+         )",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if previous_agent_id != agent_id && running_dispatch {
+        return Err(Error::Task(
+            "cannot reassign a task while its agent turn is running; stop it first".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+        [agent_id],
+    )?;
     conn.execute(
         "UPDATE task_pull_requests SET agent_id = ?1
          WHERE task_id = ?2 AND status IN ('waiting', 'attention')",
         rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE session_events SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE attempt_artifacts SET session_id = ?1
+         WHERE attempt_id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         )",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE work_attempts SET session_id = ?1
+         WHERE id IN (
+            SELECT attempt_id FROM task_queue
+            WHERE task_id = ?2 AND status = 'queued' AND attempt_id IS NOT NULL
+         ) AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE task_queue SET agent_id = ?1
+         WHERE task_id = ?2 AND status = 'queued'",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    conn.execute(
+        "UPDATE tasks SET session_id = ?1 WHERE id = ?2",
+        rusqlite::params![agent_id, task_id],
+    )?;
+    Ok(Some(previous_agent_id))
+}
+
+fn refresh_logical_session_status(conn: &rusqlite::Connection, session_id: &str) -> Result<()> {
+    let active_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts
+            WHERE session_id = ?1 AND status IN ('preparing', 'running', 'review')
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let queued_attempt: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM work_attempts WHERE session_id = ?1 AND status = 'queued'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let waiting_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'waiting_for_input'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let blocked_task: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM tasks WHERE agent_id = ?1 AND status = 'blocked'
+         )",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    let status = if active_attempt {
+        "running"
+    } else if queued_attempt {
+        "queued"
+    } else if waiting_task {
+        "waiting_for_input"
+    } else if blocked_task {
+        "blocked"
+    } else {
+        "idle"
+    };
+    conn.execute(
+        "UPDATE logical_sessions SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+        rusqlite::params![status, session_id],
     )?;
     Ok(())
 }
@@ -1153,6 +1268,12 @@ mod tests {
             )
             .unwrap();
         });
+        let queue = crate::tasks::queue::TaskQueue::new(db.clone());
+        let queued = queue
+            .enqueue_continuation(&task.id, "project-codex")
+            .unwrap()
+            .unwrap();
+        let attempt_id = queued.attempt_id.clone().unwrap();
 
         let reassigned = board
             .update(
@@ -1177,11 +1298,70 @@ mod tests {
             })
         };
         assert_eq!(monitored_agent(), "reviewer-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "reviewer-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "reviewer-codex"
+        );
+        assert!(queue
+            .enqueue_continuation(&task.id, "reviewer-codex")
+            .unwrap()
+            .is_none());
+        let (task_session, event_session, previous_status, current_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = db
+            .with_conn(|conn| {
+                let task_session = conn.query_row(
+                    "SELECT session_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )?;
+                let event_session = conn.query_row(
+                    "SELECT session_id FROM session_events WHERE attempt_id = ?1",
+                    [&attempt_id],
+                    |row| row.get(0),
+                )?;
+                let previous_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'project-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let current_status = conn.query_row(
+                    "SELECT status FROM logical_sessions WHERE id = 'reviewer-codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok::<_, rusqlite::Error>((
+                    task_session,
+                    event_session,
+                    previous_status,
+                    current_status,
+                ))
+            })
+            .unwrap();
+        assert_eq!(task_session, "reviewer-codex");
+        assert_eq!(event_session, "reviewer-codex");
+        assert_eq!(previous_status, "idle");
+        assert_eq!(current_status, "queued");
 
         board
             .update_status(&task.id, "in_progress", Some("final-codex"))
             .unwrap();
         assert_eq!(monitored_agent(), "final-codex");
+        assert_eq!(queue.get(queued.id).unwrap().agent_id, "final-codex");
+        assert_eq!(
+            crate::sessions::SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .session_id,
+            "final-codex"
+        );
 
         let error = board
             .update(
@@ -1195,6 +1375,25 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("cannot unassign"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("final-codex")
+        );
+        assert_eq!(monitored_agent(), "final-codex");
+
+        assert_eq!(queue.claim("final-codex").unwrap().unwrap().id, queued.id);
+        let error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("late-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("turn is running"));
         assert_eq!(
             board.get(&task.id).unwrap().agent_id.as_deref(),
             Some("final-codex")

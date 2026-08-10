@@ -40,6 +40,18 @@ test('ordinary task lifecycle rejects converting a ready PR back to draft', () =
   );
 });
 
+test('ordinary task lifecycle rejects dry-run creation before publication', () => {
+  const environment = { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' };
+  assert.throws(
+    () => managedCommandArguments(['pr', 'create', '--dry-run'], environment),
+    /cannot register a dry-run pull request/,
+  );
+  assert.deepEqual(
+    managedCommandArguments(['pr', 'create', '--dry-run'], {}),
+    ['pr', 'create', '--dry-run'],
+  );
+});
+
 test('workflow-managed PR creation preserves an explicit draft', () => {
   assert.deepEqual(
     managedCommandArguments(['pr', 'create', '--draft'], {}),

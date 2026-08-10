@@ -22,8 +22,9 @@ ordinary tasks:
 
 - `pr create` ignores an inherited draft flag and publishes a ready pull
   request, and managed tasks reject `pr ready --undo` rather than allowing a
-  ready pull request to become draft again. Before `pr create` or `pr ready`
-  runs, the MCP durably arms a
+  ready pull request to become draft again. Managed dry-run creation is also
+  rejected because no real pull request exists to register. Before `pr create`
+  or `pr ready` runs, the MCP durably arms a
   fail-closed completion gate; successful registration atomically replaces it
   with the real PR. A control-plane timeout therefore cannot leave a published
   PR unmonitored.
@@ -40,8 +41,9 @@ ordinary tasks:
   abandoned.
 - The task and that agent's queue lane remain active until every registered PR
   is merged or approved. Reassigning the task atomically transfers its review
-  monitor and queue-lane reservation to the new agent. Approval means a formal
-  approved review, an
+  monitor, queued continuations, work attempts, and queue-lane reservation to
+  the new agent; reassignment is rejected while a turn is actively running.
+  Approval means a formal approved review, an
   unambiguous `+1`, `LGTM`, or `approved` review/comment, or a thumbs-up
   reaction on the PR summary, in every case from someone other than the PR
   author. Submitted-review text follows each reviewer's latest review state, so

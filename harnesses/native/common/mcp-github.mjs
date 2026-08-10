@@ -126,6 +126,12 @@ export function managedCommandArguments(args, environment = process.env) {
       'managed pull-request review lifecycle cannot convert a ready pull request back to draft',
     );
   }
+  if (args[0] === 'pr' && args[1] === 'create' &&
+      args.some((argument) => argument === '--dry-run' || argument.startsWith('--dry-run='))) {
+    throw new Error(
+      'managed pull-request review lifecycle cannot register a dry-run pull request',
+    );
+  }
   if (args[0] !== 'pr' || args[1] !== 'create') return [...args];
   return args.filter((argument) =>
     argument !== '--draft' && argument !== '-d' &&
