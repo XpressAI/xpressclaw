@@ -1011,6 +1011,7 @@ CREATE TABLE task_pull_requests (
     last_feedback_at TEXT,
     after_cursor TEXT,
     last_error TEXT,
+    registration_key TEXT,
     PRIMARY KEY (task_id, owner, repo, number)
 );
 CREATE INDEX idx_task_pull_requests_due

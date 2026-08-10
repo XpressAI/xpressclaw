@@ -4,7 +4,7 @@
 // kept outside PATH and this process is the only supported entry point.
 
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
@@ -181,19 +181,25 @@ export function managedCommandArguments(args, environment = process.env) {
     return [...args];
   }
   if (args[0] === 'pr' && args[1] === 'ready' &&
-      args.some((argument) => argument === '--undo' || argument.startsWith('--undo='))) {
+      args.some((argument) => enabledBooleanFlag(argument, '--undo'))) {
     throw new Error(
       'managed pull-request review lifecycle cannot convert a ready pull request back to draft',
     );
   }
   if (args[0] === 'pr' && args[1] === 'create' &&
-      args.some((argument) => argument === '--dry-run' || argument.startsWith('--dry-run='))) {
+      args.some((argument) => enabledBooleanFlag(argument, '--dry-run'))) {
     throw new Error(
       'managed pull-request review lifecycle cannot register a dry-run pull request',
     );
   }
   if (args[0] !== 'pr' || args[1] !== 'create') return [...args];
   return withoutDraftArguments(args);
+}
+
+function enabledBooleanFlag(argument, name) {
+  if (argument === name) return true;
+  if (!argument.startsWith(`${name}=`)) return false;
+  return argument.slice(name.length + 1).toLowerCase() !== 'false';
 }
 
 export function pullRequestUrl(value) {
@@ -231,6 +237,28 @@ function commandOutput(args) {
   });
 }
 
+function gitCommandOutput(args) {
+  return new Promise((resolve) => {
+    const child = spawn('git', args, {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length < MAX_OUTPUT) stdout += chunk.slice(0, MAX_OUTPUT - stdout.length);
+    });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < MAX_OUTPUT) stderr += chunk.slice(0, MAX_OUTPUT - stderr.length);
+    });
+    child.on('error', (cause) => resolve({ exit_code: 127, stdout, stderr: cause.message }));
+    child.on('close', (code) => resolve({ exit_code: code ?? 1, stdout, stderr }));
+  });
+}
+
 async function successfulCommand(args) {
   const output = await commandOutput(args);
   if (output.exit_code !== 0) {
@@ -241,13 +269,97 @@ async function successfulCommand(args) {
   return output;
 }
 
-function repositoryParts() {
-  const repository = process.env.GH_REPO ?? '';
+function repositoryParts(environment = process.env) {
+  const repository = environment.GH_REPO ?? '';
   const parts = repository.split('/');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new Error('XpressClaw did not provide a valid project repository');
   }
   return { owner: parts[0], repo: parts[1] };
+}
+
+function commandOptionValue(args, longName, shortName) {
+  const value = optionValue(args, longName, shortName);
+  if (value !== undefined) return value;
+  const attached = args.find((argument) => argument.startsWith(shortName) && argument.length > 2);
+  return attached?.slice(2);
+}
+
+function registrationKey(owner, head, base, environment = process.env) {
+  const repository = environment.GH_REPO ?? '';
+  if (!owner || !head || !base || !repository) {
+    throw new Error('could not identify the pull-request head and base branches');
+  }
+  return createHash('sha256')
+    .update(JSON.stringify([repository.toLowerCase(), owner.toLowerCase(), head, base]))
+    .digest('hex');
+}
+
+async function currentBranch(executeGit = gitCommandOutput) {
+  const output = await executeGit(['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  if (output.exit_code !== 0 || !output.stdout.trim()) {
+    throw new Error('could not determine the current Git branch; pass --head explicitly');
+  }
+  return output.stdout.trim();
+}
+
+async function configuredBaseBranch(head, executeGit = gitCommandOutput) {
+  const output = await executeGit(['config', '--get', `branch.${head}.gh-merge-base`]);
+  if (output.exit_code === 1) return undefined;
+  if (output.exit_code !== 0) {
+    throw new Error(output.stderr.trim() || 'could not read the configured pull-request base');
+  }
+  return output.stdout.trim() || undefined;
+}
+
+async function defaultBaseBranch() {
+  const output = await successfulCommand([
+    'repo', 'view', '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name',
+  ]);
+  const branch = output.stdout.trim();
+  if (!branch) throw new Error('could not determine the repository default branch');
+  return branch;
+}
+
+async function currentPullRequestIdentity(target) {
+  const args = ['pr', 'view'];
+  if (target) args.push(target);
+  args.push('--json', 'baseRefName,headRefName,headRepositoryOwner');
+  const output = await successfulCommand(args);
+  const value = JSON.parse(output.stdout);
+  return {
+    owner: value.headRepositoryOwner?.login,
+    head: value.headRefName,
+    base: value.baseRefName,
+  };
+}
+
+export async function pullRequestRegistrationKey(args, dependencies = {}) {
+  const environment = dependencies.environment ?? process.env;
+  const { owner: repositoryOwner } = repositoryParts(environment);
+  if (args[0] === 'pr' && args[1] === 'create') {
+    const commandArgs = args.slice(2);
+    const headOption = commandOptionValue(commandArgs, '--head', '-H');
+    let owner = repositoryOwner;
+    let head = headOption;
+    if (headOption?.includes(':')) {
+      [owner, head] = headOption.split(':', 2);
+    }
+    head ??= await (dependencies.currentBranch ?? currentBranch)(dependencies.executeGit);
+    let base = commandOptionValue(commandArgs, '--base', '-B');
+    base ??= await (
+      dependencies.configuredBaseBranch ?? configuredBaseBranch
+    )(head, dependencies.executeGit);
+    base ??= await (dependencies.defaultBaseBranch ?? defaultBaseBranch)();
+    return registrationKey(owner, head, base, environment);
+  }
+  if (args[0] === 'pr' && args[1] === 'ready') {
+    const identity = await (dependencies.currentPullRequestIdentity ?? currentPullRequestIdentity)(
+      readyPullRequestTarget(args),
+    );
+    return registrationKey(identity.owner ?? repositoryOwner, identity.head, identity.base, environment);
+  }
+  throw new Error('only pull-request create and ready commands have registration keys');
 }
 
 async function graphql(query, fields) {
@@ -285,6 +397,7 @@ export async function updatePullRequestRegistration(
   phase,
   url,
   registrationId,
+  registrationKeyValue,
   environment = process.env,
   fetchImplementation = globalThis.fetch,
 ) {
@@ -297,6 +410,7 @@ export async function updatePullRequestRegistration(
   const body = { phase, agent_id: agentId };
   if (url) body.url = url;
   if (registrationId) body.registration_id = registrationId;
+  if (registrationKeyValue) body.registration_key = registrationKeyValue;
   const response = await fetchImplementation(
     `${controlPlane}/api/tasks/${encodeURIComponent(taskId)}/pull-requests`,
     {
@@ -324,14 +438,36 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
   const execute = dependencies.execute ?? commandOutput;
   const currentUrl = dependencies.currentPullRequestUrl ?? currentPullRequestUrl;
   const registrationId = dependencies.registrationId ?? randomUUID();
-  const updateRegistration = dependencies.updateRegistration ?? ((phase, url) =>
-    updatePullRequestRegistration(phase, url, registrationId, environment));
+  const identifyRegistration = dependencies.registrationKeyForCommand ??
+    ((commandArgs) => pullRequestRegistrationKey(commandArgs, { environment }));
+  const updateRegistration = dependencies.updateRegistration ??
+    ((phase, url, effectiveRegistrationId, registrationKeyValue) =>
+      updatePullRequestRegistration(
+        phase,
+        url,
+        effectiveRegistrationId,
+        registrationKeyValue,
+        environment,
+      ));
   const managed = reviewLifecycleEnabled(environment) &&
     args[0] === 'pr' && ['create', 'ready'].includes(args[1]);
   if (!managed) return execute(args);
 
+  let registrationKeyValue;
+  let effectiveRegistrationId = registrationId;
+  let reusedRegistration = false;
   try {
-    await updateRegistration('begin', undefined, registrationId);
+    registrationKeyValue = await identifyRegistration(args);
+    const pending = await updateRegistration(
+      'begin',
+      undefined,
+      registrationId,
+      registrationKeyValue,
+    );
+    if (typeof pending?.registration_id === 'string' && pending.registration_id) {
+      effectiveRegistrationId = pending.registration_id;
+    }
+    reusedRegistration = pending?.reused === true;
   } catch (cause) {
     return {
       exit_code: 1,
@@ -348,7 +484,14 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
   const output = await execute(args);
   if (output.exit_code !== 0) {
     try {
-      await updateRegistration('cancel', undefined, registrationId);
+      if (!reusedRegistration) {
+        await updateRegistration(
+          'cancel',
+          undefined,
+          effectiveRegistrationId,
+          registrationKeyValue,
+        );
+      }
     } catch (cause) {
       output.review_lifecycle = {
         registered: false,
@@ -364,7 +507,12 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
     output.review_lifecycle = {
       registered: true,
       pull_request: url,
-      state: await updateRegistration('register', url, registrationId),
+      state: await updateRegistration(
+        'register',
+        url,
+        effectiveRegistrationId,
+        registrationKeyValue,
+      ),
       message: 'XpressClaw will keep this task active and address review feedback until approval or merge.',
     };
   } catch (cause) {

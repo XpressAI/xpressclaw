@@ -91,6 +91,7 @@ pub struct PullRequestInput {
     pub url: Option<String>,
     pub agent_id: String,
     pub registration_id: Option<String>,
+    pub registration_key: Option<String>,
     #[serde(default)]
     pub phase: PullRequestRegistrationPhase,
 }
@@ -156,21 +157,28 @@ async fn register_pull_request(
     match request.phase {
         PullRequestRegistrationPhase::Begin => {
             let registration_id = registration_id(&request)?;
-            manager
+            let registration_key = registration_key(&request)?;
+            let (registration_id, reused) = manager
                 .begin_registration(
                     &id,
                     &request.agent_id,
                     &access.repository(),
                     registration_id,
+                    registration_key,
                 )
                 .map_err(pull_request_registration_error)?;
             Ok((
                 StatusCode::CREATED,
-                Json(json!({ "status": "registration_pending" })),
+                Json(json!({
+                    "status": "registration_pending",
+                    "registration_id": registration_id,
+                    "reused": reused,
+                })),
             ))
         }
         PullRequestRegistrationPhase::Register => {
             let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
             let url = request.url.as_deref().ok_or_else(|| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -184,18 +192,21 @@ async fn register_pull_request(
                     &access.repository(),
                     url,
                     registration_id,
+                    registration_key,
                 )
                 .map_err(pull_request_registration_error)?;
             Ok((StatusCode::CREATED, Json(json!(pull_request))))
         }
         PullRequestRegistrationPhase::Cancel => {
             let registration_id = registration_id(&request)?;
+            let registration_key = registration_key(&request)?;
             manager
                 .cancel_registration(
                     &id,
                     &request.agent_id,
                     &access.repository(),
                     registration_id,
+                    registration_key,
                 )
                 .map_err(pull_request_registration_error)?;
             Ok((
@@ -211,6 +222,15 @@ fn registration_id(request: &PullRequestInput) -> Result<&str, (StatusCode, Json
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "this registration phase requires a registration ID" })),
+        )
+    })
+}
+
+fn registration_key(request: &PullRequestInput) -> Result<&str, (StatusCode, Json<Value>)> {
+    request.registration_key.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "this registration phase requires a registration key" })),
         )
     })
 }

@@ -108,19 +108,39 @@ impl GithubReviewManager {
         agent_id: &str,
         repository: &str,
         registration_id: &str,
-    ) -> Result<()> {
+        registration_key: &str,
+    ) -> Result<(String, bool)> {
         validate_registration_id(registration_id)?;
+        validate_registration_key(registration_key)?;
         let (owner, repo) = parse_repository(repository)?;
         let now = Utc::now();
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             activate_registration_task_in_connection(&transaction, task_id, agent_id)?;
+            let existing = transaction
+                .query_row(
+                    "SELECT url, registration_key FROM task_pull_requests
+                     WHERE task_id = ?1 AND owner = ?2 AND repo = ?3 AND number = 0",
+                    rusqlite::params![task_id, owner, repo],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            if let Some((existing_id, existing_key)) = existing {
+                if existing_key.as_deref() != Some(registration_key) {
+                    return Err(Error::Task(
+                        "another pull-request publication is still awaiting durable registration; retry that pull request before publishing a different one"
+                            .into(),
+                    ));
+                }
+                transaction.commit()?;
+                return Ok((existing_id, true));
+            }
             transaction.execute(
                 "INSERT INTO task_pull_requests
                     (task_id, agent_id, owner, repo, number, url, status,
-                     started_at, expires_at, next_poll_at, poll_interval_seconds, last_error)
-                 VALUES (?1, ?2, ?3, ?4, 0, ?5, 'attention', ?6, ?7, NULL, ?8, ?9)
-                 ON CONFLICT(task_id, owner, repo, number) DO NOTHING",
+                     started_at, expires_at, next_poll_at, poll_interval_seconds, last_error,
+                     registration_key)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5, 'attention', ?6, ?7, NULL, ?8, ?9, ?10)",
                 rusqlite::params![
                     task_id,
                     agent_id,
@@ -131,10 +151,11 @@ impl GithubReviewManager {
                     (now + ChronoDuration::days(MONITOR_FOR_DAYS)).to_rfc3339(),
                     MIN_POLL_INTERVAL_SECONDS,
                     "pull-request publication began, but durable registration has not completed",
+                    registration_key,
                 ],
             )?;
             transaction.commit()?;
-            Ok::<_, Error>(())
+            Ok::<_, Error>((registration_id.to_string(), false))
         })
     }
 
@@ -146,16 +167,25 @@ impl GithubReviewManager {
         agent_id: &str,
         repository: &str,
         registration_id: &str,
+        registration_key: &str,
     ) -> Result<()> {
         self.validate_registration_task(task_id, agent_id)?;
         validate_registration_id(registration_id)?;
+        validate_registration_key(registration_key)?;
         let (owner, repo) = parse_repository(repository)?;
         self.db.with_conn(|conn| {
             conn.execute(
                 "DELETE FROM task_pull_requests
                  WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
-                   AND number = 0 AND url = ?5",
-                rusqlite::params![task_id, agent_id, owner, repo, registration_id],
+                   AND number = 0 AND url = ?5 AND registration_key = ?6",
+                rusqlite::params![
+                    task_id,
+                    agent_id,
+                    owner,
+                    repo,
+                    registration_id,
+                    registration_key,
+                ],
             )?;
             Ok::<_, Error>(())
         })
@@ -184,14 +214,16 @@ impl GithubReviewManager {
         repository: &str,
         url: &str,
         registration_id: &str,
+        registration_key: &str,
     ) -> Result<TaskPullRequest> {
         validate_registration_id(registration_id)?;
+        validate_registration_key(registration_key)?;
         self.register_with_registration_id(
             task_id,
             agent_id,
             repository,
             url,
-            Some(registration_id),
+            Some((registration_id, registration_key)),
         )
     }
 
@@ -201,7 +233,7 @@ impl GithubReviewManager {
         agent_id: &str,
         repository: &str,
         url: &str,
-        registration_id: Option<&str>,
+        registration: Option<(&str, &str)>,
     ) -> Result<TaskPullRequest> {
         let pull_request = parse_pull_request(url)?;
         let (expected_owner, expected_repo) = parse_repository(repository)?;
@@ -222,6 +254,30 @@ impl GithubReviewManager {
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             activate_registration_task_in_connection(&transaction, task_id, agent_id)?;
+            if let Some((registration_id, registration_key)) = registration {
+                let sentinel_exists = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM task_pull_requests
+                        WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
+                          AND number = 0 AND url = ?5 AND registration_key = ?6
+                     )",
+                    rusqlite::params![
+                        task_id,
+                        agent_id,
+                        expected_owner,
+                        expected_repo,
+                        registration_id,
+                        registration_key,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !sentinel_exists {
+                    return Err(Error::Task(
+                        "pull-request registration no longer matches its durable publication gate; begin the retry before registering it"
+                            .into(),
+                    ));
+                }
+            }
             transaction.execute(
                 "INSERT INTO task_pull_requests
                     (task_id, agent_id, owner, repo, number, url, status,
@@ -260,19 +316,26 @@ impl GithubReviewManager {
                     MIN_POLL_INTERVAL_SECONDS,
                 ],
             )?;
-            if let Some(registration_id) = registration_id {
-                transaction.execute(
+            if let Some((registration_id, registration_key)) = registration {
+                let deleted = transaction.execute(
                     "DELETE FROM task_pull_requests
                      WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
-                       AND number = 0 AND url = ?5",
+                       AND number = 0 AND url = ?5 AND registration_key = ?6",
                     rusqlite::params![
                         task_id,
                         agent_id,
                         expected_owner,
                         expected_repo,
                         registration_id,
+                        registration_key,
                     ],
                 )?;
+                if deleted != 1 {
+                    return Err(Error::Task(
+                        "pull-request publication gate changed before registration completed"
+                            .into(),
+                    ));
+                }
             }
             transaction.commit()?;
             Ok::<_, Error>(())
@@ -1281,6 +1344,16 @@ fn validate_registration_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_registration_key(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::Task(
+            "pull-request registration key must be a non-empty hexadecimal value".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_repository(value: &str) -> Result<(String, String)> {
     let value = value.trim().trim_end_matches('/').trim_end_matches(".git");
     let mut parts = value.split('/');
@@ -1359,6 +1432,11 @@ mod tests {
     use super::*;
     use crate::tasks::board::CreateTask;
     use crate::tasks::conversation::TaskConversation;
+
+    const REGISTRATION_KEY_A: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REGISTRATION_KEY_B: &str =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn setup_task(context: Option<Value>) -> (Arc<Database>, String) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -1686,6 +1764,7 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-1",
+                REGISTRATION_KEY_A,
             )
             .unwrap_err();
         assert!(begin_error.to_string().contains("finished task"));
@@ -1724,6 +1803,7 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-1",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         assert_eq!(
@@ -1742,6 +1822,7 @@ mod tests {
                 "XpressAI/xpressclaw",
                 "https://github.com/XpressAI/xpressclaw/pull/151",
                 "registration-1",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Waiting);
@@ -1757,47 +1838,59 @@ mod tests {
     }
 
     #[test]
-    fn successful_registration_deletes_only_its_matching_sentinel() {
+    fn retry_reuses_only_its_matching_registration_sentinel() {
         let (db, task_id) = setup_task(None);
         let manager = GithubReviewManager::new(db.clone());
-        manager
+        let (original_id, reused) = manager
             .begin_registration(
                 &task_id,
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-a",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
-        // The primary key permits one fail-closed sentinel per task/repo. A
-        // later command can begin while the first command's token remains.
-        manager
+        assert_eq!(original_id, "registration-a");
+        assert!(!reused);
+
+        let (retry_id, reused) = manager
             .begin_registration(
                 &task_id,
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-b",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
+        assert_eq!(retry_id, "registration-a");
+        assert!(reused);
 
-        manager
+        let unrelated_error = manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-c",
+                REGISTRATION_KEY_B,
+            )
+            .unwrap_err();
+        assert!(unrelated_error
+            .to_string()
+            .contains("another pull-request publication"));
+
+        let mismatched_error = manager
             .register_pending(
                 &task_id,
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "https://github.com/XpressAI/xpressclaw/pull/152",
                 "registration-b",
+                REGISTRATION_KEY_A,
             )
-            .unwrap();
-        let sentinel: String = db
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT url FROM task_pull_requests WHERE task_id = ?1 AND number = 0",
-                    [&task_id],
-                    |row| row.get(0),
-                )
-            })
-            .unwrap();
-        assert_eq!(sentinel, "registration-a");
+            .unwrap_err();
+        assert!(mismatched_error
+            .to_string()
+            .contains("no longer matches its durable publication gate"));
         assert_eq!(
             manager.gate(&task_id).unwrap(),
             GithubReviewGate::NeedsInput
@@ -1809,7 +1902,8 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "https://github.com/XpressAI/xpressclaw/pull/151",
-                "registration-a",
+                &retry_id,
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Waiting);
@@ -1822,7 +1916,7 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(monitored, 2);
+        assert_eq!(monitored, 1);
     }
 
     #[test]
@@ -1835,14 +1929,7 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-1",
-            )
-            .unwrap();
-        manager
-            .begin_registration(
-                &task_id,
-                "project-codex",
-                "XpressAI/xpressclaw",
-                "registration-2",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         manager
@@ -1851,6 +1938,7 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-2",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         assert_eq!(
@@ -1863,6 +1951,7 @@ mod tests {
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "registration-1",
+                REGISTRATION_KEY_A,
             )
             .unwrap();
         assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::None);

@@ -6,6 +6,7 @@ import {
   commandResultIsError,
   executeCommandWithReviewLifecycle,
   managedCommandArguments,
+  pullRequestRegistrationKey,
   pullRequestUrl,
   TOOL_DESCRIPTION,
   toolDescription,
@@ -106,6 +107,14 @@ test('ordinary task lifecycle rejects converting a ready PR back to draft', () =
     managedCommandArguments(['pr', 'ready', '--undo'], {}),
     ['pr', 'ready', '--undo'],
   );
+  assert.deepEqual(
+    managedCommandArguments(['pr', 'ready', '--undo=false'], environment),
+    ['pr', 'ready', '--undo=false'],
+  );
+  assert.throws(
+    () => managedCommandArguments(['pr', 'ready', '--undo=true'], environment),
+    /cannot convert a ready pull request back to draft/,
+  );
 });
 
 test('ordinary task lifecycle rejects dry-run creation before publication', () => {
@@ -118,6 +127,71 @@ test('ordinary task lifecycle rejects dry-run creation before publication', () =
     managedCommandArguments(['pr', 'create', '--dry-run'], {}),
     ['pr', 'create', '--dry-run'],
   );
+  assert.deepEqual(
+    managedCommandArguments(['pr', 'create', '--dry-run=false'], environment),
+    ['pr', 'create', '--dry-run=false'],
+  );
+  assert.throws(
+    () => managedCommandArguments(['pr', 'create', '--dry-run=true'], environment),
+    /cannot register a dry-run pull request/,
+  );
+});
+
+test('uses the same registration key for create and ready on one pull request', async () => {
+  const environment = { GH_REPO: 'XpressAI/xpressclaw' };
+  const created = await pullRequestRegistrationKey(
+    ['pr', 'create', '--head', 'XpressAI:feature/review', '--base=main'],
+    { environment },
+  );
+  const readied = await pullRequestRegistrationKey(
+    ['pr', 'ready', '151'],
+    {
+      environment,
+      currentPullRequestIdentity: async () => ({
+        owner: 'xpressai', head: 'feature/review', base: 'main',
+      }),
+    },
+  );
+
+  assert.equal(created, readied);
+  assert.match(created, /^[0-9a-f]{64}$/);
+});
+
+test('registration keys distinguish unrelated pull-request branches', async () => {
+  const environment = { GH_REPO: 'XpressAI/xpressclaw' };
+  const first = await pullRequestRegistrationKey(
+    ['pr', 'create', '-Hfeature/one', '-Bmain'],
+    { environment },
+  );
+  const second = await pullRequestRegistrationKey(
+    ['pr', 'create', '-Hfeature/two', '-Bmain'],
+    { environment },
+  );
+
+  assert.notEqual(first, second);
+});
+
+test('registration keys honor the branch-configured gh merge base', async () => {
+  const environment = { GH_REPO: 'XpressAI/xpressclaw' };
+  const created = await pullRequestRegistrationKey(
+    ['pr', 'create', '--head=feature/review'],
+    {
+      environment,
+      configuredBaseBranch: async () => 'develop',
+      defaultBaseBranch: async () => 'main',
+    },
+  );
+  const readied = await pullRequestRegistrationKey(
+    ['pr', 'ready', '151'],
+    {
+      environment,
+      currentPullRequestIdentity: async () => ({
+        owner: 'xpressai', head: 'feature/review', base: 'develop',
+      }),
+    },
+  );
+
+  assert.equal(created, readied);
 });
 
 test('workflow-managed PR creation preserves an explicit draft', () => {
@@ -158,17 +232,18 @@ test('sends explicit begin, register, and cancel registration phases', async () 
   };
 
   await updatePullRequestRegistration(
-    'begin', undefined, 'registration-1', environment, fetchImplementation,
+    'begin', undefined, 'registration-1', 'a'.repeat(64), environment, fetchImplementation,
   );
   await updatePullRequestRegistration(
     'register',
     'https://github.com/XpressAI/xpressclaw/pull/151',
     'registration-1',
+    'a'.repeat(64),
     environment,
     fetchImplementation,
   );
   await updatePullRequestRegistration(
-    'cancel', undefined, 'registration-1', environment, fetchImplementation,
+    'cancel', undefined, 'registration-1', 'a'.repeat(64), environment, fetchImplementation,
   );
 
   assert.deepEqual(requests, [
@@ -176,6 +251,7 @@ test('sends explicit begin, register, and cancel registration phases', async () 
       url: 'http://control-plane/api/tasks/task%2F1/pull-requests',
       body: {
         phase: 'begin', agent_id: 'agent', registration_id: 'registration-1',
+        registration_key: 'a'.repeat(64),
       },
     },
     {
@@ -184,6 +260,7 @@ test('sends explicit begin, register, and cancel registration phases', async () 
         phase: 'register',
         agent_id: 'agent',
         registration_id: 'registration-1',
+        registration_key: 'a'.repeat(64),
         url: 'https://github.com/XpressAI/xpressclaw/pull/151',
       },
     },
@@ -191,6 +268,7 @@ test('sends explicit begin, register, and cancel registration phases', async () 
       url: 'http://control-plane/api/tasks/task%2F1/pull-requests',
       body: {
         phase: 'cancel', agent_id: 'agent', registration_id: 'registration-1',
+        registration_key: 'a'.repeat(64),
       },
     },
   ]);
@@ -203,6 +281,7 @@ test('arms review monitoring before publishing and leaves the gate on registrati
     {
       environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
       registrationId: 'registration-1',
+      registrationKeyForCommand: async () => 'a'.repeat(64),
       execute: async () => {
         events.push('command');
         return {
@@ -211,15 +290,19 @@ test('arms review monitoring before publishing and leaves the gate on registrati
           stderr: '',
         };
       },
-      updateRegistration: async (phase, _url, registrationId) => {
-        events.push(`${phase}:${registrationId}`);
+      updateRegistration: async (phase, _url, registrationId, registrationKey) => {
+        events.push(`${phase}:${registrationId}:${registrationKey}`);
         if (phase === 'register') throw new Error('control plane timed out');
         return { status: 'ok' };
       },
     },
   );
 
-  assert.deepEqual(events, ['begin:registration-1', 'command', 'register:registration-1']);
+  assert.deepEqual(events, [
+    `begin:registration-1:${'a'.repeat(64)}`,
+    'command',
+    `register:registration-1:${'a'.repeat(64)}`,
+  ]);
   assert.equal(output.review_lifecycle.registered, false);
   assert.match(output.review_lifecycle.message, /durable task gate remains armed/i);
   assert.equal(commandResultIsError(output), true);
@@ -230,6 +313,7 @@ test('does not publish unless the durable review gate was armed', async () => {
   const output = await executeCommandWithReviewLifecycle(['pr', 'create'], {
     environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
     registrationId: 'registration-1',
+    registrationKeyForCommand: async () => 'a'.repeat(64),
     execute: async () => {
       executed = true;
       return { exit_code: 0, stdout: '', stderr: '' };
@@ -249,17 +333,22 @@ test('cancels the pre-publication gate when the GitHub command fails', async () 
   const output = await executeCommandWithReviewLifecycle(['pr', 'ready'], {
     environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
     registrationId: 'registration-1',
+    registrationKeyForCommand: async () => 'a'.repeat(64),
     execute: async () => {
       events.push('command');
       return { exit_code: 1, stdout: '', stderr: 'not found' };
     },
-    updateRegistration: async (phase, _url, registrationId) => {
-      events.push(`${phase}:${registrationId}`);
+    updateRegistration: async (phase, _url, registrationId, registrationKey) => {
+      events.push(`${phase}:${registrationId}:${registrationKey}`);
       return { status: 'ok' };
     },
   });
 
-  assert.deepEqual(events, ['begin:registration-1', 'command', 'cancel:registration-1']);
+  assert.deepEqual(events, [
+    `begin:registration-1:${'a'.repeat(64)}`,
+    'command',
+    `cancel:registration-1:${'a'.repeat(64)}`,
+  ]);
   assert.equal(output.exit_code, 1);
   assert.equal(output.review_lifecycle, undefined);
 });
@@ -271,6 +360,7 @@ test('resolves the explicit pull request target after ready output omits its URL
     {
       environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
       registrationId: 'registration-1',
+      registrationKeyForCommand: async () => 'a'.repeat(64),
       execute: async () => ({
         exit_code: 0,
         stdout: '✓ Pull request XpressAI/xpressclaw#151 is marked as ready for review\n',
@@ -289,4 +379,49 @@ test('resolves the explicit pull request target after ready output omits its URL
     output.review_lifecycle.pull_request,
     'https://github.com/XpressAI/xpressclaw/pull/151',
   );
+});
+
+test('a retry reuses the durable registration token returned by begin', async () => {
+  const events = [];
+  const output = await executeCommandWithReviewLifecycle(['pr', 'ready', '151'], {
+    environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
+    registrationId: 'registration-new',
+    registrationKeyForCommand: async () => 'a'.repeat(64),
+    execute: async () => ({
+      exit_code: 0,
+      stdout: 'https://github.com/XpressAI/xpressclaw/pull/151\n',
+      stderr: '',
+    }),
+    updateRegistration: async (phase, _url, registrationId) => {
+      events.push(`${phase}:${registrationId}`);
+      if (phase === 'begin') {
+        return { registration_id: 'registration-original', reused: true };
+      }
+      return { status: 'waiting' };
+    },
+  });
+
+  assert.deepEqual(events, [
+    'begin:registration-new',
+    'register:registration-original',
+  ]);
+  assert.equal(output.review_lifecycle.registered, true);
+});
+
+test('a failed retry preserves the original durable registration gate', async () => {
+  const events = [];
+  await executeCommandWithReviewLifecycle(['pr', 'ready', '151'], {
+    environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
+    registrationId: 'registration-new',
+    registrationKeyForCommand: async () => 'a'.repeat(64),
+    execute: async () => ({ exit_code: 1, stdout: '', stderr: 'not ready' }),
+    updateRegistration: async (phase, _url, registrationId) => {
+      events.push(`${phase}:${registrationId}`);
+      return phase === 'begin'
+        ? { registration_id: 'registration-original', reused: true }
+        : { status: 'ok' };
+    },
+  });
+
+  assert.deepEqual(events, ['begin:registration-new']);
 });
