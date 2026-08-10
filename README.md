@@ -138,6 +138,15 @@ or attach a recurring cron trigger. See [Workflows](docs/workflows.md) for the
 definition format and execution behavior. The CLI deliberately does not
 duplicate these product surfaces.
 
+**Finish pull requests through review:**
+
+For ordinary tasks, the scoped GitHub tool publishes completed work ready for
+review and keeps the task active. XpressClaw durably checks for review comments,
+resumes the same conversation to address them, and releases the next queued
+task only after approval or merge. Explicit workflow steps may still use draft
+PRs and their own wait logic. See
+[ADR-035](docs/adr/ADR-035-managed-pull-request-review-lifecycle.md).
+
 ## Configuration
 
 `xpressclaw init` creates a minimal `xpressclaw.yaml`. Agents are added in the

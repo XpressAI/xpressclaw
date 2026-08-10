@@ -295,6 +295,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
+    let github_review_lifecycle =
+        control_task_id.is_some() && github_review_lifecycle_enabled(&task);
     let _ = board.update_status(&item.task_id, "in_progress", Some(&item.agent_id));
 
     if let AcpSessionStart::Resume(native_session_id) = &session_start {
@@ -355,6 +357,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &kind,
         github.is_some(),
         bundled_control_tools,
+        github_review_lifecycle,
         &mut spec.environment,
     )?;
     if bundled_control_tools
@@ -373,7 +376,15 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     if let Some(access) = github.as_ref() {
         if github_mcp_attached {
-            mcp_servers.push(access.mcp_server());
+            let task_context = control_task_id
+                .as_ref()
+                .map(|task_id| github::GithubTaskContext {
+                    control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+                    task_id: task_id.clone(),
+                    agent_id: agent.name.clone(),
+                    review_lifecycle: github_review_lifecycle,
+                });
+            mcp_servers.push(access.mcp_server(task_context.as_ref()));
         } else if !bundled_control_tools {
             warn!(
                 image = spec.image,
@@ -514,10 +525,18 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
+    let review_gate =
+        crate::workers::github_review::GithubReviewManager::new(db.clone()).gate(&item.task_id)?;
     let completed_tasks = if continuation_queued {
         board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
         Vec::new()
     } else if waiting_for_user {
+        board.update_status(&item.task_id, "waiting_for_input", Some(&item.agent_id))?;
+        Vec::new()
+    } else if review_gate == crate::workers::github_review::GithubReviewGate::Waiting {
+        board.update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
+        Vec::new()
+    } else if review_gate == crate::workers::github_review::GithubReviewGate::NeedsInput {
         board.update_status(&item.task_id, "waiting_for_input", Some(&item.agent_id))?;
         Vec::new()
     } else if board.subtasks_complete(&item.task_id)? {
@@ -915,21 +934,33 @@ fn continuation_task_id(task: &Task) -> Option<&str> {
     (!task.hidden && task.task_type != "IDLE").then_some(task.id.as_str())
 }
 
+fn github_review_lifecycle_enabled(task: &Task) -> bool {
+    task.context
+        .as_ref()
+        .and_then(|context| context.get("origin"))
+        .and_then(Value::as_str)
+        != Some("workflow")
+}
+
+fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String {
+    let host = if container_runtime == "podman" {
+        "host.containers.internal"
+    } else {
+        "host.docker.internal"
+    };
+    format!("http://{host}:{control_plane_port}")
+}
+
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
     task_id: Option<&str>,
     control_plane_port: u16,
     container_runtime: &str,
 ) -> McpServer {
-    let host = if container_runtime == "podman" {
-        "host.containers.internal"
-    } else {
-        "host.docker.internal"
-    };
     let mut env = vec![
         EnvVariable::new(
             "XPRESSCLAW_URL",
-            format!("http://{host}:{control_plane_port}"),
+            control_plane_url(control_plane_port, container_runtime),
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
     ];
@@ -1143,6 +1174,7 @@ fn configure_bundled_github_mcp(
     kind: &str,
     github_available: bool,
     bundled_control_tools: bool,
+    review_lifecycle: bool,
     environment: &mut Vec<String>,
 ) -> Result<bool> {
     let attached = github_available
@@ -1160,7 +1192,7 @@ fn configure_bundled_github_mcp(
                 environment[index][PREFIX.len()..].to_string(),
             );
         }
-        github::add_codex_mcp_guidance(&mut codex_environment)?;
+        github::add_codex_mcp_guidance(&mut codex_environment, review_lifecycle)?;
         let config = codex_environment
             .remove("CODEX_CONFIG")
             .ok_or_else(|| Error::Backend("GitHub guidance did not produce CODEX_CONFIG".into()))?;
@@ -1214,7 +1246,7 @@ fn container_workspace_path(workspace: &Path, container_engine: ContainerEngineA
     }
 }
 
-fn resolved_workspace(config: &Config, agent: &AgentConfig) -> PathBuf {
+pub fn resolved_workspace(config: &Config, agent: &AgentConfig) -> PathBuf {
     let workspace = agent
         .runner
         .workspace
@@ -1694,7 +1726,8 @@ mod tests {
         let mut environment = vec!["HOME=/home/node".to_string()];
 
         assert!(
-            configure_bundled_github_mcp(&runner, "codex", true, true, &mut environment).unwrap()
+            configure_bundled_github_mcp(&runner, "codex", true, true, true, &mut environment)
+                .unwrap()
         );
         let config: Value = serde_json::from_str(
             environment
@@ -1718,6 +1751,7 @@ mod tests {
             "codex",
             true,
             false,
+            true,
             &mut custom_image_environment
         )
         .unwrap());
@@ -1728,6 +1762,7 @@ mod tests {
             &runner,
             "codex",
             false,
+            true,
             true,
             &mut missing_access_environment
         )
@@ -1741,6 +1776,7 @@ mod tests {
         assert!(!configure_bundled_github_mcp(
             &configured_runner,
             "codex",
+            true,
             true,
             true,
             &mut configured_environment

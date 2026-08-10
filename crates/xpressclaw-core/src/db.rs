@@ -182,6 +182,7 @@ impl Database {
             (29, MIGRATION_V29),
             (30, MIGRATION_V30),
             (31, MIGRATION_V31),
+            (32, MIGRATION_V32),
         ];
 
         for &(target, sql) in migrations {
@@ -989,6 +990,35 @@ const MIGRATION_V31: &str = "
 ALTER TABLE workflow_instances ADD COLUMN definition_yaml TEXT;
 ";
 
+const MIGRATION_V32: &str = "
+-- Ordinary tasks that publish pull requests remain active until a human or
+-- automated reviewer approves them, or GitHub reports that they were merged.
+CREATE TABLE task_pull_requests (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting'
+        CHECK (status IN ('waiting', 'approved', 'merged', 'attention', 'cancelled')),
+    started_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    next_poll_at TEXT,
+    poll_interval_seconds INTEGER NOT NULL DEFAULT 15,
+    last_checked_at TEXT,
+    last_activity_at TEXT,
+    last_feedback_at TEXT,
+    after_cursor TEXT,
+    last_error TEXT,
+    PRIMARY KEY (task_id, owner, repo, number)
+);
+CREATE INDEX idx_task_pull_requests_due
+    ON task_pull_requests(status, next_poll_at);
+CREATE INDEX idx_task_pull_requests_agent
+    ON task_pull_requests(agent_id, task_id, status);
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,7 +1036,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "31");
+        assert_eq!(version, "32");
     }
 
     #[test]
@@ -1051,5 +1081,6 @@ mod tests {
         assert!(tables.contains(&"project_memory_tags".to_string()));
         assert!(tables.contains(&"project_memory_links".to_string()));
         assert!(tables.contains(&"project_memory_embeddings".to_string()));
+        assert!(tables.contains(&"task_pull_requests".to_string()));
     }
 }

@@ -91,8 +91,8 @@ jobs:
       - name: Build and test
         run: bash build.sh --skip-tauri --skip-docker --skip-check
 
-      - name: Test native control-plane MCP server
-        run: node --test harnesses/native/common/mcp-xpressclaw.test.mjs
+      - name: Test native control-plane MCP servers
+        run: node --test harnesses/native/common/mcp-xpressclaw.test.mjs harnesses/native/common/mcp-github.test.mjs
 
       - name: Clippy
         run: cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings

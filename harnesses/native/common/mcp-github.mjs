@@ -33,6 +33,20 @@ Supported commands:
 
 The repository is fixed by XpressClaw. Arbitrary gh api, authentication, configuration, extensions, repository selection, merging, and checkout are unavailable. Use the shell's full git CLI for branches, fetches, pushes, rebases, cherry-picks, and other Git operations.`;
 
+const REVIEW_LIFECYCLE_DESCRIPTION = `
+
+This ordinary task uses XpressClaw's managed pull-request review lifecycle. A pull request that is ready for a person to review must be published ready for review, never left as a draft. Generic instructions that default to draft are overridden here. After creation, XpressClaw keeps the task active, checks for review feedback, resumes this conversation to address every comment, and completes the task only after approval or merge.`;
+
+export function toolDescription(environment = process.env) {
+  return reviewLifecycleEnabled(environment)
+    ? `${TOOL_DESCRIPTION}${REVIEW_LIFECYCLE_DESCRIPTION}`
+    : TOOL_DESCRIPTION;
+}
+
+export function reviewLifecycleEnabled(environment = process.env) {
+  return environment.XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE === '1';
+}
+
 function write(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -101,6 +115,25 @@ function optionValue(args, longName, shortName) {
   return undefined;
 }
 
+export function managedCommandArguments(args, environment = process.env) {
+  if (!reviewLifecycleEnabled(environment) || args[0] !== 'pr' || args[1] !== 'create') {
+    return [...args];
+  }
+  return args.filter((argument) =>
+    argument !== '--draft' && argument !== '-d' &&
+    argument !== '--draft=true' && argument !== '-d=true'
+  );
+}
+
+export function pullRequestUrl(value) {
+  const match = String(value ?? '').match(/https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+/);
+  return match?.[0];
+}
+
+export function commandResultIsError(output) {
+  return output.exit_code !== 0 || output.review_lifecycle?.registered === false;
+}
+
 function commandOutput(args) {
   return new Promise((resolve) => {
     const child = spawn(GH, args, {
@@ -162,6 +195,39 @@ async function currentPullRequestNumber() {
   return number;
 }
 
+async function currentPullRequestUrl() {
+  const output = await successfulCommand(['pr', 'view', '--json', 'url', '--jq', '.url']);
+  const url = pullRequestUrl(output.stdout.trim());
+  if (!url) throw new Error('could not determine the current pull-request URL');
+  return url;
+}
+
+async function registerPullRequest(url) {
+  const controlPlane = process.env.XPRESSCLAW_URL?.replace(/\/$/, '');
+  const taskId = process.env.XPRESSCLAW_TASK_ID;
+  const agentId = process.env.XPRESSCLAW_AGENT_ID;
+  if (!controlPlane || !taskId || !agentId) {
+    throw new Error('XpressClaw did not provide task review-lifecycle context');
+  }
+  const response = await fetch(`${controlPlane}/api/tasks/${encodeURIComponent(taskId)}/pull-requests`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ url, agent_id: agentId }),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { message: text };
+  }
+  if (!response.ok) {
+    throw new Error(payload.error ?? payload.message ?? `XpressClaw returned HTTP ${response.status}`);
+  }
+  return payload;
+}
+
 async function reviewThreads(args) {
   const command = args[2];
   if (command === 'list') {
@@ -219,10 +285,32 @@ async function reviewThreads(args) {
 }
 
 async function callTool(argumentsValue) {
-  const args = argumentsValue?.args;
-  validateArguments(args);
+  const requestedArgs = argumentsValue?.args;
+  validateArguments(requestedArgs);
+  const args = managedCommandArguments(requestedArgs);
   if (args[0] === 'pr' && args[1] === 'thread') return reviewThreads(args);
-  return commandOutput(args);
+  const output = await commandOutput(args);
+  if (
+    output.exit_code === 0 && reviewLifecycleEnabled() &&
+    args[0] === 'pr' && ['create', 'ready'].includes(args[1])
+  ) {
+    try {
+      const url = pullRequestUrl(output.stdout) ?? await currentPullRequestUrl();
+      output.review_lifecycle = {
+        registered: true,
+        pull_request: url,
+        state: await registerPullRequest(url),
+        message: 'XpressClaw will keep this task active and address review feedback until approval or merge.',
+      };
+    } catch (cause) {
+      output.review_lifecycle = {
+        registered: false,
+        error: cause instanceof Error ? cause.message : String(cause),
+        message: 'The pull request was created, but automatic review monitoring could not be registered. Do not declare the task complete; retry `gh pr ready` after correcting the error.',
+      };
+    }
+  }
+  return output;
 }
 
 async function handle(message) {
@@ -233,7 +321,7 @@ async function handle(message) {
       protocolVersion: params?.protocolVersion ?? '2024-11-05',
       capabilities: { tools: {} },
       serverInfo: { name: 'xpressclaw-github', version: '0.2.0' },
-      instructions: TOOL_DESCRIPTION,
+      instructions: toolDescription(),
     });
     return;
   }
@@ -245,7 +333,7 @@ async function handle(message) {
     result(id, {
       tools: [{
         name: 'gh',
-        description: TOOL_DESCRIPTION,
+        description: toolDescription(),
         inputSchema: {
           type: 'object',
           properties: {
@@ -270,7 +358,7 @@ async function handle(message) {
     }
     try {
       const output = await callTool(params.arguments);
-      result(id, toolResult(output, output.exit_code !== 0));
+      result(id, toolResult(output, commandResultIsError(output)));
     } catch (cause) {
       const output = cause?.output ?? { error: cause instanceof Error ? cause.message : String(cause) };
       result(id, toolResult(output, true));

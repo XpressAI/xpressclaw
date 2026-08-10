@@ -246,6 +246,15 @@ impl TaskQueue {
                                      OR active_owner.container_id IS NOT NULL
                                  )
                            )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM task_pull_requests monitored_pr
+                               JOIN tasks monitored_task
+                                 ON monitored_task.id = monitored_pr.task_id
+                               WHERE monitored_pr.agent_id = q.agent_id
+                                 AND monitored_pr.task_id != q.task_id
+                                 AND monitored_pr.status != 'cancelled'
+                                 AND monitored_task.status NOT IN ('completed', 'cancelled')
+                           )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
                         [],
                         |row| row.get(0),
@@ -761,6 +770,101 @@ mod tests {
         // to transition the attempt or attach the shared project container.
         assert!(queue.claim_next().unwrap().is_some());
         assert!(queue.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_pr_review_reserves_agent_lane_but_allows_same_task_follow_up() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                title: "Must wait for review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db.clone())
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let waiting = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+
+        let follow_up = queue
+            .enqueue_continuation(&review_task.id, "atlas")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, follow_up.id);
+        assert_eq!(queue.get(waiting.id).unwrap().status, "queued");
+    }
+
+    #[test]
+    fn completing_monitored_task_releases_agent_lane() {
+        use crate::workers::github_review::GithubReviewManager;
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let review_task = board
+            .create(&CreateTask {
+                title: "Await PR review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let next_task = board
+            .create(&CreateTask {
+                title: "Run after review".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        GithubReviewManager::new(db)
+            .register(
+                &review_task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        let next = queue.enqueue(&next_task.id, "atlas").unwrap();
+        assert!(queue.claim_next().unwrap().is_none());
+        board
+            .update_status(&review_task.id, "completed", Some("atlas"))
+            .unwrap();
+        assert_eq!(queue.claim_next().unwrap().unwrap().id, next.id);
     }
 
     #[test]

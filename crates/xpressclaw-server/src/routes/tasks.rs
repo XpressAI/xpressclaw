@@ -15,6 +15,7 @@ use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
+use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
 
 use crate::state::AppState;
 
@@ -85,6 +86,12 @@ pub struct ElicitationResponseInput {
     pub message: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct PullRequestInput {
+    pub url: String,
+    pub agent_id: String,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_tasks).post(create_task))
@@ -102,11 +109,51 @@ pub fn routes() -> Router<AppState> {
             get(get_message_attachment),
         )
         .route("/{id}/activity", get(get_activity))
+        .route("/{id}/pull-requests", post(register_pull_request))
         .route(
             "/{id}/elicitations/{elicitation_id}/response",
             post(respond_to_elicitation),
         )
         .route("/{id}/dependencies", axum::routing::post(add_dependency))
+}
+
+async fn register_pull_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PullRequestInput>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let config = state.config();
+    let agent = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == request.agent_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "the assigned agent is not configured" })),
+            )
+        })?;
+    let workspace = native::resolved_workspace(&config, agent);
+    let access = github::discover(&state.db, &workspace).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+        )
+    })?;
+    let pull_request = GithubReviewManager::new(state.db.clone())
+        .register(&id, &request.agent_id, &access.repository(), &request.url)
+        .map_err(|error| match error {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            xpressclaw_core::error::Error::Task(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": error.to_string() })),
+            ),
+            _ => internal_error(error),
+        })?;
+    Ok((StatusCode::CREATED, Json(json!(pull_request))))
 }
 
 async fn list_tasks(

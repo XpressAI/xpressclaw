@@ -146,6 +146,22 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
+    // Keep ordinary PR-producing tasks open through human/automated review.
+    // New feedback resumes the same task conversation; approval or merge
+    // releases the agent's queue lane and completes the task.
+    let github_review_db = state.db.clone();
+    let github_review_config = state.config.clone();
+    let github_review_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = xpressclaw_core::workers::github_review::start_review_runner(
+                github_review_db,
+                github_review_config,
+            ) => {}
+            _ = github_review_shutdown.cancelled() => { info!("GitHub task review runner stopped"); }
+        }
+    });
+
     let app = create_router(state.clone());
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 

@@ -641,6 +641,47 @@ impl TaskBoard {
                 .all(|subtask| subtask.status == TaskStatus::Completed))
     }
 
+    /// Complete the current ACP plan after an external lifecycle gate (such
+    /// as PR approval) finishes. Only ephemeral native-plan children are
+    /// affected; user-created and workflow subtasks retain their own state.
+    pub fn complete_reported_subtasks(&self, parent_task_id: &str) -> Result<usize> {
+        let now = Utc::now()
+            .naive_utc()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, context FROM tasks
+                 WHERE parent_task_id = ?1 AND status != 'completed'",
+            )?;
+            let ids = statement
+                .query_map([parent_task_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .filter_map(|row| row.ok())
+                .filter_map(|(id, context)| {
+                    context
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|value| {
+                            (value.get("origin").and_then(|value| value.as_str())
+                                == Some("native_plan"))
+                            .then_some(id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            drop(statement);
+            for id in &ids {
+                conn.execute(
+                    "UPDATE tasks SET status = 'completed', updated_at = ?1,
+                        completed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, id],
+                )?;
+            }
+            Ok::<_, Error>(ids.len())
+        })
+    }
+
     /// Complete a task whose steps are done, then roll that completion through
     /// any ready parents. Parents with queued/running work are left active.
     pub fn complete_and_roll_up(&self, task_id: &str, agent_id: Option<&str>) -> Result<Vec<Task>> {
@@ -649,6 +690,9 @@ impl TaskBoard {
         let mut first = true;
 
         while let Some(id) = current_id {
+            if !self.pull_request_gate_satisfied(&id)? {
+                break;
+            }
             if !self.subtasks_complete(&id)? {
                 break;
             }
@@ -662,6 +706,20 @@ impl TaskBoard {
         }
 
         Ok(completed)
+    }
+
+    fn pull_request_gate_satisfied(&self, task_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM task_pull_requests
+                    WHERE task_id = ?1 AND status NOT IN ('approved', 'merged', 'cancelled')
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+        })
     }
 
     fn has_open_attempt(&self, task_id: &str) -> Result<bool> {
