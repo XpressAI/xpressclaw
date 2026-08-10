@@ -312,6 +312,31 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
   return output;
 }
 
+export async function collectReviewThreads(fetchPage) {
+  const threads = [];
+  const seenCursors = new Set();
+  let after;
+  for (;;) {
+    const response = await fetchPage(after);
+    if (Array.isArray(response.errors) && response.errors.length > 0) {
+      throw new Error(`GitHub GraphQL returned errors: ${JSON.stringify(response.errors)}`);
+    }
+    const connection = response.data?.repository?.pullRequest?.reviewThreads;
+    if (!connection || !Array.isArray(connection.nodes)) {
+      throw new Error('GitHub returned invalid pull-request review threads');
+    }
+    threads.push(...connection.nodes);
+    if (connection.pageInfo?.hasNextPage !== true) return threads;
+
+    const cursor = connection.pageInfo?.endCursor;
+    if (typeof cursor !== 'string' || !cursor || seenCursors.has(cursor)) {
+      throw new Error('GitHub returned an invalid or repeated review-thread page cursor');
+    }
+    seenCursors.add(cursor);
+    after = cursor;
+  }
+}
+
 async function reviewThreads(args) {
   const command = args[2];
   if (command === 'list') {
@@ -319,30 +344,35 @@ async function reviewThreads(args) {
     const option = optionValue(args.slice(3), '--pr', '-p');
     const number = Number.parseInt(explicit ?? option ?? '', 10) || await currentPullRequestNumber();
     const { owner, repo } = repositoryParts();
-    const query = `query($owner:String!,$repo:String!,$number:Int!){
+    const query = `query($owner:String!,$repo:String!,$number:Int!,$after:String){
       repository(owner:$owner,name:$repo){
         pullRequest(number:$number){
           number
-          reviewThreads(first:100){
+          reviewThreads(first:100,after:$after){
             nodes{
               id path line originalLine startLine diffSide isResolved isOutdated
               viewerCanReply viewerCanResolve viewerCanUnresolve
               resolvedBy{login}
               comments(first:100){nodes{id databaseId author{login} body createdAt updatedAt url replyTo{id}}}
             }
+            pageInfo{hasNextPage endCursor}
           }
         }
       }
     }`;
-    const response = await graphql(query, [
-      ['owner', owner],
-      ['repo', repo],
-      ['number', number, true],
-    ]);
+    const threads = await collectReviewThreads(async (after) => {
+      const fields = [
+        ['owner', owner],
+        ['repo', repo],
+        ['number', number, true],
+      ];
+      if (after !== undefined) fields.push(['after', after]);
+      return graphql(query, fields);
+    });
     return {
       exit_code: 0,
       pull_request: number,
-      threads: response.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [],
+      threads,
     };
   }
 

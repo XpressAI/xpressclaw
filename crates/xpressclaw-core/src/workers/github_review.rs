@@ -1194,7 +1194,7 @@ mod tests {
             )
             .unwrap();
         TaskBoard::new(db)
-            .update(
+            .update_with_agent_repository(
                 &task_id,
                 &crate::tasks::board::UpdateTask {
                     title: None,
@@ -1202,6 +1202,7 @@ mod tests {
                     agent_id: Some("reviewer-codex".into()),
                     priority: None,
                 },
+                Some(("XpressAI", "xpressclaw")),
             )
             .unwrap();
 

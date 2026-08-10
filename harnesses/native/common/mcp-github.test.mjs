@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  collectReviewThreads,
   commandResultIsError,
   executeCommandWithReviewLifecycle,
   managedCommandArguments,
@@ -10,6 +11,60 @@ import {
   toolDescription,
   updatePullRequestRegistration,
 } from './mcp-github.mjs';
+
+test('paginates every pull-request review thread', async () => {
+  const cursors = [];
+  const threads = await collectReviewThreads(async (after) => {
+    cursors.push(after);
+    if (after === undefined) {
+      return {
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [{ id: 'thread-1' }],
+                pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
+              },
+            },
+          },
+        },
+      };
+    }
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: [{ id: 'thread-2' }],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          },
+        },
+      },
+    };
+  });
+
+  assert.deepEqual(cursors, [undefined, 'cursor-1']);
+  assert.deepEqual(threads, [{ id: 'thread-1' }, { id: 'thread-2' }]);
+});
+
+test('rejects repeated pull-request review-thread cursors', async () => {
+  await assert.rejects(
+    collectReviewThreads(async () => ({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: [],
+              pageInfo: { hasNextPage: true, endCursor: 'same-cursor' },
+            },
+          },
+        },
+      },
+    })),
+    /invalid or repeated review-thread page cursor/,
+  );
+});
 
 test('advertises the GitHub MCP tool as the configured replacement for shell gh', () => {
   assert.match(TOOL_DESCRIPTION, /authenticated, project-scoped replacement/);

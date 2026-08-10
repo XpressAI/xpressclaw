@@ -383,18 +383,29 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
+    let agent_repository = new_agent
+        .as_deref()
+        .and_then(|agent_id| github_access_for_agent(&state, agent_id));
 
-    let task = board.update(&id, &req).map_err(|e| match &e {
-        xpressclaw_core::error::Error::TaskNotFound { .. } => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": e.to_string() })),
-        ),
-        xpressclaw_core::error::Error::Task(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        ),
-        _ => internal_error(e),
-    })?;
+    let task = board
+        .update_with_agent_repository(
+            &id,
+            &req,
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
+        .map_err(|e| match &e {
+            xpressclaw_core::error::Error::TaskNotFound { .. } => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            xpressclaw_core::error::Error::Task(_) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": e.to_string() })),
+            ),
+            _ => internal_error(e),
+        })?;
 
     // If agent was assigned and task is actionable, enqueue for dispatcher
     if let Some(ref agent_id) = new_agent {
@@ -502,7 +513,18 @@ async fn update_task_status(
                     .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
             })
     } else {
-        board.update_status(&id, &req.status, req.agent_id.as_deref())
+        let agent_repository = req
+            .agent_id
+            .as_deref()
+            .and_then(|agent_id| github_access_for_agent(&state, agent_id));
+        board.update_status_with_agent_repository(
+            &id,
+            &req.status,
+            req.agent_id.as_deref(),
+            agent_repository
+                .as_ref()
+                .map(|access| (access.owner.as_str(), access.repo.as_str())),
+        )
     };
     let task = updated.map_err(|e| match &e {
         xpressclaw_core::error::Error::TaskNotFound { .. } => (
@@ -516,6 +538,16 @@ async fn update_task_status(
         _ => internal_error(e),
     })?;
     Ok(Json(json!(task)))
+}
+
+fn github_access_for_agent(
+    state: &AppState,
+    agent_id: &str,
+) -> Option<github::GithubSessionAccess> {
+    let config = state.config();
+    let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
+    let workspace = native::resolved_workspace(&config, agent);
+    github::discover(&state.db, &workspace)
 }
 
 async fn task_counts(

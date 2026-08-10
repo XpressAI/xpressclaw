@@ -426,6 +426,16 @@ impl TaskBoard {
         status: &str,
         agent_id: Option<&str>,
     ) -> Result<Task> {
+        self.update_status_with_agent_repository(task_id, status, agent_id, None)
+    }
+
+    pub fn update_status_with_agent_repository(
+        &self,
+        task_id: &str,
+        status: &str,
+        agent_id: Option<&str>,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let parsed = TaskStatus::parse(status)?;
         let now = Utc::now()
             .naive_utc()
@@ -462,7 +472,12 @@ impl TaskBoard {
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
-                    let previous = synchronize_pull_request_agent(&transaction, task_id, aid)?;
+                    let previous = synchronize_pull_request_agent(
+                        &transaction,
+                        task_id,
+                        aid,
+                        agent_repository,
+                    )?;
                     transaction.execute(
                         "UPDATE tasks SET agent_id = ?1 WHERE id = ?2",
                         rusqlite::params![aid, task_id],
@@ -482,6 +497,15 @@ impl TaskBoard {
     }
 
     pub fn update(&self, task_id: &str, req: &UpdateTask) -> Result<Task> {
+        self.update_with_agent_repository(task_id, req, None)
+    }
+
+    pub fn update_with_agent_repository(
+        &self,
+        task_id: &str,
+        req: &UpdateTask,
+        agent_repository: Option<(&str, &str)>,
+    ) -> Result<Task> {
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
@@ -519,7 +543,12 @@ impl TaskBoard {
             }
 
             if let Some(ref agent_id) = req.agent_id {
-                let previous = synchronize_pull_request_agent(&transaction, task_id, agent_id)?;
+                let previous = synchronize_pull_request_agent(
+                    &transaction,
+                    task_id,
+                    agent_id,
+                    agent_repository,
+                )?;
                 transaction.execute(
                     "UPDATE tasks SET agent_id = ?1, updated_at = ?2 WHERE id = ?3",
                     rusqlite::params![agent_id, now, task_id],
@@ -967,6 +996,7 @@ fn synchronize_pull_request_agent(
     conn: &rusqlite::Connection,
     task_id: &str,
     agent_id: &str,
+    agent_repository: Option<(&str, &str)>,
 ) -> Result<Option<String>> {
     let has_active_pull_request: bool = conn.query_row(
         "SELECT EXISTS(
@@ -1001,6 +1031,27 @@ fn synchronize_pull_request_agent(
         return Err(Error::Task(
             "cannot reassign a task while its agent turn is running; stop it first".into(),
         ));
+    }
+    if previous_agent_id != agent_id {
+        let Some((owner, repo)) = agent_repository else {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent's project-scoped GitHub repository could not be verified".into(),
+            ));
+        };
+        let incompatible_repository: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests
+                WHERE task_id = ?1 AND status IN ('waiting', 'attention')
+                  AND (owner != ?2 COLLATE NOCASE OR repo != ?3 COLLATE NOCASE)
+             )",
+            rusqlite::params![task_id, owner, repo],
+            |row| row.get(0),
+        )?;
+        if incompatible_repository {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request to an agent using a different GitHub repository".into(),
+            ));
+        }
     }
     conn.execute(
         "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
@@ -1275,8 +1326,47 @@ mod tests {
             .unwrap();
         let attempt_id = queued.attempt_id.clone().unwrap();
 
-        let reassigned = board
+        let unavailable_error = board
             .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("unverified-codex".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(unavailable_error
+            .to_string()
+            .contains("could not be verified"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let incompatible_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("other-project-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "different-repository")),
+            )
+            .unwrap_err();
+        assert!(incompatible_error
+            .to_string()
+            .contains("different GitHub repository"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+
+        let reassigned = board
+            .update_with_agent_repository(
                 &task.id,
                 &UpdateTask {
                     title: None,
@@ -1284,6 +1374,7 @@ mod tests {
                     agent_id: Some("reviewer-codex".to_string()),
                     priority: None,
                 },
+                Some(("xpressai", "XPRESSCLAW")),
             )
             .unwrap();
         assert_eq!(reassigned.agent_id.as_deref(), Some("reviewer-codex"));
@@ -1351,7 +1442,12 @@ mod tests {
         assert_eq!(current_status, "queued");
 
         board
-            .update_status(&task.id, "in_progress", Some("final-codex"))
+            .update_status_with_agent_repository(
+                &task.id,
+                "in_progress",
+                Some("final-codex"),
+                Some(("XpressAI", "xpressclaw")),
+            )
             .unwrap();
         assert_eq!(monitored_agent(), "final-codex");
         assert_eq!(queue.get(queued.id).unwrap().agent_id, "final-codex");
