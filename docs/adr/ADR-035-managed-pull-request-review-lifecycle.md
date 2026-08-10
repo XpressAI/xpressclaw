@@ -20,8 +20,9 @@ change the same workspace before review feedback is addressed.
 The bundled, project-scoped GitHub MCP manages pull requests created by
 ordinary tasks:
 
-- `pr create` ignores an inherited draft flag and publishes a ready pull
-  request, and managed tasks reject `pr ready --undo` rather than allowing a
+- `pr create` normalizes every supported long, assigned, and bundled shorthand
+  form of an inherited draft flag and publishes a ready pull request, and
+  managed tasks reject `pr ready --undo` rather than allowing a
   ready pull request to become draft again. Managed dry-run creation is also
   rejected because no real pull request exists to register. Before `pr create`
   or `pr ready` runs, the MCP durably arms a
@@ -31,7 +32,10 @@ ordinary tasks:
   cannot leave a published PR unmonitored or register the current branch's PR
   by mistake.
 - Registration is accepted only for the task's assigned agent and configured
-  repository. Hidden tasks and workflow-owned tasks are excluded.
+  repository. Hidden tasks and workflow-owned tasks are excluded. Validation,
+  task activation, and sentinel or pull-request persistence share one
+  transaction, so cancellation or reassignment cannot be overwritten by a
+  registration request that started earlier.
 - XpressClaw polls GitHub durably, starting at 15 seconds and backing off to
   five minutes. The worker process and container do not need to remain busy.
 - New external reviews and comments enqueue one continuation in the same task
@@ -40,7 +44,10 @@ ordinary tasks:
   explicit re-review is requested when the configured reviewer requires one.
   Feedback insertion, the terminal-status check, task activation, and queue
   creation are one transaction, so feedback fetched before a user cancellation
-  cannot reopen the cancelled task.
+  cannot reopen the cancelled task. Moving a closed or expired review to
+  waiting-for-input likewise checks the current task status and writes the
+  attention state and explanatory message atomically; a task cancelled during
+  GitHub I/O stays cancelled.
 - Every page of unresolved threads is rechecked and exposed through the
   project-scoped `pr thread list` command, and can trigger an hourly reminder
   after an agent turn, rather than later pages being silently abandoned.

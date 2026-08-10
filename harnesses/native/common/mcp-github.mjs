@@ -116,6 +116,66 @@ function optionValue(args, longName, shortName) {
   return undefined;
 }
 
+const PR_CREATE_LONG_VALUE_OPTIONS = new Set([
+  '--assignee', '--base', '--body', '--body-file', '--head', '--label',
+  '--milestone', '--project', '--recover', '--reviewer', '--template', '--title',
+]);
+const PR_CREATE_SHORT_VALUE_OPTIONS = new Set([
+  'a', 'B', 'b', 'F', 'H', 'l', 'm', 'p', 'r', 'T', 't',
+]);
+const PR_CREATE_SHORT_BOOLEAN_OPTIONS = new Set(['d', 'e', 'f', 'w']);
+
+function withoutDraftArguments(args) {
+  const normalized = args.slice(0, 2);
+  let optionsEnded = false;
+  let nextIsValue = false;
+  for (const argument of args.slice(2)) {
+    if (nextIsValue || optionsEnded) {
+      normalized.push(argument);
+      nextIsValue = false;
+      continue;
+    }
+    if (argument === '--') {
+      optionsEnded = true;
+      normalized.push(argument);
+      continue;
+    }
+    if (argument === '--draft' || argument.startsWith('--draft=')) continue;
+    if (argument === '-d' || argument.startsWith('-d=')) continue;
+
+    if (argument.startsWith('--')) {
+      normalized.push(argument);
+      nextIsValue = !argument.includes('=') && PR_CREATE_LONG_VALUE_OPTIONS.has(argument);
+      continue;
+    }
+    if (!argument.startsWith('-') || argument === '-') {
+      normalized.push(argument);
+      continue;
+    }
+
+    const shorthands = argument.slice(1);
+    let kept = '';
+    for (let index = 0; index < shorthands.length; index += 1) {
+      const shorthand = shorthands[index];
+      if (shorthand === 'd') continue;
+      kept += shorthand;
+      if (PR_CREATE_SHORT_VALUE_OPTIONS.has(shorthand)) {
+        if (index + 1 < shorthands.length) kept += shorthands.slice(index + 1);
+        else nextIsValue = true;
+        break;
+      }
+      // Preserve any unknown option and its suffix instead of risking a change
+      // to a value accepted by a future gh version.
+      if (!PR_CREATE_SHORT_BOOLEAN_OPTIONS.has(shorthand)) {
+        kept += shorthands.slice(index + 1);
+        break;
+      }
+    }
+    if (kept) normalized.push(`-${kept}`);
+  }
+  return normalized;
+}
+
 export function managedCommandArguments(args, environment = process.env) {
   if (!reviewLifecycleEnabled(environment)) {
     return [...args];
@@ -133,10 +193,7 @@ export function managedCommandArguments(args, environment = process.env) {
     );
   }
   if (args[0] !== 'pr' || args[1] !== 'create') return [...args];
-  return args.filter((argument) =>
-    argument !== '--draft' && argument !== '-d' &&
-    argument !== '--draft=true' && argument !== '-d=true'
-  );
+  return withoutDraftArguments(args);
 }
 
 export function pullRequestUrl(value) {

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -109,12 +110,13 @@ impl GithubReviewManager {
         repository: &str,
         registration_id: &str,
     ) -> Result<()> {
-        self.validate_registration_task(task_id, agent_id)?;
         validate_registration_id(registration_id)?;
         let (owner, repo) = parse_repository(repository)?;
         let now = Utc::now();
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = conn.unchecked_transaction()?;
+            activate_registration_task_in_connection(&transaction, task_id, agent_id)?;
+            transaction.execute(
                 "INSERT INTO task_pull_requests
                     (task_id, agent_id, owner, repo, number, url, status,
                      started_at, expires_at, next_poll_at, poll_interval_seconds, last_error)
@@ -132,10 +134,9 @@ impl GithubReviewManager {
                     "pull-request publication began, but durable registration has not completed",
                 ],
             )?;
+            transaction.commit()?;
             Ok::<_, Error>(())
-        })?;
-        TaskBoard::new(self.db.clone()).update_status(task_id, "in_progress", Some(agent_id))?;
-        Ok(())
+        })
     }
 
     /// Remove a pre-publication sentinel when the GitHub command itself
@@ -171,7 +172,6 @@ impl GithubReviewManager {
         repository: &str,
         url: &str,
     ) -> Result<TaskPullRequest> {
-        self.validate_registration_task(task_id, agent_id)?;
         let pull_request = parse_pull_request(url)?;
         let (expected_owner, expected_repo) = parse_repository(repository)?;
         if !pull_request.owner.eq_ignore_ascii_case(&expected_owner)
@@ -190,6 +190,7 @@ impl GithubReviewManager {
         let next_poll_at = now.to_rfc3339();
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
+            activate_registration_task_in_connection(&transaction, task_id, agent_id)?;
             transaction.execute(
                 "INSERT INTO task_pull_requests
                     (task_id, agent_id, owner, repo, number, url, status,
@@ -237,7 +238,6 @@ impl GithubReviewManager {
             transaction.commit()?;
             Ok::<_, Error>(())
         })?;
-        TaskBoard::new(self.db.clone()).update_status(task_id, "in_progress", Some(agent_id))?;
         self.get(
             task_id,
             &expected_owner,
@@ -247,30 +247,8 @@ impl GithubReviewManager {
     }
 
     fn validate_registration_task(&self, task_id: &str, agent_id: &str) -> Result<()> {
-        let task = TaskBoard::new(self.db.clone()).get(task_id)?;
-        if task.hidden
-            || task
-                .context
-                .as_ref()
-                .and_then(|context| context.get("origin"))
-                .and_then(Value::as_str)
-                == Some("workflow")
-        {
-            return Err(Error::Task(
-                "workflow and hidden tasks manage pull-request waits explicitly".into(),
-            ));
-        }
-        if matches!(task.status, TaskStatus::Completed | TaskStatus::Cancelled) {
-            return Err(Error::Task(
-                "cannot register a pull request for a finished task".into(),
-            ));
-        }
-        if task.agent_id.as_deref() != Some(agent_id) {
-            return Err(Error::Task(
-                "the pull request was not created by this task's assigned agent".into(),
-            ));
-        }
-        Ok(())
+        self.db
+            .with_conn(|conn| validate_registration_task_in_connection(conn, task_id, agent_id))
     }
 
     pub fn gate(&self, task_id: &str) -> Result<GithubReviewGate> {
@@ -386,25 +364,6 @@ impl GithubReviewManager {
         })
     }
 
-    fn mark_attention(&self, item: &TaskPullRequest, reason: &str) -> Result<()> {
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "UPDATE task_pull_requests SET status = 'attention', next_poll_at = NULL,
-                    last_checked_at = ?1, last_error = ?2
-                 WHERE task_id = ?3 AND owner = ?4 AND repo = ?5 AND number = ?6",
-                rusqlite::params![
-                    Utc::now().to_rfc3339(),
-                    reason,
-                    item.task_id,
-                    item.owner,
-                    item.repo,
-                    item.number as i64,
-                ],
-            )?;
-            Ok::<_, Error>(())
-        })
-    }
-
     fn cancel(&self, item: &TaskPullRequest) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(
@@ -481,6 +440,79 @@ impl GithubReviewManager {
     }
 }
 
+fn validate_registration_task_in_connection(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let task = conn
+        .query_row(
+            "SELECT agent_id, status, hidden, context FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::TaskNotFound {
+            id: task_id.to_string(),
+        })?;
+    let (assigned_agent, status, hidden, context) = task;
+    let workflow_owned = context
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("origin")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("workflow");
+    if hidden != 0 || workflow_owned {
+        return Err(Error::Task(
+            "workflow and hidden tasks manage pull-request waits explicitly".into(),
+        ));
+    }
+    if matches!(status.as_str(), "completed" | "cancelled") {
+        return Err(Error::Task(
+            "cannot register a pull request for a finished task".into(),
+        ));
+    }
+    if assigned_agent.as_deref() != Some(agent_id) {
+        return Err(Error::Task(
+            "the pull request was not created by this task's assigned agent".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn activate_registration_task_in_connection(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    validate_registration_task_in_connection(conn, task_id, agent_id)?;
+    let changed = conn.execute(
+        "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
+            updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND agent_id = ?2
+           AND status NOT IN ('completed', 'cancelled')",
+        rusqlite::params![task_id, agent_id],
+    )?;
+    if changed != 1 {
+        return Err(Error::Task(
+            "cannot register a pull request because the task finished or changed assignment".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn row_to_pull_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPullRequest> {
     Ok(TaskPullRequest {
         task_id: row.get(0)?,
@@ -552,7 +584,7 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
                 "XpressClaw monitored {} for {} days without approval or merge.",
                 item.url, MONITOR_FOR_DAYS
             );
-            require_user_attention(db, &manager, &item, &reason)?;
+            require_user_attention(db, &item, &reason)?;
             changes += 1;
             continue;
         }
@@ -591,7 +623,6 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
                 if snapshot.closed_without_merge {
                     require_user_attention(
                         db,
-                        &manager,
                         &item,
                         &format!("{} was closed without being merged or approved.", item.url),
                     )?;
@@ -627,24 +658,71 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
     Ok(changes)
 }
 
-fn require_user_attention(
-    db: &Arc<Database>,
-    manager: &GithubReviewManager,
-    item: &TaskPullRequest,
-    reason: &str,
-) -> Result<()> {
-    manager.mark_attention(item, reason)?;
-    TaskConversation::new(db.clone()).add_message(
-        &item.task_id,
-        "assistant",
-        &format!("GitHub review monitoring needs your input. {reason}"),
-    )?;
-    TaskBoard::new(db.clone()).update_status(
-        &item.task_id,
-        "waiting_for_input",
-        Some(&item.agent_id),
-    )?;
-    SessionManager::new(db.clone()).refresh_status(&item.agent_id)?;
+fn require_user_attention(db: &Arc<Database>, item: &TaskPullRequest, reason: &str) -> Result<()> {
+    let agent_id = db.with_conn(|conn| {
+        let transaction = conn.unchecked_transaction()?;
+        let (agent_id, task_status): (Option<String>, String) = transaction.query_row(
+            "SELECT agent_id, status FROM tasks WHERE id = ?1",
+            [&item.task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if matches!(task_status.as_str(), "completed" | "cancelled") {
+            transaction.execute(
+                "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                    last_checked_at = ?1, last_error = NULL
+                 WHERE task_id = ?2 AND owner = ?3 AND repo = ?4 AND number = ?5
+                   AND status IN ('waiting', 'attention')",
+                rusqlite::params![
+                    Utc::now().to_rfc3339(),
+                    item.task_id,
+                    item.owner,
+                    item.repo,
+                    item.number as i64,
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok::<_, Error>(None);
+        }
+        let agent_id = agent_id
+            .filter(|agent_id| !agent_id.trim().is_empty())
+            .ok_or_else(|| Error::Task("review task no longer has an assigned agent".into()))?;
+        let changed = transaction.execute(
+            "UPDATE task_pull_requests SET agent_id = ?1, status = 'attention',
+                next_poll_at = NULL, last_checked_at = ?2, last_error = ?3
+             WHERE task_id = ?4 AND owner = ?5 AND repo = ?6 AND number = ?7
+               AND status = 'waiting'",
+            rusqlite::params![
+                agent_id,
+                Utc::now().to_rfc3339(),
+                reason,
+                item.task_id,
+                item.owner,
+                item.repo,
+                item.number as i64,
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'assistant', ?2)",
+            rusqlite::params![
+                item.task_id,
+                format!("GitHub review monitoring needs your input. {reason}"),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET status = 'waiting_for_input', completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            [&item.task_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(agent_id))
+    })?;
+    if let Some(agent_id) = agent_id {
+        SessionManager::new(db.clone()).refresh_status(&agent_id)?;
+    }
     Ok(())
 }
 
@@ -1293,6 +1371,115 @@ mod tests {
             .get_messages(&task_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn review_attention_does_not_reopen_a_task_cancelled_during_github_io() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let stale = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "cancelled", None)
+            .unwrap();
+        require_user_attention(&db, &stale, "The pull request was closed.").unwrap();
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task_id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            manager
+                .get(&task_id, "XpressAI", "xpressclaw", 151)
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        assert!(TaskConversation::new(db)
+            .get_messages(&task_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn review_attention_atomically_records_the_reason_and_waiting_state() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let item = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+
+        require_user_attention(&db, &item, "The pull request was closed.").unwrap();
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task_id).unwrap().status,
+            TaskStatus::WaitingForInput
+        );
+        assert_eq!(
+            manager
+                .get(&task_id, "XpressAI", "xpressclaw", 151)
+                .unwrap()
+                .status,
+            "attention"
+        );
+        let messages = TaskConversation::new(db).get_messages(&task_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert!(messages[0].content.contains("The pull request was closed."));
+    }
+
+    #[test]
+    fn registration_does_not_reopen_or_persist_for_a_cancelled_task() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "cancelled", None)
+            .unwrap();
+
+        let begin_error = manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-1",
+            )
+            .unwrap_err();
+        assert!(begin_error.to_string().contains("finished task"));
+        let register_error = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap_err();
+        assert!(register_error.to_string().contains("finished task"));
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task_id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        let registrations: i64 = db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM task_pull_requests WHERE task_id = ?1",
+                [&task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(registrations, 0);
     }
 
     #[test]

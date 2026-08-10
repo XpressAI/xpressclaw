@@ -79,6 +79,19 @@ test('ordinary task lifecycle overrides generic draft defaults', () => {
     managedCommandArguments(['pr', 'create', '--draft', '--title', 'Ready'], environment),
     ['pr', 'create', '--title', 'Ready'],
   );
+  assert.deepEqual(
+    managedCommandArguments(
+      [
+        'pr', 'create', '--draft=1', '-d=1', '-df', '-fd', '-wd',
+        '--title', '-draft remains a title', '-tdrafted-inline',
+      ],
+      environment,
+    ),
+    [
+      'pr', 'create', '-f', '-f', '-w',
+      '--title', '-draft remains a title', '-tdrafted-inline',
+    ],
+  );
   assert.match(toolDescription(environment), /published ready for review, never left as a draft/);
   assert.match(toolDescription(environment), /only after approval or merge/);
 });
