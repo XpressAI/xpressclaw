@@ -2,6 +2,8 @@
 //! project environments.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
@@ -38,6 +40,10 @@ use crate::workers::acp::{
 use crate::workers::github;
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
+const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
+const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
+const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
+const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
@@ -382,6 +388,22 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             );
         }
     }
+    let pi_mcp_bridge = kind == "pi"
+        && docker
+            .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+            .await;
+    let mcp_signature = if pi_mcp_bridge {
+        let signature = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        Some(signature)
+    } else {
+        None
+    };
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
@@ -432,6 +454,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 model: agent.runner.model.clone(),
                 session_config: requested_session_config,
                 mcp_servers,
+                mcp_signature,
                 image_attachments: prompt.attachments,
             },
         )
@@ -869,6 +892,7 @@ async fn runner_image_ready(
         image,
         built_in_image,
         built_in_image && agent.runner.container_engine == ContainerEngineAccess::Host,
+        built_in_image && resolve_runner_kind(agent).is_ok_and(|kind| kind == "pi"),
     )
     .await
 }
@@ -883,6 +907,7 @@ pub async fn runner_image_compatible(
     image: &str,
     built_in_image: bool,
     host_engine_image: bool,
+    pi_mcp_image: bool,
 ) -> bool {
     docker.has_image(image).await
         && (!built_in_image
@@ -893,6 +918,361 @@ pub async fn runner_image_compatible(
             || docker
                 .image_has_label(image, "io.xpressclaw.container-engine", "host")
                 .await)
+        && (!pi_mcp_image
+            || docker
+                .image_has_label(image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+                .await)
+}
+
+fn configure_pi_mcp_bridge(
+    data_dir: &Path,
+    agent_id: &str,
+    mcp_servers: &[McpServer],
+    spec: &mut ContainerSpec,
+) -> Result<String> {
+    if spec
+        .volumes
+        .iter()
+        .any(|mount| container_paths_overlap(&mount.target, PI_MCP_CONFIG_DIR_TARGET))
+    {
+        return Err(Error::Backend(format!(
+            "the Pi MCP bridge reserves container mount target {PI_MCP_CONFIG_DIR_TARGET}"
+        )));
+    }
+    let encoded = pi_mcp_config(mcp_servers)?;
+    let config_dir = pi_mcp_config_dir(data_dir, agent_id);
+    std::fs::create_dir_all(&config_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create Pi MCP runtime directory {}: {error}",
+            config_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&config_dir)?;
+    write_private_atomic(&config_dir.join("config.json"), &encoded)?;
+
+    spec.volumes.push(VolumeMount {
+        source: config_dir.display().to_string(),
+        target: PI_MCP_CONFIG_DIR_TARGET.to_string(),
+        read_only: true,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+    spec.environment.retain(|variable| {
+        !variable.starts_with("PI_ACP_PI_COMMAND=")
+            && !variable.starts_with("XPRESSCLAW_PI_MCP_CONFIG=")
+    });
+    spec.environment
+        .push(format!("PI_ACP_PI_COMMAND={PI_MCP_WRAPPER}"));
+    spec.environment
+        .push(format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}"));
+
+    Ok(format!("pi-mcp:{:x}", Sha256::digest(&encoded)))
+}
+
+fn container_paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    data_dir.join("runtime").join("pi-mcp").join(agent_hash)
+}
+
+fn pi_mcp_config(mcp_servers: &[McpServer]) -> Result<Vec<u8>> {
+    let mut servers = serde_json::Map::new();
+    for server in mcp_servers {
+        let (name, mut definition) = pi_mcp_server(server)?;
+        if matches!(name.as_str(), "xpressclaw" | "github") {
+            definition.insert("directTools".to_string(), Value::Bool(true));
+        }
+        if servers
+            .insert(name.clone(), Value::Object(definition))
+            .is_some()
+        {
+            return Err(Error::Backend(format!(
+                "Pi MCP configuration contains duplicate server name '{name}'"
+            )));
+        }
+    }
+    serde_json::to_vec_pretty(&json!({ "mcpServers": servers })).map_err(Error::from)
+}
+
+fn pi_mcp_server(server: &McpServer) -> Result<(String, serde_json::Map<String, Value>)> {
+    let mut definition = serde_json::Map::new();
+    let name = match server {
+        McpServer::Stdio(server) => {
+            let command = server.command.to_str().ok_or_else(|| {
+                Error::Backend(format!(
+                    "Pi MCP server '{}' command is not valid UTF-8",
+                    server.name
+                ))
+            })?;
+            definition.insert("command".to_string(), json!(command));
+            if !server.args.is_empty() {
+                definition.insert("args".to_string(), json!(server.args));
+            }
+            if !server.env.is_empty() {
+                let env = server
+                    .env
+                    .iter()
+                    .map(|variable| (variable.name.clone(), json!(variable.value)))
+                    .collect::<serde_json::Map<_, _>>();
+                definition.insert("env".to_string(), Value::Object(env));
+            }
+            server.name.clone()
+        }
+        McpServer::Http(server) => {
+            definition.insert("url".to_string(), json!(server.url));
+            definition.insert("httpTransport".to_string(), json!("streamable-http"));
+            add_pi_mcp_headers(&mut definition, &server.headers);
+            server.name.clone()
+        }
+        McpServer::Sse(server) => {
+            definition.insert("url".to_string(), json!(server.url));
+            definition.insert("httpTransport".to_string(), json!("sse"));
+            add_pi_mcp_headers(&mut definition, &server.headers);
+            server.name.clone()
+        }
+        _ => {
+            return Err(Error::Backend(
+                "Pi MCP bridge received an unsupported ACP MCP transport".to_string(),
+            ));
+        }
+    };
+    Ok((name, definition))
+}
+
+fn add_pi_mcp_headers(definition: &mut serde_json::Map<String, Value>, headers: &[HttpHeader]) {
+    if headers.is_empty() {
+        return;
+    }
+    let headers = headers
+        .iter()
+        .map(|header| (header.name.clone(), json!(header.value)))
+        .collect::<serde_json::Map<_, _>>();
+    definition.insert("headers".to_string(), Value::Object(headers));
+}
+
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                Error::Backend(format!(
+                    "failed to protect Pi MCP runtime directory {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(windows)]
+    set_windows_owner_only_acl(path, true)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    if std::fs::read(path).ok().as_deref() == Some(contents) {
+        set_private_file_permissions(path)?;
+        return Ok(());
+    }
+    let temporary = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create private Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    set_private_file_permissions(&temporary)?;
+    file.write_all(contents).map_err(|error| {
+        Error::Backend(format!(
+            "failed to write Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        Error::Backend(format!(
+            "failed to sync Pi MCP configuration {}: {error}",
+            temporary.display()
+        ))
+    })?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|error| {
+            Error::Backend(format!(
+                "failed to replace Pi MCP configuration {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    std::fs::rename(&temporary, path).map_err(|error| {
+        Error::Backend(format!(
+            "failed to publish Pi MCP configuration {}: {error}",
+            path.display()
+        ))
+    })?;
+    set_private_file_permissions(path)
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |error| {
+                Error::Backend(format!(
+                    "failed to protect Pi MCP configuration {}: {error}",
+                    path.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(windows)]
+    set_windows_owner_only_acl(path, false)?;
+    #[cfg(not(any(unix, windows)))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsLocalAllocation(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for WindowsLocalAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: The pointer was returned by a Windows security API that
+            // documents LocalFree as its matching deallocator.
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::LocalFree(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+        TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide_path.contains(&0) {
+        return Err(Error::Backend(format!(
+            "failed to protect Pi MCP path {}: path contains a NUL character",
+            path.display()
+        )));
+    }
+    wide_path.push(0);
+
+    let mut owner: PSID = null_mut();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `wide_path` is NUL-terminated and all output pointers remain
+    // valid for the duration of the call. The returned descriptor is released
+    // by `WindowsLocalAllocation` below.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("read owner for", path, status));
+    }
+    let _security_descriptor = WindowsLocalAllocation(security_descriptor);
+    if owner.is_null() {
+        return Err(Error::Backend(format!(
+            "failed to protect Pi MCP path {}: Windows returned no owner",
+            path.display()
+        )));
+    }
+
+    let access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: if directory {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            NO_INHERITANCE
+        },
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: owner.cast(),
+        },
+    };
+    let mut acl: *mut ACL = null_mut();
+    // SAFETY: `access` points at the owner SID held alive by
+    // `_security_descriptor`; `acl` is an out pointer released below.
+    let status = unsafe { SetEntriesInAclW(1, &access, null(), &mut acl) };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("build ACL for", path, status));
+    }
+    let _acl = WindowsLocalAllocation(acl.cast());
+
+    // SAFETY: The path and ACL remain valid for this call. A protected DACL
+    // removes inherited access and leaves one full-control ACE for the owner.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(windows_acl_error("set ACL on", path, status));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_acl_error(action: &str, path: &Path, status: u32) -> Error {
+    Error::Backend(format!(
+        "failed to {action} Pi MCP path {}: {}",
+        path.display(),
+        std::io::Error::from_raw_os_error(status as i32)
+    ))
 }
 
 fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<McpServer>> {
@@ -1478,6 +1858,233 @@ mod tests {
         assert!(error
             .to_string()
             .contains("absolute path inside the harness container"));
+    }
+
+    #[test]
+    fn converts_acp_servers_to_pi_proxy_and_script_configuration() {
+        let encoded = pi_mcp_config(&[
+            McpServer::Stdio(
+                McpServerStdio::new("xpressclaw", "/usr/local/bin/node")
+                    .args(vec!["control.mjs".into()])
+                    .env(vec![EnvVariable::new("XPRESSCLAW_TASK_ID", "task-123")]),
+            ),
+            McpServer::Http(
+                McpServerHttp::new("github", "https://github.example.test/mcp")
+                    .headers(vec![HttpHeader::new("Authorization", "Bearer secret")]),
+            ),
+            McpServer::Sse(McpServerSse::new(
+                "project-search",
+                "https://search.example.test/sse",
+            )),
+        ])
+        .unwrap();
+        let config: Value = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(
+            config["mcpServers"]["xpressclaw"]["command"],
+            "/usr/local/bin/node"
+        );
+        assert_eq!(
+            config["mcpServers"]["xpressclaw"]["env"]["XPRESSCLAW_TASK_ID"],
+            "task-123"
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["httpTransport"],
+            "streamable-http"
+        );
+        assert_eq!(
+            config["mcpServers"]["github"]["headers"]["Authorization"],
+            "Bearer secret"
+        );
+        assert_eq!(
+            config["mcpServers"]["project-search"]["httpTransport"],
+            "sse"
+        );
+        assert_eq!(config["mcpServers"]["xpressclaw"]["directTools"], true);
+        assert_eq!(config["mcpServers"]["github"]["directTools"], true);
+        assert!(config["mcpServers"]["project-search"]["directTools"].is_null());
+    }
+
+    #[test]
+    fn pi_mcp_bridge_uses_private_unicode_safe_runtime_configuration() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut spec = ContainerSpec {
+            environment: vec![
+                "PI_ACP_PI_COMMAND=/custom/pi".into(),
+                "XPRESSCLAW_PI_MCP_CONFIG=/custom/config.json".into(),
+            ],
+            ..Default::default()
+        };
+        let servers = [McpServer::Stdio(McpServerStdio::new(
+            "xpressclaw",
+            "/usr/local/bin/node",
+        ))];
+
+        let signature =
+            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", &servers, &mut spec).unwrap();
+        let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
+        let leaf = config_dir.file_name().unwrap().to_string_lossy();
+        assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!config_dir.display().to_string().contains("エリ"));
+        assert!(signature.starts_with("pi-mcp:"));
+
+        let mount = spec
+            .volumes
+            .iter()
+            .find(|mount| mount.target == PI_MCP_CONFIG_DIR_TARGET)
+            .unwrap();
+        assert_eq!(mount.source, config_dir.display().to_string());
+        assert!(mount.read_only);
+        assert_eq!(mount.selinux_relabel, SelinuxRelabel::Shared);
+        assert!(spec
+            .environment
+            .contains(&format!("PI_ACP_PI_COMMAND={PI_MCP_WRAPPER}")));
+        assert!(spec
+            .environment
+            .contains(&format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}")));
+        assert_eq!(
+            spec.environment
+                .iter()
+                .filter(|variable| variable.starts_with("PI_ACP_PI_COMMAND="))
+                .count(),
+            1
+        );
+
+        let config_path = config_dir.join("config.json");
+        assert!(config_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&config_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_windows_owner_only_acl(&config_dir, true);
+            assert_windows_owner_only_acl(&config_path, false);
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_windows_owner_only_acl(path: &Path, directory: bool) {
+        use std::mem::size_of;
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr::{addr_of, null_mut};
+
+        use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+            DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let wide_path = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut owner: PSID = null_mut();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `wide_path` is NUL-terminated and the output pointers are
+        // valid. The returned descriptor owns `owner` and `dacl` and is kept
+        // alive until all assertions finish.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, ERROR_SUCCESS);
+        let _descriptor = WindowsLocalAllocation(descriptor);
+        assert!(!owner.is_null());
+        assert!(!dacl.is_null());
+
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: `descriptor` remains valid through `_descriptor`.
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+
+        let mut information = ACL_SIZE_INFORMATION::default();
+        // SAFETY: `dacl` remains valid through `_descriptor` and the output
+        // buffer has the exact type and size requested.
+        assert_ne!(
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut information as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            },
+            0
+        );
+        assert_eq!(information.AceCount, 1);
+
+        let mut raw_ace = null_mut();
+        // SAFETY: The DACL has one ACE, as asserted above, and `raw_ace` is a
+        // valid output pointer.
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut raw_ace) }, 0);
+        // SAFETY: `SetEntriesInAclW` created this sole ACE from an
+        // `EXPLICIT_ACCESS_W`, so it is an ACCESS_ALLOWED_ACE.
+        let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Header.AceType, 0);
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+        assert_eq!(
+            u32::from(ace.Header.AceFlags),
+            if directory {
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+            } else {
+                0
+            }
+        );
+        // SAFETY: `SidStart` is the variable-length SID at the end of the ACE,
+        // and both it and `owner` remain valid through `_descriptor`.
+        let ace_sid = addr_of!(ace.SidStart).cast_mut().cast();
+        assert_ne!(unsafe { EqualSid(owner, ace_sid) }, 0);
+    }
+
+    #[test]
+    fn pi_mcp_bridge_rejects_mounts_overlapping_its_reserved_target() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut spec = ContainerSpec {
+            volumes: vec![VolumeMount {
+                source: "/tmp/custom".into(),
+                target: "/run/xpressclaw".into(),
+                read_only: false,
+                selinux_relabel: SelinuxRelabel::None,
+            }],
+            ..Default::default()
+        };
+
+        let error = configure_pi_mcp_bridge(data_dir.path(), "pi", &[], &mut spec).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("reserves container mount target"));
+        assert!(!pi_mcp_config_dir(data_dir.path(), "pi").exists());
     }
 
     #[test]

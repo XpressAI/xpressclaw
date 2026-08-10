@@ -74,6 +74,17 @@ SSE servers are remote and do not increase the runner image size. ACP
 advertised commands and session controls appear in task chat and workflows
 after the harness has completed one discovery turn.
 
+Pi is the exception at the ACP boundary: `pi-acp` accepts ACP MCP definitions
+but does not connect them to Pi. The published Pi runner therefore includes
+[`pi-mcp-adapter`](https://github.com/nicobailon/pi-mcp-adapter). XpressClaw
+writes the effective per-task server list to a private runtime file, mounts its
+directory read-only with shared SELinux relabeling, and starts the inner Pi RPC
+process with that adapter. Existing Pi MCP files are still merged normally.
+Pi receives a compact `mcp` gateway for discovery and individual calls, an
+`mcpScript` JavaScript tool for batching or composing calls, and direct tools
+for XpressClaw's control-plane and constrained GitHub servers. Credentials in
+the generated runtime configuration are stored with owner-only permissions.
+
 Runner images are intentionally product-specific. You can extend one while
 the control-plane-managed development-environment interface is being built:
 

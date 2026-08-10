@@ -240,7 +240,7 @@ pub const ACP_AGENTS: &[AcpAgentDefinition] = &[
         "pi",
         "pi ACP",
         "π",
-        "ACP adapter for the pi coding agent.",
+        "Pi coding agent with XpressClaw MCP integration.",
         &["pi-acp"],
         &["pi", "pi-acp"],
         "pi-acp --terminal-login",
