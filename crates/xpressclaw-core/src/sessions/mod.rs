@@ -493,6 +493,97 @@ impl SessionManager {
         self.get_attempt(attempt_id)
     }
 
+    /// Cancel a live attempt and its owning task before any asynchronous
+    /// container cleanup begins. The attempt, task, active-attempt pointer,
+    /// logical session, and pull-request review gates move together so no
+    /// continuation can be enqueued in the cancellation window.
+    ///
+    /// `None` means the task or attempt had already completed in another
+    /// path, so the caller must preserve that terminal state.
+    pub fn cancel_attempt_and_task(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        summary: &str,
+    ) -> Result<Option<WorkAttempt>> {
+        let attempt = self.get_attempt(attempt_id)?;
+        if attempt.task_id.as_deref() != Some(task_id) {
+            return Err(Error::Task(
+                "the active work attempt does not belong to the task being cancelled".into(),
+            ));
+        }
+        let (applied, transitioned) = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let task_status: String = transaction.query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if task_status == "completed" {
+                transaction.commit()?;
+                return Ok::<_, Error>((false, false));
+            }
+            let updated = transaction.execute(
+                "UPDATE work_attempts SET status = 'cancelled',
+                    completed_at = CURRENT_TIMESTAMP, error_message = NULL
+                 WHERE id = ?1
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                [attempt_id],
+            )?;
+            if updated == 0 {
+                let current_status: String = transaction.query_row(
+                    "SELECT status FROM work_attempts WHERE id = ?1",
+                    [attempt_id],
+                    |row| row.get(0),
+                )?;
+                if current_status != "cancelled" {
+                    transaction.commit()?;
+                    return Ok((false, false));
+                }
+            }
+            transaction.execute(
+                "UPDATE tasks SET status = 'cancelled', completed_at = NULL,
+                    active_attempt_id = CASE WHEN active_attempt_id = ?1
+                        THEN NULL ELSE active_attempt_id END,
+                    updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2 AND status != 'completed'",
+                rusqlite::params![attempt_id, task_id],
+            )?;
+            transaction.execute(
+                "UPDATE task_pull_requests SET status = 'cancelled', next_poll_at = NULL,
+                    last_checked_at = CURRENT_TIMESTAMP, last_error = NULL
+                 WHERE task_id = ?1 AND status IN ('waiting', 'attention')",
+                [task_id],
+            )?;
+            let session_status = self.derive_status_with_conn(&transaction, &attempt.session_id)?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = ?1, latest_summary = ?2,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![session_status, summary, attempt.session_id],
+            )?;
+            transaction.commit()?;
+            Ok((true, updated == 1))
+        })?;
+        if !applied {
+            return Ok(None);
+        }
+        if transitioned {
+            self.append_event(
+                &attempt.session_id,
+                NewEvent {
+                    attempt_id: Some(attempt_id),
+                    task_id: Some(task_id),
+                    source_type: "runner",
+                    source_id: Some(&attempt.runner),
+                    event_type: "attempt_cancelled",
+                    summary,
+                    payload: json!({ "status": "cancelled", "error": Value::Null }),
+                },
+            )?;
+        }
+        self.get_attempt(attempt_id).map(Some)
+    }
+
     pub fn set_container(&self, attempt_id: &str, container_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
             conn.execute(

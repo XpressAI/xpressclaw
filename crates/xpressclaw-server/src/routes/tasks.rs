@@ -463,18 +463,12 @@ async fn update_task_status(
             .map_err(internal_error)?;
         if let Some(attempt_id) = active_attempt_id {
             let sessions = SessionManager::new(state.db.clone());
-            let cancelled = sessions
-                .transition_attempt(
-                    &attempt_id,
-                    "cancelled",
-                    "Work cancelled by user",
-                    None,
-                    None,
-                )
-                .map_err(internal_error)?;
-            if cancelled.status != "cancelled" {
+            let Some(cancelled) = sessions
+                .cancel_attempt_and_task(&attempt_id, &id, "Work cancelled by user")
+                .map_err(internal_error)?
+            else {
                 return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
-            }
+            };
             state.elicitations.cancel_attempt(&attempt_id);
             let mut container_stopped = cancelled.container_id.is_none();
             if let Some(docker) = state.docker().await {

@@ -900,6 +900,65 @@ mod tests {
     }
 
     #[test]
+    fn atomic_attempt_cancellation_blocks_review_enqueue_before_cleanup() {
+        use crate::workers::github_review::{GithubReviewGate, GithubReviewManager};
+
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Cancel while GitHub is polling".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        let reviews = GithubReviewManager::new(db.clone());
+        reviews
+            .register(
+                &task.id,
+                "atlas",
+                "XpressAI/example",
+                "https://github.com/XpressAI/example/pull/7",
+            )
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let claimed = queue.claim_next().unwrap().unwrap();
+        let attempt_id = claimed.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+
+        let cancelled = sessions
+            .cancel_attempt_and_task(attempt_id, &task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::None);
+        assert!(queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .is_none());
+        let queued_follow_ups: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_queue WHERE task_id = ?1 AND status = 'queued'",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(queued_follow_ups, 0);
+    }
+
+    #[test]
     fn claimed_dispatch_serializes_project_before_container_startup() {
         let (db, queue) = setup();
         let board = TaskBoard::new(db);

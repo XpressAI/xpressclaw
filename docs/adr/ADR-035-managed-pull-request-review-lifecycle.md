@@ -47,8 +47,10 @@ ordinary tasks:
   cannot reopen the cancelled task. Moving a closed or expired review to
   waiting-for-input likewise checks the current task status and writes the
   attention state and explanatory message atomically; a task cancelled during
-  GitHub I/O stays cancelled. Cancellation also retires every waiting or
-  attention review monitor in the task-status transaction. Approval/merge
+  GitHub I/O stays cancelled. Cancellation also transitions a live attempt,
+  marks its task cancelled, and retires every waiting or attention review
+  monitor before asynchronous container cleanup, all in one transaction.
+  Approval/merge
   finalization rechecks the task, records the terminal monitor result,
   completes native-plan children, appends the result message, and completes
   the task in one transaction, so stale GitHub responses cannot complete a
