@@ -44,7 +44,10 @@ ordinary tasks:
   monitor, queued continuations, work attempts, and queue-lane reservation to
   the new agent only after verifying that agent is bound to the same GitHub
   repository; reassignment is rejected when the repository cannot be verified,
-  differs, or a turn is actively running.
+  differs, or a turn is actively running. Review feedback rereads the task's
+  assignment and creates its queue item, attempt, and session event in one
+  transaction, so a reassignment during the GitHub request cannot recreate
+  stale work for the former agent.
   Approval means a formal approved review, an
   unambiguous `+1`, `LGTM`, or `approved` review/comment, or a thumbs-up
   reaction on the PR summary, in every case from someone other than the PR

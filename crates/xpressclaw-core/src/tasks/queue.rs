@@ -3,6 +3,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
@@ -91,6 +92,127 @@ impl TaskQueue {
 
         id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
             .transpose()
+    }
+
+    /// Enqueue a continuation for the task's assignment as one atomic unit.
+    ///
+    /// GitHub review polling performs network I/O before it knows a follow-up
+    /// is necessary. The task may be reassigned during that await, so callers
+    /// must not reuse the agent from their older polling snapshot here.
+    pub(crate) fn enqueue_continuation_for_current_agent(
+        &self,
+        task_id: &str,
+    ) -> Result<(String, Option<QueueItem>)> {
+        let (agent_id, queue_id) = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let (agent_id, title, description, context): (
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = transaction.query_row(
+                "SELECT agent_id, title, description, context FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let agent_id = agent_id
+                .filter(|agent_id| !agent_id.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::Task("cannot queue review feedback for an unassigned task".into())
+                })?;
+            let already_queued: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
+                 )",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            if already_queued {
+                transaction.commit()?;
+                return Ok::<_, Error>((agent_id, None));
+            }
+
+            transaction.execute(
+                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+                rusqlite::params![task_id, agent_id],
+            )?;
+            let queue_id = transaction.last_insert_rowid();
+            let context = context
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+            let kind = context
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_type = context
+                .as_ref()
+                .and_then(|value| value.get("origin"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("task");
+            let source_id = context
+                .as_ref()
+                .and_then(|value| value.get("source_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(task_id);
+            let prompt = match description {
+                Some(description) if !description.trim().is_empty() => {
+                    format!("{title}\n\n{description}")
+                }
+                _ => title,
+            };
+            let attempt_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO work_attempts
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6)",
+                rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
+            )?;
+            transaction.execute(
+                "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+                rusqlite::params![attempt_id, queue_id],
+            )?;
+            transaction.execute(
+                "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                    updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                rusqlite::params![agent_id, attempt_id, task_id],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status != 'running'",
+                [&agent_id],
+            )?;
+            transaction.execute(
+                "INSERT INTO session_events
+                 (session_id, attempt_id, task_id, source_type, source_id,
+                  event_type, summary, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'attempt_queued', 'Work queued', ?6)",
+                rusqlite::params![
+                    agent_id,
+                    attempt_id,
+                    task_id,
+                    source_type,
+                    source_id,
+                    serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
+                        .to_string(),
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE logical_sessions
+                 SET latest_summary = 'Work queued', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [&agent_id],
+            )?;
+            transaction.commit()?;
+            Ok((agent_id, Some(queue_id)))
+        })?;
+
+        let item = queue_id.map(|queue_id| self.get(queue_id)).transpose()?;
+        Ok((agent_id, item))
     }
 
     fn create_attempt_for_item(&self, id: i64, task_id: &str, agent_id: &str) -> Result<QueueItem> {

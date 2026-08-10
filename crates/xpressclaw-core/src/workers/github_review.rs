@@ -662,9 +662,10 @@ fn enqueue_review_follow_up(
         item.url, activity
     );
     TaskConversation::new(db.clone()).add_message(&item.task_id, "user", &message)?;
-    TaskQueue::new(db.clone()).enqueue_continuation(&item.task_id, &item.agent_id)?;
-    TaskBoard::new(db.clone()).update_status(&item.task_id, "in_progress", Some(&item.agent_id))?;
-    SessionManager::new(db.clone()).refresh_status(&item.agent_id)?;
+    let (agent_id, _) =
+        TaskQueue::new(db.clone()).enqueue_continuation_for_current_agent(&item.task_id)?;
+    TaskBoard::new(db.clone()).update_status(&item.task_id, "in_progress", None)?;
+    SessionManager::new(db.clone()).refresh_status(&agent_id)?;
     Ok(())
 }
 
@@ -1216,6 +1217,46 @@ mod tests {
                 .get(&task_id, "XpressAI", "xpressclaw", 151)
                 .unwrap()
                 .agent_id,
+            "reviewer-codex"
+        );
+    }
+
+    #[test]
+    fn review_follow_up_uses_assignment_current_at_enqueue_time() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let stale = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_with_agent_repository(
+                &task_id,
+                &crate::tasks::board::UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".into()),
+                    priority: None,
+                },
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap();
+
+        enqueue_review_follow_up(&db, &stale, None, 1).unwrap();
+
+        let queue = TaskQueue::new(db.clone());
+        let queued = queue.claim("reviewer-codex").unwrap().unwrap();
+        assert_eq!(queued.task_id, task_id);
+        assert!(queue.claim("project-codex").unwrap().is_none());
+        assert_eq!(
+            SessionManager::new(db)
+                .get_attempt(queued.attempt_id.as_deref().unwrap())
+                .unwrap()
+                .session_id,
             "reviewer-codex"
         );
     }
