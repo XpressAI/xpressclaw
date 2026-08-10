@@ -160,17 +160,20 @@ agents: []
 - The [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your platform when building the desktop app
 - Docker or Podman (for isolated ACP harnesses)
 
-### Build Everything
+### Build Locally
 
 ```bash
 git clone https://github.com/XpressAI/xpressclaw.git
 cd xpressclaw
 
-# Build CLI, server, desktop app, and native runner images
+# Build the CLI, server, and desktop app
 ./build.sh
 
-# Skip runner images when you only need the application
-./build.sh --skip-docker
+# Also build every native runner image (14 runners, two variants each)
+./build.sh --with-runners
+
+# Or build only the runner images you use; --runner is repeatable
+./build.sh --runner=codex --runner=claude
 ```
 
 ### Build Individual Targets
@@ -191,7 +194,7 @@ cargo build -p xpressclaw-server
 ### Build the Desktop App (Tauri)
 
 ```bash
-# Build everything including the Tauri desktop app
+# Build the CLI and Tauri desktop app
 ./build.sh
 
 # For signed/notarized macOS builds
