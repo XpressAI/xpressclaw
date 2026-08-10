@@ -34,7 +34,8 @@ ordinary tasks:
 - The task and that agent's queue lane remain active until every registered PR
   is merged or approved. Approval means a formal approved review, an
   unambiguous `+1`, `LGTM`, or `approved` review/comment, or a thumbs-up
-  reaction on the PR summary.
+  reaction on the PR summary, in every case from someone other than the PR
+  author.
 - Monitoring expires after 14 days. A timeout or a PR closed without merge
   moves the task to waiting for input; it does not count as completion.
 

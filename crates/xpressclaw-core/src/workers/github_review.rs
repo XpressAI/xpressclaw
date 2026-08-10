@@ -613,13 +613,13 @@ async fn fetch_snapshot(
 ) -> Result<ReviewSnapshot> {
     let number = item.number;
     let pull_path = format!("pulls/{number}");
-    let issue_path = format!("issues/{number}");
+    let reactions_path = format!("issues/{number}/reactions");
     let reviews_path = format!("pulls/{number}/reviews");
     let conversation_comments_path = format!("issues/{number}/comments");
     let review_comments_path = format!("pulls/{number}/comments");
-    let (pull_request, issue, reviews, conversation_comments, review_comments) = tokio::try_join!(
+    let (pull_request, reactions, reviews, conversation_comments, review_comments) = tokio::try_join!(
         access.api_get(&pull_path),
-        access.api_get(&issue_path),
+        access.api_get_pages(&reactions_path),
         access.api_get_pages(&reviews_path),
         access.api_get_pages(&conversation_comments_path),
         access.api_get_pages(&review_comments_path),
@@ -632,7 +632,7 @@ async fn fetch_snapshot(
         });
     Ok(review_snapshot_from_values(
         &pull_request,
-        &issue,
+        &reactions,
         &reviews,
         &conversation_comments,
         &review_comments,
@@ -642,7 +642,7 @@ async fn fetch_snapshot(
 
 fn review_snapshot_from_values(
     pull_request: &Value,
-    issue: &Value,
+    reactions: &[Value],
     reviews: &[Value],
     conversation_comments: &[Value],
     review_comments: &[Value],
@@ -657,11 +657,15 @@ fn review_snapshot_from_values(
         .get("merged_at")
         .is_some_and(|value| !value.is_null());
     let closed = pull_request.get("state").and_then(Value::as_str) == Some("closed");
-    let thumbs_up = issue
-        .pointer("/reactions/+1")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0;
+    let thumbs_up = reactions.iter().any(|reaction| {
+        reaction.get("content").and_then(Value::as_str) == Some("+1")
+            && reaction
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .is_some_and(|reactor| {
+                    !reactor.is_empty() && !reactor.eq_ignore_ascii_case(&author)
+                })
+    });
 
     let mut latest_review_by_author = HashMap::<String, (&str, DateTime<Utc>)>::new();
     let mut activities = Vec::new();
@@ -1023,7 +1027,6 @@ mod tests {
             "merged_at": null,
             "user": { "login": "author" }
         });
-        let no_reactions = json!({ "reactions": { "+1": 0 } });
         let approved_review = json!({
             "id": 1,
             "state": "APPROVED",
@@ -1032,14 +1035,16 @@ mod tests {
             "body": ""
         });
         assert_eq!(
-            review_snapshot_from_values(&open_pr, &no_reactions, &[approved_review], &[], &[], 0,)
-                .outcome,
+            review_snapshot_from_values(&open_pr, &[], &[approved_review], &[], &[], 0,).outcome,
             Some(ReviewOutcome::Approved)
         );
 
-        let reaction = json!({ "reactions": { "+1": 1 } });
+        let reaction = json!({
+            "content": "+1",
+            "user": { "login": "reviewer" }
+        });
         assert_eq!(
-            review_snapshot_from_values(&open_pr, &reaction, &[], &[], &[], 0).outcome,
+            review_snapshot_from_values(&open_pr, &[reaction], &[], &[], &[], 0).outcome,
             Some(ReviewOutcome::Approved)
         );
 
@@ -1050,7 +1055,7 @@ mod tests {
             "body": "LGTM!"
         });
         assert_eq!(
-            review_snapshot_from_values(&open_pr, &no_reactions, &[], &[lgtm], &[], 0).outcome,
+            review_snapshot_from_values(&open_pr, &[], &[], &[lgtm], &[], 0).outcome,
             Some(ReviewOutcome::Approved)
         );
 
@@ -1060,7 +1065,7 @@ mod tests {
             "user": { "login": "author" }
         });
         assert_eq!(
-            review_snapshot_from_values(&merged_pr, &no_reactions, &[], &[], &[], 0).outcome,
+            review_snapshot_from_values(&merged_pr, &[], &[], &[], &[], 0).outcome,
             Some(ReviewOutcome::Merged)
         );
     }
@@ -1072,7 +1077,6 @@ mod tests {
             "merged_at": null,
             "user": { "login": "author" }
         });
-        let issue = json!({ "reactions": { "+1": 0 } });
         let reviews = vec![
             json!({
                 "id": 1,
@@ -1095,8 +1099,18 @@ mod tests {
             "user": { "login": "author" },
             "body": "LGTM"
         });
-        let snapshot =
-            review_snapshot_from_values(&pull_request, &issue, &reviews, &[own_lgtm], &[], 1);
+        let own_reaction = json!({
+            "content": "+1",
+            "user": { "login": "AUTHOR" }
+        });
+        let snapshot = review_snapshot_from_values(
+            &pull_request,
+            &[own_reaction],
+            &reviews,
+            &[own_lgtm],
+            &[],
+            1,
+        );
         assert_eq!(snapshot.outcome, None);
         assert_eq!(snapshot.unresolved_threads, 1);
         assert_eq!(snapshot.activities.len(), 2);

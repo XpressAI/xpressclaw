@@ -252,7 +252,7 @@ impl TaskQueue {
                                  ON monitored_task.id = monitored_pr.task_id
                                WHERE monitored_pr.agent_id = q.agent_id
                                  AND monitored_pr.task_id != q.task_id
-                                 AND monitored_pr.status != 'cancelled'
+                                 AND monitored_pr.status IN ('waiting', 'attention')
                                  AND monitored_task.status NOT IN ('completed', 'cancelled')
                            )
                          ORDER BY t.priority DESC, q.queued_at ASC LIMIT 1",
@@ -476,7 +476,7 @@ fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::board::{CreateTask, TaskBoard};
+    use crate::tasks::board::{CreateTask, TaskBoard, TaskStatus};
 
     fn setup() -> (Arc<Database>, TaskQueue) {
         let db = Arc::new(Database::open_memory().unwrap());
@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn completing_monitored_task_releases_agent_lane() {
+    fn terminal_pull_request_releases_lane_while_task_has_remaining_work() {
         use crate::workers::github_review::GithubReviewManager;
 
         let (db, queue) = setup();
@@ -851,7 +851,7 @@ mod tests {
                 context: None,
             })
             .unwrap();
-        GithubReviewManager::new(db)
+        GithubReviewManager::new(db.clone())
             .register(
                 &review_task.id,
                 "atlas",
@@ -861,9 +861,18 @@ mod tests {
             .unwrap();
         let next = queue.enqueue(&next_task.id, "atlas").unwrap();
         assert!(queue.claim_next().unwrap().is_none());
-        board
-            .update_status(&review_task.id, "completed", Some("atlas"))
-            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE task_pull_requests SET status = 'approved' WHERE task_id = ?1",
+                [&review_task.id],
+            )?;
+            Ok::<_, crate::error::Error>(())
+        })
+        .unwrap();
+        assert_eq!(
+            board.get(&review_task.id).unwrap().status,
+            TaskStatus::InProgress
+        );
         assert_eq!(queue.claim_next().unwrap().unwrap().id, next.id);
     }
 
