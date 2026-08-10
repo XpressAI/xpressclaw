@@ -543,7 +543,7 @@ fn enqueue_review_follow_up(
         format!("GitHub still reports {unresolved_threads} unresolved review thread(s).")
     });
     let message = format!(
-        "Automated GitHub review follow-up for {}\n\n{}\n\nInspect the entire pull request, all unresolved review threads, conversation comments, requested changes, and CI—not just the activity quoted above. Address every actionable comment, run the relevant validation, commit and push the fixes, reply to reviewers, and resolve each thread once its fix is published. Keep the pull request ready for review. Do not mark this task complete while it awaits review; XpressClaw will continue monitoring until the pull request is approved or merged.",
+        "Automated GitHub review follow-up for {}\n\n{}\n\nInspect the entire pull request, all unresolved review threads, conversation comments, requested changes, and CI—not just the activity quoted above. Address every actionable comment, run the relevant validation, commit and push the fixes, reply to reviewers, and resolve each thread once its fix is published. Keep the pull request ready for review. If the configured automated reviewer requires an explicit re-review request after fixes, send it (for example, comment `@codex review`). Do not mark this task complete while it awaits review; XpressClaw will continue monitoring until the pull request is approved or merged.",
         item.url, activity
     );
     TaskConversation::new(db.clone()).add_message(&item.task_id, "user", &message)?;

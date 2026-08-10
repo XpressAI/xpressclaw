@@ -28,7 +28,8 @@ ordinary tasks:
   five minutes. The worker process and container do not need to remain busy.
 - New external reviews and comments enqueue one continuation in the same task
   conversation. The prompt requires inspection of the whole PR, all unresolved
-  threads, and CI; addressed threads are replied to and resolved.
+  threads, and CI; addressed threads are replied to and resolved, and an
+  explicit re-review is requested when the configured reviewer requires one.
 - Unresolved threads are rechecked and can trigger an hourly reminder after an
   agent turn, rather than being silently abandoned.
 - The task and that agent's queue lane remain active until every registered PR
