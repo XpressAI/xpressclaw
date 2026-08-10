@@ -27,10 +27,11 @@ ordinary tasks:
   rejected because no real pull request exists to register. Before `pr create`
   or `pr ready` runs, the MCP durably arms a
   fail-closed completion gate; successful registration atomically replaces it
-  with the real PR. When `pr ready` names a pull request or branch explicitly,
-  that same target is used to resolve its URL. A control-plane timeout therefore
-  cannot leave a published PR unmonitored or register the current branch's PR
-  by mistake.
+  with the real PR only when the command's registration token matches that
+  sentinel. A later command cannot clear an earlier command's unresolved gate.
+  When `pr ready` names a pull request or branch explicitly, that same target is
+  used to resolve its URL. A control-plane timeout therefore cannot leave a
+  published PR unmonitored or register the current branch's PR by mistake.
 - Registration is accepted only for the task's assigned agent and configured
   repository. Hidden tasks and workflow-owned tasks are excluded. Validation,
   task activation, and sentinel or pull-request persistence share one

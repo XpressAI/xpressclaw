@@ -171,6 +171,38 @@ impl GithubReviewManager {
         repository: &str,
         url: &str,
     ) -> Result<TaskPullRequest> {
+        self.register_with_registration_id(task_id, agent_id, repository, url, None)
+    }
+
+    /// Replace the sentinel armed by one specific managed GitHub command with
+    /// its published pull request. A different command's sentinel must remain
+    /// fail-closed until that command registers or cancels itself.
+    pub fn register_pending(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        repository: &str,
+        url: &str,
+        registration_id: &str,
+    ) -> Result<TaskPullRequest> {
+        validate_registration_id(registration_id)?;
+        self.register_with_registration_id(
+            task_id,
+            agent_id,
+            repository,
+            url,
+            Some(registration_id),
+        )
+    }
+
+    fn register_with_registration_id(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        repository: &str,
+        url: &str,
+        registration_id: Option<&str>,
+    ) -> Result<TaskPullRequest> {
         let pull_request = parse_pull_request(url)?;
         let (expected_owner, expected_repo) = parse_repository(repository)?;
         if !pull_request.owner.eq_ignore_ascii_case(&expected_owner)
@@ -228,12 +260,20 @@ impl GithubReviewManager {
                     MIN_POLL_INTERVAL_SECONDS,
                 ],
             )?;
-            transaction.execute(
-                "DELETE FROM task_pull_requests
-                 WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
-                   AND number = 0",
-                rusqlite::params![task_id, agent_id, expected_owner, expected_repo],
-            )?;
+            if let Some(registration_id) = registration_id {
+                transaction.execute(
+                    "DELETE FROM task_pull_requests
+                     WHERE task_id = ?1 AND agent_id = ?2 AND owner = ?3 AND repo = ?4
+                       AND number = 0 AND url = ?5",
+                    rusqlite::params![
+                        task_id,
+                        agent_id,
+                        expected_owner,
+                        expected_repo,
+                        registration_id,
+                    ],
+                )?;
+            }
             transaction.commit()?;
             Ok::<_, Error>(())
         })?;
@@ -1696,11 +1736,12 @@ mod tests {
             .is_empty());
 
         manager
-            .register(
+            .register_pending(
                 &task_id,
                 "project-codex",
                 "XpressAI/xpressclaw",
                 "https://github.com/XpressAI/xpressclaw/pull/151",
+                "registration-1",
             )
             .unwrap();
         assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Waiting);
@@ -1713,6 +1754,75 @@ mod tests {
             .unwrap()
         });
         assert_eq!(sentinel_count, 0);
+    }
+
+    #[test]
+    fn successful_registration_deletes_only_its_matching_sentinel() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-a",
+            )
+            .unwrap();
+        // The primary key permits one fail-closed sentinel per task/repo. A
+        // later command can begin while the first command's token remains.
+        manager
+            .begin_registration(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "registration-b",
+            )
+            .unwrap();
+
+        manager
+            .register_pending(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/152",
+                "registration-b",
+            )
+            .unwrap();
+        let sentinel: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT url FROM task_pull_requests WHERE task_id = ?1 AND number = 0",
+                    [&task_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(sentinel, "registration-a");
+        assert_eq!(
+            manager.gate(&task_id).unwrap(),
+            GithubReviewGate::NeedsInput
+        );
+
+        manager
+            .register_pending(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+                "registration-a",
+            )
+            .unwrap();
+        assert_eq!(manager.gate(&task_id).unwrap(), GithubReviewGate::Waiting);
+        let monitored: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM task_pull_requests WHERE task_id = ?1 AND number > 0",
+                    [&task_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(monitored, 2);
     }
 
     #[test]

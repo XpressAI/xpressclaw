@@ -170,6 +170,7 @@ async fn register_pull_request(
             ))
         }
         PullRequestRegistrationPhase::Register => {
+            let registration_id = registration_id(&request)?;
             let url = request.url.as_deref().ok_or_else(|| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -177,7 +178,13 @@ async fn register_pull_request(
                 )
             })?;
             let pull_request = manager
-                .register(&id, &request.agent_id, &access.repository(), url)
+                .register_pending(
+                    &id,
+                    &request.agent_id,
+                    &access.repository(),
+                    url,
+                    registration_id,
+                )
                 .map_err(pull_request_registration_error)?;
             Ok((StatusCode::CREATED, Json(json!(pull_request))))
         }
