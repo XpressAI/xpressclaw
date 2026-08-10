@@ -1052,6 +1052,23 @@ fn synchronize_pull_request_agent(
                 "cannot reassign a monitored pull request to an agent using a different GitHub repository".into(),
             ));
         }
+        let destination_lane_reserved: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_pull_requests destination_pr
+                JOIN tasks destination_task ON destination_task.id = destination_pr.task_id
+                WHERE destination_pr.agent_id = ?1
+                  AND destination_pr.task_id != ?2
+                  AND destination_pr.status IN ('waiting', 'attention')
+                  AND destination_task.status NOT IN ('completed', 'cancelled')
+             )",
+            rusqlite::params![agent_id, task_id],
+            |row| row.get(0),
+        )?;
+        if destination_lane_reserved {
+            return Err(Error::Task(
+                "cannot reassign a monitored pull request because the destination agent is already reserved by another active pull-request review task".into(),
+            ));
+        }
     }
     conn.execute(
         "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
@@ -1364,6 +1381,49 @@ mod tests {
             board.get(&task.id).unwrap().agent_id.as_deref(),
             Some("project-codex")
         );
+
+        let destination_task = board
+            .create(&CreateTask {
+                title: "Existing destination review".to_string(),
+                agent_id: Some("reviewer-codex".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO task_pull_requests
+                    (task_id, agent_id, owner, repo, number, url, status,
+                     started_at, expires_at, next_poll_at, poll_interval_seconds)
+                 VALUES (?1, 'reviewer-codex', 'XpressAI', 'xpressclaw', 152,
+                         'https://github.com/XpressAI/xpressclaw/pull/152', 'waiting',
+                         '2026-08-10T00:00:00Z', '2026-08-24T00:00:00Z',
+                         '2026-08-10T00:00:00Z', 15)",
+                [&destination_task.id],
+            )
+            .unwrap();
+        });
+        let reserved_error = board
+            .update_with_agent_repository(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("reviewer-codex".to_string()),
+                    priority: None,
+                },
+                Some(("XpressAI", "xpressclaw")),
+            )
+            .unwrap_err();
+        assert!(reserved_error
+            .to_string()
+            .contains("already reserved by another active pull-request review task"));
+        assert_eq!(
+            board.get(&task.id).unwrap().agent_id.as_deref(),
+            Some("project-codex")
+        );
+        board
+            .update_status(&destination_task.id, "cancelled", None)
+            .unwrap();
 
         let reassigned = board
             .update_with_agent_repository(

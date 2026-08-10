@@ -94,32 +94,54 @@ impl TaskQueue {
             .transpose()
     }
 
-    /// Enqueue a continuation for the task's assignment as one atomic unit.
+    /// Add GitHub review feedback and enqueue a continuation for the task's
+    /// current assignment as one atomic unit.
     ///
     /// GitHub review polling performs network I/O before it knows a follow-up
-    /// is necessary. The task may be reassigned during that await, so callers
-    /// must not reuse the agent from their older polling snapshot here.
-    pub(crate) fn enqueue_continuation_for_current_agent(
+    /// is necessary. The task may be reassigned or cancelled during that
+    /// await, so callers must not reuse the agent or status from their older
+    /// polling snapshot here. A terminal task returns `None` without adding a
+    /// message or creating work.
+    pub(crate) fn enqueue_review_follow_up_for_current_agent(
         &self,
         task_id: &str,
-    ) -> Result<(String, Option<QueueItem>)> {
-        let (agent_id, queue_id) = self.db.with_conn(|conn| {
+        message: &str,
+    ) -> Result<Option<(String, Option<QueueItem>)>> {
+        let outcome = self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
-            let (agent_id, title, description, context): (
+            let (agent_id, title, description, context, status): (
                 Option<String>,
                 String,
                 Option<String>,
                 Option<String>,
+                String,
             ) = transaction.query_row(
-                "SELECT agent_id, title, description, context FROM tasks WHERE id = ?1",
+                "SELECT agent_id, title, description, context, status
+                 FROM tasks WHERE id = ?1",
                 [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )?;
+            if matches!(status.as_str(), "completed" | "cancelled") {
+                transaction.commit()?;
+                return Ok::<_, Error>(None);
+            }
             let agent_id = agent_id
                 .filter(|agent_id| !agent_id.trim().is_empty())
                 .ok_or_else(|| {
                     Error::Task("cannot queue review feedback for an unassigned task".into())
                 })?;
+            transaction.execute(
+                "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'user', ?2)",
+                rusqlite::params![task_id, message],
+            )?;
             let already_queued: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
@@ -128,8 +150,13 @@ impl TaskQueue {
                 |row| row.get(0),
             )?;
             if already_queued {
+                transaction.execute(
+                    "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    [task_id],
+                )?;
                 transaction.commit()?;
-                return Ok::<_, Error>((agent_id, None));
+                return Ok::<_, Error>(Some((agent_id, None)));
             }
 
             transaction.execute(
@@ -178,6 +205,7 @@ impl TaskQueue {
             )?;
             transaction.execute(
                 "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                    status = 'in_progress', completed_at = NULL,
                     updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
                 rusqlite::params![agent_id, attempt_id, task_id],
             )?;
@@ -208,11 +236,14 @@ impl TaskQueue {
                 [&agent_id],
             )?;
             transaction.commit()?;
-            Ok((agent_id, Some(queue_id)))
+            Ok(Some((agent_id, Some(queue_id))))
         })?;
 
+        let Some((agent_id, queue_id)) = outcome else {
+            return Ok(None);
+        };
         let item = queue_id.map(|queue_id| self.get(queue_id)).transpose()?;
-        Ok((agent_id, item))
+        Ok(Some((agent_id, item)))
     }
 
     fn create_attempt_for_item(&self, id: i64, task_id: &str, agent_id: &str) -> Result<QueueItem> {

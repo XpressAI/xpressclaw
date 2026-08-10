@@ -661,10 +661,11 @@ fn enqueue_review_follow_up(
         "Automated GitHub review follow-up for {}\n\n{}\n\nInspect the entire pull request, all unresolved review threads, conversation comments, requested changes, and CI—not just the activity quoted above. Address every actionable comment, run the relevant validation, commit and push the fixes, reply to reviewers, and resolve each thread once its fix is published. Keep the pull request ready for review. If the configured automated reviewer requires an explicit re-review request after fixes, send it (for example, comment `@codex review`). Do not mark this task complete while it awaits review; XpressClaw will continue monitoring until the pull request is approved or merged.",
         item.url, activity
     );
-    TaskConversation::new(db.clone()).add_message(&item.task_id, "user", &message)?;
-    let (agent_id, _) =
-        TaskQueue::new(db.clone()).enqueue_continuation_for_current_agent(&item.task_id)?;
-    TaskBoard::new(db.clone()).update_status(&item.task_id, "in_progress", None)?;
+    let Some((agent_id, _)) = TaskQueue::new(db.clone())
+        .enqueue_review_follow_up_for_current_agent(&item.task_id, &message)?
+    else {
+        return Ok(());
+    };
     SessionManager::new(db.clone()).refresh_status(&agent_id)?;
     Ok(())
 }
@@ -1259,6 +1260,39 @@ mod tests {
                 .session_id,
             "reviewer-codex"
         );
+    }
+
+    #[test]
+    fn review_follow_up_does_not_reopen_a_task_cancelled_during_github_io() {
+        let (db, task_id) = setup_task(None);
+        let manager = GithubReviewManager::new(db.clone());
+        let stale = manager
+            .register(
+                &task_id,
+                "project-codex",
+                "XpressAI/xpressclaw",
+                "https://github.com/XpressAI/xpressclaw/pull/151",
+            )
+            .unwrap();
+
+        // This models cancellation after polling captured `stale` but before
+        // the GitHub request returned and attempted to enqueue its feedback.
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "cancelled", None)
+            .unwrap();
+        enqueue_review_follow_up(&db, &stale, None, 1).unwrap();
+
+        assert_eq!(
+            TaskBoard::new(db.clone()).get(&task_id).unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert!(!TaskQueue::new(db.clone())
+            .has_queued_for_task(&task_id)
+            .unwrap());
+        assert!(TaskConversation::new(db)
+            .get_messages(&task_id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

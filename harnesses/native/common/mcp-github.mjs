@@ -209,11 +209,19 @@ async function currentPullRequestNumber() {
   return number;
 }
 
-async function currentPullRequestUrl() {
-  const output = await successfulCommand(['pr', 'view', '--json', 'url', '--jq', '.url']);
+async function currentPullRequestUrl(target) {
+  const args = ['pr', 'view'];
+  if (target) args.push(target);
+  args.push('--json', 'url', '--jq', '.url');
+  const output = await successfulCommand(args);
   const url = pullRequestUrl(output.stdout.trim());
   if (!url) throw new Error('could not determine the current pull-request URL');
   return url;
+}
+
+function readyPullRequestTarget(args) {
+  if (args[0] !== 'pr' || args[1] !== 'ready') return undefined;
+  return args.slice(2).find((argument) => !argument.startsWith('-'));
 }
 
 export async function updatePullRequestRegistration(
@@ -295,7 +303,7 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
   }
 
   try {
-    const url = pullRequestUrl(output.stdout) ?? await currentUrl();
+    const url = pullRequestUrl(output.stdout) ?? await currentUrl(readyPullRequestTarget(args));
     output.review_lifecycle = {
       registered: true,
       pull_request: url,

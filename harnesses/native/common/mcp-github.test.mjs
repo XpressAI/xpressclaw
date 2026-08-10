@@ -250,3 +250,30 @@ test('cancels the pre-publication gate when the GitHub command fails', async () 
   assert.equal(output.exit_code, 1);
   assert.equal(output.review_lifecycle, undefined);
 });
+
+test('resolves the explicit pull request target after ready output omits its URL', async () => {
+  const resolvedTargets = [];
+  const output = await executeCommandWithReviewLifecycle(
+    ['pr', 'ready', 'feature/review-lifecycle'],
+    {
+      environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
+      registrationId: 'registration-1',
+      execute: async () => ({
+        exit_code: 0,
+        stdout: '✓ Pull request XpressAI/xpressclaw#151 is marked as ready for review\n',
+        stderr: '',
+      }),
+      currentPullRequestUrl: async (target) => {
+        resolvedTargets.push(target);
+        return 'https://github.com/XpressAI/xpressclaw/pull/151';
+      },
+      updateRegistration: async () => ({ status: 'waiting' }),
+    },
+  );
+
+  assert.deepEqual(resolvedTargets, ['feature/review-lifecycle']);
+  assert.equal(
+    output.review_lifecycle.pull_request,
+    'https://github.com/XpressAI/xpressclaw/pull/151',
+  );
+});

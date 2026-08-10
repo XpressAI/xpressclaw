@@ -26,8 +26,10 @@ ordinary tasks:
   rejected because no real pull request exists to register. Before `pr create`
   or `pr ready` runs, the MCP durably arms a
   fail-closed completion gate; successful registration atomically replaces it
-  with the real PR. A control-plane timeout therefore cannot leave a published
-  PR unmonitored.
+  with the real PR. When `pr ready` names a pull request or branch explicitly,
+  that same target is used to resolve its URL. A control-plane timeout therefore
+  cannot leave a published PR unmonitored or register the current branch's PR
+  by mistake.
 - Registration is accepted only for the task's assigned agent and configured
   repository. Hidden tasks and workflow-owned tasks are excluded.
 - XpressClaw polls GitHub durably, starting at 15 seconds and backing off to
@@ -36,6 +38,9 @@ ordinary tasks:
   conversation. The prompt requires inspection of the whole PR, all unresolved
   threads, and CI; addressed threads are replied to and resolved, and an
   explicit re-review is requested when the configured reviewer requires one.
+  Feedback insertion, the terminal-status check, task activation, and queue
+  creation are one transaction, so feedback fetched before a user cancellation
+  cannot reopen the cancelled task.
 - Every page of unresolved threads is rechecked and exposed through the
   project-scoped `pr thread list` command, and can trigger an hourly reminder
   after an agent turn, rather than later pages being silently abandoned.
@@ -44,9 +49,10 @@ ordinary tasks:
   monitor, queued continuations, work attempts, and queue-lane reservation to
   the new agent only after verifying that agent is bound to the same GitHub
   repository; reassignment is rejected when the repository cannot be verified,
-  differs, or a turn is actively running. Review feedback rereads the task's
-  assignment and creates its queue item, attempt, and session event in one
-  transaction, so a reassignment during the GitHub request cannot recreate
+  differs, a turn is actively running, or the destination agent's lane is
+  already reserved by another active review task. Review feedback rereads the
+  task's assignment and creates its queue item, attempt, and session event in
+  one transaction, so a reassignment during the GitHub request cannot recreate
   stale work for the former agent.
   Approval means a formal approved review, an
   unambiguous `+1`, `LGTM`, or `approved` review/comment, or a thumbs-up
