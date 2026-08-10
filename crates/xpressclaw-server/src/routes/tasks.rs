@@ -450,52 +450,62 @@ async fn update_task_status(
         ));
     }
     if req.status == "cancelled" {
-        let active_attempt_id = state
+        let sessions = SessionManager::new(state.db.clone());
+        let Some(cancelled) = sessions
+            .cancel_task_attempts(&id, "Work cancelled by user")
+            .map_err(internal_error)?
+        else {
+            return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
+        };
+        state.elicitations.cancel_task(&id);
+
+        let mut sessions_to_stop = std::collections::BTreeMap::<String, bool>::new();
+        for attempt in &cancelled {
+            state.elicitations.cancel_attempt(&attempt.id);
+            sessions_to_stop
+                .entry(attempt.session_id.clone())
+                .and_modify(|has_container| {
+                    *has_container |= attempt.container_id.is_some();
+                })
+                .or_insert(attempt.container_id.is_some());
+        }
+        let docker = state.docker().await;
+        let mut stopped_sessions = std::collections::BTreeSet::new();
+        for (session_id, has_container) in sessions_to_stop {
+            let stopped = if !has_container {
+                true
+            } else if let Some(docker) = docker.as_ref() {
+                docker.stop_preserving(&session_id).await.is_ok()
+            } else {
+                false
+            };
+            if stopped {
+                stopped_sessions.insert(session_id);
+            }
+        }
+        for attempt in &cancelled {
+            if stopped_sessions.contains(&attempt.session_id) {
+                let _ = sessions.clear_container(&attempt.id);
+            }
+        }
+        // Running dispatch rows are the lease on a retained project
+        // container. Release them only after every affected session has had
+        // its stop attempt; queued rows were failed in the atomic transition.
+        state
             .db
             .with_conn(|conn| {
-                let attempt_id = conn.query_row(
-                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
-                    [&id],
-                    |row| row.get::<_, Option<String>>(0),
-                )?;
-                Ok::<_, xpressclaw_core::error::Error>(attempt_id)
+                for queue_id in cancelled.iter().filter_map(|attempt| attempt.queue_id) {
+                    conn.execute(
+                        "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                            harness_response = 'cancelled by user'
+                         WHERE id = ?1 AND status = 'running'",
+                        [queue_id],
+                    )?;
+                }
+                Ok::<_, xpressclaw_core::error::Error>(())
             })
             .map_err(internal_error)?;
-        if let Some(attempt_id) = active_attempt_id {
-            let sessions = SessionManager::new(state.db.clone());
-            let Some(cancelled) = sessions
-                .cancel_attempt_and_task(&attempt_id, &id, "Work cancelled by user")
-                .map_err(internal_error)?
-            else {
-                return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
-            };
-            state.elicitations.cancel_attempt(&attempt_id);
-            let mut container_stopped = cancelled.container_id.is_none();
-            if let Some(docker) = state.docker().await {
-                container_stopped = docker.stop_preserving(&cancelled.session_id).await.is_ok();
-            }
-            if container_stopped {
-                let _ = sessions.clear_container(&attempt_id);
-            }
-            // Keep this dispatch marked running until the shared project
-            // container is stopped. That prevents a queued turn from
-            // restarting it just before this cancellation path kills it.
-            if let Some(queue_id) = cancelled.queue_id {
-                state
-                    .db
-                    .with_conn(|conn| {
-                        conn.execute(
-                            "UPDATE task_queue SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
-                                harness_response = 'cancelled by user' WHERE id = ?1",
-                            [queue_id],
-                        )?;
-                        Ok::<_, xpressclaw_core::error::Error>(())
-                    })
-                    .map_err(internal_error)?;
-            }
-        } else {
-            state.elicitations.cancel_task(&id);
-        }
+        return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
     }
     let updated = if req.status == "completed" {
         board

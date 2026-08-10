@@ -935,11 +935,13 @@ mod tests {
             .unwrap();
 
         let cancelled = sessions
-            .cancel_attempt_and_task(attempt_id, &task.id, "Work cancelled by user")
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
             .unwrap()
             .unwrap();
 
-        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, attempt_id);
+        assert_eq!(cancelled[0].status, "cancelled");
         assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
         assert_eq!(reviews.gate(&task.id).unwrap(), GithubReviewGate::None);
         assert!(queue
@@ -956,6 +958,70 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queued_follow_ups, 0);
+    }
+
+    #[test]
+    fn task_cancellation_retires_feedback_enqueued_before_the_transaction() {
+        let (db, queue) = setup();
+        let board = TaskBoard::new(db.clone());
+        let task = board
+            .create(&CreateTask {
+                title: "Cancel after a stale active-attempt read".into(),
+                description: None,
+                agent_id: Some("atlas".into()),
+                parent_task_id: None,
+                sop_id: None,
+                conversation_id: None,
+                priority: None,
+                context: None,
+            })
+            .unwrap();
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        let running_attempt = running.attempt_id.as_deref().unwrap();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(running_attempt, "running", "Working", None, None)
+            .unwrap();
+
+        // This is the interleaving from the review: cancellation previously
+        // read the running attempt, then feedback replaced active_attempt_id
+        // with a newly queued continuation before cancellation committed.
+        let (_, queued) = queue
+            .enqueue_review_follow_up_for_current_agent(&task.id, "New review feedback")
+            .unwrap()
+            .unwrap();
+        let queued = queued.unwrap();
+        let queued_attempt = queued.attempt_id.as_deref().unwrap();
+
+        let cancelled = sessions
+            .cancel_task_attempts(&task.id, "Work cancelled by user")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(cancelled.len(), 2);
+        assert_eq!(
+            sessions.get_attempt(running_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            sessions.get_attempt(queued_attempt).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(queue.get(running.id).unwrap().status, "running");
+        assert_eq!(queue.get(queued.id).unwrap().status, "failed");
+        assert_eq!(board.get(&task.id).unwrap().status, TaskStatus::Cancelled);
+        let active_attempt_id: Option<String> = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&task.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(active_attempt_id.is_none());
+        assert!(queue.claim_next().unwrap().is_none());
     }
 
     #[test]
