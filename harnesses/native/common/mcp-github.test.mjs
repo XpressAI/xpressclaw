@@ -111,6 +111,12 @@ test('ordinary task lifecycle rejects converting a ready PR back to draft', () =
     managedCommandArguments(['pr', 'ready', '--undo=false'], environment),
     ['pr', 'ready', '--undo=false'],
   );
+  for (const value of ['0', 'f', 'F', 'FALSE', 'False']) {
+    assert.deepEqual(
+      managedCommandArguments(['pr', 'ready', `--undo=${value}`], environment),
+      ['pr', 'ready', `--undo=${value}`],
+    );
+  }
   assert.throws(
     () => managedCommandArguments(['pr', 'ready', '--undo=true'], environment),
     /cannot convert a ready pull request back to draft/,
@@ -131,6 +137,12 @@ test('ordinary task lifecycle rejects dry-run creation before publication', () =
     managedCommandArguments(['pr', 'create', '--dry-run=false'], environment),
     ['pr', 'create', '--dry-run=false'],
   );
+  for (const value of ['0', 'f', 'F', 'FALSE', 'False']) {
+    assert.deepEqual(
+      managedCommandArguments(['pr', 'create', `--dry-run=${value}`], environment),
+      ['pr', 'create', `--dry-run=${value}`],
+    );
+  }
   assert.throws(
     () => managedCommandArguments(['pr', 'create', '--dry-run=true'], environment),
     /cannot register a dry-run pull request/,
@@ -169,6 +181,25 @@ test('registration keys distinguish unrelated pull-request branches', async () =
   );
 
   assert.notEqual(first, second);
+});
+
+test('registration keys normalize equals-attached short option values', async () => {
+  const environment = { GH_REPO: 'XpressAI/xpressclaw' };
+  const created = await pullRequestRegistrationKey(
+    ['pr', 'create', '-H=feature/review', '-B=main'],
+    { environment },
+  );
+  const readied = await pullRequestRegistrationKey(
+    ['pr', 'ready', '151'],
+    {
+      environment,
+      currentPullRequestIdentity: async () => ({
+        owner: 'xpressai', head: 'feature/review', base: 'main',
+      }),
+    },
+  );
+
+  assert.equal(created, readied);
 });
 
 test('registration keys honor the branch-configured gh merge base', async () => {
@@ -405,6 +436,40 @@ test('a retry reuses the durable registration token returned by begin', async ()
     'begin:registration-new',
     'register:registration-original',
   ]);
+  assert.equal(output.review_lifecycle.registered, true);
+});
+
+test('a retry registers a pull request that gh reports is already ready', async () => {
+  const events = [];
+  const resolvedTargets = [];
+  const output = await executeCommandWithReviewLifecycle(['pr', 'ready', '151'], {
+    environment: { XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1' },
+    registrationId: 'registration-new',
+    registrationKeyForCommand: async () => 'a'.repeat(64),
+    execute: async () => ({
+      exit_code: 1,
+      stdout: '',
+      stderr: 'Pull request XpressAI/xpressclaw#151 is already ready for review',
+    }),
+    currentPullRequestUrl: async (target) => {
+      resolvedTargets.push(target);
+      return 'https://github.com/XpressAI/xpressclaw/pull/151';
+    },
+    updateRegistration: async (phase, _url, registrationId) => {
+      events.push(`${phase}:${registrationId}`);
+      if (phase === 'begin') {
+        return { registration_id: 'registration-original', reused: true };
+      }
+      return { status: 'waiting' };
+    },
+  });
+
+  assert.deepEqual(events, [
+    'begin:registration-new',
+    'register:registration-original',
+  ]);
+  assert.deepEqual(resolvedTargets, ['151']);
+  assert.equal(output.exit_code, 0);
   assert.equal(output.review_lifecycle.registered, true);
 });
 

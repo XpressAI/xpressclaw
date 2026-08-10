@@ -124,6 +124,7 @@ const PR_CREATE_SHORT_VALUE_OPTIONS = new Set([
   'a', 'B', 'b', 'F', 'H', 'l', 'm', 'p', 'r', 'T', 't',
 ]);
 const PR_CREATE_SHORT_BOOLEAN_OPTIONS = new Set(['d', 'e', 'f', 'w']);
+const FALSE_BOOLEAN_VALUES = new Set(['0', 'f', 'false']);
 
 function withoutDraftArguments(args) {
   const normalized = args.slice(0, 2);
@@ -199,7 +200,7 @@ export function managedCommandArguments(args, environment = process.env) {
 function enabledBooleanFlag(argument, name) {
   if (argument === name) return true;
   if (!argument.startsWith(`${name}=`)) return false;
-  return argument.slice(name.length + 1).toLowerCase() !== 'false';
+  return !FALSE_BOOLEAN_VALUES.has(argument.slice(name.length + 1).toLowerCase());
 }
 
 export function pullRequestUrl(value) {
@@ -282,7 +283,8 @@ function commandOptionValue(args, longName, shortName) {
   const value = optionValue(args, longName, shortName);
   if (value !== undefined) return value;
   const attached = args.find((argument) => argument.startsWith(shortName) && argument.length > 2);
-  return attached?.slice(2);
+  const attachedValue = attached?.slice(2);
+  return attachedValue?.startsWith('=') ? attachedValue.slice(1) : attachedValue;
 }
 
 function registrationKey(owner, head, base, environment = process.env) {
@@ -393,6 +395,12 @@ function readyPullRequestTarget(args) {
   return args.slice(2).find((argument) => !argument.startsWith('-'));
 }
 
+function readyPullRequestAlreadySatisfied(args, output) {
+  if (args[0] !== 'pr' || args[1] !== 'ready' || output.exit_code === 0) return false;
+  const message = `${output.stdout ?? ''}\n${output.stderr ?? ''}`;
+  return /\balready (?:marked as )?ready for review\b/i.test(message);
+}
+
 export async function updatePullRequestRegistration(
   phase,
   url,
@@ -482,7 +490,8 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
   }
 
   const output = await execute(args);
-  if (output.exit_code !== 0) {
+  const alreadyReady = readyPullRequestAlreadySatisfied(args, output);
+  if (output.exit_code !== 0 && !alreadyReady) {
     try {
       if (!reusedRegistration) {
         await updateRegistration(
@@ -504,17 +513,19 @@ export async function executeCommandWithReviewLifecycle(args, dependencies = {})
 
   try {
     const url = pullRequestUrl(output.stdout) ?? await currentUrl(readyPullRequestTarget(args));
+    const state = await updateRegistration(
+      'register',
+      url,
+      effectiveRegistrationId,
+      registrationKeyValue,
+    );
     output.review_lifecycle = {
       registered: true,
       pull_request: url,
-      state: await updateRegistration(
-        'register',
-        url,
-        effectiveRegistrationId,
-        registrationKeyValue,
-      ),
+      state,
       message: 'XpressClaw will keep this task active and address review feedback until approval or merge.',
     };
+    if (alreadyReady) output.exit_code = 0;
   } catch (cause) {
     output.review_lifecycle = {
       registered: false,
