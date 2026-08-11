@@ -272,6 +272,49 @@ impl ProjectManager {
                 ));
             }
 
+            let has_incompatible_task_hierarchy: bool = transaction.query_row(
+                "WITH task_destinations AS (
+                    SELECT task.id,
+                           task.parent_task_id,
+                           task.project_id AS source_project_id,
+                           CASE
+                               WHEN task.agent_id = ?2
+                                 OR task.conversation_id IN (
+                                     SELECT conversation.id
+                                     FROM conversations conversation
+                                     WHERE conversation.project_id = ?1
+                                        OR EXISTS (
+                                            SELECT 1
+                                            FROM conversation_participants participant
+                                            WHERE participant.conversation_id = conversation.id
+                                              AND participant.participant_type = 'agent'
+                                              AND participant.participant_id = ?2
+                                        )
+                                 )
+                               THEN ?1
+                               ELSE task.project_id
+                           END AS destination_project_id
+                    FROM tasks task
+                )
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM task_destinations child
+                    JOIN task_destinations parent ON parent.id = child.parent_task_id
+                    WHERE child.destination_project_id IS NOT parent.destination_project_id
+                      AND (
+                          child.destination_project_id IS NOT child.source_project_id
+                          OR parent.destination_project_id IS NOT parent.source_project_id
+                      )
+                )",
+                rusqlite::params![project_id, agent_id],
+                |row| row.get(0),
+            )?;
+            if has_incompatible_task_hierarchy {
+                return Err(Error::Project(
+                    "moving this Agent would split a parent task from one of its child tasks; reassign the task hierarchy before moving the Agent".into(),
+                ));
+            }
+
             transaction.execute(
                 "UPDATE conversations
                  SET project_id = ?1, updated_at = CURRENT_TIMESTAMP
@@ -715,5 +758,70 @@ mod tests {
             .unwrap();
         assert_eq!(conversation_project, "target");
         assert_eq!(task_project, "target");
+    }
+
+    #[test]
+    fn moving_an_agent_keeps_parent_and_child_tasks_in_one_project() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('source', 'Source');
+                 INSERT INTO projects (id, name) VALUES ('target', 'Target');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'source');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('reviewer', 'Reviewer', 'native', '{}', 'source');",
+            )
+        })
+        .unwrap();
+        let board = crate::tasks::board::TaskBoard::new(db.clone());
+        let parent = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Implement the change".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let reviewed_child = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Review the change".into(),
+                agent_id: Some("reviewer".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let unassigned_child = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Publish the change".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = ProjectManager::new(db.clone());
+
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error.to_string().contains("parent task"));
+        for task_id in [&parent.id, &reviewed_child.id, &unassigned_child.id] {
+            assert_eq!(
+                board.get(task_id).unwrap().project_id.as_deref(),
+                Some("source")
+            );
+        }
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = 'atlas'
+                 WHERE id IN (?1, ?2)",
+                rusqlite::params![reviewed_child.id, unassigned_child.id],
+            )
+        })
+        .unwrap();
+        manager.assign_agent("target", "atlas").unwrap();
+        for task_id in [&parent.id, &reviewed_child.id, &unassigned_child.id] {
+            assert_eq!(
+                board.get(task_id).unwrap().project_id.as_deref(),
+                Some("target")
+            );
+        }
     }
 }
