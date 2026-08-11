@@ -135,6 +135,65 @@ impl ProjectManager {
                 return Ok(());
             }
 
+            let has_live_turn: bool = transaction.query_row(
+                "SELECT
+                    EXISTS(
+                        SELECT 1 FROM work_attempts attempt
+                        WHERE attempt.status IN ('preparing', 'running', 'review')
+                          AND (
+                              attempt.session_id = ?1
+                              OR EXISTS (
+                                  SELECT 1 FROM tasks task
+                                  WHERE task.id = attempt.task_id
+                                    AND task.agent_id = ?1
+                              )
+                          )
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM conversation_turns turn
+                        WHERE turn.agent_id = ?1 AND turn.status = 'running'
+                    )",
+                [agent_id],
+                |row| row.get(0),
+            )?;
+            if has_live_turn {
+                return Err(Error::Project(
+                    "wait for this Agent's active task or Conversation response to finish before moving it"
+                        .into(),
+                ));
+            }
+
+            let has_active_workflow: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM workflow_instances instance
+                    WHERE instance.status IN ('running', 'waiting')
+                      AND (
+                          instance.project_id = ?2
+                          OR instance.conversation_id IN (
+                              SELECT participant.conversation_id
+                              FROM conversation_participants participant
+                              WHERE participant.participant_type = 'agent'
+                                AND participant.participant_id = ?1
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM workflow_step_executions execution
+                              JOIN tasks task ON task.id = execution.task_id
+                              WHERE execution.instance_id = instance.id
+                                AND task.agent_id = ?1
+                          )
+                      )
+                )",
+                rusqlite::params![agent_id, previous_project_id],
+                |row| row.get(0),
+            )?;
+            if has_active_workflow {
+                return Err(Error::Project(
+                    "wait for or cancel this Agent's active Project workflow before moving it"
+                        .into(),
+                ));
+            }
+
             let shared_conversation = transaction
                 .query_row(
                     "SELECT c.id
@@ -322,5 +381,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(note.project_id, project.id);
+    }
+
+    #[test]
+    fn moving_an_agent_waits_for_live_task_and_conversation_turns() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('source', 'Source');
+                 INSERT INTO projects (id, name) VALUES ('target', 'Target');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'source');
+                 INSERT INTO logical_sessions (id, agent_id, title)
+                    VALUES ('atlas', 'atlas', 'Atlas');
+                 INSERT INTO work_attempts (id, session_id, runner, status)
+                    VALUES ('attempt-one', 'atlas', 'native', 'running');",
+            )
+        })
+        .unwrap();
+        let manager = ProjectManager::new(db.clone());
+
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active task or Conversation response"));
+
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "UPDATE work_attempts SET status = 'completed' WHERE id = 'attempt-one';
+                 INSERT INTO conversations (id, title, project_id)
+                    VALUES ('conversation-one', 'Design', 'source');
+                 INSERT INTO conversation_participants
+                    (conversation_id, participant_type, participant_id)
+                    VALUES ('conversation-one', 'agent', 'atlas');
+                 INSERT INTO conversation_turns
+                    (id, conversation_id, agent_id, status)
+                    VALUES ('turn-one', 'conversation-one', 'atlas', 'running');",
+            )
+        })
+        .unwrap();
+
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("active task or Conversation response"));
+        let project_id = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_id FROM agents WHERE id = 'atlas'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(project_id, "source");
+    }
+
+    #[test]
+    fn moving_an_agent_waits_for_project_workflows_to_finish() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('source', 'Source');
+                 INSERT INTO projects (id, name) VALUES ('target', 'Target');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'source');
+                 INSERT INTO workflows (id, name, yaml_content)
+                    VALUES ('review', 'Review', 'name: Review');
+                 INSERT INTO workflow_instances
+                    (id, workflow_id, status, project_id)
+                    VALUES ('review-run', 'review', 'waiting', 'source');",
+            )
+        })
+        .unwrap();
+        let manager = ProjectManager::new(db.clone());
+
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error.to_string().contains("active Project workflow"));
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET status = 'completed' WHERE id = 'review-run'",
+                [],
+            )
+        })
+        .unwrap();
+        let target = manager.assign_agent("target", "atlas").unwrap();
+        assert_eq!(target.agent_ids, vec!["atlas"]);
     }
 }
