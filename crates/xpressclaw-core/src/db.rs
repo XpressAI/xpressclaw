@@ -289,15 +289,43 @@ fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<
     let mappings = {
         let mut statement = transaction.prepare(
             "WITH RECURSIVE
+             task_agents(task_id, agent_id) AS (
+                 SELECT task.id, agent.id
+                 FROM tasks task
+                 JOIN agents agent ON agent.id = task.agent_id
+                 UNION
+                 SELECT task.id, agent.id
+                 FROM tasks task
+                 JOIN conversation_participants participant
+                   ON participant.conversation_id = task.conversation_id
+                  AND participant.participant_type = 'agent'
+                 JOIN agents agent ON agent.id = participant.participant_id
+             ),
              links(origin, peer) AS (
                  SELECT id, id FROM agents
                  UNION
                  SELECT own.participant_id, peer.participant_id
                  FROM conversation_participants own
                  JOIN conversation_participants peer
-                   ON peer.conversation_id = own.conversation_id
+                  ON peer.conversation_id = own.conversation_id
                   AND peer.participant_type = 'agent'
                  WHERE own.participant_type = 'agent'
+                 UNION
+                 SELECT own.agent_id, peer.agent_id
+                 FROM task_agents own
+                 JOIN task_agents peer ON peer.task_id = own.task_id
+                 UNION
+                 SELECT parent_agent.agent_id, child_agent.agent_id
+                 FROM tasks child
+                 JOIN tasks parent ON parent.id = child.parent_task_id
+                 JOIN task_agents parent_agent ON parent_agent.task_id = parent.id
+                 JOIN task_agents child_agent ON child_agent.task_id = child.id
+                 UNION
+                 SELECT child_agent.agent_id, parent_agent.agent_id
+                 FROM tasks child
+                 JOIN tasks parent ON parent.id = child.parent_task_id
+                 JOIN task_agents parent_agent ON parent_agent.task_id = parent.id
+                 JOIN task_agents child_agent ON child_agent.task_id = child.id
              ),
              reachable(origin, peer) AS (
                  SELECT origin, peer FROM links
@@ -340,8 +368,8 @@ fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<
             rusqlite::params![target_project_id, agent_id],
         )?;
         transaction.execute(
-            "UPDATE tasks SET project_id = ?1 WHERE agent_id = ?2",
-            rusqlite::params![target_project_id, agent_id],
+            "UPDATE tasks SET project_id = ?1 WHERE project_id = ?2",
+            rusqlite::params![target_project_id, source_project_id],
         )?;
     }
     transaction.execute(
@@ -1229,6 +1257,30 @@ SET project_id = COALESCE(
     (SELECT a.project_id FROM agents a WHERE a.id = tasks.agent_id)
 )
 WHERE project_id IS NULL;
+-- Legacy ACP plans stored their reported steps as unassigned child tasks. Once
+-- the assigned parent has a Project, carry that scope through the complete
+-- descendant tree so the migration cannot introduce a cross-Project task
+-- hierarchy.
+WITH RECURSIVE inherited_task_projects(id, project_id) AS (
+    SELECT id, project_id FROM tasks WHERE project_id IS NOT NULL
+    UNION
+    SELECT child.id, parent.project_id
+    FROM tasks child
+    JOIN inherited_task_projects parent ON parent.id = child.parent_task_id
+    WHERE child.project_id IS NULL
+)
+UPDATE tasks
+SET project_id = (
+    SELECT inherited.project_id
+    FROM inherited_task_projects inherited
+    WHERE inherited.id = tasks.id
+    LIMIT 1
+)
+WHERE project_id IS NULL
+  AND EXISTS (
+      SELECT 1 FROM inherited_task_projects inherited
+      WHERE inherited.id = tasks.id
+  );
 CREATE INDEX idx_tasks_project_updated ON tasks(project_id, updated_at DESC);
 
 ALTER TABLE workflow_instances ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
@@ -1454,6 +1506,45 @@ mod tests {
     }
 
     #[test]
+    fn v33_backfills_project_scope_through_task_ancestry() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 32 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, backend, config)
+             VALUES ('atlas', 'Atlas', 'native', '{}');
+             INSERT INTO tasks (id, title, agent_id)
+             VALUES ('parent', 'Assigned parent', 'atlas');
+             INSERT INTO tasks (id, title, parent_task_id)
+             VALUES ('child', 'Reported child', 'parent'),
+                    ('grandchild', 'Reported grandchild', 'child');",
+        )
+        .unwrap();
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V33).unwrap();
+        transaction.commit().unwrap();
+
+        for task_id in ["parent", "child", "grandchild"] {
+            let project_id: String = conn
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(project_id, "atlas", "scope for {task_id}");
+        }
+    }
+
+    #[test]
     fn v34_recovers_memory_owned_by_a_removed_agent_after_v33_commits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy-memory.db");
@@ -1560,14 +1651,23 @@ mod tests {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|conn| {
             conn.execute_batch(
-                "INSERT INTO projects (id, name) VALUES ('atlas', 'Atlas'), ('reviewer', 'Reviewer');
+                "INSERT INTO projects (id, name)
+                 VALUES ('atlas', 'Atlas'), ('builder', 'Builder'), ('reviewer', 'Reviewer');
                  INSERT INTO agents (id, name, backend, config, project_id)
                  VALUES ('atlas', 'Atlas', 'native', '{}', 'atlas'),
+                        ('builder', 'Builder', 'native', '{}', 'builder'),
                         ('reviewer', 'Reviewer', 'native', '{}', 'reviewer');
                  INSERT INTO conversations (id, title, project_id) VALUES ('shared', 'Shared', 'atlas');
                  INSERT INTO conversation_participants
                     (conversation_id, participant_type, participant_id)
-                 VALUES ('shared', 'agent', 'atlas'), ('shared', 'agent', 'reviewer');",
+                 VALUES ('shared', 'agent', 'atlas'), ('shared', 'agent', 'reviewer');
+                 INSERT INTO tasks (id, title, agent_id, project_id)
+                 VALUES ('parent', 'Cross-Agent parent', 'atlas', 'atlas'),
+                        ('child', 'Cross-Agent child', 'builder', 'builder'),
+                        ('review-parent', 'Reviewer parent', 'reviewer', 'reviewer');
+                 INSERT INTO tasks (id, title, parent_task_id, project_id)
+                 VALUES ('review-plan', 'Unassigned reported step', 'review-parent', 'reviewer');
+                 UPDATE tasks SET parent_task_id = 'parent' WHERE id = 'child';",
             )
         })
         .unwrap();
@@ -1606,6 +1706,22 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(reviewer_project, "atlas");
+            let builder_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'builder'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(builder_project, "atlas");
+            let task_projects: Vec<String> = conn
+                .prepare("SELECT project_id FROM tasks ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(task_projects, vec!["atlas"; 4]);
             let remaining_projects: i64 = conn
                 .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
                 .unwrap();
