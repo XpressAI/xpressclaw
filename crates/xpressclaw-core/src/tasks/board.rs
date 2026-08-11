@@ -167,6 +167,31 @@ impl TaskBoard {
         req: &CreateTask,
         creator_agent_id: Option<&str>,
     ) -> Result<Task> {
+        let id = self.db.with_conn(|conn| {
+            // Reserve the writer before resolving any ownership inputs. Agent,
+            // Conversation, and parent-task moves must not be able to invalidate
+            // the Project boundary between validation and task insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let id = Self::create_in_transaction(&transaction, req, creator_agent_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(id)
+        })?;
+
+        self.get(&id)
+    }
+
+    /// Insert a task while the caller owns the surrounding write transaction.
+    ///
+    /// Conversation work uses this to commit task creation, dispatch, and the
+    /// linked Conversation publication as one lifecycle operation.
+    pub(crate) fn create_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -180,126 +205,113 @@ impl TaskBoard {
             .and_then(|context| context.get("project_id"))
             .and_then(serde_json::Value::as_str);
 
-        self.db.with_conn(|conn| {
-            // Reserve the writer before resolving any ownership inputs. Agent,
-            // Conversation, and parent-task moves must not be able to invalidate
-            // the Project boundary between validation and task insertion.
-            let transaction = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            let conversation_project = if let Some(conversation_id) = req.conversation_id.as_deref()
-            {
-                let project = transaction
-                    .query_row(
-                        "SELECT project_id FROM conversations WHERE id = ?1",
-                        [conversation_id],
-                        |row| row.get::<_, Option<String>>(0),
-                    )
-                    .optional()?;
-                match project {
-                    Some(project_id) => project_id,
-                    None => {
-                        return Err(Error::ConversationNotFound {
-                            id: conversation_id.to_string(),
-                        });
-                    }
+        let conversation_project = if let Some(conversation_id) = req.conversation_id.as_deref() {
+            let project = transaction
+                .query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conversation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            match project {
+                Some(project_id) => project_id,
+                None => {
+                    return Err(Error::ConversationNotFound {
+                        id: conversation_id.to_string(),
+                    });
                 }
-            } else {
-                None
-            };
-            if let Some(creator_agent_id) = creator_agent_id {
-                let conversation_id = req.conversation_id.as_deref().ok_or_else(|| {
-                    Error::Conversation(
-                        "an Agent may only create work from a conversation".into(),
-                    )
-                })?;
-                if req.agent_id.as_deref() != Some(creator_agent_id) {
-                    return Err(Error::Conversation(
-                        "an Agent may only create a conversation task for itself".into(),
-                    ));
-                }
-                let is_participant = transaction.query_row(
-                    "SELECT EXISTS(
+            }
+        } else {
+            None
+        };
+        if let Some(creator_agent_id) = creator_agent_id {
+            let conversation_id = req.conversation_id.as_deref().ok_or_else(|| {
+                Error::Conversation("an Agent may only create work from a conversation".into())
+            })?;
+            if req.agent_id.as_deref() != Some(creator_agent_id) {
+                return Err(Error::Conversation(
+                    "an Agent may only create a conversation task for itself".into(),
+                ));
+            }
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
                         SELECT 1 FROM conversation_participants
                         WHERE conversation_id = ?1
                           AND participant_type = 'agent'
                           AND participant_id = ?2
                     )",
-                    rusqlite::params![conversation_id, creator_agent_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !is_participant {
-                    return Err(Error::Conversation(format!(
-                        "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
-                    )));
-                }
+                rusqlite::params![conversation_id, creator_agent_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !is_participant {
+                return Err(Error::Conversation(format!(
+                    "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
+                )));
             }
-            if let Some(project_id) = requested_project {
-                let exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                    [project_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !exists {
-                    return Err(Error::ProjectNotFound {
-                        id: project_id.to_string(),
-                    });
-                }
+        }
+        if let Some(project_id) = requested_project {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::ProjectNotFound {
+                    id: project_id.to_string(),
+                });
             }
-            let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
-                transaction.query_row(
+        }
+        let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
+            transaction
+                .query_row(
                     "SELECT project_id FROM agents WHERE id = ?1",
                     [agent_id],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
                 .flatten()
-            } else {
-                None
-            };
-            let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
-                transaction.query_row(
+        } else {
+            None
+        };
+        let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
+            transaction
+                .query_row(
                     "SELECT project_id FROM tasks WHERE id = ?1",
                     [parent_task_id],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
                 .flatten()
-            } else {
-                None
-            };
-            let requested_project = requested_project.map(str::to_string);
-            let project_id = consistent_project_id([
-                ("conversation", conversation_project.as_deref()),
-                ("request", requested_project.as_deref()),
-                ("Agent", agent_project.as_deref()),
-                ("parent task", parent_project.as_deref()),
-            ])?;
-            transaction.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id)
+        } else {
+            None
+        };
+        let requested_project = requested_project.map(str::to_string);
+        let project_id = consistent_project_id([
+            ("conversation", conversation_project.as_deref()),
+            ("request", requested_project.as_deref()),
+            ("Agent", agent_project.as_deref()),
+            ("parent task", parent_project.as_deref()),
+        ])?;
+        transaction.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    id,
-                    req.title,
-                    req.description,
-                    "pending",
-                    priority,
-                    req.agent_id,
-                    req.parent_task_id,
-                    req.sop_id,
-                    req.conversation_id,
-                    context_json,
-                    now,
-                    now,
-                    project_id,
-                ],
-            )?;
-            transaction.commit()?;
-            Ok::<(), Error>(())
-        })?;
-
-        self.get(&id)
+            rusqlite::params![
+                id,
+                req.title,
+                req.description,
+                "pending",
+                priority,
+                req.agent_id,
+                req.parent_task_id,
+                req.sop_id,
+                req.conversation_id,
+                context_json,
+                now,
+                now,
+                project_id,
+            ],
+        )?;
+        Ok(id)
     }
 
     /// Create a hidden single-turn idle task for an agent (XCLAW-47).

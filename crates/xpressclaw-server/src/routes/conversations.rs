@@ -23,7 +23,6 @@ use xpressclaw_core::conversations::{
     ConversationManager, CreateConversation, NewConversationAttachment, SendMessage,
 };
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
-use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::acp::AcpInterruptMode;
 use xpressclaw_core::workflows::engine::{WorkflowContext, WorkflowEngine};
 
@@ -442,7 +441,6 @@ async fn create_linked_task(
         ));
     }
 
-    let board = TaskBoard::new(state.db.clone());
     let create_task = CreateTask {
         title: request.title,
         description: request.description,
@@ -453,29 +451,19 @@ async fn create_linked_task(
         priority: request.priority,
         context: Some(json!({ "origin": "conversation", "project_id": project_id })),
     };
-    let task = if let Some(creator_agent_id) = request.creator_agent_id.as_deref() {
-        board.create_for_conversation_agent(&create_task, creator_agent_id)
-    } else {
-        board.create(&create_task)
-    }
-    .map_err(api_error)?;
-    if let Some(agent_id) = task.agent_id.as_deref() {
-        TaskQueue::new(state.db.clone())
-            .enqueue(&task.id, agent_id)
-            .map_err(api_error)?;
-    }
-    let message = manager
-        .send_structured_message(
+    let linked_message = SendMessage {
+        sender_type: sender_type.into(),
+        sender_id,
+        sender_name: Some(sender_name),
+        content: format!("Created task: {}", create_task.title),
+        message_type: Some("task".into()),
+    };
+    let (task, message) = manager
+        .create_linked_task_and_message(
             &id,
-            &SendMessage {
-                sender_type: sender_type.into(),
-                sender_id,
-                sender_name: Some(sender_name),
-                content: format!("Created task: {}", task.title),
-                message_type: Some("task".into()),
-            },
-            Some(&task.id),
-            None,
+            &create_task,
+            request.creator_agent_id.as_deref(),
+            &linked_message,
         )
         .map_err(api_error)?;
     state.event_bus.send(

@@ -213,15 +213,21 @@ impl AgentRegistry {
 
     pub fn delete(&self, agent_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             // Participant identities are polymorphic, so the original table
             // cannot express an Agent foreign key. Remove those memberships
-            // explicitly before the Agent-owned session/turn rows cascade.
+            // and schedules explicitly before the Agent-owned session/turn
+            // rows cascade. Reserving the writer first prevents a wake-up from
+            // being created after cleanup but before the Agent disappears.
             transaction.execute(
                 "DELETE FROM conversation_participants
                  WHERE participant_type = 'agent' AND participant_id = ?1",
                 [agent_id],
             )?;
+            transaction.execute("DELETE FROM schedules WHERE agent_id = ?1", [agent_id])?;
             transaction.execute("DELETE FROM agents WHERE id = ?1", [agent_id])?;
             transaction.commit()
         })?;
@@ -409,8 +415,25 @@ mod tests {
             )
         })
         .unwrap();
+        let schedules = crate::tasks::scheduler::ScheduleManager::new(db.clone());
+        let wakeup = schedules
+            .create_one_shot(&crate::tasks::scheduler::CreateOneShotSchedule {
+                name: "Check the room".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Check the room".into(),
+                description: Some("Return to the conversation.".into()),
+                continuation_task_id: None,
+                conversation_id: Some("shared".into()),
+            })
+            .unwrap();
         registry.delete("atlas").unwrap();
         assert!(registry.get("atlas").is_err());
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
         let memberships: i64 = db
             .with_conn(|conn| {
                 conn.query_row(

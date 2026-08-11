@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::tasks::board::{CreateTask, Task, TaskBoard};
+use crate::tasks::queue::TaskQueue;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -499,6 +501,47 @@ impl ConversationManager {
 
     pub fn send_message(&self, conv_id: &str, msg: &SendMessage) -> Result<ConversationMessage> {
         self.send_structured_message(conv_id, msg, None, None)
+    }
+
+    /// Create, dispatch, and publish one linked task as a single Conversation
+    /// lifecycle operation.
+    ///
+    /// Holding the immediate transaction through message insertion means
+    /// participant or Conversation deletion linearizes entirely before this
+    /// call (and rejects it) or after the task and its publication are durable.
+    pub fn create_linked_task_and_message(
+        &self,
+        conv_id: &str,
+        task: &CreateTask,
+        creator_agent_id: Option<&str>,
+        message: &SendMessage,
+    ) -> Result<(Task, ConversationMessage)> {
+        if task.conversation_id.as_deref() != Some(conv_id) {
+            return Err(Error::Conversation(
+                "linked task must belong to the publishing conversation".into(),
+            ));
+        }
+        let (task_id, message) = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let task_id = TaskBoard::create_in_transaction(&transaction, task, creator_agent_id)?;
+            if let Some(agent_id) = task.agent_id.as_deref() {
+                TaskQueue::enqueue_in_transaction(&transaction, &task_id, agent_id)?;
+            }
+            let (message, _) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                message,
+                Some(&task_id),
+                None,
+                &[],
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>((task_id, message))
+        })?;
+        Ok((TaskBoard::new(self.db.clone()).get(&task_id)?, message))
     }
 
     pub fn send_structured_message(
@@ -1352,6 +1395,93 @@ mod tests {
         );
         assert!(matches!(removed, Err(Error::Conversation(_))));
         assert_eq!(mgr.get_messages(&conv.id, 50, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn linked_task_creation_rolls_back_if_publication_fails() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Atomic linked work".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_linked_task_publication
+                     BEFORE INSERT ON conversation_messages
+                     WHEN NEW.message_type = 'task'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced linked publication failure');
+                     END;",
+                )
+            })
+            .unwrap();
+
+        let task = CreateTask {
+            title: "Investigate atomically".into(),
+            agent_id: Some("atlas".into()),
+            conversation_id: Some(conv.id.clone()),
+            context: Some(serde_json::json!({ "origin": "conversation" })),
+            ..Default::default()
+        };
+        let message = SendMessage {
+            sender_type: "agent".into(),
+            sender_id: "atlas".into(),
+            sender_name: Some("Atlas".into()),
+            content: "Created task: Investigate atomically".into(),
+            message_type: Some("task".into()),
+        };
+        assert!(mgr
+            .create_linked_task_and_message(&conv.id, &task, Some("atlas"), &message)
+            .is_err());
+
+        let rolled_back = mgr
+            .db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM conversation_messages", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(rolled_back, (0, 0, 0, 0));
+
+        mgr.db
+            .with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_linked_task_publication"))
+            .unwrap();
+        let (created, published) = mgr
+            .create_linked_task_and_message(&conv.id, &task, Some("atlas"), &message)
+            .unwrap();
+        assert_eq!(
+            published.linked_task_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        assert_eq!(created.conversation_id.as_deref(), Some(conv.id.as_str()));
+        let committed = mgr
+            .db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(committed, (1, 1));
     }
 
     #[test]

@@ -918,7 +918,7 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
 });
 
-test('project conversations coordinate multiple agents, files, and linked work', async ({ page }) => {
+test('project conversations coordinate files and project-wide linked work', async ({ page }) => {
 	const conversationMessageRequests: Record<string, unknown>[] = [];
 	const conversationTaskRequests: Record<string, unknown>[] = [];
 	const collaborationConversation = {
@@ -932,7 +932,6 @@ test('project conversations coordinate multiple agents, files, and linked work',
 		participants: [
 			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
 			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
-			{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(3) },
 		],
 	};
 	await mockApi(page, {
@@ -965,7 +964,7 @@ test('project conversations coordinate multiple agents, files, and linked work',
 	await page.goto(`/conversations/${conversationId}`);
 
 	await expect(page.getByRole('heading', { name: 'Release planning' })).toBeVisible();
-	await expect(page.getByRole('button', { name: '2 Agents' })).toBeVisible();
+	await expect(page.getByRole('button', { name: '1 Agent' })).toBeVisible();
 	await expect(page.getByText('I finished the research while the implementation task kept running.')).toBeVisible();
 	const sidebar = page.locator('aside').first();
 	await expect(sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' })).toBeVisible();
@@ -989,6 +988,7 @@ test('project conversations coordinate multiple agents, files, and linked work',
 	await page.getByRole('button', { name: 'Continue with task' }).click();
 	await page.getByLabel('Title', { exact: true }).fill('Implement the selected approach');
 	await page.getByLabel('Details', { exact: true }).fill('Use the decisions and files already published here.');
+	await expect(page.getByLabel('Agent', { exact: true }).locator('option')).toHaveCount(3);
 	await page.getByLabel('Agent', { exact: true }).selectOption('project-secondary-test');
 	await page.getByRole('button', { name: 'Create task' }).click();
 	await expect.poll(() => conversationTaskRequests).toEqual([{

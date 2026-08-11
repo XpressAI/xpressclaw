@@ -35,15 +35,119 @@ impl TaskQueue {
 
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
-        let id = self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
-                rusqlite::params![task_id, agent_id],
-            )?;
-            Ok::<_, Error>(conn.last_insert_rowid())
+        let item = self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(item)
         })?;
+        debug!(task_id, agent_id, queue_id = item.id, "enqueued task");
+        Ok(item)
+    }
 
-        self.create_attempt_for_item(id, task_id, agent_id)
+    /// Create a queue item and its initial attempt inside a caller-owned
+    /// transaction. Conversation work uses this so dispatch cannot survive a
+    /// failed linked-message publication.
+    pub(crate) fn enqueue_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<QueueItem> {
+        let (title, description, context) = transaction.query_row(
+            "SELECT title, description, context FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )?;
+        let context = context
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let kind = context
+            .as_ref()
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("task");
+        let source_type = context
+            .as_ref()
+            .and_then(|value| value.get("origin"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("task");
+        let source_id = context
+            .as_ref()
+            .and_then(|value| value.get("source_id"))
+            .and_then(|value| value.as_str())
+            .unwrap_or(task_id);
+        let prompt = match description {
+            Some(description) if !description.trim().is_empty() => {
+                format!("{title}\n\n{description}")
+            }
+            _ => title,
+        };
+
+        transaction.execute(
+            "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
+            rusqlite::params![task_id, agent_id],
+        )?;
+        let queue_id = transaction.last_insert_rowid();
+        let attempt_id = Uuid::new_v4().to_string();
+        transaction.execute(
+            "INSERT OR IGNORE INTO logical_sessions (id, agent_id) VALUES (?1, ?1)",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO work_attempts
+             (id, session_id, task_id, queue_id, kind, runner, status, prompt)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6)",
+            rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
+        )?;
+        transaction.execute(
+            "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
+            rusqlite::params![attempt_id, queue_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET session_id = ?1, active_attempt_id = ?2,
+                updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            rusqlite::params![agent_id, attempt_id, task_id],
+        )?;
+        transaction.execute(
+            "UPDATE logical_sessions SET status = 'queued', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND status != 'running'",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_events
+             (session_id, attempt_id, task_id, source_type, source_id,
+              event_type, summary, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'attempt_queued', 'Work queued', ?6)",
+            rusqlite::params![
+                agent_id,
+                attempt_id,
+                task_id,
+                source_type,
+                source_id,
+                serde_json::json!({ "runner": "auto", "kind": kind, "queue_id": queue_id })
+                    .to_string(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE logical_sessions
+             SET latest_summary = 'Work queued', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [agent_id],
+        )?;
+
+        transaction
+            .query_row(
+                "SELECT * FROM task_queue WHERE id = ?1",
+                [queue_id],
+                |row| Ok(row_to_item(row)),
+            )
+            .map_err(Error::from)?
     }
 
     /// Ensure a task has exactly one dispatchable queue item. Workflow
