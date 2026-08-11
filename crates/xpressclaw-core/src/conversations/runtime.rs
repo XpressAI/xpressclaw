@@ -75,13 +75,7 @@ impl ConversationTurnQueue {
         sender_id: &str,
         content: &str,
     ) -> Result<Vec<String>> {
-        let mentions = ConversationManager::parse_mentions(content);
-        let agent_mentions = mentions
-            .iter()
-            .filter(|(kind, _, _)| kind == "AGENT")
-            .map(|(_, id, _)| id.as_str())
-            .collect::<std::collections::HashSet<_>>();
-        let has_agent_mentions = !agent_mentions.is_empty();
+        let agent_mentions = Self::agent_mentions(content);
         let mut statement = transaction.prepare(
             "SELECT participant_id FROM conversation_participants
              WHERE conversation_id = ?1 AND participant_type = 'agent'",
@@ -91,17 +85,12 @@ impl ConversationTurnQueue {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
-        let mut targets = if has_agent_mentions {
-            participants
-                .into_iter()
-                .filter(|agent_id| agent_mentions.contains(agent_id.as_str()))
-                .collect::<Vec<_>>()
-        } else if sender_type == "agent" {
-            Vec::new()
-        } else {
-            participants
-        };
-        targets.retain(|agent_id| agent_id != sender_id);
+        let mut targets = participants
+            .into_iter()
+            .filter(|agent_id| {
+                Self::message_targets_agent(sender_type, sender_id, agent_id, &agent_mentions)
+            })
+            .collect::<Vec<_>>();
         targets.sort();
         targets.dedup();
 
@@ -112,6 +101,30 @@ impl ConversationTurnQueue {
             }
         }
         Ok(queued)
+    }
+
+    fn agent_mentions(content: &str) -> std::collections::HashSet<String> {
+        ConversationManager::parse_mentions(content)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "AGENT")
+            .map(|(_, id, _)| id)
+            .collect()
+    }
+
+    fn message_targets_agent(
+        sender_type: &str,
+        sender_id: &str,
+        agent_id: &str,
+        agent_mentions: &std::collections::HashSet<String>,
+    ) -> bool {
+        if agent_id == sender_id {
+            return false;
+        }
+        if agent_mentions.is_empty() {
+            sender_type != "agent"
+        } else {
+            agent_mentions.contains(agent_id)
+        }
     }
 
     /// Returns true when a new queued turn was inserted. A message arriving
@@ -462,21 +475,40 @@ impl ConversationTurnQueue {
             ],
         )?;
 
-        let latest_addressed = transaction.query_row(
-            "SELECT MAX(m.id)
-                 FROM conversation_messages m
-                 WHERE m.conversation_id = ?1
-                   AND (
-					 (m.sender_type = 'user'
-					  AND (instr(m.content, '@[AGENT:') = 0
-					       OR instr(m.content, '@[AGENT:' || ?2 || ':') > 0))
-                     OR (m.sender_type = 'agent' AND m.sender_id <> ?2
-                         AND instr(m.content, '@[AGENT:' || ?2 || ':') > 0)
-                   )",
-            rusqlite::params![turn.conversation_id, turn.agent_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )?;
-        if latest_addressed.is_some_and(|id| id > turn.trigger_message_id.unwrap_or(0)) {
+        let after_id = turn.trigger_message_id.unwrap_or(0);
+        let latest_addressed = {
+            let mut statement = transaction.prepare(
+                "SELECT id, sender_type, sender_id, content
+                 FROM conversation_messages
+                 WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id DESC",
+            )?;
+            let messages =
+                statement.query_map(rusqlite::params![turn.conversation_id, after_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+            let mut latest = None;
+            for message in messages {
+                let (id, sender_type, sender_id, content) = message?;
+                let agent_mentions = Self::agent_mentions(&content);
+                if Self::message_targets_agent(
+                    &sender_type,
+                    &sender_id,
+                    &turn.agent_id,
+                    &agent_mentions,
+                ) {
+                    latest = Some(id);
+                    break;
+                }
+            }
+            latest
+        };
+        if let Some(latest_addressed) = latest_addressed {
             let id = Uuid::new_v4().to_string();
             transaction.execute(
                 "INSERT INTO conversation_turns
@@ -830,6 +862,79 @@ mod tests {
             turns.iter().filter(|turn| turn.status == "queued").count(),
             1
         );
+    }
+
+    #[test]
+    fn malformed_literal_mentions_follow_the_same_broadcast_routing_after_a_turn() {
+        let (_db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Plan".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let first = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "Start".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .enqueue_for_message(&conversation.id, first.id, "user", "local", &first.content)
+            .unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+
+        let follow_up = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "The literal prefix `@[AGENT:` is not a mention".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        assert!(ConversationManager::parse_mentions(&follow_up.content).is_empty());
+        assert!(queue
+            .enqueue_for_message(
+                &conversation.id,
+                follow_up.id,
+                "user",
+                "local",
+                &follow_up.content,
+            )
+            .unwrap()
+            .is_empty());
+        let result = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "agent".into(),
+                    sender_id: "atlas".into(),
+                    sender_name: None,
+                    content: "First result".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue.complete(&running, "session", result.id).unwrap();
+
+        let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
+        assert!(turns.iter().any(|turn| {
+            turn.status == "queued" && turn.trigger_message_id == Some(follow_up.id)
+        }));
     }
 
     #[test]
