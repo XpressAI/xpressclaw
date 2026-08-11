@@ -281,7 +281,9 @@ impl TaskBoard {
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
-                .flatten()
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: parent_task_id.to_string(),
+                })?
         } else {
             None
         };
@@ -292,6 +294,11 @@ impl TaskBoard {
             ("Agent", agent_project.as_deref()),
             ("parent task", parent_project.as_deref()),
         ])?;
+        if req.parent_task_id.is_some() && parent_project.is_none() && project_id.is_some() {
+            return Err(Error::Task(
+                "a task in a Project cannot be added beneath a projectless parent task".into(),
+            ));
+        }
         transaction.execute(
             "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -1769,6 +1776,37 @@ mod tests {
             .unwrap();
 
         assert_eq!(child.project_id.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn projectless_parent_rejects_a_newly_scoped_child() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(parent.project_id.is_none());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
+
+        let error = board
+            .create(&CreateTask {
+                title: "Scoped child".into(),
+                agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("projectless parent task"));
+        assert!(board.list_subtasks(&parent.id).unwrap().is_empty());
     }
 
     #[test]
