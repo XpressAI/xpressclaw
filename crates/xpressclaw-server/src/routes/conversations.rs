@@ -375,11 +375,7 @@ async fn create_linked_task(
         .as_deref()
         .ok_or_else(|| bad_request("conversation is not assigned to a project"))?;
     if let Some(creator_agent_id) = request.creator_agent_id.as_deref() {
-        let is_participant = conversation.participants.iter().any(|participant| {
-            participant.participant_type == "agent"
-                && participant.participant_id == creator_agent_id
-        });
-        if !is_participant || request.agent_id.as_deref() != Some(creator_agent_id) {
+        if request.agent_id.as_deref() != Some(creator_agent_id) {
             return Err(bad_request(
                 "an Agent may only create a conversation task for itself",
             ));
@@ -404,16 +400,22 @@ async fn create_linked_task(
         };
 
     if let Some(workflow_id) = request.workflow_id.as_deref() {
-        let instance_id = WorkflowEngine::new(state.db.clone())
-            .start_instance_in_context(
+        let engine = WorkflowEngine::new(state.db.clone());
+        let context = WorkflowContext {
+            project_id: Some(project_id.to_string()),
+            conversation_id: Some(id.clone()),
+        };
+        let instance_id = if let Some(creator_agent_id) = request.creator_agent_id.as_deref() {
+            engine.start_instance_in_context_for_conversation_agent(
                 workflow_id,
                 request.workflow_inputs,
-                WorkflowContext {
-                    project_id: Some(project_id.to_string()),
-                    conversation_id: Some(id.clone()),
-                },
+                context,
+                creator_agent_id,
             )
-            .map_err(api_error)?;
+        } else {
+            engine.start_instance_in_context(workflow_id, request.workflow_inputs, context)
+        }
+        .map_err(api_error)?;
         let message = manager
             .send_structured_message(
                 &id,
@@ -440,18 +442,23 @@ async fn create_linked_task(
         ));
     }
 
-    let task = TaskBoard::new(state.db.clone())
-        .create(&CreateTask {
-            title: request.title,
-            description: request.description,
-            agent_id: request.agent_id,
-            parent_task_id: None,
-            sop_id: None,
-            conversation_id: Some(id.clone()),
-            priority: request.priority,
-            context: Some(json!({ "origin": "conversation", "project_id": project_id })),
-        })
-        .map_err(api_error)?;
+    let board = TaskBoard::new(state.db.clone());
+    let create_task = CreateTask {
+        title: request.title,
+        description: request.description,
+        agent_id: request.agent_id,
+        parent_task_id: None,
+        sop_id: None,
+        conversation_id: Some(id.clone()),
+        priority: request.priority,
+        context: Some(json!({ "origin": "conversation", "project_id": project_id })),
+    };
+    let task = if let Some(creator_agent_id) = request.creator_agent_id.as_deref() {
+        board.create_for_conversation_agent(&create_task, creator_agent_id)
+    } else {
+        board.create(&create_task)
+    }
+    .map_err(api_error)?;
     if let Some(agent_id) = task.agent_id.as_deref() {
         TaskQueue::new(state.db.clone())
             .enqueue(&task.id, agent_id)

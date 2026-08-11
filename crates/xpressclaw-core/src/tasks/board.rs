@@ -146,6 +146,27 @@ impl TaskBoard {
     }
 
     pub fn create(&self, req: &CreateTask) -> Result<Task> {
+        self.create_with_conversation_agent(req, None)
+    }
+
+    /// Create work requested by an Agent from one of its Conversations.
+    ///
+    /// The membership check shares the same immediate transaction as task
+    /// insertion. Participant removal therefore linearizes either before this
+    /// call (and rejects it) or after the task has already been created.
+    pub fn create_for_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: &str,
+    ) -> Result<Task> {
+        self.create_with_conversation_agent(req, Some(creator_agent_id))
+    }
+
+    fn create_with_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<Task> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -187,6 +208,33 @@ impl TaskBoard {
             } else {
                 None
             };
+            if let Some(creator_agent_id) = creator_agent_id {
+                let conversation_id = req.conversation_id.as_deref().ok_or_else(|| {
+                    Error::Conversation(
+                        "an Agent may only create work from a conversation".into(),
+                    )
+                })?;
+                if req.agent_id.as_deref() != Some(creator_agent_id) {
+                    return Err(Error::Conversation(
+                        "an Agent may only create a conversation task for itself".into(),
+                    ));
+                }
+                let is_participant = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM conversation_participants
+                        WHERE conversation_id = ?1
+                          AND participant_type = 'agent'
+                          AND participant_id = ?2
+                    )",
+                    rusqlite::params![conversation_id, creator_agent_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !is_participant {
+                    return Err(Error::Conversation(format!(
+                        "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
+                    )));
+                }
+            }
             if let Some(project_id) = requested_project {
                 let exists = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
@@ -1634,6 +1682,56 @@ mod tests {
             board.set_conversation_id("missing", "launch"),
             Err(Error::TaskNotFound { .. })
         ));
+    }
+
+    #[test]
+    fn agent_created_conversation_tasks_require_current_membership() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('launch', 'Launch', 'one');
+                 INSERT INTO conversation_participants
+                 (conversation_id, participant_type, participant_id)
+                 VALUES ('launch', 'agent', 'atlas');",
+            )
+        })
+        .unwrap();
+
+        board
+            .create_for_conversation_agent(
+                &CreateTask {
+                    title: "Authorized work".into(),
+                    agent_id: Some("atlas".into()),
+                    conversation_id: Some("launch".into()),
+                    ..Default::default()
+                },
+                "atlas",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM conversation_participants
+                 WHERE conversation_id = 'launch' AND participant_id = 'atlas'",
+                [],
+            )
+        })
+        .unwrap();
+
+        let rejected = board.create_for_conversation_agent(
+            &CreateTask {
+                title: "Stale work".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some("launch".into()),
+                ..Default::default()
+            },
+            "atlas",
+        );
+        assert!(matches!(rejected, Err(Error::Conversation(_))));
+        assert_eq!(board.list_for_conversation("launch").unwrap().len(), 1);
     }
 
     #[test]

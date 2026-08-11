@@ -18,7 +18,7 @@ use super::context;
 use super::definition::{
     parse_wait_duration, Step, WorkflowDefinition, WorkflowInputType, WorkflowTrigger,
 };
-use super::instance::{InstanceManager, StepExecution, WorkflowInstance};
+use super::instance::{InstanceManager, StepExecution, WorkflowInstance, WorkflowInstanceScope};
 use super::manager::WorkflowManager;
 use super::waits::{activity_cursor_from_parts, validate_resource, WaitState};
 
@@ -86,7 +86,32 @@ impl WorkflowEngine {
         &self,
         workflow_id: &str,
         trigger_data: Value,
+        workflow_context: WorkflowContext,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner(workflow_id, trigger_data, workflow_context, None)
+    }
+
+    pub fn start_instance_in_context_for_conversation_agent(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: &str,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            Some(creator_agent_id),
+        )
+    }
+
+    fn start_instance_in_context_inner(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
         mut workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
     ) -> Result<String> {
         let record = self.manager.get(workflow_id)?;
         let definition = WorkflowDefinition::parse(&record.yaml_content)?;
@@ -127,11 +152,13 @@ impl WorkflowEngine {
             }
         }
         let registry = AgentRegistry::new(self.db.clone());
+        let mut workflow_agent_inputs = Vec::new();
         for (name, input) in &definition.inputs {
             if input.input_type != WorkflowInputType::Agent {
                 continue;
             }
             if let Some(agent_id) = trigger_data.get(name).and_then(Value::as_str) {
+                workflow_agent_inputs.push((name.clone(), agent_id.to_string()));
                 let agent = registry.get(agent_id).map_err(|_| {
                     Error::Workflow(format!(
                         "workflow agent input '{name}' references unknown agent '{agent_id}'"
@@ -160,16 +187,17 @@ impl WorkflowEngine {
             )
         };
 
-        let instance = self.instances.create_instance_with_definition(
+        let instance = self.instances.create_instance_with_definition_in_context(
             workflow_id,
             Some(&trigger_json),
             vars_json.as_deref(),
             Some(&record.yaml_content),
-        )?;
-        self.instances.set_context(
-            &instance.id,
-            workflow_context.project_id.as_deref(),
-            workflow_context.conversation_id.as_deref(),
+            WorkflowInstanceScope {
+                project_id: workflow_context.project_id.as_deref(),
+                conversation_id: workflow_context.conversation_id.as_deref(),
+                creator_agent_id,
+                workflow_agent_inputs: &workflow_agent_inputs,
+            },
         )?;
 
         info!(
@@ -2151,6 +2179,76 @@ flows:
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn agent_started_conversation_workflows_require_current_membership() {
+        let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
+        let conversations = crate::conversations::ConversationManager::new(db.clone());
+        let conversation = conversations
+            .create_in_project(
+                Some("project-a"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Launch".into()),
+                    icon: None,
+                    participant_ids: vec!["project-a".into()],
+                },
+            )
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: agent-started
+inputs:
+  worker: { type: agent, required: true, primary: true }
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@worker"
+        prompt: "Handle the conversation work"
+"#,
+        );
+        let context = || WorkflowContext {
+            project_id: Some("project-a".into()),
+            conversation_id: Some(conversation.id.clone()),
+        };
+
+        engine
+            .start_instance_in_context_for_conversation_agent(
+                &workflow_id,
+                json!({"worker": "project-a"}),
+                context(),
+                "project-a",
+            )
+            .unwrap();
+        conversations
+            .remove_participant(&conversation.id, "agent", "project-a")
+            .unwrap();
+        let before = engine
+            .instances
+            .list_instances(&workflow_id, 10)
+            .unwrap()
+            .len();
+
+        let rejected = engine.start_instance_in_context_for_conversation_agent(
+            &workflow_id,
+            json!({"worker": "project-a"}),
+            context(),
+            "project-a",
+        );
+        assert!(matches!(rejected, Err(Error::Conversation(_))));
+        assert_eq!(
+            engine
+                .instances
+                .list_instances(&workflow_id, 10)
+                .unwrap()
+                .len(),
+            before
         );
     }
 

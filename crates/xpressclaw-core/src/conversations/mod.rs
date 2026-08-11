@@ -358,6 +358,11 @@ impl ConversationManager {
             for turn_id in &running_turns {
                 before_delete(turn_id);
             }
+            transaction.execute(
+                "UPDATE tasks SET conversation_id = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE conversation_id = ?1",
+                [id],
+            )?;
             transaction.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
             transaction.commit()?;
             Ok(())
@@ -1114,6 +1119,15 @@ mod tests {
                 participant_ids: vec!["atlas".into()],
             })
             .unwrap();
+        let board = crate::tasks::board::TaskBoard::new(mgr.db.clone());
+        let linked_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Keep the task".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some(conv.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
         mgr.db
             .with_conn(|conn| {
                 conn.execute(
@@ -1144,6 +1158,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(remaining, 0);
+        assert_eq!(
+            board
+                .get(&linked_task.id)
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            None
+        );
     }
 
     #[test]
