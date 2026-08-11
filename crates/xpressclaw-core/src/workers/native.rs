@@ -1784,9 +1784,9 @@ fn discover_host_ssh_agent_from(
         .into_iter()
         .find(|candidate| live_ssh_agent_socket(candidate))?;
     let socket = socket.canonicalize().unwrap_or(socket);
-    let generation = ssh_agent_generation(&socket)?;
     let config = home.and_then(|home| regular_ssh_file(home, "config"));
     let known_hosts = home.and_then(|home| regular_ssh_file(home, "known_hosts"));
+    let generation = ssh_forwarding_generation(&socket, config.as_deref(), known_hosts.as_deref())?;
     Some(HostSshAgentAccess {
         socket,
         generation,
@@ -1851,19 +1851,38 @@ fn live_ssh_agent_socket(_path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn ssh_agent_generation(path: &Path) -> Option<String> {
+fn ssh_forwarding_generation(
+    socket: &Path,
+    config: Option<&Path>,
+    known_hosts: Option<&Path>,
+) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(path).ok()?;
     let mut digest = Sha256::new();
-    digest.update(path.to_string_lossy().as_bytes());
-    digest.update(metadata.dev().to_le_bytes());
-    digest.update(metadata.ino().to_le_bytes());
+    for (label, path) in [
+        ("socket", Some(socket)),
+        ("config", config),
+        ("known_hosts", known_hosts),
+    ] {
+        digest.update(label.as_bytes());
+        if let Some(path) = path {
+            let metadata = std::fs::metadata(path).ok()?;
+            digest.update(path.to_string_lossy().as_bytes());
+            digest.update(metadata.dev().to_le_bytes());
+            digest.update(metadata.ino().to_le_bytes());
+        } else {
+            digest.update(b"absent");
+        }
+    }
     Some(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(not(unix))]
-fn ssh_agent_generation(_path: &Path) -> Option<String> {
+fn ssh_forwarding_generation(
+    _socket: &Path,
+    _config: Option<&Path>,
+    _known_hosts: Option<&Path>,
+) -> Option<String> {
     None
 }
 
@@ -1889,11 +1908,12 @@ fn apply_ssh_agent_forwarding(
         selinux_relabel: SelinuxRelabel::Shared,
     });
     environment.push(format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}"));
-    // The inode changes when a desktop SSH agent restarts, even when it reuses
-    // the same pathname. Including an opaque generation in the spec forces the
-    // retained container to rebind the new socket on the next turn.
+    // Bind mounts stay attached to an inode when a socket or SSH metadata file
+    // is atomically replaced at the same pathname. Including every mounted
+    // source identity in the spec forces the retained container to rebind all
+    // current sources on the next turn.
     environment.push(format!(
-        "XPRESSCLAW_SSH_AGENT_GENERATION={}",
+        "XPRESSCLAW_SSH_FORWARDING_GENERATION={}",
         access.generation
     ));
 
@@ -2643,6 +2663,29 @@ mod tests {
         assert!(git_ssh.contains(SSH_CONFIG_TARGET));
         assert!(git_ssh.contains(SSH_KNOWN_HOSTS_TARGET));
         assert!(git_ssh.contains("StrictHostKeyChecking=accept-new"));
+
+        let first_generation = access.generation;
+        let replacement_config = ssh_dir.join("config.next");
+        std::fs::write(
+            &replacement_config,
+            "Host work\n  HostName replacement.example\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement_config, ssh_dir.join("config")).unwrap();
+        let replaced_config =
+            discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_ne!(replaced_config.generation, first_generation);
+
+        let replacement_known_hosts = ssh_dir.join("known_hosts.next");
+        std::fs::write(
+            &replacement_known_hosts,
+            "replacement.example ssh-ed25519 key\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement_known_hosts, ssh_dir.join("known_hosts")).unwrap();
+        let replaced_known_hosts =
+            discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_ne!(replaced_known_hosts.generation, replaced_config.generation);
 
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();

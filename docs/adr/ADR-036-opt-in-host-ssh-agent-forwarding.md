@@ -33,9 +33,10 @@ When enabled, XpressClaw:
   trust source;
 - uses a shared SELinux label for those explicit mounts and adds the socket's
   host group to the container, matching rootless Podman and Docker hosts; and
-- includes an opaque socket device/inode generation in the retained-container
-  specification, so replacing an agent socket at the same pathname rebinds a
-  new project container on the next turn.
+- includes opaque device/inode generations for the socket, SSH config, and
+  known-host sources in the retained-container specification, so atomically
+  replacing any mounted source at the same pathname rebinds a new project
+  container on the next turn.
 
 Setup inspects only Git metadata to flag workspaces with SSH remotes. Both
 setup and Agent settings show whether a live host agent was detected and warn
