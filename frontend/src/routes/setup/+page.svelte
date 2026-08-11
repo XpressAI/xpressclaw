@@ -34,6 +34,9 @@
 	let runnerModel = $state('');
 	let runnerCommand = $state('');
 	let subscriptionAuth = $state(true);
+	let sshAgentForwarding = $state(false);
+	let sshAgentAvailable = $state(false);
+	let sshAgentSocket = $state('');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let workspaceMode = $state<'existing' | 'managed'>('existing');
 	let workspacePath = $state('');
@@ -45,6 +48,7 @@
 	let environmentSuggestions = $state<ProjectEnvironmentSuggestion[]>([]);
 	let environmentLoading = $state(false);
 	let inspectedWorkspace = $state('');
+	let gitUsesSsh = $state(false);
 	let startupCommandText = $state('');
 	let dockerStatus = $state<DockerStatus | null>(null);
 	let dockerLoading = $state(true);
@@ -69,6 +73,8 @@
 		if (systemResult.status === 'fulfilled') {
 			workspacePath = systemResult.value.working_directory ?? '';
 			hostOs = systemResult.value.os;
+			sshAgentAvailable = systemResult.value.ssh_agent_available;
+			sshAgentSocket = systemResult.value.ssh_agent_socket ?? '';
 			suggestAgentName(workspacePath);
 		}
 		if (catalogResult.status === 'fulfilled') {
@@ -153,9 +159,11 @@
 			const result = await setup.projectEnvironment(path);
 			environmentSuggestions = result.suggestions;
 			inspectedWorkspace = result.workspace;
+			gitUsesSsh = result.git_uses_ssh;
 		} catch {
 			environmentSuggestions = [];
 			inspectedWorkspace = path;
+			gitUsesSsh = false;
 		} finally {
 			environmentLoading = false;
 		}
@@ -211,6 +219,7 @@
 			runner_command: runnerCommand.split('\n').map((line) => line.trim()).filter(Boolean),
 			startup_commands: startupCommands(),
 			subscription_auth: subscriptionAuth,
+			ssh_agent_forwarding: sshAgentForwarding,
 			runner_container_engine: containerEngine,
 			volumes: additionalVolumes()
 		};
@@ -341,6 +350,11 @@
 						: ' It is mounted at /workspace.'}
 					This agent appears as <strong>{contextLabel}</strong> in the UI.
 				</p>
+				{#if gitUsesSsh}
+					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+						This repository has an SSH remote. Enable host SSH-agent access below if it is not covered by XpressClaw's scoped GitHub credential.
+					</p>
+				{/if}
 			{:else}
 				<p class="mt-1.5 text-xs leading-relaxed text-muted-foreground">
 					XpressClaw creates an empty persistent workspace. Your first message can ask the agent's harness to clone a GitHub repository or create a project from scratch.
@@ -405,6 +419,28 @@
 			{#if containerEngine === 'host'}
 				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
 					The harness can control host containers, images, volumes, and any paths the engine can mount. Enable this only for harnesses and images you trust.
+				</p>
+			{/if}
+		</section>
+
+		<section class="rounded-xl border border-border bg-muted/20 p-4">
+			<label class="flex cursor-pointer items-start gap-3">
+				<input type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 rounded border-border" />
+				<span>
+					<span class="block text-sm font-medium text-foreground">Use my host SSH agent</span>
+					<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">Let Git use keys already unlocked on this computer. XpressClaw forwards only the agent socket plus SSH config and known-host entries; it never mounts private-key files.</span>
+				</span>
+			</label>
+			{#if sshAgentAvailable}
+				<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
+			{:else}
+				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+					No live host SSH agent was detected. Start <code>ssh-agent</code>, load a key with <code>ssh-add</code>, then restart XpressClaw from that desktop session.
+				</p>
+			{/if}
+			{#if sshAgentForwarding}
+				<p class="mt-3 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+					The harness can authenticate or sign with any key loaded in your SSH agent. Enable this only for harnesses and tasks you trust.
 				</p>
 			{/if}
 		</section>

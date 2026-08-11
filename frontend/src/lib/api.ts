@@ -91,6 +91,7 @@ export interface NativeRunnerConfig {
 	startup_commands: string[];
 	command: string[];
 	subscription_auth: boolean;
+	ssh_agent_forwarding: boolean;
 	container_engine: 'none' | 'host';
 }
 
@@ -213,6 +214,9 @@ export interface RunnerReadiness {
 	container_engine: 'none' | 'host';
 	container_engine_available: boolean;
 	container_engine_socket: string | null;
+	ssh_agent_forwarding: boolean;
+	ssh_agent_available: boolean;
+	ssh_agent_socket: string | null;
 	command_present: boolean;
 	subscription_auth: boolean;
 	auth_present: boolean;
@@ -559,6 +563,8 @@ export interface SystemInfo {
 	os: string;
 	arch: string;
 	working_directory: string | null;
+	ssh_agent_available: boolean;
+	ssh_agent_socket: string | null;
 }
 
 export interface AcpAgentCatalogEntry {
@@ -598,6 +604,8 @@ export interface ProjectEnvironment {
 	workspace: string;
 	detected_files: string[];
 	suggestions: ProjectEnvironmentSuggestion[];
+	git_repository: boolean;
+	git_uses_ssh: boolean;
 }
 
 export interface OllamaInfo {
@@ -723,7 +731,7 @@ export const setup = {
 			body: JSON.stringify({ provider, api_key: apiKey, base_url: baseUrl })
 		}),
 	complete: (data: {
-		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
+		agents: { backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[] }[];
 		mcp_servers?: Record<string, unknown>;
 		isolation?: string;
 	}) =>
@@ -732,7 +740,7 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
+		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
 	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)

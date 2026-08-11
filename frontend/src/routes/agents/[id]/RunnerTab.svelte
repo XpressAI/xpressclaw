@@ -18,6 +18,9 @@
 	let projectName = $state('');
 	let model = $state('');
 	let subscriptionAuth = $state(true);
+	let sshAgentForwarding = $state(false);
+	let sshAgentAvailable = $state(false);
+	let sshAgentSocket = $state('');
 	let containerEngine = $state<'none' | 'host'>('none');
 	let commandText = $state('');
 	let configOptions = $state<AcpConfigOption[]>([]);
@@ -112,14 +115,17 @@
 
 	onMount(async () => {
 		try {
-			const [events, catalog, agents] = await Promise.all([
+			const [events, catalog, agents, systemInfo] = await Promise.all([
 				sessions.events(agentId).catch(() => []),
 				mcpServers.list().catch(() => ({ servers: [] })),
-				setup.agentCatalog().catch(() => ({ agents: [] }))
+				setup.agentCatalog().catch(() => ({ agents: [] })),
+				setup.systemInfo().catch(() => null)
 			]);
 			applyAdvertisedControls(events);
 			serverCatalog = catalog.servers;
 			agentCatalog = agents.agents;
+			sshAgentAvailable = systemInfo?.ssh_agent_available ?? false;
+			sshAgentSocket = systemInfo?.ssh_agent_socket ?? '';
 		} catch {
 			configOptions = [];
 			serverCatalog = [];
@@ -143,6 +149,7 @@
 			startupCommandsText = (agentConfig.runner.startup_commands ?? []).join('\n');
 			volumesText = agentConfig.volumes.join('\n');
 			subscriptionAuth = agentConfig.runner.subscription_auth;
+			sshAgentForwarding = agentConfig.runner.ssh_agent_forwarding ?? false;
 			commandText = agentConfig.runner.command.join('\n');
 		}
 	});
@@ -169,6 +176,7 @@
 					startup_commands: startupCommandsText.split('\n').map((line) => line.trim()).filter(Boolean),
 					command: commandText.split('\n').map((line) => line.trim()).filter(Boolean),
 					subscription_auth: subscriptionAuth,
+					ssh_agent_forwarding: sshAgentForwarding,
 					container_engine: containerEngine
 				},
 				volumes: volumesText.split('\n').map((line) => line.trim()).filter(Boolean)
@@ -471,6 +479,30 @@
 
 	<div class="rounded-xl border border-border bg-card p-5">
 		<div class="flex items-start gap-3">
+			<input id="ssh-agent-forwarding" type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 h-4 w-4 rounded border-input" />
+			<div>
+				<label for="ssh-agent-forwarding" class="text-sm font-medium">Use my host SSH agent</label>
+				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
+					Forward the host SSH-agent socket so Git can use keys you already unlocked for an existing clone. XpressClaw also exposes the host SSH config and known-host entries when present, but never mounts private-key files.
+				</p>
+				{#if sshAgentAvailable}
+					<p class="mt-2 text-[11px] text-muted-foreground">Detected <code>{sshAgentSocket}</code>.</p>
+				{:else}
+					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+						No live host SSH agent was detected. Start <code>ssh-agent</code>, load a key with <code>ssh-add</code>, then restart XpressClaw from that desktop session.
+					</p>
+				{/if}
+				{#if sshAgentForwarding}
+					<p class="mt-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+						The harness can authenticate or sign with any key loaded in that SSH agent for the life of this retained environment. Enable this only for harnesses and tasks you trust.
+					</p>
+				{/if}
+			</div>
+		</div>
+	</div>
+
+	<div class="rounded-xl border border-border bg-card p-5">
+		<div class="flex items-start gap-3">
 			<input
 				id="container-engine"
 				type="checkbox"
@@ -500,7 +532,7 @@
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{kind === 'custom'
 						? 'Custom harnesses manage their own authentication; add any required directories in the mounts above.'
-						: "Mount the selected harness's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. SSH keys still require an explicit mount."}
+						: "Mount the selected harness's standard configuration directory into each worker. This includes its subscription login plus installed skills, plugins, hooks, custom agents, and user settings. Git SSH authentication is configured separately above."}
 				</p>
 				{#if subscriptionAuth}
 					<p class="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-600">

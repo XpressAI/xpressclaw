@@ -1363,13 +1363,13 @@ fn fallback_unix_sockets() -> Vec<PathBuf> {
 fn socket_mount_groups(spec: &ContainerSpec) -> Option<Vec<String>> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
         let mut groups: Vec<String> = spec
             .volumes
             .iter()
-            .filter(|volume| volume.target == "/var/run/docker.sock")
             .filter_map(|volume| std::fs::metadata(&volume.source).ok())
+            .filter(|metadata| metadata.file_type().is_socket())
             .map(|metadata| metadata.gid().to_string())
             .collect();
         groups.sort();
@@ -1607,16 +1607,19 @@ mod tests {
     }
 
     #[test]
-    fn socket_mounts_add_the_host_socket_group() {
+    fn socket_mounts_add_the_host_socket_group_for_any_target() {
         let source = std::env::temp_dir().join(format!(
             "xpressclaw-socket-group-test-{}",
             std::process::id()
         ));
+        #[cfg(unix)]
+        let _listener = std::os::unix::net::UnixListener::bind(&source).unwrap();
+        #[cfg(not(unix))]
         std::fs::write(&source, []).unwrap();
         let mut spec = ContainerSpec::default();
         spec.volumes.push(VolumeMount {
             source: source.display().to_string(),
-            target: "/var/run/docker.sock".to_string(),
+            target: "/tmp/forwarded-agent.sock".to_string(),
             read_only: false,
             selinux_relabel: SelinuxRelabel::None,
         });

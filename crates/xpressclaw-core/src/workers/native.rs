@@ -47,6 +47,10 @@ const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
+const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
+const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
+const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
+const SSH_RETAINED_KNOWN_HOSTS: &str = "/tmp/xpressclaw-known-hosts";
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
     "\nawait main();\n"
@@ -1510,6 +1514,15 @@ fn build_spec(
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
+    if agent.runner.ssh_agent_forwarding {
+        let access = discover_host_ssh_agent().ok_or_else(|| {
+            Error::Backend(
+                "host SSH-agent forwarding is enabled, but XpressClaw could not find a live Unix SSH_AUTH_SOCK; start an SSH agent and restart XpressClaw from that desktop session"
+                    .to_string(),
+            )
+        })?;
+        apply_ssh_agent_forwarding(&access, &mut volumes, &mut environment);
+    }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
     runner_environment.sort_by(|left, right| left.0.cmp(right.0));
@@ -1738,6 +1751,182 @@ pub fn subscription_auth_available(kind: &str) -> bool {
     auth_candidates(kind)
         .iter()
         .any(|(source, _, _)| source.exists())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostSshAgentAccess {
+    socket: PathBuf,
+    generation: String,
+    config: Option<PathBuf>,
+    known_hosts: Option<PathBuf>,
+}
+
+/// Return the live host SSH-agent socket that XpressClaw would forward. The
+/// path is exposed for readiness diagnostics only; private key files are never
+/// inspected or mounted.
+pub fn host_ssh_agent_socket() -> Option<PathBuf> {
+    discover_host_ssh_agent().map(|access| access.socket)
+}
+
+fn discover_host_ssh_agent() -> Option<HostSshAgentAccess> {
+    let home = host_home();
+    discover_host_ssh_agent_from(
+        ssh_agent_socket_candidates(home.as_deref()),
+        home.as_deref(),
+    )
+}
+
+fn discover_host_ssh_agent_from(
+    candidates: Vec<PathBuf>,
+    home: Option<&Path>,
+) -> Option<HostSshAgentAccess> {
+    let socket = candidates
+        .into_iter()
+        .find(|candidate| live_ssh_agent_socket(candidate))?;
+    let socket = socket.canonicalize().unwrap_or(socket);
+    let generation = ssh_agent_generation(&socket)?;
+    let config = home.and_then(|home| regular_ssh_file(home, "config"));
+    let known_hosts = home.and_then(|home| regular_ssh_file(home, "known_hosts"));
+    Some(HostSshAgentAccess {
+        socket,
+        generation,
+        config,
+        known_hosts,
+    })
+}
+
+fn ssh_agent_socket_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+        candidates.push(PathBuf::from(socket));
+    }
+    #[cfg(unix)]
+    {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                // SAFETY: getuid has no preconditions and only reads process
+                // credentials.
+                PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+            });
+        candidates.extend([
+            runtime.join("gcr/ssh"),
+            runtime.join("keyring/ssh"),
+            runtime.join("gnupg/S.gpg-agent.ssh"),
+            runtime.join("ssh-agent.socket"),
+        ]);
+    }
+    if let Some(home) = home {
+        candidates.extend([
+            home.join(".1password/agent.sock"),
+            home.join(".ssh/agent.sock"),
+        ]);
+        #[cfg(target_os = "macos")]
+        candidates.extend([
+            home.join("Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"),
+            home.join("Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"),
+        ]);
+    }
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+#[cfg(unix)]
+fn live_ssh_agent_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    path.is_absolute()
+        && std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+        && std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn live_ssh_agent_socket(_path: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn ssh_agent_generation(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(path.to_string_lossy().as_bytes());
+    digest.update(metadata.dev().to_le_bytes());
+    digest.update(metadata.ino().to_le_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(not(unix))]
+fn ssh_agent_generation(_path: &Path) -> Option<String> {
+    None
+}
+
+fn regular_ssh_file(home: &Path, name: &str) -> Option<PathBuf> {
+    let path = home.join(".ssh").join(name);
+    std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|_| path)
+}
+
+fn apply_ssh_agent_forwarding(
+    access: &HostSshAgentAccess,
+    volumes: &mut Vec<VolumeMount>,
+    environment: &mut Vec<String>,
+) {
+    volumes.push(VolumeMount {
+        source: access.socket.display().to_string(),
+        target: SSH_AGENT_SOCKET_TARGET.to_string(),
+        read_only: false,
+        // A shared label makes rootless Podman/Docker usable on SELinux hosts
+        // without exposing any private-key files.
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+    environment.push(format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}"));
+    // The inode changes when a desktop SSH agent restarts, even when it reuses
+    // the same pathname. Including an opaque generation in the spec forces the
+    // retained container to rebind the new socket on the next turn.
+    environment.push(format!(
+        "XPRESSCLAW_SSH_AGENT_GENERATION={}",
+        access.generation
+    ));
+
+    let mut command = String::from("ssh");
+    if let Some(config) = &access.config {
+        volumes.push(VolumeMount {
+            source: config.display().to_string(),
+            target: SSH_CONFIG_TARGET.to_string(),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+        command.push_str(&format!(" -F {SSH_CONFIG_TARGET}"));
+    }
+    command.push_str(&format!(
+        " -o IdentityAgent={SSH_AGENT_SOCKET_TARGET} -o IdentitiesOnly=no"
+    ));
+    if let Some(known_hosts) = &access.known_hosts {
+        volumes.push(VolumeMount {
+            source: known_hosts.display().to_string(),
+            target: SSH_KNOWN_HOSTS_TARGET.to_string(),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+        command.push_str(&format!(
+            " -o 'UserKnownHostsFile={SSH_RETAINED_KNOWN_HOSTS} {SSH_KNOWN_HOSTS_TARGET}'"
+        ));
+    } else {
+        command.push_str(&format!(
+            " -o UserKnownHostsFile={SSH_RETAINED_KNOWN_HOSTS}"
+        ));
+    }
+    command.push_str(" -o StrictHostKeyChecking=accept-new");
+    environment.push(format!("GIT_SSH_COMMAND={command}"));
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
@@ -2395,6 +2584,98 @@ mod tests {
         assert!(!environment
             .iter()
             .any(|value| value.starts_with("INITIAL_AGENT_MODE=")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwards_only_a_live_ssh_agent_and_non_secret_ssh_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-forwarding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::write(
+            ssh_dir.join("config"),
+            "Host work\n  HostName git.example\n",
+        )
+        .unwrap();
+        std::fs::write(ssh_dir.join("known_hosts"), "git.example ssh-ed25519 key\n").unwrap();
+        std::fs::write(ssh_dir.join("id_ed25519"), "never mount this").unwrap();
+        let socket = root.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let access = discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_eq!(access.socket, socket);
+        assert!(!access.generation.is_empty());
+
+        let mut volumes = Vec::new();
+        let mut environment = Vec::new();
+        apply_ssh_agent_forwarding(&access, &mut volumes, &mut environment);
+
+        assert!(volumes.iter().any(|mount| {
+            mount.source == socket.display().to_string()
+                && mount.target == SSH_AGENT_SOCKET_TARGET
+                && !mount.read_only
+                && mount.selinux_relabel == SelinuxRelabel::Shared
+        }));
+        assert!(volumes
+            .iter()
+            .any(|mount| mount.target == SSH_CONFIG_TARGET && mount.read_only));
+        assert!(volumes
+            .iter()
+            .any(|mount| mount.target == SSH_KNOWN_HOSTS_TARGET && mount.read_only));
+        assert!(!volumes
+            .iter()
+            .any(|mount| mount.source.ends_with("id_ed25519")));
+        assert!(environment
+            .iter()
+            .any(|entry| entry == &format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}")));
+        let git_ssh = environment
+            .iter()
+            .find(|entry| entry.starts_with("GIT_SSH_COMMAND="))
+            .unwrap();
+        assert!(git_ssh.contains(SSH_AGENT_SOCKET_TARGET));
+        assert!(git_ssh.contains(SSH_CONFIG_TARGET));
+        assert!(git_ssh.contains(SSH_KNOWN_HOSTS_TARGET));
+        assert!(git_ssh.contains("StrictHostKeyChecking=accept-new"));
+
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_ssh_configuration_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-symlink-test-{}",
+            std::process::id()
+        ));
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let private_key = ssh_dir.join("id_ed25519");
+        std::fs::write(&private_key, "never mount this").unwrap();
+        symlink(&private_key, ssh_dir.join("config")).unwrap();
+
+        assert_eq!(regular_ssh_file(&root, "config"), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_non_socket_ssh_agent_candidate() {
+        let candidate =
+            std::env::temp_dir().join(format!("xpressclaw-not-an-agent-{}", std::process::id()));
+        std::fs::write(&candidate, "not a socket").unwrap();
+        assert!(discover_host_ssh_agent_from(vec![candidate.clone()], None).is_none());
+        std::fs::remove_file(candidate).unwrap();
     }
 
     #[test]

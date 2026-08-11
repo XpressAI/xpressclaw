@@ -15,8 +15,8 @@ use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    local_runner_image_alias, resolve_runner_kind, resolved_runner_image, runner_image_compatible,
-    subscription_auth_available,
+    host_ssh_agent_socket, local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    runner_image_compatible, subscription_auth_available,
 };
 
 use crate::state::AppState;
@@ -133,6 +133,11 @@ async fn prepare_runner(
             "host container-engine access requires a local Docker-compatible Unix socket",
         ));
     }
+    if agent.runner.ssh_agent_forwarding && host_ssh_agent_socket().is_none() {
+        return Err(bad_request(
+            "host SSH-agent forwarding is enabled, but no live Unix SSH_AUTH_SOCK was detected",
+        ));
+    }
     if available_runner_image(&docker, &image, &kind)
         .await
         .is_none()
@@ -170,6 +175,9 @@ async fn readiness(
         || docker
             .as_ref()
             .is_some_and(|docker| docker.host_engine_socket().is_some());
+    let ssh_agent_socket = host_ssh_agent_socket();
+    let ssh_agent_available = ssh_agent_socket.is_some();
+    let ssh_agent_ready = !agent.runner.ssh_agent_forwarding || ssh_agent_available;
     let runtime_image = match docker.as_ref() {
         Some(docker) => available_runner_image(docker, &image, &kind).await,
         None => None,
@@ -199,6 +207,12 @@ async fn readiness(
             "Host container-engine access needs a local Docker or Podman Unix socket".to_string(),
         );
     }
+    if !ssh_agent_ready {
+        issues.push(
+            "Host SSH-agent forwarding is enabled, but no live Unix SSH_AUTH_SOCK was detected; start an SSH agent and restart XpressClaw from that desktop session"
+                .to_string(),
+        );
+    }
     if !command_present {
         issues.push(
             "Custom ACP server command is not configured; add it in the Runner tab".to_string(),
@@ -211,7 +225,7 @@ async fn readiness(
     }
     Ok(json!({
         "protocol": "acp",
-        "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available,
+        "ready": docker_available && image_present && workspace_present && auth_present && command_present && container_engine_available && ssh_agent_ready,
         "docker_available": docker_available,
         "container_runtime": docker.as_ref().map(|docker| docker.runtime()),
         "container_runtime_version": docker.as_ref().and_then(|docker| docker.runtime_version()),
@@ -225,6 +239,9 @@ async fn readiness(
         "container_engine": agent.runner.container_engine,
         "container_engine_available": container_engine_available,
         "container_engine_socket": docker.as_ref().and_then(|docker| docker.host_engine_socket()).map(|path| path.display().to_string()),
+        "ssh_agent_forwarding": agent.runner.ssh_agent_forwarding,
+        "ssh_agent_available": ssh_agent_available,
+        "ssh_agent_socket": ssh_agent_socket.map(|path| path.display().to_string()),
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
