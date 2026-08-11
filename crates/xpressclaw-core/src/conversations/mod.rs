@@ -778,7 +778,7 @@ impl ConversationManager {
         })
     }
 
-    fn insert_structured_message(
+    pub(crate) fn insert_structured_message(
         transaction: &rusqlite::Transaction<'_>,
         conv_id: &str,
         msg: &SendMessage,

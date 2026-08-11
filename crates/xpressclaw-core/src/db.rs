@@ -225,6 +225,21 @@ impl Database {
 /// legacy message in ID order preserves mention semantics and lets the queue
 /// coalesce each addressed Agent to the correct high-water message.
 fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    // Participant identities were historically polymorphic and therefore did
+    // not have an Agent foreign key. Installations that deleted an Agent
+    // before durable turns were introduced can still contain stale rows. Drop
+    // those rows before routing legacy messages so the new Agent-owned turn
+    // foreign keys cannot make the migration fail at startup.
+    transaction.execute(
+        "DELETE FROM conversation_participants
+         WHERE participant_type = 'agent'
+           AND NOT EXISTS (
+               SELECT 1 FROM agents
+               WHERE agents.id = conversation_participants.participant_id
+           )",
+        [],
+    )?;
+
     let pending = {
         let mut statement = transaction.prepare(
             "SELECT id, conversation_id, sender_id, content
@@ -1616,7 +1631,8 @@ mod tests {
                  INSERT INTO conversation_participants
                     (conversation_id, participant_type, participant_id)
                  VALUES ('legacy', 'agent', 'atlas'),
-                        ('legacy', 'agent', 'reviewer');
+                        ('legacy', 'agent', 'reviewer'),
+                        ('legacy', 'agent', 'removed-agent');
                  INSERT INTO conversation_messages
                     (conversation_id, sender_type, sender_id, content, processed)
                  VALUES ('legacy', 'user', 'local', 'Please investigate', 0),
@@ -1662,6 +1678,17 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(sessions, 2);
+
+            let orphan_memberships: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_participants
+                     WHERE participant_type = 'agent'
+                       AND participant_id = 'removed-agent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphan_memberships, 0);
         });
     }
 

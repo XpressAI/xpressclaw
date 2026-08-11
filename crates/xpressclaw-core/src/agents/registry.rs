@@ -212,11 +212,45 @@ impl AgentRegistry {
     }
 
     pub fn delete(&self, agent_id: &str) -> Result<()> {
+        self.delete_with_running_conversation_turns(agent_id, |_| {})
+    }
+
+    /// Make every live Conversation turn unpublishable and notify the caller
+    /// before deleting the Agent. The callback runs while the write
+    /// transaction is held, after turn cancellation but before cascading
+    /// deletion, so the server can interrupt retained ACP processes without a
+    /// late response racing Agent deletion.
+    pub fn delete_with_running_conversation_turns<F>(
+        &self,
+        agent_id: &str,
+        mut before_delete: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
         self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            let mut statement = transaction.prepare(
+                "SELECT id FROM conversation_turns
+                 WHERE agent_id = ?1 AND status = 'running'",
+            )?;
+            let running_turns = statement
+                .query_map([agent_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            transaction.execute(
+                "UPDATE conversation_turns
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = 'Agent deleted'
+                 WHERE agent_id = ?1 AND status IN ('queued', 'running')",
+                [agent_id],
+            )?;
+            for turn_id in &running_turns {
+                before_delete(turn_id);
+            }
             // Participant identities are polymorphic, so the original table
             // cannot express an Agent foreign key. Remove those memberships
             // and schedules explicitly before the Agent-owned session/turn
@@ -428,7 +462,22 @@ mod tests {
                 conversation_id: Some("shared".into()),
             })
             .unwrap();
-        registry.delete("atlas").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversation_turns
+                 (id, conversation_id, agent_id, status, started_at)
+                 VALUES ('running-turn', 'shared', 'atlas', 'running', CURRENT_TIMESTAMP)",
+                [],
+            )
+        })
+        .unwrap();
+        let mut interrupted = Vec::new();
+        registry
+            .delete_with_running_conversation_turns("atlas", |turn_id| {
+                interrupted.push(turn_id.to_string())
+            })
+            .unwrap();
+        assert_eq!(interrupted, ["running-turn"]);
         assert!(registry.get("atlas").is_err());
         assert!(matches!(
             schedules.get(&wakeup.id),

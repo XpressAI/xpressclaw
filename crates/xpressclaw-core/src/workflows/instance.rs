@@ -99,6 +99,29 @@ impl InstanceManager {
         definition_yaml: Option<&str>,
         scope: WorkflowInstanceScope<'_>,
     ) -> Result<WorkflowInstance> {
+        self.create_instance_with_definition_in_context_and_then(
+            workflow_id,
+            trigger_data,
+            variables_json,
+            definition_yaml,
+            scope,
+            |_, _| Ok(()),
+        )
+        .map(|(instance, ())| instance)
+    }
+
+    pub(super) fn create_instance_with_definition_in_context_and_then<T, F>(
+        &self,
+        workflow_id: &str,
+        trigger_data: Option<&str>,
+        variables_json: Option<&str>,
+        definition_yaml: Option<&str>,
+        scope: WorkflowInstanceScope<'_>,
+        after_insert: F,
+    ) -> Result<(WorkflowInstance, T)>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
+    {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -106,7 +129,7 @@ impl InstanceManager {
             .to_string();
         let var_store = variables_json.unwrap_or("{}");
 
-        self.db.with_conn(|conn| {
+        let after_insert = self.db.with_conn(|conn| {
             let transaction = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
@@ -208,11 +231,12 @@ impl InstanceManager {
                     definition_yaml
                 ],
             )?;
+            let after_insert = after_insert(&transaction, &id)?;
             transaction.commit()?;
-            Ok::<(), Error>(())
+            Ok::<_, Error>(after_insert)
         })?;
 
-        self.get_instance(&id)
+        Ok((self.get_instance(&id)?, after_insert))
     }
 
     pub fn set_context(

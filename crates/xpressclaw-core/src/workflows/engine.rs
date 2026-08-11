@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::agents::registry::AgentRegistry;
+use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::tasks::board::{CreateTask, TaskBoard};
@@ -106,13 +107,71 @@ impl WorkflowEngine {
         )
     }
 
+    /// Start a Conversation-scoped workflow and publish its durable lifecycle
+    /// message in the same write transaction as the workflow instance. The
+    /// first workflow step is not dispatched until both records are durable.
+    pub fn start_instance_in_context_with_conversation_message(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
+        message: &SendMessage,
+    ) -> Result<(String, ConversationMessage)> {
+        let conversation_id = workflow_context.conversation_id.clone().ok_or_else(|| {
+            Error::Conversation("workflow message requires a conversation".into())
+        })?;
+        self.start_instance_in_context_inner_with(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            creator_agent_id,
+            |transaction, instance_id| {
+                let metadata = serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "instance_id": instance_id,
+                });
+                ConversationManager::insert_structured_message(
+                    transaction,
+                    &conversation_id,
+                    message,
+                    None,
+                    Some(&metadata),
+                    &[],
+                )
+                .map(|(message, _)| message)
+            },
+        )
+    }
+
     fn start_instance_in_context_inner(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner_with(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            creator_agent_id,
+            |_, _| Ok(()),
+        )
+        .map(|(instance_id, ())| instance_id)
+    }
+
+    fn start_instance_in_context_inner_with<T, F>(
         &self,
         workflow_id: &str,
         trigger_data: Value,
         mut workflow_context: WorkflowContext,
         creator_agent_id: Option<&str>,
-    ) -> Result<String> {
+        after_instance_insert: F,
+    ) -> Result<(String, T)>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
+    {
         let record = self.manager.get(workflow_id)?;
         let definition = WorkflowDefinition::parse(&record.yaml_content)?;
         let trigger_data = definition.resolve_inputs(&trigger_data)?;
@@ -187,18 +246,21 @@ impl WorkflowEngine {
             )
         };
 
-        let instance = self.instances.create_instance_with_definition_in_context(
-            workflow_id,
-            Some(&trigger_json),
-            vars_json.as_deref(),
-            Some(&record.yaml_content),
-            WorkflowInstanceScope {
-                project_id: workflow_context.project_id.as_deref(),
-                conversation_id: workflow_context.conversation_id.as_deref(),
-                creator_agent_id,
-                workflow_agent_inputs: &workflow_agent_inputs,
-            },
-        )?;
+        let (instance, after_instance_insert) = self
+            .instances
+            .create_instance_with_definition_in_context_and_then(
+                workflow_id,
+                Some(&trigger_json),
+                vars_json.as_deref(),
+                Some(&record.yaml_content),
+                WorkflowInstanceScope {
+                    project_id: workflow_context.project_id.as_deref(),
+                    conversation_id: workflow_context.conversation_id.as_deref(),
+                    creator_agent_id,
+                    workflow_agent_inputs: &workflow_agent_inputs,
+                },
+                after_instance_insert,
+            )?;
 
         info!(
             workflow_id,
@@ -236,7 +298,7 @@ impl WorkflowEngine {
             &var_store,
         )?;
 
-        Ok(instance.id)
+        Ok((instance.id, after_instance_insert))
     }
 
     /// Execute a step at the given position.
@@ -2249,6 +2311,108 @@ flows:
                 .unwrap()
                 .len(),
             before
+        );
+    }
+
+    #[test]
+    fn conversation_workflow_creation_rolls_back_if_publication_fails() {
+        let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
+        let conversation = crate::conversations::ConversationManager::new(db.clone())
+            .create_in_project(
+                Some("project-a"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Atomic workflow".into()),
+                    icon: None,
+                    participant_ids: vec!["project-a".into()],
+                },
+            )
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: atomic-conversation-workflow
+inputs:
+  worker: { type: agent, required: true, primary: true }
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@worker"
+        prompt: "Handle the conversation work"
+"#,
+        );
+        let context = || WorkflowContext {
+            project_id: Some("project-a".into()),
+            conversation_id: Some(conversation.id.clone()),
+        };
+        let message = SendMessage {
+            sender_type: "user".into(),
+            sender_id: "local".into(),
+            sender_name: Some("You".into()),
+            content: "Started workflow: Atomic workflow".into(),
+            message_type: Some("workflow".into()),
+        };
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_workflow_publication
+                 BEFORE INSERT ON conversation_messages
+                 WHEN NEW.message_type = 'workflow'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced workflow publication failure');
+                 END;",
+            )
+        })
+        .unwrap();
+
+        let failed = engine.start_instance_in_context_with_conversation_message(
+            &workflow_id,
+            json!({"worker": "project-a"}),
+            context(),
+            None,
+            &message,
+        );
+        assert!(failed.is_err());
+        let rolled_back = db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM conversation_messages", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(rolled_back, (0, 0, 0, 0));
+
+        db.with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_workflow_publication"))
+            .unwrap();
+        let (instance_id, published) = engine
+            .start_instance_in_context_with_conversation_message(
+                &workflow_id,
+                json!({"worker": "project-a"}),
+                context(),
+                None,
+                &message,
+            )
+            .unwrap();
+        assert_eq!(published.metadata["workflow_id"], workflow_id);
+        assert_eq!(published.metadata["instance_id"], instance_id);
+        assert_eq!(
+            engine
+                .instances
+                .list_step_executions(&instance_id)
+                .unwrap()
+                .len(),
+            1
         );
     }
 

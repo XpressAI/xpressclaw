@@ -205,6 +205,24 @@ impl ConversationAcpProcesses {
         Self::shutdown_slots(slot.into_iter().collect()).await
     }
 
+    /// Remove and close an Agent's retained lanes in every Conversation while
+    /// leaving the shared project container and all other Agent lanes intact.
+    pub async fn retire_agent_everywhere(&self, agent_id: &str) -> usize {
+        let suffix = format!("\u{0}{agent_id}");
+        let slots = {
+            let mut registered = self.slots.lock().unwrap();
+            let keys = registered
+                .keys()
+                .filter(|key| key.ends_with(&suffix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| registered.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        Self::shutdown_slots(slots).await
+    }
+
     async fn shutdown_slots(slots: Vec<Arc<AsyncMutex<Option<ConversationAcpProcess>>>>) -> usize {
         let count = slots.len();
         let mut processes = Vec::new();
@@ -3175,11 +3193,17 @@ mod tests {
         processes.slot("conversation-one", "atlas");
         processes.slot("conversation-one", "reviewer");
         processes.slot("conversation-two", "atlas");
-        assert_eq!(processes.slot_count(), 3);
+        processes.slot("conversation-two", "reviewer");
+        assert_eq!(processes.slot_count(), 4);
 
-        assert_eq!(processes.retire_conversation("conversation-one").await, 2);
+        assert_eq!(processes.retire_agent_everywhere("atlas").await, 2);
+        assert_eq!(processes.slot_count(), 2);
+        assert_eq!(processes.retire_conversation("conversation-one").await, 1);
         assert_eq!(processes.slot_count(), 1);
-        assert_eq!(processes.retire_agent("conversation-two", "atlas").await, 1);
+        assert_eq!(
+            processes.retire_agent("conversation-two", "reviewer").await,
+            1
+        );
         assert_eq!(processes.slot_count(), 0);
     }
 

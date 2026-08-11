@@ -404,20 +404,12 @@ async fn create_linked_task(
             project_id: Some(project_id.to_string()),
             conversation_id: Some(id.clone()),
         };
-        let instance_id = if let Some(creator_agent_id) = request.creator_agent_id.as_deref() {
-            engine.start_instance_in_context_for_conversation_agent(
+        let (instance_id, message) = engine
+            .start_instance_in_context_with_conversation_message(
                 workflow_id,
                 request.workflow_inputs,
                 context,
-                creator_agent_id,
-            )
-        } else {
-            engine.start_instance_in_context(workflow_id, request.workflow_inputs, context)
-        }
-        .map_err(api_error)?;
-        let message = manager
-            .send_structured_message(
-                &id,
+                request.creator_agent_id.as_deref(),
                 &SendMessage {
                     sender_type: sender_type.into(),
                     sender_id,
@@ -425,8 +417,6 @@ async fn create_linked_task(
                     content: format!("Started workflow: {}", request.title),
                     message_type: Some("workflow".into()),
                 },
-                None,
-                Some(&json!({ "workflow_id": workflow_id, "instance_id": instance_id })),
             )
             .map_err(api_error)?;
         state.event_bus.send(
