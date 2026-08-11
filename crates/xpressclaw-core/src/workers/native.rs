@@ -45,6 +45,7 @@ const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
 const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
 const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
 const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
+static PI_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
@@ -91,6 +92,12 @@ struct ConversationAcpProcess {
     process: AcpProcess,
 }
 
+#[derive(Debug)]
+struct PiMcpBridge {
+    signature: String,
+    process_environment: Vec<String>,
+}
+
 #[derive(Default)]
 struct ConversationAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
@@ -118,6 +125,7 @@ impl ConversationAcpProcesses {
         agent_id: &str,
         base: &ProjectAcpProcess,
         spec: &ContainerSpec,
+        process_environment: &[String],
     ) -> Result<ConversationAcpProcess> {
         let fingerprint = container_spec_fingerprint(spec)?;
         let slot = self.slot(conversation_id, agent_id);
@@ -134,7 +142,12 @@ impl ConversationAcpProcesses {
             Error::Backend("the selected ACP runner has no process command".into())
         })?;
         let attached = docker
-            .open_project_process(agent_id, command, spec.working_dir.as_deref())
+            .open_project_process(
+                agent_id,
+                command,
+                spec.working_dir.as_deref(),
+                process_environment,
+            )
             .await?;
         let process = AcpProcess::start(attached).await?;
         let started = ConversationAcpProcess {
@@ -549,24 +562,32 @@ async fn execute_conversation_turn(
         && docker
             .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
             .await;
-    let mcp_signature = if pi_mcp_bridge {
-        let signature = configure_pi_mcp_bridge(
+    let (mcp_signature, pi_process_environment) = if pi_mcp_bridge {
+        let bridge = configure_pi_mcp_bridge(
             &config.system.data_dir,
             &agent.name,
+            Some(&turn.conversation_id),
             &mcp_servers,
             &mut spec,
         )?;
         mcp_servers.clear();
-        Some(signature)
+        (Some(bridge.signature), bridge.process_environment)
     } else {
-        None
+        (None, Vec::new())
     };
 
     let base = project_processes
         .get_or_start(&docker, &agent.name, &spec)
         .await?;
     let live = conversation_processes
-        .get_or_start(&docker, &turn.conversation_id, &turn.agent_id, &base, &spec)
+        .get_or_start(
+            &docker,
+            &turn.conversation_id,
+            &turn.agent_id,
+            &base,
+            &spec,
+            &pi_process_environment,
+        )
         .await?;
     let session = queue.session(&turn.conversation_id, &turn.agent_id)?;
     let session_start = session
@@ -864,14 +885,15 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
             .await;
     let mcp_signature = if pi_mcp_bridge {
-        let signature = configure_pi_mcp_bridge(
+        let bridge = configure_pi_mcp_bridge(
             &config.system.data_dir,
             &agent.name,
+            None,
             &mcp_servers,
             &mut spec,
         )?;
         mcp_servers.clear();
-        Some(signature)
+        Some(bridge.signature)
     } else {
         None
     };
@@ -1408,9 +1430,14 @@ pub async fn runner_image_compatible(
 fn configure_pi_mcp_bridge(
     data_dir: &Path,
     agent_id: &str,
+    process_scope: Option<&str>,
     mcp_servers: &[McpServer],
     spec: &mut ContainerSpec,
-) -> Result<String> {
+) -> Result<PiMcpBridge> {
+    // Pi reads MCP configuration from a file when its ACP process starts.
+    // Serialize the small host-side publication step so a task and a newly
+    // created conversation process cannot contend over temporary files.
+    let _config_guard = PI_MCP_CONFIG_LOCK.lock().unwrap();
     if spec
         .volumes
         .iter()
@@ -1429,7 +1456,38 @@ fn configure_pi_mcp_bridge(
         ))
     })?;
     set_private_directory_permissions(&config_dir)?;
-    write_private_atomic(&config_dir.join("config.json"), &encoded)?;
+
+    let (config_path, process_environment) = if let Some(scope) = process_scope {
+        let scope_hash = format!("{:x}", Sha256::digest(scope.as_bytes()));
+        let process_dir = config_dir.join("processes").join(&scope_hash);
+        std::fs::create_dir_all(&process_dir).map_err(|error| {
+            Error::Backend(format!(
+                "failed to create scoped Pi MCP runtime directory {}: {error}",
+                process_dir.display()
+            ))
+        })?;
+        set_private_directory_permissions(&config_dir.join("processes"))?;
+        set_private_directory_permissions(&process_dir)?;
+
+        // The retained container starts one primary ACP process as its init
+        // command. Give that process a valid, context-free bootstrap file;
+        // the independently exec'd conversation process receives its own
+        // immutable path below. Never replace an active task's root config.
+        let bootstrap_path = config_dir.join("config.json");
+        if !bootstrap_path.exists() {
+            write_private_atomic(&bootstrap_path, &pi_mcp_config(&[])?)?;
+        }
+
+        (
+            process_dir.join("config.json"),
+            vec![format!(
+                "XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_DIR_TARGET}/processes/{scope_hash}/config.json"
+            )],
+        )
+    } else {
+        (config_dir.join("config.json"), Vec::new())
+    };
+    write_private_atomic(&config_path, &encoded)?;
 
     spec.volumes.push(VolumeMount {
         source: config_dir.display().to_string(),
@@ -1446,7 +1504,10 @@ fn configure_pi_mcp_bridge(
     spec.environment
         .push(format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}"));
 
-    Ok(format!("pi-mcp:{:x}", Sha256::digest(&encoded)))
+    Ok(PiMcpBridge {
+        signature: format!("pi-mcp:{:x}", Sha256::digest(&encoded)),
+        process_environment,
+    })
 }
 
 fn container_paths_overlap(left: &str, right: &str) -> bool {
@@ -3145,13 +3206,14 @@ mod tests {
             "/usr/local/bin/node",
         ))];
 
-        let signature =
-            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", &servers, &mut spec).unwrap();
+        let bridge =
+            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", None, &servers, &mut spec).unwrap();
         let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
         let leaf = config_dir.file_name().unwrap().to_string_lossy();
         assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
         assert!(!config_dir.display().to_string().contains("エリ"));
-        assert!(signature.starts_with("pi-mcp:"));
+        assert!(bridge.signature.starts_with("pi-mcp:"));
+        assert!(bridge.process_environment.is_empty());
 
         let mount = spec
             .volumes
@@ -3198,6 +3260,70 @@ mod tests {
             assert_windows_owner_only_acl(&config_dir, true);
             assert_windows_owner_only_acl(&config_path, false);
         }
+    }
+
+    #[test]
+    fn pi_conversation_processes_use_isolated_mcp_configuration_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (first, second) = std::thread::scope(|scope| {
+            let launch = |conversation_id: &'static str, barrier: Arc<std::sync::Barrier>| {
+                let data_dir = data_dir.path();
+                scope.spawn(move || {
+                    let mut spec = ContainerSpec::default();
+                    let servers = [McpServer::Stdio(
+                        McpServerStdio::new("xpressclaw", "/usr/local/bin/node").env(vec![
+                            EnvVariable::new("XPRESSCLAW_CONVERSATION_ID", conversation_id),
+                        ]),
+                    )];
+                    barrier.wait();
+                    let bridge = configure_pi_mcp_bridge(
+                        data_dir,
+                        "エリ-pi",
+                        Some(conversation_id),
+                        &servers,
+                        &mut spec,
+                    )
+                    .unwrap();
+                    (conversation_id, bridge, spec)
+                })
+            };
+            let first = launch("conversation-one", barrier.clone());
+            let second = launch("conversation-two", barrier);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
+        let config_for = |conversation_id: &str| {
+            let scope_hash = format!("{:x}", Sha256::digest(conversation_id.as_bytes()));
+            config_dir
+                .join("processes")
+                .join(scope_hash)
+                .join("config.json")
+        };
+        for (conversation_id, bridge, spec) in [&first, &second] {
+            let config: Value =
+                serde_json::from_slice(&std::fs::read(config_for(conversation_id)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                config["mcpServers"]["xpressclaw"]["env"]["XPRESSCLAW_CONVERSATION_ID"],
+                *conversation_id
+            );
+            assert_eq!(bridge.process_environment.len(), 1);
+            assert!(bridge.process_environment[0].contains("/processes/"));
+            assert!(spec
+                .environment
+                .contains(&format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}")));
+        }
+        assert_ne!(first.1.process_environment, second.1.process_environment);
+        assert_eq!(
+            container_spec_fingerprint(&first.2).unwrap(),
+            container_spec_fingerprint(&second.2).unwrap()
+        );
+        let bootstrap: Value =
+            serde_json::from_slice(&std::fs::read(config_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(bootstrap["mcpServers"], json!({}));
     }
 
     #[cfg(windows)]
@@ -3305,7 +3431,8 @@ mod tests {
             ..Default::default()
         };
 
-        let error = configure_pi_mcp_bridge(data_dir.path(), "pi", &[], &mut spec).unwrap_err();
+        let error =
+            configure_pi_mcp_bridge(data_dir.path(), "pi", None, &[], &mut spec).unwrap_err();
         assert!(error
             .to_string()
             .contains("reserves container mount target"));

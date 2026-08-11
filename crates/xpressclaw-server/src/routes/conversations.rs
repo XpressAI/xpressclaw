@@ -129,8 +129,14 @@ async fn delete_conversation(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     ConversationManager::new(state.db.clone())
-        .delete(&id)
+        .delete_with_running_turns(&id, |turn_id| {
+            state
+                .turn_controls
+                .request_interrupt(turn_id, AcpInterruptMode::Immediate);
+            state.elicitations.cancel_attempt(turn_id);
+        })
         .map_err(api_error)?;
+    state.event_bus.send(&id, ConversationEvent::Done);
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -316,14 +316,51 @@ impl ConversationManager {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        let deleted = self
-            .db
-            .with_conn(|conn| conn.execute("DELETE FROM conversations WHERE id = ?1", [id]))?;
+        self.delete_with_running_turns(id, |_| {})
+    }
 
-        if deleted == 0 {
-            return Err(Error::ConversationNotFound { id: id.to_string() });
-        }
-        Ok(())
+    /// Cancel every live turn and notify the caller before the conversation
+    /// row is removed. The callback runs while the write transaction is held,
+    /// after turns have been made unpublishable but before cascading deletes,
+    /// so the server can signal ACP processes without allowing a late reply or
+    /// a newly queued turn to race deletion.
+    pub fn delete_with_running_turns<F>(&self, id: &str, mut before_delete: F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
+        self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::ConversationNotFound { id: id.to_string() });
+            }
+
+            let mut statement = transaction.prepare(
+                "SELECT id FROM conversation_turns
+                 WHERE conversation_id = ?1 AND status = 'running'",
+            )?;
+            let running_turns = statement
+                .query_map([id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            transaction.execute(
+                "UPDATE conversation_turns
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = 'Conversation deleted'
+                 WHERE conversation_id = ?1 AND status IN ('queued', 'running')",
+                [id],
+            )?;
+            for turn_id in &running_turns {
+                before_delete(turn_id);
+            }
+            transaction.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub fn update(
@@ -960,6 +997,48 @@ mod tests {
 
         mgr.delete(&conv.id).unwrap();
         assert!(mgr.get(&conv.id).is_err());
+    }
+
+    #[test]
+    fn deleting_a_conversation_cancels_and_reports_running_turns_first() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Delete me".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_turns
+                     (id, conversation_id, agent_id, status, started_at)
+                     VALUES ('running-turn', ?1, 'atlas', 'running', CURRENT_TIMESTAMP)",
+                    [&conv.id],
+                )?;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+        let mut interrupted = Vec::new();
+        mgr.delete_with_running_turns(&conv.id, |turn_id| interrupted.push(turn_id.to_string()))
+            .unwrap();
+
+        assert_eq!(interrupted, ["running-turn"]);
+        assert!(mgr.get(&conv.id).is_err());
+        let remaining = mgr
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_turns WHERE conversation_id = ?1",
+                    [&conv.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

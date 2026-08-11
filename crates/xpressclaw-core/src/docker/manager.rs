@@ -835,6 +835,7 @@ impl DockerManager {
         agent_id: &str,
         command: &[String],
         working_dir: Option<&str>,
+        environment: &[String],
     ) -> Result<AttachedContainer> {
         if command.is_empty() {
             return Err(Error::Container(
@@ -880,6 +881,7 @@ impl DockerManager {
                     attach_stderr: Some(true),
                     tty: Some(false),
                     cmd: Some(command.to_vec()),
+                    env: (!environment.is_empty()).then(|| environment.to_vec()),
                     working_dir: working_dir.map(str::to_string),
                     ..Default::default()
                 },
