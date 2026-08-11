@@ -450,7 +450,10 @@ impl ConversationManager {
         participant_id: &str,
     ) -> Result<Vec<String>> {
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let running_turns = if participant_type == "agent" {
                 let mut statement = transaction.prepare(
                     "SELECT id FROM conversation_turns
@@ -480,6 +483,11 @@ impl ConversationManager {
                 transaction.execute(
                     "UPDATE conversation_agent_sessions
                      SET status = 'idle', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE conversation_id = ?1 AND agent_id = ?2",
+                    rusqlite::params![conv_id, participant_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM schedules
                      WHERE conversation_id = ?1 AND agent_id = ?2",
                     rusqlite::params![conv_id, participant_id],
                 )?;
@@ -1471,6 +1479,43 @@ mod tests {
         mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
         let conv = mgr.get(&conv.id).unwrap();
         assert_eq!(conv.participants.len(), 1);
+    }
+
+    #[test]
+    fn removing_an_agent_cancels_its_conversation_wakeups() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Release room".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let schedules = crate::tasks::scheduler::ScheduleManager::new(mgr.db.clone());
+        let wakeup = schedules
+            .create_one_shot(&crate::tasks::scheduler::CreateOneShotSchedule {
+                name: "Check release".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Check release".into(),
+                description: Some("Update the room.".into()),
+                continuation_task_id: None,
+                conversation_id: Some(conv.id.clone()),
+            })
+            .unwrap();
+
+        mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
+
+        mgr.add_participant(&conv.id, "agent", "atlas").unwrap();
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
     }
 
     #[test]

@@ -118,9 +118,21 @@ impl ProjectManager {
     }
 
     pub fn assign_agent(&self, project_id: &str, agent_id: &str) -> Result<Project> {
-        let _ = self.get(project_id)?;
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let target_exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !target_exists {
+                return Err(Error::ProjectNotFound {
+                    id: project_id.to_string(),
+                });
+            }
             let previous_project_id = transaction
                 .query_row(
                     "SELECT project_id FROM agents WHERE id = ?1",
@@ -217,6 +229,46 @@ impl ProjectManager {
             if shared_conversation.is_some() {
                 return Err(Error::Project(
                     "this Agent belongs to a shared conversation in another project; move the whole conversation or remove the Agent from it first".into(),
+                ));
+            }
+
+            let has_incompatible_linked_task: bool = transaction.query_row(
+                "SELECT
+                    EXISTS(
+                        SELECT 1
+                        FROM tasks task
+                        JOIN conversations conversation ON conversation.id = task.conversation_id
+                        JOIN conversation_participants participant
+                          ON participant.conversation_id = conversation.id
+                         AND participant.participant_type = 'agent'
+                         AND participant.participant_id = ?2
+                        WHERE task.agent_id IS NOT NULL
+                          AND task.agent_id <> ?2
+                          AND NOT EXISTS (
+                              SELECT 1 FROM agents assigned
+                              WHERE assigned.id = task.agent_id
+                                AND assigned.project_id = ?1
+                          )
+                    )
+                    OR EXISTS(
+                        SELECT 1
+                        FROM tasks task
+                        JOIN conversations conversation ON conversation.id = task.conversation_id
+                        WHERE task.agent_id = ?2
+                          AND conversation.project_id IS NOT ?1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM conversation_participants participant
+                              WHERE participant.conversation_id = conversation.id
+                                AND participant.participant_type = 'agent'
+                                AND participant.participant_id = ?2
+                          )
+                    )",
+                rusqlite::params![project_id, agent_id],
+                |row| row.get(0),
+            )?;
+            if has_incompatible_linked_task {
+                return Err(Error::Project(
+                    "moving this Agent would split a linked task from its Agent or Conversation; reassign or unlink that task before moving the Agent".into(),
                 ));
             }
 
@@ -571,5 +623,97 @@ mod tests {
         .unwrap();
         let target = manager.assign_agent("target", "atlas").unwrap();
         assert_eq!(target.agent_ids, vec!["atlas"]);
+    }
+
+    #[test]
+    fn moving_an_agent_rejects_linked_tasks_owned_outside_the_target_project() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('source', 'Source');
+                 INSERT INTO projects (id, name) VALUES ('target', 'Target');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'source');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('reviewer', 'Reviewer', 'native', '{}', 'source');",
+            )
+        })
+        .unwrap();
+        let conversation = crate::conversations::ConversationManager::new(db.clone())
+            .create_in_project(
+                Some("source"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Review room".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let task = crate::tasks::board::TaskBoard::new(db.clone())
+            .create(&crate::tasks::board::CreateTask {
+                title: "Review the patch".into(),
+                agent_id: Some("reviewer".into()),
+                conversation_id: Some(conversation.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let manager = ProjectManager::new(db.clone());
+
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error.to_string().contains("linked task"));
+        let (agent_project, conversation_project, task_project): (String, String, String) = db
+            .with_conn(|conn| {
+                Ok::<_, rusqlite::Error>((
+                    conn.query_row(
+                        "SELECT project_id FROM agents WHERE id = 'atlas'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT project_id FROM conversations WHERE id = ?1",
+                        [&conversation.id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT project_id FROM tasks WHERE id = ?1",
+                        [&task.id],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(agent_project, "source");
+        assert_eq!(conversation_project, "source");
+        assert_eq!(task_project, "source");
+
+        let error = manager.assign_agent("target", "reviewer").unwrap_err();
+        assert!(error.to_string().contains("linked task"));
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET agent_id = 'atlas' WHERE id = ?1",
+                [&task.id],
+            )
+        })
+        .unwrap();
+        manager.assign_agent("target", "atlas").unwrap();
+        let (conversation_project, task_project): (String, String) = db
+            .with_conn(|conn| {
+                Ok::<_, rusqlite::Error>((
+                    conn.query_row(
+                        "SELECT project_id FROM conversations WHERE id = ?1",
+                        [&conversation.id],
+                        |row| row.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT project_id FROM tasks WHERE id = ?1",
+                        [&task.id],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(conversation_project, "target");
+        assert_eq!(task_project, "target");
     }
 }
