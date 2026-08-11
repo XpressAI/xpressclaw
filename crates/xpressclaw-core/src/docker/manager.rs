@@ -195,6 +195,7 @@ pub struct DockerManager {
     socket_path: Option<PathBuf>,
     runtime: &'static str,
     runtime_version: Option<String>,
+    docker_desktop: bool,
     selinux: bool,
     installation_id: Option<String>,
 }
@@ -267,18 +268,25 @@ impl DockerManager {
         let version = docker.version().await.ok();
         let runtime = runtime_from_version(version.as_ref());
         let runtime_version = version.and_then(|version| version.version);
-        let security_options = docker
-            .info()
-            .await
-            .ok()
-            .and_then(|info| info.security_options)
+        let system_info = docker.info().await.ok();
+        let docker_desktop = docker_desktop_from_info(
+            runtime,
+            system_info
+                .as_ref()
+                .and_then(|info| info.operating_system.as_deref()),
+            system_info.as_ref().and_then(|info| info.name.as_deref()),
+        );
+        let security_options = system_info
+            .as_ref()
+            .and_then(|info| info.security_options.as_deref())
             .unwrap_or_default();
-        let rootless = has_security_option(&security_options, "rootless");
-        let selinux = has_security_option(&security_options, "selinux");
+        let rootless = has_security_option(security_options, "rootless");
+        let selinux = has_security_option(security_options, "selinux");
         info!(
             socket = socket_path.as_ref().map(|path| path.display().to_string()),
             runtime,
             version = runtime_version.as_deref(),
+            docker_desktop,
             rootless,
             selinux,
             "connected to container runtime"
@@ -289,6 +297,7 @@ impl DockerManager {
             socket_path,
             runtime,
             runtime_version,
+            docker_desktop,
             selinux,
             installation_id: None,
         })
@@ -323,6 +332,11 @@ impl DockerManager {
     /// Runtime version reported by its compatibility API.
     pub fn runtime_version(&self) -> Option<&str> {
         self.runtime_version.as_deref()
+    }
+
+    /// Whether the selected daemon identifies itself as Docker Desktop.
+    pub fn is_docker_desktop(&self) -> bool {
+        self.docker_desktop
     }
 
     pub fn is_rootless(&self) -> bool {
@@ -1285,6 +1299,21 @@ fn runtime_from_version(version: Option<&bollard::system::Version>) -> &'static 
     }
 }
 
+fn docker_desktop_from_info(
+    runtime: &str,
+    operating_system: Option<&str>,
+    daemon_name: Option<&str>,
+) -> bool {
+    runtime == "docker"
+        && [operating_system, daemon_name]
+            .into_iter()
+            .flatten()
+            .any(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                normalized.contains("docker desktop") || normalized == "docker-desktop"
+            })
+}
+
 fn has_security_option(options: &[String], expected: &str) -> bool {
     options.iter().any(|option| {
         option
@@ -1532,6 +1561,30 @@ mod tests {
             runtime_from_version(Some(&bollard::system::Version::default())),
             "docker"
         );
+    }
+
+    #[test]
+    fn identifies_docker_desktop_from_daemon_info() {
+        assert!(docker_desktop_from_info(
+            "docker",
+            Some("Docker Desktop"),
+            None
+        ));
+        assert!(docker_desktop_from_info(
+            "docker",
+            None,
+            Some("docker-desktop")
+        ));
+        assert!(!docker_desktop_from_info(
+            "podman",
+            Some("Docker Desktop"),
+            Some("docker-desktop")
+        ));
+        assert!(!docker_desktop_from_info(
+            "docker",
+            Some("Ubuntu 24.04 LTS"),
+            Some("builder")
+        ));
     }
 
     #[test]

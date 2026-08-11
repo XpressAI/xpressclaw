@@ -25,6 +25,9 @@ When enabled, XpressClaw:
 
 - discovers `SSH_AUTH_SOCK` and common desktop/user-service Unix socket
   locations, and refuses to start the runner when none is live;
+- uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge when the
+  selected daemon identifies itself as Docker Desktop on macOS, while other
+  runtimes mount the detected socket directly;
 - bind-mounts only that Unix socket and the read-only host
   `~/.ssh/known_hosts` file when present, and materializes a private read-only
   configuration from `~/.ssh/config` plus recursively selected regular

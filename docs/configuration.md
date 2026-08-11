@@ -131,6 +131,11 @@ survive retained-container recreation. The container is recreated
 automatically when the host agent replaces its socket or the effective SSH
 configuration or known-host source changes.
 
+On macOS, when the selected daemon identifies itself as Docker Desktop,
+XpressClaw uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge
+instead of trying to bind-mount the native macOS socket through its Linux VM.
+Other Docker-compatible runtimes continue to mount the detected host socket.
+
 The setting is deliberately opt-in: every process in that Agent's retained
 container can request signatures from every key currently loaded in the host
 agent. If XpressClaw runs as a user service and cannot see the desktop value,

@@ -47,6 +47,7 @@ const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
+const DOCKER_DESKTOP_SSH_AGENT_SOURCE: &str = "/run/host-services/ssh-auth.sock";
 const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
 const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
 const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
@@ -1533,8 +1534,14 @@ fn build_spec(
                 prepare_forwarded_ssh_config(&config.system.data_dir, &agent.name, contents)
             })
             .transpose()?;
+        let socket_mount_source = ssh_agent_mount_source(
+            &access.socket,
+            docker.is_docker_desktop(),
+            cfg!(target_os = "macos"),
+        );
         apply_ssh_agent_forwarding(
             &access,
+            &socket_mount_source,
             &retained_known_hosts,
             forwarded_config.as_deref(),
             &mut volumes,
@@ -2353,13 +2360,14 @@ fn prepare_forwarded_ssh_config(
 
 fn apply_ssh_agent_forwarding(
     access: &HostSshAgentAccess,
+    socket_mount_source: &Path,
     retained_known_hosts: &Path,
     forwarded_config: Option<&Path>,
     volumes: &mut Vec<VolumeMount>,
     environment: &mut Vec<String>,
 ) {
     volumes.push(VolumeMount {
-        source: access.socket.display().to_string(),
+        source: socket_mount_source.display().to_string(),
         target: SSH_AGENT_SOCKET_TARGET.to_string(),
         read_only: false,
         // A shared label makes rootless Podman/Docker usable on SELinux hosts
@@ -2413,6 +2421,14 @@ fn apply_ssh_agent_forwarding(
     }
     command.push_str(" -o StrictHostKeyChecking=accept-new");
     environment.push(format!("GIT_SSH_COMMAND={command}"));
+}
+
+fn ssh_agent_mount_source(host_socket: &Path, docker_desktop: bool, macos_host: bool) -> PathBuf {
+    if docker_desktop && macos_host {
+        PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
+    } else {
+        host_socket.to_path_buf()
+    }
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
@@ -3153,6 +3169,7 @@ mod tests {
         let mut environment = Vec::new();
         apply_ssh_agent_forwarding(
             &access,
+            &socket,
             &retained_known_hosts,
             Some(&forwarded_config),
             &mut volumes,
@@ -3281,6 +3298,24 @@ mod tests {
 
         drop(listener);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_desktop_on_macos_uses_its_ssh_agent_bridge() {
+        let host_socket = Path::new("/private/tmp/com.apple.launchd.example/Listeners");
+
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, true, true),
+            PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
+        );
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, false, true),
+            host_socket
+        );
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, true, false),
+            host_socket
+        );
     }
 
     #[cfg(unix)]
