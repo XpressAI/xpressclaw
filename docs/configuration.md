@@ -122,8 +122,10 @@ bind-mounts the live SSH-agent Unix socket and `~/.ssh/known_hosts` when it
 exists. It materializes a private, read-only configuration from
 `~/.ssh/config` and recursively referenced regular `Include` files under the
 host home directory, preserving their lexical order and inline position.
-Private-key-like include files and private keys are never exposed to the
-container. New host keys accepted by the runner are kept in private,
+Included files must contain only recognized OpenSSH client directives;
+unknown, binary, and private-key-format files matched by broad globs are
+skipped. Private keys are never exposed to the container. New host keys
+accepted by the runner are kept in private,
 Agent-scoped storage under XpressClaw's data directory, so changed-key checks
 survive retained-container recreation. The container is recreated
 automatically when the host agent replaces its socket or the effective SSH

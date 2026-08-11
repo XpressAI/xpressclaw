@@ -1969,8 +1969,10 @@ fn safe_ssh_config_source(
     }
     if reject_private_key {
         let contents = std::fs::read(&path).ok()?;
-        if looks_like_private_ssh_key(&path, &contents) {
-            warn!(path = %path.display(), "private-key-like SSH Include was not forwarded");
+        if looks_like_private_ssh_key(&path, &contents)
+            || !contains_only_ssh_config_directives(&contents)
+        {
+            warn!(path = %path.display(), "SSH Include was not established as a safe configuration file");
             return None;
         }
     }
@@ -1982,11 +1984,187 @@ fn looks_like_private_ssh_key(path: &Path, contents: &[u8]) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("id_") && !name.ends_with(".pub"));
-    let private_key_header = contents
-        .windows(b"PRIVATE KEY-----".len())
-        .any(|window| window == b"PRIVATE KEY-----");
+    let private_key_header = [
+        b"PRIVATE KEY-----".as_slice(),
+        b"PuTTY-User-Key-File-".as_slice(),
+        b"BEGIN SSH2 ENCRYPTED PRIVATE KEY".as_slice(),
+        b"SSH PRIVATE KEY FILE FORMAT".as_slice(),
+        b"openssh-key-v1\0".as_slice(),
+    ]
+    .iter()
+    .any(|marker| {
+        contents
+            .windows(marker.len())
+            .any(|window| window == *marker)
+    });
     private_key_name || private_key_header
 }
+
+fn contains_only_ssh_config_directives(contents: &[u8]) -> bool {
+    let Ok(contents) = std::str::from_utf8(contents) else {
+        return false;
+    };
+    let mut found_directive = false;
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let keyword_end = line
+            .find(|character: char| character.is_ascii_whitespace() || character == '=')
+            .unwrap_or(line.len());
+        let keyword = &line[..keyword_end];
+        if !SSH_CONFIG_DIRECTIVES
+            .iter()
+            .any(|known| keyword.eq_ignore_ascii_case(known))
+        {
+            return false;
+        }
+        found_directive = true;
+    }
+    found_directive
+}
+
+// Keep this conservative allowlist aligned with OpenSSH's client-side
+// readconf.c keywords. Included files with an unknown first token are skipped
+// instead of risking that an arbitrary secret matched by a broad glob is
+// copied into the harness container. Common portable platform extensions are
+// included explicitly.
+const SSH_CONFIG_DIRECTIVES: &[&str] = &[
+    "addkeystoagent",
+    "addressfamily",
+    "afstokenpassing",
+    "batchmode",
+    "bindaddress",
+    "bindinterface",
+    "canonicaldomains",
+    "canonicalizefallbacklocal",
+    "canonicalizehostname",
+    "canonicalizemaxdots",
+    "canonicalizepermittedcnames",
+    "casignaturealgorithms",
+    "certificatefile",
+    "challengeresponseauthentication",
+    "channeltimeout",
+    "checkhostip",
+    "cipher",
+    "ciphers",
+    "clearallforwardings",
+    "compression",
+    "compressionlevel",
+    "connectionattempts",
+    "connecttimeout",
+    "controlmaster",
+    "controlpath",
+    "controlpersist",
+    "dsaauthentication",
+    "dynamicforward",
+    "enableescapecommandline",
+    "enablesshkeysign",
+    "escapechar",
+    "exitonforwardfailure",
+    "fallbacktorsh",
+    "fingerprinthash",
+    "forkafterauthentication",
+    "forwardagent",
+    "forwardx11",
+    "forwardx11timeout",
+    "forwardx11trusted",
+    "gatewayports",
+    "globalknownhostsfile",
+    "globalknownhostsfile2",
+    "gssapiauthentication",
+    "gssapidelegatecredentials",
+    "gssapikexalgorithms",
+    "gssapikeyexchange",
+    "gssapirenewalforcesrekey",
+    "gssapitrustdns",
+    "hashknownhosts",
+    "host",
+    "hostbasedacceptedalgorithms",
+    "hostbasedauthentication",
+    "hostbasedkeytypes",
+    "hostkeyalgorithms",
+    "hostkeyalias",
+    "hostname",
+    "identityagent",
+    "identityfile",
+    "identityfile2",
+    "identitiesonly",
+    "ignoreunknown",
+    "include",
+    "ipqos",
+    "kbdinteractiveauthentication",
+    "kbdinteractivedevices",
+    "keepalive",
+    "kerberosauthentication",
+    "kerberostgtpassing",
+    "kexalgorithms",
+    "knownhostscommand",
+    "localcommand",
+    "localforward",
+    "loglevel",
+    "logverbose",
+    "macs",
+    "match",
+    "nohostauthenticationforlocalhost",
+    "numberofpasswordprompts",
+    "obscurekeystroketiming",
+    "passwordauthentication",
+    "permitlocalcommand",
+    "permitremoteopen",
+    "pkcs11provider",
+    "port",
+    "preferredauthentications",
+    "protocol",
+    "proxycommand",
+    "proxyjump",
+    "proxyusefdpass",
+    "pubkeyacceptedalgorithms",
+    "pubkeyacceptedkeytypes",
+    "pubkeyauthentication",
+    "refuseconnection",
+    "rekeylimit",
+    "remotecommand",
+    "remoteforward",
+    "requesttty",
+    "requiredrsasize",
+    "revokedhostkeys",
+    "rhostsauthentication",
+    "rhostsrsaauthentication",
+    "rsaauthentication",
+    "securitykeyprovider",
+    "sendenv",
+    "serveralivecountmax",
+    "serveraliveinterval",
+    "sessiontype",
+    "setenv",
+    "skeyauthentication",
+    "smartcarddevice",
+    "stdinnull",
+    "streamlocalbindmask",
+    "streamlocalbindunlink",
+    "stricthostkeychecking",
+    "syslogfacility",
+    "tag",
+    "tcpkeepalive",
+    "tisauthentication",
+    "tunnel",
+    "tunneldevice",
+    "updatehostkeys",
+    "usekeychain",
+    "useprivilegedport",
+    "user",
+    "userknownhostsfile",
+    "userknownhostsfile2",
+    "useroaming",
+    "usersh",
+    "verifyhostkeydns",
+    "versionaddendum",
+    "visualhostkey",
+    "warnweakcrypto",
+    "xauthlocation",
+];
 
 fn ssh_include_patterns(line: &str) -> Option<Vec<String>> {
     let line = line.trim_start();
@@ -2911,7 +3089,7 @@ mod tests {
         std::fs::create_dir_all(ssh_dir.join("nested")).unwrap();
         std::fs::write(
             ssh_dir.join("config"),
-            "Include \"~/.ssh/config.d/*.conf\"\nHost work\n  HostName git.example\n",
+            "Include \"~/.ssh/config.d/*\"\nHost work\n  HostName git.example\n",
         )
         .unwrap();
         std::fs::write(
@@ -2929,6 +3107,16 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY-----\nnever mount this\n",
         )
         .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/80-putty.ppk"),
+            "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: secret\nPublic-Lines: 1\npublic\nPrivate-Lines: 1\nprivate\nPrivate-MAC: secret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/85-ssh2.key"),
+            "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nnever mount this\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\n",
+        )
+        .unwrap();
         std::fs::write(ssh_dir.join("known_hosts"), "git.example ssh-ed25519 key\n").unwrap();
         std::fs::write(ssh_dir.join("id_ed25519"), "never mount this").unwrap();
         let socket = root.join("agent.sock");
@@ -2942,6 +3130,8 @@ mod tests {
         assert!(materialized_config.contains("Host nested"));
         assert!(!materialized_config.contains("Include"));
         assert!(!materialized_config.contains("PRIVATE KEY"));
+        assert!(!materialized_config.contains("PuTTY-User-Key-File"));
+        assert!(!materialized_config.contains("Private-MAC"));
         assert!(
             materialized_config.find("Host nested").unwrap()
                 < materialized_config.find("Host included").unwrap()
@@ -2992,6 +3182,8 @@ mod tests {
         assert!(!volumes
             .iter()
             .any(|mount| mount.source.ends_with("id_ed25519")
+                || mount.source.ends_with("80-putty.ppk")
+                || mount.source.ends_with("85-ssh2.key")
                 || mount.source.ends_with("90-secret.conf")));
         assert!(environment
             .iter()
@@ -3068,7 +3260,7 @@ mod tests {
         let replacement_config = ssh_dir.join("config.next");
         std::fs::write(
             &replacement_config,
-            "Include ~/.ssh/config.d/*.conf\nHost work\n  HostName replacement.example\n",
+            "Include ~/.ssh/config.d/*\nHost work\n  HostName replacement.example\n",
         )
         .unwrap();
         std::fs::rename(replacement_config, ssh_dir.join("config")).unwrap();

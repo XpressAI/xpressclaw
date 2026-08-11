@@ -28,8 +28,10 @@ When enabled, XpressClaw:
 - bind-mounts only that Unix socket and the read-only host
   `~/.ssh/known_hosts` file when present, and materializes a private read-only
   configuration from `~/.ssh/config` plus recursively selected regular
-  `Include` files under the host home directory; private-key-like include
-  files and private keys are never exposed to the container;
+  `Include` files under the host home directory; included files must contain
+  only recognized OpenSSH client directives, so unknown, binary, and private
+  key formats matched by broad globs are skipped and private keys are never
+  exposed to the container;
 - points Git's SSH transport at the forwarded socket, keeps new host keys in
   private Agent-scoped storage under XpressClaw's data directory so they
   survive container recreation, and uses the host known-host set as an
