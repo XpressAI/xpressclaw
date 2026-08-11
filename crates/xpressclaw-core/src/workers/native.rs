@@ -99,17 +99,21 @@ struct PiMcpBridge {
 }
 
 #[derive(Default)]
-struct ConversationAcpProcesses {
+pub struct ConversationAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
 }
 
 impl ConversationAcpProcesses {
+    fn key(conversation_id: &str, agent_id: &str) -> String {
+        format!("{conversation_id}\u{0}{agent_id}")
+    }
+
     fn slot(
         &self,
         conversation_id: &str,
         agent_id: &str,
     ) -> Arc<AsyncMutex<Option<ConversationAcpProcess>>> {
-        let key = format!("{conversation_id}\u{0}{agent_id}");
+        let key = Self::key(conversation_id, agent_id);
         self.slots
             .lock()
             .unwrap()
@@ -160,7 +164,10 @@ impl ConversationAcpProcesses {
     }
 
     async fn invalidate(&self, conversation_id: &str, agent_id: &str, process: &AcpProcess) {
-        let slot = self.slot(conversation_id, agent_id);
+        let key = Self::key(conversation_id, agent_id);
+        let Some(slot) = self.slots.lock().unwrap().get(&key).cloned() else {
+            return;
+        };
         let mut entry = slot.lock().await;
         if entry
             .as_ref()
@@ -168,6 +175,61 @@ impl ConversationAcpProcesses {
         {
             entry.take();
         }
+    }
+
+    /// Remove and close every retained ACP lane for a deleted Conversation.
+    /// The shared project container and its task process remain untouched.
+    pub async fn retire_conversation(&self, conversation_id: &str) -> usize {
+        let prefix = format!("{conversation_id}\u{0}");
+        let slots = {
+            let mut registered = self.slots.lock().unwrap();
+            let keys = registered
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| registered.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        Self::shutdown_slots(slots).await
+    }
+
+    /// Remove and close one Agent's lane after it leaves a Conversation.
+    pub async fn retire_agent(&self, conversation_id: &str, agent_id: &str) -> usize {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap()
+            .remove(&Self::key(conversation_id, agent_id));
+        Self::shutdown_slots(slot.into_iter().collect()).await
+    }
+
+    async fn shutdown_slots(slots: Vec<Arc<AsyncMutex<Option<ConversationAcpProcess>>>>) -> usize {
+        let count = slots.len();
+        let mut processes = Vec::new();
+        for slot in slots {
+            if let Some(process) = slot.lock().await.take() {
+                process.process.shutdown();
+                processes.push(process.process);
+            }
+        }
+        if !processes.is_empty() {
+            let waits = processes
+                .into_iter()
+                .map(|process| async move { process.wait_for_exit().await });
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                futures_util::future::join_all(waits),
+            )
+            .await;
+        }
+        count
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
     }
 }
 
@@ -241,6 +303,16 @@ impl ProjectAcpProcesses {
     }
 }
 
+/// Shared control-plane services used by both task and Conversation ACP
+/// dispatch. Keeping these together also guarantees that HTTP lifecycle
+/// handlers and the background workers refer to the same process registry.
+pub struct NativeDispatcherServices {
+    pub event_bus: Arc<ConversationEventBus>,
+    pub elicitation_broker: Arc<AcpElicitationBroker>,
+    pub turn_controls: Arc<AcpTurnControlBroker>,
+    pub conversation_processes: Arc<ConversationAcpProcesses>,
+}
+
 /// Consume the durable task queue as an Agent Client Protocol client. Each
 /// project gets one retained container and initialized ACP process that are
 /// reused across ordinary prompt turns.
@@ -248,12 +320,16 @@ pub async fn start_dispatcher(
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
     initial_docker: Option<Arc<DockerManager>>,
-    event_bus: Arc<ConversationEventBus>,
-    elicitation_broker: Arc<AcpElicitationBroker>,
-    turn_controls: Arc<AcpTurnControlBroker>,
+    services: NativeDispatcherServices,
     control_plane_port: u16,
 ) {
     info!("native attempt dispatcher started");
+    let NativeDispatcherServices {
+        event_bus,
+        elicitation_broker,
+        turn_controls,
+        conversation_processes,
+    } = services;
     let installation_id = match db.installation_id() {
         Ok(installation_id) => installation_id,
         Err(error) => {
@@ -263,7 +339,6 @@ pub async fn start_dispatcher(
     };
     let concurrency = Arc::new(Semaphore::new(4));
     let processes = Arc::new(ProjectAcpProcesses::default());
-    let conversation_processes = Arc::new(ConversationAcpProcesses::default());
     let mut docker = initial_docker;
 
     let _ = ConversationTurnQueue::new(db.clone()).recover();
@@ -615,6 +690,9 @@ async fn execute_conversation_turn(
     turn_controls.begin_attempt(&turn.id);
     if !queue.is_running(&turn.id)? {
         turn_controls.finish_attempt(&turn.id);
+        conversation_processes
+            .retire_agent(&turn.conversation_id, &turn.agent_id)
+            .await;
         return Ok(());
     }
     let recorder = AcpEventRecorder::for_conversation(
@@ -687,13 +765,17 @@ fn build_conversation_prompt(
     previous_trigger_message_id: Option<i64>,
 ) -> Result<String> {
     let messages = match (previous_trigger_message_id, turn.trigger_message_id) {
-        (Some(after_id), Some(through_id)) => manager
-            .get_messages_between(&turn.conversation_id, after_id, through_id, 80)?
-            .into_iter()
-            .filter(|message| message.sender_type != "agent" || message.sender_id != turn.agent_id)
-            .collect(),
-        _ => manager.get_messages(&turn.conversation_id, 80, None)?,
-    };
+        (Some(after_id), Some(through_id)) => {
+            manager.get_messages_between(&turn.conversation_id, after_id, through_id, 80)?
+        }
+        (None, Some(through_id)) => {
+            manager.get_messages_between(&turn.conversation_id, 0, through_id, 80)?
+        }
+        (_, None) => manager.get_messages(&turn.conversation_id, 80, None)?,
+    }
+    .into_iter()
+    .filter(|message| message.sender_type != "agent" || message.sender_id != turn.agent_id)
+    .collect::<Vec<_>>();
     let mut history = String::new();
     for message in messages {
         let name = message.sender_name.as_deref().unwrap_or(&message.sender_id);
@@ -3084,6 +3166,113 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retiring_conversations_removes_all_registered_acp_lanes() {
+        let processes = ConversationAcpProcesses::default();
+        processes.slot("conversation-one", "atlas");
+        processes.slot("conversation-one", "reviewer");
+        processes.slot("conversation-two", "atlas");
+        assert_eq!(processes.slot_count(), 3);
+
+        assert_eq!(processes.retire_conversation("conversation-one").await, 2);
+        assert_eq!(processes.slot_count(), 1);
+        assert_eq!(processes.retire_agent("conversation-two", "atlas").await, 1);
+        assert_eq!(processes.slot_count(), 0);
+    }
+
+    #[test]
+    fn first_conversation_turn_stops_at_its_claimed_trigger() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('p', 'Project')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'p')",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let manager = ConversationManager::new(db);
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Race check".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "First context".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let trigger = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Claimed request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Arrived after claim".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let turn = ConversationTurn {
+            id: "turn".into(),
+            conversation_id: conversation.id.clone(),
+            agent_id: "atlas".into(),
+            trigger_message_id: Some(trigger.id),
+            status: "running".into(),
+            result_message_id: None,
+            error_message: None,
+            context_used: None,
+            context_size: None,
+            queued_at: "now".into(),
+            started_at: None,
+            completed_at: None,
+        };
+        let agent = AgentConfig {
+            name: "atlas".into(),
+            runner: NativeRunnerConfig {
+                project_name: Some("Atlas".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let prompt =
+            build_conversation_prompt(&manager, &conversation, &turn, &agent, None).unwrap();
+        assert!(prompt.contains("First context"));
+        assert!(prompt.contains("Claimed request"));
+        assert!(!prompt.contains("Arrived after claim"));
+    }
 
     #[test]
     fn mcp_commands_use_container_path_semantics() {

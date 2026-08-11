@@ -6,6 +6,7 @@ use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::conversations::runtime::ConversationTurnQueue;
 use crate::error::{Error, Result};
 
 /// Register sqlite-vec as an auto-extension. Must be called before opening connections.
@@ -197,6 +198,15 @@ impl Database {
                         message: e.to_string(),
                     })?;
 
+                if target == 33 {
+                    backfill_pending_conversation_turns(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
                 if target == 34 {
                     consolidate_legacy_conversation_projects(&transaction).map_err(|error| {
                         Error::Migration {
@@ -245,6 +255,51 @@ impl Database {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Move work committed by the retired background conversation processor into
+/// the durable per-Agent turn queue introduced by migration v33. Routing each
+/// legacy message in ID order preserves mention semantics and lets the queue
+/// coalesce each addressed Agent to the correct high-water message.
+fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT id, conversation_id, sender_id, content
+             FROM conversation_messages
+             WHERE sender_type = 'user' AND processed = 0
+             ORDER BY id ASC",
+        )?;
+        let pending = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        pending
+    };
+
+    for (message_id, conversation_id, sender_id, content) in pending {
+        ConversationTurnQueue::enqueue_for_message_in_transaction(
+            transaction,
+            &conversation_id,
+            message_id,
+            "user",
+            &sender_id,
+            &content,
+        )?;
+    }
+    transaction.execute(
+        "UPDATE conversation_messages
+         SET processed = 1
+         WHERE sender_type = 'user' AND processed = 0",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Before Projects existed, an old conversation could contain several
@@ -1414,6 +1469,69 @@ mod tests {
             .get("atlas", &memory.id)
             .unwrap();
         assert_eq!(moved.project_id, "atlas");
+    }
+
+    #[test]
+    fn pending_legacy_messages_become_durable_addressed_turns() {
+        let db = Database::open_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('p', 'Project');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'p'),
+                        ('reviewer', 'Reviewer', 'native', '{}', 'p');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('legacy', 'Pending work', 'p');
+                 INSERT INTO conversation_participants
+                    (conversation_id, participant_type, participant_id)
+                 VALUES ('legacy', 'agent', 'atlas'),
+                        ('legacy', 'agent', 'reviewer');
+                 INSERT INTO conversation_messages
+                    (conversation_id, sender_type, sender_id, content, processed)
+                 VALUES ('legacy', 'user', 'local', 'Please investigate', 0),
+                        ('legacy', 'user', 'local', '@[AGENT:atlas:Atlas] Extra context', 0);",
+            )?;
+            let transaction = conn.unchecked_transaction()?;
+            backfill_pending_conversation_turns(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let unprocessed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_messages WHERE processed = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unprocessed, 0);
+
+            let turns = conn
+                .prepare(
+                    "SELECT agent_id, trigger_message_id FROM conversation_turns
+                     WHERE conversation_id = 'legacy' ORDER BY agent_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(turns, vec![("atlas".into(), 2), ("reviewer".into(), 1)]);
+
+            let sessions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_agent_sessions
+                     WHERE conversation_id = 'legacy' AND status = 'queued'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sessions, 2);
+        });
     }
 
     #[test]

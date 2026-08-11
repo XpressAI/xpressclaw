@@ -136,6 +136,7 @@ async fn delete_conversation(
             state.elicitations.cancel_attempt(turn_id);
         })
         .map_err(api_error)?;
+    state.conversation_processes.retire_conversation(&id).await;
     state.event_bus.send(&id, ConversationEvent::Done);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -170,6 +171,10 @@ async fn remove_participant(
             .request_interrupt(&turn_id, AcpInterruptMode::Immediate);
         state.elicitations.cancel_attempt(&turn_id);
     }
+    state
+        .conversation_processes
+        .retire_agent(&id, &agent_id)
+        .await;
     state.event_bus.send(&id, ConversationEvent::Done);
     Ok(StatusCode::NO_CONTENT)
 }

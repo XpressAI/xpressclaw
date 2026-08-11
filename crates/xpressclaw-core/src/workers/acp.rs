@@ -26,7 +26,7 @@ use bollard::container::LogOutput;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 use uuid::Uuid;
@@ -319,6 +319,7 @@ pub struct AcpTurnRuntime {
 #[derive(Clone)]
 pub struct AcpProcess {
     sender: mpsc::Sender<AcpProcessTurn>,
+    shutdown: watch::Sender<bool>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
 }
@@ -823,12 +824,14 @@ impl AcpProcess {
     /// Start and initialize one ACP process over an attached Agent container.
     pub async fn start(attached: AttachedContainer) -> Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
+        let (shutdown, shutdown_receiver) = watch::channel(false);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(Notify::new());
         tokio::spawn(serve_process(
             attached,
             receiver,
+            shutdown_receiver,
             ready_sender,
             alive.clone(),
             stopped.clone(),
@@ -840,6 +843,7 @@ impl AcpProcess {
 
         Ok(Self {
             sender,
+            shutdown,
             alive,
             stopped,
         })
@@ -853,6 +857,13 @@ impl AcpProcess {
     /// Whether two handles refer to the same underlying process.
     pub fn same_process(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.alive, &other.alive)
+    }
+
+    /// Close this ACP connection without stopping its shared project
+    /// container. Conversation lanes use this when their conversation or
+    /// participant is deleted while the base project process remains alive.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     /// Wait until the stdio connection and its process actor have exited.
@@ -899,6 +910,7 @@ impl AcpProcess {
 async fn serve_process(
     attached: AttachedContainer,
     mut turns: mpsc::Receiver<AcpProcessTurn>,
+    mut shutdown: watch::Receiver<bool>,
     ready_sender: oneshot::Sender<Result<()>>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
@@ -1055,8 +1067,17 @@ async fn serve_process(
 
             let mut sessions = HashMap::new();
             loop {
+                if *shutdown.borrow() {
+                    break;
+                }
                 let turn = tokio::select! {
                     biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    },
                     _ = &mut output_closed_receiver => break,
                     turn = turns.recv() => {
                         let Some(turn) = turn else {
@@ -1728,6 +1749,47 @@ mod tests {
         assert!(broker.request_interrupt("attempt-1", AcpInterruptMode::Immediate));
         let mut receiver = broker.register("attempt-1");
         assert_eq!(receiver.try_recv(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn explicitly_shutting_down_an_idle_acp_process_closes_its_actor() {
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            let initialize = requests.next_line().await.unwrap().unwrap();
+            let initialize: Value = serde_json::from_str(&initialize).unwrap();
+            assert_eq!(initialize["method"], "initialize");
+            send_json(
+                &output_tx,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": InitializeResponse::new(ProtocolVersion::V1),
+                }),
+            )
+            .await;
+            assert!(requests.next_line().await.unwrap().is_none());
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "test-container".into(),
+                agent_id: "test-project".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        })
+        .await
+        .unwrap();
+
+        process.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), process.wait_for_exit())
+            .await
+            .expect("explicit shutdown should stop an idle ACP actor");
+        assert!(!process.is_alive());
+        mock_agent.await.unwrap();
     }
 
     #[tokio::test]
