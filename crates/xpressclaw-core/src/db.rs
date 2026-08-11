@@ -1360,6 +1360,15 @@ BEGIN
 END;
 ";
 
+const MIGRATION_V35: &str = "
+-- One-shot wake-ups armed from a Conversation must return to that Agent's
+-- independent Conversation lane instead of creating a standalone task.
+ALTER TABLE schedules ADD COLUMN conversation_id TEXT
+    REFERENCES conversations(id) ON DELETE CASCADE;
+CREATE INDEX idx_schedules_conversation
+    ON schedules(conversation_id);
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1396,6 +1405,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (32, MIGRATION_V32),
         (33, MIGRATION_V33),
         (34, MIGRATION_V34),
+        (35, MIGRATION_V35),
     ]
 }
 
@@ -1416,7 +1426,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "34");
+        assert_eq!(version, "35");
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')

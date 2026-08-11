@@ -195,8 +195,8 @@
 
 	async function triggerSchedule(schedule: Schedule) {
 		try {
-			const task = await schedules.trigger(schedule.id);
-			window.alert(`Task created: ${task.title}`);
+			const result = await schedules.trigger(schedule.id);
+			window.alert('message' in result ? 'Conversation wake-up sent.' : `Task created: ${result.title}`);
 			await loadAutomations();
 		} catch (error) {
 			window.alert(String(error));

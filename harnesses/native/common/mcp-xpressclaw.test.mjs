@@ -41,6 +41,41 @@ test('binds a scheduled wake-up to the task that armed it', () => {
   });
 });
 
+test('binds a scheduled wake-up to the conversation lane that armed it', () => {
+  const request = buildWakeupRequest(
+    {
+      name: 'Check review',
+      delay_seconds: 60,
+      message: 'Check the review and update the conversation.',
+    },
+    {
+      agentId: 'reviewer',
+      taskId: '',
+      conversationId: 'conversation-123',
+    },
+  );
+
+  assert.equal(request.continuation_task_id, undefined);
+  assert.equal(request.conversation_id, 'conversation-123');
+});
+
+test('task wake-ups take precedence for tasks linked to conversations', () => {
+  const request = buildWakeupRequest(
+    {
+      delay_seconds: 60,
+      message: 'Continue the task.',
+    },
+    {
+      agentId: 'reviewer',
+      taskId: 'task-123',
+      conversationId: 'conversation-123',
+    },
+  );
+
+  assert.equal(request.continuation_task_id, 'task-123');
+  assert.equal(request.conversation_id, undefined);
+});
+
 test('keeps standalone compatibility when no task identity is available', () => {
   const request = buildWakeupRequest(
     {

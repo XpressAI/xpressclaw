@@ -534,7 +534,11 @@ export function memoryResourceTemplates() {
 
 export function buildWakeupRequest(
   argumentsValue,
-  { agentId = AGENT_ID, taskId = TASK_ID } = {},
+  {
+    agentId = AGENT_ID,
+    taskId = TASK_ID,
+    conversationId = CONVERSATION_ID,
+  } = {},
 ) {
   const args = argumentsValue ?? {};
   const hasDelay = Object.hasOwn(args, 'delay_seconds');
@@ -561,6 +565,7 @@ export function buildWakeupRequest(
     title: name,
     description: args.message.trim(),
     ...(taskId ? { continuation_task_id: taskId } : {}),
+    ...(!taskId && conversationId ? { conversation_id: conversationId } : {}),
     ...(hasDelay ? { delay_seconds: args.delay_seconds } : { run_at: args.run_at.trim() }),
   };
 }
@@ -577,6 +582,7 @@ async function scheduleWakeup(argumentsValue) {
     run_at: schedule.run_at,
     project: AGENT_ID,
     task: TASK_ID || null,
+    conversation: TASK_ID ? null : CONVERSATION_ID || null,
     message: 'XpressClaw will initiate the future turn. End this turn instead of waiting or polling.',
   };
 }

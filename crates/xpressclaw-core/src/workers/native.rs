@@ -1229,7 +1229,7 @@ fn publish_conversation_result(
         return;
     };
     let manager = ConversationManager::new(db.clone());
-    if let Ok(message) = manager.send_structured_message(
+    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_attachments(
         &conversation_id,
         &SendMessage {
             sender_type: "agent".to_string(),
@@ -1239,7 +1239,7 @@ fn publish_conversation_result(
             message_type: Some("task_result".to_string()),
         },
         Some(&item.task_id),
-        Some(&json!({ "task_id": item.task_id })),
+        &[],
     ) {
         event_bus.send(
             &conversation_id,
@@ -4490,9 +4490,14 @@ mod tests {
                 title: "Resume the DGX experiment".into(),
                 description: Some("Inspect the results and continue the active goal.".into()),
                 continuation_task_id: Some(original.id.clone()),
+                conversation_id: None,
             })
             .unwrap();
-        let wakeup_task = schedules.trigger(&wakeup.id, &board).unwrap();
+        let wakeup_task = schedules
+            .trigger(&wakeup.id, &board)
+            .unwrap()
+            .into_task()
+            .unwrap();
         let wakeup_item = queue
             .list(Some("dgx-codex"), Some("queued"), 10)
             .unwrap()
@@ -4664,15 +4669,22 @@ mod tests {
     #[test]
     fn native_results_return_to_conversation_history() {
         let db = Arc::new(Database::open_memory().unwrap());
-        crate::agents::registry::AgentRegistry::new(db.clone())
-            .ensure("atlas", "generic")
-            .unwrap();
+        let registry = crate::agents::registry::AgentRegistry::new(db.clone());
+        registry.ensure("atlas", "generic").unwrap();
+        registry.ensure("reviewer", "generic").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET project_id = 'atlas' WHERE id = 'reviewer'",
+                [],
+            )
+        })
+        .unwrap();
         let conversations = ConversationManager::new(db.clone());
         let conversation = conversations
             .create(&crate::conversations::CreateConversation {
                 title: Some("Native session".to_string()),
                 icon: None,
-                participant_ids: vec!["atlas".to_string()],
+                participant_ids: vec!["atlas".to_string(), "reviewer".to_string()],
             })
             .unwrap();
         let task = TaskBoard::new(db.clone())
@@ -4696,7 +4708,7 @@ mod tests {
             &Arc::new(ConversationEventBus::new()),
             &item,
             "Atlas",
-            "Native result",
+            "@[AGENT:reviewer:Reviewer] Native result",
         );
 
         let messages = conversations
@@ -4709,6 +4721,14 @@ mod tests {
             messages[0].linked_task_id.as_deref(),
             Some(task.id.as_str())
         );
-        assert_eq!(messages[0].content, "Native result");
+        assert_eq!(
+            messages[0].content,
+            "@[AGENT:reviewer:Reviewer] Native result"
+        );
+        let turns = ConversationTurnQueue::new(db)
+            .list_for_conversation(&conversation.id, 10)
+            .unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_id, "reviewer");
     }
 }

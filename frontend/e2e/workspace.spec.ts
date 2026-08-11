@@ -125,6 +125,7 @@ async function mockApi(
 			schedule_type: 'cron' | 'once';
 			run_at: string | null;
 			continuation_task_id: string | null;
+			conversation_id: string | null;
 		}[];
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
@@ -1875,6 +1876,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 			schedule_type: 'cron',
 			run_at: null,
 			continuation_task_id: null,
+			conversation_id: null,
 		}],
 	});
 	await page.goto('/automations');

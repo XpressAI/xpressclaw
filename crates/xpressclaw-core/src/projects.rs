@@ -306,6 +306,17 @@ impl ProjectManager {
                     "move or remove this project's agents, conversations, and tasks first".into(),
                 ));
             }
+            let active_workflows = transaction.query_row(
+                "SELECT COUNT(*) FROM workflow_instances
+                 WHERE project_id = ?1 AND status IN ('running', 'waiting')",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if active_workflows > 0 {
+                return Err(Error::Project(
+                    "wait for or cancel this project's active workflows before deleting it".into(),
+                ));
+            }
             transaction.execute(
                 "DELETE FROM project_memory_notes WHERE project_id = ?1",
                 [id],
@@ -361,6 +372,40 @@ mod tests {
         let project = manager.get("one").unwrap();
         assert_eq!(project.agent_ids, vec!["atlas"]);
         assert!(manager.delete("one").is_err());
+    }
+
+    #[test]
+    fn project_deletion_waits_for_running_or_waiting_workflows() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO workflows (id, name, yaml_content)
+                    VALUES ('review', 'Review', 'name: Review');
+                 INSERT INTO workflow_instances
+                    (id, workflow_id, status, project_id)
+                    VALUES ('review-run', 'review', 'waiting', 'one');",
+            )
+        })
+        .unwrap();
+        let manager = ProjectManager::new(db.clone());
+
+        let error = manager.delete("one").unwrap_err();
+        assert!(error.to_string().contains("active workflows"));
+        assert!(manager.get("one").is_ok());
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET status = 'completed' WHERE id = 'review-run'",
+                [],
+            )
+        })
+        .unwrap();
+        manager.delete("one").unwrap();
+        assert!(matches!(
+            manager.get("one"),
+            Err(Error::ProjectNotFound { .. })
+        ));
     }
 
     #[test]

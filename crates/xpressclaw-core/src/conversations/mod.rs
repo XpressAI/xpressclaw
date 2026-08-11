@@ -655,6 +655,78 @@ impl ConversationManager {
         })
     }
 
+    /// Store a message addressed to one Agent while validating the target's
+    /// membership and routing the durable message in the same write
+    /// transaction. The durable routing target is stored in message metadata
+    /// so a wake-up arriving behind a running turn is discovered by the same
+    /// high-water routing logic after that turn completes.
+    pub fn send_targeted_routed_message_with_attachments(
+        &self,
+        conv_id: &str,
+        target_agent_id: &str,
+        msg: &SendMessage,
+        metadata: Option<&serde_json::Value>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        validate_new_attachments(attachments)?;
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_participants
+                    WHERE conversation_id = ?1
+                      AND participant_type = 'agent'
+                      AND participant_id = ?2
+                )",
+                rusqlite::params![conv_id, target_agent_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !is_participant {
+                return Err(Error::Conversation(
+                    "target Agent is not a participant in this conversation".into(),
+                ));
+            }
+            let mut routed_metadata = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
+            let Some(routed_metadata) = routed_metadata.as_object_mut() else {
+                return Err(Error::Conversation(
+                    "targeted message metadata must be an object".into(),
+                ));
+            };
+            routed_metadata.insert(
+                "target_agent_id".to_string(),
+                serde_json::Value::String(target_agent_id.to_string()),
+            );
+            let routed_metadata = serde_json::Value::Object(routed_metadata.clone());
+            let (message, attachments) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                None,
+                Some(&routed_metadata),
+                attachments,
+            )?;
+            let queued_agents = if runtime::ConversationTurnQueue::enqueue_target_in_transaction(
+                &transaction,
+                conv_id,
+                target_agent_id,
+                message.id,
+            )? {
+                vec![target_agent_id.to_string()]
+            } else {
+                Vec::new()
+            };
+            transaction.commit()?;
+            Ok((message, attachments, queued_agents))
+        })
+    }
+
     fn insert_structured_message(
         transaction: &rusqlite::Transaction<'_>,
         conv_id: &str,

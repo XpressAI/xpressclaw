@@ -88,7 +88,7 @@ impl ConversationTurnQueue {
         let mut targets = participants
             .into_iter()
             .filter(|agent_id| {
-                Self::message_targets_agent(sender_type, sender_id, agent_id, &agent_mentions)
+                Self::message_targets_agent(sender_type, sender_id, agent_id, &agent_mentions, None)
             })
             .collect::<Vec<_>>();
         targets.sort();
@@ -116,9 +116,13 @@ impl ConversationTurnQueue {
         sender_id: &str,
         agent_id: &str,
         agent_mentions: &std::collections::HashSet<String>,
+        routed_target_agent_id: Option<&str>,
     ) -> bool {
         if agent_id == sender_id {
             return false;
+        }
+        if let Some(target_agent_id) = routed_target_agent_id {
+            return agent_id == target_agent_id;
         }
         if agent_mentions.is_empty() {
             sender_type != "agent"
@@ -206,6 +210,15 @@ impl ConversationTurnQueue {
             rusqlite::params![conversation_id, agent_id],
         )?;
         Ok(true)
+    }
+
+    pub(crate) fn enqueue_target_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        conversation_id: &str,
+        agent_id: &str,
+        trigger_message_id: i64,
+    ) -> Result<bool> {
+        Self::enqueue_in_transaction(transaction, conversation_id, agent_id, trigger_message_id)
     }
 
     pub fn claim_next(&self) -> Result<Option<ConversationTurn>> {
@@ -478,7 +491,7 @@ impl ConversationTurnQueue {
         let after_id = turn.trigger_message_id.unwrap_or(0);
         let latest_addressed = {
             let mut statement = transaction.prepare(
-                "SELECT id, sender_type, sender_id, content
+                "SELECT id, sender_type, sender_id, content, metadata
                  FROM conversation_messages
                  WHERE conversation_id = ?1 AND id > ?2
                  ORDER BY id DESC",
@@ -490,17 +503,27 @@ impl ConversationTurnQueue {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?;
             let mut latest = None;
             for message in messages {
-                let (id, sender_type, sender_id, content) = message?;
+                let (id, sender_type, sender_id, content, metadata) = message?;
                 let agent_mentions = Self::agent_mentions(&content);
+                let routed_target_agent_id = serde_json::from_str::<serde_json::Value>(&metadata)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("target_agent_id")
+                            .and_then(|target| target.as_str())
+                            .map(str::to_owned)
+                    });
                 if Self::message_targets_agent(
                     &sender_type,
                     &sender_id,
                     &turn.agent_id,
                     &agent_mentions,
+                    routed_target_agent_id.as_deref(),
                 ) {
                     latest = Some(id);
                     break;
@@ -862,6 +885,81 @@ mod tests {
             turns.iter().filter(|turn| turn.status == "queued").count(),
             1
         );
+    }
+
+    #[test]
+    fn targeted_messages_arriving_during_a_turn_are_queued_for_the_target() {
+        let (_db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Plan".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into(), "reviewer".into()],
+                },
+            )
+            .unwrap();
+        let first = manager
+            .send_routed_message_with_attachments(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "@[AGENT:atlas:Atlas] Start".into(),
+                    message_type: None,
+                },
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .0;
+        let running = queue.claim_next().unwrap().unwrap();
+        assert_eq!(running.agent_id, "atlas");
+        assert_eq!(running.trigger_message_id, Some(first.id));
+
+        let (follow_up, _, queued_agents) = manager
+            .send_targeted_routed_message_with_attachments(
+                &conversation.id,
+                "atlas",
+                &SendMessage {
+                    sender_type: "system".into(),
+                    sender_id: "scheduler".into(),
+                    sender_name: Some("XpressClaw".into()),
+                    content: "Scheduled wake-up".into(),
+                    message_type: Some("scheduled_wakeup".into()),
+                },
+                None,
+                &[],
+            )
+            .unwrap();
+        assert!(queued_agents.is_empty());
+
+        let result = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "agent".into(),
+                    sender_id: "atlas".into(),
+                    sender_name: None,
+                    content: "First result".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue.complete(&running, "session", result.id).unwrap();
+
+        let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
+        assert!(turns.iter().any(|turn| {
+            turn.agent_id == "atlas"
+                && turn.status == "queued"
+                && turn.trigger_message_id == Some(follow_up.id)
+        }));
+        assert!(!turns.iter().any(|turn| {
+            turn.agent_id == "reviewer" && turn.trigger_message_id == Some(follow_up.id)
+        }));
     }
 
     #[test]

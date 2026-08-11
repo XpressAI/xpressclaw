@@ -622,6 +622,7 @@ export interface Schedule {
 	schedule_type: 'cron' | 'once';
 	run_at: string | null;
 	continuation_task_id: string | null;
+	conversation_id: string | null;
 }
 
 export const schedules = {
@@ -645,11 +646,12 @@ export const schedules = {
 		run_at?: string;
 		delay_seconds?: number;
 		continuation_task_id?: string;
+		conversation_id?: string;
 	}) => request<Schedule>('/api/schedules/once', { method: 'POST', body: JSON.stringify(data) }),
 	delete: (id: string) => request<void>(`/api/schedules/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Schedule>(`/api/schedules/${id}/enable`, { method: 'POST' }),
 	disable: (id: string) => request<Schedule>(`/api/schedules/${id}/disable`, { method: 'POST' }),
-	trigger: (id: string) => request<Task>(`/api/schedules/${id}/trigger`, { method: 'POST' })
+	trigger: (id: string) => request<Task | { conversation_id: string; agent_id: string; message: ConversationMessage }>(`/api/schedules/${id}/trigger`, { method: 'POST' })
 };
 
 // -- Health --
