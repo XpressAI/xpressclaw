@@ -320,6 +320,7 @@ async function mockApi(
 						environment: {},
 						command: [],
 						subscription_auth: true,
+						ssh_agent_forwarding: false,
 						container_engine: 'none',
 					},
 					tools: [],

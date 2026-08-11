@@ -1,7 +1,7 @@
 //! Dispatcher and adapters for native coding-agent CLIs running in retained
 //! project environments.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,14 @@ const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
+const DOCKER_DESKTOP_SSH_AGENT_SOURCE: &str = "/run/host-services/ssh-auth.sock";
+const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
+const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
+const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
+const SSH_RUNTIME_DIR_TARGET: &str = "/run/xpressclaw/ssh";
+const SSH_RETAINED_KNOWN_HOSTS: &str = "/run/xpressclaw/ssh/known_hosts";
+const SSH_CONFIG_INCLUDE_LIMIT: usize = 128;
+const SSH_CONFIG_FILE_SIZE_LIMIT: u64 = 1024 * 1024;
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
     "\nawait main();\n"
@@ -1088,7 +1096,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
             |error| {
                 Error::Backend(format!(
-                    "failed to protect Pi MCP runtime directory {}: {error}",
+                    "failed to protect private runtime directory {}: {error}",
                     path.display()
                 ))
             },
@@ -1116,20 +1124,20 @@ fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     }
     let mut file = options.open(&temporary).map_err(|error| {
         Error::Backend(format!(
-            "failed to create private Pi MCP configuration {}: {error}",
+            "failed to create private runtime file {}: {error}",
             temporary.display()
         ))
     })?;
     set_private_file_permissions(&temporary)?;
     file.write_all(contents).map_err(|error| {
         Error::Backend(format!(
-            "failed to write Pi MCP configuration {}: {error}",
+            "failed to write private runtime file {}: {error}",
             temporary.display()
         ))
     })?;
     file.sync_all().map_err(|error| {
         Error::Backend(format!(
-            "failed to sync Pi MCP configuration {}: {error}",
+            "failed to sync private runtime file {}: {error}",
             temporary.display()
         ))
     })?;
@@ -1138,14 +1146,14 @@ fn write_private_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     if path.exists() {
         std::fs::remove_file(path).map_err(|error| {
             Error::Backend(format!(
-                "failed to replace Pi MCP configuration {}: {error}",
+                "failed to replace private runtime file {}: {error}",
                 path.display()
             ))
         })?;
     }
     std::fs::rename(&temporary, path).map_err(|error| {
         Error::Backend(format!(
-            "failed to publish Pi MCP configuration {}: {error}",
+            "failed to publish private runtime file {}: {error}",
             path.display()
         ))
     })?;
@@ -1159,7 +1167,7 @@ fn set_private_file_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
             |error| {
                 Error::Backend(format!(
-                    "failed to protect Pi MCP configuration {}: {error}",
+                    "failed to protect private runtime file {}: {error}",
                     path.display()
                 ))
             },
@@ -1510,6 +1518,36 @@ fn build_spec(
         "CI=1".to_string(),
         "NO_COLOR=1".to_string(),
     ];
+    if agent.runner.ssh_agent_forwarding {
+        let access = discover_host_ssh_agent().ok_or_else(|| {
+            Error::Backend(
+                "host SSH-agent forwarding is enabled, but XpressClaw could not find a live Unix SSH_AUTH_SOCK; start an SSH agent and restart XpressClaw from that desktop session"
+                    .to_string(),
+            )
+        })?;
+        let retained_known_hosts =
+            prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
+        let forwarded_config = access
+            .config
+            .as_deref()
+            .map(|contents| {
+                prepare_forwarded_ssh_config(&config.system.data_dir, &agent.name, contents)
+            })
+            .transpose()?;
+        let socket_mount_source = ssh_agent_mount_source(
+            &access.socket,
+            docker.is_docker_desktop(),
+            cfg!(target_os = "macos"),
+        );
+        apply_ssh_agent_forwarding(
+            &access,
+            &socket_mount_source,
+            &retained_known_hosts,
+            forwarded_config.as_deref(),
+            &mut volumes,
+            &mut environment,
+        );
+    }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
     runner_environment.sort_by(|left, right| left.0.cmp(right.0));
@@ -1738,6 +1776,659 @@ pub fn subscription_auth_available(kind: &str) -> bool {
     auth_candidates(kind)
         .iter()
         .any(|(source, _, _)| source.exists())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostSshAgentAccess {
+    socket: PathBuf,
+    generation: String,
+    config: Option<Vec<u8>>,
+    known_hosts: Option<PathBuf>,
+}
+
+/// Return the live host SSH-agent socket that XpressClaw would forward. The
+/// path is exposed for readiness diagnostics only; private key files are never
+/// inspected or mounted.
+pub fn host_ssh_agent_socket() -> Option<PathBuf> {
+    discover_host_ssh_agent().map(|access| access.socket)
+}
+
+fn discover_host_ssh_agent() -> Option<HostSshAgentAccess> {
+    let home = host_home();
+    discover_host_ssh_agent_from(
+        ssh_agent_socket_candidates(home.as_deref()),
+        home.as_deref(),
+    )
+}
+
+fn discover_host_ssh_agent_from(
+    candidates: Vec<PathBuf>,
+    home: Option<&Path>,
+) -> Option<HostSshAgentAccess> {
+    let socket = candidates
+        .into_iter()
+        .find(|candidate| live_ssh_agent_socket(candidate))?;
+    let socket = socket.canonicalize().unwrap_or(socket);
+    let config = home
+        .and_then(|home| regular_ssh_file(home, "config").map(|config| (home, config)))
+        .and_then(|(home, config)| materialize_ssh_config(&config, home));
+    let known_hosts = home.and_then(|home| regular_ssh_file(home, "known_hosts"));
+    let generation = ssh_forwarding_generation(&socket, config.as_deref(), known_hosts.as_deref())?;
+    Some(HostSshAgentAccess {
+        socket,
+        generation,
+        config,
+        known_hosts,
+    })
+}
+
+fn ssh_agent_socket_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+        candidates.push(PathBuf::from(socket));
+    }
+    #[cfg(unix)]
+    {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                // SAFETY: getuid has no preconditions and only reads process
+                // credentials.
+                PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+            });
+        candidates.extend([
+            runtime.join("gcr/ssh"),
+            runtime.join("keyring/ssh"),
+            runtime.join("gnupg/S.gpg-agent.ssh"),
+            runtime.join("ssh-agent.socket"),
+        ]);
+    }
+    if let Some(home) = home {
+        candidates.extend([
+            home.join(".1password/agent.sock"),
+            home.join(".ssh/agent.sock"),
+        ]);
+        #[cfg(target_os = "macos")]
+        candidates.extend([
+            home.join("Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"),
+            home.join("Library/Containers/com.maxgoedjen.Secretive.SecretAgent/Data/socket.ssh"),
+        ]);
+    }
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique.contains(&candidate) {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+#[cfg(unix)]
+fn live_ssh_agent_socket(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+
+    path.is_absolute()
+        && std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_socket())
+        && std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn live_ssh_agent_socket(_path: &Path) -> bool {
+    false
+}
+
+fn materialize_ssh_config(config: &Path, home: &Path) -> Option<Vec<u8>> {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let ssh_dir = home.join(".ssh");
+    let ssh_dir = ssh_dir.canonicalize().unwrap_or(ssh_dir);
+    let mut stack = HashSet::new();
+    let mut included = 0;
+    let mut output = String::new();
+    expand_ssh_config_file(
+        config,
+        &home,
+        &ssh_dir,
+        false,
+        &mut stack,
+        &mut included,
+        &mut output,
+    )?;
+    Some(output.into_bytes())
+}
+
+fn expand_ssh_config_file(
+    source: &Path,
+    home: &Path,
+    ssh_dir: &Path,
+    reject_private_key: bool,
+    stack: &mut HashSet<PathBuf>,
+    included: &mut usize,
+    output: &mut String,
+) -> Option<()> {
+    let source = safe_ssh_config_source(source, home, ssh_dir, reject_private_key)?;
+    if !stack.insert(source.clone()) {
+        warn!(path = %source.display(), "cyclic SSH Include was skipped");
+        return Some(());
+    }
+    let result = (|| {
+        let contents = std::fs::read_to_string(&source).ok()?;
+        for line in contents.split_inclusive('\n') {
+            let Some(patterns) = ssh_include_patterns(line) else {
+                output.push_str(line);
+                continue;
+            };
+            for pattern in patterns {
+                let Some(host_pattern) = ssh_include_host_pattern(&pattern, home, ssh_dir) else {
+                    warn!(pattern, "skipping an unsupported SSH Include pattern");
+                    continue;
+                };
+                let Some(host_pattern) = host_pattern.to_str() else {
+                    warn!(pattern, "skipping a non-Unicode SSH Include pattern");
+                    continue;
+                };
+                let Ok(matches) = glob::glob(host_pattern) else {
+                    warn!(pattern, "skipping an invalid SSH Include glob");
+                    continue;
+                };
+                let mut matches = matches
+                    .filter_map(std::result::Result::ok)
+                    .collect::<Vec<_>>();
+                matches.sort();
+                for candidate in matches {
+                    if *included >= SSH_CONFIG_INCLUDE_LIMIT {
+                        warn!(
+                            limit = SSH_CONFIG_INCLUDE_LIMIT,
+                            "SSH Include file limit reached; remaining files were skipped"
+                        );
+                        continue;
+                    }
+                    *included += 1;
+                    let before = output.len();
+                    let _ = expand_ssh_config_file(
+                        &candidate, home, ssh_dir, true, stack, included, output,
+                    );
+                    if output.len() > before && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+        }
+        Some(())
+    })();
+    stack.remove(&source);
+    result
+}
+
+fn safe_ssh_config_source(
+    path: &Path,
+    home: &Path,
+    ssh_dir: &Path,
+    reject_private_key: bool,
+) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > SSH_CONFIG_FILE_SIZE_LIMIT {
+        return None;
+    }
+    let path = path.canonicalize().ok()?;
+    if !path.starts_with(home) && !path.starts_with(ssh_dir) {
+        warn!(path = %path.display(), "SSH Include outside the host home directory was not forwarded");
+        return None;
+    }
+    if reject_private_key {
+        let contents = std::fs::read(&path).ok()?;
+        if looks_like_private_ssh_key(&path, &contents)
+            || !contains_only_ssh_config_directives(&contents)
+        {
+            warn!(path = %path.display(), "SSH Include was not established as a safe configuration file");
+            return None;
+        }
+    }
+    Some(path)
+}
+
+fn looks_like_private_ssh_key(path: &Path, contents: &[u8]) -> bool {
+    let private_key_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("id_") && !name.ends_with(".pub"));
+    let private_key_header = [
+        b"PRIVATE KEY-----".as_slice(),
+        b"PuTTY-User-Key-File-".as_slice(),
+        b"BEGIN SSH2 ENCRYPTED PRIVATE KEY".as_slice(),
+        b"SSH PRIVATE KEY FILE FORMAT".as_slice(),
+        b"openssh-key-v1\0".as_slice(),
+    ]
+    .iter()
+    .any(|marker| {
+        contents
+            .windows(marker.len())
+            .any(|window| window == *marker)
+    });
+    private_key_name || private_key_header
+}
+
+fn contains_only_ssh_config_directives(contents: &[u8]) -> bool {
+    let Ok(contents) = std::str::from_utf8(contents) else {
+        return false;
+    };
+    let mut found_directive = false;
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let keyword_end = line
+            .find(|character: char| character.is_ascii_whitespace() || character == '=')
+            .unwrap_or(line.len());
+        let keyword = &line[..keyword_end];
+        if !SSH_CONFIG_DIRECTIVES
+            .iter()
+            .any(|known| keyword.eq_ignore_ascii_case(known))
+        {
+            return false;
+        }
+        found_directive = true;
+    }
+    found_directive
+}
+
+// Keep this conservative allowlist aligned with OpenSSH's client-side
+// readconf.c keywords. Included files with an unknown first token are skipped
+// instead of risking that an arbitrary secret matched by a broad glob is
+// copied into the harness container. Common portable platform extensions are
+// included explicitly.
+const SSH_CONFIG_DIRECTIVES: &[&str] = &[
+    "addkeystoagent",
+    "addressfamily",
+    "afstokenpassing",
+    "batchmode",
+    "bindaddress",
+    "bindinterface",
+    "canonicaldomains",
+    "canonicalizefallbacklocal",
+    "canonicalizehostname",
+    "canonicalizemaxdots",
+    "canonicalizepermittedcnames",
+    "casignaturealgorithms",
+    "certificatefile",
+    "challengeresponseauthentication",
+    "channeltimeout",
+    "checkhostip",
+    "cipher",
+    "ciphers",
+    "clearallforwardings",
+    "compression",
+    "compressionlevel",
+    "connectionattempts",
+    "connecttimeout",
+    "controlmaster",
+    "controlpath",
+    "controlpersist",
+    "dsaauthentication",
+    "dynamicforward",
+    "enableescapecommandline",
+    "enablesshkeysign",
+    "escapechar",
+    "exitonforwardfailure",
+    "fallbacktorsh",
+    "fingerprinthash",
+    "forkafterauthentication",
+    "forwardagent",
+    "forwardx11",
+    "forwardx11timeout",
+    "forwardx11trusted",
+    "gatewayports",
+    "globalknownhostsfile",
+    "globalknownhostsfile2",
+    "gssapiauthentication",
+    "gssapidelegatecredentials",
+    "gssapikexalgorithms",
+    "gssapikeyexchange",
+    "gssapirenewalforcesrekey",
+    "gssapitrustdns",
+    "hashknownhosts",
+    "host",
+    "hostbasedacceptedalgorithms",
+    "hostbasedauthentication",
+    "hostbasedkeytypes",
+    "hostkeyalgorithms",
+    "hostkeyalias",
+    "hostname",
+    "identityagent",
+    "identityfile",
+    "identityfile2",
+    "identitiesonly",
+    "ignoreunknown",
+    "include",
+    "ipqos",
+    "kbdinteractiveauthentication",
+    "kbdinteractivedevices",
+    "keepalive",
+    "kerberosauthentication",
+    "kerberostgtpassing",
+    "kexalgorithms",
+    "knownhostscommand",
+    "localcommand",
+    "localforward",
+    "loglevel",
+    "logverbose",
+    "macs",
+    "match",
+    "nohostauthenticationforlocalhost",
+    "numberofpasswordprompts",
+    "obscurekeystroketiming",
+    "passwordauthentication",
+    "permitlocalcommand",
+    "permitremoteopen",
+    "pkcs11provider",
+    "port",
+    "preferredauthentications",
+    "protocol",
+    "proxycommand",
+    "proxyjump",
+    "proxyusefdpass",
+    "pubkeyacceptedalgorithms",
+    "pubkeyacceptedkeytypes",
+    "pubkeyauthentication",
+    "refuseconnection",
+    "rekeylimit",
+    "remotecommand",
+    "remoteforward",
+    "requesttty",
+    "requiredrsasize",
+    "revokedhostkeys",
+    "rhostsauthentication",
+    "rhostsrsaauthentication",
+    "rsaauthentication",
+    "securitykeyprovider",
+    "sendenv",
+    "serveralivecountmax",
+    "serveraliveinterval",
+    "sessiontype",
+    "setenv",
+    "skeyauthentication",
+    "smartcarddevice",
+    "stdinnull",
+    "streamlocalbindmask",
+    "streamlocalbindunlink",
+    "stricthostkeychecking",
+    "syslogfacility",
+    "tag",
+    "tcpkeepalive",
+    "tisauthentication",
+    "tunnel",
+    "tunneldevice",
+    "updatehostkeys",
+    "usekeychain",
+    "useprivilegedport",
+    "user",
+    "userknownhostsfile",
+    "userknownhostsfile2",
+    "useroaming",
+    "usersh",
+    "verifyhostkeydns",
+    "versionaddendum",
+    "visualhostkey",
+    "warnweakcrypto",
+    "xauthlocation",
+];
+
+fn ssh_include_patterns(line: &str) -> Option<Vec<String>> {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let keyword_end = line
+        .find(|character: char| character.is_ascii_whitespace() || character == '=')
+        .unwrap_or(line.len());
+    if !line[..keyword_end].eq_ignore_ascii_case("include") {
+        return None;
+    }
+    let mut arguments = line[keyword_end..].trim_start();
+    if let Some(rest) = arguments.strip_prefix('=') {
+        arguments = rest.trim_start();
+    }
+    Some(split_ssh_config_arguments(arguments).unwrap_or_default())
+}
+
+fn split_ssh_config_arguments(arguments: &str) -> Option<Vec<String>> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in arguments.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '#' {
+            break;
+        } else if character.is_ascii_whitespace() {
+            if !current.is_empty() {
+                values.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        values.push(current);
+    }
+    Some(values)
+}
+
+fn ssh_include_host_pattern(pattern: &str, home: &Path, ssh_dir: &Path) -> Option<PathBuf> {
+    if let Some(relative) = pattern
+        .strip_prefix("~/")
+        .or_else(|| pattern.strip_prefix("%d/"))
+        .or_else(|| pattern.strip_prefix("${HOME}/"))
+    {
+        return Some(home.join(relative));
+    }
+    if pattern.contains('%') || pattern.contains("${") || pattern.starts_with('~') {
+        return None;
+    }
+    let pattern = PathBuf::from(pattern);
+    if pattern.is_absolute() {
+        Some(pattern)
+    } else {
+        Some(ssh_dir.join(pattern))
+    }
+}
+
+#[cfg(unix)]
+fn ssh_forwarding_generation(
+    socket: &Path,
+    config: Option<&[u8]>,
+    known_hosts: Option<&Path>,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut digest = Sha256::new();
+    for (label, path) in [("socket", Some(socket)), ("known_hosts", known_hosts)] {
+        digest.update(label.as_bytes());
+        if let Some(path) = path {
+            let metadata = std::fs::metadata(path).ok()?;
+            digest.update(path.to_string_lossy().as_bytes());
+            digest.update(metadata.dev().to_le_bytes());
+            digest.update(metadata.ino().to_le_bytes());
+        } else {
+            digest.update(b"absent");
+        }
+    }
+    digest.update(b"config");
+    if let Some(config) = config {
+        digest.update(config);
+    } else {
+        digest.update(b"absent");
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+#[cfg(not(unix))]
+fn ssh_forwarding_generation(
+    _socket: &Path,
+    _config: Option<&[u8]>,
+    _known_hosts: Option<&Path>,
+) -> Option<String> {
+    None
+}
+
+fn regular_ssh_file(home: &Path, name: &str) -> Option<PathBuf> {
+    let path = home.join(".ssh").join(name);
+    std::fs::symlink_metadata(&path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|_| path)
+}
+
+fn retained_ssh_runtime_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    data_dir
+        .join("runtime")
+        .join("ssh-known-hosts")
+        .join(agent_hash)
+}
+
+fn prepare_retained_ssh_known_hosts(data_dir: &Path, agent_id: &str) -> Result<PathBuf> {
+    let runtime_dir = retained_ssh_runtime_dir(data_dir, agent_id);
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create retained SSH host-key directory {}: {error}",
+            runtime_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&runtime_dir)?;
+
+    let known_hosts = runtime_dir.join("known_hosts");
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&known_hosts).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create retained SSH host-key file {}: {error}",
+            known_hosts.display()
+        ))
+    })?;
+    set_private_file_permissions(&known_hosts)?;
+    Ok(runtime_dir)
+}
+
+fn prepare_forwarded_ssh_config(
+    data_dir: &Path,
+    agent_id: &str,
+    contents: &[u8],
+) -> Result<PathBuf> {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    let runtime_dir = data_dir.join("runtime").join("ssh-config").join(agent_hash);
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create forwarded SSH configuration directory {}: {error}",
+            runtime_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&runtime_dir)?;
+    let config = runtime_dir.join("config");
+    write_private_atomic(&config, contents)?;
+    Ok(config)
+}
+
+fn apply_ssh_agent_forwarding(
+    access: &HostSshAgentAccess,
+    socket_mount_source: &Path,
+    retained_known_hosts: &Path,
+    forwarded_config: Option<&Path>,
+    volumes: &mut Vec<VolumeMount>,
+    environment: &mut Vec<String>,
+) {
+    volumes.push(VolumeMount {
+        source: socket_mount_source.display().to_string(),
+        target: SSH_AGENT_SOCKET_TARGET.to_string(),
+        read_only: false,
+        // A shared label makes rootless Podman/Docker usable on SELinux hosts
+        // without exposing any private-key files.
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+    environment.push(format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}"));
+    // Bind mounts stay attached to an inode when a socket or SSH metadata file
+    // is atomically replaced at the same pathname. Including every mounted
+    // source identity in the spec forces the retained container to rebind all
+    // current sources on the next turn.
+    environment.push(format!(
+        "XPRESSCLAW_SSH_FORWARDING_GENERATION={}",
+        access.generation
+    ));
+
+    volumes.push(VolumeMount {
+        source: retained_known_hosts.display().to_string(),
+        target: SSH_RUNTIME_DIR_TARGET.to_string(),
+        read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+
+    let mut command = String::from("ssh");
+    if let Some(config) = forwarded_config {
+        volumes.push(VolumeMount {
+            source: config.display().to_string(),
+            target: SSH_CONFIG_TARGET.to_string(),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+        command.push_str(&format!(" -F {SSH_CONFIG_TARGET}"));
+    }
+    command.push_str(&format!(
+        " -o IdentityAgent={SSH_AGENT_SOCKET_TARGET} -o IdentitiesOnly=no"
+    ));
+    if let Some(known_hosts) = &access.known_hosts {
+        volumes.push(VolumeMount {
+            source: known_hosts.display().to_string(),
+            target: SSH_KNOWN_HOSTS_TARGET.to_string(),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+        command.push_str(&format!(
+            " -o 'UserKnownHostsFile={SSH_RETAINED_KNOWN_HOSTS} {SSH_KNOWN_HOSTS_TARGET}'"
+        ));
+    } else {
+        command.push_str(&format!(
+            " -o UserKnownHostsFile={SSH_RETAINED_KNOWN_HOSTS}"
+        ));
+    }
+    command.push_str(" -o StrictHostKeyChecking=accept-new");
+    environment.push(format!("GIT_SSH_COMMAND={command}"));
+}
+
+fn ssh_agent_mount_source(host_socket: &Path, docker_desktop: bool, macos_host: bool) -> PathBuf {
+    if docker_desktop && macos_host {
+        PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
+    } else {
+        host_socket.to_path_buf()
+    }
 }
 
 fn auth_mounts(kind: &str) -> Vec<VolumeMount> {
@@ -2395,6 +3086,266 @@ mod tests {
         assert!(!environment
             .iter()
             .any(|value| value.starts_with("INITIAL_AGENT_MODE=")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forwards_only_a_live_ssh_agent_and_non_secret_ssh_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-forwarding-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::create_dir_all(ssh_dir.join("config.d")).unwrap();
+        std::fs::create_dir_all(ssh_dir.join("nested")).unwrap();
+        std::fs::write(
+            ssh_dir.join("config"),
+            "Include \"~/.ssh/config.d/*\"\nHost work\n  HostName git.example\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/20-work.conf"),
+            "Include nested/*.conf\nHost included\n  HostName included.example\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("nested/30-extra.conf"),
+            "Host nested\n  HostName nested.example\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/90-secret.conf"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nnever mount this\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/80-putty.ppk"),
+            "PuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nComment: secret\nPublic-Lines: 1\npublic\nPrivate-Lines: 1\nprivate\nPrivate-MAC: secret\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ssh_dir.join("config.d/85-ssh2.key"),
+            "---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\nnever mount this\n---- END SSH2 ENCRYPTED PRIVATE KEY ----\n",
+        )
+        .unwrap();
+        std::fs::write(ssh_dir.join("known_hosts"), "git.example ssh-ed25519 key\n").unwrap();
+        std::fs::write(ssh_dir.join("id_ed25519"), "never mount this").unwrap();
+        let socket = root.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let access = discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_eq!(access.socket, socket);
+        assert!(!access.generation.is_empty());
+        let materialized_config = std::str::from_utf8(access.config.as_deref().unwrap()).unwrap();
+        assert!(materialized_config.contains("Host included"));
+        assert!(materialized_config.contains("Host nested"));
+        assert!(!materialized_config.contains("Include"));
+        assert!(!materialized_config.contains("PRIVATE KEY"));
+        assert!(!materialized_config.contains("PuTTY-User-Key-File"));
+        assert!(!materialized_config.contains("Private-MAC"));
+        assert!(
+            materialized_config.find("Host nested").unwrap()
+                < materialized_config.find("Host included").unwrap()
+        );
+        assert!(
+            materialized_config.find("Host included").unwrap()
+                < materialized_config.find("Host work").unwrap()
+        );
+        let retained_known_hosts =
+            prepare_retained_ssh_known_hosts(&root.join("data"), "エリ-codex").unwrap();
+        let forwarded_config = prepare_forwarded_ssh_config(
+            &root.join("data"),
+            "エリ-codex",
+            access.config.as_deref().unwrap(),
+        )
+        .unwrap();
+
+        let mut volumes = Vec::new();
+        let mut environment = Vec::new();
+        apply_ssh_agent_forwarding(
+            &access,
+            &socket,
+            &retained_known_hosts,
+            Some(&forwarded_config),
+            &mut volumes,
+            &mut environment,
+        );
+
+        assert!(volumes.iter().any(|mount| {
+            mount.source == socket.display().to_string()
+                && mount.target == SSH_AGENT_SOCKET_TARGET
+                && !mount.read_only
+                && mount.selinux_relabel == SelinuxRelabel::Shared
+        }));
+        assert!(volumes.iter().any(|mount| {
+            mount.source == forwarded_config.display().to_string()
+                && mount.target == SSH_CONFIG_TARGET
+                && mount.read_only
+        }));
+        assert!(volumes
+            .iter()
+            .any(|mount| mount.target == SSH_KNOWN_HOSTS_TARGET && mount.read_only));
+        assert!(volumes.iter().any(|mount| {
+            mount.source == retained_known_hosts.display().to_string()
+                && mount.target == SSH_RUNTIME_DIR_TARGET
+                && !mount.read_only
+                && mount.selinux_relabel == SelinuxRelabel::Shared
+        }));
+        assert!(!volumes
+            .iter()
+            .any(|mount| mount.source.ends_with("id_ed25519")
+                || mount.source.ends_with("80-putty.ppk")
+                || mount.source.ends_with("85-ssh2.key")
+                || mount.source.ends_with("90-secret.conf")));
+        assert!(environment
+            .iter()
+            .any(|entry| entry == &format!("SSH_AUTH_SOCK={SSH_AGENT_SOCKET_TARGET}")));
+        let git_ssh = environment
+            .iter()
+            .find(|entry| entry.starts_with("GIT_SSH_COMMAND="))
+            .unwrap();
+        assert!(git_ssh.contains(SSH_AGENT_SOCKET_TARGET));
+        assert!(git_ssh.contains(SSH_CONFIG_TARGET));
+        assert!(git_ssh.contains(SSH_KNOWN_HOSTS_TARGET));
+        assert!(git_ssh.contains(SSH_RETAINED_KNOWN_HOSTS));
+        assert!(git_ssh.contains("StrictHostKeyChecking=accept-new"));
+
+        let retained_file = retained_known_hosts.join("known_hosts");
+        std::fs::write(&retained_file, "learned.example ssh-ed25519 learned\n").unwrap();
+        let after_recreation =
+            prepare_retained_ssh_known_hosts(&root.join("data"), "エリ-codex").unwrap();
+        assert_eq!(after_recreation, retained_known_hosts);
+        assert_eq!(
+            std::fs::read_to_string(after_recreation.join("known_hosts")).unwrap(),
+            "learned.example ssh-ed25519 learned\n"
+        );
+        let leaf = retained_known_hosts.file_name().unwrap().to_string_lossy();
+        assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!retained_known_hosts.display().to_string().contains("エリ"));
+        assert_ne!(
+            retained_known_hosts,
+            retained_ssh_runtime_dir(&root.join("data"), "another-agent")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&retained_known_hosts)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&retained_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read(&forwarded_config).unwrap(),
+            access.config.as_deref().unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&forwarded_config)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!forwarded_config.display().to_string().contains("エリ"));
+
+        let first_generation = access.generation;
+        let replacement_include = ssh_dir.join("config.d/20-work.next");
+        std::fs::write(
+            &replacement_include,
+            "Include nested/*.conf\nHost included\n  HostName replacement.example\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement_include, ssh_dir.join("config.d/20-work.conf")).unwrap();
+        let replaced_include =
+            discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_ne!(replaced_include.generation, first_generation);
+
+        let replacement_config = ssh_dir.join("config.next");
+        std::fs::write(
+            &replacement_config,
+            "Include ~/.ssh/config.d/*\nHost work\n  HostName replacement.example\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement_config, ssh_dir.join("config")).unwrap();
+        let replaced_config =
+            discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_ne!(replaced_config.generation, replaced_include.generation);
+
+        let replacement_known_hosts = ssh_dir.join("known_hosts.next");
+        std::fs::write(
+            &replacement_known_hosts,
+            "replacement.example ssh-ed25519 key\n",
+        )
+        .unwrap();
+        std::fs::rename(replacement_known_hosts, ssh_dir.join("known_hosts")).unwrap();
+        let replaced_known_hosts =
+            discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
+        assert_ne!(replaced_known_hosts.generation, replaced_config.generation);
+
+        drop(listener);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_desktop_on_macos_uses_its_ssh_agent_bridge() {
+        let host_socket = Path::new("/private/tmp/com.apple.launchd.example/Listeners");
+
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, true, true),
+            PathBuf::from(DOCKER_DESKTOP_SSH_AGENT_SOURCE)
+        );
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, false, true),
+            host_socket
+        );
+        assert_eq!(
+            ssh_agent_mount_source(host_socket, true, false),
+            host_socket
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_ssh_configuration_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-symlink-test-{}",
+            std::process::id()
+        ));
+        let ssh_dir = root.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let private_key = ssh_dir.join("id_ed25519");
+        std::fs::write(&private_key, "never mount this").unwrap();
+        symlink(&private_key, ssh_dir.join("config")).unwrap();
+
+        assert_eq!(regular_ssh_file(&root, "config"), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_non_socket_ssh_agent_candidate() {
+        let candidate =
+            std::env::temp_dir().join(format!("xpressclaw-not-an-agent-{}", std::process::id()));
+        std::fs::write(&candidate, "not a socket").unwrap();
+        assert!(discover_host_ssh_agent_from(vec![candidate.clone()], None).is_none());
+        std::fs::remove_file(candidate).unwrap();
     }
 
     #[test]

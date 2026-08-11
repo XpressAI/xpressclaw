@@ -57,6 +57,15 @@ that it satisfies generic skills' `gh` prerequisites, so a missing shell
 binary must not block pull-request work. The MCP server advertises the same
 substitution to other ACP agents.
 
+Repositories that use another SSH remote can opt into **Use my host SSH
+agent**. XpressClaw forwards the live agent socket and read-only SSH
+configuration/known-host files; it does not mount private keys. The retained
+container is replaced when the host agent socket, SSH config, or known-host
+file is replaced, so a desktop agent restart or atomic file update does not
+leave the runner attached to a stale inode. This access is intentionally
+disabled by default because every process in the runner can request signatures
+from every key loaded in the forwarded agent.
+
 ## Customization
 
 With **Use host login and harness configuration** enabled, XpressClaw mounts

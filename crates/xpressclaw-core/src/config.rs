@@ -280,6 +280,10 @@ pub struct NativeRunnerConfig {
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
     pub subscription_auth: bool,
+    /// Forward the host SSH agent into the retained project container. This
+    /// exposes signing operations through the agent protocol, never private
+    /// key files, and is intentionally opt-in.
+    pub ssh_agent_forwarding: bool,
     /// Optional access to the same Docker-compatible engine used by the
     /// control plane. Built-in agents select a separate CLI-enabled image.
     pub container_engine: ContainerEngineAccess,
@@ -299,6 +303,7 @@ impl Default for NativeRunnerConfig {
             startup_commands: Vec::new(),
             command: Vec::new(),
             subscription_auth: true,
+            ssh_agent_forwarding: false,
             container_engine: ContainerEngineAccess::None,
         }
     }

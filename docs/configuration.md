@@ -31,6 +31,7 @@ agents:
       workspace: /home/me/projects/site
       project_name: Site maintainer # user-facing Agent name
       subscription_auth: true
+      ssh_agent_forwarding: false
       container_engine: none
     volumes: []
 ```
@@ -45,6 +46,7 @@ agents:
 | `project_name` | User-facing Agent name; falls back to the workspace folder when omitted |
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
+| `ssh_agent_forwarding` | Forward a detected host SSH agent plus SSH config/known hosts; private keys are never mounted (default `false`) |
 | `container_engine` | `none` (default) or trusted `host` Docker/Podman socket access |
 | `command` | ACP server argument list; required for custom harnesses and supports `{workspace}` |
 
@@ -106,6 +108,40 @@ explicitly selected. Set `runner.environment.INITIAL_AGENT_MODE` to another
 Codex ACP mode (for example, `agent`) when a project needs the additional inner
 sandbox. A mode selected through the Agent or task controls remains
 authoritative for that session.
+
+## Existing repositories and SSH remotes
+
+An existing workspace is mounted read-write, including its `.git` directory.
+For GitHub repositories, XpressClaw prefers its project-scoped HTTPS credential
+helper and rewrites the standard `git@github.com:` remote forms when a GitHub
+connector is available. No SSH key is needed for that path.
+
+For GitLab, self-hosted Git servers, SSH host aliases, or a GitHub repository
+without connector access, enable `runner.ssh_agent_forwarding`. XpressClaw
+bind-mounts the live SSH-agent Unix socket and `~/.ssh/known_hosts` when it
+exists. It materializes a private, read-only configuration from
+`~/.ssh/config` and recursively referenced regular `Include` files under the
+host home directory, preserving their lexical order and inline position.
+Included files must contain only recognized OpenSSH client directives;
+unknown, binary, and private-key-format files matched by broad globs are
+skipped. Private keys are never exposed to the container. New host keys
+accepted by the runner are kept in private,
+Agent-scoped storage under XpressClaw's data directory, so changed-key checks
+survive retained-container recreation. The container is recreated
+automatically when the host agent replaces its socket or the effective SSH
+configuration or known-host source changes.
+
+On macOS, when the selected daemon identifies itself as Docker Desktop,
+XpressClaw uses Docker Desktop's `/run/host-services/ssh-auth.sock` bridge
+instead of trying to bind-mount the native macOS socket through its Linux VM.
+Other Docker-compatible runtimes continue to mount the detected host socket.
+
+The setting is deliberately opt-in: every process in that Agent's retained
+container can request signatures from every key currently loaded in the host
+agent. If XpressClaw runs as a user service and cannot see the desktop value,
+import `SSH_AUTH_SOCK` into the service manager and restart XpressClaw, for
+example with `systemctl --user import-environment SSH_AUTH_SOCK`. The Agent
+readiness panel reports the detected socket or a specific configuration issue.
 
 ## Multiple agents and control planes
 

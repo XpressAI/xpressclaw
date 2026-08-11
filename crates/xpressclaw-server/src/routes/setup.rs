@@ -24,7 +24,7 @@ use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::system;
 use xpressclaw_core::workers::native::{
-    local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
+    host_ssh_agent_socket, local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
     subscription_auth_available,
 };
 
@@ -204,6 +204,9 @@ async fn system_info() -> Json<Value> {
     value["working_directory"] = json!(std::env::current_dir()
         .ok()
         .map(|path| path.display().to_string()));
+    let ssh_agent_socket = host_ssh_agent_socket();
+    value["ssh_agent_available"] = json!(ssh_agent_socket.is_some());
+    value["ssh_agent_socket"] = json!(ssh_agent_socket.map(|path| path.display().to_string()));
     Json(value)
 }
 
@@ -593,11 +596,48 @@ async fn project_environment(
         }
     }
 
+    let git_repository = workspace.join(".git").exists();
+    let git_uses_ssh = git_repository && repository_uses_ssh_remote(&workspace);
+
     Ok(Json(json!({
         "workspace": workspace.display().to_string(),
         "detected_files": detected_files,
         "suggestions": suggestions,
+        "git_repository": git_repository,
+        "git_uses_ssh": git_uses_ssh,
     })))
+}
+
+fn repository_uses_ssh_remote(workspace: &FsPath) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| {
+            String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                line.split_once(char::is_whitespace)
+                    .is_some_and(|(_, remote)| is_ssh_git_remote(remote.trim()))
+            })
+        })
+}
+
+fn is_ssh_git_remote(remote: &str) -> bool {
+    if remote.starts_with("ssh://") || remote.starts_with("git+ssh://") {
+        return true;
+    }
+    if remote.contains("://") {
+        return false;
+    }
+    let Some((host, path)) = remote.split_once(':') else {
+        return false;
+    };
+    if path.is_empty() || host.contains('/') || host.contains('\\') {
+        return false;
+    }
+    !(host.len() == 1 && host.as_bytes()[0].is_ascii_alphabetic())
 }
 
 fn first_existing<'a>(workspace: &FsPath, candidates: &'a [&'a str]) -> Option<&'a str> {
@@ -733,6 +773,7 @@ struct AgentSetup {
     runner_command: Option<Vec<String>>,
     startup_commands: Option<Vec<String>>,
     subscription_auth: Option<bool>,
+    ssh_agent_forwarding: Option<bool>,
     runner_container_engine: Option<ContainerEngineAccess>,
     volumes: Option<Vec<String>>,
     #[serde(default)]
@@ -820,6 +861,7 @@ fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
             .filter(|argument| !argument.is_empty())
             .collect(),
         subscription_auth: setup.subscription_auth.unwrap_or(true),
+        ssh_agent_forwarding: setup.ssh_agent_forwarding.unwrap_or(false),
         container_engine,
     }
 }
@@ -2356,6 +2398,36 @@ mod tests {
     }
 
     #[test]
+    fn setup_preserves_explicit_ssh_agent_forwarding() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "ssh_agent_forwarding": true
+        }))
+        .unwrap();
+        let runner = runner_from_setup(&setup);
+        assert!(runner.ssh_agent_forwarding);
+    }
+
+    #[test]
+    fn recognizes_ssh_git_remote_forms_without_confusing_local_paths() {
+        for remote in [
+            "git@github.com:XpressAI/xpressclaw.git",
+            "ssh://git@gitlab.example/team/repo.git",
+            "work-github:team/repo.git",
+        ] {
+            assert!(is_ssh_git_remote(remote), "{remote}");
+        }
+        for remote in [
+            "https://github.com/XpressAI/xpressclaw.git",
+            "file:///srv/repos/xpressclaw.git",
+            "/srv/repos/xpressclaw.git",
+            r"C:\repos\xpressclaw",
+        ] {
+            assert!(!is_ssh_git_remote(remote), "{remote}");
+        }
+    }
+
+    #[test]
     fn setup_selects_an_expanded_catalog_runner() {
         let setup: AgentSetup = serde_json::from_value(json!({
             "runner_kind": "qwen"
@@ -2407,6 +2479,24 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("compose.yaml"), "services: {}\n").unwrap();
         std::fs::write(workspace.join("package-lock.json"), "{}\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
 
         let response = project_environment(Query(ProjectEnvironmentQuery {
             path: workspace.display().to_string(),
@@ -2421,6 +2511,53 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|suggestion| suggestion["command"] == "npm ci"));
+        assert_eq!(response["git_repository"], true);
+        assert_eq!(response["git_uses_ssh"], true);
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn detects_ssh_push_urls_when_fetching_over_https() {
+        let workspace = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-pushurl-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(repository_uses_ssh_remote(&workspace));
 
         std::fs::remove_dir_all(workspace).unwrap();
     }
@@ -2627,6 +2764,8 @@ mod tests {
         assert!(body["total_memory_gb"].as_f64().unwrap() > 0.0);
         assert!(body["cpu_count"].as_u64().unwrap() > 0);
         assert!(body["working_directory"].as_str().is_some());
+        assert!(body["ssh_agent_available"].as_bool().is_some());
+        assert!(body.get("ssh_agent_socket").is_some());
     }
 
     #[tokio::test]
