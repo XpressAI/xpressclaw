@@ -612,7 +612,7 @@ fn repository_uses_ssh_remote(workspace: &FsPath) -> bool {
     std::process::Command::new("git")
         .arg("-C")
         .arg(workspace)
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .args(["config", "--get-regexp", r"^remote\..*\.(url|pushurl)$"])
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -2513,6 +2513,51 @@ mod tests {
             .any(|suggestion| suggestion["command"] == "npm ci"));
         assert_eq!(response["git_repository"], true);
         assert_eq!(response["git_uses_ssh"], true);
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn detects_ssh_push_urls_when_fetching_over_https() {
+        let workspace = std::env::temp_dir().join(format!(
+            "xpressclaw-ssh-pushurl-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args([
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:XpressAI/xpressclaw.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        assert!(repository_uses_ssh_remote(&workspace));
 
         std::fs::remove_dir_all(workspace).unwrap();
     }
