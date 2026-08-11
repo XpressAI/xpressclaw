@@ -29,8 +29,9 @@ When enabled, XpressClaw:
   `~/.ssh/known_hosts` files when present; private-key files are never read or
   mounted;
 - points Git's SSH transport at the forwarded socket, keeps new host keys in
-  the retained container, and uses the host known-host set as an additional
-  trust source;
+  private Agent-scoped storage under XpressClaw's data directory so they
+  survive container recreation, and uses the host known-host set as an
+  additional trust source;
 - uses a shared SELinux label for those explicit mounts and adds the socket's
   host group to the container, matching rootless Podman and Docker hosts; and
 - includes opaque device/inode generations for the socket, SSH config, and
@@ -52,4 +53,6 @@ Forwarding an SSH agent is not repository-scoped: a trusted process can ask it
 to sign with any loaded key and can authenticate anywhere that key is
 accepted. The option therefore remains off by default and must be enabled only
 for trusted runner images and tasks. A service-launched XpressClaw process may
-need the desktop `SSH_AUTH_SOCK` imported into its service environment.
+need the desktop `SSH_AUTH_SOCK` imported into its service environment. Host
+keys learned through `accept-new` remain in that Agent's private runtime data
+until the XpressClaw data directory is removed.

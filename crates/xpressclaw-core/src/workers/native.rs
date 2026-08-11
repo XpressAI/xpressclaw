@@ -50,7 +50,8 @@ const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
 const SSH_AGENT_SOCKET_TARGET: &str = "/tmp/xpressclaw-ssh-agent.sock";
 const SSH_CONFIG_TARGET: &str = "/tmp/xpressclaw-host-ssh-config";
 const SSH_KNOWN_HOSTS_TARGET: &str = "/tmp/xpressclaw-host-known-hosts";
-const SSH_RETAINED_KNOWN_HOSTS: &str = "/tmp/xpressclaw-known-hosts";
+const SSH_RUNTIME_DIR_TARGET: &str = "/run/xpressclaw/ssh";
+const SSH_RETAINED_KNOWN_HOSTS: &str = "/run/xpressclaw/ssh/known_hosts";
 const BUNDLED_CONTROL_MCP_SOURCE: &str = concat!(
     include_str!("../../../../harnesses/native/common/mcp-xpressclaw.mjs"),
     "\nawait main();\n"
@@ -1092,7 +1093,7 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
             |error| {
                 Error::Backend(format!(
-                    "failed to protect Pi MCP runtime directory {}: {error}",
+                    "failed to protect private runtime directory {}: {error}",
                     path.display()
                 ))
             },
@@ -1163,7 +1164,7 @@ fn set_private_file_permissions(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
             |error| {
                 Error::Backend(format!(
-                    "failed to protect Pi MCP configuration {}: {error}",
+                    "failed to protect private runtime file {}: {error}",
                     path.display()
                 ))
             },
@@ -1521,7 +1522,14 @@ fn build_spec(
                     .to_string(),
             )
         })?;
-        apply_ssh_agent_forwarding(&access, &mut volumes, &mut environment);
+        let retained_known_hosts =
+            prepare_retained_ssh_known_hosts(&config.system.data_dir, &agent.name)?;
+        apply_ssh_agent_forwarding(
+            &access,
+            &retained_known_hosts,
+            &mut volumes,
+            &mut environment,
+        );
     }
     apply_codex_mode_default(kind, &agent.runner, &mut environment);
     let mut runner_environment = agent.runner.environment.iter().collect::<Vec<_>>();
@@ -1894,8 +1902,45 @@ fn regular_ssh_file(home: &Path, name: &str) -> Option<PathBuf> {
         .map(|_| path)
 }
 
+fn retained_ssh_runtime_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    data_dir
+        .join("runtime")
+        .join("ssh-known-hosts")
+        .join(agent_hash)
+}
+
+fn prepare_retained_ssh_known_hosts(data_dir: &Path, agent_id: &str) -> Result<PathBuf> {
+    let runtime_dir = retained_ssh_runtime_dir(data_dir, agent_id);
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create retained SSH host-key directory {}: {error}",
+            runtime_dir.display()
+        ))
+    })?;
+    set_private_directory_permissions(&runtime_dir)?;
+
+    let known_hosts = runtime_dir.join("known_hosts");
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&known_hosts).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create retained SSH host-key file {}: {error}",
+            known_hosts.display()
+        ))
+    })?;
+    set_private_file_permissions(&known_hosts)?;
+    Ok(runtime_dir)
+}
+
 fn apply_ssh_agent_forwarding(
     access: &HostSshAgentAccess,
+    retained_known_hosts: &Path,
     volumes: &mut Vec<VolumeMount>,
     environment: &mut Vec<String>,
 ) {
@@ -1916,6 +1961,13 @@ fn apply_ssh_agent_forwarding(
         "XPRESSCLAW_SSH_FORWARDING_GENERATION={}",
         access.generation
     ));
+
+    volumes.push(VolumeMount {
+        source: retained_known_hosts.display().to_string(),
+        target: SSH_RUNTIME_DIR_TARGET.to_string(),
+        read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
 
     let mut command = String::from("ssh");
     if let Some(config) = &access.config {
@@ -2632,10 +2684,17 @@ mod tests {
         let access = discover_host_ssh_agent_from(vec![socket.clone()], Some(&root)).unwrap();
         assert_eq!(access.socket, socket);
         assert!(!access.generation.is_empty());
+        let retained_known_hosts =
+            prepare_retained_ssh_known_hosts(&root.join("data"), "エリ-codex").unwrap();
 
         let mut volumes = Vec::new();
         let mut environment = Vec::new();
-        apply_ssh_agent_forwarding(&access, &mut volumes, &mut environment);
+        apply_ssh_agent_forwarding(
+            &access,
+            &retained_known_hosts,
+            &mut volumes,
+            &mut environment,
+        );
 
         assert!(volumes.iter().any(|mount| {
             mount.source == socket.display().to_string()
@@ -2649,6 +2708,12 @@ mod tests {
         assert!(volumes
             .iter()
             .any(|mount| mount.target == SSH_KNOWN_HOSTS_TARGET && mount.read_only));
+        assert!(volumes.iter().any(|mount| {
+            mount.source == retained_known_hosts.display().to_string()
+                && mount.target == SSH_RUNTIME_DIR_TARGET
+                && !mount.read_only
+                && mount.selinux_relabel == SelinuxRelabel::Shared
+        }));
         assert!(!volumes
             .iter()
             .any(|mount| mount.source.ends_with("id_ed25519")));
@@ -2662,7 +2727,42 @@ mod tests {
         assert!(git_ssh.contains(SSH_AGENT_SOCKET_TARGET));
         assert!(git_ssh.contains(SSH_CONFIG_TARGET));
         assert!(git_ssh.contains(SSH_KNOWN_HOSTS_TARGET));
+        assert!(git_ssh.contains(SSH_RETAINED_KNOWN_HOSTS));
         assert!(git_ssh.contains("StrictHostKeyChecking=accept-new"));
+
+        let retained_file = retained_known_hosts.join("known_hosts");
+        std::fs::write(&retained_file, "learned.example ssh-ed25519 learned\n").unwrap();
+        let after_recreation =
+            prepare_retained_ssh_known_hosts(&root.join("data"), "エリ-codex").unwrap();
+        assert_eq!(after_recreation, retained_known_hosts);
+        assert_eq!(
+            std::fs::read_to_string(after_recreation.join("known_hosts")).unwrap(),
+            "learned.example ssh-ed25519 learned\n"
+        );
+        let leaf = retained_known_hosts.file_name().unwrap().to_string_lossy();
+        assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!retained_known_hosts.display().to_string().contains("エリ"));
+        assert_ne!(
+            retained_known_hosts,
+            retained_ssh_runtime_dir(&root.join("data"), "another-agent")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&retained_known_hosts)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&retained_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         let first_generation = access.generation;
         let replacement_config = ssh_dir.join("config.next");
