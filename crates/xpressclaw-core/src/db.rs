@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 
@@ -280,133 +281,307 @@ fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) 
     Ok(())
 }
 
+struct LegacyComponents {
+    parents: Vec<usize>,
+    ranks: Vec<u8>,
+}
+
+impl LegacyComponents {
+    fn new(node_count: usize) -> Self {
+        Self {
+            parents: (0..node_count).collect(),
+            ranks: vec![0; node_count],
+        }
+    }
+
+    fn find(&mut self, node: usize) -> usize {
+        let parent = self.parents[node];
+        if parent != node {
+            self.parents[node] = self.find(parent);
+        }
+        self.parents[node]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let mut left_root = self.find(left);
+        let mut right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+        if self.ranks[left_root] < self.ranks[right_root] {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        self.parents[right_root] = left_root;
+        if self.ranks[left_root] == self.ranks[right_root] {
+            self.ranks[left_root] += 1;
+        }
+    }
+}
+
 /// Before Projects existed, conversations and task hierarchies could contain
 /// several Agents. Migration v33 initially gives each Agent its own Project;
 /// merge every connected legacy collaboration component so the new Project
 /// invariants hold without losing conversations, tasks, or vector-indexed
 /// memory.
 fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
-    let mappings = {
+    let agents = {
+        let mut statement = transaction.prepare("SELECT id, project_id FROM agents")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, Option<String>)>, _>>()?;
+        rows
+    };
+    let conversations = {
+        let mut statement = transaction.prepare("SELECT id, project_id FROM conversations")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, Option<String>)>, _>>()?;
+        rows
+    };
+    let tasks = {
         let mut statement = transaction.prepare(
-            "WITH RECURSIVE
-             task_agents(task_id, agent_id) AS (
-                 SELECT task.id, agent.id
-                 FROM tasks task
-                 JOIN agents agent ON agent.id = task.agent_id
-                 UNION
-                 SELECT task.id, agent.id
-                 FROM tasks task
-                 JOIN conversation_participants participant
-                   ON participant.conversation_id = task.conversation_id
-                  AND participant.participant_type = 'agent'
-                 JOIN agents agent ON agent.id = participant.participant_id
-             ),
-             task_links(origin, peer) AS (
-                 SELECT id, id FROM tasks
-                 UNION
-                 SELECT parent_task_id, id
-                 FROM tasks
-                 WHERE parent_task_id IS NOT NULL
-                 UNION
-                 SELECT id, parent_task_id
-                 FROM tasks
-                 WHERE parent_task_id IS NOT NULL
-             ),
-             task_reachable(origin, peer) AS (
-                 SELECT origin, peer FROM task_links
-                 UNION
-                 SELECT task_reachable.origin, task_links.peer
-                 FROM task_reachable
-                 JOIN task_links ON task_links.origin = task_reachable.peer
-             ),
-             links(origin, peer) AS (
-                 SELECT id, id FROM agents
-                 UNION
-                 SELECT own.participant_id, peer.participant_id
-                 FROM conversation_participants own
-                 JOIN conversation_participants peer
-                  ON peer.conversation_id = own.conversation_id
-                  AND peer.participant_type = 'agent'
-                 WHERE own.participant_type = 'agent'
-                 UNION
-                 SELECT own.agent_id, peer.agent_id
-                 FROM task_reachable hierarchy
-                 JOIN task_agents own ON own.task_id = hierarchy.origin
-                 JOIN task_agents peer ON peer.task_id = hierarchy.peer
-             ),
-             reachable(origin, peer) AS (
-                 SELECT origin, peer FROM links
-                 UNION
-                 SELECT reachable.origin, links.peer
-                 FROM reachable JOIN links ON links.origin = reachable.peer
-             ),
-             components(agent_id, root_agent_id) AS (
-                 SELECT origin, MIN(peer) FROM reachable GROUP BY origin
-             )
-             SELECT agent.id, agent.project_id, root.project_id
-             FROM components
-             JOIN agents agent ON agent.id = components.agent_id
-             JOIN agents root ON root.id = components.root_agent_id
-             WHERE agent.project_id IS NOT NULL AND root.project_id IS NOT NULL",
+            "SELECT id, agent_id, conversation_id, parent_task_id, project_id FROM tasks",
         )?;
-        let mappings = statement
+        let rows = statement
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
                 ))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        mappings
+            .collect::<std::result::Result<
+                Vec<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )>,
+                _,
+            >>()?;
+        rows
     };
-
-    for (agent_id, source_project_id, target_project_id) in mappings {
-        if source_project_id == target_project_id {
-            continue;
-        }
-        crate::memory::project::move_project_memory(
-            transaction,
-            &source_project_id,
-            &target_project_id,
-        )?;
-        transaction.execute(
-            "UPDATE agents SET project_id = ?1 WHERE id = ?2",
-            rusqlite::params![target_project_id, agent_id],
-        )?;
-        transaction.execute(
-            "UPDATE tasks SET project_id = ?1 WHERE project_id = ?2",
-            rusqlite::params![target_project_id, source_project_id],
-        )?;
-    }
-    transaction.execute(
-        "UPDATE conversations
-         SET project_id = (
-             SELECT agent.project_id
+    let participants = {
+        let mut statement = transaction.prepare(
+            "SELECT participant.conversation_id, participant.participant_id
              FROM conversation_participants participant
              JOIN agents agent ON agent.id = participant.participant_id
-             WHERE participant.conversation_id = conversations.id
-               AND participant.participant_type = 'agent'
-             ORDER BY participant.joined_at, participant.participant_id
-             LIMIT 1
-         )
-         WHERE EXISTS (
-             SELECT 1 FROM conversation_participants participant
-             WHERE participant.conversation_id = conversations.id
-               AND participant.participant_type = 'agent'
-         )",
-        [],
-    )?;
-    transaction.execute(
-        "UPDATE tasks
-         SET project_id = (
-             SELECT conversation.project_id
-             FROM conversations conversation
-             WHERE conversation.id = tasks.conversation_id
-         )
-         WHERE conversation_id IS NOT NULL",
-        [],
-    )?;
+             WHERE participant.participant_type = 'agent'",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, String)>, _>>()?;
+        rows
+    };
+
+    let conversation_offset = agents.len();
+    let task_offset = conversation_offset + conversations.len();
+    let mut components = LegacyComponents::new(task_offset + tasks.len());
+    let agent_indexes: HashMap<&str, usize> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), index))
+        .collect();
+    let conversation_indexes: HashMap<&str, usize> = conversations
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), conversation_offset + index))
+        .collect();
+    let task_indexes: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, (id, ..))| (id.as_str(), task_offset + index))
+        .collect();
+
+    // Existing Project ownership is itself a collaboration edge. This also
+    // makes the source-to-target Project mapping unambiguous if an older
+    // migration attempt already attached several objects to one Project.
+    let mut project_anchors = HashMap::<String, usize>::new();
+    for (index, (_, project_id)) in agents.iter().enumerate() {
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+    for (index, (_, project_id)) in conversations.iter().enumerate() {
+        let index = conversation_offset + index;
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+    for (index, (_, _, _, _, project_id)) in tasks.iter().enumerate() {
+        let index = task_offset + index;
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+
+    for (conversation_id, agent_id) in &participants {
+        if let (Some(conversation), Some(agent)) = (
+            conversation_indexes.get(conversation_id.as_str()),
+            agent_indexes.get(agent_id.as_str()),
+        ) {
+            components.union(*conversation, *agent);
+        }
+    }
+    for (index, (_, agent_id, conversation_id, parent_task_id, _)) in tasks.iter().enumerate() {
+        let task = task_offset + index;
+        if let Some(agent) = agent_id
+            .as_deref()
+            .and_then(|agent_id| agent_indexes.get(agent_id))
+        {
+            components.union(task, *agent);
+        }
+        if let Some(conversation) = conversation_id
+            .as_deref()
+            .and_then(|conversation_id| conversation_indexes.get(conversation_id))
+        {
+            components.union(task, *conversation);
+        }
+        if let Some(parent) = parent_task_id
+            .as_deref()
+            .and_then(|parent_task_id| task_indexes.get(parent_task_id))
+        {
+            components.union(task, *parent);
+        }
+    }
+
+    // Prefer the lexicographically first Agent's Project, matching the old
+    // deterministic consolidation behavior. Components without an Agent keep
+    // their lexicographically first existing Project.
+    let mut component_targets = HashMap::<usize, (u8, String, String)>::new();
+    {
+        let mut consider_target = |node: usize, priority: u8, key: &str, project_id: &str| {
+            let root = components.find(node);
+            let candidate = (priority, key.to_string(), project_id.to_string());
+            if component_targets
+                .get(&root)
+                .is_none_or(|current| &candidate < current)
+            {
+                component_targets.insert(root, candidate);
+            }
+        };
+        for (index, (agent_id, project_id)) in agents.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(index, 0, agent_id, project_id);
+            }
+        }
+        for (index, (_, project_id)) in conversations.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(conversation_offset + index, 1, project_id, project_id);
+            }
+        }
+        for (index, (_, _, _, _, project_id)) in tasks.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(task_offset + index, 1, project_id, project_id);
+            }
+        }
+    }
+
+    fn record_project_target(
+        project_targets: &mut HashMap<String, String>,
+        source_project_id: Option<&String>,
+        target_project_id: &str,
+    ) -> Result<()> {
+        let Some(source_project_id) = source_project_id else {
+            return Ok(());
+        };
+        if let Some(existing) = project_targets.get(source_project_id) {
+            if existing != target_project_id {
+                return Err(Error::Database(format!(
+                    "legacy project {source_project_id} belongs to multiple collaboration components"
+                )));
+            }
+        } else {
+            project_targets.insert(source_project_id.clone(), target_project_id.to_string());
+        }
+        Ok(())
+    }
+
+    let mut project_targets = HashMap::<String, String>::new();
+    let mut agent_updates = Vec::<(String, String)>::new();
+    for (index, (agent_id, source_project_id)) in agents.iter().enumerate() {
+        let root = components.find(index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            agent_updates.push((agent_id.clone(), target_project_id.clone()));
+        }
+    }
+    let mut conversation_updates = Vec::<(String, String)>::new();
+    for (index, (conversation_id, source_project_id)) in conversations.iter().enumerate() {
+        let root = components.find(conversation_offset + index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            conversation_updates.push((conversation_id.clone(), target_project_id.clone()));
+        }
+    }
+    let mut task_updates = Vec::<(String, String)>::new();
+    for (index, (task_id, _, _, _, source_project_id)) in tasks.iter().enumerate() {
+        let root = components.find(task_offset + index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            task_updates.push((task_id.clone(), target_project_id.clone()));
+        }
+    }
+
+    let mut project_moves = project_targets.into_iter().collect::<Vec<_>>();
+    project_moves.sort();
+    for (source_project_id, target_project_id) in project_moves {
+        if source_project_id != target_project_id {
+            crate::memory::project::move_project_memory(
+                transaction,
+                &source_project_id,
+                &target_project_id,
+            )?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE agents SET project_id = ?1 WHERE id = ?2")?;
+        for (agent_id, project_id) in agent_updates {
+            statement.execute(rusqlite::params![project_id, agent_id])?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE conversations SET project_id = ?1 WHERE id = ?2")?;
+        for (conversation_id, project_id) in conversation_updates {
+            statement.execute(rusqlite::params![project_id, conversation_id])?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE tasks SET project_id = ?1 WHERE id = ?2")?;
+        for (task_id, project_id) in task_updates {
+            statement.execute(rusqlite::params![project_id, task_id])?;
+        }
+    }
     transaction.execute(
         "DELETE FROM projects
          WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.project_id = projects.id)
@@ -1552,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn v34_merges_agents_connected_through_an_unassigned_task() {
+    fn v34_merges_agents_and_adopts_every_task_in_their_hierarchy() {
         ensure_sqlite_vec();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -1567,8 +1742,10 @@ mod tests {
             "INSERT INTO agents (id, name, backend, config)
              VALUES ('atlas', 'Atlas', 'native', '{}'),
                     ('builder', 'Builder', 'native', '{}');
-             INSERT INTO tasks (id, title, agent_id)
-             VALUES ('parent', 'Atlas parent', 'atlas');
+             INSERT INTO tasks (id, title)
+             VALUES ('root', 'Unassigned root');
+             INSERT INTO tasks (id, title, agent_id, parent_task_id)
+             VALUES ('parent', 'Atlas parent', 'atlas', 'root');
              INSERT INTO tasks (id, title, parent_task_id)
              VALUES ('reported-step', 'Unassigned reported step', 'parent');
              INSERT INTO tasks (id, title, agent_id, parent_task_id)
@@ -1581,7 +1758,7 @@ mod tests {
         backfill_pending_conversation_turns(&transaction).unwrap();
         transaction.commit().unwrap();
 
-        let projects_after_v33: Vec<(String, String)> = conn
+        let projects_after_v33: Vec<(String, Option<String>)> = conn
             .prepare("SELECT id, project_id FROM tasks ORDER BY id")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -1591,9 +1768,10 @@ mod tests {
         assert_eq!(
             projects_after_v33,
             vec![
-                ("grandchild".into(), "builder".into()),
-                ("parent".into(), "atlas".into()),
-                ("reported-step".into(), "atlas".into()),
+                ("grandchild".into(), Some("builder".into())),
+                ("parent".into(), Some("atlas".into())),
+                ("reported-step".into(), Some("atlas".into())),
+                ("root".into(), None),
             ]
         );
 
@@ -1617,7 +1795,61 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(task_projects, vec!["atlas"; 3]);
+        assert_eq!(task_projects, vec!["atlas"; 4]);
+    }
+
+    #[test]
+    fn legacy_consolidation_handles_a_large_task_hierarchy_without_pairwise_closure() {
+        let db = Database::open_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('atlas', 'Atlas'), ('builder', 'Builder');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'atlas'),
+                        ('builder', 'Builder', 'native', '{}', 'builder');",
+            )?;
+            let transaction = conn.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO tasks (id, title, parent_task_id, agent_id, project_id)
+                     VALUES (?1, ?1, ?2, ?3, ?4)",
+                )?;
+                let mut parent = None::<String>;
+                for index in 0..2_000 {
+                    let id = format!("task-{index:04}");
+                    let (agent_id, project_id) = match index {
+                        0 => (Some("atlas"), Some("atlas")),
+                        1_999 => (Some("builder"), Some("builder")),
+                        _ => (None, None),
+                    };
+                    statement.execute(rusqlite::params![id, parent, agent_id, project_id])?;
+                    parent = Some(format!("task-{index:04}"));
+                }
+            }
+            consolidate_legacy_conversation_projects(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let adopted: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id = 'atlas'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(adopted, 2_000);
+            let builder_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'builder'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(builder_project, "atlas");
+        });
     }
 
     #[test]
