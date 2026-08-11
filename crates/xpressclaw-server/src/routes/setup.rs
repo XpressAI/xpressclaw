@@ -1017,14 +1017,6 @@ async fn add_session(
         .map(str::trim)
         .filter(|project_id| !project_id.is_empty())
         .map(str::to_owned);
-    if let Some(project_id) = target_project_id.as_deref() {
-        xpressclaw_core::projects::ProjectManager::new(state.db.clone())
-            .get(project_id)
-            .map_err(|error| match error {
-                xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
-                _ => internal_error(error),
-            })?;
-    }
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let mut runner = runner_from_setup(&req);
@@ -1061,25 +1053,37 @@ async fn add_session(
         // policies, memory, system, and future configuration fields.
         ..old_config.as_ref().clone()
     };
-    new_config
-        .save(&state.config_path)
-        .map_err(internal_error)?;
+    // Register the durable Agent. ACP workers are started per
+    // attempt, so there is no long-running agent to auto-start. When an
+    // existing Project is selected, attach the Agent under one database write
+    // reservation before saving its configuration. Project deletion then
+    // either wins first (and no config is written) or observes the new Agent
+    // and is rejected as non-empty.
+    let registry = AgentRegistry::new(state.db.clone());
+    let record = if let Some(project_id) = target_project_id.as_deref() {
+        let record = registry
+            .create_in_project(&agent_config.name, &agent_config.backend, project_id)
+            .map_err(|error| match error {
+                xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+                _ => internal_error(error),
+            })?;
+        if let Err(error) = new_config.save(&state.config_path) {
+            let _ = registry.delete(&record.id);
+            return Err(internal_error(error));
+        }
+        record
+    } else {
+        new_config
+            .save(&state.config_path)
+            .map_err(internal_error)?;
+        registry
+            .ensure(&agent_config.name, &agent_config.backend)
+            .map_err(internal_error)?
+    };
     info!(
         name = agent_config.name,
         "added ACP project to configuration"
     );
-
-    // Register the durable Agent. ACP workers are started per
-    // attempt, so there is no long-running agent to auto-start.
-    let registry = AgentRegistry::new(state.db.clone());
-    let record = registry
-        .ensure(&agent_config.name, &agent_config.backend)
-        .map_err(internal_error)?;
-    if let Some(project_id) = target_project_id.as_deref() {
-        xpressclaw_core::projects::ProjectManager::new(state.db.clone())
-            .assign_agent(project_id, &record.id)
-            .map_err(internal_error)?;
-    }
     xpressclaw_core::sessions::SessionManager::new(state.db.clone())
         .ensure(&record.id, Some(&title))
         .map_err(internal_error)?;
@@ -2709,6 +2713,41 @@ mod tests {
             Some("/tmp/website")
         );
         let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[tokio::test]
+    async fn add_session_rejects_a_missing_project_without_persisting_an_agent() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-add-session-missing-project-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = Arc::new(Database::open_memory().unwrap());
+        let config = Arc::new(Config::load_default().unwrap());
+        let state = AppState::new(config, db.clone(), None, config_path.clone(), false);
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/add-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "project_id": "deleted-project",
+                            "runner_kind": "codex",
+                            "runner_workspace": "/tmp/website"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(AgentRegistry::new(db).get("website-codex").is_err());
+        assert!(!config_path.exists());
     }
 
     #[tokio::test]

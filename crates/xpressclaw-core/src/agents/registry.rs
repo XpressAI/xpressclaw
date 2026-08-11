@@ -77,6 +77,48 @@ impl AgentRegistry {
         self.get(name)
     }
 
+    /// Create a new Agent directly inside an existing Project.
+    ///
+    /// Reserving the SQLite writer before validating the Project keeps Project
+    /// deletion from committing between validation and Agent attachment. This
+    /// deliberately uses `INSERT`, not `INSERT OR IGNORE`: callers creating a
+    /// new configured Agent must not silently adopt an unrelated stale row.
+    pub fn create_in_project(
+        &self,
+        name: &str,
+        backend: &str,
+        project_id: &str,
+    ) -> Result<AgentRecord> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !project_exists {
+                return Err(Error::ProjectNotFound {
+                    id: project_id.to_string(),
+                });
+            }
+            transaction.execute(
+                "INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES (?1, ?1, ?2, '{}', 'stopped', ?3)",
+                rusqlite::params![name, backend, project_id],
+            )?;
+            transaction.execute(
+                "UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [project_id],
+            )?;
+            transaction.commit()?;
+            Ok::<(), Error>(())
+        })?;
+        self.get(name)
+    }
+
     pub fn get(&self, agent_id: &str) -> Result<AgentRecord> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -395,6 +437,51 @@ mod tests {
             })
             .unwrap();
         assert!(!shadow_project);
+    }
+
+    #[test]
+    fn creating_an_agent_reserves_its_existing_project_and_fails_closed() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('shared', 'Shared')",
+                [],
+            )
+        })
+        .unwrap();
+        let registry = AgentRegistry::new(db.clone());
+
+        let agent = registry
+            .create_in_project("reviewer", "codex", "shared")
+            .unwrap();
+        assert_eq!(agent.project_id.as_deref(), Some("shared"));
+        let shadow_project = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = 'reviewer')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(!shadow_project);
+
+        let missing = registry.create_in_project("orphan", "codex", "deleted");
+        assert!(matches!(missing, Err(Error::ProjectNotFound { .. })));
+        assert!(matches!(
+            registry.get("orphan"),
+            Err(Error::AgentNotFound { .. })
+        ));
+        let orphan_project = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = 'orphan')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(!orphan_project);
     }
 
     #[test]
