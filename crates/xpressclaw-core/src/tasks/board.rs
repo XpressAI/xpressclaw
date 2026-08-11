@@ -159,11 +159,17 @@ impl TaskBoard {
             .and_then(|context| context.get("project_id"))
             .and_then(serde_json::Value::as_str);
 
-        {
-            let conn = self.db.conn();
+        self.db.with_conn(|conn| {
+            // Reserve the writer before resolving any ownership inputs. Agent,
+            // Conversation, and parent-task moves must not be able to invalidate
+            // the Project boundary between validation and task insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let conversation_project = if let Some(conversation_id) = req.conversation_id.as_deref()
             {
-                let project = conn
+                let project = transaction
                     .query_row(
                         "SELECT project_id FROM conversations WHERE id = ?1",
                         [conversation_id],
@@ -182,7 +188,7 @@ impl TaskBoard {
                 None
             };
             if let Some(project_id) = requested_project {
-                let exists = conn.query_row(
+                let exists = transaction.query_row(
                     "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
                     [project_id],
                     |row| row.get::<_, bool>(0),
@@ -194,7 +200,7 @@ impl TaskBoard {
                 }
             }
             let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
-                conn.query_row(
+                transaction.query_row(
                     "SELECT project_id FROM agents WHERE id = ?1",
                     [agent_id],
                     |row| row.get::<_, Option<String>>(0),
@@ -205,7 +211,7 @@ impl TaskBoard {
                 None
             };
             let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
-                conn.query_row(
+                transaction.query_row(
                     "SELECT project_id FROM tasks WHERE id = ?1",
                     [parent_task_id],
                     |row| row.get::<_, Option<String>>(0),
@@ -222,7 +228,7 @@ impl TaskBoard {
                 ("Agent", agent_project.as_deref()),
                 ("parent task", parent_project.as_deref()),
             ])?;
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
@@ -241,7 +247,9 @@ impl TaskBoard {
                     project_id,
                 ],
             )?;
-        }
+            transaction.commit()?;
+            Ok::<(), Error>(())
+        })?;
 
         self.get(&id)
     }

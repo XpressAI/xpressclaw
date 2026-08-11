@@ -4,6 +4,7 @@ pub mod runtime;
 
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -559,6 +560,96 @@ impl ConversationManager {
         })
     }
 
+    /// Store an Agent-authored message only while its Conversation membership
+    /// and optional source task still belong to the same routing scope.
+    pub fn send_agent_routed_message_with_attachments(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        source_task_id: Option<&str>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        validate_new_attachments(attachments)?;
+        if msg.sender_type != "agent" {
+            return Err(Error::Conversation(
+                "Agent message validation requires an Agent sender".into(),
+            ));
+        }
+        self.db.with_conn(|conn| {
+            // Membership removal and source-task reassignment must not be able
+            // to interleave between validation, publication, and peer routing.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_participants
+                    WHERE conversation_id = ?1
+                      AND participant_type = 'agent'
+                      AND participant_id = ?2
+                )",
+                rusqlite::params![conv_id, msg.sender_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !is_participant {
+                return Err(Error::Conversation(
+                    "Agent is not a participant in this conversation".into(),
+                ));
+            }
+
+            if let Some(source_task_id) = source_task_id {
+                let task_scope = transaction
+                    .query_row(
+                        "SELECT agent_id, conversation_id FROM tasks WHERE id = ?1",
+                        [source_task_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((agent_id, conversation_id)) = task_scope else {
+                    return Err(Error::TaskNotFound {
+                        id: source_task_id.to_string(),
+                    });
+                };
+                if agent_id.as_deref() != Some(msg.sender_id.as_str())
+                    || conversation_id.as_deref() != Some(conv_id)
+                {
+                    return Err(Error::Conversation(
+                        "source task is not linked to this Agent and conversation".into(),
+                    ));
+                }
+            }
+
+            let (message, attachments) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                source_task_id,
+                None,
+                attachments,
+            )?;
+            let queued_agents = runtime::ConversationTurnQueue::enqueue_for_message_in_transaction(
+                &transaction,
+                conv_id,
+                message.id,
+                &msg.sender_type,
+                &msg.sender_id,
+                &msg.content,
+            )?;
+            transaction.commit()?;
+            Ok((message, attachments, queued_agents))
+        })
+    }
+
     fn insert_structured_message(
         transaction: &rusqlite::Transaction<'_>,
         conv_id: &str,
@@ -1099,6 +1190,66 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].id, m1.id);
         assert_eq!(msgs[1].id, m2.id);
+    }
+
+    #[test]
+    fn agent_publication_requires_current_membership_and_source_task_scope() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Scoped Agent messages".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let board = crate::tasks::board::TaskBoard::new(mgr.db.clone());
+        let source_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Publish findings".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some(conv.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let detached_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Private work".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = SendMessage {
+            sender_type: "agent".into(),
+            sender_id: "atlas".into(),
+            sender_name: Some("Atlas".into()),
+            content: "The findings are ready.".into(),
+            message_type: None,
+        };
+
+        mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&source_task.id),
+            &[],
+        )
+        .unwrap();
+        let mismatched = mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&detached_task.id),
+            &[],
+        );
+        assert!(matches!(mismatched, Err(Error::Conversation(_))));
+
+        mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
+        let removed = mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&source_task.id),
+            &[],
+        );
+        assert!(matches!(removed, Err(Error::Conversation(_))));
+        assert_eq!(mgr.get_messages(&conv.id, 50, None).unwrap().len(), 1);
     }
 
     #[test]

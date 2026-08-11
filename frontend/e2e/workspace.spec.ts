@@ -327,7 +327,9 @@ async function mockApi(
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
 				options.conversationTaskRequests?.push(payload);
-				response = { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
+				response = payload.workflow_id
+					? { workflow_instance_id: 'conversation-workflow-instance' }
+					: { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
 			} else response = listedTasks.filter((listedTask) => listedTask.conversation_id === conversationId);
 		} else if (path === `/api/conversations/${conversationId}/turns`) {
 			response = [];
@@ -358,6 +360,19 @@ async function mockApi(
 			} else {
 				response = options.workflows ?? [];
 			}
+		} else if (/^\/api\/workflows\/instances\/[^/]+$/.test(path)) {
+			response = {
+				instance: {
+					id: path.split('/')[4], workflow_id: 'workflow-review-loop', status: 'running',
+					current_flow: 'main', current_step_index: 0, trigger_data: '{}', variable_store: '{}',
+					loop_state: null, started_at: timestamp(200), completed_at: null, error_message: null,
+				},
+				step_executions: [{
+					id: 'conversation-workflow-step', instance_id: path.split('/')[4], flow_name: 'main',
+					step_id: 'implement', task_id: taskId, status: 'running', input_context: null,
+					output: null, attempt: 1, started_at: timestamp(200), completed_at: null,
+				}],
+			};
 		} else if (/^\/api\/workflows\/[^/]+\/instances$/.test(path)) {
 			response = [];
 		} else if (/^\/api\/workflows\/[^/]+\/run$/.test(path)) {
@@ -1115,6 +1130,63 @@ flows:
 		},
 	}]);
 	expect(queuedSessionMessages).toEqual([]);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+});
+
+test('new work opens the task created by a conversation workflow', async ({ page }) => {
+	const conversationTaskRequests: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Release planning',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_message_at: timestamp(2),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) },
+			],
+		}],
+		conversationTaskRequests,
+		workflows: [{
+			id: 'workflow-review-loop',
+			name: 'Code Review Loop',
+			description: 'Implement and review linked Conversation work.',
+			yaml_content: `name: code-review-loop
+inputs:
+  goal:
+    type: string
+    required: true
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: "${agentId}"
+        prompt: "Implement @goal"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+	await page.goto('/');
+
+	await page.getByLabel('Conversation', { exact: true }).selectOption(conversationId);
+	await page.getByLabel('Workflow').selectOption('workflow-review-loop');
+	await page.getByPlaceholder('Describe the outcome you want…').fill('Review the release changes');
+	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
+
+	await expect.poll(() => conversationTaskRequests).toEqual([{
+		title: 'Review the release changes',
+		workflow_id: 'workflow-review-loop',
+		workflow_inputs: { goal: 'Review the release changes' },
+	}]);
 	await expect(page).toHaveURL(`/tasks/${taskId}`);
 });
 

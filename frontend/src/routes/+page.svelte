@@ -285,7 +285,11 @@
 			workflow_inputs: inputs,
 		});
 		if (!('workflow_instance_id' in result)) throw new Error('The conversation workflow did not start');
-		return workflowsApi.getInstance(result.workflow_instance_id);
+		const details = await workflowsApi.getInstance(result.workflow_instance_id);
+		const currentTaskId = [...details.step_executions]
+			.reverse()
+			.find((execution) => execution.task_id)?.task_id ?? null;
+		return { ...details.instance, current_task_id: currentTaskId };
 	}
 
 	async function addImages(files: File[]) {

@@ -952,6 +952,11 @@ export interface StepExecution {
 	completed_at: string | null;
 }
 
+export interface WorkflowInstanceDetails {
+	instance: WorkflowInstance;
+	step_executions: StepExecution[];
+}
+
 export const workflows = {
 	list: () => request<Workflow[]>('/api/workflows'),
 	create: (data: { name: string; description?: string; yaml_content: string }) =>
@@ -969,6 +974,6 @@ export const workflows = {
 		return request<WorkflowInstance>(`/api/workflows/${id}/run${query ? `?${query}` : ''}`, { method: 'POST', body: JSON.stringify(triggerData || {}) });
 	},
 	instances: (id: string) => request<WorkflowInstance[]>(`/api/workflows/${id}/instances`),
-	getInstance: (instanceId: string) => request<WorkflowInstance>(`/api/workflows/instances/${instanceId}`),
+	getInstance: (instanceId: string) => request<WorkflowInstanceDetails>(`/api/workflows/instances/${instanceId}`),
 	cancelInstance: (instanceId: string) => request<void>(`/api/workflows/instances/${instanceId}/cancel`, { method: 'POST' }),
 };

@@ -316,26 +316,6 @@ async fn send_agent_message(
     }
     let attachments = decode_attachments(request.attachments, request.source_task_id.as_deref())?;
     let manager = ConversationManager::new(state.db.clone());
-    let conversation = manager.get(&id).map_err(api_error)?;
-    if !conversation.participants.iter().any(|participant| {
-        participant.participant_type == "agent" && participant.participant_id == request.agent_id
-    }) {
-        return Err(bad_request(
-            "Agent is not a participant in this conversation",
-        ));
-    }
-    if let Some(source_task_id) = request.source_task_id.as_deref() {
-        let task = TaskBoard::new(state.db.clone())
-            .get(source_task_id)
-            .map_err(api_error)?;
-        if task.agent_id.as_deref() != Some(request.agent_id.as_str())
-            || task.conversation_id.as_deref() != Some(id.as_str())
-        {
-            return Err(bad_request(
-                "source task is not linked to this Agent and conversation",
-            ));
-        }
-    }
     let sender_name = state
         .config()
         .agents
@@ -344,7 +324,7 @@ async fn send_agent_message(
         .map(|agent| agent.context_label())
         .unwrap_or_else(|| request.agent_id.clone());
     let (message, attachments, queued_agents) = manager
-        .send_routed_message_with_attachments(
+        .send_agent_routed_message_with_attachments(
             &id,
             &SendMessage {
                 sender_type: "agent".into(),
@@ -354,7 +334,6 @@ async fn send_agent_message(
                 message_type: None,
             },
             request.source_task_id.as_deref(),
-            None,
             &attachments,
         )
         .map_err(api_error)?;
