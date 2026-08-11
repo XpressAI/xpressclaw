@@ -118,13 +118,16 @@ connector is available. No SSH key is needed for that path.
 
 For GitLab, self-hosted Git servers, SSH host aliases, or a GitHub repository
 without connector access, enable `runner.ssh_agent_forwarding`. XpressClaw
-bind-mounts the live SSH-agent Unix socket and read-only copies of
-`~/.ssh/config` and `~/.ssh/known_hosts` when they exist. Private-key files are
-never mounted. New host keys accepted by the runner are kept in private,
+bind-mounts the live SSH-agent Unix socket and `~/.ssh/known_hosts` when it
+exists. It materializes a private, read-only configuration from
+`~/.ssh/config` and recursively referenced regular `Include` files under the
+host home directory, preserving their lexical order and inline position.
+Private-key-like include files and private keys are never exposed to the
+container. New host keys accepted by the runner are kept in private,
 Agent-scoped storage under XpressClaw's data directory, so changed-key checks
 survive retained-container recreation. The container is recreated
-automatically when the host agent replaces its socket or an editor atomically
-replaces the mounted SSH config or known-host file.
+automatically when the host agent replaces its socket or the effective SSH
+configuration or known-host source changes.
 
 The setting is deliberately opt-in: every process in that Agent's retained
 container can request signatures from every key currently loaded in the host

@@ -25,19 +25,21 @@ When enabled, XpressClaw:
 
 - discovers `SSH_AUTH_SOCK` and common desktop/user-service Unix socket
   locations, and refuses to start the runner when none is live;
-- bind-mounts only that Unix socket, plus read-only `~/.ssh/config` and
-  `~/.ssh/known_hosts` files when present; private-key files are never read or
-  mounted;
+- bind-mounts only that Unix socket and the read-only host
+  `~/.ssh/known_hosts` file when present, and materializes a private read-only
+  configuration from `~/.ssh/config` plus recursively selected regular
+  `Include` files under the host home directory; private-key-like include
+  files and private keys are never exposed to the container;
 - points Git's SSH transport at the forwarded socket, keeps new host keys in
   private Agent-scoped storage under XpressClaw's data directory so they
   survive container recreation, and uses the host known-host set as an
   additional trust source;
 - uses a shared SELinux label for those explicit mounts and adds the socket's
   host group to the container, matching rootless Podman and Docker hosts; and
-- includes opaque device/inode generations for the socket, SSH config, and
-  known-host sources in the retained-container specification, so atomically
-  replacing any mounted source at the same pathname rebinds a new project
-  container on the next turn.
+- includes opaque socket and known-host device/inode generations plus the
+  effective materialized SSH configuration in the retained-container
+  specification, so replacing any source or changing an included config
+  recreates the project container on the next turn.
 
 Setup inspects only Git metadata to flag workspaces with SSH remotes. Both
 setup and Agent settings show whether a live host agent was detected and warn
