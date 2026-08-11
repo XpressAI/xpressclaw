@@ -268,41 +268,52 @@ impl ProjectManager {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        let _ = self.get(id)?;
-        let (agents, conversations, tasks): (i64, i64, i64) = self.db.with_conn(|conn| {
-            Ok::<_, rusqlite::Error>((
-                conn.query_row(
+        self.db.with_conn(|conn| {
+            // Acquire the SQLite write reservation before checking whether the
+            // Project is empty. This keeps another connection from attaching
+            // an Agent, Conversation, or Task between validation and deletion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::ProjectNotFound { id: id.to_string() });
+            }
+            let (agents, conversations, tasks): (i64, i64, i64) = (
+                transaction.query_row(
                     "SELECT COUNT(*) FROM agents WHERE project_id = ?1",
                     [id],
                     |row| row.get(0),
                 )?,
-                conn.query_row(
+                transaction.query_row(
                     "SELECT COUNT(*) FROM conversations WHERE project_id = ?1",
                     [id],
                     |row| row.get(0),
                 )?,
-                conn.query_row(
+                transaction.query_row(
                     "SELECT COUNT(*) FROM tasks WHERE project_id = ?1",
                     [id],
                     |row| row.get(0),
                 )?,
-            ))
-        })?;
-        if agents + conversations + tasks > 0 {
-            return Err(Error::Project(
-                "move or remove this project's agents, conversations, and tasks first".into(),
-            ));
-        }
-        self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            );
+            if agents + conversations + tasks > 0 {
+                return Err(Error::Project(
+                    "move or remove this project's agents, conversations, and tasks first".into(),
+                ));
+            }
             transaction.execute(
                 "DELETE FROM project_memory_notes WHERE project_id = ?1",
                 [id],
             )?;
             transaction.execute("DELETE FROM projects WHERE id = ?1", [id])?;
-            transaction.commit()
-        })?;
-        Ok(())
+            transaction.commit()?;
+            Ok(())
+        })
     }
 }
 
@@ -381,6 +392,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(note.project_id, project.id);
+    }
+
+    #[test]
+    fn deleting_an_empty_project_removes_its_memory_in_the_same_transaction() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = ProjectManager::new(db.clone());
+        let project = manager
+            .create(&CreateProject {
+                name: "Temporary".into(),
+                description: None,
+                icon: None,
+            })
+            .unwrap();
+        ProjectMemoryStore::new(db.clone())
+            .create(
+                &project.id,
+                &CreateProjectMemoryNote {
+                    title: "Temporary note".into(),
+                    body: "Delete with the Project.".into(),
+                    summary: None,
+                    note_type: "fact".into(),
+                    state: "evergreen".into(),
+                    source_task_id: None,
+                    source_attempt_id: None,
+                    created_by: "user".into(),
+                    pinned: false,
+                    tags: vec![],
+                },
+            )
+            .unwrap();
+
+        manager.delete(&project.id).unwrap();
+
+        assert!(matches!(
+            manager.get(&project.id),
+            Err(Error::ProjectNotFound { .. })
+        ));
+        let notes: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM project_memory_notes WHERE project_id = ?1",
+                    [&project.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(notes, 0);
     }
 
     #[test]

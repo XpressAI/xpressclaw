@@ -393,33 +393,47 @@ impl ConversationManager {
         participant_type: &str,
         participant_id: &str,
     ) -> Result<()> {
-        // Verify conversation exists
-        let conversation = self.get(conv_id)?;
+        self.db.with_conn(|conn| {
+            // Reserve the write transaction before validating ownership so an
+            // Agent cannot move Projects between this check and insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let conversation_project = transaction
+                .query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conv_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|_| Error::ConversationNotFound {
+                    id: conv_id.to_string(),
+                })?;
 
-        if participant_type == "agent" {
-            let agent_project = self.db.with_conn(|conn| {
-                conn.query_row(
+            if participant_type == "agent" {
+                let agent_project = transaction
+                    .query_row(
                     "SELECT project_id FROM agents WHERE id = ?1",
                     [participant_id],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .map_err(|_| Error::AgentNotFound {
                     name: participant_id.to_string(),
-                })
-            })?;
-            if conversation.project_id.is_some() && agent_project != conversation.project_id {
-                return Err(Error::Conversation(
-                    "an Agent must belong to the conversation's project before it can join".into(),
-                ));
+                })?;
+                if conversation_project.is_some() && agent_project != conversation_project {
+                    return Err(Error::Conversation(
+                        "an Agent must belong to the conversation's project before it can join"
+                            .into(),
+                    ));
+                }
             }
-        }
 
-        self.db.with_conn(|conn| {
-            conn.execute(
+            transaction.execute(
                 "INSERT OR IGNORE INTO conversation_participants (conversation_id, participant_type, participant_id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![conv_id, participant_type, participant_id],
             )?;
-            Ok::<(), Error>(())
+            transaction.commit()?;
+            Ok(())
         })
     }
 
@@ -1212,6 +1226,49 @@ mod tests {
         mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
         let conv = mgr.get(&conv.id).unwrap();
         assert_eq!(conv.participants.len(), 1);
+    }
+
+    #[test]
+    fn adding_an_agent_from_another_project_is_rejected_without_membership() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO projects (id, name) VALUES ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'two');",
+            )
+        })
+        .unwrap();
+        let manager = ConversationManager::new(db.clone());
+        let conversation = manager
+            .create_in_project(
+                Some("one"),
+                &CreateConversation {
+                    title: Some("Project one".into()),
+                    icon: None,
+                    participant_ids: vec![],
+                },
+            )
+            .unwrap();
+
+        let error = manager
+            .add_participant(&conversation.id, "agent", "atlas")
+            .unwrap_err();
+        assert!(error.to_string().contains("must belong"));
+        let membership: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_participants
+                     WHERE conversation_id = ?1
+                       AND participant_type = 'agent'
+                       AND participant_id = 'atlas'",
+                    [&conversation.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(membership, 0);
     }
 
     #[test]
