@@ -280,11 +280,11 @@ fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) 
     Ok(())
 }
 
-/// Before Projects existed, an old conversation could contain several
-/// Agents. Migration v33 initially gives each Agent its own Project; merge
-/// every connected legacy conversation component so the new invariant (all
-/// participants belong to the conversation's Project) holds without losing
-/// conversations, tasks, or vector-indexed memory.
+/// Before Projects existed, conversations and task hierarchies could contain
+/// several Agents. Migration v33 initially gives each Agent its own Project;
+/// merge every connected legacy collaboration component so the new Project
+/// invariants hold without losing conversations, tasks, or vector-indexed
+/// memory.
 fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
     let mappings = {
         let mut statement = transaction.prepare(
@@ -301,6 +301,24 @@ fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<
                   AND participant.participant_type = 'agent'
                  JOIN agents agent ON agent.id = participant.participant_id
              ),
+             task_links(origin, peer) AS (
+                 SELECT id, id FROM tasks
+                 UNION
+                 SELECT parent_task_id, id
+                 FROM tasks
+                 WHERE parent_task_id IS NOT NULL
+                 UNION
+                 SELECT id, parent_task_id
+                 FROM tasks
+                 WHERE parent_task_id IS NOT NULL
+             ),
+             task_reachable(origin, peer) AS (
+                 SELECT origin, peer FROM task_links
+                 UNION
+                 SELECT task_reachable.origin, task_links.peer
+                 FROM task_reachable
+                 JOIN task_links ON task_links.origin = task_reachable.peer
+             ),
              links(origin, peer) AS (
                  SELECT id, id FROM agents
                  UNION
@@ -312,20 +330,9 @@ fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<
                  WHERE own.participant_type = 'agent'
                  UNION
                  SELECT own.agent_id, peer.agent_id
-                 FROM task_agents own
-                 JOIN task_agents peer ON peer.task_id = own.task_id
-                 UNION
-                 SELECT parent_agent.agent_id, child_agent.agent_id
-                 FROM tasks child
-                 JOIN tasks parent ON parent.id = child.parent_task_id
-                 JOIN task_agents parent_agent ON parent_agent.task_id = parent.id
-                 JOIN task_agents child_agent ON child_agent.task_id = child.id
-                 UNION
-                 SELECT child_agent.agent_id, parent_agent.agent_id
-                 FROM tasks child
-                 JOIN tasks parent ON parent.id = child.parent_task_id
-                 JOIN task_agents parent_agent ON parent_agent.task_id = parent.id
-                 JOIN task_agents child_agent ON child_agent.task_id = child.id
+                 FROM task_reachable hierarchy
+                 JOIN task_agents own ON own.task_id = hierarchy.origin
+                 JOIN task_agents peer ON peer.task_id = hierarchy.peer
              ),
              reachable(origin, peer) AS (
                  SELECT origin, peer FROM links
@@ -1542,6 +1549,75 @@ mod tests {
                 .unwrap();
             assert_eq!(project_id, "atlas", "scope for {task_id}");
         }
+    }
+
+    #[test]
+    fn v34_merges_agents_connected_through_an_unassigned_task() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 32 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, backend, config)
+             VALUES ('atlas', 'Atlas', 'native', '{}'),
+                    ('builder', 'Builder', 'native', '{}');
+             INSERT INTO tasks (id, title, agent_id)
+             VALUES ('parent', 'Atlas parent', 'atlas');
+             INSERT INTO tasks (id, title, parent_task_id)
+             VALUES ('reported-step', 'Unassigned reported step', 'parent');
+             INSERT INTO tasks (id, title, agent_id, parent_task_id)
+             VALUES ('grandchild', 'Builder grandchild', 'builder', 'reported-step');",
+        )
+        .unwrap();
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V33).unwrap();
+        backfill_pending_conversation_turns(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let projects_after_v33: Vec<(String, String)> = conn
+            .prepare("SELECT id, project_id FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            projects_after_v33,
+            vec![
+                ("grandchild".into(), "builder".into()),
+                ("parent".into(), "atlas".into()),
+                ("reported-step".into(), "atlas".into()),
+            ]
+        );
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V34).unwrap();
+        consolidate_legacy_conversation_projects(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let agent_projects: Vec<String> = conn
+            .prepare("SELECT project_id FROM agents ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(agent_projects, vec!["atlas"; 2]);
+        let task_projects: Vec<String> = conn
+            .prepare("SELECT project_id FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(task_projects, vec!["atlas"; 3]);
     }
 
     #[test]
