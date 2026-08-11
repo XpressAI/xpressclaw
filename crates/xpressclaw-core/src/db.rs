@@ -151,44 +151,7 @@ impl Database {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        let migrations: &[(u32, &str)] = &[
-            (1, MIGRATION_V1),
-            (2, MIGRATION_V2),
-            (3, MIGRATION_V3),
-            (4, MIGRATION_V4),
-            (5, MIGRATION_V5),
-            (6, MIGRATION_V6),
-            (7, MIGRATION_V7),
-            (8, MIGRATION_V8),
-            (9, MIGRATION_V9),
-            (10, MIGRATION_V10),
-            (11, MIGRATION_V11),
-            (12, MIGRATION_V12),
-            (13, MIGRATION_V13),
-            (14, MIGRATION_V14),
-            (15, MIGRATION_V15),
-            (16, MIGRATION_V16),
-            (17, MIGRATION_V17),
-            (18, MIGRATION_V18),
-            (19, MIGRATION_V19),
-            (20, MIGRATION_V20),
-            (21, MIGRATION_V21),
-            (22, MIGRATION_V22),
-            (23, MIGRATION_V23),
-            (24, MIGRATION_V24),
-            (25, MIGRATION_V25),
-            (26, MIGRATION_V26),
-            (27, MIGRATION_V27),
-            (28, MIGRATION_V28),
-            (29, MIGRATION_V29),
-            (30, MIGRATION_V30),
-            (31, MIGRATION_V31),
-            (32, MIGRATION_V32),
-            (33, MIGRATION_V33),
-            (34, MIGRATION_V34),
-        ];
-
-        for &(target, sql) in migrations {
+        for &(target, sql) in schema_migrations() {
             if version < target {
                 let transaction = conn.unchecked_transaction()?;
                 transaction
@@ -398,7 +361,11 @@ fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<
         "DELETE FROM projects
          WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.project_id = projects.id)
            AND NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.project_id = projects.id)
-           AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.project_id = projects.id)",
+           AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.project_id = projects.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM project_memory_notes
+               WHERE project_memory_notes.project_id = projects.id
+           )",
         [],
     )?;
     Ok(())
@@ -1209,6 +1176,7 @@ CREATE TABLE projects (
 ALTER TABLE agents ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
 INSERT INTO projects (id, name, description)
 SELECT id, name, 'Imported from the existing Agent workspace' FROM agents;
+
 UPDATE agents SET project_id = id WHERE project_id IS NULL;
 CREATE INDEX idx_agents_project ON agents(project_id, name);
 
@@ -1311,6 +1279,20 @@ const MIGRATION_V34: &str = "
 -- Project memory originally used the logical Agent session as its ownership
 -- foreign key. Rebuild the relational tables around the real Project boundary
 -- while preserving notes, tags, links, and the existing vector index.
+-- Removed Agents can still own durable memory through their retained logical
+-- session. Seed every legacy memory owner before changing the ownership
+-- foreign key. Keep this repair in v34 so installations where v33 committed
+-- before an older v34 failed can resume the upgrade safely.
+INSERT OR IGNORE INTO projects (id, name, description)
+SELECT DISTINCT note.project_id,
+       COALESCE(
+           (SELECT NULLIF(TRIM(session.title), '')
+            FROM logical_sessions session WHERE session.id = note.project_id),
+           note.project_id
+       ),
+       'Imported from retained Agent memory'
+FROM project_memory_notes note;
+
 CREATE TABLE project_memory_notes_v34 (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -1378,6 +1360,45 @@ BEGIN
 END;
 ";
 
+fn schema_migrations() -> &'static [(u32, &'static str)] {
+    &[
+        (1, MIGRATION_V1),
+        (2, MIGRATION_V2),
+        (3, MIGRATION_V3),
+        (4, MIGRATION_V4),
+        (5, MIGRATION_V5),
+        (6, MIGRATION_V6),
+        (7, MIGRATION_V7),
+        (8, MIGRATION_V8),
+        (9, MIGRATION_V9),
+        (10, MIGRATION_V10),
+        (11, MIGRATION_V11),
+        (12, MIGRATION_V12),
+        (13, MIGRATION_V13),
+        (14, MIGRATION_V14),
+        (15, MIGRATION_V15),
+        (16, MIGRATION_V16),
+        (17, MIGRATION_V17),
+        (18, MIGRATION_V18),
+        (19, MIGRATION_V19),
+        (20, MIGRATION_V20),
+        (21, MIGRATION_V21),
+        (22, MIGRATION_V22),
+        (23, MIGRATION_V23),
+        (24, MIGRATION_V24),
+        (25, MIGRATION_V25),
+        (26, MIGRATION_V26),
+        (27, MIGRATION_V27),
+        (28, MIGRATION_V28),
+        (29, MIGRATION_V29),
+        (30, MIGRATION_V30),
+        (31, MIGRATION_V31),
+        (32, MIGRATION_V32),
+        (33, MIGRATION_V33),
+        (34, MIGRATION_V34),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1405,6 +1426,106 @@ mod tests {
             )
             .unwrap();
         assert_eq!(memory_owner, "projects");
+    }
+
+    #[test]
+    fn v34_recovers_memory_owned_by_a_removed_agent_after_v33_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-memory.db");
+        ensure_sqlite_vec();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                 );",
+            )
+            .unwrap();
+            register_sql_functions(&conn).unwrap();
+            for &(target, sql) in schema_migrations() {
+                if target > 32 {
+                    break;
+                }
+                let transaction = conn.unchecked_transaction().unwrap();
+                transaction.execute_batch(sql).unwrap();
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO config (key, value)
+                         VALUES ('schema_version', ?1)",
+                        [target.to_string()],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config)
+                    VALUES ('retired', 'Retired researcher', 'native', '{}');
+                 INSERT INTO logical_sessions (id, agent_id, title)
+                    VALUES ('retired', 'retired', 'Retired researcher');
+                 INSERT INTO project_memory_notes
+                    (id, project_id, title, body, summary, search_key)
+                    VALUES (
+                        'remembered-note',
+                        'retired',
+                        'Retained decision',
+                        'Keep this knowledge after removing the Agent.',
+                        'Keep retained knowledge.',
+                        'retained decision keep knowledge'
+                    );
+                 DELETE FROM agents WHERE id = 'retired';",
+            )
+            .unwrap();
+            let transaction = conn.unchecked_transaction().unwrap();
+            transaction.execute_batch(MIGRATION_V33).unwrap();
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO config (key, value)
+                     VALUES ('schema_version', '33')",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            let missing_project: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id = 'retired'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(missing_project, 0);
+        }
+
+        let upgraded = Database::open(&path).unwrap();
+        upgraded.with_conn(|conn| {
+            let project: (String, String) = conn
+                .query_row(
+                    "SELECT name, description FROM projects WHERE id = 'retired'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(project.0, "Retired researcher");
+            assert_eq!(project.1, "Imported from retained Agent memory");
+            let note: (String, String) = conn
+                .query_row(
+                    "SELECT project_id, body FROM project_memory_notes
+                     WHERE id = 'remembered-note'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(note.0, "retired");
+            assert_eq!(note.1, "Keep this knowledge after removing the Agent.");
+            let foreign_key_errors: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(foreign_key_errors, 0);
+        });
     }
 
     #[test]

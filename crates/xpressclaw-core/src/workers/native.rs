@@ -608,7 +608,6 @@ async fn execute_conversation_turn(
         &kind,
         github.is_some(),
         bundled_control_tools,
-        false,
         &mut spec.environment,
     )?;
     if bundled_control_tools
@@ -923,7 +922,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &kind,
         github.is_some(),
         bundled_control_tools,
-        github_review_lifecycle,
         &mut spec.environment,
     )?;
     if bundled_control_tools
@@ -2237,7 +2235,6 @@ fn configure_bundled_github_mcp(
     kind: &str,
     github_available: bool,
     bundled_control_tools: bool,
-    review_lifecycle: bool,
     environment: &mut Vec<String>,
 ) -> Result<bool> {
     let attached = github_available
@@ -2255,7 +2252,12 @@ fn configure_bundled_github_mcp(
                 environment[index][PREFIX.len()..].to_string(),
             );
         }
-        github::add_codex_mcp_guidance(&mut codex_environment, review_lifecycle)?;
+        // The retained container is shared by task and Conversation ACP
+        // lanes, so its specification must not depend on the current lane.
+        // Keep the complete, conditional guidance stable here; the scoped
+        // GitHub MCP environment remains authoritative about whether an
+        // ordinary task actually participates in the review lifecycle.
+        github::add_codex_mcp_guidance(&mut codex_environment, true)?;
         let config = codex_environment
             .remove("CODEX_CONFIG")
             .ok_or_else(|| Error::Backend("GitHub guidance did not produce CODEX_CONFIG".into()))?;
@@ -4153,8 +4155,7 @@ mod tests {
         let mut environment = vec!["HOME=/home/node".to_string()];
 
         assert!(
-            configure_bundled_github_mcp(&runner, "codex", true, true, true, &mut environment)
-                .unwrap()
+            configure_bundled_github_mcp(&runner, "codex", true, true, &mut environment).unwrap()
         );
         let config: Value = serde_json::from_str(
             environment
@@ -4178,7 +4179,6 @@ mod tests {
             "codex",
             true,
             false,
-            true,
             &mut custom_image_environment
         )
         .unwrap());
@@ -4189,7 +4189,6 @@ mod tests {
             &runner,
             "codex",
             false,
-            true,
             true,
             &mut missing_access_environment
         )
@@ -4205,10 +4204,35 @@ mod tests {
             "codex",
             true,
             true,
-            true,
             &mut configured_environment
         )
         .unwrap());
+    }
+
+    #[test]
+    fn codex_github_guidance_keeps_the_shared_container_lane_neutral() {
+        let runner = NativeRunnerConfig::default();
+        let mut task = ContainerSpec::default();
+        let mut conversation = ContainerSpec::default();
+
+        assert!(
+            configure_bundled_github_mcp(&runner, "codex", true, true, &mut task.environment,)
+                .unwrap()
+        );
+        assert!(configure_bundled_github_mcp(
+            &runner,
+            "codex",
+            true,
+            true,
+            &mut conversation.environment,
+        )
+        .unwrap());
+
+        assert_eq!(task.environment, conversation.environment);
+        assert_eq!(
+            container_spec_fingerprint(&task).unwrap(),
+            container_spec_fingerprint(&conversation).unwrap()
+        );
     }
 
     #[test]
