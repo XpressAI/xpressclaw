@@ -183,19 +183,34 @@ impl Database {
             (30, MIGRATION_V30),
             (31, MIGRATION_V31),
             (32, MIGRATION_V32),
+            (33, MIGRATION_V33),
+            (34, MIGRATION_V34),
         ];
 
         for &(target, sql) in migrations {
             if version < target {
-                conn.execute_batch(sql).map_err(|e| Error::Migration {
-                    version: target,
-                    message: e.to_string(),
-                })?;
+                let transaction = conn.unchecked_transaction()?;
+                transaction
+                    .execute_batch(sql)
+                    .map_err(|e| Error::Migration {
+                        version: target,
+                        message: e.to_string(),
+                    })?;
 
-                conn.execute(
+                if target == 34 {
+                    consolidate_legacy_conversation_projects(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
+                transaction.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', ?1)",
                     [target.to_string()],
                 )?;
+                transaction.commit()?;
 
                 info!("applied migration v{target}");
             }
@@ -230,6 +245,108 @@ impl Database {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Before Projects existed, an old conversation could contain several
+/// Agents. Migration v33 initially gives each Agent its own Project; merge
+/// every connected legacy conversation component so the new invariant (all
+/// participants belong to the conversation's Project) holds without losing
+/// conversations, tasks, or vector-indexed memory.
+fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mappings = {
+        let mut statement = transaction.prepare(
+            "WITH RECURSIVE
+             links(origin, peer) AS (
+                 SELECT id, id FROM agents
+                 UNION
+                 SELECT own.participant_id, peer.participant_id
+                 FROM conversation_participants own
+                 JOIN conversation_participants peer
+                   ON peer.conversation_id = own.conversation_id
+                  AND peer.participant_type = 'agent'
+                 WHERE own.participant_type = 'agent'
+             ),
+             reachable(origin, peer) AS (
+                 SELECT origin, peer FROM links
+                 UNION
+                 SELECT reachable.origin, links.peer
+                 FROM reachable JOIN links ON links.origin = reachable.peer
+             ),
+             components(agent_id, root_agent_id) AS (
+                 SELECT origin, MIN(peer) FROM reachable GROUP BY origin
+             )
+             SELECT agent.id, agent.project_id, root.project_id
+             FROM components
+             JOIN agents agent ON agent.id = components.agent_id
+             JOIN agents root ON root.id = components.root_agent_id
+             WHERE agent.project_id IS NOT NULL AND root.project_id IS NOT NULL",
+        )?;
+        let mappings = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        mappings
+    };
+
+    for (agent_id, source_project_id, target_project_id) in mappings {
+        if source_project_id == target_project_id {
+            continue;
+        }
+        crate::memory::project::move_project_memory(
+            transaction,
+            &source_project_id,
+            &target_project_id,
+        )?;
+        transaction.execute(
+            "UPDATE agents SET project_id = ?1 WHERE id = ?2",
+            rusqlite::params![target_project_id, agent_id],
+        )?;
+        transaction.execute(
+            "UPDATE tasks SET project_id = ?1 WHERE agent_id = ?2",
+            rusqlite::params![target_project_id, agent_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE conversations
+         SET project_id = (
+             SELECT agent.project_id
+             FROM conversation_participants participant
+             JOIN agents agent ON agent.id = participant.participant_id
+             WHERE participant.conversation_id = conversations.id
+               AND participant.participant_type = 'agent'
+             ORDER BY participant.joined_at, participant.participant_id
+             LIMIT 1
+         )
+         WHERE EXISTS (
+             SELECT 1 FROM conversation_participants participant
+             WHERE participant.conversation_id = conversations.id
+               AND participant.participant_type = 'agent'
+         )",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE tasks
+         SET project_id = (
+             SELECT conversation.project_id
+             FROM conversations conversation
+             WHERE conversation.id = tasks.conversation_id
+         )
+         WHERE conversation_id IS NOT NULL",
+        [],
+    )?;
+    transaction.execute(
+        "DELETE FROM projects
+         WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.project_id = projects.id)
+           AND NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.project_id = projects.id)
+           AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.project_id = projects.id)",
+        [],
+    )?;
+    Ok(())
 }
 
 // -- Migrations --
@@ -1020,6 +1137,192 @@ CREATE INDEX idx_task_pull_requests_agent
     ON task_pull_requests(agent_id, task_id, status);
 ";
 
+const MIGRATION_V33: &str = "
+-- Projects are the top-level collaboration boundary. Existing installations
+-- previously treated each configured Agent as a project, so preserve that
+-- mental model by creating one project for each existing Agent and assigning
+-- its tasks and conversations to it.
+CREATE TABLE projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    icon TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE agents ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+INSERT INTO projects (id, name, description)
+SELECT id, name, 'Imported from the existing Agent workspace' FROM agents;
+UPDATE agents SET project_id = id WHERE project_id IS NULL;
+CREATE INDEX idx_agents_project ON agents(project_id, name);
+
+ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;
+UPDATE conversations
+SET project_id = (
+    SELECT a.project_id
+    FROM conversation_participants cp
+    JOIN agents a ON a.id = cp.participant_id
+    WHERE cp.conversation_id = conversations.id
+      AND cp.participant_type = 'agent'
+      AND a.project_id IS NOT NULL
+    ORDER BY cp.joined_at ASC
+    LIMIT 1
+)
+WHERE project_id IS NULL;
+INSERT INTO projects (id, name, description)
+SELECT 'imported-conversations-' || lower(hex(randomblob(16))), 'Imported conversations',
+       'Conversations created before project organization was available'
+WHERE EXISTS (SELECT 1 FROM conversations WHERE project_id IS NULL);
+UPDATE conversations
+SET project_id = (
+    SELECT id FROM projects
+    WHERE description = 'Conversations created before project organization was available'
+    LIMIT 1
+)
+WHERE project_id IS NULL;
+CREATE INDEX idx_conversations_project_activity
+    ON conversations(project_id, last_message_at DESC, created_at DESC);
+
+ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+UPDATE tasks
+SET project_id = COALESCE(
+    (SELECT c.project_id FROM conversations c WHERE c.id = tasks.conversation_id),
+    (SELECT a.project_id FROM agents a WHERE a.id = tasks.agent_id)
+)
+WHERE project_id IS NULL;
+CREATE INDEX idx_tasks_project_updated ON tasks(project_id, updated_at DESC);
+
+ALTER TABLE workflow_instances ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE workflow_instances ADD COLUMN conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL;
+CREATE INDEX idx_workflow_instances_conversation
+    ON workflow_instances(conversation_id, started_at DESC);
+
+-- Conversation messages may represent linked tasks or durable file
+-- publications in addition to plain chat.
+ALTER TABLE conversation_messages ADD COLUMN linked_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+ALTER TABLE conversation_messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+CREATE TABLE conversation_message_attachments (
+    id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    size INTEGER NOT NULL,
+    source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_conversation_attachments_message
+    ON conversation_message_attachments(message_id);
+
+-- Conversation turns use a queue independent of task execution. One ACP
+-- session is retained per conversation/Agent pair, while each queued turn is
+-- independently recoverable after a control-plane restart.
+CREATE TABLE conversation_agent_sessions (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    native_session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'idle'
+        CHECK (status IN ('idle', 'queued', 'running', 'failed')),
+    last_error TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, agent_id)
+);
+CREATE TABLE conversation_turns (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    trigger_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    result_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE SET NULL,
+    error_message TEXT,
+    context_used INTEGER,
+    context_size INTEGER,
+    queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX idx_conversation_turns_queue
+    ON conversation_turns(status, queued_at);
+CREATE INDEX idx_conversation_turns_conversation
+    ON conversation_turns(conversation_id, queued_at DESC);
+CREATE UNIQUE INDEX idx_conversation_turns_active_agent
+    ON conversation_turns(conversation_id, agent_id)
+    WHERE status IN ('queued', 'running');
+";
+
+const MIGRATION_V34: &str = "
+-- Project memory originally used the logical Agent session as its ownership
+-- foreign key. Rebuild the relational tables around the real Project boundary
+-- while preserving notes, tags, links, and the existing vector index.
+CREATE TABLE project_memory_notes_v34 (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    note_type TEXT NOT NULL DEFAULT 'fact'
+        CHECK (note_type IN ('decision', 'convention', 'procedure', 'fact', 'warning', 'question')),
+    state TEXT NOT NULL DEFAULT 'evergreen'
+        CHECK (state IN ('inbox', 'evergreen', 'archived')),
+    source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL DEFAULT 'agent'
+        CHECK (created_by IN ('user', 'agent', 'upkeep')),
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    search_key TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO project_memory_notes_v34
+SELECT * FROM project_memory_notes;
+
+CREATE TABLE project_memory_tags_v34 (
+    note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    tag_key TEXT NOT NULL,
+    PRIMARY KEY (note_id, tag_key)
+);
+INSERT INTO project_memory_tags_v34 SELECT * FROM project_memory_tags;
+
+CREATE TABLE project_memory_links_v34 (
+    from_note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    to_note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL DEFAULT 'related'
+        CHECK (link_type IN ('related', 'supports', 'contradicts', 'supersedes', 'depends_on', 'example_of')),
+    strength REAL NOT NULL DEFAULT 1.0 CHECK (strength >= 0.0 AND strength <= 1.0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (from_note_id, to_note_id, link_type),
+    CHECK (from_note_id <> to_note_id)
+);
+INSERT INTO project_memory_links_v34 SELECT * FROM project_memory_links;
+
+DROP TRIGGER project_memory_notes_delete_embedding;
+DROP TABLE project_memory_links;
+DROP TABLE project_memory_tags;
+DROP TABLE project_memory_notes;
+ALTER TABLE project_memory_notes_v34 RENAME TO project_memory_notes;
+ALTER TABLE project_memory_tags_v34 RENAME TO project_memory_tags;
+ALTER TABLE project_memory_links_v34 RENAME TO project_memory_links;
+
+CREATE INDEX idx_project_memory_notes_project_updated
+    ON project_memory_notes(project_id, state, pinned DESC, updated_at DESC);
+CREATE INDEX idx_project_memory_notes_task
+    ON project_memory_notes(source_task_id);
+CREATE INDEX idx_project_memory_tags_key
+    ON project_memory_tags(tag_key, note_id);
+CREATE INDEX idx_project_memory_links_to
+    ON project_memory_links(to_note_id, link_type);
+CREATE TRIGGER project_memory_notes_delete_embedding
+AFTER DELETE ON project_memory_notes
+BEGIN
+    DELETE FROM project_memory_embeddings WHERE note_id = OLD.id;
+END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,7 +1340,80 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "32");
+        assert_eq!(version, "34");
+        let memory_owner: String = conn
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
+                 WHERE \"from\" = 'project_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_owner, "projects");
+    }
+
+    #[test]
+    fn legacy_multi_agent_conversations_merge_projects_and_memory() {
+        use crate::memory::project::{CreateProjectMemoryNote, ProjectMemoryStore};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('atlas', 'Atlas'), ('reviewer', 'Reviewer');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'atlas'),
+                        ('reviewer', 'Reviewer', 'native', '{}', 'reviewer');
+                 INSERT INTO conversations (id, title, project_id) VALUES ('shared', 'Shared', 'atlas');
+                 INSERT INTO conversation_participants
+                    (conversation_id, participant_type, participant_id)
+                 VALUES ('shared', 'agent', 'atlas'), ('shared', 'agent', 'reviewer');",
+            )
+        })
+        .unwrap();
+        let memory = ProjectMemoryStore::new(db.clone())
+            .create(
+                "reviewer",
+                &CreateProjectMemoryNote {
+                    title: "Review convention".into(),
+                    body: "Check every migration before approval.".into(),
+                    summary: None,
+                    note_type: "convention".into(),
+                    state: "evergreen".into(),
+                    source_task_id: None,
+                    source_attempt_id: None,
+                    created_by: "agent".into(),
+                    pinned: false,
+                    tags: vec!["review".into()],
+                },
+            )
+            .unwrap();
+
+        db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            consolidate_legacy_conversation_projects(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let reviewer_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'reviewer'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reviewer_project, "atlas");
+            let remaining_projects: i64 = conn
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(remaining_projects, 1);
+        });
+        let moved = ProjectMemoryStore::new(db)
+            .get("atlas", &memory.id)
+            .unwrap();
+        assert_eq!(moved.project_id, "atlas");
     }
 
     #[test]

@@ -381,9 +381,9 @@ flows:
 				<div class="text-xs font-medium">Run-time agent roles</div>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 					{#if template === 'code-review'}
-						Each run chooses an <strong>implementer</strong> and an independent <strong>reviewer</strong>. The definition is not tied to one project; bind it to contexts for the target repository when starting work. A draft PR is their handoff, so they do not need to share a folder. After it is marked ready, the workflow sleeps until a GitHub review or comment arrives.
+						Each run chooses an <strong>implementer</strong> and an independent <strong>reviewer</strong>. The definition is reusable; when started in a Project, both roles must be Agents in that Project. A draft PR is their handoff, so they do not need to share a folder. After it is marked ready, the workflow sleeps until a GitHub review or comment arrives.
 					{:else}
-						Each run chooses the <strong>worker</strong> agent, so this definition can be reused with any project context.
+						Each run chooses the <strong>worker</strong> Agent, so this definition can be reused in any Project.
 					{/if}
 				</p>
 			</div>

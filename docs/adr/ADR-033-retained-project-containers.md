@@ -1,4 +1,4 @@
-# ADR-033: Retained Project Runtimes
+# ADR-033: Retained Agent Runtimes
 
 ## Status
 
@@ -20,7 +20,7 @@ multi-turn protocol, so those costs are not an inherent turn boundary.
 
 ## Decision
 
-Each configured project agent owns one retained container whose engine name is
+Each configured Agent owns one retained container whose engine name is
 a deterministic SHA-256 encoding of the installation and logical Agent IDs.
 This keeps names within Docker's ASCII grammar even when an Agent is named in
 Japanese or another non-ASCII script, while labels retain the human-readable
@@ -37,7 +37,7 @@ and resumes or loads the persisted session. A hard cancellation, runner
 configuration or image change, project deletion, and control-plane shutdown are
 also explicit process boundaries. Normal successful turns are not.
 
-Project queue dispatch remains serialized. A running queue row is also the
+Agent task-queue dispatch remains serialized. A running queue row is also the
 lease on the shared process, including the short cancellation interval after an
 attempt becomes terminal but before a hard stop has completed. This prevents a
 new turn from entering a process that an older cancellation path is stopping.
@@ -57,8 +57,8 @@ written only after every command succeeds; a failed initialization is retried
 on the next process start. Changing a startup command changes the container
 specification and therefore creates a clean environment and process.
 
-Control-plane shutdown and startup stop configured project containers but
-retain them. Deleting a project agent removes its container and writable layer.
+Control-plane shutdown and startup stop configured Agent containers but
+retain them. Deleting an Agent removes its container and writable layer.
 Startup cleanup operates only on containers carrying this installation's owner
 label. Containers owned by another installation—and unlabelled legacy
 containers whose ownership cannot be proven—are never included in that cleanup.

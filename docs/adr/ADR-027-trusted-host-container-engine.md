@@ -17,7 +17,7 @@ not yet available. The practical local engine may be rootful Docker, Docker
 Desktop, or rootless Podman.
 
 The expected threat model is trusted agents and trusted runner images. The
-project container contains accidental damage to its own root filesystem, which
+Agent container contains accidental damage to its own root filesystem, which
 ADR-033 now retains between turns, but the host container engine is not treated
 as a boundary against a malicious worker.
 

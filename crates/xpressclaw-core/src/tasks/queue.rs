@@ -890,7 +890,7 @@ mod tests {
             .unwrap();
 
         // The terminal attempt no longer provides the ordinary session lock,
-        // but its running dispatch keeps the shared project container leased
+        // but its running dispatch keeps the shared Agent container leased
         // until the cancellation path has stopped it.
         assert!(queue.claim_next().unwrap().is_none());
         sessions
@@ -1045,7 +1045,7 @@ mod tests {
         }
 
         // The first claim changes the dispatch row before its worker has time
-        // to transition the attempt or attach the shared project container.
+        // to transition the attempt or attach the shared Agent container.
         assert!(queue.claim_next().unwrap().is_some());
         assert!(queue.claim_next().unwrap().is_none());
     }

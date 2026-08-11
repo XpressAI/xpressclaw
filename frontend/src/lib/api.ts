@@ -22,6 +22,7 @@ export interface Agent {
 	name: string;
 	title: string;
 	backend: string;
+	project_id: string | null;
 	status: string;
 	desired_status: string;
 	observed_status: string;
@@ -75,6 +76,128 @@ export const agents = {
 	),
 	logs: (id: string, tail = 100) =>
 		request<{ logs: string }>(`/api/agents/${id}/logs?tail=${tail}`)
+};
+
+// -- Projects and conversations --
+
+export interface Project {
+	id: string;
+	name: string;
+	description: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	agent_ids: string[];
+	conversation_count: number;
+	task_count: number;
+}
+
+export interface ConversationParticipant {
+	participant_type: 'user' | 'agent';
+	participant_id: string;
+	joined_at: string;
+}
+
+export interface ConversationAttachment {
+	id: string;
+	message_id: number;
+	name: string;
+	mime_type: string;
+	size: number;
+	source_task_id: string | null;
+	created_at: string;
+}
+
+export interface ConversationMessage {
+	id: number;
+	conversation_id: string;
+	sender_type: 'user' | 'agent' | 'system';
+	sender_id: string;
+	sender_name: string | null;
+	content: string;
+	message_type: string;
+	linked_task_id: string | null;
+	metadata: Record<string, unknown>;
+	attachments?: ConversationAttachment[];
+	created_at: string;
+}
+
+export interface Conversation {
+	id: string;
+	project_id: string | null;
+	title: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	last_message_at: string | null;
+	participants: ConversationParticipant[];
+}
+
+export interface ConversationTurn {
+	id: string;
+	conversation_id: string;
+	agent_id: string;
+	status: string;
+	error_message: string | null;
+	context_used: number | null;
+	context_size: number | null;
+	queued_at: string;
+	started_at: string | null;
+	completed_at: string | null;
+}
+
+export interface ConversationMessageUpload {
+	name: string;
+	mime_type: string;
+	data: string;
+}
+
+export const projects = {
+	list: () => request<Project[]>('/api/projects'),
+	get: (id: string) => request<Project>(`/api/projects/${encodeURIComponent(id)}`),
+	create: (data: { name: string; description?: string; icon?: string }) =>
+		request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { name?: string; description?: string; icon?: string }) =>
+		request<Project>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	assignAgent: (id: string, agentId: string) =>
+		request<Project>(`/api/projects/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: '{}' }),
+	tasks: (id: string) => request<Task[]>(`/api/projects/${encodeURIComponent(id)}/tasks`),
+};
+
+export const conversations = {
+	list: (projectId?: string, limit = 100) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (projectId) params.set('project_id', projectId);
+		return request<Conversation[]>(`/api/conversations?${params}`);
+	},
+	get: (id: string) => request<Conversation>(`/api/conversations/${encodeURIComponent(id)}`),
+	create: (data: { project_id: string; title?: string; icon?: string; participant_ids?: string[] }) =>
+		request<Conversation>('/api/conversations', { method: 'POST', body: JSON.stringify(data) }),
+	update: (id: string, data: { title?: string; icon?: string }) =>
+		request<Conversation>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
+	delete: (id: string) => request<void>(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+	addParticipant: (id: string, agentId: string) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/participants`, { method: 'POST', body: JSON.stringify({ agent_id: agentId }) }),
+	removeParticipant: (id: string, agentId: string) =>
+		request<void>(`/api/conversations/${encodeURIComponent(id)}/participants/${encodeURIComponent(agentId)}`, { method: 'DELETE' }),
+	messages: (id: string, limit = 100, beforeId?: number) => {
+		const params = new URLSearchParams({ limit: String(limit) });
+		if (beforeId !== undefined) params.set('before_id', String(beforeId));
+		return request<ConversationMessage[]>(`/api/conversations/${encodeURIComponent(id)}/messages?${params}`);
+	},
+	sendMessage: (id: string, content: string, attachments: ConversationMessageUpload[] = []) =>
+		request<{ message: ConversationMessage; queued_agents: string[] }>(`/api/conversations/${encodeURIComponent(id)}/messages`, {
+			method: 'POST',
+			body: JSON.stringify({ content, attachments }),
+		}),
+	tasks: (id: string) => request<Task[]>(`/api/conversations/${encodeURIComponent(id)}/tasks`),
+	createTask: (id: string, data: { title: string; description?: string; agent_id?: string; workflow_id?: string; workflow_inputs?: Record<string, unknown>; priority?: number }) =>
+		request<Task | { workflow_instance_id: string }>(`/api/conversations/${encodeURIComponent(id)}/tasks`, {
+			method: 'POST',
+			body: JSON.stringify(data),
+		}),
+	turns: (id: string) => request<ConversationTurn[]>(`/api/conversations/${encodeURIComponent(id)}/turns`),
+	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
 };
 
 // -- Logical sessions and native work attempts --
@@ -355,6 +478,8 @@ export interface Task {
 	agent_id: string | null;
 	parent_task_id: string | null;
 	sop_id: string | null;
+	conversation_id: string | null;
+	project_id?: string | null;
 	created_at: string;
 	updated_at: string;
 	completed_at: string | null;
@@ -740,8 +865,8 @@ export const setup = {
 			body: JSON.stringify(data)
 		}),
 	addSession: (data: {
-		backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
-	}) => request<{ success: boolean; session: string; session_id: string; title: string }>('/api/setup/add-session', {
+		project_id?: string; backend?: string; runner_kind?: string; runner_image?: string; runner_workspace?: string; workspace_mode?: 'existing' | 'managed'; project_name?: string; runner_model?: string; runner_command?: string[]; startup_commands?: string[]; subscription_auth?: boolean; ssh_agent_forwarding?: boolean; runner_container_engine?: 'none' | 'host'; volumes?: string[];
+	}) => request<{ success: boolean; session: string; session_id: string; title: string; project_id: string | null }>('/api/setup/add-session', {
 		method: 'POST',
 		body: JSON.stringify(data)
 	})
@@ -794,6 +919,8 @@ export interface Workflow {
 export interface WorkflowInstance {
 	id: string;
 	workflow_id: string;
+	project_id?: string | null;
+	conversation_id?: string | null;
 	current_task_id?: string | null;
 	status: string;
 	current_flow: string;
@@ -835,8 +962,12 @@ export const workflows = {
 	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),
 	disable: (id: string) => request<Workflow>(`/api/workflows/${id}/disable`, { method: 'POST' }),
-	run: (id: string, triggerData?: Record<string, unknown>) =>
-		request<WorkflowInstance>(`/api/workflows/${id}/run`, { method: 'POST', body: JSON.stringify(triggerData || {}) }),
+	run: (id: string, triggerData?: Record<string, unknown>, projectId?: string) => {
+		const params = new URLSearchParams();
+		if (projectId) params.set('project_id', projectId);
+		const query = params.toString();
+		return request<WorkflowInstance>(`/api/workflows/${id}/run${query ? `?${query}` : ''}`, { method: 'POST', body: JSON.stringify(triggerData || {}) });
+	},
 	instances: (id: string) => request<WorkflowInstance[]>(`/api/workflows/${id}/instances`),
 	getInstance: (instanceId: string) => request<WorkflowInstance>(`/api/workflows/instances/${instanceId}`),
 	cancelInstance: (instanceId: string) => request<void>(`/api/workflows/instances/${instanceId}/cancel`, { method: 'POST' }),

@@ -4,9 +4,11 @@ use axum::Router;
 use crate::state::AppState;
 
 mod agents;
+mod conversations;
 mod health;
 mod memory;
 mod open_url;
+mod projects;
 mod schedules;
 mod sessions;
 mod settings;
@@ -20,7 +22,9 @@ pub fn api_routes() -> Router<AppState> {
         .route("/health", get(health::health_check))
         .route("/open-url", post(open_url::open_url))
         .nest("/agents", agents::routes())
+        .nest("/conversations", conversations::routes())
         .nest("/memory", memory::routes())
+        .nest("/projects", projects::routes())
         .nest("/tasks", tasks::routes())
         .nest("/schedules", schedules::routes())
         .nest("/sessions", sessions::routes())

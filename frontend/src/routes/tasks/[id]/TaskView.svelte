@@ -1110,7 +1110,8 @@
 						</div>
 					{/if}
 					<div class="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh conversation' : 'Continues agent conversation'}</span>
+						<span class="rounded-full border border-border bg-secondary/40 px-2 py-1">{startsFreshConversation() ? 'Fresh Agent session' : 'Continues Agent session'}</span>
+						{#if task.conversation_id}<a href="/conversations/{task.conversation_id}" class="rounded-full border border-primary/30 bg-primary/5 px-2 py-1 text-primary hover:bg-primary/10">Linked conversation</a>{/if}
 						{#if task.depends_on && task.depends_on.length > 0}<span>Continues its dependency</span>{/if}
 					</div>
 
@@ -1653,6 +1654,12 @@
 					<div class="space-y-2">
 						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Agent</h3>
 						<a href="/agents/{task.agent_id}" class="text-sm underline hover:text-foreground">Open agent</a>
+					</div>
+				{/if}
+				{#if task.conversation_id}
+					<div class="space-y-2">
+						<h3 class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Conversation</h3>
+						<a href="/conversations/{task.conversation_id}" class="text-sm underline hover:text-foreground">Open conversation</a>
 					</div>
 				{/if}
 			</div>

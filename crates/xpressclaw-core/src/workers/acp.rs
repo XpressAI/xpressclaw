@@ -310,6 +310,7 @@ pub struct AcpTurnRuntime {
     recorder: AcpEventRecorder,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    allow_elicitation: bool,
 }
 
 /// A live, initialized ACP process. One handle is retained for each project so
@@ -336,6 +337,7 @@ struct ActiveTurn {
     recorder: AcpEventRecorder,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    allow_elicitation: bool,
 }
 
 #[derive(Clone)]
@@ -355,6 +357,20 @@ impl AcpTurnRuntime {
             recorder,
             elicitation_broker,
             turn_controls,
+            allow_elicitation: true,
+        }
+    }
+
+    pub fn for_conversation(
+        recorder: AcpEventRecorder,
+        elicitation_broker: Arc<AcpElicitationBroker>,
+        turn_controls: Arc<AcpTurnControlBroker>,
+    ) -> Self {
+        Self {
+            recorder,
+            elicitation_broker,
+            turn_controls,
+            allow_elicitation: false,
         }
     }
 }
@@ -380,6 +396,7 @@ pub struct AcpEventRecorder {
     attempt_id: String,
     task_id: String,
     runner: String,
+    conversation_id: Option<String>,
     state: Arc<Mutex<TurnState>>,
 }
 
@@ -397,6 +414,26 @@ impl AcpEventRecorder {
             attempt_id: attempt_id.into(),
             task_id: task_id.into(),
             runner: runner.into(),
+            conversation_id: None,
+            state: Arc::new(Mutex::new(TurnState::default())),
+        }
+    }
+
+    pub fn for_conversation(
+        db: Arc<Database>,
+        conversation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        runner: impl Into<String>,
+    ) -> Self {
+        let conversation_id = conversation_id.into();
+        Self {
+            db,
+            logical_session_id: agent_id.into(),
+            attempt_id: turn_id.into(),
+            task_id: format!("conversation:{conversation_id}"),
+            runner: runner.into(),
+            conversation_id: Some(conversation_id),
             state: Arc::new(Mutex::new(TurnState::default())),
         }
     }
@@ -411,6 +448,9 @@ impl AcpEventRecorder {
     }
 
     fn persist_native_session(&self, native_session_id: &str) -> Result<()> {
+        if self.conversation_id.is_some() {
+            return Ok(());
+        }
         SessionManager::new(self.db.clone()).set_native_session(&self.attempt_id, native_session_id)
     }
 
@@ -505,11 +545,13 @@ impl AcpEventRecorder {
                         },
                     })
                     .collect();
-                TaskBoard::new(self.db.clone()).sync_reported_subtasks(
-                    &self.task_id,
-                    &self.attempt_id,
-                    &reported,
-                )?;
+                if self.conversation_id.is_none() {
+                    TaskBoard::new(self.db.clone()).sync_reported_subtasks(
+                        &self.task_id,
+                        &self.attempt_id,
+                        &reported,
+                    )?;
+                }
                 let completed = reported
                     .iter()
                     .filter(|entry| entry.status == TaskStatus::Completed)
@@ -536,11 +578,16 @@ impl AcpEventRecorder {
             }
             SessionUpdate::UsageUpdate(update) => {
                 self.flush_prompt_output()?;
-                SessionManager::new(self.db.clone()).set_context_usage(
-                    &self.attempt_id,
-                    update.used,
-                    update.size,
-                )?;
+                if self.conversation_id.is_some() {
+                    crate::conversations::runtime::ConversationTurnQueue::new(self.db.clone())
+                        .set_context_usage(&self.attempt_id, update.used, update.size)?;
+                } else {
+                    SessionManager::new(self.db.clone()).set_context_usage(
+                        &self.attempt_id,
+                        update.used,
+                        update.size,
+                    )?;
+                }
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -739,6 +786,9 @@ impl AcpEventRecorder {
     }
 
     fn append_event(&self, event_type: &str, summary: &str, payload: Value) -> Result<()> {
+        if self.conversation_id.is_some() {
+            return Ok(());
+        }
         SessionManager::new(self.db.clone()).append_event(
             &self.logical_session_id,
             NewEvent {
@@ -770,7 +820,7 @@ impl AcpEventRecorder {
 }
 
 impl AcpProcess {
-    /// Start and initialize one ACP process over an attached project container.
+    /// Start and initialize one ACP process over an attached Agent container.
     pub async fn start(attached: AttachedContainer) -> Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -951,6 +1001,10 @@ async fn serve_process(
                     return responder
                         .respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
                 };
+                if !active.allow_elicitation {
+                    return responder
+                        .respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                }
                 let elicitation_task_id = active.recorder.task_id.clone();
                 let elicitation_attempt_id = active.recorder.attempt_id.clone();
                 let (elicitation_id, receiver) = active
@@ -1023,11 +1077,13 @@ async fn serve_process(
                     recorder,
                     elicitation_broker,
                     turn_controls,
+                    allow_elicitation,
                 } = runtime;
                 *active_turn.lock().unwrap() = Some(ActiveTurn {
                     recorder: recorder.clone(),
                     elicitation_broker,
                     turn_controls: turn_controls.clone(),
+                    allow_elicitation,
                 });
                 stderr_for_connection.lock().unwrap().clear();
 

@@ -1,6 +1,6 @@
 //! Event-driven logical sessions and their isolated native work attempts.
 //!
-//! A session is the durable, user-facing project context. Native harnesses own
+//! A session is the durable task context for one Agent. Native harnesses own
 //! their instructions and subagents; every invocation is represented by a work
 //! attempt that contributes structured events and artifacts to the timeline.
 
@@ -112,7 +112,7 @@ impl SessionManager {
         Self { db }
     }
 
-    /// Ensure that the durable project-context session exists. IDs retain the
+    /// Ensure that the durable Agent task session exists. IDs retain the
     /// legacy registry key shape so existing task and workflow references stay
     /// valid, but titles are always refreshed from the current project path.
     pub fn ensure(&self, session_id: &str, title: Option<&str>) -> Result<LogicalSession> {
@@ -612,7 +612,7 @@ impl SessionManager {
         })
     }
 
-    /// Release this attempt's lease on its project container after the
+    /// Release this attempt's lease on its Agent container after the
     /// process has stopped. The container itself remains available for a
     /// later attempt.
     pub fn clear_container(&self, attempt_id: &str) -> Result<()> {

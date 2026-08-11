@@ -17,9 +17,8 @@ use crate::db::Database;
 /// Route a connector event to conversations (direct binding) or to the
 /// connector_events table (for workflow matching).
 ///
-/// Returns `Some((conv_id, agent_id))` if the message was injected into
-/// a conversation (direct agent binding), so the caller can spawn the
-/// conversation processor.
+/// Returns `Some((conv_id, agent_id))` if the message was injected into a
+/// conversation. Message storage also queues its durable Conversation turn.
 pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) -> Option<(String, String)> {
     let mgr = ConnectorManager::new(db.clone());
 
@@ -61,7 +60,8 @@ pub fn route_event(db: &Arc<Database>, event: &ConnectorEvent) -> Option<(String
 }
 
 /// Find or create a conversation for this channel+agent and inject the message.
-/// Returns (conv_id, agent_id) on success so the caller can spawn the processor.
+/// Returns (conv_id, agent_id) on success for compatibility with connector
+/// callers that track the bound Agent.
 fn inject_into_conversation(
     db: &Arc<Database>,
     event: &ConnectorEvent,
@@ -118,8 +118,7 @@ fn inject_into_conversation(
         }
     };
 
-    // Send the message into the conversation (must use send_user_message
-    // which sets processed=0 so the processor picks it up)
+    // Store the message and its addressed Agent turn atomically.
     match conv_mgr.send_user_message(
         &conv_id,
         &SendMessage {

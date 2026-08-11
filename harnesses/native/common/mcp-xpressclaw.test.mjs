@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -238,5 +241,123 @@ test('serves project memory discovery and writes over the stdio MCP protocol', {
     if (child.exitCode === null) await once(child, 'exit');
     lines.close();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('conversation tools publish files, download attachments, and create linked work', { timeout: 5000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-conversation-'));
+  await writeFile(path.join(workspace, 'report.md'), '# Report\nUseful evidence.\n');
+  let publishedBody = null;
+  let taskBody = null;
+  const server = createServer(async (request, response) => {
+    if (request.url === '/api/memory/project-a/index' && request.method === 'GET') {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ active_notes: 0, pinned_notes: 0, note_types: [], top_tags: [], pinned: [], recent: [], hint: '' }));
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/agent-messages' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      publishedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ message: { id: 1 }, queued_agents: [] }));
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/attachments/file-1' && request.method === 'GET') {
+      response.writeHead(200, { 'content-type': 'text/markdown' });
+      response.end('# Published finding\n');
+      return;
+    }
+    if (request.url === '/api/conversations/conversation-a/tasks' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      taskBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(201, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: 'task-10', ...taskBody }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+        XPRESSCLAW_AGENT_ID: 'atlas',
+        XPRESSCLAW_TASK_ID: 'task-9',
+        XPRESSCLAW_PROJECT_ID: 'project-a',
+        XPRESSCLAW_CONVERSATION_ID: 'conversation-a',
+        XPRESSCLAW_WORKSPACE: workspace,
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  let childError = '';
+  child.stderr.on('data', (chunk) => {
+    childError += chunk.toString('utf8');
+  });
+  const requestMcp = async (message) => {
+    child.stdin.write(`${JSON.stringify(message)}\n`);
+    const next = await output.next();
+    assert.equal(next.done, false, childError || 'MCP server closed stdout unexpectedly');
+    return JSON.parse(next.value);
+  };
+
+  try {
+    const initialized = await requestMcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
+    assert.match(initialized.result.instructions, /linked to a project conversation/);
+    const listed = await requestMcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
+    assert.deepEqual(
+      listed.result.tools
+        .filter((tool) => tool.name.includes('conversation'))
+        .map((tool) => tool.name),
+      ['send_conversation_message', 'download_conversation_attachment', 'create_conversation_task'],
+    );
+
+    await requestMcp({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'send_conversation_message', arguments: { content: 'Research complete.', files: ['report.md'] } },
+    });
+    assert.equal(publishedBody.agent_id, 'atlas');
+    assert.equal(publishedBody.source_task_id, 'task-9');
+    assert.equal(Buffer.from(publishedBody.attachments[0].data, 'base64').toString('utf8'), '# Report\nUseful evidence.\n');
+
+    const downloaded = await requestMcp({
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: { name: 'download_conversation_attachment', arguments: { attachment_id: 'file-1', file_name: '../finding.md' } },
+    });
+    const downloadedPath = downloaded.result.structuredContent.path;
+    assert.equal(path.dirname(downloadedPath), path.join(workspace, '.xpressclaw', 'conversations', 'conversation-a'));
+    assert.equal(await readFile(downloadedPath, 'utf8'), '# Published finding\n');
+
+    await requestMcp({
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: { name: 'create_conversation_task', arguments: { title: 'Continue research', description: 'Check the edge cases.' } },
+    });
+    assert.equal(taskBody.agent_id, 'atlas');
+    assert.equal(taskBody.creator_agent_id, 'atlas');
+    assert.equal(taskBody.project_id, 'project-a');
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(workspace, { recursive: true, force: true });
   }
 });

@@ -13,11 +13,12 @@ opens first-session setup when no configuration exists.
 
 Use `xpressclaw up --detach` to keep the server in the background.
 
-## 2. Create an agent
+## 2. Create a Project and Agent
 
-The agent creator asks for:
+Create a Project for the work, then add one or more Agents. The Agent creator
+asks for:
 
-- a durable agent name;
+- an Agent name;
 - Codex, Claude Code, OpenCode, or another ACP-compatible harness;
 - the host project folder mounted at `/workspace`;
 - whether to reuse a built-in harness's host subscription login;
@@ -44,13 +45,17 @@ The chosen agent name labels its durable context. Legacy or manually edited
 configuration without a name falls back to the workspace folder. The label is
 not a persona, role, or Xpressclaw-authored system prompt.
 
-## 4. Send work
+## 4. Start a Conversation or send work
 
-Describe an outcome for the agent. Xpressclaw queues it, lazily starts and
-initializes an ACP server inside the agent's retained project container, sends
+Start a Project Conversation with one or more Agents for shared coordination.
+Conversation ACP sessions remain available while task work is running. Use
+**Continue with task** for a durable outcome, or describe an outcome directly
+to an Agent from **New Work**. XpressClaw queues task work, lazily starts and
+initializes an ACP server inside the Agent's retained container, sends
 `session/prompt`, and writes standard progress, plans, tool activity, and
-results back to the durable timeline. Later turns reuse that process and its
-live ACP sessions along with installed tools, caches, `/home/node`, and `/tmp`.
+results back to the durable timeline. Later task turns reuse that process and
+its live ACP sessions along with installed tools, caches, `/home/node`, and
+`/tmp`.
 
 Open an Agent's **Files** tab to browse and edit its configured workspace with
 Monaco, inspect current Git changes and diffs, or open a terminal in its
@@ -60,10 +65,10 @@ link directly to them in the editor.
 
 ## 5. Automate work
 
-- **Tasks** queue explicit work for a selected agent.
-- **Automations → Schedules** send work to an agent once or on a cron schedule.
-- **Automations → Workflows** coordinate agents through implementation/review,
-  goal, and custom loops.
+- **Tasks** queue explicit work for a selected Agent.
+- **Automations → Schedules** send work to an Agent once or on a cron schedule.
+- **Automations → Workflows** coordinate Agents through implementation/review,
+  goal, and custom loops; workflows started in a Conversation report there.
 
 ## Lifecycle commands
 

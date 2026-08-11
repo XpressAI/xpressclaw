@@ -19,7 +19,7 @@ Each Agent has a **Files** view with three related capabilities:
 
 1. A lazy directory tree and UTF-8 file API rooted at the Agent's configured
    host workspace. The workspace is already mounted read-write into the
-   retained project container, so host-side reads and saves immediately appear
+   retained Agent container, so host-side reads and saves immediately appear
    to the harness without requiring the container to be running.
 2. A lazily loaded Monaco editor with language-aware highlighting and a diff
    view. A read returns a SHA-256 content revision; a save must provide that
@@ -27,7 +27,7 @@ Each Agent has a **Files** view with three related capabilities:
    file in the meantime. Saves replace the file atomically and preserve its
    permissions.
 3. An xterm.js terminal attached through a WebSocket to a TTY created with
-   `docker exec` in the installation-owned retained project container. A
+   `docker exec` in the installation-owned retained Agent container. A
    stopped retained container is restarted for the session. An Agent that has
    never run a task explains that one task must initialize its environment
    before a terminal is available.

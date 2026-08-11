@@ -23,6 +23,7 @@ use crate::config::{
     NativeRunnerConfig,
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
+use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::{
@@ -81,6 +82,80 @@ struct ProjectAcpProcess {
 #[derive(Default)]
 struct ProjectAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ProjectAcpProcess>>>>>,
+}
+
+#[derive(Clone)]
+struct ConversationAcpProcess {
+    fingerprint: String,
+    container_id: String,
+    process: AcpProcess,
+}
+
+#[derive(Default)]
+struct ConversationAcpProcesses {
+    slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
+}
+
+impl ConversationAcpProcesses {
+    fn slot(
+        &self,
+        conversation_id: &str,
+        agent_id: &str,
+    ) -> Arc<AsyncMutex<Option<ConversationAcpProcess>>> {
+        let key = format!("{conversation_id}\u{0}{agent_id}");
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+            .clone()
+    }
+
+    async fn get_or_start(
+        &self,
+        docker: &DockerManager,
+        conversation_id: &str,
+        agent_id: &str,
+        base: &ProjectAcpProcess,
+        spec: &ContainerSpec,
+    ) -> Result<ConversationAcpProcess> {
+        let fingerprint = container_spec_fingerprint(spec)?;
+        let slot = self.slot(conversation_id, agent_id);
+        let mut entry = slot.lock().await;
+        if entry.as_ref().is_some_and(|current| {
+            current.fingerprint == fingerprint
+                && current.container_id == base.container_id
+                && current.process.is_alive()
+        }) {
+            return Ok(entry.as_ref().unwrap().clone());
+        }
+        entry.take();
+        let command = spec.cmd.as_deref().ok_or_else(|| {
+            Error::Backend("the selected ACP runner has no process command".into())
+        })?;
+        let attached = docker
+            .open_project_process(agent_id, command, spec.working_dir.as_deref())
+            .await?;
+        let process = AcpProcess::start(attached).await?;
+        let started = ConversationAcpProcess {
+            fingerprint,
+            container_id: base.container_id.clone(),
+            process,
+        };
+        *entry = Some(started.clone());
+        Ok(started)
+    }
+
+    async fn invalidate(&self, conversation_id: &str, agent_id: &str, process: &AcpProcess) {
+        let slot = self.slot(conversation_id, agent_id);
+        let mut entry = slot.lock().await;
+        if entry
+            .as_ref()
+            .is_some_and(|current| current.process.same_process(process))
+        {
+            entry.take();
+        }
+    }
 }
 
 impl ProjectAcpProcesses {
@@ -175,7 +250,31 @@ pub async fn start_dispatcher(
     };
     let concurrency = Arc::new(Semaphore::new(4));
     let processes = Arc::new(ProjectAcpProcesses::default());
+    let conversation_processes = Arc::new(ConversationAcpProcesses::default());
     let mut docker = initial_docker;
+
+    let _ = ConversationTurnQueue::new(db.clone()).recover();
+    let conversation_db = db.clone();
+    let conversation_config = config.clone();
+    let conversation_docker = docker.clone();
+    let conversation_bus = event_bus.clone();
+    let conversation_elicitations = elicitation_broker.clone();
+    let conversation_controls = turn_controls.clone();
+    let conversation_base_processes = processes.clone();
+    tokio::spawn(async move {
+        start_conversation_dispatcher(
+            conversation_db,
+            conversation_config,
+            conversation_docker,
+            conversation_bus,
+            conversation_elicitations,
+            conversation_controls,
+            conversation_base_processes,
+            conversation_processes,
+            control_plane_port,
+        )
+        .await;
+    });
 
     loop {
         let docker = match docker.clone() {
@@ -253,6 +352,353 @@ pub async fn start_dispatcher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn start_conversation_dispatcher(
+    db: Arc<Database>,
+    config: Arc<RwLock<Arc<Config>>>,
+    initial_docker: Option<Arc<DockerManager>>,
+    event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+    project_processes: Arc<ProjectAcpProcesses>,
+    conversation_processes: Arc<ConversationAcpProcesses>,
+    control_plane_port: u16,
+) {
+    info!("conversation ACP dispatcher started");
+    let installation_id = match db.installation_id() {
+        Ok(installation_id) => installation_id,
+        Err(error) => {
+            warn!(%error, "conversation dispatcher could not load installation identity");
+            return;
+        }
+    };
+    let concurrency = Arc::new(Semaphore::new(8));
+    let mut docker = initial_docker;
+    loop {
+        let docker = match docker.clone() {
+            Some(docker) => docker,
+            None => match DockerManager::connect_for_installation(&installation_id).await {
+                Ok(connected) => {
+                    let connected = Arc::new(connected);
+                    docker = Some(connected.clone());
+                    connected
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    continue;
+                }
+            },
+        };
+        let permit = match concurrency.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        match ConversationTurnQueue::new(db.clone()).claim_next() {
+            Ok(Some(turn)) => {
+                let runtime = ConversationAttemptRuntime {
+                    db: db.clone(),
+                    config: config.read().unwrap().clone(),
+                    docker,
+                    event_bus: event_bus.clone(),
+                    elicitation_broker: elicitation_broker.clone(),
+                    turn_controls: turn_controls.clone(),
+                    project_processes: project_processes.clone(),
+                    conversation_processes: conversation_processes.clone(),
+                    control_plane_port,
+                };
+                let failure_db = runtime.db.clone();
+                let failure_bus = runtime.event_bus.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = execute_conversation_turn(runtime, turn.clone()).await {
+                        warn!(
+                            conversation_id = turn.conversation_id,
+                            agent_id = turn.agent_id,
+                            %error,
+                            "conversation turn failed"
+                        );
+                        let _ =
+                            ConversationTurnQueue::new(failure_db).fail(&turn, &error.to_string());
+                        failure_bus.send(
+                            &turn.conversation_id,
+                            ConversationEvent::Error {
+                                agent_id: Some(turn.agent_id.clone()),
+                                error: error.to_string(),
+                            },
+                        );
+                        failure_bus.send(&turn.conversation_id, ConversationEvent::Done);
+                    }
+                });
+            }
+            Ok(None) => {
+                drop(permit);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                drop(permit);
+                warn!(%error, "failed to claim conversation turn");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+struct ConversationAttemptRuntime {
+    db: Arc<Database>,
+    config: Arc<Config>,
+    docker: Arc<DockerManager>,
+    event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+    project_processes: Arc<ProjectAcpProcesses>,
+    conversation_processes: Arc<ConversationAcpProcesses>,
+    control_plane_port: u16,
+}
+
+async fn execute_conversation_turn(
+    runtime: ConversationAttemptRuntime,
+    turn: ConversationTurn,
+) -> Result<()> {
+    let ConversationAttemptRuntime {
+        db,
+        config,
+        docker,
+        event_bus,
+        elicitation_broker,
+        turn_controls,
+        project_processes,
+        conversation_processes,
+        control_plane_port,
+    } = runtime;
+    let queue = ConversationTurnQueue::new(db.clone());
+    if !queue.is_running(&turn.id)? {
+        return Ok(());
+    }
+    let manager = ConversationManager::new(db.clone());
+    let conversation = manager.get(&turn.conversation_id)?;
+    let agent = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == turn.agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: turn.agent_id.clone(),
+        })?;
+    let kind = resolve_runner_kind(agent)?;
+    let workspace = resolved_workspace(&config, agent);
+    let github = github::discover(&db, &workspace);
+    let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let container_workspace = spec
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| "/workspace".to_string());
+    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
+        == Some(spec.image.as_str());
+    if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
+        let local_fallback = match local_runner_image_alias(&spec.image) {
+            Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
+                Some(image)
+            }
+            _ => None,
+        };
+        if let Some(local_image) = local_fallback {
+            spec.image = local_image.to_string();
+        } else {
+            docker.pull_image(&spec.image).await?;
+        }
+    }
+
+    let mut mcp_servers = configured_mcp_servers(&config, agent)?;
+    let bundled_control_tools = docker
+        .image_has_label(
+            &spec.image,
+            "io.xpressclaw.protocol",
+            BUILT_IN_RUNNER_PROTOCOL,
+        )
+        .await;
+    let github_mcp_attached = configure_bundled_github_mcp(
+        &agent.runner,
+        &kind,
+        github.is_some(),
+        bundled_control_tools,
+        false,
+        &mut spec.environment,
+    )?;
+    if bundled_control_tools
+        && !agent
+            .runner
+            .mcp_servers
+            .iter()
+            .any(|name| name == "xpressclaw")
+    {
+        mcp_servers.push(xpressclaw_control_mcp_server_for_context(
+            &agent.name,
+            None,
+            Some(&turn.conversation_id),
+            conversation.project_id.as_deref(),
+            &container_workspace,
+            control_plane_port,
+            docker.runtime(),
+        ));
+    }
+    if let Some(access) = github.as_ref() {
+        if github_mcp_attached {
+            mcp_servers.push(access.mcp_server(None));
+        }
+    }
+    let pi_mcp_bridge = kind == "pi"
+        && docker
+            .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+            .await;
+    let mcp_signature = if pi_mcp_bridge {
+        let signature = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        Some(signature)
+    } else {
+        None
+    };
+
+    let base = project_processes
+        .get_or_start(&docker, &agent.name, &spec)
+        .await?;
+    let live = conversation_processes
+        .get_or_start(&docker, &turn.conversation_id, &turn.agent_id, &base, &spec)
+        .await?;
+    let session = queue.session(&turn.conversation_id, &turn.agent_id)?;
+    let session_start = session
+        .native_session_id
+        .map(AcpSessionStart::Resume)
+        .unwrap_or(AcpSessionStart::New);
+    let previous_trigger_message_id = if matches!(&session_start, AcpSessionStart::Resume(_)) {
+        queue.last_completed_trigger(&turn.conversation_id, &turn.agent_id)?
+    } else {
+        None
+    };
+    let prompt = build_conversation_prompt(
+        &manager,
+        &conversation,
+        &turn,
+        agent,
+        previous_trigger_message_id,
+    )?;
+    event_bus.send(
+        &turn.conversation_id,
+        ConversationEvent::Thinking {
+            agent_id: turn.agent_id.clone(),
+        },
+    );
+    turn_controls.begin_attempt(&turn.id);
+    if !queue.is_running(&turn.id)? {
+        turn_controls.finish_attempt(&turn.id);
+        return Ok(());
+    }
+    let recorder = AcpEventRecorder::for_conversation(
+        db.clone(),
+        turn.conversation_id.clone(),
+        turn.agent_id.clone(),
+        turn.id.clone(),
+        kind.clone(),
+    );
+    let result = live
+        .process
+        .run_turn(
+            AcpTurnRuntime::for_conversation(recorder, elicitation_broker, turn_controls.clone()),
+            session_start,
+            Path::new(&container_workspace),
+            &prompt,
+            AcpTurnOptions {
+                model: agent.runner.model.clone(),
+                session_config: agent.runner.session_config.clone(),
+                mcp_servers,
+                mcp_signature,
+                image_attachments: vec![],
+            },
+        )
+        .await;
+    turn_controls.finish_attempt(&turn.id);
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            conversation_processes
+                .invalidate(&turn.conversation_id, &turn.agent_id, &live.process)
+                .await;
+            if !queue.is_running(&turn.id)? {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    let Some(message) = queue.complete_with_message(
+        &turn,
+        &result.session_id,
+        &SendMessage {
+            sender_type: "agent".into(),
+            sender_id: turn.agent_id.clone(),
+            sender_name: Some(agent.context_label()),
+            content: result.summary,
+            message_type: None,
+        },
+        &json!({ "conversation_turn_id": turn.id, "runner": kind }),
+    )?
+    else {
+        event_bus.send(&turn.conversation_id, ConversationEvent::Done);
+        return Ok(());
+    };
+    event_bus.send(
+        &turn.conversation_id,
+        ConversationEvent::Message {
+            message: json!(message),
+        },
+    );
+    event_bus.send(&turn.conversation_id, ConversationEvent::Done);
+    Ok(())
+}
+
+fn build_conversation_prompt(
+    manager: &ConversationManager,
+    conversation: &crate::conversations::Conversation,
+    turn: &ConversationTurn,
+    agent: &AgentConfig,
+    previous_trigger_message_id: Option<i64>,
+) -> Result<String> {
+    let messages = match (previous_trigger_message_id, turn.trigger_message_id) {
+        (Some(after_id), Some(through_id)) => manager
+            .get_messages_between(&turn.conversation_id, after_id, through_id, 80)?
+            .into_iter()
+            .filter(|message| message.sender_type != "agent" || message.sender_id != turn.agent_id)
+            .collect(),
+        _ => manager.get_messages(&turn.conversation_id, 80, None)?,
+    };
+    let mut history = String::new();
+    for message in messages {
+        let name = message.sender_name.as_deref().unwrap_or(&message.sender_id);
+        history.push_str(&format!("[{name}]: {}\n", message.content));
+        for attachment in manager.attachments(message.id).unwrap_or_default() {
+            history.push_str(&format!(
+                "  [file: {} | attachment_id: {} | {} bytes]\n",
+                attachment.name, attachment.id, attachment.size
+            ));
+        }
+    }
+    let history_label = if previous_trigger_message_id.is_some() {
+        "New conversation activity since your previous response"
+    } else {
+        "Recent conversation history"
+    };
+    Ok(format!(
+        "You are {} participating in the project conversation {:?}. Reply conversationally and concisely to the newest messages addressed to you. You are in an independent chat lane, so do not duplicate a long-running task. If substantial work is needed, use create_conversation_task to create it and tell the participants. You may use send_conversation_message to share an interim update or publish workspace files. Use download_conversation_attachment with an attachment_id when you need to inspect a published file. Other Agents may be working in parallel.\n\nConversation ID: {}\nProject ID: {}\n\n{history_label}:\n{}",
+        agent.context_label(),
+        conversation.title.as_deref().unwrap_or("Untitled conversation"),
+        turn.conversation_id,
+        conversation.project_id.as_deref().unwrap_or("unassigned"),
+        history,
+    ))
+}
+
 async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {
     let NativeAttemptRuntime {
         db,
@@ -310,6 +756,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
+    let task_project_id = board.project_id(&task.id)?;
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
         control_task_id.is_some() && github_review_lifecycle_enabled(&task);
@@ -383,9 +830,12 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             .iter()
             .any(|name| name == "xpressclaw")
     {
-        mcp_servers.push(xpressclaw_control_mcp_server(
+        mcp_servers.push(xpressclaw_control_mcp_server_for_context(
             &agent.name,
             control_task_id.as_deref(),
+            task.conversation_id.as_deref(),
+            task_project_id.as_deref(),
+            &container_workspace,
             control_plane_port,
             docker.runtime(),
         ));
@@ -677,15 +1127,17 @@ fn publish_conversation_result(
         return;
     };
     let manager = ConversationManager::new(db.clone());
-    if let Ok(message) = manager.send_message(
+    if let Ok(message) = manager.send_structured_message(
         &conversation_id,
         &SendMessage {
             sender_type: "agent".to_string(),
             sender_id: item.agent_id.clone(),
             sender_name: Some(sender_name.to_string()),
             content: content.to_string(),
-            message_type: None,
+            message_type: Some("task_result".to_string()),
         },
+        Some(&item.task_id),
+        Some(&json!({ "task_id": item.task_id })),
     ) {
         event_bus.send(
             &conversation_id,
@@ -1341,9 +1793,30 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
     format!("http://{host}:{control_plane_port}")
 }
 
+#[cfg(test)]
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
     task_id: Option<&str>,
+    control_plane_port: u16,
+    container_runtime: &str,
+) -> McpServer {
+    xpressclaw_control_mcp_server_for_context(
+        agent_id,
+        task_id,
+        None,
+        None,
+        "/workspace",
+        control_plane_port,
+        container_runtime,
+    )
+}
+
+fn xpressclaw_control_mcp_server_for_context(
+    agent_id: &str,
+    task_id: Option<&str>,
+    conversation_id: Option<&str>,
+    project_id: Option<&str>,
+    workspace: &str,
     control_plane_port: u16,
     container_runtime: &str,
 ) -> McpServer {
@@ -1353,9 +1826,19 @@ fn xpressclaw_control_mcp_server(
             control_plane_url(control_plane_port, container_runtime),
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
+        EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
     ];
     if let Some(task_id) = task_id {
         env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
+    }
+    if let Some(conversation_id) = conversation_id {
+        env.push(EnvVariable::new(
+            "XPRESSCLAW_CONVERSATION_ID",
+            conversation_id,
+        ));
+    }
+    if let Some(project_id) = project_id {
+        env.push(EnvVariable::new("XPRESSCLAW_PROJECT_ID", project_id));
     }
     // The control MCP must move in lockstep with the control plane. Runner
     // images are cached independently and can legitimately remain on an older
@@ -3841,6 +4324,9 @@ mod tests {
     #[test]
     fn native_results_return_to_conversation_history() {
         let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "generic")
+            .unwrap();
         let conversations = ConversationManager::new(db.clone());
         let conversation = conversations
             .create(&crate::conversations::CreateConversation {
@@ -3878,6 +4364,11 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].sender_type, "agent");
+        assert_eq!(messages[0].message_type, "task_result");
+        assert_eq!(
+            messages[0].linked_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
         assert_eq!(messages[0].content, "Native result");
     }
 }

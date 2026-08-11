@@ -412,8 +412,7 @@ impl DockerManager {
     fn installation_id(&self) -> Result<&str> {
         self.installation_id.as_deref().ok_or_else(|| {
             Error::Container(
-                "retained project containers require an XpressClaw installation identity"
-                    .to_string(),
+                "retained Agent containers require an XpressClaw installation identity".to_string(),
             )
         })
     }
@@ -444,7 +443,7 @@ impl DockerManager {
                 .unwrap_or_default();
             if !project_ownership_matches(&labels, installation_id, agent_id) {
                 return Err(Error::Container(format!(
-                    "refusing to replace project container {container_name} owned by another XpressClaw installation"
+                    "refusing to replace Agent container {container_name} owned by another XpressClaw installation"
                 )));
             }
             let labels_match =
@@ -456,20 +455,20 @@ impl DockerManager {
                 self.stop_preserving(agent_id).await?;
                 let container_id = existing.id.ok_or_else(|| {
                     Error::Container(format!(
-                        "project container {container_name} has no container ID"
+                        "Agent container {container_name} has no container ID"
                     ))
                 })?;
                 self.docker
                     .start_container::<String>(&container_id, None)
                     .await
                     .map_err(|error| {
-                        Error::Container(format!("failed to restart project container: {error}"))
+                        Error::Container(format!("failed to restart Agent container: {error}"))
                     })?;
                 let host_port = self.get_host_port(&container_id, spec.expose_port).await;
                 info!(
                     agent_id,
                     container_id = &container_id[..12.min(container_id.len())],
-                    "restarted retained project container"
+                    "restarted retained Agent container"
                 );
                 ContainerInfo {
                     container_id,
@@ -482,7 +481,7 @@ impl DockerManager {
                     agent_id,
                     labels_match,
                     image_matches,
-                    "recreating project container after runner configuration changed"
+                    "recreating Agent container after runner configuration changed"
                 );
                 self.remove(&container_name).await?;
                 self.create_and_start(
@@ -520,7 +519,7 @@ impl DockerManager {
         }
     }
 
-    /// Whether a retained project container still represents the requested
+    /// Whether a retained Agent container still represents the requested
     /// runner specification and the image currently available under its tag.
     pub async fn project_container_matches(&self, agent_id: &str, spec: &ContainerSpec) -> bool {
         let Ok(installation_id) = self.installation_id() else {
@@ -695,7 +694,7 @@ impl DockerManager {
         })
     }
 
-    /// Stop a project container without deleting its writable layer.
+    /// Stop an Agent container without deleting its writable layer.
     pub async fn stop_preserving(&self, agent_id: &str) -> Result<()> {
         let container_name = self.owned_project_container_name(agent_id)?;
         if !self.is_container_running(&container_name).await {
@@ -707,14 +706,14 @@ impl DockerManager {
             .stop_container(&container_name, Some(stop_opts))
             .await
         {
-            warn!(agent_id, %error, "error stopping retained project container");
+            warn!(agent_id, %error, "error stopping retained Agent container");
             if self.is_container_running(&container_name).await {
                 return Err(Error::Container(format!(
-                    "failed to stop retained project container: {error}"
+                    "failed to stop retained Agent container: {error}"
                 )));
             }
         }
-        info!(agent_id, "stopped and retained project container");
+        info!(agent_id, "stopped and retained Agent container");
         Ok(())
     }
 
@@ -758,7 +757,7 @@ impl DockerManager {
             .unwrap_or_default();
         if !project_ownership_matches(&labels, installation_id, agent_id) {
             return Err(Error::Container(format!(
-                "refusing terminal access to project container {container_name} with mismatched ownership"
+                "refusing terminal access to Agent container {container_name} with mismatched ownership"
             )));
         }
         let running = container
@@ -772,7 +771,7 @@ impl DockerManager {
                 .await
                 .map_err(|error| {
                     Error::Container(format!(
-                        "failed to restart retained project container: {error}"
+                        "failed to restart retained Agent container: {error}"
                     ))
                 })?;
         }
@@ -826,6 +825,98 @@ impl DockerManager {
         };
         let _ = self.resize_terminal(&session.exec_id, columns, rows).await;
         Ok(session)
+    }
+
+    /// Start another non-TTY ACP process inside a retained Agent container.
+    /// Conversation turns use this independent stdio channel so an Agent can
+    /// keep chatting while its primary ACP process is busy with a long task.
+    pub async fn open_project_process(
+        &self,
+        agent_id: &str,
+        command: &[String],
+        working_dir: Option<&str>,
+    ) -> Result<AttachedContainer> {
+        if command.is_empty() {
+            return Err(Error::Container(
+                "cannot start a project process without a command".into(),
+            ));
+        }
+        let installation_id = self.installation_id()?;
+        let container_name = project_container_name(installation_id, agent_id);
+        let container = self.inspect_by_name(&container_name).await.ok_or_else(|| {
+            Error::ContainerNotFound {
+                id: format!("retained environment for {agent_id}"),
+            }
+        })?;
+        let labels = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        if !project_ownership_matches(&labels, installation_id, agent_id) {
+            return Err(Error::Container(format!(
+                "refusing process access to Agent container {container_name} with mismatched ownership"
+            )));
+        }
+        let running = container
+            .state
+            .as_ref()
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if !running {
+            return Err(Error::Container(format!(
+                "retained Agent container {container_name} is not running"
+            )));
+        }
+        let container_id = container.id.unwrap_or_else(|| container_name.clone());
+        let exec = self
+            .docker
+            .create_exec(
+                &container_name,
+                CreateExecOptions::<String> {
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    tty: Some(false),
+                    cmd: Some(command.to_vec()),
+                    working_dir: working_dir.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                Error::Container(format!("failed to create project ACP process: {error}"))
+            })?;
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(StartExecOptions {
+                    detach: false,
+                    tty: false,
+                    output_capacity: Some(1024 * 1024),
+                }),
+            )
+            .await
+            .map_err(|error| {
+                Error::Container(format!("failed to start project ACP process: {error}"))
+            })?;
+        let StartExecResults::Attached { output, input } = started else {
+            return Err(Error::Container(
+                "project ACP process unexpectedly started detached".into(),
+            ));
+        };
+        Ok(AttachedContainer {
+            info: ContainerInfo {
+                container_id,
+                agent_id: agent_id.to_string(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input,
+            output,
+        })
     }
 
     /// Resize an interactive terminal created by [`open_project_terminal`].
@@ -1433,7 +1524,7 @@ fn container_user(run_as_host_user: bool, rootless: bool) -> Option<String> {
 pub(crate) fn container_spec_fingerprint(spec: &ContainerSpec) -> Result<String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| {
         Error::Container(format!(
-            "failed to fingerprint project container specification: {error}"
+            "failed to fingerprint Agent container specification: {error}"
         ))
     })?;
     Ok(format!("{:x}", Sha256::digest(encoded)))

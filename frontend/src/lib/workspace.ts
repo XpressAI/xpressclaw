@@ -2,6 +2,9 @@ export type WorkspaceTabKind =
 	| 'home'
 	| 'projects'
 	| 'project'
+	| 'agents'
+	| 'agent'
+	| 'conversation'
 	| 'tasks'
 	| 'task'
 	| 'automations'
@@ -53,6 +56,14 @@ export function projectPath(projectId: string, section: ProjectSection = 'sessio
 	return section === 'session' ? base : `${base}?tab=${section}`;
 }
 
+export function collaborationProjectPath(projectId: string): string {
+	return `/projects/${encodeURIComponent(projectId)}`;
+}
+
+export function conversationPath(conversationId: string): string {
+	return `/conversations/${encodeURIComponent(conversationId)}`;
+}
+
 export function projectSection(route: string): ProjectSection {
 	const queryIndex = route.indexOf('?');
 	if (queryIndex < 0) return 'session';
@@ -65,6 +76,10 @@ export function projectSection(route: string): ProjectSection {
 export function workspacePath(route: string): boolean {
 	const pathname = pathnameFromRoute(route);
 	return pathname === '/'
+		|| pathname === '/projects'
+		|| pathname.startsWith('/projects/')
+		|| pathname === '/conversations'
+		|| pathname.startsWith('/conversations/')
 		|| pathname === '/agents'
 		|| pathname.startsWith('/agents/')
 		|| pathname === '/tasks'
@@ -80,8 +95,12 @@ export function workspacePath(route: string): boolean {
 export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
-	if (pathname === '/agents') return { path: route, kind: 'projects', title: 'Agents', resourceId: null };
-	if (pathname.startsWith('/agents/')) return { path: route, kind: 'project', title: 'Agent', resourceId: pathname.slice('/agents/'.length) };
+	if (pathname === '/projects') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
+	if (pathname.startsWith('/projects/')) return { path: route, kind: 'project', title: 'Project', resourceId: decodeURIComponent(pathname.slice('/projects/'.length)) };
+	if (pathname === '/conversations') return { path: route, kind: 'projects', title: 'Conversations', resourceId: null };
+	if (pathname.startsWith('/conversations/')) return { path: route, kind: 'conversation', title: 'Conversation', resourceId: decodeURIComponent(pathname.slice('/conversations/'.length)) };
+	if (pathname === '/agents') return { path: route, kind: 'agents', title: 'Agents', resourceId: null };
+	if (pathname.startsWith('/agents/')) return { path: route, kind: 'agent', title: 'Agent', resourceId: decodeURIComponent(pathname.slice('/agents/'.length)) };
 	if (pathname === '/tasks') return { path: route, kind: 'tasks', title: 'Tasks', resourceId: null };
 	if (pathname.startsWith('/tasks/')) return { path: route, kind: 'task', title: 'Task', resourceId: pathname.slice('/tasks/'.length) };
 	if (pathname === '/automations' || pathname === '/schedules' || pathname === '/workflows') return { path: route, kind: 'automations', title: 'Automations', resourceId: null };
@@ -99,6 +118,8 @@ export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 	if (settingsKinds.includes(tab.kind) && settingsKinds.includes(next.kind)) return true;
 	if (automationKinds.includes(tab.kind) && automationKinds.includes(next.kind)) return true;
 	if (tab.kind === 'project' && next.kind === 'project') return tab.resourceId === next.resourceId;
+	if (tab.kind === 'agent' && next.kind === 'agent') return tab.resourceId === next.resourceId;
+	if (tab.kind === 'conversation' && next.kind === 'conversation') return tab.resourceId === next.resourceId;
 	return tab.path === route;
 }
 

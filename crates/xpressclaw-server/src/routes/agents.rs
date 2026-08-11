@@ -42,6 +42,7 @@ fn agent_json(
         "name": record.name,
         "title": agent_cfg.map(|config| config.context_label()).unwrap_or_else(|| record.name.clone()),
         "backend": record.backend,
+        "project_id": record.project_id,
         "status": status,
         "desired_status": "available",
         "observed_status": "native",

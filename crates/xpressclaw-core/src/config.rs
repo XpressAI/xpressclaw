@@ -280,7 +280,7 @@ pub struct NativeRunnerConfig {
     pub command: Vec<String>,
     /// Reuse the host agent login from its standard config directory.
     pub subscription_auth: bool,
-    /// Forward the host SSH agent into the retained project container. This
+    /// Forward the host SSH agent into the retained Agent container. This
     /// exposes signing operations through the agent protocol, never private
     /// key files, and is intentionally opt-in.
     pub ssh_agent_forwarding: bool,

@@ -103,7 +103,7 @@ interface AgentRuntimeSummaryInput {
 	};
 }
 
-/** Harness and folder metadata shown beneath a durable agent name. */
+/** Harness and folder metadata shown beneath an Agent name. */
 export function agentRuntimeSummary(agent: AgentRuntimeSummaryInput): string {
 	const runner = agent.config?.runner;
 	return `${harnessName(runner?.kind || agent.backend)} · ${workspaceFolder(runner?.workspace)}`;

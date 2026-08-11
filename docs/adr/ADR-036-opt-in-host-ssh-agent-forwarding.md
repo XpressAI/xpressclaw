@@ -44,7 +44,7 @@ When enabled, XpressClaw:
 - includes opaque socket and known-host device/inode generations plus the
   effective materialized SSH configuration in the retained-container
   specification, so replacing any source or changing an included config
-  recreates the project container on the next turn.
+  recreates the Agent container on the next turn.
 
 Setup inspects only Git metadata to flag workspaces with SSH remotes. Both
 setup and Agent settings show whether a live host agent was detected and warn

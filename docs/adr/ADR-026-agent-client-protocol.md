@@ -112,7 +112,7 @@ resource limits. Permission requests and the selected option are recorded.
 
 The built-in Codex runner also defaults its ACP adapter to
 `agent-full-access`. Codex's normal workspace sandbox would otherwise create a
-second, product-specific restriction inside the retained project container and
+second, product-specific restriction inside the retained Agent container and
 make common development tools fail despite already being isolated from the
 host. This does not grant host access: the outer container, its mounts, network,
 limits, and the separately opt-in host container-engine socket remain the

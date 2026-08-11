@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 pub struct WorkflowInstance {
     pub id: String,
     pub workflow_id: String,
+    pub project_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub status: String, // running, waiting, completed, failed, cancelled
     pub current_flow: String,
     pub current_step_index: i32,
@@ -88,6 +90,22 @@ impl InstanceManager {
         })?;
 
         self.get_instance(&id)
+    }
+
+    pub fn set_context(
+        &self,
+        instance_id: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET project_id = ?1, conversation_id = ?2 WHERE id = ?3",
+                rusqlite::params![project_id, conversation_id, instance_id],
+            )
+            .map_err(|error| Error::Database(error.to_string()))
+        })?;
+        Ok(())
     }
 
     /// Get a workflow instance by ID.
@@ -588,6 +606,8 @@ fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
     WorkflowInstance {
         id: row.get("id").unwrap_or_default(),
         workflow_id: row.get("workflow_id").unwrap_or_default(),
+        project_id: row.get("project_id").unwrap_or_default(),
+        conversation_id: row.get("conversation_id").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         current_flow: row
             .get("current_flow")

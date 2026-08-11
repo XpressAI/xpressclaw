@@ -763,6 +763,9 @@ fn default_isolation() -> String {
 
 #[derive(Deserialize)]
 struct AgentSetup {
+    /// Existing collaboration Project that should own a newly added Agent.
+    /// Initial setup leaves this empty and creates the Agent's first Project.
+    project_id: Option<String>,
     backend: Option<String>,
     runner_kind: Option<String>,
     runner_image: Option<String>,
@@ -1003,11 +1006,25 @@ async fn complete_setup(
     })))
 }
 
-/// Add a durable ACP project without replacing existing projects.
+/// Add a durable ACP Agent without replacing existing Agents.
 async fn add_session(
     State(state): State<AppState>,
     Json(req): Json<AgentSetup>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let target_project_id = req
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .map(str::to_owned);
+    if let Some(project_id) = target_project_id.as_deref() {
+        xpressclaw_core::projects::ProjectManager::new(state.db.clone())
+            .get(project_id)
+            .map_err(|error| match error {
+                xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+                _ => internal_error(error),
+            })?;
+    }
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let mut runner = runner_from_setup(&req);
@@ -1052,12 +1069,17 @@ async fn add_session(
         "added ACP project to configuration"
     );
 
-    // Register the durable project. ACP workers are started per
+    // Register the durable Agent. ACP workers are started per
     // attempt, so there is no long-running agent to auto-start.
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry
         .ensure(&agent_config.name, &agent_config.backend)
         .map_err(internal_error)?;
+    if let Some(project_id) = target_project_id.as_deref() {
+        xpressclaw_core::projects::ProjectManager::new(state.db.clone())
+            .assign_agent(project_id, &record.id)
+            .map_err(internal_error)?;
+    }
     xpressclaw_core::sessions::SessionManager::new(state.db.clone())
         .ensure(&record.id, Some(&title))
         .map_err(internal_error)?;
@@ -1074,6 +1096,7 @@ async fn add_session(
         "session": agent_config.name,
         "session_id": record.id,
         "title": title,
+        "project_id": target_project_id.or(record.project_id),
     })))
 }
 
@@ -2057,6 +2080,13 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn not_found(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": e.to_string() })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2625,8 +2655,15 @@ mod tests {
         let _ = std::fs::remove_file(&config_path);
 
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('website-project', 'Website')",
+                [],
+            )
+        })
+        .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
-        let state = AppState::new(config, db, None, config_path.clone(), false);
+        let state = AppState::new(config, db.clone(), None, config_path.clone(), false);
         let app = Router::new().nest("/setup", routes()).with_state(state);
 
         let response = app
@@ -2637,6 +2674,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
+                            "project_id": "website-project",
                             "runner_kind": "codex",
                             "runner_workspace": "/tmp/website"
                         })
@@ -2651,7 +2689,18 @@ mod tests {
         let body = body_json(response.into_body()).await;
         assert_eq!(body["session"], "website-codex");
         assert_eq!(body["title"], "website");
+        assert_eq!(body["project_id"], "website-project");
         assert!(body["session_id"].as_str().is_some_and(|id| !id.is_empty()));
+        let project_id: String = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_id FROM agents WHERE id = 'website-codex'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(project_id, "website-project");
 
         let saved = Config::load(&config_path).unwrap();
         assert_eq!(saved.agents.len(), 1);

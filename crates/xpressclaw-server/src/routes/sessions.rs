@@ -432,7 +432,7 @@ async fn cancel_attempt(
     if container_stopped {
         let _ = sessions.clear_container(&attempt_id);
     }
-    // The running queue row is the lease on the shared project container.
+    // The running queue row is the lease on the shared Agent container.
     // Release it only after the retained environment has stopped.
     state
         .db

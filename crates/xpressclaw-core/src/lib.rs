@@ -13,6 +13,7 @@ pub mod conversations;
 pub mod docker;
 pub mod llm;
 pub mod memory;
+pub mod projects;
 pub mod sessions;
 pub mod tasks;
 pub mod tools;

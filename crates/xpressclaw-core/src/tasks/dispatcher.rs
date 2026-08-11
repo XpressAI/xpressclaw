@@ -653,11 +653,8 @@ fn notify_conversation(
         );
     }
 
-    // On completion or failure, send an unprocessed "user" message so the
-    // conversation processor wakes the agent to respond about the result.
-    // Uses sender_type "user" because the processor only checks for
-    // unprocessed user messages (system messages are user messages with
-    // a SYSTEM prefix in this architecture).
+    // On completion or failure, route a system-authored user message through
+    // the durable Conversation queue so participating Agents can respond.
     if status == "completed" || status == "failed" {
         let wake_content = format!(
             "SYSTEM: Background task \"{}\" has {}. Please acknowledge this to the user.",
@@ -924,6 +921,7 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -941,6 +939,7 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -958,6 +957,7 @@ mod tests {
                 parent_task_id: None,
                 sop_id: None,
                 conversation_id: None,
+                project_id: None,
                 created_at: String::new(),
                 updated_at: String::new(),
                 completed_at: None,
@@ -983,6 +983,7 @@ mod tests {
             parent_task_id: None,
             sop_id: None,
             conversation_id: None,
+            project_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
@@ -1007,6 +1008,7 @@ mod tests {
             parent_task_id: None,
             sop_id: None,
             conversation_id: None,
+            project_id: None,
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,

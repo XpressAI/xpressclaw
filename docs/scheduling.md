@@ -71,6 +71,6 @@ configured in the workflow's **Inputs & trigger** block; see
   minute after its deadline.
 - If the agent already has an active attempt, the follow-up remains queued
   and starts when that conversation is available.
-- Every run records schedule provenance in the agent timeline.
+- Every run records schedule provenance in the Agent task timeline.
 - Missed or failed work remains inspectable instead of disappearing into a log.
 - Disabling a schedule prevents future dispatches without deleting history.
