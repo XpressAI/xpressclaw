@@ -1421,7 +1421,6 @@ fn import_conversation_messages(
         sender_name: Option<String>,
         content: String,
         message_type: String,
-        linked_task_id: Option<String>,
         metadata: String,
         created_at: String,
     }
@@ -1440,8 +1439,7 @@ fn import_conversation_messages(
             .query_row(
                 "SELECT message.id, message.conversation_id, message.sender_type,
                         message.sender_id, message.sender_name, message.content,
-                        message.message_type, message.linked_task_id, message.metadata,
-                        message.created_at
+                        message.message_type, message.metadata, message.created_at
                  FROM conversation_message_sync sync
                  JOIN conversation_messages message ON message.id = sync.message_id
                  WHERE sync.record_id = ?1",
@@ -1455,9 +1453,8 @@ fn import_conversation_messages(
                         sender_name: row.get(4)?,
                         content: row.get(5)?,
                         message_type: row.get(6)?,
-                        linked_task_id: row.get(7)?,
-                        metadata: row.get(8)?,
-                        created_at: row.get(9)?,
+                        metadata: row.get(7)?,
+                        created_at: row.get(8)?,
                     })
                 },
             )
@@ -1470,7 +1467,6 @@ fn import_conversation_messages(
                 || existing.sender_name != message.sender_name
                 || existing.content != message.content
                 || existing.message_type != message.message_type
-                || existing.linked_task_id != message.linked_task_id
                 || parse_json(existing.metadata, "Conversation message metadata")?
                     != message.metadata
                 || existing.created_at != message.created_at
@@ -1480,6 +1476,13 @@ fn import_conversation_messages(
                     message.record_id
                 )));
             }
+            // The message body and identity are immutable, but this relationship
+            // is intentionally mutable: deleting a task clears it via the local
+            // foreign key and that cleared association must synchronize.
+            connection.execute(
+                "UPDATE conversation_messages SET linked_task_id = ?1 WHERE id = ?2",
+                params![message.linked_task_id, existing.id],
+            )?;
             existing.id
         } else {
             let metadata = serde_json::to_string(&message.metadata).map_err(|error| {
@@ -1910,6 +1913,55 @@ mod tests {
         ];
         let order = message_import_order(records.into_iter()).unwrap();
         assert_eq!(order, vec![1, 0]);
+    }
+
+    #[test]
+    fn import_allows_a_conversation_message_task_link_to_be_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("xpressclaw.yaml");
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        db.with_conn(|connection| {
+            connection
+                .execute(
+                    "UPDATE conversation_messages
+                     SET linked_task_id = 'task-one'
+                     WHERE content = 'one'",
+                    [],
+                )
+                .unwrap();
+        });
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        config.save(&config_path).unwrap();
+        let mut snapshot = export_snapshot(&db, &config, &manifest()).unwrap();
+        let message = snapshot
+            .conversation_messages
+            .iter_mut()
+            .find(|message| message.content == "one")
+            .unwrap();
+        assert_eq!(message.linked_task_id.as_deref(), Some("task-one"));
+        message.linked_task_id = None;
+
+        let mut loaded = Config::load(&config_path).unwrap();
+        import_snapshot(&db, &mut loaded, &config_path, directory.path(), &snapshot).unwrap();
+
+        let linked_task_id: Option<String> = db
+            .with_conn(|connection| {
+                connection.query_row(
+                    "SELECT linked_task_id FROM conversation_messages WHERE content = 'one'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(linked_task_id.is_none());
     }
 
     #[test]

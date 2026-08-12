@@ -16,10 +16,12 @@ The version 1 store carries portable Project data:
 - reusable workflows associated with the Project; and
 - Project memory notes, tags, and links, unless disabled by the manifest.
 
-Conversation and task messages are written as separate immutable records. Each
-record has a stable unique ID and an optional parent-record ID. This avoids a
-single frequently rewritten transcript and allows Git to merge independent
-message additions more cleanly.
+Conversation and task messages are written as separate append-oriented records.
+Each record has a stable unique ID and an optional parent-record ID. Message
+identity, content, authorship, timestamps, and parent relationships are
+immutable; a Conversation message's linked-task relationship can change when
+that task is linked or deleted. This avoids a single frequently rewritten
+transcript and allows Git to merge independent message additions more cleanly.
 
 Runtime state remains local: work attempts, queues, active turns, hidden idle
 tasks, internal task context, workflow instances, schedules, logs, connector
@@ -127,8 +129,9 @@ fetch is a no-op and preserves unpublished local edits. After reviewing a
 conflict, `--force` acknowledges a **non-destructive merge**; it does not delete
 local data. Restart XpressClaw after fetch so the running control plane reloads
 imported Agent configuration. For records with the same stable ID, fetched
-shared fields replace their local counterparts; immutable message records must
-match exactly. Local records that exist only on the receiving installation
+shared fields replace their local counterparts; immutable message fields must
+match exactly, while a Conversation message's linked-task relationship follows
+the fetched record. Local records that exist only on the receiving installation
 remain present.
 
 ## Git credentials and secret safety
