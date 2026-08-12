@@ -770,6 +770,9 @@ fn merge_agent_config(
                     backend: portable.backend.clone(),
                     ..AgentConfig::default()
                 };
+                // Subscription auth mounts host credential directories. A newly
+                // synchronized agent has no local opt-in, so keep it disabled.
+                agent.runner.subscription_auth = false;
                 apply_portable_agent(&mut agent, portable, Some(&workspace))?;
                 config.agents.push(agent);
             }
@@ -1737,6 +1740,42 @@ mod tests {
             merged.llm.as_ref().unwrap().model.as_deref(),
             Some("shared-model")
         );
+    }
+
+    #[test]
+    fn fetch_disables_subscription_auth_for_new_agents() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("xpressclaw.yaml");
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let source_config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        let snapshot = export_snapshot(&db, &source_config, &manifest()).unwrap();
+        let mut target_config = Config {
+            agents: Vec::new(),
+            ..Config::default()
+        };
+        target_config.save(&config_path).unwrap();
+
+        import_snapshot(
+            &db,
+            &mut target_config,
+            &config_path,
+            directory.path(),
+            &snapshot,
+        )
+        .unwrap();
+
+        assert_eq!(target_config.agents.len(), 1);
+        assert!(!target_config.agents[0].runner.subscription_auth);
+        let saved = Config::load(&config_path).unwrap();
+        assert!(!saved.agents[0].runner.subscription_auth);
     }
 
     #[test]
