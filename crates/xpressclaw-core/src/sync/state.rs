@@ -453,7 +453,9 @@ fn portable_agent_settings(agent: &AgentConfig) -> PortableAgentSettings {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<BTreeMap<_, _>>(),
-            mcp_servers: agent.runner.mcp_servers.clone(),
+            // MCP catalog entries and the decision to attach them are local.
+            // Keep the wire field empty for compatibility with early v1 stores.
+            mcp_servers: Vec::new(),
             startup_commands: agent.runner.startup_commands.clone(),
             command: agent.runner.command.clone(),
         },
@@ -814,14 +816,14 @@ fn apply_portable_agent(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    agent.runner.mcp_servers = portable.settings.runner.mcp_servers.clone();
     agent.runner.startup_commands = portable.settings.runner.startup_commands.clone();
     agent.runner.command = portable.settings.runner.command.clone();
     if let Some(workspace) = new_workspace {
         agent.runner.workspace = Some(workspace.to_string());
     }
     // workspace, environment, subscription credentials, SSH forwarding,
-    // container-engine access, volumes, hooks, and MCP definitions stay local.
+    // container-engine access, volumes, hooks, and MCP selections/definitions
+    // stay local.
     agent.tools = portable.settings.tools.clone();
     agent.skills = portable.settings.skills.clone();
     agent.budget = portable
@@ -1779,6 +1781,53 @@ mod tests {
         assert!(!target_config.agents[0].runner.subscription_auth);
         let saved = Config::load(&config_path).unwrap();
         assert!(!saved.agents[0].runner.subscription_auth);
+    }
+
+    #[test]
+    fn synchronized_agents_require_local_mcp_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open_memory().unwrap();
+        insert_project_data(&db);
+        let source_config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                runner: NativeRunnerConfig {
+                    mcp_servers: vec!["source-private".into()],
+                    ..NativeRunnerConfig::default()
+                },
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        let mut snapshot = export_snapshot(&db, &source_config, &manifest()).unwrap();
+        assert!(snapshot.agents[0].settings.runner.mcp_servers.is_empty());
+        snapshot.agents[0].settings.runner.mcp_servers = vec!["remote-selector".into()];
+
+        let mut fresh_config = Config {
+            agents: Vec::new(),
+            ..Config::default()
+        };
+        merge_agent_config(&mut fresh_config, &snapshot, directory.path()).unwrap();
+        assert!(fresh_config.agents[0].runner.mcp_servers.is_empty());
+
+        let mut existing_config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                runner: NativeRunnerConfig {
+                    mcp_servers: vec!["locally-approved".into()],
+                    ..NativeRunnerConfig::default()
+                },
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+        merge_agent_config(&mut existing_config, &snapshot, directory.path()).unwrap();
+        assert_eq!(
+            existing_config.agents[0].runner.mcp_servers,
+            ["locally-approved"]
+        );
     }
 
     #[test]

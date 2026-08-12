@@ -36,7 +36,7 @@ Agent configuration is split deliberately:
 | --- | --- |
 | backend, provider/model names, runner kind/image/model | API keys, bearer tokens, base URLs |
 | tool and skill names | workspace paths, environment variables, volumes |
-| non-secret ACP session options and commands | MCP definitions/headers, hooks |
+| non-secret ACP session options and commands | MCP selections/definitions/headers, hooks |
 | budgets, rate limits, wake rules, idle prompt | subscription auth, SSH forwarding, container-engine access |
 
 On fetch, shared fields are merged into `xpressclaw.yaml`; local fields for an

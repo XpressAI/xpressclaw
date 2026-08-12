@@ -99,6 +99,10 @@ pub struct PortableRunnerSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub session_config: BTreeMap<String, Value>,
+    /// Accepted for compatibility with early version 1 stores. Selections are
+    /// ignored on import and new snapshots leave this empty because attachment
+    /// to a local, potentially credential-bearing MCP definition is local-only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<String>,
     pub startup_commands: Vec<String>,
     pub command: Vec<String>,
@@ -1276,25 +1280,43 @@ fn reject_secret_text(contents: &str, label: &str) -> Result<()> {
             .next()
             .is_some_and(|token| token.len() >= 16 && !is_placeholder(token))
     });
-    let named_secret = lower.lines().any(|line| {
-        ["api_key", "access_token", "client_secret", "password"]
-            .iter()
-            .any(|name| {
-                line.find(name).is_some_and(|index| {
-                    line[index + name.len()..]
-                        .trim_start_matches([' ', '\t', ':', '=', '\"'])
-                        .split([' ', '\t', '\"', ',', '}'])
-                        .next()
-                        .is_some_and(|value| value.len() >= 12 && !is_placeholder(value))
-                })
-            })
-    });
+    let named_secret = ["api_key", "access_token", "client_secret", "password"]
+        .iter()
+        .any(|name| has_named_secret_assignment(&lower, name));
     if bearer || named_secret || fixed_markers.iter().any(|marker| lower.contains(marker)) {
         return Err(Error::Sync(format!(
             "{label} appears to contain a credential; remove it before synchronization"
         )));
     }
     Ok(())
+}
+
+fn has_named_secret_assignment(contents: &str, name: &str) -> bool {
+    contents.match_indices(name).any(|(index, _)| {
+        if contents[..index]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return false;
+        }
+        let suffix =
+            contents[index + name.len()..].trim_start_matches([' ', '\t', '\\', '\"', '\'']);
+        let Some(delimiter) = suffix.chars().next() else {
+            return false;
+        };
+        if delimiter != ':' && delimiter != '=' {
+            return false;
+        }
+        let value = suffix[delimiter.len_utf8()..]
+            .trim_start_matches([' ', '\t', '\\', '\"', '\''])
+            .split(|character| {
+                [' ', '\t', '\r', '\n', '\\', '\"', '\'', ',', '}', ']'].contains(&character)
+            })
+            .next()
+            .unwrap_or_default();
+        value.len() >= 12 && !is_placeholder(value)
+    })
 }
 
 fn is_placeholder(value: &str) -> bool {
@@ -1435,6 +1457,22 @@ mod tests {
         snapshot.conversation_messages[0].content =
             "Use API_KEY=$OPENAI_API_KEY from the local environment".into();
         reject_snapshot_secrets(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn secret_guard_allows_security_terms_in_prose() {
+        let mut snapshot = snapshot();
+        snapshot.conversation_messages[0].content =
+            "Document password authentication and client_secret rotation.".into();
+        reject_snapshot_secrets(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn secret_guard_rejects_named_secret_assignments() {
+        let mut snapshot = snapshot();
+        snapshot.conversation_messages[0].content =
+            r#"Configure {"password": "abcdefghijklmnop"}"#.into();
+        assert!(reject_snapshot_secrets(&snapshot).is_err());
     }
 
     #[test]
