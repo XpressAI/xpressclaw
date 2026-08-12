@@ -396,11 +396,76 @@ xpressclaw status            Show logical session status
 xpressclaw sync ...          Explicitly fetch/publish portable Project state
 ```
 
-Projects can optionally preserve a small `.xpressclaw.yml` pointer to a
-separate Git-backed collaboration store. The main project does not need to be a
-Git repository, synchronization is never automatic, and credentials remain in
-each user's local Git and XpressClaw configuration. See [Git-backed Project
-synchronization](docs/project-sync.md).
+### Git-backed Project Synchronization
+
+XpressClaw can share a Project's portable collaboration state through a
+separate Git repository. Agents, Tasks, Conversations, workflows, and
+optionally Project memory are included. Runtime state, workspace paths,
+credentials, tokens, environment variables, and other user-specific settings
+remain local.
+
+Synchronization is always explicit: ordinary XpressClaw use and changes to the
+main project never fetch or publish this data. The main project does not need
+to be a Git repository; it only needs to preserve the generated
+`.xpressclaw.yml` manifest.
+
+First, create the remote synchronization repository and configure Git access
+with your own SSH agent or credential helper. Then initialize synchronization
+for an existing local Project. You can copy the Project ID from its
+`/projects/<project-id>` URL in the web UI:
+
+```bash
+xpressclaw sync init \
+  --project-id <project-id> \
+  --remote git@github.com:your-org/xpressclaw-data.git \
+  --branch main \
+  --store-path projects/<project-id> \
+  --project-dir /path/to/main-project \
+  --workdir /path/to/xpressclaw-control
+```
+
+`--branch` defaults to `main`, `--store-path` defaults to
+`projects/<project-id>`, and both directory options default to the current
+directory. Use `--no-project-memory` with `sync init` if memory should stay
+local. Initialization only creates `/path/to/main-project/.xpressclaw.yml`; it
+does not contact the remote or synchronize any data. Preserve that manifest
+with the main project, but never put credentials in it.
+
+Publish the first shared snapshot:
+
+```bash
+xpressclaw sync publish \
+  --project-dir /path/to/main-project \
+  --workdir /path/to/xpressclaw-control
+```
+
+Anyone with the same manifest can explicitly fetch the snapshot into their
+local XpressClaw installation, work normally, and publish their updates:
+
+```bash
+# Before starting work
+xpressclaw sync fetch \
+  --project-dir /path/to/main-project \
+  --workdir /path/to/xpressclaw-control
+
+# After making XpressClaw Project changes
+xpressclaw sync publish \
+  --project-dir /path/to/main-project \
+  --workdir /path/to/xpressclaw-control
+```
+
+Stop the control plane, or wait until the Project has no active work, before a
+fetch or publish. Restart it after a fetch so imported Agent configuration is
+reloaded. A first fetch into an already populated Project, or a two-sided
+change, fails safely; review the conflict before retrying fetch with `--force`.
+The forced fetch is a non-destructive merge and does not delete local-only
+records.
+
+Each user supplies their own Git and Agent credentials through local secure
+configuration. Those values are never copied into `.xpressclaw.yml` or the
+synchronized repository. For the full manifest schema, shared/private data
+boundary, conflict behavior, and merge-friendly record format, see the
+[Git-backed Project synchronization guide](docs/project-sync.md).
 
 Default port: `8935` (override with `--port`).
 
