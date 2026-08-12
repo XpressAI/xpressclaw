@@ -4,6 +4,7 @@ mod client;
 mod down;
 mod init;
 mod status;
+mod sync;
 mod up;
 
 /// Default port for the xpressclaw server.
@@ -46,6 +47,12 @@ pub enum Command {
         #[arg(short, long, default_value_t = DEFAULT_PORT)]
         port: u16,
     },
+
+    /// Explicitly synchronize portable Project state through Git
+    Sync {
+        #[command(subcommand)]
+        command: sync::SyncCommand,
+    },
 }
 
 pub async fn run(command: Command) -> anyhow::Result<()> {
@@ -58,5 +65,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         } => up::run(detach, port, workdir).await,
         Command::Down { port } => down::run(port).await,
         Command::Status { port } => status::run(port).await,
+        Command::Sync { command } => sync::run(command).await,
     }
 }

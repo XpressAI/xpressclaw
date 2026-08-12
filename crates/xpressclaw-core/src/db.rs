@@ -1618,6 +1618,72 @@ CREATE INDEX idx_schedules_conversation
     ON schedules(conversation_id);
 ";
 
+const MIGRATION_V36: &str = "
+-- Explicit Git-backed Project synchronization. Message record IDs are kept
+-- separately from SQLite row IDs so Git history remains portable across
+-- installations and can represent branches through parent record IDs.
+CREATE TABLE conversation_message_sync (
+    record_id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL UNIQUE
+        REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    parent_record_id TEXT
+        REFERENCES conversation_message_sync(record_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_conversation_message_sync_parent
+    ON conversation_message_sync(parent_record_id);
+
+CREATE TABLE task_message_sync (
+    record_id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL UNIQUE
+        REFERENCES task_messages(id) ON DELETE CASCADE,
+    parent_record_id TEXT
+        REFERENCES task_message_sync(record_id) ON DELETE SET NULL
+);
+CREATE INDEX idx_task_message_sync_parent
+    ON task_message_sync(parent_record_id);
+
+-- Reusable workflows may be shared by more than one Project. Runs establish
+-- the association automatically; fetch also records imported associations.
+CREATE TABLE project_workflows (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    PRIMARY KEY (project_id, workflow_id)
+);
+INSERT OR IGNORE INTO project_workflows (project_id, workflow_id)
+SELECT DISTINCT project_id, workflow_id
+FROM workflow_instances
+WHERE project_id IS NOT NULL;
+CREATE TRIGGER project_workflows_from_instance
+AFTER INSERT ON workflow_instances
+WHEN NEW.project_id IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO project_workflows (project_id, workflow_id)
+    VALUES (NEW.project_id, NEW.workflow_id);
+END;
+CREATE TRIGGER project_workflows_from_instance_update
+AFTER UPDATE OF project_id, workflow_id ON workflow_instances
+WHEN NEW.project_id IS NOT NULL
+BEGIN
+    INSERT OR IGNORE INTO project_workflows (project_id, workflow_id)
+    VALUES (NEW.project_id, NEW.workflow_id);
+END;
+
+-- The last observed commit plus local and remote portable snapshot hashes
+-- provide a path-aware optimistic-concurrency boundary. Secrets are never
+-- stored here.
+CREATE TABLE project_sync_state (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    remote TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    store_path TEXT NOT NULL,
+    last_commit TEXT NOT NULL,
+    local_snapshot_hash TEXT NOT NULL,
+    remote_snapshot_hash TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (project_id, remote, branch, store_path)
+);
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1655,6 +1721,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (33, MIGRATION_V33),
         (34, MIGRATION_V34),
         (35, MIGRATION_V35),
+        (36, MIGRATION_V36),
     ]
 }
 
@@ -1675,7 +1742,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "35");
+        assert_eq!(version, "36");
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -2159,5 +2226,9 @@ mod tests {
         assert!(tables.contains(&"project_memory_links".to_string()));
         assert!(tables.contains(&"project_memory_embeddings".to_string()));
         assert!(tables.contains(&"task_pull_requests".to_string()));
+        assert!(tables.contains(&"conversation_message_sync".to_string()));
+        assert!(tables.contains(&"task_message_sync".to_string()));
+        assert!(tables.contains(&"project_workflows".to_string()));
+        assert!(tables.contains(&"project_sync_state".to_string()));
     }
 }

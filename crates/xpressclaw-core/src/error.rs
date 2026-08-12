@@ -115,6 +115,9 @@ pub enum Error {
     #[error("project error: {0}")]
     Project(String),
 
+    #[error("project synchronization error: {0}")]
+    Sync(String),
+
     // Database
     #[error("database error: {0}")]
     Database(String),

@@ -393,7 +393,14 @@ xpressclaw init              Create an empty workspace configuration
 xpressclaw up [--detach]     Start the control plane and worker dispatcher
 xpressclaw down              Stop the control plane and active workers
 xpressclaw status            Show logical session status
+xpressclaw sync ...          Explicitly fetch/publish portable Project state
 ```
+
+Projects can optionally preserve a small `.xpressclaw.yml` pointer to a
+separate Git-backed collaboration store. The main project does not need to be a
+Git repository, synchronization is never automatic, and credentials remain in
+each user's local Git and XpressClaw configuration. See [Git-backed Project
+synchronization](docs/project-sync.md).
 
 Default port: `8935` (override with `--port`).
 
