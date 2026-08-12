@@ -1,10 +1,12 @@
 <script lang="ts">
-	import type { Agent, Task } from '$lib/api';
+	import type { Agent, Conversation, Project, Task } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 
 	const TASKS_PER_PROJECT = 5;
 
 	let {
+		projectList,
+		conversationList,
 		agentList,
 		taskList,
 		activeTaskId = null,
@@ -12,6 +14,8 @@
 		showHeading = true,
 		onnavigate,
 	}: {
+		projectList: Project[];
+		conversationList: Conversation[];
 		agentList: Agent[];
 		taskList: Task[];
 		activeTaskId?: string | null;
@@ -22,15 +26,18 @@
 
 	let sortedTasks = $derived([...taskList].sort(compareTaskRecency));
 	let taskGroups = $derived((() => {
-		const projectIds = new Set(agentList.map((agent) => agent.id));
-		const groups = agentList.map((agent) => ({
-			id: agent.id,
-			label: agent.title || agent.name,
-			href: `/agents/${agent.id}`,
-			tasks: sortedTasks.filter((task) => task.agent_id === agent.id).slice(0, TASKS_PER_PROJECT),
+		const projectIds = new Set(projectList.map((project) => project.id));
+		const groups = projectList.map((project) => ({
+			id: project.id,
+			label: project.name,
+			href: `/projects/${project.id}`,
+			tasks: sortedTasks.filter((task) => taskProjectId(task) === project.id).slice(0, TASKS_PER_PROJECT),
 		}));
 		const unassigned = sortedTasks
-			.filter((task) => !task.agent_id || !projectIds.has(task.agent_id))
+			.filter((task) => {
+				const projectId = taskProjectId(task);
+				return !projectId || !projectIds.has(projectId);
+			})
 			.slice(0, TASKS_PER_PROJECT);
 		return unassigned.length > 0
 			? [...groups, { id: 'unassigned', label: 'Unassigned', href: null, tasks: unassigned }]
@@ -42,6 +49,15 @@
 		return Date.parse(right.updated_at) - Date.parse(left.updated_at)
 			|| Date.parse(right.created_at) - Date.parse(left.created_at)
 			|| right.id.localeCompare(left.id);
+	}
+
+	function taskProjectId(task: Task): string | null {
+		if (task.project_id) return task.project_id;
+		if (task.conversation_id) {
+			const conversation = conversationList.find((candidate) => candidate.id === task.conversation_id);
+			if (conversation?.project_id) return conversation.project_id;
+		}
+		return agentList.find((agent) => agent.id === task.agent_id)?.project_id ?? null;
 	}
 
 	function statusDot(status: string): string {

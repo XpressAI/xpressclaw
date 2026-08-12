@@ -1,17 +1,22 @@
 pub mod event_bus;
 pub mod processor;
+pub mod runtime;
 
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::tasks::board::{CreateTask, Task, TaskBoard};
+use crate::tasks::queue::TaskQueue;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: String,
+    pub project_id: Option<String>,
     pub title: Option<String>,
     pub icon: Option<String>,
     pub created_at: String,
@@ -37,7 +42,28 @@ pub struct ConversationMessage {
     pub sender_name: Option<String>,
     pub content: String,
     pub message_type: String,
+    pub linked_task_id: Option<String>,
+    pub metadata: serde_json::Value,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationAttachment {
+    pub id: String,
+    pub message_id: i64,
+    pub name: String,
+    pub mime_type: String,
+    pub size: i64,
+    pub source_task_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewConversationAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub data: Vec<u8>,
+    pub source_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,8 +92,67 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationMessa
         sender_name: row.get("sender_name")?,
         content: row.get("content")?,
         message_type: row.get("message_type")?,
+        linked_task_id: row.get("linked_task_id").unwrap_or(None),
+        metadata: row
+            .get::<_, String>("metadata")
+            .ok()
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_else(|| serde_json::json!({})),
         created_at: row.get("created_at")?,
     })
+}
+
+fn row_to_attachment(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationAttachment> {
+    Ok(ConversationAttachment {
+        id: row.get("id")?,
+        message_id: row.get("message_id")?,
+        name: row.get("name")?,
+        mime_type: row.get("mime_type")?,
+        size: row.get("size")?,
+        source_task_id: row.get("source_task_id")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn read_attachment(conn: &rusqlite::Connection, id: &str) -> Result<ConversationAttachment> {
+    conn.query_row(
+        "SELECT id, message_id, name, mime_type, size, source_task_id, created_at
+         FROM conversation_message_attachments WHERE id = ?1",
+        [id],
+        row_to_attachment,
+    )
+    .map_err(Error::from)
+}
+
+fn validate_new_attachments(attachments: &[NewConversationAttachment]) -> Result<()> {
+    const MAX_ATTACHMENT_COUNT: usize = 10;
+    const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+    if attachments.len() > MAX_ATTACHMENT_COUNT {
+        return Err(Error::Conversation(
+            "a conversation message may contain at most 10 attachments".into(),
+        ));
+    }
+    let total_size = attachments.iter().try_fold(0usize, |total, attachment| {
+        if attachment.name.trim().is_empty() || attachment.name.len() > 255 {
+            return Err(Error::Conversation(
+                "conversation attachment names must be between 1 and 255 bytes".into(),
+            ));
+        }
+        if attachment.mime_type.trim().is_empty() || attachment.mime_type.len() > 255 {
+            return Err(Error::Conversation(
+                "conversation attachment MIME types must be between 1 and 255 bytes".into(),
+            ));
+        }
+        total
+            .checked_add(attachment.data.len())
+            .ok_or_else(|| Error::Conversation("conversation attachments are too large".into()))
+    })?;
+    if total_size > MAX_ATTACHMENT_BYTES {
+        return Err(Error::Conversation(
+            "conversation attachments in one message must total 20 MiB or less".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Manages conversations and their messages.
@@ -81,28 +166,77 @@ impl ConversationManager {
     }
 
     pub fn create(&self, req: &CreateConversation) -> Result<Conversation> {
+        let project_id = req.participant_ids.iter().find_map(|agent_id| {
+            self.db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+            })
+        });
+        self.create_in_project(project_id.as_deref(), req)
+    }
+
+    pub fn create_in_project(
+        &self,
+        project_id: Option<&str>,
+        req: &CreateConversation,
+    ) -> Result<Conversation> {
         let id = Uuid::new_v4().to_string();
 
         self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO conversations (id, title, icon) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, req.title, req.icon],
+            let transaction = conn.unchecked_transaction()?;
+            if let Some(project_id) = project_id {
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                    [project_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !exists {
+                    return Err(Error::ProjectNotFound {
+                        id: project_id.to_string(),
+                    });
+                }
+            }
+            for agent_id in &req.participant_ids {
+                let agent_project = transaction
+                    .query_row(
+                        "SELECT project_id FROM agents WHERE id = ?1",
+                        [agent_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .map_err(|_| Error::AgentNotFound {
+                        name: agent_id.clone(),
+                    })?;
+                if project_id.is_some() && agent_project.as_deref() != project_id {
+                    return Err(Error::Conversation(format!(
+                        "Agent '{agent_id}' does not belong to this project"
+                    )));
+                }
+            }
+            transaction.execute(
+                "INSERT INTO conversations (id, title, icon, project_id) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id, req.title, req.icon, project_id],
             )?;
 
             // Add the local user as participant
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO conversation_participants (conversation_id, participant_type, participant_id) VALUES (?1, 'user', 'local')",
                 rusqlite::params![id],
             )?;
 
             // Add requested agent participants
             for agent_id in &req.participant_ids {
-                conn.execute(
+                transaction.execute(
                     "INSERT OR IGNORE INTO conversation_participants (conversation_id, participant_type, participant_id) VALUES (?1, 'agent', ?2)",
                     rusqlite::params![id, agent_id],
                 )?;
             }
 
+            transaction.commit()?;
             Ok::<(), Error>(())
         })?;
 
@@ -110,18 +244,31 @@ impl ConversationManager {
     }
 
     pub fn list(&self, limit: i64) -> Result<Vec<Conversation>> {
+        self.list_in_project(None, limit)
+    }
+
+    pub fn list_in_project(
+        &self,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Conversation>> {
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, title, icon, created_at, updated_at, last_message_at
+            let sql = if project_id.is_some() {
+                "SELECT id, project_id, title, icon, created_at, updated_at, last_message_at
+                 FROM conversations WHERE project_id = ?1
+                 ORDER BY COALESCE(last_message_at, created_at) DESC LIMIT ?2"
+            } else {
+                "SELECT id, project_id, title, icon, created_at, updated_at, last_message_at
                  FROM conversations
-                 ORDER BY COALESCE(last_message_at, created_at) DESC
-                 LIMIT ?1",
-            )?;
+                 ORDER BY COALESCE(last_message_at, created_at) DESC LIMIT ?2"
+            };
+            let mut stmt = conn.prepare(sql)?;
 
             let convs: Vec<Conversation> = stmt
-                .query_map([limit], |row| {
+                .query_map(rusqlite::params![project_id, limit], |row| {
                     Ok(Conversation {
                         id: row.get("id")?,
+                        project_id: row.get("project_id")?,
                         title: row.get("title")?,
                         icon: row.get("icon")?,
                         created_at: row.get("created_at")?,
@@ -147,7 +294,7 @@ impl ConversationManager {
     pub fn get(&self, id: &str) -> Result<Conversation> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, title, icon, created_at, updated_at, last_message_at
+                "SELECT id, project_id, title, icon, created_at, updated_at, last_message_at
                  FROM conversations WHERE id = ?1",
             )?;
 
@@ -155,6 +302,7 @@ impl ConversationManager {
                 .query_row([id], |row| {
                     Ok(Conversation {
                         id: row.get("id")?,
+                        project_id: row.get("project_id")?,
                         title: row.get("title")?,
                         icon: row.get("icon")?,
                         created_at: row.get("created_at")?,
@@ -171,14 +319,56 @@ impl ConversationManager {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
-        let deleted = self
-            .db
-            .with_conn(|conn| conn.execute("DELETE FROM conversations WHERE id = ?1", [id]))?;
+        self.delete_with_running_turns(id, |_| {})
+    }
 
-        if deleted == 0 {
-            return Err(Error::ConversationNotFound { id: id.to_string() });
-        }
-        Ok(())
+    /// Cancel every live turn and notify the caller before the conversation
+    /// row is removed. The callback runs while the write transaction is held,
+    /// after turns have been made unpublishable but before cascading deletes,
+    /// so the server can signal ACP processes without allowing a late reply or
+    /// a newly queued turn to race deletion.
+    pub fn delete_with_running_turns<F>(&self, id: &str, mut before_delete: F) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
+        self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::ConversationNotFound { id: id.to_string() });
+            }
+
+            let mut statement = transaction.prepare(
+                "SELECT id FROM conversation_turns
+                 WHERE conversation_id = ?1 AND status = 'running'",
+            )?;
+            let running_turns = statement
+                .query_map([id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            transaction.execute(
+                "UPDATE conversation_turns
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = 'Conversation deleted'
+                 WHERE conversation_id = ?1 AND status IN ('queued', 'running')",
+                [id],
+            )?;
+            for turn_id in &running_turns {
+                before_delete(turn_id);
+            }
+            transaction.execute(
+                "UPDATE tasks SET conversation_id = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE conversation_id = ?1",
+                [id],
+            )?;
+            transaction.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     pub fn update(
@@ -211,15 +401,47 @@ impl ConversationManager {
         participant_type: &str,
         participant_id: &str,
     ) -> Result<()> {
-        // Verify conversation exists
-        let _ = self.get(conv_id)?;
-
         self.db.with_conn(|conn| {
-            conn.execute(
+            // Reserve the write transaction before validating ownership so an
+            // Agent cannot move Projects between this check and insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let conversation_project = transaction
+                .query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conv_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|_| Error::ConversationNotFound {
+                    id: conv_id.to_string(),
+                })?;
+
+            if participant_type == "agent" {
+                let agent_project = transaction
+                    .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [participant_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|_| Error::AgentNotFound {
+                    name: participant_id.to_string(),
+                })?;
+                if conversation_project.is_some() && agent_project != conversation_project {
+                    return Err(Error::Conversation(
+                        "an Agent must belong to the conversation's project before it can join"
+                            .into(),
+                    ));
+                }
+            }
+
+            transaction.execute(
                 "INSERT OR IGNORE INTO conversation_participants (conversation_id, participant_type, participant_id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![conv_id, participant_type, participant_id],
             )?;
-            Ok::<(), Error>(())
+            transaction.commit()?;
+            Ok(())
         })
     }
 
@@ -228,36 +450,461 @@ impl ConversationManager {
         conv_id: &str,
         participant_type: &str,
         participant_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let running_turns = if participant_type == "agent" {
+                let mut statement = transaction.prepare(
+                    "SELECT id FROM conversation_turns
+                     WHERE conversation_id = ?1 AND agent_id = ?2 AND status = 'running'",
+                )?;
+                let ids = statement
+                    .query_map(rusqlite::params![conv_id, participant_id], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<String>, _>>()?;
+                drop(statement);
+                ids
+            } else {
+                Vec::new()
+            };
+            transaction.execute(
                 "DELETE FROM conversation_participants WHERE conversation_id = ?1 AND participant_type = ?2 AND participant_id = ?3",
                 rusqlite::params![conv_id, participant_type, participant_id],
             )?;
-            Ok::<(), Error>(())
+            if participant_type == "agent" {
+                transaction.execute(
+                    "UPDATE conversation_turns
+                     SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                         error_message = 'Agent removed from conversation'
+                     WHERE conversation_id = ?1 AND agent_id = ?2
+                       AND status IN ('queued', 'running')",
+                    rusqlite::params![conv_id, participant_id],
+                )?;
+                transaction.execute(
+                    "UPDATE conversation_agent_sessions
+                     SET status = 'idle', last_error = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE conversation_id = ?1 AND agent_id = ?2",
+                    rusqlite::params![conv_id, participant_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM schedules
+                     WHERE conversation_id = ?1 AND agent_id = ?2",
+                    rusqlite::params![conv_id, participant_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(running_turns)
         })
     }
 
     pub fn send_message(&self, conv_id: &str, msg: &SendMessage) -> Result<ConversationMessage> {
+        self.send_structured_message(conv_id, msg, None, None)
+    }
+
+    /// Create, dispatch, and publish one linked task as a single Conversation
+    /// lifecycle operation.
+    ///
+    /// Holding the immediate transaction through message insertion means
+    /// participant or Conversation deletion linearizes entirely before this
+    /// call (and rejects it) or after the task and its publication are durable.
+    pub fn create_linked_task_and_message(
+        &self,
+        conv_id: &str,
+        task: &CreateTask,
+        creator_agent_id: Option<&str>,
+        message: &SendMessage,
+    ) -> Result<(Task, ConversationMessage)> {
+        if task.conversation_id.as_deref() != Some(conv_id) {
+            return Err(Error::Conversation(
+                "linked task must belong to the publishing conversation".into(),
+            ));
+        }
+        let (task_id, message) = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let task_id = TaskBoard::create_in_transaction(&transaction, task, creator_agent_id)?;
+            if let Some(agent_id) = task.agent_id.as_deref() {
+                TaskQueue::enqueue_in_transaction(&transaction, &task_id, agent_id)?;
+            }
+            let (message, _) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                message,
+                Some(&task_id),
+                None,
+                &[],
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>((task_id, message))
+        })?;
+        Ok((TaskBoard::new(self.db.clone()).get(&task_id)?, message))
+    }
+
+    pub fn send_structured_message(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        linked_task_id: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<ConversationMessage> {
+        self.send_structured_message_with_attachments(conv_id, msg, linked_task_id, metadata, &[])
+            .map(|(message, _)| message)
+    }
+
+    pub fn send_structured_message_with_attachments(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        linked_task_id: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
+        validate_new_attachments(attachments)?;
         self.db.with_conn(|conn| {
-            let message_type = msg.message_type.as_deref().unwrap_or("message");
-
-            conn.execute(
-                "INSERT INTO conversation_messages (conversation_id, sender_type, sender_id, sender_name, content, message_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![conv_id, msg.sender_type, msg.sender_id, msg.sender_name, msg.content, message_type],
+            let transaction = conn.unchecked_transaction()?;
+            let result = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                linked_task_id,
+                metadata,
+                attachments,
             )?;
+            transaction.commit()?;
+            Ok(result)
+        })
+    }
 
-            let id = conn.last_insert_rowid();
-
-            // Update conversation timestamps
-            conn.execute(
-                "UPDATE conversations SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                [conv_id],
+    /// Store a message and schedule every addressed Agent atomically.
+    pub fn send_routed_message_with_attachments(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        linked_task_id: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        validate_new_attachments(attachments)?;
+        self.db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let (message, attachments) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                linked_task_id,
+                metadata,
+                attachments,
             )?;
+            let queued_agents = runtime::ConversationTurnQueue::enqueue_for_message_in_transaction(
+                &transaction,
+                conv_id,
+                message.id,
+                &msg.sender_type,
+                &msg.sender_id,
+                &msg.content,
+            )?;
+            transaction.commit()?;
+            Ok((message, attachments, queued_agents))
+        })
+    }
 
-            let mut stmt = conn.prepare("SELECT * FROM conversation_messages WHERE id = ?1")?;
-            stmt.query_row([id], row_to_message)
-                .map_err(|e| Error::Database(e.to_string()))
+    /// Store an Agent-authored message only while its Conversation membership
+    /// and optional source task still belong to the same routing scope.
+    pub fn send_agent_routed_message_with_attachments(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        source_task_id: Option<&str>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        validate_new_attachments(attachments)?;
+        if msg.sender_type != "agent" {
+            return Err(Error::Conversation(
+                "Agent message validation requires an Agent sender".into(),
+            ));
+        }
+        self.db.with_conn(|conn| {
+            // Membership removal and source-task reassignment must not be able
+            // to interleave between validation, publication, and peer routing.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_participants
+                    WHERE conversation_id = ?1
+                      AND participant_type = 'agent'
+                      AND participant_id = ?2
+                )",
+                rusqlite::params![conv_id, msg.sender_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !is_participant {
+                return Err(Error::Conversation(
+                    "Agent is not a participant in this conversation".into(),
+                ));
+            }
+
+            if let Some(source_task_id) = source_task_id {
+                let task_scope = transaction
+                    .query_row(
+                        "SELECT agent_id, conversation_id FROM tasks WHERE id = ?1",
+                        [source_task_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((agent_id, conversation_id)) = task_scope else {
+                    return Err(Error::TaskNotFound {
+                        id: source_task_id.to_string(),
+                    });
+                };
+                if agent_id.as_deref() != Some(msg.sender_id.as_str())
+                    || conversation_id.as_deref() != Some(conv_id)
+                {
+                    return Err(Error::Conversation(
+                        "source task is not linked to this Agent and conversation".into(),
+                    ));
+                }
+            }
+
+            let (message, attachments) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                source_task_id,
+                None,
+                attachments,
+            )?;
+            let queued_agents = runtime::ConversationTurnQueue::enqueue_for_message_in_transaction(
+                &transaction,
+                conv_id,
+                message.id,
+                &msg.sender_type,
+                &msg.sender_id,
+                &msg.content,
+            )?;
+            transaction.commit()?;
+            Ok((message, attachments, queued_agents))
+        })
+    }
+
+    /// Store a message addressed to one Agent while validating the target's
+    /// membership and routing the durable message in the same write
+    /// transaction. The durable routing target is stored in message metadata
+    /// so a wake-up arriving behind a running turn is discovered by the same
+    /// high-water routing logic after that turn completes.
+    pub fn send_targeted_routed_message_with_attachments(
+        &self,
+        conv_id: &str,
+        target_agent_id: &str,
+        msg: &SendMessage,
+        metadata: Option<&serde_json::Value>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        validate_new_attachments(attachments)?;
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM conversation_participants
+                    WHERE conversation_id = ?1
+                      AND participant_type = 'agent'
+                      AND participant_id = ?2
+                )",
+                rusqlite::params![conv_id, target_agent_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !is_participant {
+                return Err(Error::Conversation(
+                    "target Agent is not a participant in this conversation".into(),
+                ));
+            }
+            let mut routed_metadata = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
+            let Some(routed_metadata) = routed_metadata.as_object_mut() else {
+                return Err(Error::Conversation(
+                    "targeted message metadata must be an object".into(),
+                ));
+            };
+            routed_metadata.insert(
+                "target_agent_id".to_string(),
+                serde_json::Value::String(target_agent_id.to_string()),
+            );
+            let routed_metadata = serde_json::Value::Object(routed_metadata.clone());
+            let (message, attachments) = Self::insert_structured_message(
+                &transaction,
+                conv_id,
+                msg,
+                None,
+                Some(&routed_metadata),
+                attachments,
+            )?;
+            let queued_agents = if runtime::ConversationTurnQueue::enqueue_target_in_transaction(
+                &transaction,
+                conv_id,
+                target_agent_id,
+                message.id,
+            )? {
+                vec![target_agent_id.to_string()]
+            } else {
+                Vec::new()
+            };
+            transaction.commit()?;
+            Ok((message, attachments, queued_agents))
+        })
+    }
+
+    pub(crate) fn insert_structured_message(
+        transaction: &rusqlite::Transaction<'_>,
+        conv_id: &str,
+        msg: &SendMessage,
+        linked_task_id: Option<&str>,
+        metadata: Option<&serde_json::Value>,
+        attachments: &[NewConversationAttachment],
+    ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
+        let message_type = msg.message_type.as_deref().unwrap_or("message");
+        let metadata = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
+        transaction.execute(
+            "INSERT INTO conversation_messages
+             (conversation_id, sender_type, sender_id, sender_name, content, message_type, linked_task_id, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                conv_id,
+                msg.sender_type,
+                msg.sender_id,
+                msg.sender_name,
+                msg.content,
+                message_type,
+                linked_task_id,
+                metadata.to_string(),
+            ],
+        )?;
+
+        let id = transaction.last_insert_rowid();
+        let mut inserted_attachments = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let attachment_id = Uuid::new_v4().to_string();
+            transaction.execute(
+                "INSERT INTO conversation_message_attachments
+                 (id, message_id, name, mime_type, data, size, source_task_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    attachment_id,
+                    id,
+                    attachment.name,
+                    attachment.mime_type,
+                    attachment.data,
+                    attachment.data.len() as i64,
+                    attachment.source_task_id,
+                ],
+            )?;
+            inserted_attachments.push(read_attachment(transaction, &attachment_id)?);
+        }
+
+        transaction.execute(
+            "UPDATE conversations
+             SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [conv_id],
+        )?;
+        let message = transaction
+            .query_row(
+                "SELECT * FROM conversation_messages WHERE id = ?1",
+                [id],
+                row_to_message,
+            )
+            .map_err(|error| Error::Database(error.to_string()))?;
+        Ok((message, inserted_attachments))
+    }
+
+    pub fn add_attachment(
+        &self,
+        message_id: i64,
+        name: &str,
+        mime_type: &str,
+        data: &[u8],
+        source_task_id: Option<&str>,
+    ) -> Result<ConversationAttachment> {
+        const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+        if data.len() > MAX_ATTACHMENT_BYTES {
+            return Err(Error::Conversation(
+                "conversation attachments must be 20 MiB or smaller".into(),
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversation_message_attachments
+                 (id, message_id, name, mime_type, data, size, source_task_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id,
+                    message_id,
+                    name,
+                    mime_type,
+                    data,
+                    data.len() as i64,
+                    source_task_id,
+                ],
+            )?;
+            read_attachment(conn, &id)
+        })
+    }
+
+    pub fn attachments(&self, message_id: i64) -> Result<Vec<ConversationAttachment>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT id, message_id, name, mime_type, size, source_task_id, created_at
+                 FROM conversation_message_attachments
+                 WHERE message_id = ?1 ORDER BY created_at, id",
+            )?;
+            let attachments = statement
+                .query_map([message_id], row_to_attachment)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(attachments)
+        })
+    }
+
+    pub fn attachment_data(
+        &self,
+        conversation_id: &str,
+        attachment_id: &str,
+    ) -> Result<(ConversationAttachment, Vec<u8>)> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT a.id, a.message_id, a.name, a.mime_type, a.size,
+                        a.source_task_id, a.created_at, a.data
+                 FROM conversation_message_attachments a
+                 JOIN conversation_messages m ON m.id = a.message_id
+                 WHERE a.id = ?1 AND m.conversation_id = ?2",
+                rusqlite::params![attachment_id, conversation_id],
+                |row| Ok((row_to_attachment(row)?, row.get(7)?)),
+            )
+            .map_err(|_| Error::Conversation("attachment not found".into()))
         })
     }
 
@@ -323,21 +970,32 @@ impl ConversationManager {
 
     /// Get agent IDs mentioned in content, or all agent participants if none explicitly mentioned.
     pub fn resolve_target_agents(&self, conv_id: &str, content: &str) -> Result<Vec<String>> {
+        let participants = self
+            .db
+            .with_conn(|conn| self.load_participants(conn, conv_id))?;
+        let participant_agents = participants
+            .iter()
+            .filter(|participant| participant.participant_type == "agent")
+            .map(|participant| participant.participant_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
         let mentions = Self::parse_mentions(content);
-        let mentioned_agents: Vec<String> = mentions
+        let mut mentioned_agents: Vec<String> = mentions
             .iter()
             .filter(|(t, _, _)| t == "AGENT")
             .map(|(_, id, _)| id.clone())
+            .filter(|id| participant_agents.contains(id.as_str()))
             .collect();
+        mentioned_agents.sort();
+        mentioned_agents.dedup();
 
         if !mentioned_agents.is_empty() {
             return Ok(mentioned_agents);
         }
+        if mentions.iter().any(|(kind, _, _)| kind == "AGENT") {
+            return Ok(Vec::new());
+        }
 
         // No explicit mention — auto-route to all agent participants
-        let participants = self
-            .db
-            .with_conn(|conn| self.load_participants(conn, conv_id))?;
         Ok(participants
             .iter()
             .filter(|p| p.participant_type == "agent")
@@ -371,32 +1029,17 @@ impl ConversationManager {
 
     // -- Background processing methods (ADR-019) --
 
-    /// Store a user message as unprocessed (processed=0).
-    /// The background task will pick it up.
+    /// Compatibility entry point used by connectors and the retired task
+    /// dispatcher. New conversation turns use the durable ACP queue rather
+    /// than the legacy `processed` flag.
     pub fn send_user_message(
         &self,
         conv_id: &str,
         msg: &SendMessage,
     ) -> Result<ConversationMessage> {
-        self.db.with_conn(|conn| {
-            let message_type = msg.message_type.as_deref().unwrap_or("message");
-
-            conn.execute(
-                "INSERT INTO conversation_messages (conversation_id, sender_type, sender_id, sender_name, content, message_type, processed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-                rusqlite::params![conv_id, msg.sender_type, msg.sender_id, msg.sender_name, msg.content, message_type],
-            )?;
-
-            let id = conn.last_insert_rowid();
-
-            conn.execute(
-                "UPDATE conversations SET last_message_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                [conv_id],
-            )?;
-
-            let mut stmt = conn.prepare("SELECT * FROM conversation_messages WHERE id = ?1")?;
-            stmt.query_row([id], row_to_message)
-                .map_err(|e| Error::Database(e.to_string()))
-        })
+        let (message, _, _) =
+            self.send_routed_message_with_attachments(conv_id, msg, None, None, &[])?;
+        Ok(message)
     }
 
     /// Check if there are unprocessed user messages in a conversation.
@@ -443,6 +1086,35 @@ impl ConversationManager {
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(msgs)
+        })
+    }
+
+    /// Return the newest messages in an inclusive high-water range. This is
+    /// used when resuming an Agent's durable conversation session so prior
+    /// history is not resent on every turn.
+    pub fn get_messages_between(
+        &self,
+        conv_id: &str,
+        after_id: i64,
+        through_id: i64,
+        limit: i64,
+    ) -> Result<Vec<ConversationMessage>> {
+        self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT * FROM (
+                    SELECT * FROM conversation_messages
+                    WHERE conversation_id = ?1 AND id > ?2 AND id <= ?3
+                    ORDER BY id DESC LIMIT ?4
+                 ) ORDER BY id ASC",
+            )?;
+            let messages = stmt
+                .query_map(
+                    rusqlite::params![conv_id, after_id, through_id, limit],
+                    row_to_message,
+                )?
+                .filter_map(|result| result.ok())
+                .collect();
+            Ok(messages)
         })
     }
 
@@ -561,6 +1233,65 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_conversation_cancels_and_reports_running_turns_first() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Delete me".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let board = crate::tasks::board::TaskBoard::new(mgr.db.clone());
+        let linked_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Keep the task".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some(conv.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO conversation_turns
+                     (id, conversation_id, agent_id, status, started_at)
+                     VALUES ('running-turn', ?1, 'atlas', 'running', CURRENT_TIMESTAMP)",
+                    [&conv.id],
+                )?;
+                Ok::<(), Error>(())
+            })
+            .unwrap();
+
+        let mut interrupted = Vec::new();
+        mgr.delete_with_running_turns(&conv.id, |turn_id| interrupted.push(turn_id.to_string()))
+            .unwrap();
+
+        assert_eq!(interrupted, ["running-turn"]);
+        assert!(mgr.get(&conv.id).is_err());
+        let remaining = mgr
+            .db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_turns WHERE conversation_id = ?1",
+                    [&conv.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(Error::from)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            board
+                .get(&linked_task.id)
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
     fn test_messages() {
         let mgr = test_manager();
         let conv = mgr
@@ -607,6 +1338,153 @@ mod tests {
     }
 
     #[test]
+    fn agent_publication_requires_current_membership_and_source_task_scope() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Scoped Agent messages".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let board = crate::tasks::board::TaskBoard::new(mgr.db.clone());
+        let source_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Publish findings".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some(conv.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let detached_task = board
+            .create(&crate::tasks::board::CreateTask {
+                title: "Private work".into(),
+                agent_id: Some("atlas".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = SendMessage {
+            sender_type: "agent".into(),
+            sender_id: "atlas".into(),
+            sender_name: Some("Atlas".into()),
+            content: "The findings are ready.".into(),
+            message_type: None,
+        };
+
+        mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&source_task.id),
+            &[],
+        )
+        .unwrap();
+        let mismatched = mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&detached_task.id),
+            &[],
+        );
+        assert!(matches!(mismatched, Err(Error::Conversation(_))));
+
+        mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
+        let removed = mgr.send_agent_routed_message_with_attachments(
+            &conv.id,
+            &message,
+            Some(&source_task.id),
+            &[],
+        );
+        assert!(matches!(removed, Err(Error::Conversation(_))));
+        assert_eq!(mgr.get_messages(&conv.id, 50, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn linked_task_creation_rolls_back_if_publication_fails() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Atomic linked work".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        mgr.db
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_linked_task_publication
+                     BEFORE INSERT ON conversation_messages
+                     WHEN NEW.message_type = 'task'
+                     BEGIN
+                         SELECT RAISE(ABORT, 'forced linked publication failure');
+                     END;",
+                )
+            })
+            .unwrap();
+
+        let task = CreateTask {
+            title: "Investigate atomically".into(),
+            agent_id: Some("atlas".into()),
+            conversation_id: Some(conv.id.clone()),
+            context: Some(serde_json::json!({ "origin": "conversation" })),
+            ..Default::default()
+        };
+        let message = SendMessage {
+            sender_type: "agent".into(),
+            sender_id: "atlas".into(),
+            sender_name: Some("Atlas".into()),
+            content: "Created task: Investigate atomically".into(),
+            message_type: Some("task".into()),
+        };
+        assert!(mgr
+            .create_linked_task_and_message(&conv.id, &task, Some("atlas"), &message)
+            .is_err());
+
+        let rolled_back = mgr
+            .db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM conversation_messages", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(rolled_back, (0, 0, 0, 0));
+
+        mgr.db
+            .with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_linked_task_publication"))
+            .unwrap();
+        let (created, published) = mgr
+            .create_linked_task_and_message(&conv.id, &task, Some("atlas"), &message)
+            .unwrap();
+        assert_eq!(
+            published.linked_task_id.as_deref(),
+            Some(created.id.as_str())
+        );
+        assert_eq!(created.conversation_id.as_deref(), Some(conv.id.as_str()));
+        let committed = mgr
+            .db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM work_attempts", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(committed, (1, 1));
+    }
+
+    #[test]
     fn test_message_pagination() {
         let mgr = test_manager();
         let conv = mgr
@@ -641,6 +1519,17 @@ mod tests {
         assert_eq!(before.len(), 2);
         assert_eq!(before[0].content, "msg 0");
         assert_eq!(before[1].content, "msg 1");
+
+        let between = mgr
+            .get_messages_between(&conv.id, before[0].id, msgs[1].id, 10)
+            .unwrap();
+        assert_eq!(
+            between
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg 1", "msg 2", "msg 3"]
+        );
     }
 
     #[test]
@@ -677,6 +1566,11 @@ mod tests {
             .resolve_target_agents(&conv.id, "Hey @[AGENT:atlas:atlas]")
             .unwrap();
         assert_eq!(targets, vec!["atlas"]);
+
+        let targets = mgr
+            .resolve_target_agents(&conv.id, "Hey @[AGENT:reviewer:reviewer]")
+            .unwrap();
+        assert!(targets.is_empty());
     }
 
     #[test]
@@ -715,6 +1609,86 @@ mod tests {
         mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
         let conv = mgr.get(&conv.id).unwrap();
         assert_eq!(conv.participants.len(), 1);
+    }
+
+    #[test]
+    fn removing_an_agent_cancels_its_conversation_wakeups() {
+        let mgr = test_manager();
+        let conv = mgr
+            .create(&CreateConversation {
+                title: Some("Release room".into()),
+                icon: None,
+                participant_ids: vec!["atlas".into()],
+            })
+            .unwrap();
+        let schedules = crate::tasks::scheduler::ScheduleManager::new(mgr.db.clone());
+        let wakeup = schedules
+            .create_one_shot(&crate::tasks::scheduler::CreateOneShotSchedule {
+                name: "Check release".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Check release".into(),
+                description: Some("Update the room.".into()),
+                continuation_task_id: None,
+                conversation_id: Some(conv.id.clone()),
+            })
+            .unwrap();
+
+        mgr.remove_participant(&conv.id, "agent", "atlas").unwrap();
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
+
+        mgr.add_participant(&conv.id, "agent", "atlas").unwrap();
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn adding_an_agent_from_another_project_is_rejected_without_membership() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO projects (id, name) VALUES ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'two');",
+            )
+        })
+        .unwrap();
+        let manager = ConversationManager::new(db.clone());
+        let conversation = manager
+            .create_in_project(
+                Some("one"),
+                &CreateConversation {
+                    title: Some("Project one".into()),
+                    icon: None,
+                    participant_ids: vec![],
+                },
+            )
+            .unwrap();
+
+        let error = manager
+            .add_participant(&conversation.id, "agent", "atlas")
+            .unwrap_err();
+        assert!(error.to_string().contains("must belong"));
+        let membership: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_participants
+                     WHERE conversation_id = ?1
+                       AND participant_type = 'agent'
+                       AND participant_id = 'atlas'",
+                    [&conversation.id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(membership, 0);
     }
 
     #[test]

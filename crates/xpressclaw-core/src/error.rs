@@ -109,6 +109,12 @@ pub enum Error {
     #[error("conversation error: {0}")]
     Conversation(String),
 
+    #[error("project not found: {id}")]
+    ProjectNotFound { id: String },
+
+    #[error("project error: {0}")]
+    Project(String),
+
     // Database
     #[error("database error: {0}")]
     Database(String),

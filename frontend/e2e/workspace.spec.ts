@@ -2,6 +2,8 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 
 const taskId = 'task-browser-test';
 const agentId = 'project-browser-test';
+const projectId = 'collaboration-project-test';
+const conversationId = 'conversation-browser-test';
 const startTime = Date.parse('2026-07-19T00:00:00.000Z');
 
 function timestamp(second: number): string {
@@ -123,12 +125,17 @@ async function mockApi(
 			schedule_type: 'cron' | 'once';
 			run_at: string | null;
 			continuation_task_id: string | null;
+			conversation_id: string | null;
 		}[];
 		workflowCreateRequests?: { name: string; description?: string; yaml_content: string }[];
-		workflowRunRequests?: { id: string; inputs: Record<string, unknown> }[];
+		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
 		includeDeletedWorkspaceFile?: boolean;
+		conversations?: Record<string, unknown>[];
+		conversationMessages?: Record<string, unknown>[];
+		conversationMessageRequests?: Record<string, unknown>[];
+		conversationTaskRequests?: Record<string, unknown>[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -159,6 +166,7 @@ async function mockApi(
 		agent_id: agentId,
 		parent_task_id: null,
 		sop_id: null,
+		conversation_id: null,
 		created_at: timestamp(0),
 		updated_at: timestamp(61),
 		completed_at: status === 'completed' ? timestamp(61) : null,
@@ -173,6 +181,7 @@ async function mockApi(
 		name: 'browser-tested-workspace',
 		title: 'Browser-tested workspace',
 		backend: 'codex',
+		project_id: projectId,
 		status: options.live ? 'running' : 'stopped',
 		desired_status: options.live ? 'running' : 'stopped',
 		observed_status: options.live ? 'running' : 'stopped',
@@ -203,6 +212,7 @@ async function mockApi(
 			id: `project-mobile-${index + 1}`,
 			name: `mobile-workspace-${index + 1}`,
 			title: `Mobile workspace ${index + 1}`,
+			project_id: `project-mobile-${index + 1}`,
 		})
 		: options.multipleAgents ? [agent, secondaryAgent] : [agent];
 	const listedTasks = options.completedTaskCount
@@ -210,6 +220,9 @@ async function mockApi(
 			...task,
 			id: `completed-task-${index + 1}`,
 			title: `Completed task ${index + 1}`,
+			agent_id: options.projectCount
+				? availableAgents[index % availableAgents.length].id
+				: task.agent_id,
 			status: 'completed',
 			created_at: timestamp(index),
 			updated_at: timestamp(index),
@@ -233,6 +246,30 @@ async function mockApi(
 		completed: 0,
 		cancelled: 0,
 	});
+	const project = {
+		id: projectId,
+		name: 'Browser collaboration project',
+		description: 'A project with conversations, Agents, and tasks.',
+		icon: null,
+		created_at: timestamp(0),
+		updated_at: timestamp(61),
+		agent_ids: availableAgents.map((availableAgent) => availableAgent.id),
+		conversation_count: options.conversations?.length ?? 0,
+		task_count: listedTasks.length,
+	};
+	const availableProjects = options.projectCount
+		? availableAgents.map((availableAgent, index) => ({
+			...project,
+			id: index === 0 ? project.id : availableAgent.project_id,
+			name: index === 0 ? project.name : `Mobile project ${index + 1}`,
+			description: index === 0
+				? project.description
+				: `Project ${index + 1} verifies the mobile hierarchy can scroll.`,
+			agent_ids: [availableAgent.id],
+			task_count: listedTasks.filter((listedTask) => listedTask.agent_id === availableAgent.id).length,
+		}))
+		: [project];
+	let conversationMessages = [...(options.conversationMessages ?? [])];
 
 	await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
 	await page.route('**/api/**', async (route) => {
@@ -263,6 +300,47 @@ async function mockApi(
 				message: 'The MCP endpoint accepted a protocol verification request.',
 				suggestion: null,
 			};
+		} else if (path === '/api/projects') {
+			response = availableProjects;
+		} else if (path === `/api/projects/${projectId}`) {
+			response = project;
+		} else if (path === `/api/projects/${projectId}/tasks`) {
+			response = listedTasks;
+		} else if (path === '/api/conversations') {
+			response = options.conversations ?? [];
+		} else if (path === `/api/conversations/${conversationId}`) {
+			response = options.conversations?.find((conversation) => conversation.id === conversationId) ?? { error: 'Unknown conversation' };
+		} else if (path === `/api/conversations/${conversationId}/messages`) {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.conversationMessageRequests?.push(payload);
+				const sent = {
+					id: conversationMessages.length + 100,
+					conversation_id: conversationId,
+					sender_type: 'user', sender_id: 'local', sender_name: 'You',
+					content: payload.content, message_type: 'message', linked_task_id: null,
+					metadata: {}, attachments: [], created_at: timestamp(200),
+				};
+				conversationMessages.push(sent);
+				response = { message: sent, queued_agents: [agentId] };
+			} else response = conversationMessages;
+		} else if (path === `/api/conversations/${conversationId}/tasks`) {
+			if (request.method() === 'POST') {
+				const payload = request.postDataJSON() as Record<string, unknown>;
+				options.conversationTaskRequests?.push(payload);
+				response = payload.workflow_id
+					? { workflow_instance_id: 'conversation-workflow-instance' }
+					: { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
+			} else response = listedTasks.filter((listedTask) => listedTask.conversation_id === conversationId);
+		} else if (path === `/api/conversations/${conversationId}/turns`) {
+			response = [];
+		} else if (path === `/api/conversations/${conversationId}/events`) {
+			await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
+			return;
+		} else if (path === `/api/conversations/${conversationId}/participants`) {
+			response = {};
+		} else if (path.startsWith(`/api/conversations/${conversationId}/participants/`)) {
+			response = {};
 		} else if (path === '/api/agents') {
 			response = availableAgents;
 		} else if (path === `/api/agents/${agentId}`) {
@@ -283,12 +361,27 @@ async function mockApi(
 			} else {
 				response = options.workflows ?? [];
 			}
+		} else if (/^\/api\/workflows\/instances\/[^/]+$/.test(path)) {
+			response = {
+				instance: {
+					id: path.split('/')[4], workflow_id: 'workflow-review-loop', status: 'running',
+					current_flow: 'main', current_step_index: 0, trigger_data: '{}', variable_store: '{}',
+					loop_state: null, started_at: timestamp(200), completed_at: null, error_message: null,
+				},
+				step_executions: [{
+					id: 'conversation-workflow-step', instance_id: path.split('/')[4], flow_name: 'main',
+					step_id: 'implement', task_id: taskId, status: 'running', input_context: null,
+					output: null, attempt: 1, started_at: timestamp(200), completed_at: null,
+				}],
+			};
 		} else if (/^\/api\/workflows\/[^/]+\/instances$/.test(path)) {
 			response = [];
 		} else if (/^\/api\/workflows\/[^/]+\/run$/.test(path)) {
 			const id = path.split('/')[3];
 			const inputs = request.postDataJSON() as Record<string, unknown>;
-			options.workflowRunRequests?.push({ id, inputs });
+			const runRequest: { id: string; inputs: Record<string, unknown>; projectId?: string } = { id, inputs };
+			if (url.searchParams.has('project_id')) runRequest.projectId = url.searchParams.get('project_id') ?? undefined;
+			options.workflowRunRequests?.push(runRequest);
 			response = {
 				id: 'workflow-instance', workflow_id: id, status: 'running', current_flow: 'main', current_step_index: 0,
 				current_task_id: taskId,
@@ -444,6 +537,7 @@ async function mockApi(
 			}
 		} else if (path === '/api/tasks/recent-by-agent') {
 			const limit = Number.parseInt(url.searchParams.get('limit') ?? '5', 10);
+			const countsByAgent = new Map<string, number>();
 			response = {
 				tasks: [...listedTasks]
 					.sort((left, right) =>
@@ -451,7 +545,13 @@ async function mockApi(
 						|| Date.parse(right.created_at) - Date.parse(left.created_at)
 						|| right.id.localeCompare(left.id)
 					)
-					.slice(0, limit),
+					.filter((listedTask) => {
+						const key = listedTask.agent_id ?? 'unassigned';
+						const count = countsByAgent.get(key) ?? 0;
+						if (count >= limit) return false;
+						countsByAgent.set(key, count + 1);
+						return true;
+					}),
 			};
 		} else if (path === `/api/tasks/${taskId}`) {
 			response = task;
@@ -818,6 +918,86 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
 });
 
+test('project conversations coordinate files and project-wide linked work', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const conversationTaskRequests: Record<string, unknown>[] = [];
+	const collaborationConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Release planning',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await mockApi(page, {
+		multipleAgents: true,
+		conversations: [collaborationConversation],
+		conversationMessages: [{
+			id: 1,
+			conversation_id: conversationId,
+			sender_type: 'agent',
+			sender_id: agentId,
+			sender_name: 'Browser-tested workspace',
+			content: 'I finished the research while the implementation task kept running.',
+			message_type: 'message',
+			linked_task_id: null,
+			metadata: { source_task_id: taskId },
+			attachments: [{
+				id: 'published-findings',
+				message_id: 1,
+				name: 'findings.md',
+				mime_type: 'text/markdown',
+				size: 128,
+				source_task_id: taskId,
+				created_at: timestamp(20),
+			}],
+			created_at: timestamp(20),
+		}],
+		conversationMessageRequests,
+		conversationTaskRequests,
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.getByRole('heading', { name: 'Release planning' })).toBeVisible();
+	await expect(page.getByRole('button', { name: '1 Agent' })).toBeVisible();
+	await expect(page.getByText('I finished the research while the implementation task kept running.')).toBeVisible();
+	const sidebar = page.locator('aside').first();
+	await expect(sidebar.locator(`a[href="/projects/${projectId}"]`).filter({ hasText: 'Browser collaboration project' })).toBeVisible();
+	await expect(sidebar.locator(`a[href="/conversations/${conversationId}"]`)).toBeVisible();
+
+	await page.getByRole('button', { name: /Files 1/ }).click();
+	await expect(page.getByRole('link', { name: /findings\.md/ })).toHaveAttribute(
+		'href',
+		`/api/conversations/${conversationId}/attachments/published-findings`,
+	);
+	await page.getByRole('button', { name: 'Conversation' }).click();
+
+	const composer = page.getByPlaceholder('Message #Release planning…');
+	await composer.fill('Please compare both approaches.');
+	await page.getByRole('button', { name: 'Send', exact: true }).click();
+	await expect.poll(() => conversationMessageRequests).toEqual([{
+		content: 'Please compare both approaches.',
+		attachments: [],
+	}]);
+
+	await page.getByRole('button', { name: 'Continue with task' }).click();
+	await page.getByLabel('Title', { exact: true }).fill('Implement the selected approach');
+	await page.getByLabel('Details', { exact: true }).fill('Use the decisions and files already published here.');
+	await expect(page.getByLabel('Agent', { exact: true }).locator('option')).toHaveCount(3);
+	await page.getByLabel('Agent', { exact: true }).selectOption('project-secondary-test');
+	await page.getByRole('button', { name: 'Create task' }).click();
+	await expect.poll(() => conversationTaskRequests).toEqual([{
+		title: 'Implement the selected approach',
+		description: 'Use the decisions and files already published here.',
+		agent_id: 'project-secondary-test',
+	}]);
+});
+
 test('running agents can be guided at a safe break or interrupted immediately', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	const interruptedAttempts: string[] = [];
@@ -878,7 +1058,7 @@ test('new-work drafts restore the agent they were written for', async ({ page })
 
 test('new work binds reusable workflow agent roles across projects', async ({ page }) => {
 	const queuedSessionMessages: { agentId: string; payload: Record<string, unknown> }[] = [];
-	const workflowRunRequests: { id: string; inputs: Record<string, unknown> }[] = [];
+	const workflowRunRequests: { id: string; inputs: Record<string, unknown>; projectId?: string }[] = [];
 	await mockApi(page, {
 		multipleAgents: true,
 		queuedSessionMessages,
@@ -943,6 +1123,7 @@ flows:
 
 	await expect.poll(() => workflowRunRequests).toEqual([{
 		id: 'workflow-review-loop',
+		projectId,
 		inputs: {
 			goal: 'Add workflow selection to New Work',
 			implementer: agentId,
@@ -950,6 +1131,63 @@ flows:
 		},
 	}]);
 	expect(queuedSessionMessages).toEqual([]);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+});
+
+test('new work opens the task created by a conversation workflow', async ({ page }) => {
+	const conversationTaskRequests: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Release planning',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_message_at: timestamp(2),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(1) },
+			],
+		}],
+		conversationTaskRequests,
+		workflows: [{
+			id: 'workflow-review-loop',
+			name: 'Code Review Loop',
+			description: 'Implement and review linked Conversation work.',
+			yaml_content: `name: code-review-loop
+inputs:
+  goal:
+    type: string
+    required: true
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: "${agentId}"
+        prompt: "Implement @goal"
+`,
+			enabled: true,
+			version: 1,
+			created_at: timestamp(1),
+			updated_at: timestamp(2),
+			last_triggered_at: null,
+			trigger_count: 0,
+			trigger_error: null,
+		}],
+	});
+	await page.goto('/');
+
+	await page.getByLabel('Conversation', { exact: true }).selectOption(conversationId);
+	await page.getByLabel('Workflow').selectOption('workflow-review-loop');
+	await page.getByPlaceholder('Describe the outcome you want…').fill('Review the release changes');
+	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
+
+	await expect.poll(() => conversationTaskRequests).toEqual([{
+		title: 'Review the release changes',
+		workflow_id: 'workflow-review-loop',
+		workflow_inputs: { goal: 'Review the release changes' },
+	}]);
 	await expect(page).toHaveURL(`/tasks/${taskId}`);
 });
 
@@ -1120,6 +1358,10 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 
 	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
+	await mobile.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
+	await mobile.locator('nav a[href="/projects"]').click();
+	await expect(mobile).toHaveURL('/projects');
+	await mobile.getByRole('button', { name: 'Open agent switcher' }).click();
 	let mobileProject = mobile.locator(`aside a[href="/agents/${agentId}"]:visible`);
 	await mobileProject.click();
 	await expect(mobile).toHaveURL(`/agents/${agentId}`);
@@ -1152,7 +1394,7 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobile).toHaveURL(`/agents/${agentId}?tab=workspace`);
 
 	const mobileTabs = mobile.locator('[data-workspace-tab]:visible');
-	await expect(mobileTabs).toHaveCount(2);
+	await expect(mobileTabs).toHaveCount(3);
 	await mobileTabs.nth(1).evaluate((element) => element.dispatchEvent(new MouseEvent('contextmenu', {
 		bubbles: true,
 		cancelable: true,
@@ -1218,15 +1460,15 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	const sidebar = page.locator('aside').first();
 	const tabs = page.locator('[data-workspace-pane] [data-workspace-tab]');
 
-	await sidebar.locator('a[href="/agents"]').click();
+	await sidebar.locator('a[href="/projects"]').click();
 	await sidebar.locator('a[href="/settings"]').click();
 	await expect(tabs).toHaveCount(3);
 
-	await tabs.filter({ has: page.locator('[title="Agents"]') }).click({ button: 'right' });
+	await tabs.filter({ has: page.locator('[title="Projects"]') }).click({ button: 'right' });
 	await page.getByRole('menuitem', { name: 'Close Other Tabs' }).click();
 	await expect(tabs).toHaveCount(1);
-	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Agents');
-	await expect(page).toHaveURL('/agents');
+	await expect(tabs).toHaveAttribute('data-workspace-tab-title', 'Projects');
+	await expect(page).toHaveURL('/projects');
 
 	await tabs.click({ button: 'right' });
 	await expect(page.getByRole('menuitem', { name: 'Close Other Tabs' })).toBeDisabled();
@@ -1236,7 +1478,7 @@ test('tab context menus close one, other, or all tabs within a pane', async ({ p
 	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
 	await page.getByRole('menuitem', { name: 'Close Tab', exact: true }).click();
 	await expect(tabs).toHaveCount(1);
-	await expect(page).toHaveURL('/agents');
+	await expect(page).toHaveURL('/projects');
 
 	await sidebar.locator('a[href="/settings"]').click();
 	await tabs.filter({ has: page.locator('[title="Settings"]') }).click({ button: 'right' });
@@ -1289,7 +1531,7 @@ test('tab context menus create native webview windows in the desktop app', async
 	expect(new URL(call.args.options.url).searchParams.get('_xpressclaw_window')).toBe(call.args.options.label);
 });
 
-test('task pages show five recent tasks per agent in the sidebar', async ({ page }) => {
+test('task pages show five recent tasks per project in the sidebar', async ({ page }) => {
 	await mockApi(page, { multipleAgents: true });
 	const sidebarTasks = [
 		{ id: 'primary-oldest', title: 'Primary oldest', agentId, updatedAt: 10, status: 'completed' },
@@ -1349,28 +1591,20 @@ test('task pages show five recent tasks per agent in the sidebar', async ({ page
 	const taskSidebar = sidebar.locator('[data-sidebar-mode="tasks"]');
 	await expect(taskSidebar).toBeVisible();
 
-	const primaryGroup = taskSidebar.locator(`[data-sidebar-project-group="${agentId}"]`);
-	await expect(primaryGroup.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
-	const primaryTasks = primaryGroup.locator('[data-sidebar-task]');
-	await expect(primaryTasks).toHaveCount(5);
-	expect(await primaryTasks.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
+	const projectGroup = taskSidebar.locator(`[data-sidebar-project-group="${projectId}"]`);
+	await expect(projectGroup.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+	const projectTasks = projectGroup.locator('[data-sidebar-task]');
+	await expect(projectTasks).toHaveCount(5);
+	expect(await projectTasks.evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
 		'/tasks/primary-newest',
 		'/tasks/primary-second',
 		'/tasks/primary-recent',
-		'/tasks/primary-middle',
-		`/tasks/${taskId}`,
-	]);
-	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"]`)).toHaveAttribute('aria-current', 'page');
-	await expect(primaryGroup.locator(`a[href="/tasks/${taskId}"] [data-task-status="in_progress"]`)).toBeVisible();
-
-	const secondaryGroup = taskSidebar.locator('[data-sidebar-project-group="project-secondary-test"]');
-	await expect(secondaryGroup.getByRole('heading', { name: 'Secondary browser workspace' })).toBeVisible();
-	expect(await secondaryGroup.locator('[data-sidebar-task]').evaluateAll((items) => items.map((item) => item.getAttribute('href')))).toEqual([
 		'/tasks/secondary-newest',
-		'/tasks/secondary-older',
+		'/tasks/primary-middle',
 	]);
+	await expect(projectGroup.locator(`a[href="/tasks/${taskId}"]`)).toHaveCount(0);
 
-	await sidebar.locator('a[href="/agents"]').click();
+	await sidebar.locator('a[href="/projects"]').click();
 	await expect(sidebar.locator('[data-sidebar-mode="tasks"]')).toHaveCount(0);
 	await expect(sidebar.locator(`a[href="/agents/${agentId}"]`)).toBeVisible();
 });
@@ -1642,6 +1876,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 			schedule_type: 'cron',
 			run_at: null,
 			continuation_task_id: null,
+			conversation_id: null,
 		}],
 	});
 	await page.goto('/automations');
@@ -1720,7 +1955,7 @@ test('goal-loop workflow template is bounded and reusable across agents', async 
 	await page.goto('/workflows/new');
 
 	await page.getByRole('button', { name: /Goal loop/ }).click();
-	await expect(page.getByText('Each run chooses the worker agent, so this definition can be reused with any project context.')).toBeVisible();
+	await expect(page.getByText('Each run chooses the worker Agent, so this definition can be reused in any Project.')).toBeVisible();
 	await page.getByRole('button', { name: 'Create workflow' }).click();
 
 	await expect.poll(() => workflowCreateRequests.length).toBe(1);

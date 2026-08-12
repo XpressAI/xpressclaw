@@ -603,11 +603,9 @@ impl ProjectMemoryStore {
 
     fn ensure_project(&self, project_id: &str) -> Result<()> {
         let exists = self.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT 1 FROM logical_sessions WHERE id = ?1",
-                [project_id],
-                |_| Ok(()),
-            )
+            conn.query_row("SELECT 1 FROM projects WHERE id = ?1", [project_id], |_| {
+                Ok(())
+            })
             .optional()
             .map_err(Error::from)
         })?;
@@ -627,7 +625,10 @@ impl ProjectMemoryStore {
             let belongs = self.db.with_conn(|conn| {
                 conn.query_row(
                     "SELECT 1 FROM tasks
-                     WHERE id = ?1 AND (session_id = ?2 OR agent_id = ?2)",
+                     WHERE id = ?1 AND (
+                         project_id = ?2
+                         OR (project_id IS NULL AND (session_id = ?2 OR agent_id = ?2))
+                     )",
                     rusqlite::params![task_id, project_id],
                     |_| Ok(()),
                 )
@@ -643,7 +644,13 @@ impl ProjectMemoryStore {
         if let Some(attempt_id) = attempt_id {
             let belongs = self.db.with_conn(|conn| {
                 conn.query_row(
-                    "SELECT 1 FROM work_attempts WHERE id = ?1 AND session_id = ?2",
+                    "SELECT 1
+                     FROM work_attempts wa
+                     LEFT JOIN tasks t ON t.id = wa.task_id
+                     LEFT JOIN logical_sessions ls ON ls.id = wa.session_id
+                     LEFT JOIN agents a ON a.id = ls.agent_id
+                     WHERE wa.id = ?1
+                       AND COALESCE(t.project_id, a.project_id, wa.session_id) = ?2",
                     rusqlite::params![attempt_id, project_id],
                     |_| Ok(()),
                 )
@@ -756,6 +763,51 @@ impl ProjectMemoryStore {
             Ok(counts)
         })
     }
+}
+
+/// Transfer the durable memory partition while consolidating an otherwise
+/// empty imported Project into another Project.
+pub(crate) fn move_project_memory(
+    transaction: &rusqlite::Transaction<'_>,
+    source_project_id: &str,
+    target_project_id: &str,
+) -> Result<()> {
+    let notes = {
+        let mut statement = transaction.prepare(
+            "SELECT id, search_key, state FROM project_memory_notes WHERE project_id = ?1",
+        )?;
+        let rows = statement
+            .query_map([source_project_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (note_id, _, _) in &notes {
+        transaction.execute(
+            "DELETE FROM project_memory_embeddings WHERE note_id = ?1",
+            [note_id],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE project_memory_notes SET project_id = ?1 WHERE project_id = ?2",
+        rusqlite::params![target_project_id, source_project_id],
+    )?;
+    for (note_id, search_key, state) in notes {
+        if state != "archived" {
+            insert_embedding(
+                transaction,
+                &note_id,
+                target_project_id,
+                &simple_embedding(&search_key),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl From<ProjectMemoryNote> for ProjectMemoryReference {
@@ -906,13 +958,16 @@ fn like_pattern(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sessions::SessionManager;
 
     fn setup() -> (Arc<Database>, ProjectMemoryStore) {
         let db = Arc::new(Database::open_memory().unwrap());
-        let sessions = SessionManager::new(db.clone());
-        sessions.ensure("alpha", Some("Alpha")).unwrap();
-        sessions.ensure("beta", Some("Beta")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('alpha', 'Alpha');
+                 INSERT INTO projects (id, name) VALUES ('beta', 'Beta');",
+            )
+        })
+        .unwrap();
         let store = ProjectMemoryStore::new(db.clone());
         (db, store)
     }
@@ -1073,7 +1128,8 @@ mod tests {
     fn deleting_a_project_cleans_up_partitioned_embeddings() {
         let (db, store) = setup();
         create_note(&store, "alpha", "Database", "SQLite migration strategy");
-        SessionManager::new(db.clone()).delete("alpha").unwrap();
+        db.with_conn(|conn| conn.execute("DELETE FROM projects WHERE id = 'alpha'", []))
+            .unwrap();
 
         db.with_conn(|conn| {
             let count: i64 = conn

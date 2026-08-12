@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -12,6 +13,8 @@ use crate::error::{Error, Result};
 pub struct WorkflowInstance {
     pub id: String,
     pub workflow_id: String,
+    pub project_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub status: String, // running, waiting, completed, failed, cancelled
     pub current_flow: String,
     pub current_step_index: i32,
@@ -48,6 +51,14 @@ pub struct InstanceManager {
     db: Arc<Database>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct WorkflowInstanceScope<'a> {
+    pub project_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub creator_agent_id: Option<&'a str>,
+    pub workflow_agent_inputs: &'a [(String, String)],
+}
+
 impl InstanceManager {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
@@ -71,6 +82,46 @@ impl InstanceManager {
         variables_json: Option<&str>,
         definition_yaml: Option<&str>,
     ) -> Result<WorkflowInstance> {
+        self.create_instance_with_definition_in_context(
+            workflow_id,
+            trigger_data,
+            variables_json,
+            definition_yaml,
+            WorkflowInstanceScope::default(),
+        )
+    }
+
+    pub(super) fn create_instance_with_definition_in_context(
+        &self,
+        workflow_id: &str,
+        trigger_data: Option<&str>,
+        variables_json: Option<&str>,
+        definition_yaml: Option<&str>,
+        scope: WorkflowInstanceScope<'_>,
+    ) -> Result<WorkflowInstance> {
+        self.create_instance_with_definition_in_context_and_then(
+            workflow_id,
+            trigger_data,
+            variables_json,
+            definition_yaml,
+            scope,
+            |_, _| Ok(()),
+        )
+        .map(|(instance, ())| instance)
+    }
+
+    pub(super) fn create_instance_with_definition_in_context_and_then<T, F>(
+        &self,
+        workflow_id: &str,
+        trigger_data: Option<&str>,
+        variables_json: Option<&str>,
+        definition_yaml: Option<&str>,
+        scope: WorkflowInstanceScope<'_>,
+        after_insert: F,
+    ) -> Result<(WorkflowInstance, T)>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
+    {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -78,16 +129,130 @@ impl InstanceManager {
             .to_string();
         let var_store = variables_json.unwrap_or("{}");
 
-        self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO workflow_instances (id, workflow_id, status, current_flow, current_step_index, trigger_data, variable_store, started_at, definition_yaml)
-                 VALUES (?1, ?2, 'running', 'main', 0, ?3, ?4, ?5, ?6)",
-                rusqlite::params![id, workflow_id, trigger_data, var_store, now, definition_yaml],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+        let after_insert = self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let conversation_project = if let Some(conversation_id) = scope.conversation_id {
+                transaction
+                    .query_row(
+                        "SELECT project_id FROM conversations WHERE id = ?1",
+                        [conversation_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        Error::Workflow(format!("conversation '{conversation_id}' not found"))
+                    })?
+            } else {
+                None
+            };
+            if let (Some(requested), Some(actual)) =
+                (scope.project_id, conversation_project.as_deref())
+            {
+                if requested != actual {
+                    return Err(Error::Workflow(format!(
+                        "conversation '{}' belongs to project '{actual}', not '{requested}'",
+                        scope.conversation_id.unwrap_or_default()
+                    )));
+                }
+            }
+            let resolved_project = scope.project_id.or(conversation_project.as_deref());
+            if let Some(project_id) = resolved_project {
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                    [project_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !exists {
+                    return Err(Error::Workflow(format!(
+                        "project '{project_id}' not found"
+                    )));
+                }
+            }
+            if let Some(creator_agent_id) = scope.creator_agent_id {
+                let conversation_id = scope.conversation_id.ok_or_else(|| {
+                    Error::Conversation(
+                        "an Agent may only create work from a conversation".into(),
+                    )
+                })?;
+                let is_participant = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM conversation_participants
+                        WHERE conversation_id = ?1
+                          AND participant_type = 'agent'
+                          AND participant_id = ?2
+                    )",
+                    rusqlite::params![conversation_id, creator_agent_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !is_participant {
+                    return Err(Error::Conversation(format!(
+                        "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
+                    )));
+                }
+            }
+            for (input_name, agent_id) in scope.workflow_agent_inputs {
+                let agent_project = transaction
+                    .query_row(
+                        "SELECT project_id FROM agents WHERE id = ?1",
+                        [agent_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        Error::Workflow(format!(
+                            "workflow agent input '{input_name}' references unknown agent '{agent_id}'"
+                        ))
+                    })?;
+                if let Some(project_id) = resolved_project {
+                    if agent_project.as_deref() != Some(project_id) {
+                        return Err(Error::Workflow(format!(
+                            "workflow agent input '{input_name}' references Agent '{agent_id}' outside project '{project_id}'"
+                        )));
+                    }
+                }
+            }
+            transaction.execute(
+                "INSERT INTO workflow_instances
+                 (id, workflow_id, project_id, conversation_id, status,
+                  current_flow, current_step_index, trigger_data, variable_store,
+                  started_at, definition_yaml)
+                 VALUES (?1, ?2, ?3, ?4, 'running', 'main', 0, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    id,
+                    workflow_id,
+                    resolved_project,
+                    scope.conversation_id,
+                    trigger_data,
+                    var_store,
+                    now,
+                    definition_yaml
+                ],
+            )?;
+            let after_insert = after_insert(&transaction, &id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(after_insert)
         })?;
 
-        self.get_instance(&id)
+        Ok((self.get_instance(&id)?, after_insert))
+    }
+
+    pub fn set_context(
+        &self,
+        instance_id: &str,
+        project_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET project_id = ?1, conversation_id = ?2 WHERE id = ?3",
+                rusqlite::params![project_id, conversation_id, instance_id],
+            )
+            .map_err(|error| Error::Database(error.to_string()))
+        })?;
+        Ok(())
     }
 
     /// Get a workflow instance by ID.
@@ -588,6 +753,8 @@ fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
     WorkflowInstance {
         id: row.get("id").unwrap_or_default(),
         workflow_id: row.get("workflow_id").unwrap_or_default(),
+        project_id: row.get("project_id").unwrap_or_default(),
+        conversation_id: row.get("conversation_id").unwrap_or_default(),
         status: row.get("status").unwrap_or_default(),
         current_flow: row
             .get("current_flow")

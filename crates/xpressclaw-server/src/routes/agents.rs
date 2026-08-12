@@ -11,6 +11,7 @@ use xpressclaw_core::config::{
     WakeOnConfig,
 };
 use xpressclaw_core::sessions::LogicalSession;
+use xpressclaw_core::workers::acp::AcpInterruptMode;
 
 use crate::state::AppState;
 
@@ -42,6 +43,7 @@ fn agent_json(
         "name": record.name,
         "title": agent_cfg.map(|config| config.context_label()).unwrap_or_else(|| record.name.clone()),
         "backend": record.backend,
+        "project_id": record.project_id,
         "status": status,
         "desired_status": "available",
         "observed_status": "native",
@@ -136,7 +138,18 @@ async fn delete_agent(
         // environment (and also removes a pre-ADR-025 legacy container).
         let _ = docker.stop(&id).await;
     }
-    registry.delete(&id).map_err(internal_error)?;
+    registry
+        .delete_with_running_conversation_turns(&id, |turn_id| {
+            state
+                .turn_controls
+                .request_interrupt(turn_id, AcpInterruptMode::Immediate);
+            state.elicitations.cancel_attempt(turn_id);
+        })
+        .map_err(internal_error)?;
+    state
+        .conversation_processes
+        .retire_agent_everywhere(&id)
+        .await;
     sessions.delete(&id).map_err(internal_error)?;
 
     // Remove from YAML config

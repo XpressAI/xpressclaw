@@ -97,6 +97,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     let dispatcher_event_bus = state.event_bus.clone();
     let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_turn_controls = state.turn_controls.clone();
+    let dispatcher_conversation_processes = state.conversation_processes.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -104,9 +105,12 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                 dispatcher_db,
                 dispatcher_config,
                 dispatcher_docker,
-                dispatcher_event_bus,
-                dispatcher_elicitations,
-                dispatcher_turn_controls,
+                xpressclaw_core::workers::native::NativeDispatcherServices {
+                    event_bus: dispatcher_event_bus,
+                    elicitation_broker: dispatcher_elicitations,
+                    turn_controls: dispatcher_turn_controls,
+                    conversation_processes: dispatcher_conversation_processes,
+                },
                 port,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }

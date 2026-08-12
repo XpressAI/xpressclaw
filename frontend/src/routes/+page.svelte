@@ -2,8 +2,8 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import yaml from 'js-yaml';
-	import { setup, sessions, agents as agentsApi, workflows as workflowsApi } from '$lib/api';
-	import type { Agent, ImageAttachmentUpload, Workflow } from '$lib/api';
+	import { setup, sessions, agents as agentsApi, conversations as conversationsApi, projects as projectsApi, workflows as workflowsApi } from '$lib/api';
+	import type { Agent, Conversation, ImageAttachmentUpload, Project, Task, Workflow } from '$lib/api';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
@@ -17,6 +17,12 @@
 	let message = $state('');
 	let messageDraftReady = $state(false);
 	let agentList = $state<Agent[]>([]);
+	let projectList = $state<Project[]>([]);
+	let conversationList = $state<Conversation[]>([]);
+	let selectedProject = $state('');
+	let selectedProjectReady = $state(false);
+	let selectedConversation = $state('');
+	let selectedConversationReady = $state(false);
 	let selectedAgent = $state('');
 	let selectedAgentReady = $state(false);
 	let workflowList = $state<Workflow[]>([]);
@@ -43,15 +49,30 @@
 				return;
 			}
 
-			const [agts, workflowRecords] = await Promise.all([
+			const [agts, projects, conversationRecords, workflowRecords] = await Promise.all([
 				agentsApi.list().catch(() => []),
+				projectsApi.list().catch(() => []),
+				conversationsApi.list(undefined, 200).catch(() => []),
 				workflowsApi.list().catch(() => []),
 			]);
 			agentList = agts;
+			projectList = projects;
+			conversationList = conversationRecords;
 			workflowList = workflowRecords;
 			const savedAgent = loadComposerTarget(messageDraftScope);
-			selectedAgent = agts.find((agent) => agent.id === savedAgent)?.id ?? agts[0]?.id ?? '';
+			const savedProject = loadComposerTarget(`${messageDraftScope}-project`);
+			selectedProject = projects.find((project) => project.id === savedProject)?.id
+				?? agts.find((agent) => agent.id === savedAgent)?.project_id
+				?? projects[0]?.id
+				?? '';
+			selectedProjectReady = true;
+			selectedAgent = agts.find((agent) => agent.id === savedAgent && (!selectedProject || agent.project_id === selectedProject))?.id
+				?? agts.find((agent) => !selectedProject || agent.project_id === selectedProject)?.id
+				?? '';
 			selectedAgentReady = true;
+			const savedConversation = loadComposerTarget(`${messageDraftScope}-conversation`);
+			selectedConversation = conversationRecords.find((conversation) => conversation.id === savedConversation && conversation.project_id === selectedProject)?.id ?? '';
+			selectedConversationReady = true;
 			const savedWorkflow = loadComposerTarget(`${messageDraftScope}-workflow`);
 			selectedWorkflow = workflowRecords.some((workflow) => workflow.id === savedWorkflow) ? savedWorkflow : '';
 			selectedWorkflowReady = true;
@@ -73,6 +94,14 @@
 
 	$effect(() => {
 		if (selectedAgentReady) saveComposerTarget(messageDraftScope, selectedAgent);
+	});
+
+	$effect(() => {
+		if (selectedProjectReady) saveComposerTarget(`${messageDraftScope}-project`, selectedProject);
+	});
+
+	$effect(() => {
+		if (selectedConversationReady) saveComposerTarget(`${messageDraftScope}-conversation`, selectedConversation);
 	});
 
 	$effect(() => {
@@ -149,7 +178,9 @@
 		);
 	}
 
-	let selectedAgentObj = $derived(agentList.find(a => a.id === selectedAgent));
+	let projectAgents = $derived(selectedProject ? agentList.filter((agent) => agent.project_id === selectedProject) : agentList);
+	let projectConversations = $derived(conversationList.filter((conversation) => conversation.project_id === selectedProject));
+	let selectedAgentObj = $derived(projectAgents.find(a => a.id === selectedAgent));
 	let compatibleWorkflows = $derived(workflowList.filter((workflow) => supportsNewWork(workflow, selectedAgent)));
 	let selectedWorkflowObj = $derived(compatibleWorkflows.find((workflow) => workflow.id === selectedWorkflow));
 	let selectedWorkflowInputs = $derived(workflowDefinition(selectedWorkflowObj)?.inputs ?? {});
@@ -160,8 +191,14 @@
 		selectedWorkflow
 			? Boolean(message.trim()) && imageAttachments.length === 0 && Boolean(selectedWorkflowObj)
 				&& secondaryAgentRoles.every(([name, input]) => !input.required || Boolean(roleAgents[name] || input.default))
-			: Boolean(message.trim()) || imageAttachments.length > 0
+			: (Boolean(message.trim()) || imageAttachments.length > 0) && (!selectedConversation || imageAttachments.length === 0)
 	));
+
+	$effect(() => {
+		if (!selectedProjectReady) return;
+		if (!projectAgents.some((agent) => agent.id === selectedAgent)) selectedAgent = projectAgents[0]?.id ?? '';
+		if (!projectConversations.some((conversation) => conversation.id === selectedConversation)) selectedConversation = '';
+	});
 
 	$effect(() => {
 		if (selectedWorkflowReady && selectedWorkflow && !compatibleWorkflows.some((workflow) => workflow.id === selectedWorkflow)) {
@@ -178,11 +215,11 @@
 		for (const [name, input] of secondaryAgentRoles) {
 			const configured = typeof input.default === 'string' ? input.default : '';
 			const saved = loadComposerTarget(`${messageDraftScope}-workflow-${selectedWorkflowObj.id}-role-${name}`);
-			const alternative = agentList.find((agent) => agent.id !== selectedAgent)?.id ?? selectedAgent;
-			next[name] = agentList.some((agent) => agent.id === roleAgents[name])
+			const alternative = projectAgents.find((agent) => agent.id !== selectedAgent)?.id ?? selectedAgent;
+			next[name] = projectAgents.some((agent) => agent.id === roleAgents[name])
 				? roleAgents[name]
-				: agentList.some((agent) => agent.id === saved) ? saved
-					: agentList.some((agent) => agent.id === configured) ? configured : alternative;
+				: projectAgents.some((agent) => agent.id === saved) ? saved
+					: projectAgents.some((agent) => agent.id === configured) ? configured : alternative;
 		}
 		if (JSON.stringify(next) !== JSON.stringify(roleAgents)) roleAgents = next;
 	});
@@ -200,11 +237,25 @@
 					const value = roleAgents[name] || input.default;
 					if (value) inputs[name] = value;
 				}
-				const instance = await workflowsApi.run(selectedWorkflowObj.id, inputs);
+				const instance = selectedConversation
+					? await startConversationWorkflow(selectedWorkflowObj, inputs)
+					: await workflowsApi.run(selectedWorkflowObj.id, inputs, selectedProject || undefined);
 				message = '';
 				clearComposerDraft(messageDraftScope);
 				imageAttachments = [];
 				await goto(instance.current_task_id ? `/tasks/${instance.current_task_id}` : `/workflows/${selectedWorkflowObj.id}`);
+				return;
+			}
+			if (selectedConversation) {
+				const task = await conversationsApi.createTask(selectedConversation, {
+					title: taskTitle(message),
+					description: message.trim(),
+					agent_id: selectedAgent,
+				}) as Task;
+				message = '';
+				clearComposerDraft(messageDraftScope);
+				imageAttachments = [];
+				await goto(`/tasks/${task.id}`);
 				return;
 			}
 			const queued = await sessions.sendMessage(selectedAgent, message.trim(), {
@@ -220,6 +271,25 @@
 		} finally {
 			sending = false;
 		}
+	}
+
+	function taskTitle(content: string): string {
+		const firstLine = content.trim().split(/\r?\n/, 1)[0] || 'Conversation task';
+		return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
+	}
+
+	async function startConversationWorkflow(workflow: Workflow, inputs: Record<string, unknown>) {
+		const result = await conversationsApi.createTask(selectedConversation, {
+			title: taskTitle(message),
+			workflow_id: workflow.id,
+			workflow_inputs: inputs,
+		});
+		if (!('workflow_instance_id' in result)) throw new Error('The conversation workflow did not start');
+		const details = await workflowsApi.getInstance(result.workflow_instance_id);
+		const currentTaskId = [...details.step_executions]
+			.reverse()
+			.find((execution) => execution.task_id)?.task_id ?? null;
+		return { ...details.instance, current_task_id: currentTaskId };
 	}
 
 	async function addImages(files: File[]) {
@@ -304,7 +374,7 @@
 									saveComposerTarget(`${messageDraftScope}-workflow-${selectedWorkflowObj.id}-role-${name}`, event.currentTarget.value);
 								}} class="mt-1 w-full rounded border border-input bg-secondary px-2.5 py-1.5 text-xs text-foreground">
 									<option value="">Select agent…</option>
-									{#each agentList as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
+									{#each projectAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}
 								</select>
 								{#if input.description}<span class="mt-1 block font-normal normal-case leading-relaxed">{input.description}</span>{/if}
 							</label>
@@ -314,18 +384,33 @@
 				<div class="flex flex-col gap-3 px-4 pb-4 sm:flex-row sm:items-center sm:justify-between">
 					{#if selectedWorkflowObj}
 						<p class="text-xs text-muted-foreground">Bind each workflow role for this run. The definition is reusable across projects.</p>
-					{:else}
+					{:else if !selectedConversation}
 						<label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground" title="Do not inherit context from this agent's current conversation">
 							<input type="checkbox" bind:checked={startFresh} class="h-3.5 w-3.5 rounded border-border accent-primary" />
 							Start a fresh conversation
 						</label>
+					{:else}
+						<p class="text-xs text-muted-foreground">This task will stay linked to the selected conversation.</p>
 					{/if}
 					<div class="flex min-w-0 flex-wrap items-center justify-end gap-2 sm:gap-3">
 						<input bind:this={imageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleImageInput} class="hidden" />
-						<button type="button" onclick={() => imageInput?.click()} disabled={sending || Boolean(selectedWorkflow) || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title={selectedWorkflow ? 'Workflow runs currently accept text input only' : 'Attach images (you can also paste)'}
+						<button type="button" onclick={() => imageInput?.click()} disabled={sending || Boolean(selectedWorkflow) || Boolean(selectedConversation) || imageAttachments.length >= MAX_IMAGE_ATTACHMENTS} aria-label="Attach images" title={selectedConversation ? 'Attach files in the conversation before creating linked work' : selectedWorkflow ? 'Workflow runs currently accept text input only' : 'Attach images (you can also paste)'}
 							class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 							<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
 						</button>
+						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
+							<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">P</span>
+							<select bind:value={selectedProject} aria-label="Project" class="min-w-0 max-w-28 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-40">
+								{#each projectList as project}<option value={project.id}>{project.name}</option>{/each}
+							</select>
+						</div>
+						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
+							<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">#</span>
+							<select bind:value={selectedConversation} aria-label="Conversation" class="min-w-0 max-w-32 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-44">
+								<option value="">Private task</option>
+								{#each projectConversations as conversation}<option value={conversation.id}>{conversation.title || 'Untitled conversation'}</option>{/each}
+							</select>
+						</div>
 						<div class="flex min-w-0 items-center gap-2 rounded-lg border border-border bg-secondary px-2.5 py-1.5">
 								{#if selectedAgentObj}
 									<span class="flex h-5 w-5 items-center justify-center rounded bg-muted text-[10px] font-semibold">{harnessMark(selectedAgentObj.backend)}</span>
@@ -336,7 +421,7 @@
 									aria-label={primaryAgentRole ? `Agent role ${primaryAgentRole}` : 'Agent'}
 									class="min-w-0 max-w-28 cursor-pointer bg-transparent text-xs text-foreground focus:outline-none sm:max-w-40"
 								>
-									{#each agentList as agent}
+									{#each projectAgents as agent}
 										<option value={agent.id}>
 											{agent.title || agent.name}
 										</option>
@@ -369,9 +454,11 @@
 			</div>
 			{#if selectedWorkflow && imageAttachments.length > 0}
 				<p class="text-center text-xs text-amber-600">Workflow runs currently accept text input only. Remove the attachments or choose No workflow.</p>
+			{:else if selectedConversation && imageAttachments.length > 0}
+				<p class="text-center text-xs text-amber-600">Put files in the conversation before creating linked work, or choose Private task.</p>
 			{/if}
 			{#if sendError}<p class="text-center text-sm text-destructive">{sendError}</p>{/if}
-			<div class="text-center"><a href="/agents" class="text-xs text-muted-foreground hover:text-foreground hover:underline">Manage agents</a></div>
+			<div class="text-center"><a href="/projects" class="text-xs text-muted-foreground hover:text-foreground hover:underline">Manage projects, conversations, and Agents</a></div>
 			{/if}
 		</div>
 	</div>

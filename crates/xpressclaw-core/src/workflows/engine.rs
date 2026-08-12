@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::agents::registry::AgentRegistry;
+use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::tasks::board::{CreateTask, TaskBoard};
@@ -18,7 +19,7 @@ use super::context;
 use super::definition::{
     parse_wait_duration, Step, WorkflowDefinition, WorkflowInputType, WorkflowTrigger,
 };
-use super::instance::{InstanceManager, StepExecution, WorkflowInstance};
+use super::instance::{InstanceManager, StepExecution, WorkflowInstance, WorkflowInstanceScope};
 use super::manager::WorkflowManager;
 use super::waits::{activity_cursor_from_parts, validate_resource, WaitState};
 
@@ -58,6 +59,12 @@ pub struct WorkflowEngine {
     instances: InstanceManager,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowContext {
+    pub project_id: Option<String>,
+    pub conversation_id: Option<String>,
+}
+
 impl WorkflowEngine {
     pub fn new(db: Arc<Database>) -> Self {
         let manager = WorkflowManager::new(db.clone());
@@ -73,20 +80,156 @@ impl WorkflowEngine {
     ///
     /// Returns the instance ID.
     pub fn start_instance(&self, workflow_id: &str, trigger_data: Value) -> Result<String> {
+        self.start_instance_in_context(workflow_id, trigger_data, WorkflowContext::default())
+    }
+
+    pub fn start_instance_in_context(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner(workflow_id, trigger_data, workflow_context, None)
+    }
+
+    pub fn start_instance_in_context_for_conversation_agent(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: &str,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            Some(creator_agent_id),
+        )
+    }
+
+    /// Start a Conversation-scoped workflow and publish its durable lifecycle
+    /// message in the same write transaction as the workflow instance. The
+    /// first workflow step is not dispatched until both records are durable.
+    pub fn start_instance_in_context_with_conversation_message(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
+        message: &SendMessage,
+    ) -> Result<(String, ConversationMessage)> {
+        let conversation_id = workflow_context.conversation_id.clone().ok_or_else(|| {
+            Error::Conversation("workflow message requires a conversation".into())
+        })?;
+        self.start_instance_in_context_inner_with(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            creator_agent_id,
+            |transaction, instance_id| {
+                let metadata = serde_json::json!({
+                    "workflow_id": workflow_id,
+                    "instance_id": instance_id,
+                });
+                ConversationManager::insert_structured_message(
+                    transaction,
+                    &conversation_id,
+                    message,
+                    None,
+                    Some(&metadata),
+                    &[],
+                )
+                .map(|(message, _)| message)
+            },
+        )
+    }
+
+    fn start_instance_in_context_inner(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
+    ) -> Result<String> {
+        self.start_instance_in_context_inner_with(
+            workflow_id,
+            trigger_data,
+            workflow_context,
+            creator_agent_id,
+            |_, _| Ok(()),
+        )
+        .map(|(instance_id, ())| instance_id)
+    }
+
+    fn start_instance_in_context_inner_with<T, F>(
+        &self,
+        workflow_id: &str,
+        trigger_data: Value,
+        mut workflow_context: WorkflowContext,
+        creator_agent_id: Option<&str>,
+        after_instance_insert: F,
+    ) -> Result<(String, T)>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
+    {
         let record = self.manager.get(workflow_id)?;
         let definition = WorkflowDefinition::parse(&record.yaml_content)?;
         let trigger_data = definition.resolve_inputs(&trigger_data)?;
+        if let Some(conversation_id) = workflow_context.conversation_id.as_deref() {
+            let conversation_project = self.db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conversation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|_| Error::Workflow(format!("conversation '{conversation_id}' not found")))
+            })?;
+            if let (Some(requested), Some(actual)) = (
+                workflow_context.project_id.as_deref(),
+                conversation_project.as_deref(),
+            ) {
+                if requested != actual {
+                    return Err(Error::Workflow(format!(
+                        "conversation '{conversation_id}' belongs to project '{actual}', not '{requested}'"
+                    )));
+                }
+            }
+            if workflow_context.project_id.is_none() {
+                workflow_context.project_id = conversation_project;
+            }
+        }
+        if let Some(project_id) = workflow_context.project_id.as_deref() {
+            let exists = self.db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                    [project_id],
+                    |row| row.get::<_, bool>(0),
+                )
+            })?;
+            if !exists {
+                return Err(Error::Workflow(format!("project '{project_id}' not found")));
+            }
+        }
         let registry = AgentRegistry::new(self.db.clone());
+        let mut workflow_agent_inputs = Vec::new();
         for (name, input) in &definition.inputs {
             if input.input_type != WorkflowInputType::Agent {
                 continue;
             }
             if let Some(agent_id) = trigger_data.get(name).and_then(Value::as_str) {
-                registry.get(agent_id).map_err(|_| {
+                workflow_agent_inputs.push((name.clone(), agent_id.to_string()));
+                let agent = registry.get(agent_id).map_err(|_| {
                     Error::Workflow(format!(
                         "workflow agent input '{name}' references unknown agent '{agent_id}'"
                     ))
                 })?;
+                if let Some(project_id) = workflow_context.project_id.as_deref() {
+                    if agent.project_id.as_deref() != Some(project_id) {
+                        return Err(Error::Workflow(format!(
+                            "workflow agent input '{name}' references Agent '{agent_id}' outside project '{project_id}'"
+                        )));
+                    }
+                }
             }
         }
 
@@ -103,12 +246,21 @@ impl WorkflowEngine {
             )
         };
 
-        let instance = self.instances.create_instance_with_definition(
-            workflow_id,
-            Some(&trigger_json),
-            vars_json.as_deref(),
-            Some(&record.yaml_content),
-        )?;
+        let (instance, after_instance_insert) = self
+            .instances
+            .create_instance_with_definition_in_context_and_then(
+                workflow_id,
+                Some(&trigger_json),
+                vars_json.as_deref(),
+                Some(&record.yaml_content),
+                WorkflowInstanceScope {
+                    project_id: workflow_context.project_id.as_deref(),
+                    conversation_id: workflow_context.conversation_id.as_deref(),
+                    creator_agent_id,
+                    workflow_agent_inputs: &workflow_agent_inputs,
+                },
+                after_instance_insert,
+            )?;
 
         info!(
             workflow_id,
@@ -146,7 +298,7 @@ impl WorkflowEngine {
             &var_store,
         )?;
 
-        Ok(instance.id)
+        Ok((instance.id, after_instance_insert))
     }
 
     /// Execute a step at the given position.
@@ -315,6 +467,23 @@ impl WorkflowEngine {
         ctx: &Value,
     ) -> Result<PreparedTaskStep> {
         let agent_id = self.resolve_step_agent(step, ctx)?;
+        let workflow_context = self.instances.get_instance(instance_id)?;
+        if let Some(project_id) = workflow_context.project_id.as_deref() {
+            let belongs = self.db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2)",
+                    rusqlite::params![agent_id, project_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            });
+            if !belongs {
+                return Err(Error::Workflow(format!(
+                    "workflow step '{}' uses Agent '{}' outside project '{}'",
+                    step.id, agent_id, project_id
+                )));
+            }
+        }
         let rendered_prompt = match &step.prompt {
             Some(tmpl) => context::render_template(tmpl, ctx),
             None => format!("Execute workflow step: {}", step.id),
@@ -405,7 +574,7 @@ impl WorkflowEngine {
             agent_id: Some(agent_id.clone()),
             parent_task_id: None,
             sop_id: step.procedure.clone(),
-            conversation_id: None,
+            conversation_id: workflow_context.conversation_id.clone(),
             priority: None,
             context: Some(serde_json::json!({
                 "origin": "workflow",
@@ -415,6 +584,8 @@ impl WorkflowEngine {
                 "step": step.id,
                 "session_mode": if step.new_session { "new" } else { "continue" },
                 "session_config": rendered_session_config,
+                "project_id": workflow_context.project_id,
+                "conversation_id": workflow_context.conversation_id,
             })),
         })?;
 
@@ -1993,6 +2164,256 @@ flows:
             )
             .unwrap_err();
         assert!(error.to_string().contains("unknown agent 'missing'"));
+    }
+
+    #[test]
+    fn conversation_workflows_adopt_and_enforce_the_project_boundary() {
+        let (db, engine) = setup();
+        let registry = AgentRegistry::new(db.clone());
+        registry.ensure("project-a", "codex").unwrap();
+        registry.ensure("project-b", "codex").unwrap();
+        let conversation = crate::conversations::ConversationManager::new(db.clone())
+            .create_in_project(
+                Some("project-a"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Launch".into()),
+                    icon: None,
+                    participant_ids: vec!["project-a".into()],
+                },
+            )
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: project-bound
+inputs:
+  worker: { type: agent, required: true, primary: true }
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@worker"
+        prompt: "Handle the conversation work"
+"#,
+        );
+
+        let instance_id = engine
+            .start_instance_in_context(
+                &workflow_id,
+                json!({"worker": "project-a"}),
+                WorkflowContext {
+                    project_id: None,
+                    conversation_id: Some(conversation.id.clone()),
+                },
+            )
+            .unwrap();
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.project_id.as_deref(), Some("project-a"));
+        assert_eq!(
+            instance.conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+        let execution = engine.instances.list_step_executions(&instance_id).unwrap()[0].clone();
+        let task = TaskBoard::new(db.clone())
+            .get(execution.task_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(task.project_id.as_deref(), Some("project-a"));
+        assert_eq!(
+            task.conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+
+        let error = engine
+            .start_instance_in_context(
+                &workflow_id,
+                json!({"worker": "project-b"}),
+                WorkflowContext {
+                    project_id: Some("project-a".into()),
+                    conversation_id: Some(conversation.id),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("outside project 'project-a'"));
+        assert_eq!(
+            engine
+                .instances
+                .list_instances(&workflow_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn agent_started_conversation_workflows_require_current_membership() {
+        let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
+        let conversations = crate::conversations::ConversationManager::new(db.clone());
+        let conversation = conversations
+            .create_in_project(
+                Some("project-a"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Launch".into()),
+                    icon: None,
+                    participant_ids: vec!["project-a".into()],
+                },
+            )
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: agent-started
+inputs:
+  worker: { type: agent, required: true, primary: true }
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@worker"
+        prompt: "Handle the conversation work"
+"#,
+        );
+        let context = || WorkflowContext {
+            project_id: Some("project-a".into()),
+            conversation_id: Some(conversation.id.clone()),
+        };
+
+        engine
+            .start_instance_in_context_for_conversation_agent(
+                &workflow_id,
+                json!({"worker": "project-a"}),
+                context(),
+                "project-a",
+            )
+            .unwrap();
+        conversations
+            .remove_participant(&conversation.id, "agent", "project-a")
+            .unwrap();
+        let before = engine
+            .instances
+            .list_instances(&workflow_id, 10)
+            .unwrap()
+            .len();
+
+        let rejected = engine.start_instance_in_context_for_conversation_agent(
+            &workflow_id,
+            json!({"worker": "project-a"}),
+            context(),
+            "project-a",
+        );
+        assert!(matches!(rejected, Err(Error::Conversation(_))));
+        assert_eq!(
+            engine
+                .instances
+                .list_instances(&workflow_id, 10)
+                .unwrap()
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn conversation_workflow_creation_rolls_back_if_publication_fails() {
+        let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
+        let conversation = crate::conversations::ConversationManager::new(db.clone())
+            .create_in_project(
+                Some("project-a"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Atomic workflow".into()),
+                    icon: None,
+                    participant_ids: vec!["project-a".into()],
+                },
+            )
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: atomic-conversation-workflow
+inputs:
+  worker: { type: agent, required: true, primary: true }
+flows:
+  main:
+    steps:
+      - id: work
+        agent: "@worker"
+        prompt: "Handle the conversation work"
+"#,
+        );
+        let context = || WorkflowContext {
+            project_id: Some("project-a".into()),
+            conversation_id: Some(conversation.id.clone()),
+        };
+        let message = SendMessage {
+            sender_type: "user".into(),
+            sender_id: "local".into(),
+            sender_name: Some("You".into()),
+            content: "Started workflow: Atomic workflow".into(),
+            message_type: Some("workflow".into()),
+        };
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_workflow_publication
+                 BEFORE INSERT ON conversation_messages
+                 WHEN NEW.message_type = 'workflow'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced workflow publication failure');
+                 END;",
+            )
+        })
+        .unwrap();
+
+        let failed = engine.start_instance_in_context_with_conversation_message(
+            &workflow_id,
+            json!({"worker": "project-a"}),
+            context(),
+            None,
+            &message,
+        );
+        assert!(failed.is_err());
+        let rolled_back = db
+            .with_conn(|conn| {
+                Ok::<_, Error>((
+                    conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM task_queue", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM conversation_messages", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(rolled_back, (0, 0, 0, 0));
+
+        db.with_conn(|conn| conn.execute_batch("DROP TRIGGER fail_workflow_publication"))
+            .unwrap();
+        let (instance_id, published) = engine
+            .start_instance_in_context_with_conversation_message(
+                &workflow_id,
+                json!({"worker": "project-a"}),
+                context(),
+                None,
+                &message,
+            )
+            .unwrap();
+        assert_eq!(published.metadata["workflow_id"], workflow_id);
+        assert_eq!(published.metadata["instance_id"], instance_id);
+        assert_eq!(
+            engine
+                .instances
+                .list_step_executions(&instance_id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

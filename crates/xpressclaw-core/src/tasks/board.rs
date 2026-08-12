@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -54,6 +55,7 @@ pub struct Task {
     pub parent_task_id: Option<String>,
     pub sop_id: Option<String>,
     pub conversation_id: Option<String>,
+    pub project_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -144,6 +146,52 @@ impl TaskBoard {
     }
 
     pub fn create(&self, req: &CreateTask) -> Result<Task> {
+        self.create_with_conversation_agent(req, None)
+    }
+
+    /// Create work requested by an Agent from one of its Conversations.
+    ///
+    /// The membership check shares the same immediate transaction as task
+    /// insertion. Participant removal therefore linearizes either before this
+    /// call (and rejects it) or after the task has already been created.
+    pub fn create_for_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: &str,
+    ) -> Result<Task> {
+        self.create_with_conversation_agent(req, Some(creator_agent_id))
+    }
+
+    fn create_with_conversation_agent(
+        &self,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<Task> {
+        let id = self.db.with_conn(|conn| {
+            // Reserve the writer before resolving any ownership inputs. Agent,
+            // Conversation, and parent-task moves must not be able to invalidate
+            // the Project boundary between validation and task insertion.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let id = Self::create_in_transaction(&transaction, req, creator_agent_id)?;
+            transaction.commit()?;
+            Ok::<_, Error>(id)
+        })?;
+
+        self.get(&id)
+    }
+
+    /// Insert a task while the caller owns the surrounding write transaction.
+    ///
+    /// Conversation work uses this to commit task creation, dispatch, and the
+    /// linked Conversation publication as one lifecycle operation.
+    pub(crate) fn create_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        req: &CreateTask,
+        creator_agent_id: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -151,30 +199,126 @@ impl TaskBoard {
             .to_string();
         let priority = req.priority.unwrap_or(0);
         let context_json = req.context.as_ref().map(|c| c.to_string());
+        let requested_project = req
+            .context
+            .as_ref()
+            .and_then(|context| context.get("project_id"))
+            .and_then(serde_json::Value::as_str);
 
-        {
-            let conn = self.db.conn();
-            conn.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                rusqlite::params![
-                    id,
-                    req.title,
-                    req.description,
-                    "pending",
-                    priority,
-                    req.agent_id,
-                    req.parent_task_id,
-                    req.sop_id,
-                    req.conversation_id,
-                    context_json,
-                    now,
-                    now,
-                ],
+        let conversation_project = if let Some(conversation_id) = req.conversation_id.as_deref() {
+            let project = transaction
+                .query_row(
+                    "SELECT project_id FROM conversations WHERE id = ?1",
+                    [conversation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            match project {
+                Some(project_id) => project_id,
+                None => {
+                    return Err(Error::ConversationNotFound {
+                        id: conversation_id.to_string(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(creator_agent_id) = creator_agent_id {
+            let conversation_id = req.conversation_id.as_deref().ok_or_else(|| {
+                Error::Conversation("an Agent may only create work from a conversation".into())
+            })?;
+            if req.agent_id.as_deref() != Some(creator_agent_id) {
+                return Err(Error::Conversation(
+                    "an Agent may only create a conversation task for itself".into(),
+                ));
+            }
+            let is_participant = transaction.query_row(
+                "SELECT EXISTS(
+                        SELECT 1 FROM conversation_participants
+                        WHERE conversation_id = ?1
+                          AND participant_type = 'agent'
+                          AND participant_id = ?2
+                    )",
+                rusqlite::params![conversation_id, creator_agent_id],
+                |row| row.get::<_, bool>(0),
             )?;
+            if !is_participant {
+                return Err(Error::Conversation(format!(
+                    "Agent '{creator_agent_id}' is not a participant in conversation '{conversation_id}'"
+                )));
+            }
         }
-
-        self.get(&id)
+        if let Some(project_id) = requested_project {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(Error::ProjectNotFound {
+                    id: project_id.to_string(),
+                });
+            }
+        }
+        let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
+            transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+        } else {
+            None
+        };
+        let parent_project = if let Some(parent_task_id) = req.parent_task_id.as_deref() {
+            transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [parent_task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: parent_task_id.to_string(),
+                })?
+        } else {
+            None
+        };
+        let requested_project = requested_project.map(str::to_string);
+        let project_id = consistent_project_id([
+            ("conversation", conversation_project.as_deref()),
+            ("request", requested_project.as_deref()),
+            ("Agent", agent_project.as_deref()),
+            ("parent task", parent_project.as_deref()),
+        ])?;
+        if req.parent_task_id.is_some() && parent_project.is_none() && project_id.is_some() {
+            return Err(Error::Task(
+                "a task in a Project cannot be added beneath a projectless parent task".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO tasks (id, title, description, status, priority, agent_id, parent_task_id, sop_id, conversation_id, context, created_at, updated_at, project_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id,
+                req.title,
+                req.description,
+                "pending",
+                priority,
+                req.agent_id,
+                req.parent_task_id,
+                req.sop_id,
+                req.conversation_id,
+                context_json,
+                now,
+                now,
+                project_id,
+            ],
+        )?;
+        Ok(id)
     }
 
     /// Create a hidden single-turn idle task for an agent (XCLAW-47).
@@ -189,8 +333,9 @@ impl TaskBoard {
         {
             let conn = self.db.conn();
             conn.execute(
-                "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6)",
+                "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at, project_id)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6,
+                         (SELECT project_id FROM agents WHERE id = ?4))",
                 rusqlite::params![id, title, description, agent_id, now, now],
             )?;
         }
@@ -211,11 +356,72 @@ impl TaskBoard {
 
     pub fn set_conversation_id(&self, task_id: &str, conversation_id: &str) -> Result<()> {
         let conn = self.db.conn();
-        conn.execute(
-            "UPDATE tasks SET conversation_id = ?1, updated_at = datetime('now') WHERE id = ?2",
-            rusqlite::params![conversation_id, task_id],
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let conversation_project = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conversation_id.to_string(),
+            })?
+            .ok_or_else(|| {
+                Error::Conversation(format!(
+                    "conversation '{conversation_id}' is not assigned to a project"
+                ))
+            })?;
+        let (task_project, agent_project) = transaction
+            .query_row(
+                "SELECT tasks.project_id, agents.project_id
+                 FROM tasks
+                 LEFT JOIN agents ON agents.id = tasks.agent_id
+                 WHERE tasks.id = ?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| Error::TaskNotFound {
+                id: task_id.to_string(),
+            })?;
+        let project_id = consistent_project_id([
+            ("conversation", Some(conversation_project.as_str())),
+            ("task", task_project.as_deref()),
+            ("Agent", agent_project.as_deref()),
+        ])?
+        .expect("the conversation always supplies a project");
+        ensure_task_hierarchy_project(&transaction, task_id, &project_id)?;
+
+        transaction.execute(
+            "UPDATE tasks
+             SET conversation_id = ?1,
+                 project_id = ?2,
+                 updated_at = datetime('now')
+             WHERE id = ?3",
+            rusqlite::params![conversation_id, project_id, task_id],
         )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn project_id(&self, task_id: &str) -> Result<Option<String>> {
+        self.db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| Error::TaskNotFound {
+                id: task_id.to_string(),
+            })
+        })
     }
 
     pub fn list(
@@ -236,6 +442,39 @@ impl TaskBoard {
             false,
             TaskListOrder::Scheduler,
         )
+    }
+
+    /// List visible tasks linked to a conversation, newest first.
+    pub fn list_for_conversation(&self, conversation_id: &str) -> Result<Vec<Task>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks WHERE conversation_id = ?1 AND hidden = 0
+                 ORDER BY created_at DESC",
+            )?;
+            let mut rows = statement.query([conversation_id])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })
+    }
+
+    /// List visible top-level tasks owned by a project, newest first.
+    pub fn list_for_project(&self, project_id: &str, limit: i64) -> Result<Vec<Task>> {
+        self.db.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT * FROM tasks
+                 WHERE project_id = ?1 AND hidden = 0 AND parent_task_id IS NULL
+                 ORDER BY updated_at DESC, created_at DESC LIMIT ?2",
+            )?;
+            let mut rows = statement.query(rusqlite::params![project_id, limit])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(row_to_task(row)?);
+            }
+            Ok(tasks)
+        })
     }
 
     /// List a page of scheduler-ordered tasks matching any supplied status.
@@ -445,7 +684,10 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Verify task exists
             let exists: bool = transaction.query_row(
@@ -484,6 +726,7 @@ impl TaskBoard {
             // Set agent_id if transitioning to in_progress
             if parsed == TaskStatus::InProgress {
                 if let Some(aid) = agent_id {
+                    ensure_task_agent_project(&transaction, task_id, aid)?;
                     let previous = synchronize_pull_request_agent(
                         &transaction,
                         task_id,
@@ -525,7 +768,10 @@ impl TaskBoard {
 
         {
             let conn = self.db.conn();
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
 
             // Verify task exists
             let exists: bool = transaction.query_row(
@@ -555,6 +801,7 @@ impl TaskBoard {
             }
 
             if let Some(ref agent_id) = req.agent_id {
+                ensure_task_agent_project(&transaction, task_id, agent_id)?;
                 let previous = synchronize_pull_request_agent(
                     &transaction,
                     task_id,
@@ -608,14 +855,27 @@ impl TaskBoard {
         attempt_id: &str,
         items: &[ReportedSubtask],
     ) -> Result<Vec<Task>> {
-        self.get(parent_task_id)?;
         let now = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
         self.db.with_conn(|conn| {
-            let mut stmt = conn.prepare(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let parent_project = transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [parent_task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: parent_task_id.to_string(),
+                })?;
+            let mut stmt = transaction.prepare(
                 "SELECT id, context FROM tasks WHERE parent_task_id = ?1 ORDER BY created_at ASC",
             )?;
             let existing: Vec<(String, usize)> = stmt
@@ -646,25 +906,26 @@ impl TaskBoard {
                 })
                 .to_string();
                 if let Some((id, _)) = existing.iter().find(|(_, current)| *current == index) {
-                    conn.execute(
+                    transaction.execute(
                         "UPDATE tasks SET title = ?1, status = ?2, updated_at = ?3,
-                            completed_at = ?4, context = ?5 WHERE id = ?6",
+                            completed_at = ?4, context = ?5, project_id = ?6 WHERE id = ?7",
                         rusqlite::params![
                             item.title,
                             item.status.as_str(),
                             now,
                             completed_at,
                             context,
+                            parent_project,
                             id,
                         ],
                     )?;
                 } else {
                     let id = Uuid::new_v4().to_string();
-                    conn.execute(
+                    transaction.execute(
                         "INSERT INTO tasks
                             (id, title, status, priority, parent_task_id, context,
-                             created_at, updated_at, completed_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
+                             created_at, updated_at, completed_at, project_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
                         rusqlite::params![
                             id,
                             item.title,
@@ -674,6 +935,7 @@ impl TaskBoard {
                             context,
                             now,
                             completed_at,
+                            parent_project,
                         ],
                     )?;
                 }
@@ -681,9 +943,10 @@ impl TaskBoard {
 
             for (id, index) in existing {
                 if index >= items.len() {
-                    conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+                    transaction.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
                 }
             }
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
 
@@ -1036,6 +1299,129 @@ impl TaskBoard {
     }
 }
 
+fn consistent_project_id<const N: usize>(
+    candidates: [(&str, Option<&str>); N],
+) -> Result<Option<String>> {
+    let mut selected: Option<(&str, &str)> = None;
+    for (label, project_id) in candidates {
+        let Some(project_id) = project_id else {
+            continue;
+        };
+        if let Some((selected_label, selected_project_id)) = selected {
+            if selected_project_id != project_id {
+                return Err(Error::Task(format!(
+                    "task {label} belongs to project '{project_id}', but its {selected_label} belongs to project '{selected_project_id}'"
+                )));
+            }
+        } else {
+            selected = Some((label, project_id));
+        }
+    }
+    Ok(selected.map(|(_, project_id)| project_id.to_string()))
+}
+
+fn ensure_task_agent_project(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let task_project = conn.query_row(
+        "SELECT project_id FROM tasks WHERE id = ?1",
+        [task_id],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    let agent_project = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let project_id = consistent_project_id([
+        ("task", task_project.as_deref()),
+        ("Agent", agent_project.as_deref()),
+    ])?;
+    if let Some(project_id) = project_id {
+        ensure_task_hierarchy_project(conn, task_id, &project_id)?;
+    }
+    Ok(())
+}
+
+/// Adopt an otherwise-projectless parent/child component into one Project.
+///
+/// Project assignment is an invariant of the complete task hierarchy rather
+/// than one row. Callers hold an IMMEDIATE transaction, so validation and the
+/// null-only adoption cannot race another hierarchy mutation. Any existing
+/// conflicting scope fails closed without changing part of the tree.
+fn ensure_task_hierarchy_project(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let has_conflicting_scope: bool = conn.query_row(
+        "WITH RECURSIVE
+         task_links(origin_id, linked_id) AS (
+             SELECT id, parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL
+             UNION
+             SELECT parent_task_id, id FROM tasks WHERE parent_task_id IS NOT NULL
+         ),
+         hierarchy(id) AS (
+             SELECT ?1
+             UNION
+             SELECT task_links.linked_id
+             FROM hierarchy
+             JOIN task_links ON task_links.origin_id = hierarchy.id
+         )
+         SELECT EXISTS(
+             SELECT 1
+             FROM tasks
+             JOIN hierarchy ON hierarchy.id = tasks.id
+             WHERE (tasks.project_id IS NOT NULL AND tasks.project_id <> ?2)
+                OR EXISTS (
+                    SELECT 1 FROM agents
+                    WHERE agents.id = tasks.agent_id
+                      AND agents.project_id IS NOT NULL
+                      AND agents.project_id <> ?2
+                )
+                OR EXISTS (
+                    SELECT 1 FROM conversations
+                    WHERE conversations.id = tasks.conversation_id
+                      AND conversations.project_id IS NOT NULL
+                      AND conversations.project_id <> ?2
+                )
+         )",
+        rusqlite::params![task_id, project_id],
+        |row| row.get(0),
+    )?;
+    if has_conflicting_scope {
+        return Err(Error::Task(format!(
+            "task hierarchy cannot be assigned to project '{project_id}' because part of it belongs to another project"
+        )));
+    }
+
+    conn.execute(
+        "WITH RECURSIVE
+         task_links(origin_id, linked_id) AS (
+             SELECT id, parent_task_id FROM tasks WHERE parent_task_id IS NOT NULL
+             UNION
+             SELECT parent_task_id, id FROM tasks WHERE parent_task_id IS NOT NULL
+         ),
+         hierarchy(id) AS (
+             SELECT ?1
+             UNION
+             SELECT task_links.linked_id
+             FROM hierarchy
+             JOIN task_links ON task_links.origin_id = hierarchy.id
+         )
+         UPDATE tasks
+         SET project_id = ?2
+         WHERE project_id IS NULL AND id IN (SELECT id FROM hierarchy)",
+        rusqlite::params![task_id, project_id],
+    )?;
+    Ok(())
+}
+
 fn synchronize_pull_request_agent(
     conn: &rusqlite::Connection,
     task_id: &str,
@@ -1281,6 +1667,7 @@ fn row_to_task(row: &rusqlite::Row) -> Result<Task> {
         parent_task_id: row.get("parent_task_id")?,
         sop_id: row.get("sop_id")?,
         conversation_id: row.get("conversation_id").unwrap_or(None),
+        project_id: row.get("project_id").unwrap_or(None),
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
@@ -1324,6 +1711,320 @@ mod tests {
 
         let fetched = board.get(&task.id).unwrap();
         assert_eq!(fetched.id, task.id);
+    }
+
+    #[test]
+    fn tasks_preserve_their_project_boundary() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one'),
+                        ('other', 'Other', 'native', '{}', 'two');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('launch', 'Launch', 'one');",
+            )
+        })
+        .unwrap();
+
+        let task = board
+            .create(&CreateTask {
+                title: "Ship it".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some("launch".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(task.project_id.as_deref(), Some("one"));
+
+        let mismatch = board.create(&CreateTask {
+            title: "Wrong project".into(),
+            agent_id: Some("other".into()),
+            conversation_id: Some("launch".into()),
+            ..Default::default()
+        });
+        assert!(matches!(mismatch, Err(Error::Task(_))));
+
+        let reassignment = board.update(
+            &task.id,
+            &UpdateTask {
+                title: None,
+                description: None,
+                agent_id: Some("other".into()),
+                priority: None,
+            },
+        );
+        assert!(matches!(reassignment, Err(Error::Task(_))));
+
+        let detached = board
+            .create(&CreateTask {
+                title: "Adopt the conversation project".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        board.set_conversation_id(&detached.id, "launch").unwrap();
+        let detached = board.get(&detached.id).unwrap();
+        assert_eq!(detached.conversation_id.as_deref(), Some("launch"));
+        assert_eq!(detached.project_id.as_deref(), Some("one"));
+
+        let legacy_parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let legacy_child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(legacy_parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .set_conversation_id(&legacy_child.id, "launch")
+            .unwrap();
+        assert_eq!(
+            board.get(&legacy_parent.id).unwrap().project_id.as_deref(),
+            Some("one")
+        );
+        assert_eq!(
+            board.get(&legacy_child.id).unwrap().project_id.as_deref(),
+            Some("one")
+        );
+
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('other-launch', 'Other launch', 'two')",
+                [],
+            )
+        })
+        .unwrap();
+        let mismatch = board.set_conversation_id(&task.id, "other-launch");
+        assert!(matches!(mismatch, Err(Error::Task(_))));
+        assert_eq!(
+            board.get(&task.id).unwrap().conversation_id.as_deref(),
+            Some("launch")
+        );
+        assert!(matches!(
+            board.set_conversation_id(&task.id, "missing"),
+            Err(Error::ConversationNotFound { .. })
+        ));
+        assert!(matches!(
+            board.set_conversation_id("missing", "launch"),
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn agent_created_conversation_tasks_require_current_membership() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('launch', 'Launch', 'one');
+                 INSERT INTO conversation_participants
+                 (conversation_id, participant_type, participant_id)
+                 VALUES ('launch', 'agent', 'atlas');",
+            )
+        })
+        .unwrap();
+
+        board
+            .create_for_conversation_agent(
+                &CreateTask {
+                    title: "Authorized work".into(),
+                    agent_id: Some("atlas".into()),
+                    conversation_id: Some("launch".into()),
+                    ..Default::default()
+                },
+                "atlas",
+            )
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM conversation_participants
+                 WHERE conversation_id = 'launch' AND participant_id = 'atlas'",
+                [],
+            )
+        })
+        .unwrap();
+
+        let rejected = board.create_for_conversation_agent(
+            &CreateTask {
+                title: "Stale work".into(),
+                agent_id: Some("atlas".into()),
+                conversation_id: Some("launch".into()),
+                ..Default::default()
+            },
+            "atlas",
+        );
+        assert!(matches!(rejected, Err(Error::Conversation(_))));
+        assert_eq!(board.list_for_conversation("launch").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn child_tasks_inherit_their_parent_project() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute("INSERT INTO projects (id, name) VALUES ('one', 'One')", [])
+        })
+        .unwrap();
+        let parent = board
+            .create(&CreateTask {
+                title: "Parent".into(),
+                context: Some(serde_json::json!({ "project_id": "one" })),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Child".into(),
+                parent_task_id: Some(parent.id),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(child.project_id.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn projectless_parent_rejects_a_newly_scoped_child() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(parent.project_id.is_none());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
+
+        let error = board
+            .create(&CreateTask {
+                title: "Scoped child".into(),
+                agent_id: Some("atlas".into()),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("projectless parent task"));
+        assert!(board.list_subtasks(&parent.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_assignment_adopts_the_complete_projectless_hierarchy() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let grandchild = board
+            .create(&CreateTask {
+                title: "Legacy grandchild".into(),
+                parent_task_id: Some(child.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let unrelated = board
+            .create(&CreateTask {
+                title: "Unrelated".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
+
+        board
+            .update(
+                &child.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("atlas".into()),
+                    priority: None,
+                },
+            )
+            .unwrap();
+
+        for task_id in [&parent.id, &child.id, &grandchild.id] {
+            assert_eq!(
+                board.get(task_id).unwrap().project_id.as_deref(),
+                Some("one")
+            );
+        }
+        assert!(board.get(&unrelated.id).unwrap().project_id.is_none());
+    }
+
+    #[test]
+    fn agent_assignment_rejects_a_conflicting_hierarchy_atomically() {
+        let (db, board) = setup();
+        let parent = board
+            .create(&CreateTask {
+                title: "Legacy parent".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let child = board
+            .create(&CreateTask {
+                title: "Legacy child".into(),
+                parent_task_id: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'one');",
+            )?;
+            conn.execute(
+                "UPDATE tasks SET project_id = 'two' WHERE id = ?1",
+                [&child.id],
+            )
+        })
+        .unwrap();
+
+        let error = board
+            .update_status(&parent.id, "in_progress", Some("atlas"))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("part of it belongs to another project"));
+        let parent = board.get(&parent.id).unwrap();
+        assert_eq!(parent.status, TaskStatus::Pending);
+        assert!(parent.agent_id.is_none());
+        assert!(parent.project_id.is_none());
+        assert_eq!(
+            board.get(&child.id).unwrap().project_id.as_deref(),
+            Some("two")
+        );
     }
 
     #[test]
@@ -1603,7 +2304,15 @@ mod tests {
 
     #[test]
     fn syncs_native_plan_steps_and_rolls_up_completion() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('developer', 'Developer', 'native', '{}', 'one');",
+            )
+        })
+        .unwrap();
         let parent = board
             .create(&CreateTask {
                 title: "Implement feature".to_string(),
@@ -1634,7 +2343,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(initial.len(), 2);
+        assert!(initial
+            .iter()
+            .all(|task| task.project_id.as_deref() == Some("one")));
         assert!(!board.subtasks_complete(&parent.id).unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET project_id = NULL WHERE id = ?1",
+                [&initial[0].id],
+            )
+        })
+        .unwrap();
 
         let updated = board
             .sync_reported_subtasks(
@@ -1654,6 +2373,9 @@ mod tests {
             .unwrap();
         assert_eq!(updated.len(), 2);
         assert_eq!(updated[1].title, "Run the full test suite");
+        assert!(updated
+            .iter()
+            .all(|task| task.project_id.as_deref() == Some("one")));
         assert!(board.subtasks_complete(&parent.id).unwrap());
 
         let completed = board

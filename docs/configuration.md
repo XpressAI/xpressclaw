@@ -102,7 +102,7 @@ the configured product when an older file is loaded.
 
 Codex starts in its `agent-full-access` mode by default. This disables Codex's
 nested filesystem sandbox and approval prompts **inside the Agent's retained
-project container**; Docker or Podman remains the security boundary, and the
+container**; Docker or Podman remains the security boundary, and the
 host container engine remains unavailable unless `container_engine: host` is
 explicitly selected. Set `runner.environment.INITIAL_AGENT_MODE` to another
 Codex ACP mode (for example, `agent`) when a project needs the additional inner

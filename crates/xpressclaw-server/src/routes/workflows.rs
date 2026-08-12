@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use xpressclaw_core::workflows::definition::WorkflowDefinition;
-use xpressclaw_core::workflows::engine::WorkflowEngine;
+use xpressclaw_core::workflows::engine::{WorkflowContext, WorkflowEngine};
 use xpressclaw_core::workflows::instance::InstanceManager;
 use xpressclaw_core::workflows::manager::{CreateWorkflow, WorkflowManager};
 use xpressclaw_core::workflows::waits::WaitState;
@@ -147,6 +147,7 @@ async fn disable_workflow(
 async fn run_workflow(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(context): Query<RunWorkflowContext>,
     Json(trigger_data): Json<Value>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = WorkflowManager::new(state.db.clone());
@@ -157,7 +158,14 @@ async fn run_workflow(
     reject_connector_execution(&record.yaml_content)?;
     let engine = WorkflowEngine::new(state.db.clone());
     let instance_id = engine
-        .start_instance(&id, trigger_data)
+        .start_instance_in_context(
+            &id,
+            trigger_data,
+            WorkflowContext {
+                project_id: context.project_id,
+                conversation_id: None,
+            },
+        )
         .map_err(|e| match &e {
             xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&e),
             xpressclaw_core::error::Error::Workflow(_) => bad_request(&e),
@@ -177,6 +185,11 @@ async fn run_workflow(
         object.insert("current_task_id".into(), json!(current_task_id));
     }
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[derive(Default, Deserialize)]
+struct RunWorkflowContext {
+    project_id: Option<String>,
 }
 
 async fn list_instances(

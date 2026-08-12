@@ -26,6 +26,8 @@
 	let isAddSession = $derived(
 		['add-session', 'add-agent'].includes($page.url.searchParams.get('mode') ?? '')
 	);
+	let targetProjectId = $derived($page.url.searchParams.get('project_id')?.trim() || '');
+	let cancelPath = $derived(targetProjectId ? `/projects/${encodeURIComponent(targetProjectId)}` : '/agents');
 	let agentCatalog = $state<AcpAgentCatalogEntry[]>([]);
 	let agentCatalogLoading = $state(true);
 	let runnerOptions = $derived([...agentCatalog, customRunner]);
@@ -209,6 +211,7 @@
 		saveError = '';
 
 		const session = {
+			project_id: targetProjectId || undefined,
 			backend: runnerKind,
 			runner_kind: runnerKind,
 			runner_image: runnerImage.trim(),
@@ -257,7 +260,7 @@
 		{#if isAddSession}
 			<button
 				type="button"
-				onclick={() => goto('/agents')}
+				onclick={() => goto(cancelPath)}
 				aria-label="Cancel"
 				class="ml-4 rounded-md p-2 text-xl leading-none text-muted-foreground hover:bg-accent hover:text-foreground"
 			>&times;</button>
@@ -591,7 +594,7 @@
 
 		<div class="flex items-center justify-between border-t border-border pt-5">
 			{#if isAddSession}
-				<button type="button" onclick={() => goto('/agents')} class="rounded-lg px-4 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground">Cancel</button>
+				<button type="button" onclick={() => goto(cancelPath)} class="rounded-lg px-4 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-foreground">Cancel</button>
 			{:else}
 				<span class="text-xs text-muted-foreground">No API key required when using a subscription login.</span>
 			{/if}

@@ -10,7 +10,7 @@
 		<div class="mb-8 text-center">
 			<img src="/icon.png" alt="xpressclaw" class="mx-auto mb-4 h-12 w-12 rounded-xl" />
 			<h1 class="text-2xl font-bold text-foreground">Set up xpressclaw</h1>
-			<p class="mt-1 text-sm text-muted-foreground">Give a durable agent context a workspace and ACP harness</p>
+			<p class="mt-1 text-sm text-muted-foreground">Give an Agent a workspace and ACP harness</p>
 		</div>
 
 		{@render children()}

@@ -34,15 +34,17 @@ and other local Git operations. Use the MCP tool for pull requests, checks, \
 Actions, issues, and review threads. Repository selection and authentication \
 are already fixed by XpressClaw.";
 const GITHUB_REVIEW_LIFECYCLE_INSTRUCTIONS: &str = "\
-For ordinary XpressClaw tasks, a pull request that is ready for a person to \
-review must be published as ready for review, not left as a draft. This \
-instruction overrides generic publishing guidance that defaults to draft pull \
-requests. After publishing, do not declare the task complete: XpressClaw keeps \
-the task active and will resume this same conversation when review feedback \
-arrives. Address every actionable review comment, reply and resolve threads \
-after the corresponding fix is pushed, keep CI green, and leave the pull \
-request ready for review. XpressClaw completes the task only after approval or \
-merge.";
+For ordinary XpressClaw tasks where the attached GitHub tool advertises its \
+managed review lifecycle, a pull request that is ready for a person to review \
+must be published as ready for review, not left as a draft. This instruction \
+overrides generic publishing guidance that defaults to draft pull requests. \
+After publishing, do not declare the task complete: XpressClaw keeps the task \
+active and will resume this same conversation when review feedback arrives. \
+Address every actionable review comment, reply and resolve threads after the \
+corresponding fix is pushed, keep CI green, and leave the pull request ready \
+for review. XpressClaw completes the task only after approval or merge. This \
+managed lifecycle does not apply to Conversation chat lanes or workflow tasks \
+whose GitHub tool does not advertise it.";
 
 #[derive(Debug, Clone)]
 pub struct GithubTaskContext {

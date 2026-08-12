@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 
@@ -6,6 +7,7 @@ use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
+use crate::conversations::runtime::ConversationTurnQueue;
 use crate::error::{Error, Result};
 
 /// Register sqlite-vec as an auto-extension. Must be called before opening connections.
@@ -150,52 +152,39 @@ impl Database {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        let migrations: &[(u32, &str)] = &[
-            (1, MIGRATION_V1),
-            (2, MIGRATION_V2),
-            (3, MIGRATION_V3),
-            (4, MIGRATION_V4),
-            (5, MIGRATION_V5),
-            (6, MIGRATION_V6),
-            (7, MIGRATION_V7),
-            (8, MIGRATION_V8),
-            (9, MIGRATION_V9),
-            (10, MIGRATION_V10),
-            (11, MIGRATION_V11),
-            (12, MIGRATION_V12),
-            (13, MIGRATION_V13),
-            (14, MIGRATION_V14),
-            (15, MIGRATION_V15),
-            (16, MIGRATION_V16),
-            (17, MIGRATION_V17),
-            (18, MIGRATION_V18),
-            (19, MIGRATION_V19),
-            (20, MIGRATION_V20),
-            (21, MIGRATION_V21),
-            (22, MIGRATION_V22),
-            (23, MIGRATION_V23),
-            (24, MIGRATION_V24),
-            (25, MIGRATION_V25),
-            (26, MIGRATION_V26),
-            (27, MIGRATION_V27),
-            (28, MIGRATION_V28),
-            (29, MIGRATION_V29),
-            (30, MIGRATION_V30),
-            (31, MIGRATION_V31),
-            (32, MIGRATION_V32),
-        ];
-
-        for &(target, sql) in migrations {
+        for &(target, sql) in schema_migrations() {
             if version < target {
-                conn.execute_batch(sql).map_err(|e| Error::Migration {
-                    version: target,
-                    message: e.to_string(),
-                })?;
+                let transaction = conn.unchecked_transaction()?;
+                transaction
+                    .execute_batch(sql)
+                    .map_err(|e| Error::Migration {
+                        version: target,
+                        message: e.to_string(),
+                    })?;
 
-                conn.execute(
+                if target == 33 {
+                    backfill_pending_conversation_turns(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
+                if target == 34 {
+                    consolidate_legacy_conversation_projects(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
+                transaction.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', ?1)",
                     [target.to_string()],
                 )?;
+                transaction.commit()?;
 
                 info!("applied migration v{target}");
             }
@@ -230,6 +219,381 @@ impl Database {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Move work committed by the retired background conversation processor into
+/// the durable per-Agent turn queue introduced by migration v33. Routing each
+/// legacy message in ID order preserves mention semantics and lets the queue
+/// coalesce each addressed Agent to the correct high-water message.
+fn backfill_pending_conversation_turns(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    // Participant identities were historically polymorphic and therefore did
+    // not have an Agent foreign key. Installations that deleted an Agent
+    // before durable turns were introduced can still contain stale rows. Drop
+    // those rows before routing legacy messages so the new Agent-owned turn
+    // foreign keys cannot make the migration fail at startup.
+    transaction.execute(
+        "DELETE FROM conversation_participants
+         WHERE participant_type = 'agent'
+           AND NOT EXISTS (
+               SELECT 1 FROM agents
+               WHERE agents.id = conversation_participants.participant_id
+           )",
+        [],
+    )?;
+
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT id, conversation_id, sender_id, content
+             FROM conversation_messages
+             WHERE sender_type = 'user' AND processed = 0
+             ORDER BY id ASC",
+        )?;
+        let pending = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        pending
+    };
+
+    for (message_id, conversation_id, sender_id, content) in pending {
+        ConversationTurnQueue::enqueue_for_message_in_transaction(
+            transaction,
+            &conversation_id,
+            message_id,
+            "user",
+            &sender_id,
+            &content,
+        )?;
+    }
+    transaction.execute(
+        "UPDATE conversation_messages
+         SET processed = 1
+         WHERE sender_type = 'user' AND processed = 0",
+        [],
+    )?;
+    Ok(())
+}
+
+struct LegacyComponents {
+    parents: Vec<usize>,
+    ranks: Vec<u8>,
+}
+
+impl LegacyComponents {
+    fn new(node_count: usize) -> Self {
+        Self {
+            parents: (0..node_count).collect(),
+            ranks: vec![0; node_count],
+        }
+    }
+
+    fn find(&mut self, node: usize) -> usize {
+        let parent = self.parents[node];
+        if parent != node {
+            self.parents[node] = self.find(parent);
+        }
+        self.parents[node]
+    }
+
+    fn union(&mut self, left: usize, right: usize) {
+        let mut left_root = self.find(left);
+        let mut right_root = self.find(right);
+        if left_root == right_root {
+            return;
+        }
+        if self.ranks[left_root] < self.ranks[right_root] {
+            std::mem::swap(&mut left_root, &mut right_root);
+        }
+        self.parents[right_root] = left_root;
+        if self.ranks[left_root] == self.ranks[right_root] {
+            self.ranks[left_root] += 1;
+        }
+    }
+}
+
+/// Before Projects existed, conversations and task hierarchies could contain
+/// several Agents. Migration v33 initially gives each Agent its own Project;
+/// merge every connected legacy collaboration component so the new Project
+/// invariants hold without losing conversations, tasks, or vector-indexed
+/// memory.
+fn consolidate_legacy_conversation_projects(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let agents = {
+        let mut statement = transaction.prepare("SELECT id, project_id FROM agents")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, Option<String>)>, _>>()?;
+        rows
+    };
+    let conversations = {
+        let mut statement = transaction.prepare("SELECT id, project_id FROM conversations")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, Option<String>)>, _>>()?;
+        rows
+    };
+    let tasks = {
+        let mut statement = transaction.prepare(
+            "SELECT id, agent_id, conversation_id, parent_task_id, project_id FROM tasks",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<
+                Vec<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )>,
+                _,
+            >>()?;
+        rows
+    };
+    let participants = {
+        let mut statement = transaction.prepare(
+            "SELECT participant.conversation_id, participant.participant_id
+             FROM conversation_participants participant
+             JOIN agents agent ON agent.id = participant.participant_id
+             WHERE participant.participant_type = 'agent'",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<(String, String)>, _>>()?;
+        rows
+    };
+
+    let conversation_offset = agents.len();
+    let task_offset = conversation_offset + conversations.len();
+    let mut components = LegacyComponents::new(task_offset + tasks.len());
+    let agent_indexes: HashMap<&str, usize> = agents
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), index))
+        .collect();
+    let conversation_indexes: HashMap<&str, usize> = conversations
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.as_str(), conversation_offset + index))
+        .collect();
+    let task_indexes: HashMap<&str, usize> = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, (id, ..))| (id.as_str(), task_offset + index))
+        .collect();
+
+    // Existing Project ownership is itself a collaboration edge. This also
+    // makes the source-to-target Project mapping unambiguous if an older
+    // migration attempt already attached several objects to one Project.
+    let mut project_anchors = HashMap::<String, usize>::new();
+    for (index, (_, project_id)) in agents.iter().enumerate() {
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+    for (index, (_, project_id)) in conversations.iter().enumerate() {
+        let index = conversation_offset + index;
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+    for (index, (_, _, _, _, project_id)) in tasks.iter().enumerate() {
+        let index = task_offset + index;
+        if let Some(project_id) = project_id {
+            if let Some(anchor) = project_anchors.get(project_id) {
+                components.union(index, *anchor);
+            } else {
+                project_anchors.insert(project_id.clone(), index);
+            }
+        }
+    }
+
+    for (conversation_id, agent_id) in &participants {
+        if let (Some(conversation), Some(agent)) = (
+            conversation_indexes.get(conversation_id.as_str()),
+            agent_indexes.get(agent_id.as_str()),
+        ) {
+            components.union(*conversation, *agent);
+        }
+    }
+    for (index, (_, agent_id, conversation_id, parent_task_id, _)) in tasks.iter().enumerate() {
+        let task = task_offset + index;
+        if let Some(agent) = agent_id
+            .as_deref()
+            .and_then(|agent_id| agent_indexes.get(agent_id))
+        {
+            components.union(task, *agent);
+        }
+        if let Some(conversation) = conversation_id
+            .as_deref()
+            .and_then(|conversation_id| conversation_indexes.get(conversation_id))
+        {
+            components.union(task, *conversation);
+        }
+        if let Some(parent) = parent_task_id
+            .as_deref()
+            .and_then(|parent_task_id| task_indexes.get(parent_task_id))
+        {
+            components.union(task, *parent);
+        }
+    }
+
+    // Prefer the lexicographically first Agent's Project, matching the old
+    // deterministic consolidation behavior. Components without an Agent keep
+    // their lexicographically first existing Project.
+    let mut component_targets = HashMap::<usize, (u8, String, String)>::new();
+    {
+        let mut consider_target = |node: usize, priority: u8, key: &str, project_id: &str| {
+            let root = components.find(node);
+            let candidate = (priority, key.to_string(), project_id.to_string());
+            if component_targets
+                .get(&root)
+                .is_none_or(|current| &candidate < current)
+            {
+                component_targets.insert(root, candidate);
+            }
+        };
+        for (index, (agent_id, project_id)) in agents.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(index, 0, agent_id, project_id);
+            }
+        }
+        for (index, (_, project_id)) in conversations.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(conversation_offset + index, 1, project_id, project_id);
+            }
+        }
+        for (index, (_, _, _, _, project_id)) in tasks.iter().enumerate() {
+            if let Some(project_id) = project_id {
+                consider_target(task_offset + index, 1, project_id, project_id);
+            }
+        }
+    }
+
+    fn record_project_target(
+        project_targets: &mut HashMap<String, String>,
+        source_project_id: Option<&String>,
+        target_project_id: &str,
+    ) -> Result<()> {
+        let Some(source_project_id) = source_project_id else {
+            return Ok(());
+        };
+        if let Some(existing) = project_targets.get(source_project_id) {
+            if existing != target_project_id {
+                return Err(Error::Database(format!(
+                    "legacy project {source_project_id} belongs to multiple collaboration components"
+                )));
+            }
+        } else {
+            project_targets.insert(source_project_id.clone(), target_project_id.to_string());
+        }
+        Ok(())
+    }
+
+    let mut project_targets = HashMap::<String, String>::new();
+    let mut agent_updates = Vec::<(String, String)>::new();
+    for (index, (agent_id, source_project_id)) in agents.iter().enumerate() {
+        let root = components.find(index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            agent_updates.push((agent_id.clone(), target_project_id.clone()));
+        }
+    }
+    let mut conversation_updates = Vec::<(String, String)>::new();
+    for (index, (conversation_id, source_project_id)) in conversations.iter().enumerate() {
+        let root = components.find(conversation_offset + index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            conversation_updates.push((conversation_id.clone(), target_project_id.clone()));
+        }
+    }
+    let mut task_updates = Vec::<(String, String)>::new();
+    for (index, (task_id, _, _, _, source_project_id)) in tasks.iter().enumerate() {
+        let root = components.find(task_offset + index);
+        if let Some((_, _, target_project_id)) = component_targets.get(&root) {
+            record_project_target(
+                &mut project_targets,
+                source_project_id.as_ref(),
+                target_project_id,
+            )?;
+            task_updates.push((task_id.clone(), target_project_id.clone()));
+        }
+    }
+
+    let mut project_moves = project_targets.into_iter().collect::<Vec<_>>();
+    project_moves.sort();
+    for (source_project_id, target_project_id) in project_moves {
+        if source_project_id != target_project_id {
+            crate::memory::project::move_project_memory(
+                transaction,
+                &source_project_id,
+                &target_project_id,
+            )?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE agents SET project_id = ?1 WHERE id = ?2")?;
+        for (agent_id, project_id) in agent_updates {
+            statement.execute(rusqlite::params![project_id, agent_id])?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE conversations SET project_id = ?1 WHERE id = ?2")?;
+        for (conversation_id, project_id) in conversation_updates {
+            statement.execute(rusqlite::params![project_id, conversation_id])?;
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("UPDATE tasks SET project_id = ?1 WHERE id = ?2")?;
+        for (task_id, project_id) in task_updates {
+            statement.execute(rusqlite::params![project_id, task_id])?;
+        }
+    }
+    transaction.execute(
+        "DELETE FROM projects
+         WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.project_id = projects.id)
+           AND NOT EXISTS (SELECT 1 FROM conversations WHERE conversations.project_id = projects.id)
+           AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.project_id = projects.id)
+           AND NOT EXISTS (
+               SELECT 1 FROM project_memory_notes
+               WHERE project_memory_notes.project_id = projects.id
+           )",
+        [],
+    )?;
+    Ok(())
 }
 
 // -- Migrations --
@@ -1020,6 +1384,280 @@ CREATE INDEX idx_task_pull_requests_agent
     ON task_pull_requests(agent_id, task_id, status);
 ";
 
+const MIGRATION_V33: &str = "
+-- Projects are the top-level collaboration boundary. Existing installations
+-- previously treated each configured Agent as a project, so preserve that
+-- mental model by creating one project for each existing Agent and assigning
+-- its tasks and conversations to it.
+CREATE TABLE projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    icon TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+ALTER TABLE agents ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+INSERT INTO projects (id, name, description)
+SELECT id, name, 'Imported from the existing Agent workspace' FROM agents;
+
+UPDATE agents SET project_id = id WHERE project_id IS NULL;
+CREATE INDEX idx_agents_project ON agents(project_id, name);
+
+ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE CASCADE;
+UPDATE conversations
+SET project_id = (
+    SELECT a.project_id
+    FROM conversation_participants cp
+    JOIN agents a ON a.id = cp.participant_id
+    WHERE cp.conversation_id = conversations.id
+      AND cp.participant_type = 'agent'
+      AND a.project_id IS NOT NULL
+    ORDER BY cp.joined_at ASC
+    LIMIT 1
+)
+WHERE project_id IS NULL;
+INSERT INTO projects (id, name, description)
+SELECT 'imported-conversations-' || lower(hex(randomblob(16))), 'Imported conversations',
+       'Conversations created before project organization was available'
+WHERE EXISTS (SELECT 1 FROM conversations WHERE project_id IS NULL);
+UPDATE conversations
+SET project_id = (
+    SELECT id FROM projects
+    WHERE description = 'Conversations created before project organization was available'
+    LIMIT 1
+)
+WHERE project_id IS NULL;
+CREATE INDEX idx_conversations_project_activity
+    ON conversations(project_id, last_message_at DESC, created_at DESC);
+
+ALTER TABLE tasks ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+UPDATE tasks
+SET project_id = COALESCE(
+    (SELECT c.project_id FROM conversations c WHERE c.id = tasks.conversation_id),
+    (SELECT a.project_id FROM agents a WHERE a.id = tasks.agent_id)
+)
+WHERE project_id IS NULL;
+-- Legacy ACP plans stored their reported steps as unassigned child tasks. Once
+-- the assigned parent has a Project, carry that scope through the complete
+-- descendant tree so the migration cannot introduce a cross-Project task
+-- hierarchy.
+WITH RECURSIVE inherited_task_projects(id, project_id) AS (
+    SELECT id, project_id FROM tasks WHERE project_id IS NOT NULL
+    UNION
+    SELECT child.id, parent.project_id
+    FROM tasks child
+    JOIN inherited_task_projects parent ON parent.id = child.parent_task_id
+    WHERE child.project_id IS NULL
+)
+UPDATE tasks
+SET project_id = (
+    SELECT inherited.project_id
+    FROM inherited_task_projects inherited
+    WHERE inherited.id = tasks.id
+    LIMIT 1
+)
+WHERE project_id IS NULL
+  AND EXISTS (
+      SELECT 1 FROM inherited_task_projects inherited
+      WHERE inherited.id = tasks.id
+  );
+CREATE INDEX idx_tasks_project_updated ON tasks(project_id, updated_at DESC);
+
+ALTER TABLE workflow_instances ADD COLUMN project_id TEXT REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE workflow_instances ADD COLUMN conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL;
+CREATE INDEX idx_workflow_instances_conversation
+    ON workflow_instances(conversation_id, started_at DESC);
+
+-- Conversation messages may represent linked tasks or durable file
+-- publications in addition to plain chat.
+ALTER TABLE conversation_messages ADD COLUMN linked_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
+ALTER TABLE conversation_messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';
+CREATE TABLE conversation_message_attachments (
+    id TEXT PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    data BLOB NOT NULL,
+    size INTEGER NOT NULL,
+    source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_conversation_attachments_message
+    ON conversation_message_attachments(message_id);
+
+-- Conversation turns use a queue independent of task execution. One ACP
+-- session is retained per conversation/Agent pair, while each queued turn is
+-- independently recoverable after a control-plane restart.
+CREATE TABLE conversation_agent_sessions (
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    native_session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'idle'
+        CHECK (status IN ('idle', 'queued', 'running', 'failed')),
+    last_error TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (conversation_id, agent_id)
+);
+CREATE TABLE conversation_turns (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    trigger_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    result_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE SET NULL,
+    error_message TEXT,
+    context_used INTEGER,
+    context_size INTEGER,
+    queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX idx_conversation_turns_queue
+    ON conversation_turns(status, queued_at);
+CREATE INDEX idx_conversation_turns_conversation
+    ON conversation_turns(conversation_id, queued_at DESC);
+CREATE UNIQUE INDEX idx_conversation_turns_active_agent
+    ON conversation_turns(conversation_id, agent_id)
+    WHERE status IN ('queued', 'running');
+";
+
+const MIGRATION_V34: &str = "
+-- Project memory originally used the logical Agent session as its ownership
+-- foreign key. Rebuild the relational tables around the real Project boundary
+-- while preserving notes, tags, links, and the existing vector index.
+-- Removed Agents can still own durable memory through their retained logical
+-- session. Seed every legacy memory owner before changing the ownership
+-- foreign key. Keep this repair in v34 so installations where v33 committed
+-- before an older v34 failed can resume the upgrade safely.
+INSERT OR IGNORE INTO projects (id, name, description)
+SELECT DISTINCT note.project_id,
+       COALESCE(
+           (SELECT NULLIF(TRIM(session.title), '')
+            FROM logical_sessions session WHERE session.id = note.project_id),
+           note.project_id
+       ),
+       'Imported from retained Agent memory'
+FROM project_memory_notes note;
+
+CREATE TABLE project_memory_notes_v34 (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    note_type TEXT NOT NULL DEFAULT 'fact'
+        CHECK (note_type IN ('decision', 'convention', 'procedure', 'fact', 'warning', 'question')),
+    state TEXT NOT NULL DEFAULT 'evergreen'
+        CHECK (state IN ('inbox', 'evergreen', 'archived')),
+    source_task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    source_attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    created_by TEXT NOT NULL DEFAULT 'agent'
+        CHECK (created_by IN ('user', 'agent', 'upkeep')),
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    search_key TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    access_count INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO project_memory_notes_v34
+SELECT * FROM project_memory_notes;
+
+CREATE TABLE project_memory_tags_v34 (
+    note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    tag_key TEXT NOT NULL,
+    PRIMARY KEY (note_id, tag_key)
+);
+INSERT INTO project_memory_tags_v34 SELECT * FROM project_memory_tags;
+
+CREATE TABLE project_memory_links_v34 (
+    from_note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    to_note_id TEXT NOT NULL REFERENCES project_memory_notes_v34(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL DEFAULT 'related'
+        CHECK (link_type IN ('related', 'supports', 'contradicts', 'supersedes', 'depends_on', 'example_of')),
+    strength REAL NOT NULL DEFAULT 1.0 CHECK (strength >= 0.0 AND strength <= 1.0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (from_note_id, to_note_id, link_type),
+    CHECK (from_note_id <> to_note_id)
+);
+INSERT INTO project_memory_links_v34 SELECT * FROM project_memory_links;
+
+DROP TRIGGER project_memory_notes_delete_embedding;
+DROP TABLE project_memory_links;
+DROP TABLE project_memory_tags;
+DROP TABLE project_memory_notes;
+ALTER TABLE project_memory_notes_v34 RENAME TO project_memory_notes;
+ALTER TABLE project_memory_tags_v34 RENAME TO project_memory_tags;
+ALTER TABLE project_memory_links_v34 RENAME TO project_memory_links;
+
+CREATE INDEX idx_project_memory_notes_project_updated
+    ON project_memory_notes(project_id, state, pinned DESC, updated_at DESC);
+CREATE INDEX idx_project_memory_notes_task
+    ON project_memory_notes(source_task_id);
+CREATE INDEX idx_project_memory_tags_key
+    ON project_memory_tags(tag_key, note_id);
+CREATE INDEX idx_project_memory_links_to
+    ON project_memory_links(to_note_id, link_type);
+CREATE TRIGGER project_memory_notes_delete_embedding
+AFTER DELETE ON project_memory_notes
+BEGIN
+    DELETE FROM project_memory_embeddings WHERE note_id = OLD.id;
+END;
+";
+
+const MIGRATION_V35: &str = "
+-- One-shot wake-ups armed from a Conversation must return to that Agent's
+-- independent Conversation lane instead of creating a standalone task.
+ALTER TABLE schedules ADD COLUMN conversation_id TEXT
+    REFERENCES conversations(id) ON DELETE CASCADE;
+CREATE INDEX idx_schedules_conversation
+    ON schedules(conversation_id);
+";
+
+fn schema_migrations() -> &'static [(u32, &'static str)] {
+    &[
+        (1, MIGRATION_V1),
+        (2, MIGRATION_V2),
+        (3, MIGRATION_V3),
+        (4, MIGRATION_V4),
+        (5, MIGRATION_V5),
+        (6, MIGRATION_V6),
+        (7, MIGRATION_V7),
+        (8, MIGRATION_V8),
+        (9, MIGRATION_V9),
+        (10, MIGRATION_V10),
+        (11, MIGRATION_V11),
+        (12, MIGRATION_V12),
+        (13, MIGRATION_V13),
+        (14, MIGRATION_V14),
+        (15, MIGRATION_V15),
+        (16, MIGRATION_V16),
+        (17, MIGRATION_V17),
+        (18, MIGRATION_V18),
+        (19, MIGRATION_V19),
+        (20, MIGRATION_V20),
+        (21, MIGRATION_V21),
+        (22, MIGRATION_V22),
+        (23, MIGRATION_V23),
+        (24, MIGRATION_V24),
+        (25, MIGRATION_V25),
+        (26, MIGRATION_V26),
+        (27, MIGRATION_V27),
+        (28, MIGRATION_V28),
+        (29, MIGRATION_V29),
+        (30, MIGRATION_V30),
+        (31, MIGRATION_V31),
+        (32, MIGRATION_V32),
+        (33, MIGRATION_V33),
+        (34, MIGRATION_V34),
+        (35, MIGRATION_V35),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1037,7 +1675,445 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "32");
+        assert_eq!(version, "35");
+        let memory_owner: String = conn
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
+                 WHERE \"from\" = 'project_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_owner, "projects");
+    }
+
+    #[test]
+    fn v33_backfills_project_scope_through_task_ancestry() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 32 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, backend, config)
+             VALUES ('atlas', 'Atlas', 'native', '{}');
+             INSERT INTO tasks (id, title, agent_id)
+             VALUES ('parent', 'Assigned parent', 'atlas');
+             INSERT INTO tasks (id, title, parent_task_id)
+             VALUES ('child', 'Reported child', 'parent'),
+                    ('grandchild', 'Reported grandchild', 'child');",
+        )
+        .unwrap();
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V33).unwrap();
+        transaction.commit().unwrap();
+
+        for task_id in ["parent", "child", "grandchild"] {
+            let project_id: String = conn
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(project_id, "atlas", "scope for {task_id}");
+        }
+    }
+
+    #[test]
+    fn v34_merges_agents_and_adopts_every_task_in_their_hierarchy() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 32 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, backend, config)
+             VALUES ('atlas', 'Atlas', 'native', '{}'),
+                    ('builder', 'Builder', 'native', '{}');
+             INSERT INTO tasks (id, title)
+             VALUES ('root', 'Unassigned root');
+             INSERT INTO tasks (id, title, agent_id, parent_task_id)
+             VALUES ('parent', 'Atlas parent', 'atlas', 'root');
+             INSERT INTO tasks (id, title, parent_task_id)
+             VALUES ('reported-step', 'Unassigned reported step', 'parent');
+             INSERT INTO tasks (id, title, agent_id, parent_task_id)
+             VALUES ('grandchild', 'Builder grandchild', 'builder', 'reported-step');",
+        )
+        .unwrap();
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V33).unwrap();
+        backfill_pending_conversation_turns(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let projects_after_v33: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, project_id FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            projects_after_v33,
+            vec![
+                ("grandchild".into(), Some("builder".into())),
+                ("parent".into(), Some("atlas".into())),
+                ("reported-step".into(), Some("atlas".into())),
+                ("root".into(), None),
+            ]
+        );
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V34).unwrap();
+        consolidate_legacy_conversation_projects(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let agent_projects: Vec<String> = conn
+            .prepare("SELECT project_id FROM agents ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(agent_projects, vec!["atlas"; 2]);
+        let task_projects: Vec<String> = conn
+            .prepare("SELECT project_id FROM tasks ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(task_projects, vec!["atlas"; 4]);
+    }
+
+    #[test]
+    fn legacy_consolidation_handles_a_large_task_hierarchy_without_pairwise_closure() {
+        let db = Database::open_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('atlas', 'Atlas'), ('builder', 'Builder');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'atlas'),
+                        ('builder', 'Builder', 'native', '{}', 'builder');",
+            )?;
+            let transaction = conn.unchecked_transaction()?;
+            {
+                let mut statement = transaction.prepare(
+                    "INSERT INTO tasks (id, title, parent_task_id, agent_id, project_id)
+                     VALUES (?1, ?1, ?2, ?3, ?4)",
+                )?;
+                let mut parent = None::<String>;
+                for index in 0..2_000 {
+                    let id = format!("task-{index:04}");
+                    let (agent_id, project_id) = match index {
+                        0 => (Some("atlas"), Some("atlas")),
+                        1_999 => (Some("builder"), Some("builder")),
+                        _ => (None, None),
+                    };
+                    statement.execute(rusqlite::params![id, parent, agent_id, project_id])?;
+                    parent = Some(format!("task-{index:04}"));
+                }
+            }
+            consolidate_legacy_conversation_projects(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let adopted: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE project_id = 'atlas'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(adopted, 2_000);
+            let builder_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'builder'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(builder_project, "atlas");
+        });
+    }
+
+    #[test]
+    fn v34_recovers_memory_owned_by_a_removed_agent_after_v33_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-memory.db");
+        ensure_sqlite_vec();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                 );",
+            )
+            .unwrap();
+            register_sql_functions(&conn).unwrap();
+            for &(target, sql) in schema_migrations() {
+                if target > 32 {
+                    break;
+                }
+                let transaction = conn.unchecked_transaction().unwrap();
+                transaction.execute_batch(sql).unwrap();
+                transaction
+                    .execute(
+                        "INSERT OR REPLACE INTO config (key, value)
+                         VALUES ('schema_version', ?1)",
+                        [target.to_string()],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config)
+                    VALUES ('retired', 'Retired researcher', 'native', '{}');
+                 INSERT INTO logical_sessions (id, agent_id, title)
+                    VALUES ('retired', 'retired', 'Retired researcher');
+                 INSERT INTO project_memory_notes
+                    (id, project_id, title, body, summary, search_key)
+                    VALUES (
+                        'remembered-note',
+                        'retired',
+                        'Retained decision',
+                        'Keep this knowledge after removing the Agent.',
+                        'Keep retained knowledge.',
+                        'retained decision keep knowledge'
+                    );
+                 DELETE FROM agents WHERE id = 'retired';",
+            )
+            .unwrap();
+            let transaction = conn.unchecked_transaction().unwrap();
+            transaction.execute_batch(MIGRATION_V33).unwrap();
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO config (key, value)
+                     VALUES ('schema_version', '33')",
+                    [],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            let missing_project: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id = 'retired'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(missing_project, 0);
+        }
+
+        let upgraded = Database::open(&path).unwrap();
+        upgraded.with_conn(|conn| {
+            let project: (String, String) = conn
+                .query_row(
+                    "SELECT name, description FROM projects WHERE id = 'retired'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(project.0, "Retired researcher");
+            assert_eq!(project.1, "Imported from retained Agent memory");
+            let note: (String, String) = conn
+                .query_row(
+                    "SELECT project_id, body FROM project_memory_notes
+                     WHERE id = 'remembered-note'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(note.0, "retired");
+            assert_eq!(note.1, "Keep this knowledge after removing the Agent.");
+            let foreign_key_errors: i64 = conn
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(foreign_key_errors, 0);
+        });
+    }
+
+    #[test]
+    fn legacy_multi_agent_conversations_merge_projects_and_memory() {
+        use crate::memory::project::{CreateProjectMemoryNote, ProjectMemoryStore};
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name)
+                 VALUES ('atlas', 'Atlas'), ('builder', 'Builder'), ('reviewer', 'Reviewer');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'atlas'),
+                        ('builder', 'Builder', 'native', '{}', 'builder'),
+                        ('reviewer', 'Reviewer', 'native', '{}', 'reviewer');
+                 INSERT INTO conversations (id, title, project_id) VALUES ('shared', 'Shared', 'atlas');
+                 INSERT INTO conversation_participants
+                    (conversation_id, participant_type, participant_id)
+                 VALUES ('shared', 'agent', 'atlas'), ('shared', 'agent', 'reviewer');
+                 INSERT INTO tasks (id, title, agent_id, project_id)
+                 VALUES ('parent', 'Cross-Agent parent', 'atlas', 'atlas'),
+                        ('child', 'Cross-Agent child', 'builder', 'builder'),
+                        ('review-parent', 'Reviewer parent', 'reviewer', 'reviewer');
+                 INSERT INTO tasks (id, title, parent_task_id, project_id)
+                 VALUES ('review-plan', 'Unassigned reported step', 'review-parent', 'reviewer');
+                 UPDATE tasks SET parent_task_id = 'parent' WHERE id = 'child';",
+            )
+        })
+        .unwrap();
+        let memory = ProjectMemoryStore::new(db.clone())
+            .create(
+                "reviewer",
+                &CreateProjectMemoryNote {
+                    title: "Review convention".into(),
+                    body: "Check every migration before approval.".into(),
+                    summary: None,
+                    note_type: "convention".into(),
+                    state: "evergreen".into(),
+                    source_task_id: None,
+                    source_attempt_id: None,
+                    created_by: "agent".into(),
+                    pinned: false,
+                    tags: vec!["review".into()],
+                },
+            )
+            .unwrap();
+
+        db.with_conn(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            consolidate_legacy_conversation_projects(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let reviewer_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'reviewer'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reviewer_project, "atlas");
+            let builder_project: String = conn
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = 'builder'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(builder_project, "atlas");
+            let task_projects: Vec<String> = conn
+                .prepare("SELECT project_id FROM tasks ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(task_projects, vec!["atlas"; 4]);
+            let remaining_projects: i64 = conn
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(remaining_projects, 1);
+        });
+        let moved = ProjectMemoryStore::new(db)
+            .get("atlas", &memory.id)
+            .unwrap();
+        assert_eq!(moved.project_id, "atlas");
+    }
+
+    #[test]
+    fn pending_legacy_messages_become_durable_addressed_turns() {
+        let db = Database::open_memory().unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('p', 'Project');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'p'),
+                        ('reviewer', 'Reviewer', 'native', '{}', 'p');
+                 INSERT INTO conversations (id, title, project_id)
+                 VALUES ('legacy', 'Pending work', 'p');
+                 INSERT INTO conversation_participants
+                    (conversation_id, participant_type, participant_id)
+                 VALUES ('legacy', 'agent', 'atlas'),
+                        ('legacy', 'agent', 'reviewer'),
+                        ('legacy', 'agent', 'removed-agent');
+                 INSERT INTO conversation_messages
+                    (conversation_id, sender_type, sender_id, content, processed)
+                 VALUES ('legacy', 'user', 'local', 'Please investigate', 0),
+                        ('legacy', 'user', 'local', '@[AGENT:atlas:Atlas] Extra context', 0);",
+            )?;
+            let transaction = conn.unchecked_transaction()?;
+            backfill_pending_conversation_turns(&transaction)?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        db.with_conn(|conn| {
+            let unprocessed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_messages WHERE processed = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unprocessed, 0);
+
+            let turns = conn
+                .prepare(
+                    "SELECT agent_id, trigger_message_id FROM conversation_turns
+                     WHERE conversation_id = 'legacy' ORDER BY agent_id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(turns, vec![("atlas".into(), 2), ("reviewer".into(), 1)]);
+
+            let sessions: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_agent_sessions
+                     WHERE conversation_id = 'legacy' AND status = 'queued'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(sessions, 2);
+
+            let orphan_memberships: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversation_participants
+                     WHERE participant_type = 'agent'
+                       AND participant_id = 'removed-agent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphan_memberships, 0);
+        });
     }
 
     #[test]

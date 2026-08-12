@@ -26,7 +26,7 @@ use bollard::container::LogOutput;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 use uuid::Uuid;
@@ -310,6 +310,7 @@ pub struct AcpTurnRuntime {
     recorder: AcpEventRecorder,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    allow_elicitation: bool,
 }
 
 /// A live, initialized ACP process. One handle is retained for each project so
@@ -318,6 +319,7 @@ pub struct AcpTurnRuntime {
 #[derive(Clone)]
 pub struct AcpProcess {
     sender: mpsc::Sender<AcpProcessTurn>,
+    shutdown: watch::Sender<bool>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
 }
@@ -336,6 +338,7 @@ struct ActiveTurn {
     recorder: AcpEventRecorder,
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
+    allow_elicitation: bool,
 }
 
 #[derive(Clone)]
@@ -355,6 +358,20 @@ impl AcpTurnRuntime {
             recorder,
             elicitation_broker,
             turn_controls,
+            allow_elicitation: true,
+        }
+    }
+
+    pub fn for_conversation(
+        recorder: AcpEventRecorder,
+        elicitation_broker: Arc<AcpElicitationBroker>,
+        turn_controls: Arc<AcpTurnControlBroker>,
+    ) -> Self {
+        Self {
+            recorder,
+            elicitation_broker,
+            turn_controls,
+            allow_elicitation: false,
         }
     }
 }
@@ -380,6 +397,7 @@ pub struct AcpEventRecorder {
     attempt_id: String,
     task_id: String,
     runner: String,
+    conversation_id: Option<String>,
     state: Arc<Mutex<TurnState>>,
 }
 
@@ -397,6 +415,26 @@ impl AcpEventRecorder {
             attempt_id: attempt_id.into(),
             task_id: task_id.into(),
             runner: runner.into(),
+            conversation_id: None,
+            state: Arc::new(Mutex::new(TurnState::default())),
+        }
+    }
+
+    pub fn for_conversation(
+        db: Arc<Database>,
+        conversation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        runner: impl Into<String>,
+    ) -> Self {
+        let conversation_id = conversation_id.into();
+        Self {
+            db,
+            logical_session_id: agent_id.into(),
+            attempt_id: turn_id.into(),
+            task_id: format!("conversation:{conversation_id}"),
+            runner: runner.into(),
+            conversation_id: Some(conversation_id),
             state: Arc::new(Mutex::new(TurnState::default())),
         }
     }
@@ -411,6 +449,9 @@ impl AcpEventRecorder {
     }
 
     fn persist_native_session(&self, native_session_id: &str) -> Result<()> {
+        if self.conversation_id.is_some() {
+            return Ok(());
+        }
         SessionManager::new(self.db.clone()).set_native_session(&self.attempt_id, native_session_id)
     }
 
@@ -505,11 +546,13 @@ impl AcpEventRecorder {
                         },
                     })
                     .collect();
-                TaskBoard::new(self.db.clone()).sync_reported_subtasks(
-                    &self.task_id,
-                    &self.attempt_id,
-                    &reported,
-                )?;
+                if self.conversation_id.is_none() {
+                    TaskBoard::new(self.db.clone()).sync_reported_subtasks(
+                        &self.task_id,
+                        &self.attempt_id,
+                        &reported,
+                    )?;
+                }
                 let completed = reported
                     .iter()
                     .filter(|entry| entry.status == TaskStatus::Completed)
@@ -536,11 +579,16 @@ impl AcpEventRecorder {
             }
             SessionUpdate::UsageUpdate(update) => {
                 self.flush_prompt_output()?;
-                SessionManager::new(self.db.clone()).set_context_usage(
-                    &self.attempt_id,
-                    update.used,
-                    update.size,
-                )?;
+                if self.conversation_id.is_some() {
+                    crate::conversations::runtime::ConversationTurnQueue::new(self.db.clone())
+                        .set_context_usage(&self.attempt_id, update.used, update.size)?;
+                } else {
+                    SessionManager::new(self.db.clone()).set_context_usage(
+                        &self.attempt_id,
+                        update.used,
+                        update.size,
+                    )?;
+                }
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -739,6 +787,9 @@ impl AcpEventRecorder {
     }
 
     fn append_event(&self, event_type: &str, summary: &str, payload: Value) -> Result<()> {
+        if self.conversation_id.is_some() {
+            return Ok(());
+        }
         SessionManager::new(self.db.clone()).append_event(
             &self.logical_session_id,
             NewEvent {
@@ -770,15 +821,17 @@ impl AcpEventRecorder {
 }
 
 impl AcpProcess {
-    /// Start and initialize one ACP process over an attached project container.
+    /// Start and initialize one ACP process over an attached Agent container.
     pub async fn start(attached: AttachedContainer) -> Result<Self> {
         let (sender, receiver) = mpsc::channel(1);
+        let (shutdown, shutdown_receiver) = watch::channel(false);
         let (ready_sender, ready_receiver) = oneshot::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let stopped = Arc::new(Notify::new());
         tokio::spawn(serve_process(
             attached,
             receiver,
+            shutdown_receiver,
             ready_sender,
             alive.clone(),
             stopped.clone(),
@@ -790,6 +843,7 @@ impl AcpProcess {
 
         Ok(Self {
             sender,
+            shutdown,
             alive,
             stopped,
         })
@@ -803,6 +857,13 @@ impl AcpProcess {
     /// Whether two handles refer to the same underlying process.
     pub fn same_process(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.alive, &other.alive)
+    }
+
+    /// Close this ACP connection without stopping its shared project
+    /// container. Conversation lanes use this when their conversation or
+    /// participant is deleted while the base project process remains alive.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
     }
 
     /// Wait until the stdio connection and its process actor have exited.
@@ -849,6 +910,7 @@ impl AcpProcess {
 async fn serve_process(
     attached: AttachedContainer,
     mut turns: mpsc::Receiver<AcpProcessTurn>,
+    mut shutdown: watch::Receiver<bool>,
     ready_sender: oneshot::Sender<Result<()>>,
     alive: Arc<AtomicBool>,
     stopped: Arc<Notify>,
@@ -951,6 +1013,10 @@ async fn serve_process(
                     return responder
                         .respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
                 };
+                if !active.allow_elicitation {
+                    return responder
+                        .respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                }
                 let elicitation_task_id = active.recorder.task_id.clone();
                 let elicitation_attempt_id = active.recorder.attempt_id.clone();
                 let (elicitation_id, receiver) = active
@@ -1001,8 +1067,17 @@ async fn serve_process(
 
             let mut sessions = HashMap::new();
             loop {
+                if *shutdown.borrow() {
+                    break;
+                }
                 let turn = tokio::select! {
                     biased;
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    },
                     _ = &mut output_closed_receiver => break,
                     turn = turns.recv() => {
                         let Some(turn) = turn else {
@@ -1023,11 +1098,13 @@ async fn serve_process(
                     recorder,
                     elicitation_broker,
                     turn_controls,
+                    allow_elicitation,
                 } = runtime;
                 *active_turn.lock().unwrap() = Some(ActiveTurn {
                     recorder: recorder.clone(),
                     elicitation_broker,
                     turn_controls: turn_controls.clone(),
+                    allow_elicitation,
                 });
                 stderr_for_connection.lock().unwrap().clear();
 
@@ -1672,6 +1749,47 @@ mod tests {
         assert!(broker.request_interrupt("attempt-1", AcpInterruptMode::Immediate));
         let mut receiver = broker.register("attempt-1");
         assert_eq!(receiver.try_recv(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn explicitly_shutting_down_an_idle_acp_process_closes_its_actor() {
+        let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
+        let mock_agent = tokio::spawn(async move {
+            let mut requests = BufReader::new(agent_input).lines();
+            let initialize = requests.next_line().await.unwrap().unwrap();
+            let initialize: Value = serde_json::from_str(&initialize).unwrap();
+            assert_eq!(initialize["method"], "initialize");
+            send_json(
+                &output_tx,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize["id"],
+                    "result": InitializeResponse::new(ProtocolVersion::V1),
+                }),
+            )
+            .await;
+            assert!(requests.next_line().await.unwrap().is_none());
+        });
+        let process = AcpProcess::start(AttachedContainer {
+            info: ContainerInfo {
+                container_id: "test-container".into(),
+                agent_id: "test-project".into(),
+                status: "running".into(),
+                host_port: None,
+            },
+            input: Box::pin(client_input),
+            output: Box::pin(ReceiverStream::new(output_rx)),
+        })
+        .await
+        .unwrap();
+
+        process.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(1), process.wait_for_exit())
+            .await
+            .expect("explicit shutdown should stop an idle ACP actor");
+        assert!(!process.is_alive());
+        mock_agent.await.unwrap();
     }
 
     #[tokio::test]

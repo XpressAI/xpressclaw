@@ -23,6 +23,7 @@ use crate::config::{
     NativeRunnerConfig,
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
+use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
 use crate::conversations::{ConversationManager, SendMessage};
 use crate::db::Database;
 use crate::docker::manager::{
@@ -44,6 +45,7 @@ const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
 const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
 const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
 const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
+static PI_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
@@ -81,6 +83,172 @@ struct ProjectAcpProcess {
 #[derive(Default)]
 struct ProjectAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ProjectAcpProcess>>>>>,
+}
+
+#[derive(Clone)]
+struct ConversationAcpProcess {
+    fingerprint: String,
+    container_id: String,
+    process: AcpProcess,
+}
+
+#[derive(Debug)]
+struct PiMcpBridge {
+    signature: String,
+    process_environment: Vec<String>,
+}
+
+#[derive(Default)]
+pub struct ConversationAcpProcesses {
+    slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
+}
+
+impl ConversationAcpProcesses {
+    fn key(conversation_id: &str, agent_id: &str) -> String {
+        format!("{conversation_id}\u{0}{agent_id}")
+    }
+
+    fn slot(
+        &self,
+        conversation_id: &str,
+        agent_id: &str,
+    ) -> Arc<AsyncMutex<Option<ConversationAcpProcess>>> {
+        let key = Self::key(conversation_id, agent_id);
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(None)))
+            .clone()
+    }
+
+    async fn get_or_start(
+        &self,
+        docker: &DockerManager,
+        conversation_id: &str,
+        agent_id: &str,
+        base: &ProjectAcpProcess,
+        spec: &ContainerSpec,
+        process_environment: &[String],
+    ) -> Result<ConversationAcpProcess> {
+        let fingerprint = container_spec_fingerprint(spec)?;
+        let slot = self.slot(conversation_id, agent_id);
+        let mut entry = slot.lock().await;
+        if entry.as_ref().is_some_and(|current| {
+            current.fingerprint == fingerprint
+                && current.container_id == base.container_id
+                && current.process.is_alive()
+        }) {
+            return Ok(entry.as_ref().unwrap().clone());
+        }
+        entry.take();
+        let command = spec.cmd.as_deref().ok_or_else(|| {
+            Error::Backend("the selected ACP runner has no process command".into())
+        })?;
+        let attached = docker
+            .open_project_process(
+                agent_id,
+                command,
+                spec.working_dir.as_deref(),
+                process_environment,
+            )
+            .await?;
+        let process = AcpProcess::start(attached).await?;
+        let started = ConversationAcpProcess {
+            fingerprint,
+            container_id: base.container_id.clone(),
+            process,
+        };
+        *entry = Some(started.clone());
+        Ok(started)
+    }
+
+    async fn invalidate(&self, conversation_id: &str, agent_id: &str, process: &AcpProcess) {
+        let key = Self::key(conversation_id, agent_id);
+        let Some(slot) = self.slots.lock().unwrap().get(&key).cloned() else {
+            return;
+        };
+        let mut entry = slot.lock().await;
+        if entry
+            .as_ref()
+            .is_some_and(|current| current.process.same_process(process))
+        {
+            entry.take();
+        }
+    }
+
+    /// Remove and close every retained ACP lane for a deleted Conversation.
+    /// The shared project container and its task process remain untouched.
+    pub async fn retire_conversation(&self, conversation_id: &str) -> usize {
+        let prefix = format!("{conversation_id}\u{0}");
+        let slots = {
+            let mut registered = self.slots.lock().unwrap();
+            let keys = registered
+                .keys()
+                .filter(|key| key.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| registered.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        Self::shutdown_slots(slots).await
+    }
+
+    /// Remove and close one Agent's lane after it leaves a Conversation.
+    pub async fn retire_agent(&self, conversation_id: &str, agent_id: &str) -> usize {
+        let slot = self
+            .slots
+            .lock()
+            .unwrap()
+            .remove(&Self::key(conversation_id, agent_id));
+        Self::shutdown_slots(slot.into_iter().collect()).await
+    }
+
+    /// Remove and close an Agent's retained lanes in every Conversation while
+    /// leaving the shared project container and all other Agent lanes intact.
+    pub async fn retire_agent_everywhere(&self, agent_id: &str) -> usize {
+        let suffix = format!("\u{0}{agent_id}");
+        let slots = {
+            let mut registered = self.slots.lock().unwrap();
+            let keys = registered
+                .keys()
+                .filter(|key| key.ends_with(&suffix))
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| registered.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        Self::shutdown_slots(slots).await
+    }
+
+    async fn shutdown_slots(slots: Vec<Arc<AsyncMutex<Option<ConversationAcpProcess>>>>) -> usize {
+        let count = slots.len();
+        let mut processes = Vec::new();
+        for slot in slots {
+            if let Some(process) = slot.lock().await.take() {
+                process.process.shutdown();
+                processes.push(process.process);
+            }
+        }
+        if !processes.is_empty() {
+            let waits = processes
+                .into_iter()
+                .map(|process| async move { process.wait_for_exit().await });
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                futures_util::future::join_all(waits),
+            )
+            .await;
+        }
+        count
+    }
+
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.lock().unwrap().len()
+    }
 }
 
 impl ProjectAcpProcesses {
@@ -153,6 +321,16 @@ impl ProjectAcpProcesses {
     }
 }
 
+/// Shared control-plane services used by both task and Conversation ACP
+/// dispatch. Keeping these together also guarantees that HTTP lifecycle
+/// handlers and the background workers refer to the same process registry.
+pub struct NativeDispatcherServices {
+    pub event_bus: Arc<ConversationEventBus>,
+    pub elicitation_broker: Arc<AcpElicitationBroker>,
+    pub turn_controls: Arc<AcpTurnControlBroker>,
+    pub conversation_processes: Arc<ConversationAcpProcesses>,
+}
+
 /// Consume the durable task queue as an Agent Client Protocol client. Each
 /// project gets one retained container and initialized ACP process that are
 /// reused across ordinary prompt turns.
@@ -160,12 +338,16 @@ pub async fn start_dispatcher(
     db: Arc<Database>,
     config: Arc<RwLock<Arc<Config>>>,
     initial_docker: Option<Arc<DockerManager>>,
-    event_bus: Arc<ConversationEventBus>,
-    elicitation_broker: Arc<AcpElicitationBroker>,
-    turn_controls: Arc<AcpTurnControlBroker>,
+    services: NativeDispatcherServices,
     control_plane_port: u16,
 ) {
     info!("native attempt dispatcher started");
+    let NativeDispatcherServices {
+        event_bus,
+        elicitation_broker,
+        turn_controls,
+        conversation_processes,
+    } = services;
     let installation_id = match db.installation_id() {
         Ok(installation_id) => installation_id,
         Err(error) => {
@@ -176,6 +358,29 @@ pub async fn start_dispatcher(
     let concurrency = Arc::new(Semaphore::new(4));
     let processes = Arc::new(ProjectAcpProcesses::default());
     let mut docker = initial_docker;
+
+    let _ = ConversationTurnQueue::new(db.clone()).recover();
+    let conversation_db = db.clone();
+    let conversation_config = config.clone();
+    let conversation_docker = docker.clone();
+    let conversation_bus = event_bus.clone();
+    let conversation_elicitations = elicitation_broker.clone();
+    let conversation_controls = turn_controls.clone();
+    let conversation_base_processes = processes.clone();
+    tokio::spawn(async move {
+        start_conversation_dispatcher(
+            conversation_db,
+            conversation_config,
+            conversation_docker,
+            conversation_bus,
+            conversation_elicitations,
+            conversation_controls,
+            conversation_base_processes,
+            conversation_processes,
+            control_plane_port,
+        )
+        .await;
+    });
 
     loop {
         let docker = match docker.clone() {
@@ -253,6 +458,367 @@ pub async fn start_dispatcher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn start_conversation_dispatcher(
+    db: Arc<Database>,
+    config: Arc<RwLock<Arc<Config>>>,
+    initial_docker: Option<Arc<DockerManager>>,
+    event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+    project_processes: Arc<ProjectAcpProcesses>,
+    conversation_processes: Arc<ConversationAcpProcesses>,
+    control_plane_port: u16,
+) {
+    info!("conversation ACP dispatcher started");
+    let installation_id = match db.installation_id() {
+        Ok(installation_id) => installation_id,
+        Err(error) => {
+            warn!(%error, "conversation dispatcher could not load installation identity");
+            return;
+        }
+    };
+    let concurrency = Arc::new(Semaphore::new(8));
+    let mut docker = initial_docker;
+    loop {
+        let docker = match docker.clone() {
+            Some(docker) => docker,
+            None => match DockerManager::connect_for_installation(&installation_id).await {
+                Ok(connected) => {
+                    let connected = Arc::new(connected);
+                    docker = Some(connected.clone());
+                    connected
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    continue;
+                }
+            },
+        };
+        let permit = match concurrency.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        match ConversationTurnQueue::new(db.clone()).claim_next() {
+            Ok(Some(turn)) => {
+                let runtime = ConversationAttemptRuntime {
+                    db: db.clone(),
+                    config: config.read().unwrap().clone(),
+                    docker,
+                    event_bus: event_bus.clone(),
+                    elicitation_broker: elicitation_broker.clone(),
+                    turn_controls: turn_controls.clone(),
+                    project_processes: project_processes.clone(),
+                    conversation_processes: conversation_processes.clone(),
+                    control_plane_port,
+                };
+                let failure_db = runtime.db.clone();
+                let failure_bus = runtime.event_bus.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = execute_conversation_turn(runtime, turn.clone()).await {
+                        warn!(
+                            conversation_id = turn.conversation_id,
+                            agent_id = turn.agent_id,
+                            %error,
+                            "conversation turn failed"
+                        );
+                        let _ =
+                            ConversationTurnQueue::new(failure_db).fail(&turn, &error.to_string());
+                        failure_bus.send(
+                            &turn.conversation_id,
+                            ConversationEvent::Error {
+                                agent_id: Some(turn.agent_id.clone()),
+                                error: error.to_string(),
+                            },
+                        );
+                        failure_bus.send(&turn.conversation_id, ConversationEvent::Done);
+                    }
+                });
+            }
+            Ok(None) => {
+                drop(permit);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                drop(permit);
+                warn!(%error, "failed to claim conversation turn");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+struct ConversationAttemptRuntime {
+    db: Arc<Database>,
+    config: Arc<Config>,
+    docker: Arc<DockerManager>,
+    event_bus: Arc<ConversationEventBus>,
+    elicitation_broker: Arc<AcpElicitationBroker>,
+    turn_controls: Arc<AcpTurnControlBroker>,
+    project_processes: Arc<ProjectAcpProcesses>,
+    conversation_processes: Arc<ConversationAcpProcesses>,
+    control_plane_port: u16,
+}
+
+async fn execute_conversation_turn(
+    runtime: ConversationAttemptRuntime,
+    turn: ConversationTurn,
+) -> Result<()> {
+    let ConversationAttemptRuntime {
+        db,
+        config,
+        docker,
+        event_bus,
+        elicitation_broker,
+        turn_controls,
+        project_processes,
+        conversation_processes,
+        control_plane_port,
+    } = runtime;
+    let queue = ConversationTurnQueue::new(db.clone());
+    if !queue.is_running(&turn.id)? {
+        return Ok(());
+    }
+    let manager = ConversationManager::new(db.clone());
+    let conversation = manager.get(&turn.conversation_id)?;
+    let agent = config
+        .agents
+        .iter()
+        .find(|agent| agent.name == turn.agent_id)
+        .ok_or_else(|| Error::AgentNotFound {
+            name: turn.agent_id.clone(),
+        })?;
+    let kind = resolve_runner_kind(agent)?;
+    let workspace = resolved_workspace(&config, agent);
+    let github = github::discover(&db, &workspace);
+    let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let container_workspace = spec
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| "/workspace".to_string());
+    let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
+        == Some(spec.image.as_str());
+    if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
+        let local_fallback = match local_runner_image_alias(&spec.image) {
+            Some(image) if runner_image_ready(&docker, image, built_in_image, agent).await => {
+                Some(image)
+            }
+            _ => None,
+        };
+        if let Some(local_image) = local_fallback {
+            spec.image = local_image.to_string();
+        } else {
+            docker.pull_image(&spec.image).await?;
+        }
+    }
+
+    let mut mcp_servers = configured_mcp_servers(&config, agent)?;
+    let bundled_control_tools = docker
+        .image_has_label(
+            &spec.image,
+            "io.xpressclaw.protocol",
+            BUILT_IN_RUNNER_PROTOCOL,
+        )
+        .await;
+    let github_mcp_attached = configure_bundled_github_mcp(
+        &agent.runner,
+        &kind,
+        github.is_some(),
+        bundled_control_tools,
+        &mut spec.environment,
+    )?;
+    if bundled_control_tools
+        && !agent
+            .runner
+            .mcp_servers
+            .iter()
+            .any(|name| name == "xpressclaw")
+    {
+        mcp_servers.push(xpressclaw_control_mcp_server_for_context(
+            &agent.name,
+            None,
+            Some(&turn.conversation_id),
+            conversation.project_id.as_deref(),
+            &container_workspace,
+            control_plane_port,
+            docker.runtime(),
+        ));
+    }
+    if let Some(access) = github.as_ref() {
+        if github_mcp_attached {
+            mcp_servers.push(access.mcp_server(None));
+        }
+    }
+    let pi_mcp_bridge = kind == "pi"
+        && docker
+            .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
+            .await;
+    let (mcp_signature, pi_process_environment) = if pi_mcp_bridge {
+        let bridge = configure_pi_mcp_bridge(
+            &config.system.data_dir,
+            &agent.name,
+            Some(&turn.conversation_id),
+            &mcp_servers,
+            &mut spec,
+        )?;
+        mcp_servers.clear();
+        (Some(bridge.signature), bridge.process_environment)
+    } else {
+        (None, Vec::new())
+    };
+
+    let base = project_processes
+        .get_or_start(&docker, &agent.name, &spec)
+        .await?;
+    let live = conversation_processes
+        .get_or_start(
+            &docker,
+            &turn.conversation_id,
+            &turn.agent_id,
+            &base,
+            &spec,
+            &pi_process_environment,
+        )
+        .await?;
+    let session = queue.session(&turn.conversation_id, &turn.agent_id)?;
+    let session_start = session
+        .native_session_id
+        .map(AcpSessionStart::Resume)
+        .unwrap_or(AcpSessionStart::New);
+    let previous_trigger_message_id = if matches!(&session_start, AcpSessionStart::Resume(_)) {
+        queue.last_completed_trigger(&turn.conversation_id, &turn.agent_id)?
+    } else {
+        None
+    };
+    let prompt = build_conversation_prompt(
+        &manager,
+        &conversation,
+        &turn,
+        agent,
+        previous_trigger_message_id,
+    )?;
+    event_bus.send(
+        &turn.conversation_id,
+        ConversationEvent::Thinking {
+            agent_id: turn.agent_id.clone(),
+        },
+    );
+    turn_controls.begin_attempt(&turn.id);
+    if !queue.is_running(&turn.id)? {
+        turn_controls.finish_attempt(&turn.id);
+        conversation_processes
+            .retire_agent(&turn.conversation_id, &turn.agent_id)
+            .await;
+        return Ok(());
+    }
+    let recorder = AcpEventRecorder::for_conversation(
+        db.clone(),
+        turn.conversation_id.clone(),
+        turn.agent_id.clone(),
+        turn.id.clone(),
+        kind.clone(),
+    );
+    let result = live
+        .process
+        .run_turn(
+            AcpTurnRuntime::for_conversation(recorder, elicitation_broker, turn_controls.clone()),
+            session_start,
+            Path::new(&container_workspace),
+            &prompt,
+            AcpTurnOptions {
+                model: agent.runner.model.clone(),
+                session_config: agent.runner.session_config.clone(),
+                mcp_servers,
+                mcp_signature,
+                image_attachments: vec![],
+            },
+        )
+        .await;
+    turn_controls.finish_attempt(&turn.id);
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            conversation_processes
+                .invalidate(&turn.conversation_id, &turn.agent_id, &live.process)
+                .await;
+            if !queue.is_running(&turn.id)? {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    let Some(message) = queue.complete_with_message(
+        &turn,
+        &result.session_id,
+        &SendMessage {
+            sender_type: "agent".into(),
+            sender_id: turn.agent_id.clone(),
+            sender_name: Some(agent.context_label()),
+            content: result.summary,
+            message_type: None,
+        },
+        &json!({ "conversation_turn_id": turn.id, "runner": kind }),
+    )?
+    else {
+        event_bus.send(&turn.conversation_id, ConversationEvent::Done);
+        return Ok(());
+    };
+    event_bus.send(
+        &turn.conversation_id,
+        ConversationEvent::Message {
+            message: json!(message),
+        },
+    );
+    event_bus.send(&turn.conversation_id, ConversationEvent::Done);
+    Ok(())
+}
+
+fn build_conversation_prompt(
+    manager: &ConversationManager,
+    conversation: &crate::conversations::Conversation,
+    turn: &ConversationTurn,
+    agent: &AgentConfig,
+    previous_trigger_message_id: Option<i64>,
+) -> Result<String> {
+    let messages = match (previous_trigger_message_id, turn.trigger_message_id) {
+        (Some(after_id), Some(through_id)) => {
+            manager.get_messages_between(&turn.conversation_id, after_id, through_id, 80)?
+        }
+        (None, Some(through_id)) => {
+            manager.get_messages_between(&turn.conversation_id, 0, through_id, 80)?
+        }
+        (_, None) => manager.get_messages(&turn.conversation_id, 80, None)?,
+    }
+    .into_iter()
+    .filter(|message| message.sender_type != "agent" || message.sender_id != turn.agent_id)
+    .collect::<Vec<_>>();
+    let mut history = String::new();
+    for message in messages {
+        let name = message.sender_name.as_deref().unwrap_or(&message.sender_id);
+        history.push_str(&format!("[{name}]: {}\n", message.content));
+        for attachment in manager.attachments(message.id).unwrap_or_default() {
+            history.push_str(&format!(
+                "  [file: {} | attachment_id: {} | {} bytes]\n",
+                attachment.name, attachment.id, attachment.size
+            ));
+        }
+    }
+    let history_label = if previous_trigger_message_id.is_some() {
+        "New conversation activity since your previous response"
+    } else {
+        "Recent conversation history"
+    };
+    Ok(format!(
+        "You are {} participating in the project conversation {:?}. Reply conversationally and concisely to the newest messages addressed to you. You are in an independent chat lane, so do not duplicate a long-running task. If substantial work is needed, use create_conversation_task to create it and tell the participants. You may use send_conversation_message to share an interim update or publish workspace files. Use download_conversation_attachment with an attachment_id when you need to inspect a published file. Other Agents may be working in parallel.\n\nConversation ID: {}\nProject ID: {}\n\n{history_label}:\n{}",
+        agent.context_label(),
+        conversation.title.as_deref().unwrap_or("Untitled conversation"),
+        turn.conversation_id,
+        conversation.project_id.as_deref().unwrap_or("unassigned"),
+        history,
+    ))
+}
+
 async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {
     let NativeAttemptRuntime {
         db,
@@ -310,6 +876,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
+    let task_project_id = board.project_id(&task.id)?;
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
         control_task_id.is_some() && github_review_lifecycle_enabled(&task);
@@ -373,7 +940,6 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &kind,
         github.is_some(),
         bundled_control_tools,
-        github_review_lifecycle,
         &mut spec.environment,
     )?;
     if bundled_control_tools
@@ -383,9 +949,12 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             .iter()
             .any(|name| name == "xpressclaw")
     {
-        mcp_servers.push(xpressclaw_control_mcp_server(
+        mcp_servers.push(xpressclaw_control_mcp_server_for_context(
             &agent.name,
             control_task_id.as_deref(),
+            task.conversation_id.as_deref(),
+            task_project_id.as_deref(),
+            &container_workspace,
             control_plane_port,
             docker.runtime(),
         ));
@@ -414,14 +983,15 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             .image_has_label(&spec.image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
             .await;
     let mcp_signature = if pi_mcp_bridge {
-        let signature = configure_pi_mcp_bridge(
+        let bridge = configure_pi_mcp_bridge(
             &config.system.data_dir,
             &agent.name,
+            None,
             &mcp_servers,
             &mut spec,
         )?;
         mcp_servers.clear();
-        Some(signature)
+        Some(bridge.signature)
     } else {
         None
     };
@@ -677,15 +1247,17 @@ fn publish_conversation_result(
         return;
     };
     let manager = ConversationManager::new(db.clone());
-    if let Ok(message) = manager.send_message(
+    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_attachments(
         &conversation_id,
         &SendMessage {
             sender_type: "agent".to_string(),
             sender_id: item.agent_id.clone(),
             sender_name: Some(sender_name.to_string()),
             content: content.to_string(),
-            message_type: None,
+            message_type: Some("task_result".to_string()),
         },
+        Some(&item.task_id),
+        &[],
     ) {
         event_bus.send(
             &conversation_id,
@@ -956,9 +1528,14 @@ pub async fn runner_image_compatible(
 fn configure_pi_mcp_bridge(
     data_dir: &Path,
     agent_id: &str,
+    process_scope: Option<&str>,
     mcp_servers: &[McpServer],
     spec: &mut ContainerSpec,
-) -> Result<String> {
+) -> Result<PiMcpBridge> {
+    // Pi reads MCP configuration from a file when its ACP process starts.
+    // Serialize the small host-side publication step so a task and a newly
+    // created conversation process cannot contend over temporary files.
+    let _config_guard = PI_MCP_CONFIG_LOCK.lock().unwrap();
     if spec
         .volumes
         .iter()
@@ -977,7 +1554,38 @@ fn configure_pi_mcp_bridge(
         ))
     })?;
     set_private_directory_permissions(&config_dir)?;
-    write_private_atomic(&config_dir.join("config.json"), &encoded)?;
+
+    let (config_path, process_environment) = if let Some(scope) = process_scope {
+        let scope_hash = format!("{:x}", Sha256::digest(scope.as_bytes()));
+        let process_dir = config_dir.join("processes").join(&scope_hash);
+        std::fs::create_dir_all(&process_dir).map_err(|error| {
+            Error::Backend(format!(
+                "failed to create scoped Pi MCP runtime directory {}: {error}",
+                process_dir.display()
+            ))
+        })?;
+        set_private_directory_permissions(&config_dir.join("processes"))?;
+        set_private_directory_permissions(&process_dir)?;
+
+        // The retained container starts one primary ACP process as its init
+        // command. Give that process a valid, context-free bootstrap file;
+        // the independently exec'd conversation process receives its own
+        // immutable path below. Never replace an active task's root config.
+        let bootstrap_path = config_dir.join("config.json");
+        if !bootstrap_path.exists() {
+            write_private_atomic(&bootstrap_path, &pi_mcp_config(&[])?)?;
+        }
+
+        (
+            process_dir.join("config.json"),
+            vec![format!(
+                "XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_DIR_TARGET}/processes/{scope_hash}/config.json"
+            )],
+        )
+    } else {
+        (config_dir.join("config.json"), Vec::new())
+    };
+    write_private_atomic(&config_path, &encoded)?;
 
     spec.volumes.push(VolumeMount {
         source: config_dir.display().to_string(),
@@ -994,7 +1602,10 @@ fn configure_pi_mcp_bridge(
     spec.environment
         .push(format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}"));
 
-    Ok(format!("pi-mcp:{:x}", Sha256::digest(&encoded)))
+    Ok(PiMcpBridge {
+        signature: format!("pi-mcp:{:x}", Sha256::digest(&encoded)),
+        process_environment,
+    })
 }
 
 fn container_paths_overlap(left: &str, right: &str) -> bool {
@@ -1341,9 +1952,30 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
     format!("http://{host}:{control_plane_port}")
 }
 
+#[cfg(test)]
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
     task_id: Option<&str>,
+    control_plane_port: u16,
+    container_runtime: &str,
+) -> McpServer {
+    xpressclaw_control_mcp_server_for_context(
+        agent_id,
+        task_id,
+        None,
+        None,
+        "/workspace",
+        control_plane_port,
+        container_runtime,
+    )
+}
+
+fn xpressclaw_control_mcp_server_for_context(
+    agent_id: &str,
+    task_id: Option<&str>,
+    conversation_id: Option<&str>,
+    project_id: Option<&str>,
+    workspace: &str,
     control_plane_port: u16,
     container_runtime: &str,
 ) -> McpServer {
@@ -1353,9 +1985,19 @@ fn xpressclaw_control_mcp_server(
             control_plane_url(control_plane_port, container_runtime),
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
+        EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
     ];
     if let Some(task_id) = task_id {
         env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
+    }
+    if let Some(conversation_id) = conversation_id {
+        env.push(EnvVariable::new(
+            "XPRESSCLAW_CONVERSATION_ID",
+            conversation_id,
+        ));
+    }
+    if let Some(project_id) = project_id {
+        env.push(EnvVariable::new("XPRESSCLAW_PROJECT_ID", project_id));
     }
     // The control MCP must move in lockstep with the control plane. Runner
     // images are cached independently and can legitimately remain on an older
@@ -1611,7 +2253,6 @@ fn configure_bundled_github_mcp(
     kind: &str,
     github_available: bool,
     bundled_control_tools: bool,
-    review_lifecycle: bool,
     environment: &mut Vec<String>,
 ) -> Result<bool> {
     let attached = github_available
@@ -1629,7 +2270,12 @@ fn configure_bundled_github_mcp(
                 environment[index][PREFIX.len()..].to_string(),
             );
         }
-        github::add_codex_mcp_guidance(&mut codex_environment, review_lifecycle)?;
+        // The retained container is shared by task and Conversation ACP
+        // lanes, so its specification must not depend on the current lane.
+        // Keep the complete, conditional guidance stable here; the scoped
+        // GitHub MCP environment remains authoritative about whether an
+        // ordinary task actually participates in the review lifecycle.
+        github::add_codex_mcp_guidance(&mut codex_environment, true)?;
         let config = codex_environment
             .remove("CODEX_CONFIG")
             .ok_or_else(|| Error::Backend("GitHub guidance did not produce CODEX_CONFIG".into()))?;
@@ -2541,6 +3187,119 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn retiring_conversations_removes_all_registered_acp_lanes() {
+        let processes = ConversationAcpProcesses::default();
+        processes.slot("conversation-one", "atlas");
+        processes.slot("conversation-one", "reviewer");
+        processes.slot("conversation-two", "atlas");
+        processes.slot("conversation-two", "reviewer");
+        assert_eq!(processes.slot_count(), 4);
+
+        assert_eq!(processes.retire_agent_everywhere("atlas").await, 2);
+        assert_eq!(processes.slot_count(), 2);
+        assert_eq!(processes.retire_conversation("conversation-one").await, 1);
+        assert_eq!(processes.slot_count(), 1);
+        assert_eq!(
+            processes.retire_agent("conversation-two", "reviewer").await,
+            1
+        );
+        assert_eq!(processes.slot_count(), 0);
+    }
+
+    #[test]
+    fn first_conversation_turn_stops_at_its_claimed_trigger() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('p', 'Project')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'p')",
+                [],
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let manager = ConversationManager::new(db);
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &crate::conversations::CreateConversation {
+                    title: Some("Race check".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "First context".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let trigger = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Claimed request".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: Some("You".into()),
+                    content: "Arrived after claim".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        let turn = ConversationTurn {
+            id: "turn".into(),
+            conversation_id: conversation.id.clone(),
+            agent_id: "atlas".into(),
+            trigger_message_id: Some(trigger.id),
+            status: "running".into(),
+            result_message_id: None,
+            error_message: None,
+            context_used: None,
+            context_size: None,
+            queued_at: "now".into(),
+            started_at: None,
+            completed_at: None,
+        };
+        let agent = AgentConfig {
+            name: "atlas".into(),
+            runner: NativeRunnerConfig {
+                project_name: Some("Atlas".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let prompt =
+            build_conversation_prompt(&manager, &conversation, &turn, &agent, None).unwrap();
+        assert!(prompt.contains("First context"));
+        assert!(prompt.contains("Claimed request"));
+        assert!(!prompt.contains("Arrived after claim"));
+    }
+
     #[test]
     fn mcp_commands_use_container_path_semantics() {
         assert!(is_absolute_container_path("/opt/project/mcp-server"));
@@ -2662,13 +3421,14 @@ mod tests {
             "/usr/local/bin/node",
         ))];
 
-        let signature =
-            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", &servers, &mut spec).unwrap();
+        let bridge =
+            configure_pi_mcp_bridge(data_dir.path(), "エリ-pi", None, &servers, &mut spec).unwrap();
         let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
         let leaf = config_dir.file_name().unwrap().to_string_lossy();
         assert!(leaf.chars().all(|character| character.is_ascii_hexdigit()));
         assert!(!config_dir.display().to_string().contains("エリ"));
-        assert!(signature.starts_with("pi-mcp:"));
+        assert!(bridge.signature.starts_with("pi-mcp:"));
+        assert!(bridge.process_environment.is_empty());
 
         let mount = spec
             .volumes
@@ -2715,6 +3475,70 @@ mod tests {
             assert_windows_owner_only_acl(&config_dir, true);
             assert_windows_owner_only_acl(&config_path, false);
         }
+    }
+
+    #[test]
+    fn pi_conversation_processes_use_isolated_mcp_configuration_files() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (first, second) = std::thread::scope(|scope| {
+            let launch = |conversation_id: &'static str, barrier: Arc<std::sync::Barrier>| {
+                let data_dir = data_dir.path();
+                scope.spawn(move || {
+                    let mut spec = ContainerSpec::default();
+                    let servers = [McpServer::Stdio(
+                        McpServerStdio::new("xpressclaw", "/usr/local/bin/node").env(vec![
+                            EnvVariable::new("XPRESSCLAW_CONVERSATION_ID", conversation_id),
+                        ]),
+                    )];
+                    barrier.wait();
+                    let bridge = configure_pi_mcp_bridge(
+                        data_dir,
+                        "エリ-pi",
+                        Some(conversation_id),
+                        &servers,
+                        &mut spec,
+                    )
+                    .unwrap();
+                    (conversation_id, bridge, spec)
+                })
+            };
+            let first = launch("conversation-one", barrier.clone());
+            let second = launch("conversation-two", barrier);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let config_dir = pi_mcp_config_dir(data_dir.path(), "エリ-pi");
+        let config_for = |conversation_id: &str| {
+            let scope_hash = format!("{:x}", Sha256::digest(conversation_id.as_bytes()));
+            config_dir
+                .join("processes")
+                .join(scope_hash)
+                .join("config.json")
+        };
+        for (conversation_id, bridge, spec) in [&first, &second] {
+            let config: Value =
+                serde_json::from_slice(&std::fs::read(config_for(conversation_id)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                config["mcpServers"]["xpressclaw"]["env"]["XPRESSCLAW_CONVERSATION_ID"],
+                *conversation_id
+            );
+            assert_eq!(bridge.process_environment.len(), 1);
+            assert!(bridge.process_environment[0].contains("/processes/"));
+            assert!(spec
+                .environment
+                .contains(&format!("XPRESSCLAW_PI_MCP_CONFIG={PI_MCP_CONFIG_TARGET}")));
+        }
+        assert_ne!(first.1.process_environment, second.1.process_environment);
+        assert_eq!(
+            container_spec_fingerprint(&first.2).unwrap(),
+            container_spec_fingerprint(&second.2).unwrap()
+        );
+        let bootstrap: Value =
+            serde_json::from_slice(&std::fs::read(config_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(bootstrap["mcpServers"], json!({}));
     }
 
     #[cfg(windows)]
@@ -2822,7 +3646,8 @@ mod tests {
             ..Default::default()
         };
 
-        let error = configure_pi_mcp_bridge(data_dir.path(), "pi", &[], &mut spec).unwrap_err();
+        let error =
+            configure_pi_mcp_bridge(data_dir.path(), "pi", None, &[], &mut spec).unwrap_err();
         assert!(error
             .to_string()
             .contains("reserves container mount target"));
@@ -3354,8 +4179,7 @@ mod tests {
         let mut environment = vec!["HOME=/home/node".to_string()];
 
         assert!(
-            configure_bundled_github_mcp(&runner, "codex", true, true, true, &mut environment)
-                .unwrap()
+            configure_bundled_github_mcp(&runner, "codex", true, true, &mut environment).unwrap()
         );
         let config: Value = serde_json::from_str(
             environment
@@ -3379,7 +4203,6 @@ mod tests {
             "codex",
             true,
             false,
-            true,
             &mut custom_image_environment
         )
         .unwrap());
@@ -3390,7 +4213,6 @@ mod tests {
             &runner,
             "codex",
             false,
-            true,
             true,
             &mut missing_access_environment
         )
@@ -3406,10 +4228,35 @@ mod tests {
             "codex",
             true,
             true,
-            true,
             &mut configured_environment
         )
         .unwrap());
+    }
+
+    #[test]
+    fn codex_github_guidance_keeps_the_shared_container_lane_neutral() {
+        let runner = NativeRunnerConfig::default();
+        let mut task = ContainerSpec::default();
+        let mut conversation = ContainerSpec::default();
+
+        assert!(
+            configure_bundled_github_mcp(&runner, "codex", true, true, &mut task.environment,)
+                .unwrap()
+        );
+        assert!(configure_bundled_github_mcp(
+            &runner,
+            "codex",
+            true,
+            true,
+            &mut conversation.environment,
+        )
+        .unwrap());
+
+        assert_eq!(task.environment, conversation.environment);
+        assert_eq!(
+            container_spec_fingerprint(&task).unwrap(),
+            container_spec_fingerprint(&conversation).unwrap()
+        );
     }
 
     #[test]
@@ -3667,9 +4514,14 @@ mod tests {
                 title: "Resume the DGX experiment".into(),
                 description: Some("Inspect the results and continue the active goal.".into()),
                 continuation_task_id: Some(original.id.clone()),
+                conversation_id: None,
             })
             .unwrap();
-        let wakeup_task = schedules.trigger(&wakeup.id, &board).unwrap();
+        let wakeup_task = schedules
+            .trigger(&wakeup.id, &board)
+            .unwrap()
+            .into_task()
+            .unwrap();
         let wakeup_item = queue
             .list(Some("dgx-codex"), Some("queued"), 10)
             .unwrap()
@@ -3841,12 +4693,22 @@ mod tests {
     #[test]
     fn native_results_return_to_conversation_history() {
         let db = Arc::new(Database::open_memory().unwrap());
+        let registry = crate::agents::registry::AgentRegistry::new(db.clone());
+        registry.ensure("atlas", "generic").unwrap();
+        registry.ensure("reviewer", "generic").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE agents SET project_id = 'atlas' WHERE id = 'reviewer'",
+                [],
+            )
+        })
+        .unwrap();
         let conversations = ConversationManager::new(db.clone());
         let conversation = conversations
             .create(&crate::conversations::CreateConversation {
                 title: Some("Native session".to_string()),
                 icon: None,
-                participant_ids: vec!["atlas".to_string()],
+                participant_ids: vec!["atlas".to_string(), "reviewer".to_string()],
             })
             .unwrap();
         let task = TaskBoard::new(db.clone())
@@ -3870,7 +4732,7 @@ mod tests {
             &Arc::new(ConversationEventBus::new()),
             &item,
             "Atlas",
-            "Native result",
+            "@[AGENT:reviewer:Reviewer] Native result",
         );
 
         let messages = conversations
@@ -3878,6 +4740,19 @@ mod tests {
             .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].sender_type, "agent");
-        assert_eq!(messages[0].content, "Native result");
+        assert_eq!(messages[0].message_type, "task_result");
+        assert_eq!(
+            messages[0].linked_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        assert_eq!(
+            messages[0].content,
+            "@[AGENT:reviewer:Reviewer] Native result"
+        );
+        let turns = ConversationTurnQueue::new(db)
+            .list_for_conversation(&conversation.id, 10)
+            .unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].agent_id, "reviewer");
     }
 }

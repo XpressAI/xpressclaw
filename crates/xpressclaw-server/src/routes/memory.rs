@@ -165,15 +165,18 @@ mod tests {
 
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
-    use xpressclaw_core::sessions::SessionManager;
 
     use super::*;
 
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
-        let sessions = SessionManager::new(db.clone());
-        sessions.ensure("alpha", Some("Alpha")).unwrap();
-        sessions.ensure("beta", Some("Beta")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('alpha', 'Alpha');
+                 INSERT INTO projects (id, name) VALUES ('beta', 'Beta');",
+            )
+        })
+        .unwrap();
         let state = AppState::new(
             Arc::new(Config::load_default().unwrap()),
             db,

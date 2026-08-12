@@ -9,6 +9,7 @@ use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
+use xpressclaw_core::workers::native::ConversationAcpProcesses;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -34,6 +35,8 @@ pub struct AppState {
     pub elicitations: Arc<AcpElicitationBroker>,
     /// Live signals that let queued user guidance interrupt an ACP prompt.
     pub turn_controls: Arc<AcpTurnControlBroker>,
+    /// Retained per-Conversation ACP lanes shared with the native dispatcher.
+    pub conversation_processes: Arc<ConversationAcpProcesses>,
 }
 
 impl AppState {
@@ -58,6 +61,7 @@ impl AppState {
             docker: Arc::new(RwLock::new(None)),
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
+            conversation_processes: Arc::new(ConversationAcpProcesses::default()),
         }
     }
 

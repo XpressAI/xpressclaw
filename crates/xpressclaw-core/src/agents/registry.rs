@@ -13,6 +13,9 @@ pub struct AgentRecord {
     pub id: String,
     pub name: String,
     pub backend: String,
+    /// Project that owns this Agent's conversations, tasks, and retained
+    /// workspace. Existing installations receive one project per Agent.
+    pub project_id: Option<String>,
     /// Old status column — will be removed once all callers migrate.
     pub status: String,
     pub container_id: Option<String>,
@@ -54,10 +57,64 @@ impl AgentRegistry {
     pub fn ensure(&self, name: &str, backend: &str) -> Result<AgentRecord> {
         self.db.with_conn(|conn| {
             conn.execute(
-                "INSERT OR IGNORE INTO agents (id, name, backend, config, status)
-                 VALUES (?1, ?2, ?3, '{}', 'stopped')",
+                "INSERT OR IGNORE INTO projects (id, name, description)
+                 SELECT ?1, ?1, 'Created with this Agent'
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM agents WHERE id = ?1 AND project_id IS NOT NULL
+                 )",
+                [name],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, backend, config, status, project_id)
+                 VALUES (?1, ?2, ?3, '{}', 'stopped', ?1)",
                 rusqlite::params![name, name, backend],
+            )?;
+            conn.execute(
+                "UPDATE agents SET project_id = COALESCE(project_id, ?1) WHERE id = ?1",
+                [name],
             )
+        })?;
+        self.get(name)
+    }
+
+    /// Create a new Agent directly inside an existing Project.
+    ///
+    /// Reserving the SQLite writer before validating the Project keeps Project
+    /// deletion from committing between validation and Agent attachment. This
+    /// deliberately uses `INSERT`, not `INSERT OR IGNORE`: callers creating a
+    /// new configured Agent must not silently adopt an unrelated stale row.
+    pub fn create_in_project(
+        &self,
+        name: &str,
+        backend: &str,
+        project_id: &str,
+    ) -> Result<AgentRecord> {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+                [project_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !project_exists {
+                return Err(Error::ProjectNotFound {
+                    id: project_id.to_string(),
+                });
+            }
+            transaction.execute(
+                "INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES (?1, ?1, ?2, '{}', 'stopped', ?3)",
+                rusqlite::params![name, backend, project_id],
+            )?;
+            transaction.execute(
+                "UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [project_id],
+            )?;
+            transaction.commit()?;
+            Ok::<(), Error>(())
         })?;
         self.get(name)
     }
@@ -65,7 +122,7 @@ impl AgentRegistry {
     pub fn get(&self, agent_id: &str) -> Result<AgentRecord> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, backend, status, container_id, created_at,
+                "SELECT id, name, backend, project_id, status, container_id, created_at,
                         started_at, stopped_at, error_message,
                         desired_status, restart_count, last_attempt_at,
                         idle_count, last_idle_check
@@ -76,17 +133,18 @@ impl AgentRegistry {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     backend: row.get(2)?,
-                    status: row.get(3)?,
-                    container_id: row.get(4)?,
-                    created_at: row.get(5)?,
-                    started_at: row.get(6)?,
-                    stopped_at: row.get(7)?,
-                    error_message: row.get(8)?,
-                    desired_status: row.get(9)?,
-                    restart_count: row.get(10)?,
-                    last_attempt_at: row.get(11)?,
-                    idle_count: row.get(12)?,
-                    last_idle_check: row.get(13)?,
+                    project_id: row.get(3)?,
+                    status: row.get(4)?,
+                    container_id: row.get(5)?,
+                    created_at: row.get(6)?,
+                    started_at: row.get(7)?,
+                    stopped_at: row.get(8)?,
+                    error_message: row.get(9)?,
+                    desired_status: row.get(10)?,
+                    restart_count: row.get(11)?,
+                    last_attempt_at: row.get(12)?,
+                    idle_count: row.get(13)?,
+                    last_idle_check: row.get(14)?,
                 })
             });
             match record {
@@ -101,7 +159,7 @@ impl AgentRegistry {
     pub fn list(&self) -> Result<Vec<AgentRecord>> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, name, backend, status, container_id, created_at,
+                "SELECT id, name, backend, project_id, status, container_id, created_at,
                         started_at, stopped_at, error_message,
                         desired_status, restart_count, last_attempt_at,
                         idle_count, last_idle_check
@@ -113,17 +171,18 @@ impl AgentRegistry {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         backend: row.get(2)?,
-                        status: row.get(3)?,
-                        container_id: row.get(4)?,
-                        created_at: row.get(5)?,
-                        started_at: row.get(6)?,
-                        stopped_at: row.get(7)?,
-                        error_message: row.get(8)?,
-                        desired_status: row.get(9)?,
-                        restart_count: row.get(10)?,
-                        last_attempt_at: row.get(11)?,
-                        idle_count: row.get(12)?,
-                        last_idle_check: row.get(13)?,
+                        project_id: row.get(3)?,
+                        status: row.get(4)?,
+                        container_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                        started_at: row.get(7)?,
+                        stopped_at: row.get(8)?,
+                        error_message: row.get(9)?,
+                        desired_status: row.get(10)?,
+                        restart_count: row.get(11)?,
+                        last_attempt_at: row.get(12)?,
+                        idle_count: row.get(13)?,
+                        last_idle_check: row.get(14)?,
                     })
                 })
                 .map_err(|e| Error::Database(e.to_string()))?
@@ -195,8 +254,59 @@ impl AgentRegistry {
     }
 
     pub fn delete(&self, agent_id: &str) -> Result<()> {
-        self.db
-            .with_conn(|conn| conn.execute("DELETE FROM agents WHERE id = ?1", [agent_id]))?;
+        self.delete_with_running_conversation_turns(agent_id, |_| {})
+    }
+
+    /// Make every live Conversation turn unpublishable and notify the caller
+    /// before deleting the Agent. The callback runs while the write
+    /// transaction is held, after turn cancellation but before cascading
+    /// deletion, so the server can interrupt retained ACP processes without a
+    /// late response racing Agent deletion.
+    pub fn delete_with_running_conversation_turns<F>(
+        &self,
+        agent_id: &str,
+        mut before_delete: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str),
+    {
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut statement = transaction.prepare(
+                "SELECT id FROM conversation_turns
+                 WHERE agent_id = ?1 AND status = 'running'",
+            )?;
+            let running_turns = statement
+                .query_map([agent_id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            transaction.execute(
+                "UPDATE conversation_turns
+                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                     error_message = 'Agent deleted'
+                 WHERE agent_id = ?1 AND status IN ('queued', 'running')",
+                [agent_id],
+            )?;
+            for turn_id in &running_turns {
+                before_delete(turn_id);
+            }
+            // Participant identities are polymorphic, so the original table
+            // cannot express an Agent foreign key. Remove those memberships
+            // and schedules explicitly before the Agent-owned session/turn
+            // rows cascade. Reserving the writer first prevents a wake-up from
+            // being created after cleanup but before the Agent disappears.
+            transaction.execute(
+                "DELETE FROM conversation_participants
+                 WHERE participant_type = 'agent' AND participant_id = ?1",
+                [agent_id],
+            )?;
+            transaction.execute("DELETE FROM schedules WHERE agent_id = ?1", [agent_id])?;
+            transaction.execute("DELETE FROM agents WHERE id = ?1", [agent_id])?;
+            transaction.commit()
+        })?;
         Ok(())
     }
 
@@ -298,6 +408,83 @@ mod tests {
     }
 
     #[test]
+    fn ensuring_an_agent_in_a_shared_project_does_not_recreate_its_old_project() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('shared', 'Shared')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'shared')",
+                [],
+            )
+        })
+        .unwrap();
+        let registry = AgentRegistry::new(db.clone());
+
+        let agent = registry.ensure("atlas", "native").unwrap();
+
+        assert_eq!(agent.project_id.as_deref(), Some("shared"));
+        let shadow_project: bool = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = 'atlas')",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert!(!shadow_project);
+    }
+
+    #[test]
+    fn creating_an_agent_reserves_its_existing_project_and_fails_closed() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('shared', 'Shared')",
+                [],
+            )
+        })
+        .unwrap();
+        let registry = AgentRegistry::new(db.clone());
+
+        let agent = registry
+            .create_in_project("reviewer", "codex", "shared")
+            .unwrap();
+        assert_eq!(agent.project_id.as_deref(), Some("shared"));
+        let shadow_project = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = 'reviewer')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(!shadow_project);
+
+        let missing = registry.create_in_project("orphan", "codex", "deleted");
+        assert!(matches!(missing, Err(Error::ProjectNotFound { .. })));
+        assert!(matches!(
+            registry.get("orphan"),
+            Err(Error::AgentNotFound { .. })
+        ));
+        let orphan_project = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = 'orphan')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(!orphan_project);
+    }
+
+    #[test]
     fn test_update_status() {
         let db = Arc::new(Database::open_memory().unwrap());
         let registry = AgentRegistry::new(db);
@@ -332,11 +519,68 @@ mod tests {
     #[test]
     fn test_delete_agent() {
         let db = Arc::new(Database::open_memory().unwrap());
-        let registry = AgentRegistry::new(db);
+        let registry = AgentRegistry::new(db.clone());
 
         registry.ensure("atlas", "generic").unwrap();
-        registry.delete("atlas").unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('shared', 'Shared', 'atlas')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO conversation_participants
+                 (conversation_id, participant_type, participant_id)
+                 VALUES ('shared', 'agent', 'atlas')",
+                [],
+            )
+        })
+        .unwrap();
+        let schedules = crate::tasks::scheduler::ScheduleManager::new(db.clone());
+        let wakeup = schedules
+            .create_one_shot(&crate::tasks::scheduler::CreateOneShotSchedule {
+                name: "Check the room".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Check the room".into(),
+                description: Some("Return to the conversation.".into()),
+                continuation_task_id: None,
+                conversation_id: Some("shared".into()),
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversation_turns
+                 (id, conversation_id, agent_id, status, started_at)
+                 VALUES ('running-turn', 'shared', 'atlas', 'running', CURRENT_TIMESTAMP)",
+                [],
+            )
+        })
+        .unwrap();
+        let mut interrupted = Vec::new();
+        registry
+            .delete_with_running_conversation_turns("atlas", |turn_id| {
+                interrupted.push(turn_id.to_string())
+            })
+            .unwrap();
+        assert_eq!(interrupted, ["running-turn"]);
         assert!(registry.get("atlas").is_err());
+        assert!(matches!(
+            schedules.get(&wakeup.id),
+            Err(Error::ScheduleNotFound { .. })
+        ));
+        let memberships: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM conversation_participants
+                     WHERE participant_type = 'agent' AND participant_id = 'atlas'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(memberships, 0);
     }
 
     #[test]

@@ -5,17 +5,21 @@
 // local API or allowing work to be scheduled for another project.
 
 import { createInterface } from 'node:readline';
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const BASE_URL = (process.env.XPRESSCLAW_URL ?? '').replace(/\/$/, '');
 const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
+const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
+const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
 
 const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume later.
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
-XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.`;
+XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Use send_conversation_message for useful updates or workspace files, download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
 
 export const TOOLS = [
   {
@@ -253,6 +257,76 @@ export const TOOLS = [
       openWorldHint: false,
     },
   },
+  ...(CONVERSATION_ID ? [
+    {
+      name: 'send_conversation_message',
+      description: 'Send an update to the current XpressClaw conversation while you continue working. Optionally publish files from /workspace as durable conversation attachments.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', maxLength: 100000 },
+          files: {
+            type: 'array',
+            maxItems: 10,
+            items: { type: 'string', minLength: 1 },
+            description: 'Absolute /workspace paths or paths relative to /workspace.',
+            default: [],
+          },
+        },
+        additionalProperties: false,
+      },
+      annotations: {
+        title: 'Message project conversation',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+	{
+	  name: 'download_conversation_attachment',
+	  description: 'Download a file published in the current conversation into a private .xpressclaw/conversations directory in the workspace so you can inspect it with ordinary tools.',
+	  inputSchema: {
+		type: 'object',
+		properties: {
+		  attachment_id: { type: 'string', minLength: 1 },
+		  file_name: { type: 'string', minLength: 1, description: 'Optional display filename from the conversation. Directory components are ignored.' },
+		},
+		required: ['attachment_id'],
+		additionalProperties: false,
+	  },
+	  annotations: {
+		title: 'Download conversation file',
+		readOnlyHint: false,
+		destructiveHint: false,
+		idempotentHint: true,
+		openWorldHint: false,
+	  },
+	},
+    {
+      name: 'create_conversation_task',
+      description: 'Create a durable task for yourself from the current conversation when the request needs substantial work. The task runs independently and reports its result back here.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 300 },
+          description: { type: 'string', maxLength: 100000 },
+          priority: { type: 'integer', minimum: 0, maximum: 3, default: 0 },
+          workflow_id: { type: 'string', minLength: 1 },
+          workflow_inputs: { type: 'object', default: {} },
+        },
+        required: ['title'],
+        additionalProperties: false,
+      },
+      annotations: {
+        title: 'Continue with task',
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+  ] : []),
 ];
 
 const MEMORY_RESOURCE_ANNOTATIONS = {
@@ -323,7 +397,7 @@ async function wakeups() {
 }
 
 function memoryPath(path = '') {
-  return `/api/memory/${encodeURIComponent(AGENT_ID)}${path}`;
+  return `/api/memory/${encodeURIComponent(PROJECT_ID || AGENT_ID)}${path}`;
 }
 
 async function projectMemoryIndex(options = {}) {
@@ -460,7 +534,11 @@ export function memoryResourceTemplates() {
 
 export function buildWakeupRequest(
   argumentsValue,
-  { agentId = AGENT_ID, taskId = TASK_ID } = {},
+  {
+    agentId = AGENT_ID,
+    taskId = TASK_ID,
+    conversationId = CONVERSATION_ID,
+  } = {},
 ) {
   const args = argumentsValue ?? {};
   const hasDelay = Object.hasOwn(args, 'delay_seconds');
@@ -487,6 +565,7 @@ export function buildWakeupRequest(
     title: name,
     description: args.message.trim(),
     ...(taskId ? { continuation_task_id: taskId } : {}),
+    ...(!taskId && conversationId ? { conversation_id: conversationId } : {}),
     ...(hasDelay ? { delay_seconds: args.delay_seconds } : { run_at: args.run_at.trim() }),
   };
 }
@@ -503,6 +582,7 @@ async function scheduleWakeup(argumentsValue) {
     run_at: schedule.run_at,
     project: AGENT_ID,
     task: TASK_ID || null,
+    conversation: TASK_ID ? null : CONVERSATION_ID || null,
     message: 'XpressClaw will initiate the future turn. End this turn instead of waiting or polling.',
   };
 }
@@ -578,6 +658,104 @@ async function archiveProjectMemory(argumentsValue) {
   });
 }
 
+function conversationPath(suffix = '') {
+  if (!CONVERSATION_ID) throw new Error('this turn is not attached to an XpressClaw conversation');
+  return `/api/conversations/${encodeURIComponent(CONVERSATION_ID)}${suffix}`;
+}
+
+function attachmentMime(filename) {
+  const extension = path.extname(filename).toLowerCase();
+  return ({
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+    '.webp': 'image/webp', '.svg': 'image/svg+xml', '.pdf': 'application/pdf',
+    '.json': 'application/json', '.md': 'text/markdown', '.txt': 'text/plain',
+    '.csv': 'text/csv', '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+    '.ts': 'text/typescript', '.py': 'text/x-python', '.rs': 'text/x-rust',
+  })[extension] ?? 'application/octet-stream';
+}
+
+async function conversationAttachment(filename) {
+	const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requested = path.isAbsolute(filename) ? filename : path.join(workspace, filename);
+  const resolved = await realpath(requested);
+  if (resolved !== workspace && !resolved.startsWith(`${workspace}${path.sep}`)) {
+    throw new Error(`conversation files must be inside /workspace: ${filename}`);
+  }
+  const details = await stat(resolved);
+  if (!details.isFile()) throw new Error(`conversation attachment is not a regular file: ${filename}`);
+  if (details.size > 20 * 1024 * 1024) throw new Error(`conversation attachment exceeds 20 MiB: ${filename}`);
+  const data = await readFile(resolved);
+  return {
+    name: path.basename(resolved),
+    mime_type: attachmentMime(resolved),
+    data: data.toString('base64'),
+  };
+}
+
+async function sendConversationMessage(argumentsValue) {
+  const content = String(argumentsValue?.content ?? '');
+  const files = Array.isArray(argumentsValue?.files) ? argumentsValue.files : [];
+  if (!content.trim() && files.length === 0) throw new Error('content or files is required');
+  const attachments = await Promise.all(files.map(conversationAttachment));
+  return api(conversationPath('/agent-messages'), {
+    method: 'POST',
+    body: JSON.stringify({
+      agent_id: AGENT_ID,
+      content,
+      attachments,
+      ...(TASK_ID ? { source_task_id: TASK_ID } : {}),
+    }),
+  });
+}
+
+async function downloadConversationAttachment(argumentsValue) {
+  const attachmentId = String(argumentsValue?.attachment_id ?? '').trim();
+  if (!attachmentId) throw new Error('attachment_id must be a non-empty string');
+  requireConfiguration();
+  const response = await fetch(`${BASE_URL}${conversationPath(`/attachments/${encodeURIComponent(attachmentId)}`)}`);
+  if (!response.ok) {
+	const detail = await response.text();
+	throw new Error(detail || `conversation attachment download failed with HTTP ${response.status}`);
+  }
+  const data = Buffer.from(await response.arrayBuffer());
+  if (data.length > 20 * 1024 * 1024) throw new Error('conversation attachment exceeds 20 MiB');
+
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requestedName = path.basename(String(argumentsValue?.file_name ?? 'attachment'));
+  const safeName = requestedName && requestedName !== '.' && requestedName !== '..'
+	? requestedName.replaceAll(/[^\p{L}\p{N}._ -]/gu, '_')
+	: 'attachment';
+  const safeId = attachmentId.replaceAll(/[^A-Za-z0-9._-]/g, '_');
+  const directory = path.join(workspace, '.xpressclaw', 'conversations', CONVERSATION_ID);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const destination = path.join(directory, `${safeId}-${safeName}`);
+  await writeFile(destination, data, { mode: 0o600 });
+  return {
+	attachment_id: attachmentId,
+	path: destination,
+	size: data.length,
+	mime_type: response.headers.get('content-type') ?? 'application/octet-stream',
+  };
+}
+
+async function createConversationTask(argumentsValue) {
+  const title = String(argumentsValue?.title ?? '').trim();
+  if (!title) throw new Error('title must be a non-empty string');
+  return api(conversationPath('/tasks'), {
+    method: 'POST',
+    body: JSON.stringify({
+      title,
+      description: argumentsValue?.description,
+      agent_id: AGENT_ID,
+      creator_agent_id: AGENT_ID,
+      priority: argumentsValue?.priority,
+      workflow_id: argumentsValue?.workflow_id,
+      workflow_inputs: argumentsValue?.workflow_inputs ?? {},
+      project_id: PROJECT_ID || undefined,
+    }),
+  });
+}
+
 async function callTool(name, argumentsValue) {
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
@@ -589,6 +767,9 @@ async function callTool(name, argumentsValue) {
   if (name === 'update_project_memory') return updateProjectMemory(argumentsValue);
   if (name === 'link_project_memories') return linkProjectMemories(argumentsValue);
   if (name === 'archive_project_memory') return archiveProjectMemory(argumentsValue);
+  if (name === 'send_conversation_message') return sendConversationMessage(argumentsValue);
+  if (name === 'download_conversation_attachment') return downloadConversationAttachment(argumentsValue);
+  if (name === 'create_conversation_task') return createConversationTask(argumentsValue);
   throw new Error(`unknown tool: ${name ?? ''}`);
 }
 

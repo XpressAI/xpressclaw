@@ -1,8 +1,10 @@
 # Workflows
 
-Workflows coordinate reusable steps across one or more agents. Each run is a
-durable workflow instance; task steps enter the normal agent queue and their
-declared outputs become available to later steps.
+Workflows coordinate reusable steps across one or more Agents. Each run is a
+durable workflow instance; task steps enter the normal Agent queue and their
+declared outputs become available to later steps. A run can be independent or
+bound to a Project Conversation, in which case its Tasks and results remain
+linked to that shared context.
 
 ## Run a workflow
 
@@ -23,7 +25,7 @@ inputs:
     type: json
   worker:
     type: agent
-    description: Project context that creates the report.
+    description: Agent that creates the report.
     required: true
     primary: true
 
@@ -44,7 +46,8 @@ defaults and existing definitions.
 
 An `agent` input is a reusable role. Task and wait blocks reference it as
 `agent: "@role_name"`; each run binds that role to any configured XpressClaw
-agent/project context. Mark one role `primary: true` to connect it to New Work's
+Agent. When a run is bound to a Project, every selected role must belong to
+that Project. Mark one role `primary: true` to connect it to New Work's
 main Agent picker. Other roles (for example, an independent reviewer) receive
 their own picker. A literal agent ID remains supported for intentionally fixed
 workflows.
@@ -61,6 +64,15 @@ every other required input is either an `agent` role or has a default. The main
 Agent picker binds the primary role, and additional required agent roles appear
 beside the composer. Workflows with other required inputs remain available from
 **Automations**, where the full typed run form collects them.
+
+### Run a workflow in a Conversation
+
+Open a Project Conversation and choose **Continue with task**, then select a
+workflow. The same form collects its typed inputs and binds the workflow
+instance to both the Project and Conversation. Each task step links back to the
+Conversation, and Agent results are published there as they complete. The
+workflow definition remains reusable: running it from another Conversation
+creates a new instance with that Conversation's Project boundary.
 
 ## Wait for an external event
 
@@ -149,5 +161,6 @@ occurrence twice. The Automations page shows the latest trigger error so a bad
 agent or workspace configuration does not fail silently.
 
 Connector-backed triggers and notification sinks from legacy workflow files
-remain readable but disabled. They will return with channels, which need a
-separate event and conversation model.
+remain readable but disabled. Project Conversations now provide the durable
+human/Agent coordination surface; future connector events and sinks can target
+that model without changing workflow-instance ownership.
