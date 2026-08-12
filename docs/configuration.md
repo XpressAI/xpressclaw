@@ -6,6 +6,12 @@ memory, and workspace configuration while its replaceable ACP harness owns
 reasoning, tools, and subagents. Xpressclaw does not define a persona or system
 prompt for the harness.
 
+This local `xpressclaw.yaml` is distinct from the optional
+`.xpressclaw.yml` Project synchronization manifest. The latter is a small,
+portable pointer to a separate Git store and must never contain credentials or
+machine-specific runner settings. See [Git-backed Project
+synchronization](project-sync.md).
+
 `xpressclaw init` writes an empty starting point:
 
 ```yaml

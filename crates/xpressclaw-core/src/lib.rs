@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod runtime;
+pub mod sync;
 pub mod system;
 
 pub mod activity;

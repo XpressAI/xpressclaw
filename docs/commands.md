@@ -2,7 +2,9 @@
 
 The xpressclaw CLI manages the local control-plane process. Product operations
 such as messages, tasks, schedules, workflows, and runner configuration belong
-in the web UI and REST API rather than a second command interface.
+in the web UI and REST API. Git-backed Project synchronization is the explicit
+exception: it uses the `sync` commands below and never runs during ordinary
+Project updates.
 
 ## `xpressclaw init`
 
@@ -50,6 +52,24 @@ containers remain stopped on disk for the next launch.
 xpressclaw down
 xpressclaw down --port 9000
 ```
+
+## `xpressclaw sync`
+
+Create a portable `.xpressclaw.yml` pointer, fetch shared Project state, or
+publish local portable state through a separate Git repository:
+
+```bash
+xpressclaw sync init --project-id <id> --remote git@github.com:org/data.git
+xpressclaw sync fetch
+xpressclaw sync publish
+```
+
+The main project need not be a Git repository. Use `--project-dir` to locate
+its manifest and `--workdir` to locate the local `xpressclaw.yaml`; they may be
+different directories. Fetch and publish require Git and use local SSH-agent or
+credential-helper credentials. See [Git-backed Project
+synchronization](project-sync.md) for the schema, conflict behavior, portable
+data boundary, and security model.
 
 ## Removed legacy commands
 
