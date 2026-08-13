@@ -83,6 +83,7 @@ async fn fetch_project(
     request: Option<Json<FetchRequest>>,
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
+    let _config_guard = state.config_write_lock.lock().await;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config_path = state.config_path.clone();
@@ -113,6 +114,7 @@ async fn publish_project(
     AxumPath(project_id): AxumPath<String>,
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
+    let _config_guard = state.config_write_lock.lock().await;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config = state.config();
@@ -266,7 +268,7 @@ fn project_workspaces(state: &AppState, project_id: &str) -> Result<Vec<PathBuf>
     let names = records
         .iter()
         .filter(|record| record.project_id.as_deref() == Some(project_id))
-        .map(|record| record.name.as_str())
+        .map(|record| record.id.as_str())
         .collect::<HashSet<_>>();
     let config = state.config();
     let workspaces = config
@@ -358,7 +360,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO agents (id, name, backend, config, project_id)
-                 VALUES ('agent-one', 'agent-one', 'codex', '{}', 'project-one')",
+                 VALUES ('agent-one', 'Agent One', 'codex', '{}', 'project-one')",
                 [],
             )
             .unwrap();

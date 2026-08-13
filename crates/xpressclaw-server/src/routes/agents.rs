@@ -138,6 +138,7 @@ async fn delete_agent(
         // environment (and also removes a pre-ADR-025 legacy container).
         let _ = docker.stop(&id).await;
     }
+    let _config_guard = state.config_write_lock.lock().await;
     registry
         .delete_with_running_conversation_turns(&id, |turn_id| {
             state
@@ -239,6 +240,7 @@ async fn update_agent_config(
     Path(id): Path<String>,
     Json(req): Json<UpdateAgentConfigRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let registry = AgentRegistry::new(state.db.clone());
     let record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
