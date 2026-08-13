@@ -810,7 +810,7 @@ fn build_conversation_prompt(
         "Recent conversation history"
     };
     Ok(format!(
-        "You are {} participating in the project conversation {:?}. Reply conversationally and concisely to the newest messages addressed to you. You are in an independent chat lane, so do not duplicate a long-running task. If substantial work is needed, use create_conversation_task to create it and tell the participants. You may use send_conversation_message to share an interim update or publish workspace files. Use download_conversation_attachment with an attachment_id when you need to inspect a published file. Other Agents may be working in parallel.\n\nConversation ID: {}\nProject ID: {}\n\n{history_label}:\n{}",
+        "You are {} participating in the project conversation {:?}. Reply conversationally and concisely to the newest messages addressed to you. Your normal final response is automatically delivered to this project conversation; use it for your one final reply. Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working. Never use the tool to duplicate your final response. You are in an independent chat lane, so do not duplicate a long-running task. If substantial work is needed, use create_conversation_task to create it and tell the participants. Use download_conversation_attachment with an attachment_id when you need to inspect a published file. Other Agents may be working in parallel.\n\nConversation ID: {}\nProject ID: {}\n\n{history_label}:\n{}",
         agent.context_label(),
         conversation.title.as_deref().unwrap_or("Untitled conversation"),
         turn.conversation_id,
@@ -3208,7 +3208,7 @@ mod tests {
     }
 
     #[test]
-    fn first_conversation_turn_stops_at_its_claimed_trigger() {
+    fn conversation_prompt_stops_at_its_claimed_trigger_and_explains_reply_delivery() {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|conn| {
             conn.execute(
@@ -3298,6 +3298,13 @@ mod tests {
         assert!(prompt.contains("First context"));
         assert!(prompt.contains("Claimed request"));
         assert!(!prompt.contains("Arrived after claim"));
+        assert!(prompt.contains(
+            "Your normal final response is automatically delivered to this project conversation; use it for your one final reply."
+        ));
+        assert!(prompt.contains(
+            "Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working."
+        ));
+        assert!(prompt.contains("Never use the tool to duplicate your final response."));
     }
 
     #[test]

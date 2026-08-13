@@ -19,7 +19,7 @@ const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume la
 
 The wake-up is stored by XpressClaw, survives control-plane restarts, and starts exactly one future turn in this project's existing ACP conversation. After it is armed, end the current turn instead of sleeping, polling, or claiming that an OS timer can initiate a model turn.
 
-XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Use send_conversation_message for useful updates or workspace files, download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
+XpressClaw also provides durable, project-scoped memory. Read memory://project/briefing or call get_project_memory_index near the start of work that depends on project conventions or prior decisions. Search before making a project-wide choice. Store only durable, reusable knowledge as an atomic note; do not use memory as a task log. Typed links are explicit claims, while vector similarity is only a retrieval aid.${CONVERSATION_ID ? '\n\nThis turn is linked to a project conversation. Your normal final response is automatically delivered to this project conversation; use it for your one final reply. Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working. Never use the tool to duplicate your final response. Use download_conversation_attachment to inspect files people or other Agents published, and create_conversation_task when substantial work should continue independently.' : ''}`;
 
 export const TOOLS = [
   {
@@ -260,7 +260,7 @@ export const TOOLS = [
   ...(CONVERSATION_ID ? [
     {
       name: 'send_conversation_message',
-      description: 'Send an update to the current XpressClaw conversation while you continue working. Optionally publish files from /workspace as durable conversation attachments.',
+      description: 'Send a genuine interim update or publish workspace files to the current XpressClaw conversation while continuing work. Your normal final response is delivered automatically; never use this tool to duplicate it.',
       inputSchema: {
         type: 'object',
         properties: {

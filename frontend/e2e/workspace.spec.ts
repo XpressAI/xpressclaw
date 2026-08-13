@@ -138,6 +138,9 @@ async function mockApi(
 		conversationMessages?: Record<string, unknown>[];
 		conversationMessageRequests?: Record<string, unknown>[];
 		conversationTaskRequests?: Record<string, unknown>[];
+		projectSyncStatuses?: Record<string, unknown>[];
+		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
+		projectSyncFetchConflictOnce?: boolean;
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -145,6 +148,7 @@ async function mockApi(
 	let createdWorkflow: Record<string, unknown> | null = null;
 	let workspaceFileContent = 'export const greeting = "hello";\n';
 	let workspaceFileRevision = 'revision-before-save';
+	let projectSyncConflictReturned = false;
 	const status = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed';
 	const attemptStatus = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'running' : 'completed';
 	const firstAnswer = options.agentResponseLinks
@@ -301,6 +305,30 @@ async function mockApi(
 				status: 'ready',
 				message: 'The MCP endpoint accepted a protocol verification request.',
 				suggestion: null,
+			};
+		} else if (path === '/api/settings/sync') {
+			response = { projects: options.projectSyncStatuses ?? [] };
+		} else if (/^\/api\/settings\/sync\/[^/]+\/(fetch|publish)$/.test(path)) {
+			const parts = path.split('/');
+			const projectId = decodeURIComponent(parts[4]);
+			const operation = parts[5] as 'fetch' | 'publish';
+			const payload = (request.postDataJSON() ?? {}) as { force?: boolean };
+			const force = operation === 'fetch' && payload.force === true;
+			options.projectSyncRequests?.push({ projectId, operation, force });
+			if (operation === 'fetch' && options.projectSyncFetchConflictOnce && !force && !projectSyncConflictReturned) {
+				projectSyncConflictReturned = true;
+				await route.fulfill({
+					status: 409,
+					contentType: 'application/json',
+					body: JSON.stringify({ error: 'project synchronization error: this is the first fetch for a populated local Project; rerun with --force to acknowledge a non-destructive merge' }),
+				});
+				return;
+			}
+			response = {
+				action: operation,
+				project_id: projectId,
+				commit: operation === 'fetch' ? '12345678fetch' : '87654321publish',
+				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
 			};
 		} else if (path === '/api/projects') {
 			response = availableProjects;
@@ -2049,6 +2077,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await expect(settingsSidebar).toBeVisible();
 	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
 		'P Profile',
+		'↕ Project sync',
 		'M MCP servers',
 		'S Server',
 	]);
@@ -2068,7 +2097,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(3);
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(4);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
@@ -2262,6 +2291,73 @@ test('appearance follows the saved light, dark, and system preference', async ({
 	await expect(root).toHaveClass(/dark/);
 	await page.emulateMedia({ colorScheme: 'light' });
 	await expect(root).not.toHaveClass(/dark/);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('project sync settings fetch, acknowledge conflicts, and publish explicitly', async ({ page }) => {
+	const projectSyncRequests: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[] = [];
+	await mockApi(page, {
+		projectSyncRequests,
+		projectSyncFetchConflictOnce: true,
+		projectSyncStatuses: [
+			{
+				project_id: projectId,
+				project_name: 'Browser collaboration project',
+				project_icon: null,
+				status: 'ready',
+				project_dir: '/srv/repos/xpressclaw',
+				remote: 'git@github.com:XpressAI/project-data.git',
+				branch: 'main',
+				store_path: `projects/${projectId}`,
+				share_project_memory: true,
+				last_commit: 'abcdef1234567890',
+				last_synced_at: '2026-07-19 00:01:01',
+				message: null,
+			},
+			{
+				project_id: 'project-without-manifest',
+				project_name: 'Local-only project',
+				project_icon: 'L',
+				status: 'unconfigured',
+				project_dir: '/srv/repos/local-only',
+				remote: null,
+				branch: null,
+				store_path: null,
+				share_project_memory: null,
+				last_commit: null,
+				last_synced_at: null,
+				message: 'No .xpressclaw.yml was found in this Project workspace. Run `xpressclaw sync init` there first.',
+			},
+		],
+	});
+	await page.goto('/settings/sync');
+
+	await expect(page.getByRole('heading', { name: 'Project sync' })).toBeVisible();
+	await expect(page.locator('[data-sidebar-setting="settings-sync"]')).toHaveAttribute('aria-current', 'page');
+	const ready = page.locator(`[data-project-sync="${projectId}"]`);
+	await expect(ready).toContainText('git@github.com:XpressAI/project-data.git');
+	await expect(ready).toContainText(`projects/${projectId}`);
+	await expect(ready).toContainText('Included');
+
+	const unconfigured = page.locator('[data-project-sync="project-without-manifest"]');
+	await expect(unconfigured).toContainText('Needs setup');
+	await expect(unconfigured.getByRole('button', { name: 'Fetch' })).toBeDisabled();
+	await expect(unconfigured.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+	await ready.getByRole('button', { name: 'Fetch' }).click();
+	await expect(ready).toContainText('rerun with --force');
+	await ready.getByRole('button', { name: 'Merge remote changes' }).click();
+	await expect.poll(() => projectSyncRequests).toEqual([
+		{ projectId, operation: 'fetch', force: false },
+		{ projectId, operation: 'fetch', force: true },
+	]);
+	await expect(ready).toContainText('Fetched 2 Agents, 8 tasks, 3 Conversations, and 1 workflow at 12345678.');
+
+	await ready.getByRole('button', { name: 'Publish' }).click();
+	await expect.poll(() => projectSyncRequests.at(-1)).toEqual({ projectId, operation: 'publish', force: false });
+	await expect(ready).toContainText('Published 2 Agents, 8 tasks, 3 Conversations, and 1 workflow at 87654321.');
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

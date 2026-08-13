@@ -37,6 +37,12 @@ pub struct AppState {
     pub turn_controls: Arc<AcpTurnControlBroker>,
     /// Retained per-Conversation ACP lanes shared with the native dispatcher.
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Serialize writes that replace the file-backed and in-memory
+    /// configuration so handlers cannot persist and apply stale snapshots.
+    pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize explicit Git-backed Project sync operations so fetch and
+    /// publish cannot race through the same temporary Git store state.
+    pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -62,6 +68,8 @@ impl AppState {
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
