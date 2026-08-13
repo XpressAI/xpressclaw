@@ -1044,7 +1044,7 @@ test('unsupported ACP elicitations stay visible and actionable', async ({ page }
 			requestedSchema: {
 				type: 'object',
 				properties: {
-					plugin: { type: '_codex_plugin_install', pluginId: 'figma@openai-curated-remote' },
+					plugin: { type: 'string', oneOf: [null] },
 				},
 			},
 		},

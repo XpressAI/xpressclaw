@@ -421,10 +421,32 @@
 		return typeof value === 'object' && value !== null && !Array.isArray(value);
 	}
 
+	function isElicitationOption(value: unknown): value is ElicitationOption {
+		return isRecord(value)
+			&& typeof value.const === 'string'
+			&& typeof value.title === 'string'
+			&& (value.description === undefined || typeof value.description === 'string');
+	}
+
+	function isElicitationOptionList(value: unknown): value is ElicitationOption[] {
+		return Array.isArray(value) && value.length > 0 && value.every(isElicitationOption);
+	}
+
+	function isElicitationEnum(value: unknown): value is string[] {
+		return Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string');
+	}
+
 	function isSupportedElicitationProperty(property: ElicitationProperty): boolean {
-		if (['string', 'number', 'integer', 'boolean'].includes(property.type ?? '')) return true;
-		if (property.type !== 'array') return false;
-		return Array.isArray(property.items?.anyOf) || Array.isArray(property.items?.enum);
+		if (property.type === 'string') {
+			if (property.oneOf !== undefined) return isElicitationOptionList(property.oneOf);
+			if (property.enum !== undefined) return isElicitationEnum(property.enum);
+			return true;
+		}
+		if (['number', 'integer', 'boolean'].includes(property.type ?? '')) return true;
+		if (property.type !== 'array' || !isRecord(property.items)) return false;
+		if (property.items.anyOf !== undefined) return isElicitationOptionList(property.items.anyOf);
+		if (property.items.enum !== undefined) return isElicitationEnum(property.items.enum);
+		return false;
 	}
 
 	function parsePendingElicitation(event: SessionEvent): PendingElicitation | null {
