@@ -919,6 +919,7 @@ async fn complete_setup(
             Json(json!({ "error": "ACP agents require Docker or Podman isolation" })),
         ));
     }
+    let _config_guard = state.config_write_lock.lock().await;
     // Native products own model selection, credentials, instructions, and
     // subagents. The control plane stores only session runtime context.
     let llm = LlmConfig::default();
@@ -1017,6 +1018,7 @@ async fn add_session(
         .map(str::trim)
         .filter(|project_id| !project_id.is_empty())
         .map(str::to_owned);
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
     let existing_ids: Vec<&str> = old_config.agents.iter().map(|a| a.name.as_str()).collect();
     let mut runner = runner_from_setup(&req);
@@ -1190,6 +1192,7 @@ async fn upsert_mcp_server(
     State(state): State<AppState>,
     Json(req): Json<UpsertMcpServerRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
 
     let name = req.name.trim().to_string();
@@ -2036,6 +2039,7 @@ async fn delete_mcp_server(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _config_guard = state.config_write_lock.lock().await;
     let old_config = state.config();
 
     let mut new_mcp = old_config.mcp_servers.clone();

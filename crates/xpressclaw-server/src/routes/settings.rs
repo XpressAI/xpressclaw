@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+use super::settings_sync;
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/profile", get(get_profile).put(put_profile))
+    Router::new()
+        .route("/profile", get(get_profile).put(put_profile))
+        .nest("/sync", settings_sync::routes())
 }
 
 #[derive(Serialize, Deserialize)]

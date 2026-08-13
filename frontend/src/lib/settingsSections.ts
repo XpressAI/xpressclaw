@@ -7,6 +7,7 @@ export const SETTINGS_SECTIONS: {
 	href: string;
 }[] = [
 	{ kind: 'settings', label: 'Profile', shortLabel: 'P', href: '/settings' },
+	{ kind: 'settings-sync', label: 'Project sync', shortLabel: '↕', href: '/settings/sync' },
 	{ kind: 'settings-mcp', label: 'MCP servers', shortLabel: 'M', href: '/settings/mcp' },
 	{ kind: 'settings-server', label: 'Server', shortLabel: 'S', href: '/settings/server' },
 ];
