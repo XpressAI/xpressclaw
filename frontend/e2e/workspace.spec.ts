@@ -1044,6 +1044,9 @@ test('new-work drafts restore the agent they were written for', async ({ page })
 
 	const composer = page.getByPlaceholder('Describe the outcome you want…');
 	const projectPicker = page.getByLabel('Agent', { exact: true });
+	await expect(composer).toBeVisible();
+	await expect(page.locator('[data-new-work-composer]').getByLabel('Project', { exact: true })).toHaveCount(0);
+	await expect(page.locator('[data-new-work-context]').getByLabel('Project', { exact: true })).toBeVisible();
 	await projectPicker.selectOption('project-secondary-test');
 	await composer.fill('Keep this work with the secondary project');
 	await page.reload();
@@ -1072,6 +1075,9 @@ inputs:
   goal:
     type: string
     required: true
+  prompt_fragment:
+    type: string
+    required: true
   implementer:
     type: agent
     required: true
@@ -1079,6 +1085,15 @@ inputs:
   reviewer:
     type: agent
     required: true
+  retries:
+    type: number
+    required: true
+  review_context:
+    type: json
+    required: true
+  notify:
+    type: boolean
+    default: false
 flows:
   main:
     steps:
@@ -1100,25 +1115,39 @@ flows:
 	});
 	await page.goto('/');
 
-	const agentPicker = page.getByLabel(/Agent(?: role implementer)?$/);
-	const workflowPicker = page.getByLabel('Workflow');
-	await expect(workflowPicker).toHaveValue('');
-	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);
+	await expect(page.getByRole('button', { name: 'Agent mode' })).toHaveAttribute('aria-pressed', 'true');
+	await page.getByRole('button', { name: 'Workflow mode' }).click();
+	await expect(page.getByRole('button', { name: 'Workflow mode' })).toHaveAttribute('aria-pressed', 'true');
+	const agentPicker = page.getByLabel('Agent role implementer');
+	const workflowPicker = page.getByLabel('Workflow', { exact: true });
+	await expect(workflowPicker).toHaveValue('workflow-review-loop');
+	await expect(workflowPicker.locator('option')).toHaveText(['Code Review Loop']);
 
-	await workflowPicker.selectOption('workflow-review-loop');
-	await expect(page.getByText('Bind each workflow role for this run. The definition is reusable across projects.')).toBeVisible();
 	await expect(page.getByLabel('Agent role reviewer')).toHaveValue('project-secondary-test');
 	await agentPicker.selectOption('project-secondary-test');
 	await expect(workflowPicker).toHaveValue('workflow-review-loop');
-	await expect(workflowPicker.locator('option')).toHaveText(['No workflow', 'Code Review Loop']);
+	await expect(workflowPicker.locator('option')).toHaveText(['Code Review Loop']);
 
 	await agentPicker.selectOption(agentId);
 	await page.getByLabel('Agent role reviewer').selectOption('project-secondary-test');
 	await page.getByPlaceholder('Describe the outcome you want…').fill('Add workflow selection to New Work');
+	await page.getByLabel('Workflow input prompt_fragment').fill('  Keep this spacing.  ');
+	await page.getByLabel('Workflow input retries').fill('3');
+	await page.getByLabel('Workflow input review_context').fill('{"focus":"accessibility"}');
+	await page.getByLabel('Workflow input notify').selectOption('true');
 	await page.reload();
+	await expect(page.getByRole('button', { name: 'Workflow mode' })).toHaveAttribute('aria-pressed', 'true');
 	await expect(agentPicker).toHaveValue(agentId);
 	await expect(workflowPicker).toHaveValue('workflow-review-loop');
 	await expect(page.getByPlaceholder('Describe the outcome you want…')).toHaveValue('Add workflow selection to New Work');
+	await expect(page.getByLabel('Workflow input prompt_fragment')).toHaveValue('  Keep this spacing.  ');
+	await expect(page.getByLabel('Workflow input retries')).toHaveValue('3');
+	await expect(page.getByLabel('Workflow input review_context')).toHaveValue('{"focus":"accessibility"}');
+	await expect(page.getByLabel('Workflow input notify')).toHaveValue('true');
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await expectVerticalScroll(page.locator('[data-new-work-scroll]'));
+	await expect(page.locator('[data-new-work-context]').getByLabel('Project', { exact: true })).toBeVisible();
 	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
 
 	await expect.poll(() => workflowRunRequests).toEqual([{
@@ -1126,8 +1155,12 @@ flows:
 		projectId,
 		inputs: {
 			goal: 'Add workflow selection to New Work',
+			prompt_fragment: '  Keep this spacing.  ',
 			implementer: agentId,
 			reviewer: 'project-secondary-test',
+			retries: 3,
+			review_context: { focus: 'accessibility' },
+			notify: true,
 		},
 	}]);
 	expect(queuedSessionMessages).toEqual([]);
@@ -1179,7 +1212,8 @@ flows:
 	await page.goto('/');
 
 	await page.getByLabel('Conversation', { exact: true }).selectOption(conversationId);
-	await page.getByLabel('Workflow').selectOption('workflow-review-loop');
+	await page.getByRole('button', { name: 'Workflow mode' }).click();
+	await page.getByLabel('Workflow', { exact: true }).selectOption('workflow-review-loop');
 	await page.getByPlaceholder('Describe the outcome you want…').fill('Review the release changes');
 	await page.getByPlaceholder('Describe the outcome you want…').press('Enter');
 
