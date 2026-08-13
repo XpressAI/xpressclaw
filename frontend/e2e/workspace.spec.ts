@@ -74,6 +74,8 @@ async function mockApi(
 		richToolActivity?: boolean;
 		postedMessages?: Record<string, unknown>[];
 		interruptedAttempts?: string[];
+		pendingElicitation?: Record<string, unknown>;
+		elicitationResponses?: { elicitationId: string; payload: Record<string, unknown> }[];
 		connection?: { online: boolean };
 		multipleAgents?: boolean;
 		projectCount?: number;
@@ -143,8 +145,8 @@ async function mockApi(
 	let createdWorkflow: Record<string, unknown> | null = null;
 	let workspaceFileContent = 'export const greeting = "hello";\n';
 	let workspaceFileRevision = 'revision-before-save';
-	const status = options.live ? 'in_progress' : 'completed';
-	const attemptStatus = options.live ? 'running' : 'completed';
+	const status = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed';
+	const attemptStatus = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'running' : 'completed';
 	const firstAnswer = options.agentResponseLinks
 		? 'First answer with [agent docs](https://example.com/agent-docs).'
 		: 'First answer';
@@ -572,6 +574,11 @@ async function mockApi(
 					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
 				];
 			}
+		} else if (path.startsWith(`/api/tasks/${taskId}/elicitations/`) && path.endsWith('/response')) {
+			const elicitationId = decodeURIComponent(path.split('/')[5]);
+			const payload = request.postDataJSON() as Record<string, unknown>;
+			options.elicitationResponses?.push({ elicitationId, payload });
+			response = { resolved: true, action: payload.action };
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
@@ -604,7 +611,13 @@ async function mockApi(
 			} else {
 				response = {
 					attempts: [attempt(attemptStatus, contextUsed)],
-					events: options.richToolActivity ? [
+					events: options.pendingElicitation ? [
+						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
+							elicitationId: 'elicitation-browser-test',
+							status: 'pending',
+							...options.pendingElicitation,
+						}),
+					] : options.richToolActivity ? [
 						{
 							...activityEvent(21),
 							event_type: 'usage',
@@ -1018,6 +1031,109 @@ test('running agents can be guided at a safe break or interrupted immediately', 
 
 	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
 	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+});
+
+test('unsupported ACP elicitations stay visible and actionable', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	const interruptedAttempts: string[] = [];
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Install the Figma plugin to continue?',
+			requestedSchema: {
+				type: 'object',
+				properties: {
+					plugin: { type: '_codex_plugin_install', pluginId: 'figma@openai-curated-remote' },
+				},
+			},
+		},
+		elicitationResponses,
+		interruptedAttempts,
+		postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const fallback = page.locator('[data-unsupported-elicitation]');
+	await expect(fallback).toBeVisible();
+	await expect(fallback).toContainText('Install the Figma plugin to continue?');
+	await expect(fallback).toContainText('cannot display safely');
+	await expect(fallback.getByRole('button', { name: 'Cancel request' })).toBeVisible();
+	await expect(fallback.getByRole('button', { name: 'Decline request' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Start' })).toHaveCount(0);
+
+	// Stopping with an empty composer remains a pure interruption. It does not
+	// turn the elicitation into a task message or silently enqueue more work.
+	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
+	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+	expect(postedMessages).toEqual([]);
+
+	await fallback.getByRole('button', { name: 'Decline request' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: { action: 'decline' },
+	}]);
+	await expect(fallback).toHaveCount(0);
+});
+
+test('a normal reply can replace an unsupported elicitation', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: '_codex_plugin_install',
+			message: 'Install a plugin to continue?',
+		},
+		postedMessages,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await expect(composer).toBeEnabled();
+	await expect(composer).toHaveAttribute('placeholder', 'Reply to continue with different guidance...');
+	await composer.fill('Continue without installing the plugin.');
+	await page.getByRole('button', { name: 'Send message' }).click();
+	await expect.poll(() => postedMessages).toHaveLength(1);
+	expect(postedMessages[0]).toMatchObject({
+		content: 'Continue without installing the plugin.',
+		delivery: 'after_tool',
+	});
+});
+
+test('supported ACP forms still require structured answers', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Choose an approach',
+			requestedSchema: {
+				type: 'object',
+				properties: {
+					approach: {
+						type: 'string',
+						title: 'Approach',
+						description: 'Which approach should the agent use?',
+						oneOf: [{ const: 'safe', title: 'Safe approach' }],
+					},
+				},
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.getByText('Agent question')).toBeVisible();
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await page.getByRole('button', { name: 'Safe approach' }).click();
+	await page.getByRole('button', { name: 'Review' }).click();
+	await page.getByRole('button', { name: 'Send answers' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: expect.objectContaining({
+			action: 'accept',
+			content: { approach: 'safe' },
+		}),
+	}]);
 });
 
 test('task drafts survive reloads and clear after a successful send', async ({ page }) => {
