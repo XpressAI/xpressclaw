@@ -106,6 +106,13 @@ xpressclaw sync publish \
   --workdir /work/xpressclaw-control
 ```
 
+Once a Project workspace contains `.xpressclaw.yml`, the same explicit Fetch
+and Publish operations are available from **Settings → Project sync** in the
+web UI. The page discovers manifests from the host workspaces assigned to the
+Project's Agents, shows the configured remote, branch, store path, and last
+successful sync, and uses the control-plane process's existing Git
+credentials. Nothing is synchronized in the background.
+
 The first publish may create the configured branch and store path. If that
 Project path already exists remotely, publish requires a prior fetch. Later
 publishes require that Project path to match the snapshot last observed by
@@ -127,12 +134,14 @@ fetch where both local and remote portable state changed, stops with a conflict
 error. If the configured remote Project snapshot has not changed, an ordinary
 fetch is a no-op and preserves unpublished local edits. After reviewing a
 conflict, `--force` acknowledges a **non-destructive merge**; it does not delete
-local data. Restart XpressClaw after fetch so the running control plane reloads
-imported Agent configuration. For records with the same stable ID, fetched
-shared fields replace their local counterparts; immutable message fields must
-match exactly, while a Conversation message's linked-task relationship follows
-the fetched record. Local records that exist only on the receiving installation
-remain present.
+local data. The Settings page only offers this merge after reporting the
+conflict and applies imported Agent configuration to the running control
+plane after a successful fetch. Restart XpressClaw after a CLI fetch so the
+separate server process reloads imported Agent configuration. For records with
+the same stable ID, fetched shared fields replace their local counterparts;
+immutable message fields must match exactly, while a Conversation message's
+linked-task relationship follows the fetched record. Local records that exist
+only on the receiving installation remain present.
 
 ## Git credentials and secret safety
 

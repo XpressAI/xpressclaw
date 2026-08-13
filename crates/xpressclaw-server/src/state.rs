@@ -37,6 +37,10 @@ pub struct AppState {
     pub turn_controls: Arc<AcpTurnControlBroker>,
     /// Retained per-Conversation ACP lanes shared with the native dispatcher.
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Serialize explicit Git-backed Project sync operations. Git and SQLite
+    /// both have their own conflict checks, but fetch also updates the shared
+    /// in-memory configuration and should not race another fetch or publish.
+    pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -62,6 +66,7 @@ impl AppState {
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 

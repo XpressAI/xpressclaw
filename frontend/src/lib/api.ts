@@ -879,12 +879,55 @@ export interface UserProfile {
 	avatar: string | null;
 }
 
+export interface ProjectSyncStatus {
+	project_id: string;
+	project_name: string;
+	project_icon: string | null;
+	status: 'ready' | 'unconfigured' | 'unavailable' | 'error';
+	project_dir: string | null;
+	remote: string | null;
+	branch: string | null;
+	store_path: string | null;
+	share_project_memory: boolean | null;
+	last_commit: string | null;
+	last_synced_at: string | null;
+	message: string | null;
+}
+
+export interface ProjectSyncCounts {
+	agents: number;
+	tasks: number;
+	task_messages: number;
+	conversations: number;
+	conversation_messages: number;
+	workflows: number;
+	memory_notes: number;
+}
+
+export interface ProjectSyncAction {
+	action: 'fetch' | 'publish';
+	project_id: string;
+	commit: string;
+	counts: ProjectSyncCounts;
+}
+
 export const settings = {
 	getProfile: () => request<UserProfile>('/api/settings/profile'),
 	putProfile: (profile: UserProfile) =>
 		request<UserProfile>('/api/settings/profile', {
 			method: 'PUT',
 			body: JSON.stringify(profile)
+		}),
+	listProjectSync: () => request<{ projects: ProjectSyncStatus[] }>('/api/settings/sync'),
+	fetchProject: (projectId: string, force = false) =>
+		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/fetch`, {
+			method: 'POST',
+			body: JSON.stringify({ force })
+		}),
+	publishProject: (projectId: string) =>
+		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/publish`, {
+			method: 'POST',
+			body: '{}'
 		})
 };
 
