@@ -36,13 +36,23 @@
 		customProperty: ElicitationProperty | null;
 	}
 
-	interface PendingElicitation {
+	interface PendingElicitationBase {
 		id: string;
 		eventId: number;
 		attemptId: string | null;
 		message: string;
+	}
+
+	interface PendingFormElicitation extends PendingElicitationBase {
+		kind: 'form';
 		fields: ElicitationField[];
 	}
+
+	interface PendingUnsupportedElicitation extends PendingElicitationBase {
+		kind: 'unsupported';
+	}
+
+	type PendingElicitation = PendingFormElicitation | PendingUnsupportedElicitation;
 
 	interface ContextUsage {
 		used: number;
@@ -211,6 +221,7 @@
 			.filter((item): item is PendingElicitation => item !== null);
 	})());
 	let pendingElicitation = $derived(pendingElicitations.at(-1) ?? null);
+	let composerBlockedByElicitation = $derived(pendingElicitation?.kind === 'form');
 	let runningAttempt = $derived(
 		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
 	);
@@ -230,8 +241,10 @@
 	let messagePlaceholder = $derived(
 		!task?.agent_id
 			? 'Assign an agent to chat about this task'
-			: pendingElicitation
+			: composerBlockedByElicitation
 				? 'Answer the agent’s question above...'
+			: pendingElicitation?.kind === 'unsupported'
+				? 'Reply to continue with different guidance...'
 			: task.status === 'waiting_for_input'
 				? 'Reply to the worker...'
 				: ['completed', 'blocked', 'cancelled'].includes(task.status)
@@ -408,16 +421,54 @@
 		return typeof value === 'object' && value !== null && !Array.isArray(value);
 	}
 
+	function isElicitationOption(value: unknown): value is ElicitationOption {
+		return isRecord(value)
+			&& typeof value.const === 'string'
+			&& typeof value.title === 'string'
+			&& (value.description === undefined || typeof value.description === 'string');
+	}
+
+	function isElicitationOptionList(value: unknown): value is ElicitationOption[] {
+		return Array.isArray(value) && value.length > 0 && value.every(isElicitationOption);
+	}
+
+	function isElicitationEnum(value: unknown): value is string[] {
+		return Array.isArray(value) && value.length > 0 && value.every(item => typeof item === 'string');
+	}
+
+	function isSupportedElicitationProperty(property: ElicitationProperty): boolean {
+		if (property.type === 'string') {
+			if (property.oneOf !== undefined) return isElicitationOptionList(property.oneOf);
+			if (property.enum !== undefined) return isElicitationEnum(property.enum);
+			return true;
+		}
+		if (['number', 'integer', 'boolean'].includes(property.type ?? '')) return true;
+		if (property.type !== 'array' || !isRecord(property.items)) return false;
+		if (property.items.anyOf !== undefined) return isElicitationOptionList(property.items.anyOf);
+		if (property.items.enum !== undefined) return isElicitationEnum(property.items.enum);
+		return false;
+	}
+
 	function parsePendingElicitation(event: SessionEvent): PendingElicitation | null {
 		const id = typeof event.payload.elicitationId === 'string' ? event.payload.elicitationId : null;
 		const message = typeof event.payload.message === 'string' ? event.payload.message : 'The agent needs your input.';
 		const schema = isRecord(event.payload.requestedSchema) ? event.payload.requestedSchema : null;
 		const properties = schema && isRecord(schema.properties) ? schema.properties : null;
-		if (!id || event.payload.mode !== 'form' || !properties) return null;
+		if (!id) return null;
+		const fallback: PendingUnsupportedElicitation = {
+			kind: 'unsupported', id, eventId: event.id, attemptId: event.attempt_id, message,
+		};
+		if (event.payload.mode !== 'form' || !properties) return fallback;
 
-		const entries = Object.entries(properties)
-			.filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]));
+		const rawEntries = Object.entries(properties);
+		if (rawEntries.length === 0 || !rawEntries.every(([, property]) => isRecord(property))) return fallback;
+		const entries = rawEntries as [string, Record<string, unknown>][];
 		const propertyMap = Object.fromEntries(entries) as Record<string, ElicitationProperty>;
+		if (entries.some(([key, property]) => {
+			const typedProperty = property as ElicitationProperty;
+			const pairedCustomField = key.endsWith('_custom') && propertyMap[key.slice(0, -'_custom'.length)];
+			return pairedCustomField ? typedProperty.type !== 'string' : !isSupportedElicitationProperty(typedProperty);
+		})) return fallback;
 		const mainEntries = entries.filter(([key]) => {
 			if (!key.endsWith('_custom')) return true;
 			return !propertyMap[key.slice(0, -'_custom'.length)];
@@ -436,8 +487,8 @@
 				customProperty: customKey ? propertyMap[customKey] : null,
 			};
 		});
-		if (fields.length === 0) return null;
-		return { id, eventId: event.id, attemptId: event.attempt_id, message, fields };
+		if (fields.length === 0) return fallback;
+		return { kind: 'form', id, eventId: event.id, attemptId: event.attempt_id, message, fields };
 	}
 
 	function optionsFor(field: ElicitationField): { value: unknown; title: string; description?: string }[] {
@@ -490,7 +541,7 @@
 				: [...selected, value]);
 	}
 
-	function displayElicitationAnswer(elicitation: PendingElicitation, field: ElicitationField): string {
+	function displayElicitationAnswer(elicitation: PendingFormElicitation, field: ElicitationField): string {
 		const answers = answersFor(elicitation.id);
 		const custom = field.customKey ? answers[field.customKey] : undefined;
 		if (typeof custom === 'string' && custom.trim()) return custom.trim();
@@ -500,19 +551,19 @@
 		return String(value);
 	}
 
-	function elicitationResponseMessage(elicitation: PendingElicitation): string {
+	function elicitationResponseMessage(elicitation: PendingFormElicitation): string {
 		return elicitation.fields
 			.map(field => `${field.question}\n${displayElicitationAnswer(elicitation, field)}`)
 			.join('\n\n');
 	}
 
 	async function respondToElicitation(elicitation: PendingElicitation, action: 'accept' | 'decline' | 'cancel') {
-		if (!task || elicitationSending) return;
+		if (!task || elicitationSending || (action === 'accept' && elicitation.kind !== 'form')) return;
 		elicitationSending = true;
 		try {
 			await tasks.respondToElicitation(task.id, elicitation.id, {
 				action,
-				...(action === 'accept' ? {
+				...(action === 'accept' && elicitation.kind === 'form' ? {
 					content: answersFor(elicitation.id),
 					message: elicitationResponseMessage(elicitation),
 				} : {}),
@@ -759,7 +810,7 @@
 	}
 
 	async function sendTaskMessage(immediate = false) {
-		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || pendingElicitation) return;
+		if ((!messageInput.trim() && messageAttachments.length === 0) || !task || composerBlockedByElicitation) return;
 		const content = messageInput.trim();
 		const attachments = messageAttachments;
 		messageAttachmentError = '';
@@ -788,7 +839,7 @@
 
 	async function interruptAgent() {
 		if (!task?.agent_id || !runningAttempt || interrupting || messageSending) return;
-		if (!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
+		if (!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
 			await sendTaskMessage(true);
 			return;
 		}
@@ -1218,7 +1269,31 @@
 						</div>
 					{/if}
 
-					{#if pendingElicitation}
+					{#if pendingElicitation?.kind === 'unsupported'}
+						{@const question = pendingElicitation}
+						<section class="rounded-xl border border-orange-500/35 bg-orange-500/5 shadow-sm" data-unsupported-elicitation aria-live="polite">
+							<div class="flex items-center gap-2 border-b border-orange-500/20 px-4 py-3">
+								<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
+								<span class="truncate text-xs font-semibold uppercase tracking-wide text-orange-300">Agent action required</span>
+							</div>
+							<div class="space-y-3 p-4">
+								<div class="whitespace-pre-wrap text-sm font-medium leading-relaxed text-foreground">{question.message}</div>
+								<p class="text-xs leading-relaxed text-muted-foreground">
+									This request uses a prompt format XpressClaw cannot display safely. Decline or cancel it, or reply below to restart the agent with different guidance.
+								</p>
+								<div class="flex flex-wrap items-center gap-2 pt-1">
+									<button type="button" onclick={() => respondToElicitation(question, 'cancel')} disabled={elicitationSending}
+										class="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-accent disabled:opacity-50">Cancel request</button>
+									<button type="button" onclick={() => respondToElicitation(question, 'decline')} disabled={elicitationSending}
+										class="ml-auto rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+										{elicitationSending ? 'Responding…' : 'Decline request'}
+									</button>
+								</div>
+							</div>
+						</section>
+					{/if}
+
+					{#if pendingElicitation?.kind === 'form'}
 						{@const question = pendingElicitation}
 						{@const questionPage = elicitationPage[question.id] ?? 0}
 						{@const isReviewPage = questionPage >= question.fields.length}
@@ -1458,14 +1533,14 @@
 							placeholder={messagePlaceholder}
 							rows={2}
 							class="max-h-32 w-full resize-none rounded-xl bg-transparent px-4 pb-1 pt-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-							disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
+							disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
 						></textarea>
 						{#if messageAttachmentError}<div class="px-4 pb-1 text-xs text-destructive">{messageAttachmentError}</div>{/if}
 
 						<div class="flex min-h-9 items-center gap-2 px-3 pb-2">
 							<input bind:this={messageImageInput} type="file" accept={IMAGE_FILE_ACCEPT} multiple onchange={handleMessageImageInput} class="hidden" />
 							<button type="button" onclick={() => messageImageInput?.click()}
-								disabled={messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation) || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
+								disabled={messageSending || interrupting || !task.agent_id || composerBlockedByElicitation || messageAttachments.length >= MAX_IMAGE_ATTACHMENTS}
 								aria-label="Attach images" title="Attach images (you can also paste)"
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-30">
 								<svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg>
@@ -1505,8 +1580,8 @@
 								<button
 									type="button"
 									onclick={interruptAgent}
-									aria-label={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
-									title={!pendingElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
+									aria-label={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
+									title={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
 									disabled={messageSending || interrupting}
 									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
 								>
@@ -1520,7 +1595,7 @@
 							<button
 								onclick={() => sendTaskMessage()}
 								aria-label="Send message"
-								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || Boolean(pendingElicitation)}
+								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
 								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30"
 							>
 								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>

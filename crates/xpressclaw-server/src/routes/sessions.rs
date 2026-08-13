@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_stops_only_the_active_attempt() {
+    async fn interrupt_stops_only_the_waiting_attempt() {
         let (app, db) = test_app_with_db();
         let response = app
             .clone()
@@ -665,8 +665,22 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let value: Value = serde_json::from_slice(&body).unwrap();
         let attempt_id = value["attempt_id"].as_str().unwrap();
-        SessionManager::new(db.clone())
+        let sessions = SessionManager::new(db.clone());
+        sessions
             .transition_attempt(attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                attempt_id,
+                "waiting_for_input",
+                "Waiting for your answer",
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = value["task"]["id"].as_str().unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(task_id, "waiting_for_input", Some("builder"))
             .unwrap();
 
         let response = app
@@ -686,9 +700,10 @@ mod tests {
         assert_eq!(value["status"], "interrupted");
         let task_id = value["task_id"].as_str().unwrap();
         assert_eq!(
-            TaskBoard::new(db).get(task_id).unwrap().status,
+            TaskBoard::new(db.clone()).get(task_id).unwrap().status,
             TaskStatus::Pending
         );
+        assert_eq!(TaskQueue::new(db).pending_count("builder").unwrap(), 0);
     }
 
     #[tokio::test]

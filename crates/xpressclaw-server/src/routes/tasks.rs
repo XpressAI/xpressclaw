@@ -786,6 +786,9 @@ async fn add_message(
                     "preparing" | "running" | "waiting_for_input" | "review"
                 )
             });
+        let waiting_for_input = active_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.status == "waiting_for_input");
         sessions
             .append_event(
                 agent_id,
@@ -811,7 +814,9 @@ async fn add_message(
             .enqueue_continuation(&id, agent_id)
             .map_err(internal_error)?;
         delivery = if let Some(active_attempt) = active_attempt {
-            if req.delivery == MessageDelivery::Immediate {
+            // A deferred interruption cannot reach a turn parked on an elicitation.
+            // Cancel that request and hand off to the queued guidance immediately.
+            if req.delivery == MessageDelivery::Immediate || waiting_for_input {
                 state
                     .interrupt_attempt(&active_attempt.id)
                     .await
@@ -827,6 +832,7 @@ async fn add_message(
             "queued"
         };
         if continuation.is_some()
+            && !waiting_for_input
             && matches!(
                 task.status,
                 TaskStatus::WaitingForInput
@@ -1765,6 +1771,79 @@ mod tests {
                 .unwrap()
                 .status,
             "running"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_task_message_interrupts_the_attempt_and_runs_the_continuation() {
+        let (app, db) = test_app_with_db();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"title": "Answer this", "agent_id": "developer"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp.into_body()).await;
+        let task_id = body["id"].as_str().unwrap().to_string();
+        let queue = TaskQueue::new(db.clone());
+        let first = queue.claim("developer").unwrap().unwrap();
+        let attempt_id = first.attempt_id.as_deref().unwrap().to_string();
+        let sessions = SessionManager::new(db.clone());
+        sessions
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        sessions
+            .transition_attempt(
+                &attempt_id,
+                "waiting_for_input",
+                "Waiting for your answer",
+                None,
+                None,
+            )
+            .unwrap();
+        TaskBoard::new(db.clone())
+            .update_status(&task_id, "waiting_for_input", Some("developer"))
+            .unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/tasks/{task_id}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "role": "user",
+                            "content": "Continue without that plugin"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["delivery"], "immediate");
+        assert_eq!(body["continuation_queued"], true);
+        assert!(body["attempt_id"].is_string());
+        assert_eq!(
+            sessions.get_attempt(&attempt_id).unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(queue.get(first.id).unwrap().status, "completed");
+        assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        assert_eq!(
+            TaskBoard::new(db).get(&task_id).unwrap().status,
+            TaskStatus::InProgress
         );
     }
 
