@@ -351,6 +351,9 @@ test('conversation tools publish files, download attachments, and create linked 
   try {
     const initialized = await requestMcp({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
     assert.match(initialized.result.instructions, /linked to a project conversation/);
+    assert.match(initialized.result.instructions, /normal final response is automatically delivered to this project conversation/);
+    assert.match(initialized.result.instructions, /Reserve send_conversation_message for genuine interim updates or publishing workspace files while you continue working/);
+    assert.match(initialized.result.instructions, /Never use the tool to duplicate your final response/);
     const listed = await requestMcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     assert.deepEqual(
       listed.result.tools
@@ -358,6 +361,10 @@ test('conversation tools publish files, download attachments, and create linked 
         .map((tool) => tool.name),
       ['send_conversation_message', 'download_conversation_attachment', 'create_conversation_task'],
     );
+    const sendConversationMessage = listed.result.tools.find((tool) => tool.name === 'send_conversation_message');
+    assert.match(sendConversationMessage.description, /genuine interim update or publish workspace files/);
+    assert.match(sendConversationMessage.description, /normal final response is delivered automatically/);
+    assert.match(sendConversationMessage.description, /never use this tool to duplicate it/);
 
     await requestMcp({
       jsonrpc: '2.0',
