@@ -47,23 +47,24 @@ defaults and existing definitions.
 An `agent` input is a reusable role. Task and wait blocks reference it as
 `agent: "@role_name"`; each run binds that role to any configured XpressClaw
 Agent. When a run is bound to a Project, every selected role must belong to
-that Project. Mark one role `primary: true` to connect it to New Work's
-main Agent picker. Other roles (for example, an independent reviewer) receive
-their own picker. A literal agent ID remains supported for intentionally fixed
-workflows.
+that Project. Mark one role `primary: true` to have it reuse New Work's current
+Agent selection when switching modes. Every role, including an independent
+reviewer, receives its own workflow input. A literal agent ID remains supported
+for intentionally fixed workflows and appears in Workflow mode when its Agent
+belongs to the selected Project.
 
 ### Start new work through a workflow
 
-The **New Work** composer has an optional workflow picker beside the agent
-picker. Choosing **No workflow** sends an ordinary task directly to that
-agent. Choosing a workflow sends the composer text as its `goal` input and
-opens the first task created by the workflow.
+The **New Work** composer has separate **Agent** and **Workflow** modes. Agent
+mode sends an ordinary task directly to the selected Agent. Workflow mode lets
+you choose a manual workflow, fills the composer from its declared input
+schema, and opens the first task created by the run.
 
-A workflow appears in this picker when it declares a string `goal` input and
-every other required input is either an `agent` role or has a default. The main
-Agent picker binds the primary role, and additional required agent roles appear
-beside the composer. Workflows with other required inputs remain available from
-**Automations**, where the full typed run form collects them.
+Workflow mode supports the same string, number, boolean, JSON, and Agent inputs
+as the full run form in **Automations**. Agent roles are limited to the Agents
+in the selected Project, defaults prefill their fields, and required inputs
+must be provided before the workflow can start. Workflows with automatic
+triggers or connector sinks remain managed from **Automations**.
 
 ### Run a workflow in a Conversation
 
