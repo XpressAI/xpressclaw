@@ -314,7 +314,8 @@
 		const values: Record<string, unknown> = {};
 		try {
 			for (const [name, input] of workflowInputEntries) {
-				const raw = workflowInputValue(name, input).trim();
+				const value = workflowInputValue(name, input);
+				const raw = value.trim();
 				if (!raw) {
 					if (input.required && input.default === undefined) throw new Error(`${workflowInputLabel(name)} is required`);
 					continue;
@@ -327,9 +328,9 @@
 					if (raw !== 'true' && raw !== 'false') throw new Error(`${workflowInputLabel(name)} must be yes or no`);
 					values[name] = raw === 'true';
 				} else if (input.type === 'json') {
-					values[name] = JSON.parse(workflowInputValue(name, input));
+					values[name] = JSON.parse(value);
 				} else {
-					values[name] = raw;
+					values[name] = value;
 				}
 			}
 			workflowInputError = '';

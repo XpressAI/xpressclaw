@@ -1075,6 +1075,9 @@ inputs:
   goal:
     type: string
     required: true
+  prompt_fragment:
+    type: string
+    required: true
   implementer:
     type: agent
     required: true
@@ -1128,6 +1131,7 @@ flows:
 	await agentPicker.selectOption(agentId);
 	await page.getByLabel('Agent role reviewer').selectOption('project-secondary-test');
 	await page.getByPlaceholder('Describe the outcome you want…').fill('Add workflow selection to New Work');
+	await page.getByLabel('Workflow input prompt_fragment').fill('  Keep this spacing.  ');
 	await page.getByLabel('Workflow input retries').fill('3');
 	await page.getByLabel('Workflow input review_context').fill('{"focus":"accessibility"}');
 	await page.getByLabel('Workflow input notify').selectOption('true');
@@ -1136,6 +1140,7 @@ flows:
 	await expect(agentPicker).toHaveValue(agentId);
 	await expect(workflowPicker).toHaveValue('workflow-review-loop');
 	await expect(page.getByPlaceholder('Describe the outcome you want…')).toHaveValue('Add workflow selection to New Work');
+	await expect(page.getByLabel('Workflow input prompt_fragment')).toHaveValue('  Keep this spacing.  ');
 	await expect(page.getByLabel('Workflow input retries')).toHaveValue('3');
 	await expect(page.getByLabel('Workflow input review_context')).toHaveValue('{"focus":"accessibility"}');
 	await expect(page.getByLabel('Workflow input notify')).toHaveValue('true');
@@ -1150,6 +1155,7 @@ flows:
 		projectId,
 		inputs: {
 			goal: 'Add workflow selection to New Work',
+			prompt_fragment: '  Keep this spacing.  ',
 			implementer: agentId,
 			reviewer: 'project-secondary-test',
 			retries: 3,
