@@ -6,6 +6,14 @@ memory, and workspace configuration while its replaceable ACP harness owns
 reasoning, tools, and subagents. Xpressclaw does not define a persona or system
 prompt for the harness.
 
+The packaged Desktop app uses `~/.xpressclaw/xpressclaw.yaml` and starts its
+bundled server automatically. CLI users choose the directory: it is the
+argument to `xpressclaw init` and `xpressclaw up --workdir`. It is an
+installation-level control plane that can manage many Agent workspaces, not a
+requirement to place XpressClaw configuration in every source repository.
+`~/.xpressclaw` is also the default data directory, so Desktop intentionally
+keeps its config and local database under the same root.
+
 This local `xpressclaw.yaml` is distinct from the optional
 `.xpressclaw.yml` Project synchronization manifest. The latter is a small,
 portable pointer to a separate Git store and must never contain credentials or

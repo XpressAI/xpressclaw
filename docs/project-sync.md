@@ -3,8 +3,9 @@
 XpressClaw can keep a Project's collaboration data in a dedicated Git
 repository. The main project only preserves a small `.xpressclaw.yml` pointer;
 it does not need to be a Git repository itself. Synchronization is always an
-explicit CLI operation. Starting XpressClaw, editing source code, and updating
-the main project never fetch or publish collaboration data.
+explicit user operation through the CLI or **Settings → Project sync**.
+Starting XpressClaw, editing source code, and updating the main project never
+fetch or publish collaboration data.
 
 ## What is synchronized
 
@@ -67,11 +68,12 @@ Project page displays the canonical ID and provides a copy button.
 
 By default, the project repository is the current directory. XpressClaw looks
 for the control plane's `xpressclaw.yaml` in the current directory and its
-parents, then in a single sibling control-plane repository. For example,
-running in `~/Projects/acme/platform` discovers
-`~/Projects/acme/xpressclaw/xpressclaw.yaml` when it is the only sibling match.
-If the control plane is elsewhere or multiple matches exist, name it
-explicitly:
+parents, then in a single sibling control-plane repository, and finally at the
+Desktop default `~/.xpressclaw/xpressclaw.yaml`. For example, running in
+`~/Projects/acme/platform` discovers either a nearby
+`~/Projects/acme/xpressclaw/xpressclaw.yaml` development control plane or the
+installed Desktop control plane without an extra option. If the CLI control
+plane is elsewhere or multiple nearby matches exist, name it explicitly:
 
 ```bash
 xpressclaw sync init \
@@ -84,9 +86,10 @@ xpressclaw sync init \
 `--project-dir` always means the repository being synchronized;
 `--control-plane-dir` always means the directory containing
 `xpressclaw.yaml`. The old `--workdir` spelling remains an alias for scripts,
-but `~/.xpressclaw` is normally the runtime data directory, not the control
-plane. A missing or invalid control-plane path produces a specific error with
-the path and next command to use.
+and `~/.xpressclaw` is the correct control-plane directory for Desktop as well
+as its local data directory. CLI users may keep their control plane elsewhere.
+A missing or invalid control-plane path distinguishes an unfinished Desktop
+setup from a CLI directory that still needs `xpressclaw init`.
 
 `--store-path` defaults to `projects/<canonical-project-id>` and `--branch`
 defaults to `main`. Add `--store-path projects/platform`, `--branch <branch>`,

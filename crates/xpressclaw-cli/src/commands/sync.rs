@@ -36,7 +36,7 @@ pub enum SyncCommand {
         #[arg(long, default_value = ".", value_name = "DIR")]
         project_dir: PathBuf,
 
-        /// XpressClaw control-plane directory containing xpressclaw.yaml
+        /// XpressClaw control-plane directory containing xpressclaw.yaml (Desktop: ~/.xpressclaw)
         #[arg(long, visible_alias = "workdir", value_name = "DIR")]
         control_plane_dir: Option<PathBuf>,
     },
@@ -51,7 +51,7 @@ pub enum SyncCommand {
         #[arg(long, default_value = ".", value_name = "DIR")]
         project_dir: PathBuf,
 
-        /// XpressClaw control-plane directory containing xpressclaw.yaml
+        /// XpressClaw control-plane directory containing xpressclaw.yaml (Desktop: ~/.xpressclaw)
         #[arg(long, visible_alias = "workdir", value_name = "DIR")]
         control_plane_dir: Option<PathBuf>,
     },
@@ -62,7 +62,7 @@ pub enum SyncCommand {
         #[arg(long, default_value = ".", value_name = "DIR")]
         project_dir: PathBuf,
 
-        /// XpressClaw control-plane directory containing xpressclaw.yaml
+        /// XpressClaw control-plane directory containing xpressclaw.yaml (Desktop: ~/.xpressclaw)
         #[arg(long, visible_alias = "workdir", value_name = "DIR")]
         control_plane_dir: Option<PathBuf>,
     },
@@ -183,7 +183,7 @@ fn resolve_control_plane_dir(
         let config_path = directory.join("xpressclaw.yaml");
         if !config_path.is_file() && !allow_missing_config {
             anyhow::bail!(
-                "no xpressclaw.yaml exists in control-plane directory {}. Pass `--control-plane-dir <DIR>` with the existing control plane, or run `xpressclaw init {}` to create one there. The ~/.xpressclaw directory normally stores runtime data; it is not the control-plane directory.",
+                "no xpressclaw.yaml exists in control-plane directory {}. Desktop creates ~/.xpressclaw/xpressclaw.yaml after first-run setup. For CLI mode, pass the directory used with `xpressclaw up --workdir`, or run `xpressclaw init {}` to create a control plane here.",
                 directory.display(),
                 directory.display()
             );
@@ -228,7 +228,7 @@ fn select_discovered_control_plane(
                 ""
             };
             anyhow::bail!(
-                "could not discover a control plane from project repository {}. No xpressclaw.yaml was found in the repository, its parent directories, or a single sibling control-plane repository. Rerun with `--control-plane-dir /path/to/xpressclaw-control` (the directory containing xpressclaw.yaml). The ~/.xpressclaw directory normally stores runtime data; it is not the control-plane directory.{fetch_hint}",
+                "could not discover a control plane from project repository {}. No xpressclaw.yaml was found in the repository, its parent directories, a single sibling control-plane repository, or the Desktop default ~/.xpressclaw. If you use Desktop, launch it and finish first-run setup, then retry. For CLI mode, rerun with `--control-plane-dir /path/to/xpressclaw-control` (the directory used with `xpressclaw up --workdir`).{fetch_hint}",
                 project_dir.display()
             );
         }
@@ -251,12 +251,14 @@ fn discover_control_plane_dirs(project_dir: &Path) -> Result<Vec<PathBuf>> {
         .context("failed to resolve current directory")?
         .canonicalize()
         .context("failed to resolve current directory")?;
-    discover_control_plane_dirs_from(project_dir, &current_dir)
+    let desktop_control_plane = default_desktop_control_plane_dir();
+    discover_control_plane_dirs_from(project_dir, &current_dir, desktop_control_plane.as_deref())
 }
 
 fn discover_control_plane_dirs_from(
     project_dir: &Path,
     current_dir: &Path,
+    desktop_control_plane: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     // Prefer an explicit context: when the command is run inside a control-plane
     // checkout, or the synchronized repository itself contains xpressclaw.yaml,
@@ -294,7 +296,32 @@ fn discover_control_plane_dirs_from(
             }
         }
     }
-    Ok(candidates.into_iter().collect())
+    if !candidates.is_empty() {
+        return Ok(candidates.into_iter().collect());
+    }
+
+    // The packaged Desktop app always starts its sidecar with ~/.xpressclaw as
+    // the control-plane directory. Keep nearby CLI/source checkouts higher
+    // priority, then make a Desktop-only installation work without an option.
+    if let Some(directory) = desktop_control_plane {
+        if directory.join("xpressclaw.yaml").is_file() {
+            return Ok(vec![directory.canonicalize().with_context(|| {
+                format!(
+                    "failed to resolve Desktop control-plane directory {}",
+                    directory.display()
+                )
+            })?]);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
+fn default_desktop_control_plane_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".xpressclaw"))
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -382,6 +409,7 @@ mod tests {
         assert!(help.contains("--control-plane-dir <DIR>"));
         assert!(help.contains("--workdir"));
         assert!(help.contains("containing xpressclaw.yaml"));
+        assert!(help.contains("Desktop: ~/.xpressclaw"));
     }
 
     #[test]
@@ -396,6 +424,7 @@ mod tests {
         let resolved = discover_control_plane_dirs_from(
             &project.canonicalize().unwrap(),
             &project.canonicalize().unwrap(),
+            None,
         )
         .unwrap();
 
@@ -419,7 +448,8 @@ mod tests {
             .to_string();
         assert!(wrong_error.contains("no xpressclaw.yaml exists"));
         assert!(wrong_error.contains("xpressclaw init"));
-        assert!(wrong_error.contains("runtime data"));
+        assert!(wrong_error.contains("Desktop creates ~/.xpressclaw/xpressclaw.yaml"));
+        assert!(wrong_error.contains("xpressclaw up --workdir"));
         assert_eq!(
             resolve_control_plane_dir(Some(&data_dir), root.path(), true).unwrap(),
             data_dir.canonicalize().unwrap()
@@ -437,7 +467,8 @@ mod tests {
         assert!(error.contains("/work/platform"));
         assert!(error.contains("No xpressclaw.yaml was found"));
         assert!(error.contains("--control-plane-dir /path/to/xpressclaw-control"));
-        assert!(error.contains("runtime data"));
+        assert!(error.contains("Desktop default ~/.xpressclaw"));
+        assert!(error.contains("finish first-run setup"));
     }
 
     #[test]
@@ -454,6 +485,7 @@ mod tests {
         let candidates = discover_control_plane_dirs_from(
             &project.canonicalize().unwrap(),
             &project.canonicalize().unwrap(),
+            None,
         )
         .unwrap();
         let error = select_discovered_control_plane(candidates, &project, false)
@@ -464,5 +496,31 @@ mod tests {
         assert!(error.contains("control-one"));
         assert!(error.contains("control-two"));
         assert!(error.contains("--control-plane-dir <DIR>"));
+    }
+
+    #[test]
+    fn falls_back_to_the_desktop_control_plane_from_a_project_repository() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("projects").join("platform");
+        let desktop_control_plane = root.path().join("home").join(".xpressclaw");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(&desktop_control_plane).unwrap();
+        fs::write(
+            desktop_control_plane.join("xpressclaw.yaml"),
+            "system: {}\n",
+        )
+        .unwrap();
+
+        let resolved = discover_control_plane_dirs_from(
+            &project.canonicalize().unwrap(),
+            &project.canonicalize().unwrap(),
+            Some(&desktop_control_plane),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            vec![desktop_control_plane.canonicalize().unwrap()]
+        );
     }
 }

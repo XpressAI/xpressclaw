@@ -2,21 +2,35 @@
 
 ## 1. Start the control plane
 
-From the project you want xpressclaw to manage:
+### Desktop
+
+Install and launch `xpressclaw-desktop`. It starts the bundled control plane
+from `~/.xpressclaw`, opens the setup screen, and stays available in the system
+tray. Do not run `xpressclaw init` or `xpressclaw up` separately.
+
+### CLI
+
+Choose one durable control-plane directory for the installation. It holds
+`xpressclaw.yaml` and can manage many source repositories; it is not the Agent
+workspace selected later in the UI.
 
 ```bash
-xpressclaw up
+xpressclaw init ~/.xpressclaw
+xpressclaw up --workdir ~/.xpressclaw
 ```
 
-Open `http://localhost:8935`. An explicit `xpressclaw init` is optional; `up`
-opens first-session setup when no configuration exists.
+Open `http://localhost:8935`. For development, the XpressClaw source checkout
+can instead be the control-plane directory: run both commands from that
+checkout and omit the path/options. An explicit `init` remains optional;
+`up` opens first-session setup when its selected directory has no config.
 
-Use `xpressclaw up --detach` to keep the server in the background.
+Use `xpressclaw up --detach` from the selected control-plane directory to keep
+the server in the background.
 
 ## 2. Create a Project and Agent
 
-Create a Project for the work, then add one or more Agents. The Agent creator
-asks for:
+Complete the first-run Agent setup, or create a Project and add one or more
+Agents. The Agent creator asks for:
 
 - an Agent name;
 - Codex, Claude Code, OpenCode, or another ACP-compatible harness;
