@@ -4,7 +4,6 @@ use anyhow::Context;
 
 pub const CONFIG_FILE: &str = "xpressclaw.yaml";
 const INSTANCE_MARKER: &str = ".xpressclaw-instance";
-const PID_FILE: &str = "server.pid";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceSource {
@@ -85,7 +84,7 @@ fn resolve_from(explicit: Option<PathBuf>, current: &Path, default: &Path) -> In
 }
 
 fn is_materialized(root: &Path) -> bool {
-    [CONFIG_FILE, INSTANCE_MARKER, PID_FILE]
+    [CONFIG_FILE, INSTANCE_MARKER]
         .into_iter()
         .any(|name| root.join(name).is_file())
 }
@@ -154,6 +153,22 @@ mod tests {
         std::fs::create_dir_all(&default).unwrap();
         std::fs::write(current.join(CONFIG_FILE), "agents: []\n").unwrap();
         std::fs::write(default.join("xpressclaw.db"), "legacy shared data").unwrap();
+
+        let instance = resolve_from(None, &current, &default);
+
+        assert_eq!(instance.root, current);
+        assert_eq!(instance.source, InstanceSource::LegacyCurrentDirectory);
+    }
+
+    #[test]
+    fn legacy_shared_pid_does_not_override_a_current_directory_config() {
+        let root = tempdir().unwrap();
+        let current = root.path().join("control-plane");
+        let default = root.path().join("home-instance");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(current.join(CONFIG_FILE), "agents: []\n").unwrap();
+        std::fs::write(default.join("server.pid"), "1234\n").unwrap();
 
         let instance = resolve_from(None, &current, &default);
 
