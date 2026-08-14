@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 pub const CONFIG_FILE: &str = "xpressclaw.yaml";
-const DATA_FILE: &str = "xpressclaw.db";
+const INSTANCE_MARKER: &str = ".xpressclaw-instance";
 const PID_FILE: &str = "server.pid";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,15 @@ pub fn resolve(explicit: Option<PathBuf>) -> anyhow::Result<Instance> {
     Ok(resolve_from(explicit, &current, &default))
 }
 
+pub fn mark_materialized(instance: &Instance) -> anyhow::Result<()> {
+    std::fs::write(instance.root.join(INSTANCE_MARKER), "1\n").with_context(|| {
+        format!(
+            "failed to mark XpressClaw instance at {}",
+            instance.root.display()
+        )
+    })
+}
+
 fn resolve_from(explicit: Option<PathBuf>, current: &Path, default: &Path) -> Instance {
     if let Some(root) = explicit {
         let root = if root.is_absolute() {
@@ -76,7 +85,7 @@ fn resolve_from(explicit: Option<PathBuf>, current: &Path, default: &Path) -> In
 }
 
 fn is_materialized(root: &Path) -> bool {
-    [CONFIG_FILE, DATA_FILE, PID_FILE]
+    [CONFIG_FILE, INSTANCE_MARKER, PID_FILE]
         .into_iter()
         .any(|name| root.join(name).is_file())
 }
@@ -117,19 +126,39 @@ mod tests {
     }
 
     #[test]
-    fn first_run_database_marks_the_default_instance_before_config_exists() {
+    fn first_run_marker_marks_the_default_instance_before_config_exists() {
         let root = tempdir().unwrap();
         let current = root.path().join("repo");
         let default = root.path().join("home-instance");
         std::fs::create_dir_all(&current).unwrap();
         std::fs::create_dir_all(&default).unwrap();
         std::fs::write(current.join(CONFIG_FILE), "agents: []\n").unwrap();
-        std::fs::write(default.join(DATA_FILE), "").unwrap();
+        mark_materialized(&Instance {
+            root: default.clone(),
+            source: InstanceSource::Default,
+        })
+        .unwrap();
 
         let instance = resolve_from(None, &current, &default);
 
         assert_eq!(instance.root, default);
         assert_eq!(instance.source, InstanceSource::Default);
+    }
+
+    #[test]
+    fn legacy_shared_database_does_not_override_a_current_directory_config() {
+        let root = tempdir().unwrap();
+        let current = root.path().join("control-plane");
+        let default = root.path().join("home-instance");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(current.join(CONFIG_FILE), "agents: []\n").unwrap();
+        std::fs::write(default.join("xpressclaw.db"), "legacy shared data").unwrap();
+
+        let instance = resolve_from(None, &current, &default);
+
+        assert_eq!(instance.root, current);
+        assert_eq!(instance.source, InstanceSource::LegacyCurrentDirectory);
     }
 
     #[test]

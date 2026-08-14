@@ -159,6 +159,7 @@ async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
 
     // Check if config exists — if not, start in setup mode
     if !config_path.exists() {
+        instance::mark_materialized(instance)?;
         info!(instance = %instance.root.display(), "no instance config found — starting setup");
         let mut config = Config::default();
         config.system.data_dir = instance.root.clone();
