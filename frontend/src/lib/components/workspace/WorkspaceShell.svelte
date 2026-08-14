@@ -41,9 +41,11 @@
 		? `xpressclaw.workspace.v1.${workspaceWindowId}`
 		: 'xpressclaw.workspace.v1';
 	const MAX_PANES = 4;
+	const MAX_TABS = 10;
+	let recencyClock = Date.now();
 	const initialRoute = currentRoute();
 	const initialDescription = describeWorkspacePath(initialRoute);
-	const initialTab: WorkspaceTab = { id: 'initial-tab', status: null, ...initialDescription };
+	const initialTab: WorkspaceTab = { id: 'initial-tab', status: null, lastActiveAt: nextTabRecency(), ...initialDescription };
 
 	let panes = $state<WorkspacePaneState[]>([
 		{ id: 'initial-pane', tabs: [initialTab], activeTabId: initialTab.id, width: 1 },
@@ -52,6 +54,7 @@
 	let workspaceReady = $state(false);
 	let lastSyncedPath = '';
 	let workspaceEl = $state<HTMLDivElement>();
+	let compactTabStrip = $state<HTMLDivElement>();
 	let sidebarCollapsed = $state(false);
 	let mobileMenuOpen = $state(false);
 	let agentList = $state<Agent[]>([]);
@@ -130,6 +133,18 @@
 		openPath(route, false);
 	});
 
+	$effect(() => {
+		focusedPaneId;
+		focusedPane?.activeTabId;
+		if (!compactTabStrip) return;
+		const frame = window.requestAnimationFrame(() => {
+			compactTabStrip
+				?.querySelector<HTMLElement>('[data-workspace-tab-active="true"]')
+				?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+		});
+		return () => window.cancelAnimationFrame(frame);
+	});
+
 	function validWorkspaceWindowId(value: string | null): string | null {
 		return value && /^workspace-\d+-\d+$/.test(value) ? value : null;
 	}
@@ -156,6 +171,37 @@
 
 	function activeTabFor(pane: WorkspacePaneState): WorkspaceTab {
 		return pane.tabs.find((tab) => tab.id === pane.activeTabId) ?? pane.tabs[0];
+	}
+
+	function nextTabRecency(): number {
+		recencyClock = Math.max(Date.now(), recencyClock + 1);
+		return recencyClock;
+	}
+
+	function tabKey(paneId: string, tabId: string): string {
+		return `${paneId}:${tabId}`;
+	}
+
+	function enforceTabLimit(nextPanes: WorkspacePaneState[]): WorkspacePaneState[] {
+		const openCount = nextPanes.reduce((count, pane) => count + pane.tabs.length, 0);
+		if (openCount <= MAX_TABS) return nextPanes;
+
+		const activeKeys = new Set(nextPanes.map((pane) => tabKey(pane.id, activeTabFor(pane).id)));
+		let order = 0;
+		const evictionCandidates = nextPanes
+			.flatMap((pane) => pane.tabs.map((tab) => ({ paneId: pane.id, tab, order: order++ })))
+			.filter((item) => !activeKeys.has(tabKey(item.paneId, item.tab.id)))
+			.sort((left, right) => left.tab.lastActiveAt - right.tab.lastActiveAt || left.order - right.order);
+		const evicted = new Set(
+			evictionCandidates
+				.slice(0, openCount - MAX_TABS)
+				.map((item) => tabKey(item.paneId, item.tab.id)),
+		);
+
+		return nextPanes.map((pane) => ({
+			...pane,
+			tabs: pane.tabs.filter((tab) => !evicted.has(tabKey(pane.id, tab.id))),
+		}));
 	}
 
 	function persistWorkspace() {
@@ -218,7 +264,7 @@
 		if (tabIndex >= 0) {
 			const pane = panes[paneIndex];
 			const existing = pane.tabs[tabIndex];
-			const updated = decorateTab({ ...existing, ...describeWorkspacePath(route) });
+			const updated = decorateTab({ ...existing, ...describeWorkspacePath(route), lastActiveAt: nextTabRecency() });
 			panes = panes.map((candidate, index) => index === paneIndex ? {
 				...candidate,
 				tabs: candidate.tabs.map((tab) => tab.id === existing.id ? updated : tab),
@@ -226,13 +272,14 @@
 			} : candidate);
 			focusedPaneId = pane.id;
 		} else {
-			const tab = decorateTab(createWorkspaceTab(route));
+			const tab = decorateTab({ ...createWorkspaceTab(route), lastActiveAt: nextTabRecency() });
 			const pane = panes[paneIndex];
 			panes = panes.map((candidate, index) => index === paneIndex
 				? { ...candidate, tabs: [...candidate.tabs, tab], activeTabId: tab.id }
 				: candidate);
 			focusedPaneId = pane.id;
 		}
+		panes = enforceTabLimit(panes);
 
 		persistWorkspace();
 		if (navigate && currentRoute() !== route) {
@@ -242,7 +289,12 @@
 	}
 
 	function activateTab(paneId: string, tab: WorkspaceTab) {
-		panes = panes.map((pane) => pane.id === paneId ? { ...pane, activeTabId: tab.id } : pane);
+		const activatedAt = nextTabRecency();
+		panes = panes.map((pane) => pane.id === paneId ? {
+			...pane,
+			activeTabId: tab.id,
+			tabs: pane.tabs.map((candidate) => candidate.id === tab.id ? { ...candidate, lastActiveAt: activatedAt } : candidate),
+		} : pane);
 		focusedPaneId = paneId;
 		persistWorkspace();
 		if (currentRoute() !== tab.path) {
@@ -256,6 +308,13 @@
 		focusedPaneId = paneId;
 		const pane = panes.find((candidate) => candidate.id === paneId);
 		const tab = pane ? activeTabFor(pane) : null;
+		if (tab) {
+			const activatedAt = nextTabRecency();
+			panes = panes.map((candidate) => candidate.id === paneId ? {
+				...candidate,
+				tabs: candidate.tabs.map((paneTab) => paneTab.id === tab.id ? { ...paneTab, lastActiveAt: activatedAt } : paneTab),
+			} : candidate);
+		}
 		persistWorkspace();
 		if (tab && currentRoute() !== tab.path) {
 			lastSyncedPath = tab.path;
@@ -276,7 +335,7 @@
 			const nextPane = panes[Math.min(paneIndex, panes.length - 1)];
 			focusedPaneId = nextPane.id;
 		} else if (remaining.length === 0) {
-			const home = createWorkspaceTab('/');
+			const home = { ...createWorkspaceTab('/'), lastActiveAt: nextTabRecency() };
 			panes = [{ ...pane, tabs: [home], activeTabId: home.id }];
 			focusedPaneId = pane.id;
 		} else {
@@ -284,9 +343,16 @@
 			panes = panes.map((candidate) => candidate.id === paneId ? { ...candidate, tabs: remaining, activeTabId: nextActive } : candidate);
 		}
 
-		persistWorkspace();
 		const nextFocusedPane = panes.find((candidate) => candidate.id === focusedPaneId) ?? panes[0];
 		const nextTab = activeTabFor(nextFocusedPane);
+		if (wasActive) {
+			const activatedAt = nextTabRecency();
+			panes = panes.map((candidate) => candidate.id === nextFocusedPane.id ? {
+				...candidate,
+				tabs: candidate.tabs.map((paneTab) => paneTab.id === nextTab.id ? { ...paneTab, lastActiveAt: activatedAt } : paneTab),
+			} : candidate);
+		}
+		persistWorkspace();
 		if (currentRoute() !== nextTab.path) {
 			lastSyncedPath = nextTab.path;
 			goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
@@ -298,14 +364,15 @@
 		const target = pane?.tabs.find((candidate) => candidate.id === tab.id);
 		if (!pane || !target || pane.tabs.length <= 1) return;
 
+		const activatedTarget = { ...target, lastActiveAt: nextTabRecency() };
 		panes = panes.map((candidate) => candidate.id === paneId
-			? { ...candidate, tabs: [target], activeTabId: target.id }
+			? { ...candidate, tabs: [activatedTarget], activeTabId: activatedTarget.id }
 			: candidate);
 		focusedPaneId = paneId;
 		persistWorkspace();
-		if (currentRoute() !== target.path) {
-			lastSyncedPath = target.path;
-			goto(target.path, { replaceState: true, keepFocus: true, noScroll: true });
+		if (currentRoute() !== activatedTarget.path) {
+			lastSyncedPath = activatedTarget.path;
+			goto(activatedTarget.path, { replaceState: true, keepFocus: true, noScroll: true });
 		}
 	}
 
@@ -318,14 +385,19 @@
 			focusedPaneId = panes[Math.min(paneIndex, panes.length - 1)].id;
 		} else {
 			const pane = panes[0];
-			const home = createWorkspaceTab('/');
+			const home = { ...createWorkspaceTab('/'), lastActiveAt: nextTabRecency() };
 			panes = [{ ...pane, tabs: [home], activeTabId: home.id }];
 			focusedPaneId = pane.id;
 		}
 
-		persistWorkspace();
 		const nextPane = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
 		const nextTab = activeTabFor(nextPane);
+		const activatedAt = nextTabRecency();
+		panes = panes.map((pane) => pane.id === nextPane.id ? {
+			...pane,
+			tabs: pane.tabs.map((tab) => tab.id === nextTab.id ? { ...tab, lastActiveAt: activatedAt } : tab),
+		} : pane);
+		persistWorkspace();
 		if (currentRoute() !== nextTab.path) {
 			lastSyncedPath = nextTab.path;
 			goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
@@ -394,7 +466,7 @@
 		if (paneIndex < 0) return;
 		const pane = panes[paneIndex];
 		const source = activeTabFor(pane);
-		const clone = { ...source, id: workspaceId('tab') };
+		const clone = { ...source, id: workspaceId('tab'), lastActiveAt: nextTabRecency() };
 		const nextPane: WorkspacePaneState = { id: workspaceId('pane'), tabs: [clone], activeTabId: clone.id, width: 1 };
 		panes = [
 			...panes.slice(0, paneIndex),
@@ -403,6 +475,7 @@
 			...panes.slice(paneIndex + 1),
 		].map((candidate) => ({ ...candidate, width: 1 }));
 		focusedPaneId = nextPane.id;
+		panes = enforceTabLimit(panes);
 		persistWorkspace();
 	}
 
@@ -536,10 +609,22 @@
 			const saved = JSON.parse(workspaceStateStorage().getItem(WORKSPACE_STORAGE_KEY) ?? 'null') as { panes?: unknown[]; focusedPaneId?: string } | null;
 			const savedPanes = saved?.panes?.filter(validWorkspacePane).slice(0, MAX_PANES) ?? [];
 			if (savedPanes.length > 0) {
-				panes = savedPanes.map((pane) => ({
-					...pane,
-					tabs: pane.tabs.map((tab) => ({ ...tab, status: null, ...describeWorkspacePath(tab.path) })),
-				}));
+				let fallbackRecency = Date.now() - savedPanes.reduce((count, pane) => count + pane.tabs.length, 0);
+				const restoredPanes = savedPanes.map((pane) => {
+					const tabs = pane.tabs.map((tab) => ({
+						...tab,
+						status: null,
+						lastActiveAt: Number.isFinite(tab.lastActiveAt) ? tab.lastActiveAt : fallbackRecency++,
+						...describeWorkspacePath(tab.path),
+					}));
+					return {
+						...pane,
+						tabs,
+						activeTabId: tabs.some((tab) => tab.id === pane.activeTabId) ? pane.activeTabId : tabs[0].id,
+					};
+				});
+				recencyClock = Math.max(recencyClock, ...restoredPanes.flatMap((pane) => pane.tabs.map((tab) => tab.lastActiveAt)));
+				panes = enforceTabLimit(restoredPanes);
 				focusedPaneId = panes.some((pane) => pane.id === saved?.focusedPaneId) ? saved!.focusedPaneId! : panes[0].id;
 				restored = true;
 			}
@@ -547,6 +632,7 @@
 		} catch {}
 
 		workspaceReady = true;
+		persistWorkspace();
 		const route = currentRoute();
 		if (restored && route === '/') {
 			const restoredTab = activeTabFor(panes.find((pane) => pane.id === focusedPaneId) ?? panes[0]);
@@ -660,19 +746,22 @@
 		</div>
 
 		{#if workspacePath($page.url.pathname)}
-			<div class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-card/35 lg:hidden scrollbar-hide">
+			<div bind:this={compactTabStrip} data-workspace-tab-strip class="flex h-9 shrink-0 items-stretch overflow-x-auto border-b border-border bg-[hsl(var(--field))] lg:hidden scrollbar-hide">
 				{#each openTabs as item (item.tab.id)}
+					{@const isActive = item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						data-workspace-tab
 						data-workspace-tab-title={item.tab.title}
+						data-workspace-tab-active={isActive}
 						oncontextmenu={(event) => showTabContextMenu(event, item.paneId, item.tab)}
-						class="group flex max-w-52 shrink-0 items-center border-r border-border/70 {item.paneId === focusedPaneId && item.tab.id === focusedPane?.activeTabId ? 'bg-background text-foreground' : 'text-muted-foreground'}"
+						class="group relative flex max-w-52 shrink-0 items-center border-r border-border/70 transition-colors {isActive ? 'bg-card font-semibold text-primary shadow-[inset_0_0_0_1px_hsl(var(--border-strong))]' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}"
 					>
-						<button type="button" onclick={() => activateTab(item.paneId, item.tab)} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-xs">
+						<button type="button" onclick={() => activateTab(item.paneId, item.tab)} aria-current={isActive ? 'page' : undefined} class="flex min-w-0 flex-1 items-center gap-2 py-2 pl-3 text-xs">
 							{#if item.tab.status}<span class="h-1.5 w-1.5 shrink-0 rounded-full {statusDot(item.tab.status)}"></span>{/if}<span class="truncate">{item.tab.title}</span>
 						</button>
 						<button type="button" onclick={() => closeTab(item.paneId, item.tab)} class="mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded text-sm text-muted-foreground/60 hover:bg-accent hover:text-foreground" aria-label="Close {item.tab.title}">×</button>
+						{#if isActive}<span data-active-tab-indicator class="pointer-events-none absolute inset-x-2 bottom-0 h-0.5 rounded-full bg-primary" aria-hidden="true"></span>{/if}
 					</div>
 				{/each}
 			</div>

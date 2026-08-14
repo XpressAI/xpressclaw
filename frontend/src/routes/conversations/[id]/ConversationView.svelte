@@ -3,8 +3,9 @@
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
-	import { renderContent } from '$lib/formatMessage';
 	import { harnessMark, timeAgo } from '$lib/utils';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import AiMessage from '$lib/components/AiMessage.svelte';
 
 	const MESSAGE_PAGE_SIZE = 80;
 
@@ -36,6 +37,7 @@
 	let taskWorkflow = $state('');
 	let workflowValues = $state<Record<string, string | boolean | number>>({});
 	let fileInput = $state<HTMLInputElement>();
+	let composerInput = $state<HTMLTextAreaElement>();
 	let messagePane = $state<HTMLDivElement>();
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let eventSource: EventSource | null = null;
@@ -244,6 +246,19 @@
 		content += `${prefix}@[AGENT:${agent.id}:${agent.title || agent.name}] `;
 	}
 
+	function handleSelectionAction(action: string, selection: string) {
+		const prompts: Record<string, string> = {
+			Explain: 'Explain this passage',
+			Improve: 'Improve this passage',
+			Shorten: 'Shorten this passage',
+			Tone: 'Adjust the tone of this passage',
+			Grammar: 'Correct the grammar in this passage',
+		};
+		const selectionPrompt = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		content = content.trim() ? `${content.trimEnd()}\n\n${selectionPrompt}` : selectionPrompt;
+		setTimeout(() => composerInput?.focus(), 0);
+	}
+
 	async function addFiles(files: File[]) {
 		try {
 			const currentSize = attachments.reduce((sum, attachment) => sum + Math.floor(attachment.data.length * 3 / 4), 0);
@@ -347,7 +362,7 @@
 
 <div class="flex h-full min-h-0 flex-col bg-background">
 	{#if loading}
-		<div class="p-6 text-sm text-muted-foreground">Loading conversation…</div>
+		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading conversation" /></div>
 	{:else if conversation}
 		<header class="shrink-0 border-b border-border bg-card/30 px-4 pt-3 sm:px-6">
 			<div class="flex flex-wrap items-center justify-between gap-3">
@@ -372,12 +387,40 @@
 						{#each messages as message (message.id)}
 							{@const fromUser = message.sender_type === 'user'}
 							{@const linkedTask = taskList.find((task) => task.id === message.linked_task_id)}
-							<div class="flex gap-3 {fromUser ? 'flex-row-reverse' : ''}"><span class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full {fromUser ? 'bg-primary text-primary-foreground' : 'bg-muted'} text-xs font-semibold">{fromUser ? 'Y' : message.sender_name?.slice(0, 1).toUpperCase() || 'A'}</span><div class="min-w-0 max-w-[min(48rem,88%)] {fromUser ? 'items-end' : ''}"><div class="mb-1 flex items-center gap-2 text-[11px] text-muted-foreground {fromUser ? 'justify-end' : ''}"><span class="font-medium text-foreground">{message.sender_name || message.sender_id}</span><span>{timeAgo(message.created_at)}</span></div><div class="rounded-2xl px-4 py-3 text-sm {fromUser ? 'rounded-tr-sm bg-primary text-primary-foreground' : 'rounded-tl-sm border border-border bg-card'}"><div class="prose-chat break-words">{@html renderContent(message.content, { openLinksInNewWindow: true })}</div>{#if linkedTask}<a href="/tasks/{linkedTask.id}" class="mt-3 flex items-center gap-2 rounded-lg border border-current/20 bg-background/10 px-3 py-2 text-xs"><span class="h-2 w-2 rounded-full {statusDot(linkedTask.status)}"></span><span class="min-w-0 flex-1 truncate">{linkedTask.title}</span><span>{linkedTask.status.replaceAll('_', ' ')}</span></a>{/if}{#if message.attachments?.length}<div class="mt-3 grid gap-2 sm:grid-cols-2">{#each message.attachments as attachment}<a href={conversations.attachmentUrl(conversationId, attachment.id)} target="_blank" rel="noopener noreferrer" class="overflow-hidden rounded-lg border border-current/20 bg-background/10">{#if attachment.mime_type.startsWith('image/')}<img src={conversations.attachmentUrl(conversationId, attachment.id)} alt={attachment.name} class="max-h-48 w-full object-cover" />{/if}<span class="flex items-center justify-between gap-2 px-2 py-1.5 text-[11px]"><span class="truncate">{attachment.name}</span><span class="opacity-70">{formatBytes(attachment.size)}</span></span></a>{/each}</div>{/if}</div></div></div>
+							<AiMessage
+								role={fromUser ? 'user' : 'assistant'}
+								sender={message.sender_name || message.sender_id}
+								timestampLabel={timeAgo(message.created_at)}
+								content={message.content}
+								avatar={fromUser ? 'Y' : message.sender_name?.slice(0, 1).toUpperCase() || 'A'}
+								selectionActions={!fromUser}
+								onselectionaction={handleSelectionAction}
+							>
+								{#if linkedTask}
+									<a href="/tasks/{linkedTask.id}" class="mt-3 flex items-center gap-2 rounded-lg bg-background/40 px-3 py-2 text-xs shadow-[var(--shadow-hairline)]">
+										<span class="h-2 w-2 rounded-full {statusDot(linkedTask.status)}"></span>
+										<span class="min-w-0 flex-1 truncate">{linkedTask.title}</span>
+										<span class="text-muted-foreground">{linkedTask.status.replaceAll('_', ' ')}</span>
+									</a>
+								{/if}
+								{#if message.attachments?.length}
+									<div class="mt-3 grid gap-2 sm:grid-cols-2">
+										{#each message.attachments as attachment}
+											<a href={conversations.attachmentUrl(conversationId, attachment.id)} target="_blank" rel="noopener noreferrer" class="overflow-hidden rounded-lg bg-background/40 shadow-[var(--shadow-hairline)]">
+												{#if attachment.mime_type.startsWith('image/')}<img src={conversations.attachmentUrl(conversationId, attachment.id)} alt={attachment.name} class="max-h-48 w-full object-cover" />{/if}
+												<span class="flex items-center justify-between gap-2 px-2 py-1.5 text-[11px]"><span class="truncate">{attachment.name}</span><span class="opacity-70">{formatBytes(attachment.size)}</span></span>
+											</a>
+										{/each}
+									</div>
+								{/if}
+							</AiMessage>
 						{/each}
-						{#if activeTurns.length}<div class="flex items-center gap-2 py-2 text-xs text-muted-foreground"><span class="flex gap-1"><span class="h-1.5 w-1.5 animate-bounce rounded-full bg-primary"></span><span class="h-1.5 w-1.5 animate-bounce rounded-full bg-primary [animation-delay:120ms]"></span><span class="h-1.5 w-1.5 animate-bounce rounded-full bg-primary [animation-delay:240ms]"></span></span>{activeTurns.map((turn) => projectAgents.find((agent) => agent.id === turn.agent_id)?.title || turn.agent_id).join(', ')} {activeTurns.length === 1 ? 'is' : 'are'} responding</div>{/if}
+						{#if activeTurns.length}
+							<div class="py-2 pl-10"><AgentLoading label={`${activeTurns.map((turn) => projectAgents.find((agent) => agent.id === turn.agent_id)?.title || turn.agent_id).join(', ')} ${activeTurns.length === 1 ? 'is' : 'are'} responding`} startedAt={activeTurns[0].started_at ?? activeTurns[0].queued_at} /></div>
+						{/if}
 					</div></div>
 
-					<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4"><div class="mx-auto max-w-4xl rounded-xl border border-input bg-card shadow-sm focus-within:ring-2 focus-within:ring-ring"><div class="flex flex-wrap gap-1 px-3 pt-2">{#each participantAgents as agent}<button type="button" onclick={() => mention(agent)} class="rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground">@{agent.title || agent.name}</button>{/each}</div>{#if attachments.length}<div class="flex flex-wrap gap-2 px-3 pt-2">{#each attachments as attachment, index}<span class="flex max-w-48 items-center gap-2 rounded-lg border border-border bg-muted px-2 py-1 text-[11px]"><span class="truncate">{attachment.name}</span><button type="button" onclick={() => (attachments = attachments.filter((_, item) => item !== index))}>×</button></span>{/each}</div>{/if}<textarea bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block w-full resize-none bg-transparent px-3 py-2 text-sm outline-none"></textarea><div class="flex items-center justify-between px-2 pb-2"><div><input bind:this={fileInput} onchange={handleFileInput} type="file" multiple class="hidden" /><button type="button" onclick={() => fileInput?.click()} class="flex h-8 w-8 items-center justify-center rounded-lg text-lg text-muted-foreground hover:bg-accent" title="Attach files">+</button></div><button type="button" onclick={() => void send()} disabled={sending || !content.trim() && attachments.length === 0} class="rounded-lg bg-primary px-4 py-2 text-xs font-medium text-primary-foreground disabled:opacity-40">{sending ? 'Sending…' : 'Send'}</button></div></div></div>
+					<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4"><div class="ai-card mx-auto max-w-4xl focus-within:ring-1 focus-within:ring-ring/40"><div class="flex flex-wrap gap-1 px-3 pt-2">{#each participantAgents as agent}<button type="button" onclick={() => mention(agent)} class="rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground">@{agent.title || agent.name}</button>{/each}</div>{#if attachments.length}<div class="flex flex-wrap gap-2 px-3 pt-2">{#each attachments as attachment, index}<span class="flex max-w-48 items-center gap-2 rounded-lg bg-muted px-2 py-1 text-[11px] shadow-[var(--shadow-hairline)]"><span class="truncate">{attachment.name}</span><button type="button" onclick={() => (attachments = attachments.filter((_, item) => item !== index))}>×</button></span>{/each}</div>{/if}<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-36 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea><div class="flex items-center justify-between px-2 pb-2"><div><input bind:this={fileInput} onchange={handleFileInput} type="file" multiple class="hidden" /><button type="button" onclick={() => fileInput?.click()} class="ai-icon-button" title="Attach files" aria-label="Attach files"><svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg></button></div><button type="button" onclick={() => void send()} disabled={sending || !content.trim() && attachments.length === 0} class="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-transform enabled:active:scale-95 disabled:opacity-35" aria-label="Send">{#if sending}<span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"></span>{:else}<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>{/if}</button></div></div></div>
 				</div>
 
 				<aside class="hidden w-72 shrink-0 overflow-y-auto border-l border-border bg-card/20 p-4 xl:block"><div class="mb-3 flex items-center justify-between"><h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tasks</h2><button type="button" onclick={() => (showTaskComposer = true)} class="text-xs text-primary">+ Add</button></div><div class="space-y-2">{#each taskList.slice(0, 10) as task}<a href="/tasks/{task.id}" class="block rounded-lg border border-border bg-card p-3 hover:border-primary/40"><div class="flex items-start gap-2"><span class="mt-1 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"></span><span class="min-w-0 flex-1"><span class="line-clamp-2 text-xs font-medium">{task.title}</span><span class="mt-1 block text-[10px] text-muted-foreground">{task.status.replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span></div></a>{/each}{#if taskList.length === 0}<p class="rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">No tasks yet.</p>{/if}</div></aside>

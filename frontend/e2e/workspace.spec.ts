@@ -143,6 +143,7 @@ async function mockApi(
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
 		projectSyncFetchConflictOnce?: boolean;
+		preserveWorkspace?: boolean;
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -284,7 +285,9 @@ async function mockApi(
 		: [project];
 	let conversationMessages = [...(options.conversationMessages ?? [])];
 
-	await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
+	if (!options.preserveWorkspace) {
+		await page.addInitScript(() => localStorage.removeItem('xpressclaw.workspace.v1'));
+	}
 	await page.route('**/api/**', async (route) => {
 		const request = route.request();
 		const url = new URL(request.url());
@@ -888,6 +891,41 @@ test('links in agent responses open in new windows without changing user links',
 	await expect(userLink).toBeVisible();
 	await expect(userLink).not.toHaveAttribute('target', '_blank');
 	await expect(userLink).not.toHaveAttribute('rel', /noopener|noreferrer/);
+	await expect(userLink).toHaveCSS('color', 'rgb(255, 255, 255)');
+});
+
+test('assistant text selections offer follow-up actions in the task composer', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep this draft');
+
+	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
+	const messageContent = assistantMessage.locator('.prose-chat');
+	await messageContent.evaluate((element) => {
+		const selection = window.getSelection();
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+	});
+
+	const actions = assistantMessage.locator('[data-selection-actions]');
+	await expect(actions).toBeVisible();
+	await actions.getByRole('button', { name: 'Improve' }).click();
+	await expect(composer).toHaveValue(/Keep this draft\n\nImprove this passage:\n\n> First answer/);
+	await expect(composer).toBeFocused();
+});
+
+test('active work uses the elapsed agent loading indicator', async ({ page }) => {
+	await mockApi(page, { live: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const loadingIndicator = page.locator('[data-agent-loading]', { hasText: 'The agent is working on this task' });
+	await expect(loadingIndicator).toBeVisible();
+	await expect(loadingIndicator.locator('[aria-hidden="true"]').first().locator('span')).toHaveCount(9);
+	await expect(loadingIndicator).toContainText(/\d+(?:\.\d)?(?:s|m)/);
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {
@@ -1064,6 +1102,19 @@ test('project conversations coordinate files and project-wide linked work', asyn
 	await page.getByRole('button', { name: 'Conversation' }).click();
 
 	const composer = page.getByPlaceholder('Message #Release planning…');
+	await composer.fill('Keep this conversation draft');
+	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
+	await assistantMessage.locator('.prose-chat').evaluate((element) => {
+		const selection = window.getSelection();
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+	});
+	await assistantMessage.locator('[data-selection-actions]').getByRole('button', { name: 'Shorten' }).click();
+	await expect(composer).toHaveValue(/Keep this conversation draft\n\nShorten this passage:/);
+
 	await composer.fill('Please compare both approaches.');
 	await page.getByRole('button', { name: 'Send', exact: true }).click();
 	await expect.poll(() => conversationMessageRequests).toEqual([{
@@ -1278,6 +1329,7 @@ test('supported ACP forms still require structured answers', async ({ page }) =>
 	await page.goto(`/tasks/${taskId}`);
 
 	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.locator('[data-approval-card]')).toBeVisible();
 	await expect(page.getByText('Agent question')).toBeVisible();
 	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
 	await page.getByRole('button', { name: 'Safe approach' }).click();
@@ -1712,6 +1764,110 @@ test('workspace panes split on wide screens and collapse cleanly on mobile', asy
 	await expect(mobileTabs).toHaveCount(1);
 	expect(await mobile.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await mobile.close();
+});
+
+test('workspace keeps the ten most recently used tabs and clearly marks the active tab', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Release planning',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(2),
+		last_message_at: timestamp(2),
+		participants: [],
+	};
+	const workflow = {
+		id: 'workflow-limit-test',
+		name: 'Limit test workflow',
+		description: 'Exercises the workspace tab limit.',
+		yaml_content: 'name: limit-test\nflows:\n  main:\n    steps: []\n',
+		enabled: true,
+		version: 1,
+		created_at: timestamp(1),
+		updated_at: timestamp(2),
+	};
+	await page.addInitScript(({ storageKey, state }) => {
+		if (!localStorage.getItem(storageKey)) localStorage.setItem(storageKey, JSON.stringify(state));
+	}, {
+		storageKey: 'xpressclaw.workspace.v1',
+		state: {
+			focusedPaneId: 'seed-pane',
+			panes: [{
+				id: 'seed-pane',
+				activeTabId: 'seed-tab-10',
+				width: 1,
+				tabs: [
+					{ id: 'seed-tab-1', path: '/', kind: 'home', title: 'New work', resourceId: null, status: null, lastActiveAt: 1 },
+					{ id: 'seed-tab-2', path: '/projects', kind: 'projects', title: 'Projects', resourceId: null, status: null, lastActiveAt: 2 },
+					{ id: 'seed-tab-3', path: `/projects/${projectId}`, kind: 'project', title: 'Browser collaboration project', resourceId: projectId, status: null, lastActiveAt: 3 },
+					{ id: 'seed-tab-4', path: `/conversations/${conversationId}`, kind: 'conversation', title: 'Release planning', resourceId: conversationId, status: null, lastActiveAt: 4 },
+					{ id: 'seed-tab-5', path: '/agents', kind: 'agents', title: 'Agents', resourceId: null, status: null, lastActiveAt: 5 },
+					{ id: 'seed-tab-6', path: `/agents/${agentId}`, kind: 'agent', title: 'Browser-tested workspace', resourceId: agentId, status: null, lastActiveAt: 6 },
+					{ id: 'seed-tab-7', path: '/tasks', kind: 'tasks', title: 'Tasks', resourceId: null, status: null, lastActiveAt: 7 },
+					{ id: 'seed-tab-8', path: `/tasks/${taskId}`, kind: 'task', title: 'Browser-tested workspace', resourceId: taskId, status: null, lastActiveAt: 8 },
+					{ id: 'seed-tab-9', path: '/workflows/new', kind: 'workflow-new', title: 'New workflow', resourceId: null, status: null, lastActiveAt: 9 },
+					{ id: 'seed-tab-10', path: '/workflows/workflow-limit-test', kind: 'workflow', title: 'Limit test workflow', resourceId: 'workflow-limit-test', status: null, lastActiveAt: 10 },
+				],
+			}],
+		},
+	});
+	await mockApi(page, {
+		preserveWorkspace: true,
+		conversations: [conversation],
+		workflows: [workflow],
+	});
+	await page.goto('/workflows/workflow-limit-test');
+
+	const tabs = page.locator('[data-workspace-pane] [data-workspace-tab]');
+	await expect(tabs).toHaveCount(10);
+	await tabs.filter({ has: page.locator('button[title="New work"]') }).locator('button').first().click();
+	await expect(page).toHaveURL('/');
+
+	await page.locator('aside').first().locator('a[href="/settings"]').click();
+	await expect(page).toHaveURL('/settings');
+	await expect(tabs).toHaveCount(10);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="New work"]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="Projects"]')).toHaveCount(0);
+
+	const activeTab = page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-active="true"]');
+	const inactiveTab = page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-active="false"]').first();
+	await expect(activeTab).toHaveCount(1);
+	await expect(activeTab).toHaveAttribute('data-workspace-tab-title', 'Settings');
+	await expect(activeTab.locator('button').first()).toHaveAttribute('aria-current', 'page');
+	await expect(activeTab.locator('[data-active-tab-indicator]')).toBeVisible();
+	const tabStrip = page.locator('[data-workspace-pane] [data-workspace-tab-strip]');
+	await expect.poll(async () => {
+		const [stripBounds, activeBounds] = await Promise.all([tabStrip.boundingBox(), activeTab.boundingBox()]);
+		return Boolean(stripBounds && activeBounds
+			&& activeBounds.x >= stripBounds.x
+			&& activeBounds.x + activeBounds.width <= stripBounds.x + stripBounds.width + 1);
+	}).toBe(true);
+	const [activeStyle, inactiveStyle] = await Promise.all([
+		activeTab.evaluate((element) => ({
+			background: getComputedStyle(element).backgroundColor,
+			color: getComputedStyle(element).color,
+		})),
+		inactiveTab.evaluate((element) => ({
+			background: getComputedStyle(element).backgroundColor,
+			color: getComputedStyle(element).color,
+		})),
+	]);
+	expect(activeStyle).not.toEqual(inactiveStyle);
+
+	const persistedTabs = await page.evaluate(() => {
+		const state = JSON.parse(localStorage.getItem('xpressclaw.workspace.v1') ?? '{}') as {
+			panes?: { tabs?: { lastActiveAt?: number }[] }[];
+		};
+		return state.panes?.flatMap((pane) => pane.tabs ?? []) ?? [];
+	});
+	expect(persistedTabs).toHaveLength(10);
+	expect(persistedTabs.every((tab) => Number.isFinite(tab.lastActiveAt))).toBe(true);
+
+	await page.reload();
+	await expect(tabs).toHaveCount(10);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="New work"]')).toHaveCount(1);
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab][data-workspace-tab-title="Projects"]')).toHaveCount(0);
 });
 
 test('workspace renders when session storage is unavailable', async ({ page }) => {

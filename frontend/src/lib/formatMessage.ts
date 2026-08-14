@@ -7,6 +7,15 @@ interface RenderContentOptions {
 	openLinksInNewWindow?: boolean;
 }
 
+function escapeHtml(value: string): string {
+	return value
+		.replaceAll('&', '&amp;')
+		.replaceAll('<', '&lt;')
+		.replaceAll('>', '&gt;')
+		.replaceAll('"', '&quot;')
+		.replaceAll("'", '&#039;');
+}
+
 function openLinksInNewWindow(html: string): string {
 	const template = document.createElement('template');
 	template.innerHTML = html;
@@ -66,12 +75,12 @@ export function renderContent(content: string, options: RenderContentOptions = {
 
 		result = result.replace(
 			`%%THINK_${i}%%`,
-			`<details class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-muted-foreground select-none">Thinking...</summary><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></details>`
+			`<details class="ai-inline-trace not-prose"><summary><span aria-hidden="true">✦</span><span>Thinking</span></summary><div class="ai-inline-trace-content">${escaped}</div></details>`
 		);
 
 		const streamHtml = thinking
-			? `<div class="mb-2 rounded-lg border border-border/50 bg-[hsl(228_22%_13%)] text-xs not-prose"><div class="px-3 py-1.5 text-muted-foreground select-none flex items-center gap-1.5"><span class="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span> Thinking...</div><div class="px-3 py-2 text-muted-foreground/80 border-t border-border/30">${escaped}</div></div>`
-			: '<span class="text-xs text-muted-foreground italic">Thinking...</span>';
+			? `<div class="ai-inline-trace ai-inline-trace-streaming not-prose"><div class="ai-inline-trace-label"><span aria-hidden="true">✦</span><span class="ai-shimmer-text">Thinking</span></div><div class="ai-inline-trace-content">${escaped}</div></div>`
+			: '<span class="ai-shimmer-text text-xs font-medium">Thinking</span>';
 		result = result.replace(`%%THINKSTREAM_${i}%%`, streamHtml);
 	}
 
@@ -80,10 +89,10 @@ export function renderContent(content: string, options: RenderContentOptions = {
 		const { name, args } = toolCallBlocks[i];
 		let prettyArgs = args;
 		try { prettyArgs = JSON.stringify(JSON.parse(args), null, 2); } catch {}
-		const escapedArgs = prettyArgs.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+		const escapedArgs = escapeHtml(prettyArgs);
 		result = result.replace(
 			`%%TOOL_${i}%%`,
-			`<details class="mb-2 rounded-lg border border-blue-500/30 bg-blue-500/5 text-xs not-prose"><summary class="cursor-pointer px-3 py-1.5 text-blue-400 select-none flex items-center gap-1.5"><span>&#x1f527;</span> ${name}</summary><pre class="px-3 py-2 text-muted-foreground/80 border-t border-blue-500/20 overflow-x-auto">${escapedArgs}</pre></details>`
+			`<details class="ai-inline-tool not-prose"><summary><span aria-hidden="true">⌘</span><span>${escapeHtml(name)}</span></summary><pre>${escapedArgs}</pre></details>`
 		);
 	}
 

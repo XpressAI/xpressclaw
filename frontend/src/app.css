@@ -5,54 +5,93 @@
 @layer base {
 	:root {
 		color-scheme: light;
-		--background: 220 33% 98%;
-		--foreground: 224 24% 12%;
+		--background: 240 7% 98%;
+		--foreground: 220 8% 13%;
 		--card: 0 0% 100%;
-		--card-foreground: 224 24% 12%;
-		--primary: 225 70% 52%;
+		--card-foreground: 220 8% 13%;
+		--primary: 209 100% 50%;
 		--primary-foreground: 0 0% 100%;
-		--secondary: 220 24% 95%;
-		--secondary-foreground: 224 24% 16%;
-		--muted: 220 20% 95%;
-		--muted-foreground: 222 12% 44%;
-		--accent: 223 32% 92%;
-		--accent-foreground: 224 24% 16%;
-		--destructive: 0 84.2% 60.2%;
+		--secondary: 220 9% 96%;
+		--secondary-foreground: 220 8% 16%;
+		--muted: 220 10% 96%;
+		--muted-foreground: 220 5% 40%;
+		--accent: 211 100% 96%;
+		--accent-foreground: 210 98% 43%;
+		--destructive: 358 75% 58%;
 		--destructive-foreground: 0 0% 98%;
-		--border: 220 18% 87%;
-		--input: 220 18% 84%;
-		--ring: 225 70% 52%;
-		--radius: 0.5rem;
+		--border: 220 8% 93%;
+		--input: 220 9% 88%;
+		--ring: 209 100% 50%;
+		--radius: 0.625rem;
+
+		/* AI-native surface tokens adapted from Beautiful UI's MIT-licensed primitives. */
+		--canvas: 220 8% 95%;
+		--inset: 210 17% 97%;
+		--hover: 210 12% 96%;
+		--hover-strong: 210 9% 91%;
+		--foreground-secondary: 220 5% 40%;
+		--foreground-tertiary: 220 3% 62%;
+		--border-strong: 220 8% 88%;
+		--field: 240 4% 95%;
+		--success: 145 73% 35%;
+		--success-tint: 145 48% 94%;
+		--warning: 27 93% 49%;
+		--warning-tint: 31 82% 95%;
+		--danger: 358 75% 58%;
+		--danger-tint: 358 72% 96%;
+		--shadow-hairline: 0 0 0 1px hsl(var(--border));
+		--shadow-control: 0 0 0 1px hsl(var(--border-strong)), 0 1px 2px rgb(16 24 40 / 5%);
+		--shadow-card: 0 0 0 1px hsl(var(--border)), 0 1px 2px rgb(16 24 40 / 4%), 0 2px 6px rgb(16 24 40 / 3%);
+		--shadow-overlay: 0 0 0 1px hsl(var(--border)), 0 8px 28px rgb(0 0 0 / 7%);
 
 		--sidebar: 222 30% 97%;
-		--sidebar-active: 225 76% 91%;
+		--sidebar-active: 211 100% 95%;
 	}
 
 	.dark {
 		color-scheme: dark;
-		--background: 228 25% 8%;
-		--foreground: 220 20% 92%;
-		--card: 228 22% 11%;
-		--card-foreground: 220 20% 92%;
-		--primary: 225 65% 55%;
+		--background: 220 6% 9%;
+		--foreground: 210 8% 95%;
+		--card: 220 5% 15%;
+		--card-foreground: 210 8% 95%;
+		--primary: 212 100% 62%;
 		--primary-foreground: 0 0% 100%;
-		--secondary: 228 20% 16%;
-		--secondary-foreground: 220 20% 92%;
-		--muted: 228 18% 14%;
-		--muted-foreground: 225 15% 55%;
-		--accent: 225 50% 25%;
-		--accent-foreground: 220 20% 92%;
-		--destructive: 0 62.8% 45%;
+		--secondary: 220 5% 17%;
+		--secondary-foreground: 210 8% 95%;
+		--muted: 220 5% 13%;
+		--muted-foreground: 220 4% 66%;
+		--accent: 220 5% 19%;
+		--accent-foreground: 210 8% 95%;
+		--destructive: 358 80% 65%;
 		--destructive-foreground: 0 0% 98%;
-		--border: 225 18% 18%;
-		--input: 225 18% 18%;
-		--ring: 225 65% 55%;
-		--radius: 0.5rem;
+		--border: 220 5% 19%;
+		--input: 220 5% 24%;
+		--ring: 212 100% 62%;
+		--radius: 0.625rem;
 
-		--sidebar: 228 25% 10%;
-		--sidebar-active: 225 50% 30%;
+		--canvas: 220 5% 12%;
+		--inset: 220 5% 13%;
+		--hover: 220 5% 17%;
+		--hover-strong: 220 5% 20%;
+		--foreground-secondary: 220 4% 66%;
+		--foreground-tertiary: 220 4% 44%;
+		--border-strong: 220 5% 24%;
+		--field: 220 5% 18%;
+		--success: 145 51% 49%;
+		--success-tint: 145 51% 49% / 14%;
+		--warning: 27 91% 60%;
+		--warning-tint: 27 91% 60% / 14%;
+		--danger: 358 80% 65%;
+		--danger-tint: 358 80% 65% / 14%;
+		--shadow-hairline: 0 0 0 1px hsl(var(--border));
+		--shadow-control: 0 0 0 1px hsl(var(--border-strong)), 0 1px 2px rgb(0 0 0 / 30%);
+		--shadow-card: 0 0 0 1px hsl(var(--border)), 0 1px 2px rgb(0 0 0 / 20%), 0 2px 6px rgb(0 0 0 / 20%);
+		--shadow-overlay: 0 0 0 1px hsl(var(--border-strong)), 0 8px 28px rgb(0 0 0 / 34%);
+
+		--sidebar: 220 6% 11%;
+		--sidebar-active: 212 45% 22%;
 		--bubble-user: 260 60% 45%;
-		--bubble-agent: 228 22% 15%;
+		--bubble-agent: 220 5% 15%;
 	}
 }
 
@@ -62,6 +101,63 @@
 	}
 	body {
 		@apply bg-background text-foreground;
+		font-feature-settings: 'cv11', 'ss01';
+		letter-spacing: -0.01em;
+		-webkit-font-smoothing: antialiased;
+	}
+	::selection {
+		background: hsl(var(--primary) / 20%);
+	}
+}
+
+@layer components {
+	.ai-card {
+		border-radius: 0.625rem;
+		background: hsl(var(--card));
+		box-shadow: var(--shadow-card);
+	}
+	.ai-raised {
+		border-radius: 0.625rem;
+		background: hsl(var(--card));
+		box-shadow: var(--shadow-overlay);
+	}
+	.ai-control {
+		border-radius: 0.5rem;
+		background: hsl(var(--card));
+		box-shadow: var(--shadow-control);
+	}
+	.ai-icon-button {
+		display: inline-flex;
+		height: 1.75rem;
+		width: 1.75rem;
+		align-items: center;
+		justify-content: center;
+		border-radius: 0.5rem;
+		color: hsl(var(--foreground-tertiary));
+		transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+	}
+	.ai-icon-button:hover {
+		background: hsl(var(--hover));
+		color: hsl(var(--foreground));
+	}
+	.ai-icon-button:active {
+		transform: scale(0.96);
+	}
+	.ai-shimmer-text {
+		background-image: linear-gradient(90deg, hsl(var(--foreground-tertiary)) 35%, hsl(var(--foreground)) 50%, hsl(var(--foreground-tertiary)) 65%);
+		background-size: 200% 100%;
+		background-clip: text;
+		color: transparent;
+		animation: ai-shimmer-text 1.4s linear infinite;
+	}
+	.ai-status-pill {
+		display: inline-flex;
+		height: 1.375rem;
+		align-items: center;
+		border-radius: 999px;
+		padding-inline: 0.5rem;
+		font-size: 0.6875rem;
+		font-weight: 500;
 	}
 }
 
@@ -99,16 +195,18 @@
 	font-size: 0.85em;
 }
 .prose-chat pre {
-	background: hsl(var(--muted));
-	padding: 0.75em 1em;
-	border-radius: 0.375rem;
+	background: hsl(var(--canvas));
+	padding: 0.875rem 1rem;
+	border-radius: 0.625rem;
 	overflow-x: auto;
-	margin: 0.5em 0;
+	margin: 0.75em 0;
+	box-shadow: var(--shadow-hairline);
 }
 .prose-chat pre code {
 	background: none;
 	padding: 0;
 	font-size: 0.85em;
+	line-height: 1.65;
 }
 .prose-chat blockquote {
 	border-left: 3px solid hsl(var(--border));
@@ -117,23 +215,37 @@
 	color: hsl(var(--muted-foreground));
 }
 .prose-chat table {
-	border-collapse: collapse;
+	border-collapse: separate;
+	border-spacing: 0;
 	width: 100%;
-	margin: 0.5em 0;
+	margin: 0.75em 0;
 	font-size: 0.85em;
+	border-radius: 0.625rem;
+	overflow: hidden;
+	box-shadow: var(--shadow-hairline);
 }
 .prose-chat th, .prose-chat td {
-	border: 1px solid hsl(var(--border));
-	padding: 0.35em 0.6em;
+	border: 0;
+	border-bottom: 1px solid hsl(var(--border));
+	padding: 0.6rem 0.75rem;
 	text-align: left;
 }
 .prose-chat th {
-	background: hsl(var(--muted));
+	background: hsl(var(--inset));
 	font-weight: 600;
+	color: hsl(var(--foreground-secondary));
+}
+.prose-chat tr:last-child td {
+	border-bottom: 0;
 }
 .prose-chat a {
 	color: hsl(var(--ring));
 	text-decoration: underline;
+}
+.prose-chat-user a {
+	color: hsl(var(--primary-foreground));
+	font-weight: 500;
+	text-decoration-color: hsl(var(--primary-foreground) / 65%);
 }
 .prose-chat img {
 	max-width: 100%;
@@ -145,8 +257,74 @@
 	border-top: 1px solid hsl(var(--border));
 	margin: 0.75em 0;
 }
-.prose-chat .not-prose, .prose-chat details {
-	all: revert;
+.prose-chat .not-prose {
+	font-style: normal;
+}
+
+.prose-chat details.ai-inline-trace,
+.prose-chat details.ai-inline-tool,
+.prose-chat .ai-inline-trace-streaming {
+	margin-block: 0.5rem;
+	overflow: hidden;
+	border-radius: 0.625rem;
+	background: hsl(var(--card));
+	font-size: 0.75rem;
+	box-shadow: var(--shadow-control);
+}
+
+.prose-chat details.ai-inline-trace summary,
+.prose-chat details.ai-inline-tool summary,
+.prose-chat .ai-inline-trace-label {
+	display: flex;
+	cursor: pointer;
+	user-select: none;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.45rem 0.65rem;
+	color: hsl(var(--foreground-secondary));
+	font-weight: 500;
+}
+
+.prose-chat .ai-inline-trace-content {
+	border-top: 1px solid hsl(var(--border));
+	padding: 0.65rem;
+	color: hsl(var(--foreground-secondary));
+}
+
+.prose-chat details.ai-inline-tool pre {
+	margin: 0;
+	border-radius: 0;
+	box-shadow: none;
+	border-top: 1px solid hsl(var(--border));
+}
+
+@keyframes ai-shimmer-text {
+	0% { background-position: 150%; }
+	100% { background-position: -50%; }
+}
+
+@keyframes ai-fade-up {
+	0% { opacity: 0; transform: translateY(8px); }
+	100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes ai-pop-in {
+	0% { opacity: 0; transform: scale(0.95); }
+	100% { opacity: 1; transform: scale(1); }
+}
+
+@keyframes ai-pixel-on {
+	0%, 100% { opacity: 0.15; }
+	18%, 42% { opacity: 1; }
+	62% { opacity: 0.15; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.ai-shimmer-text,
+	[data-agent-loading] * {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+	}
 }
 
 /* Dark-mode form controls — Linux renders native widgets that ignore CSS colors */

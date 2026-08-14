@@ -24,6 +24,7 @@ export interface WorkspaceTab {
 	title: string;
 	resourceId: string | null;
 	status: string | null;
+	lastActiveAt: number;
 }
 
 export interface WorkspacePaneState {
@@ -93,7 +94,7 @@ export function workspacePath(route: string): boolean {
 		|| pathname.startsWith('/settings/');
 }
 
-export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status'> {
+export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status' | 'lastActiveAt'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
 	if (pathname === '/projects') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
@@ -126,7 +127,7 @@ export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 }
 
 export function createWorkspaceTab(route: string): WorkspaceTab {
-	return { id: workspaceId('tab'), status: null, ...describeWorkspacePath(route) };
+	return { id: workspaceId('tab'), status: null, lastActiveAt: Date.now(), ...describeWorkspacePath(route) };
 }
 
 export function validWorkspacePane(value: unknown): value is WorkspacePaneState {
