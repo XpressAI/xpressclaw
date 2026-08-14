@@ -2162,7 +2162,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 		'P Profile',
 		'↕ Project sync',
 		'M MCP servers',
-		'S Server',
+		'I Instance',
 	]);
 	await expect(settingsSidebar.locator('[data-sidebar-setting="settings"]')).toHaveAttribute('aria-current', 'page');
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
