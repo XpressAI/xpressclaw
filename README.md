@@ -24,8 +24,8 @@ Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers
 ---
 
 ```bash
-xpressclaw init
-xpressclaw up
+xpressclaw init ~/.xpressclaw
+xpressclaw up --workdir ~/.xpressclaw
 ```
 
 Open `http://localhost:8935`, create a Project, add an Agent with its harness
@@ -108,19 +108,25 @@ Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know
 
 ## Quick Start
 
-### Option 1: Download Binary
+### Option 1: Native App
 
-Grab the latest release from [GitHub Releases](https://github.com/XpressAI/xpressclaw/releases).
+Download the macOS, Windows, or Linux installer from
+[Releases](https://github.com/XpressAI/xpressclaw/releases), then launch the
+app. No CLI initialization is required: Desktop starts its bundled control
+plane from `~/.xpressclaw`, opens the first-run Agent setup, and keeps running
+in the system tray.
+
+### Option 2: Download Binary
+
+Grab the CLI release, choose one durable control-plane directory for this
+installation, and start it. That directory is not the source repository an
+Agent will work on; one control plane can manage many Project workspaces.
 
 ```bash
-xpressclaw init
-xpressclaw up
+xpressclaw init ~/.xpressclaw
+xpressclaw up --workdir ~/.xpressclaw
 # Open http://localhost:8935
 ```
-
-### Option 2: Native App
-
-Download the macOS, Windows, or Linux installer from [Releases](https://github.com/XpressAI/xpressclaw/releases). The app runs in the system tray and keeps the local control plane available in the background.
 
 ### Option 3: Build from Source
 
@@ -411,32 +417,37 @@ to be a Git repository; it only needs to preserve the generated
 
 First, create the remote synchronization repository and configure Git access
 with your own SSH agent or credential helper. Then initialize synchronization
-for an existing local Project. You can copy the Project ID from its
-`/projects/<project-id>` URL in the web UI:
+for an existing local Project from the repository being synchronized:
 
 ```bash
+cd /path/to/platform
 xpressclaw sync init \
-  --project-id <project-id> \
-  --remote git@github.com:your-org/xpressclaw-data.git \
-  --branch main \
-  --store-path projects/<project-id> \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+  --project platform \
+  --remote git@github.com:your-org/xpressclaw-data.git
 ```
 
-`--branch` defaults to `main`, `--store-path` defaults to
-`projects/<project-id>`, and both directory options default to the current
-directory. Use `--no-project-memory` with `sync init` if memory should stay
-local. Initialization only creates `/path/to/main-project/.xpressclaw.yml`; it
-does not contact the remote or synchronize any data. Preserve that manifest
-with the main project, but never put credentials in it.
+`--project` accepts a visible name or exact canonical ID. Ambiguous names are
+reported with their IDs, and the Project page exposes a copyable canonical ID;
+the old `--project-id <ID>` spelling remains supported. XpressClaw discovers
+`xpressclaw.yaml` in the current/parent directories or in a single sibling
+control-plane repository, then falls back to Desktop's
+`~/.xpressclaw/xpressclaw.yaml`. Otherwise pass
+`--control-plane-dir /path/to/xpressclaw-control`. This is distinct from
+`--project-dir`, which means the repository receiving `.xpressclaw.yml`;
+`~/.xpressclaw` is both Desktop's control-plane directory and the default local
+data directory. CLI installations may keep `xpressclaw.yaml` elsewhere.
+`--workdir` remains a backward-compatible alias for `--control-plane-dir`.
+
+`--branch` defaults to `main`, and `--store-path` defaults to
+`projects/<canonical-project-id>`. Use `--no-project-memory` if memory should
+stay local. Initialization only creates `.xpressclaw.yml`; it does not contact
+the remote or synchronize any data. Preserve that manifest with the main
+project, but never put credentials in it.
 
 Publish the first shared snapshot:
 
 ```bash
-xpressclaw sync publish \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync publish
 ```
 
 Anyone with the same manifest can explicitly fetch the snapshot into their
@@ -444,14 +455,10 @@ local XpressClaw installation, work normally, and publish their updates:
 
 ```bash
 # Before starting work
-xpressclaw sync fetch \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync fetch
 
 # After making XpressClaw Project changes
-xpressclaw sync publish \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync publish
 ```
 
 Stop the control plane, or wait until the Project has no active work, before a

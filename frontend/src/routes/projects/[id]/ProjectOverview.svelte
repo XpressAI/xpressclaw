@@ -14,6 +14,7 @@
 	let conversationTitle = $state('');
 	let selectedAgents = $state<string[]>([]);
 	let selectedAgentToMove = $state('');
+	let projectIdCopied = $state(false);
 	let error = $state('');
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
@@ -41,6 +42,16 @@
 		selectedAgents = selectedAgents.includes(agentId)
 			? selectedAgents.filter((id) => id !== agentId)
 			: [...selectedAgents, agentId];
+	}
+
+	async function copyProjectId() {
+		if (!project) return;
+		try {
+			await navigator.clipboard.writeText(project.id);
+			projectIdCopied = true;
+		} catch {
+			error = 'Could not copy the Project ID. It remains visible so you can select it.';
+		}
 	}
 
 	async function createConversation() {
@@ -90,7 +101,7 @@
 			<header class="flex flex-wrap items-start justify-between gap-4">
 				<div class="flex min-w-0 items-center gap-4">
 					<span class="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-xl font-semibold text-primary">{project.icon || project.name.slice(0, 1).toUpperCase()}</span>
-					<div class="min-w-0"><p class="text-xs text-muted-foreground"><a href="/projects" class="hover:text-foreground">Projects</a> /</p><h1 class="truncate text-2xl font-bold">{project.name}</h1><p class="mt-1 text-sm text-muted-foreground">{project.description || 'A shared context for conversations, Agents, tasks, and memory.'}</p></div>
+					<div class="min-w-0"><p class="text-xs text-muted-foreground"><a href="/projects" class="hover:text-foreground">Projects</a> /</p><h1 class="truncate text-2xl font-bold">{project.name}</h1><p class="mt-1 text-sm text-muted-foreground">{project.description || 'A shared context for conversations, Agents, tasks, and memory.'}</p><div class="mt-2 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground"><span class="shrink-0 font-medium">Project ID</span><code data-project-id class="min-w-0 select-all truncate rounded bg-muted px-1.5 py-0.5 font-mono">{project.id}</code><button type="button" aria-label="Copy project ID" onclick={() => void copyProjectId()} class="shrink-0 font-medium text-primary hover:underline">{projectIdCopied ? 'Copied' : 'Copy ID'}</button></div></div>
 				</div>
 				<button type="button" onclick={() => (creatingConversation = !creatingConversation)} class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">+ Conversation</button>
 			</header>
@@ -110,7 +121,7 @@
 				{#if projectConversations.length === 0}
 					<button type="button" onclick={() => (creatingConversation = true)} class="w-full rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground hover:border-primary/40 hover:text-foreground">Start the first conversation</button>
 				{:else}
-					<div class="grid gap-3 md:grid-cols-2">{#each projectConversations as conversation (conversation.id)}<a href="/conversations/{encodeURIComponent(conversation.id)}" class="rounded-xl border border-border bg-card p-4 transition hover:border-primary/40"><div class="flex items-start gap-3"><span class="text-lg">{conversation.icon || '#'}</span><div class="min-w-0 flex-1"><h3 class="truncate text-sm font-medium">{conversation.title || 'Untitled conversation'}</h3><p class="mt-1 text-xs text-muted-foreground">{conversation.participants.filter((participant) => participant.participant_type === 'agent').length} Agents · {timeAgo(conversation.last_message_at || conversation.created_at)}</p></div><span class="text-muted-foreground">→</span></div></a>{/each}</div>
+					<div class="grid gap-3 md:grid-cols-2">{#each projectConversations as conversation (conversation.id)}<a href="/conversations/{encodeURIComponent(conversation.id)}" data-project-conversation={conversation.id} class="rounded-xl border border-border bg-card p-4 transition hover:border-primary/40"><div class="flex items-start gap-3"><span class="text-lg">{conversation.icon || '#'}</span><div class="min-w-0 flex-1"><h3 class="truncate text-sm font-medium">{conversation.title || 'Untitled conversation'}</h3><p class="mt-1 text-xs text-muted-foreground">{conversation.participants.filter((participant) => participant.participant_type === 'agent').length} Agents · {timeAgo(conversation.last_message_at || conversation.created_at)}</p></div><span class="text-muted-foreground">→</span></div></a>{/each}</div>
 				{/if}
 			</section>
 

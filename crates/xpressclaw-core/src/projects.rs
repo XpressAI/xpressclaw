@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::db::Database;
+use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::project::move_project_memory;
 
@@ -93,6 +93,56 @@ impl ProjectManager {
             )
             .map_err(|_| Error::ProjectNotFound { id: id.to_string() })
         })
+    }
+
+    /// Resolve a human-readable Project name or an exact canonical Project ID.
+    ///
+    /// Exact IDs take precedence over names so existing integrations remain
+    /// deterministic even when a different Project happens to use that ID as
+    /// its display name.
+    pub fn resolve(&self, selector: &str) -> Result<Project> {
+        let selector = selector.trim();
+        if !selector.is_empty() {
+            if let Ok(project) = self.get(selector) {
+                return Ok(project);
+            }
+        }
+
+        let projects = self.list()?;
+        let selector_key = task_search_key(selector);
+        let matches = projects
+            .iter()
+            .filter(|project| task_search_key(&project.name) == selector_key)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [project] => Ok((*project).clone()),
+            [] => {
+                let available = if projects.is_empty() {
+                    "There are no local Projects yet; create one in the Projects UI first."
+                        .to_string()
+                } else {
+                    let choices = projects
+                        .iter()
+                        .map(|project| format!("'{}' ({})", project.name, project.id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("Available local Projects: {choices}.")
+                };
+                Err(Error::Project(format!(
+                    "no local Project matches '{selector}' by name or exact ID. {available} Use `--project <NAME>` or copy a canonical ID from the Project page and use `--project-id <ID>`."
+                )))
+            }
+            _ => {
+                let ids = matches
+                    .iter()
+                    .map(|project| project.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(Error::Project(format!(
+                    "Project name '{selector}' is ambiguous; matching canonical IDs: {ids}. Rerun with one of those IDs using `--project-id <ID>`."
+                )))
+            }
+        }
     }
 
     pub fn update(&self, id: &str, request: &UpdateProject) -> Result<Project> {
@@ -450,6 +500,50 @@ fn row_to_project(
 mod tests {
     use super::*;
     use crate::memory::project::{CreateProjectMemoryNote, ProjectMemoryStore};
+
+    #[test]
+    fn project_selectors_support_names_and_keep_exact_ids_deterministic() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('platform-id', 'Platform');
+                 INSERT INTO projects (id, name) VALUES ('platform', 'A Project Named Like An ID');
+                 INSERT INTO projects (id, name) VALUES ('website-id', 'Straße');",
+            )
+        })
+        .unwrap();
+        let manager = ProjectManager::new(db);
+
+        assert_eq!(manager.resolve("PLATFORM").unwrap().id, "platform-id");
+        assert_eq!(manager.resolve("platform").unwrap().id, "platform");
+        assert_eq!(manager.resolve(" platform-id ").unwrap().name, "Platform");
+        assert_eq!(manager.resolve("STRASSE").unwrap().id, "website-id");
+    }
+
+    #[test]
+    fn project_selectors_report_ambiguous_and_unknown_names_actionably() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('platform-one', 'Platform');
+                 INSERT INTO projects (id, name) VALUES ('platform-two', 'platform');
+                 INSERT INTO projects (id, name) VALUES ('website-id', 'Website');",
+            )
+        })
+        .unwrap();
+        let manager = ProjectManager::new(db);
+
+        let ambiguous = manager.resolve("platform").unwrap_err().to_string();
+        assert!(ambiguous.contains("ambiguous"));
+        assert!(ambiguous.contains("platform-one"));
+        assert!(ambiguous.contains("platform-two"));
+        assert!(ambiguous.contains("--project-id <ID>"));
+
+        let unknown = manager.resolve("mobile").unwrap_err().to_string();
+        assert!(unknown.contains("no local Project matches 'mobile'"));
+        assert!(unknown.contains("Website"));
+        assert!(unknown.contains("Project page"));
+    }
 
     #[test]
     fn projects_group_existing_agents_and_reject_nonempty_deletion() {
