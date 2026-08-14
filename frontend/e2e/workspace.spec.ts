@@ -891,11 +891,14 @@ test('links in agent responses open in new windows without changing user links',
 	await expect(userLink).toBeVisible();
 	await expect(userLink).not.toHaveAttribute('target', '_blank');
 	await expect(userLink).not.toHaveAttribute('rel', /noopener|noreferrer/);
+	await expect(userLink).toHaveCSS('color', 'rgb(255, 255, 255)');
 });
 
 test('assistant text selections offer follow-up actions in the task composer', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
+	const composer = page.locator(`#task-message-input-${taskId}`);
+	await composer.fill('Keep this draft');
 
 	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
 	const messageContent = assistantMessage.locator('.prose-chat');
@@ -911,8 +914,8 @@ test('assistant text selections offer follow-up actions in the task composer', a
 	const actions = assistantMessage.locator('[data-selection-actions]');
 	await expect(actions).toBeVisible();
 	await actions.getByRole('button', { name: 'Improve' }).click();
-	await expect(page.locator(`#task-message-input-${taskId}`)).toHaveValue(/Improve this passage:\n\n> First answer/);
-	await expect(page.locator(`#task-message-input-${taskId}`)).toBeFocused();
+	await expect(composer).toHaveValue(/Keep this draft\n\nImprove this passage:\n\n> First answer/);
+	await expect(composer).toBeFocused();
 });
 
 test('active work uses the elapsed agent loading indicator', async ({ page }) => {
@@ -1099,6 +1102,19 @@ test('project conversations coordinate files and project-wide linked work', asyn
 	await page.getByRole('button', { name: 'Conversation' }).click();
 
 	const composer = page.getByPlaceholder('Message #Release planning…');
+	await composer.fill('Keep this conversation draft');
+	const assistantMessage = page.locator('[data-message-role="assistant"]').first();
+	await assistantMessage.locator('.prose-chat').evaluate((element) => {
+		const selection = window.getSelection();
+		const range = document.createRange();
+		range.selectNodeContents(element);
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		element.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+	});
+	await assistantMessage.locator('[data-selection-actions]').getByRole('button', { name: 'Shorten' }).click();
+	await expect(composer).toHaveValue(/Keep this conversation draft\n\nShorten this passage:/);
+
 	await composer.fill('Please compare both approaches.');
 	await page.getByRole('button', { name: 'Send', exact: true }).click();
 	await expect.poll(() => conversationMessageRequests).toEqual([{

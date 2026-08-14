@@ -242,6 +242,11 @@
 	color: hsl(var(--ring));
 	text-decoration: underline;
 }
+.prose-chat-user a {
+	color: hsl(var(--primary-foreground));
+	font-weight: 500;
+	text-decoration-color: hsl(var(--primary-foreground) / 65%);
+}
 .prose-chat img {
 	max-width: 100%;
 	border-radius: 0.375rem;

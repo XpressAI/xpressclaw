@@ -254,7 +254,8 @@
 			Tone: 'Adjust the tone of this passage',
 			Grammar: 'Correct the grammar in this passage',
 		};
-		content = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		const selectionPrompt = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		content = content.trim() ? `${content.trimEnd()}\n\n${selectionPrompt}` : selectionPrompt;
 		setTimeout(() => composerInput?.focus(), 0);
 	}
 

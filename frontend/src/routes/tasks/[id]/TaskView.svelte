@@ -657,7 +657,8 @@
 			Tone: 'Adjust the tone of this passage',
 			Grammar: 'Correct the grammar in this passage',
 		};
-		messageInput = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		const selectionPrompt = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		messageInput = messageInput.trim() ? `${messageInput.trimEnd()}\n\n${selectionPrompt}` : selectionPrompt;
 		setTimeout(() => composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(), 0);
 	}
 

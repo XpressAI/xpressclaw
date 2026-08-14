@@ -117,7 +117,7 @@
 				fromUser ? 'rounded-tr-[4px] bg-primary text-primary-foreground shadow-sm' :
 				'rounded-tl-[4px] bg-card pr-10 text-card-foreground shadow-[var(--shadow-card)]'}"
 		>
-			<div class="prose-chat max-w-none break-words">
+			<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
 				{@html renderContent(content, { openLinksInNewWindow })}
 			</div>
 			{#if children}{@render children()}{/if}
