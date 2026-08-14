@@ -31,6 +31,11 @@ jobs:
       - name: Check formatting
         run: ./scripts/rustfmt.sh --check
 
+      - name: Test standalone installer
+        run: |
+          sh -n install.sh
+          bash scripts/test-install.sh
+
   # Frontend type checking (independent of Rust)
   frontend:
     name: Frontend

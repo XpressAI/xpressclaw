@@ -8,9 +8,9 @@ mod commands;
     name = "xpressclaw",
     about = "Control plane for native agent work",
     version,
-    long_about = "Run the xpressclaw control plane for durable sessions, queued work, \
+    long_about = "Run the XpressClaw control plane for durable Agents, queued work, \
                   schedules, and isolated Codex, Claude Code, or OpenCode workers. \
-                  Create and operate sessions from the web UI."
+                  Create Projects and operate Agents from the web UI."
 )]
 struct Cli {
     #[command(subcommand)]

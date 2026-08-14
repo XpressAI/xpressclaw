@@ -15,7 +15,7 @@ use xpressclaw_core::acp::ACP_AGENTS;
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
-    ContainerEngineAccess, LlmConfig, McpServerConfig, NativeRunnerConfig,
+    ContainerEngineAccess, McpServerConfig, NativeRunnerConfig,
 };
 use xpressclaw_core::docker::manager::ContainerSpec;
 use xpressclaw_core::llm::anthropic::AnthropicProvider;
@@ -138,6 +138,11 @@ async fn get_config(State(state): State<AppState>) -> Json<Value> {
                 "monthly": config.system.budget.monthly,
                 "on_exceeded": config.system.budget.on_exceeded,
             },
+        },
+        "instance": {
+            "config_path": state.config_path.display().to_string(),
+            "data_dir": config.system.data_dir.display().to_string(),
+            "workspace_dir": config.system.workspace_dir.display().to_string(),
         },
         "mcp_servers": config.mcp_servers.iter().map(|(name, cfg)| {
             json!({
@@ -751,7 +756,7 @@ struct CompleteSetupRequest {
     #[serde(default)]
     agents: Vec<AgentSetup>,
     #[serde(default)]
-    mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    mcp_servers: Option<std::collections::HashMap<String, McpServerConfig>>,
     /// Isolation mode. ACP workers currently require "docker".
     #[serde(default = "default_isolation")]
     isolation: String,
@@ -922,9 +927,8 @@ async fn complete_setup(
     let _config_guard = state.config_write_lock.lock().await;
     // Native products own model selection, credentials, instructions, and
     // subagents. The control plane stores only session runtime context.
-    let llm = LlmConfig::default();
-
-    let managed_root = state.config().system.data_dir.clone();
+    let current_config = state.config();
+    let managed_root = current_config.system.data_dir.clone();
     let mut used_ids: Vec<String> = Vec::new();
     let mut agents: Vec<AgentConfig> = Vec::new();
     for session in &req.agents {
@@ -945,16 +949,14 @@ async fn complete_setup(
         });
     }
 
-    let mut config = Config {
-        llm,
-        agents,
-        // ACP agents own their tool loop. Only keep connectors the user
-        // explicitly configured; do not inject the retired agent-layer MCPs.
-        mcp_servers: req.mcp_servers,
-        ..Default::default()
-    };
+    let mut config = (*current_config).clone();
+    config.agents = agents;
+    // Omission means the setup form did not manage connectors. An explicit
+    // map, including an empty one, still replaces the configured MCP servers.
+    if let Some(mcp_servers) = req.mcp_servers {
+        config.mcp_servers = mcp_servers;
+    }
     config.system.isolation = req.isolation.clone();
-    config.system.data_dir = managed_root;
 
     // Save config to disk
     config.save(&state.config_path).map_err(internal_error)?;
@@ -2838,6 +2840,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_identifies_the_control_plane_instance() {
+        let app = test_app();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/setup/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(
+            body["instance"]["config_path"],
+            test_config_path().display().to_string()
+        );
+        assert!(body["instance"]["data_dir"].as_str().is_some());
+        assert!(body["instance"]["workspace_dir"].as_str().is_some());
+    }
+
+    #[tokio::test]
     async fn test_system_info() {
         let app = test_app();
 
@@ -2925,6 +2951,120 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn complete_setup_preserves_instance_local_system_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let instance = root.path().join("instance");
+        std::fs::create_dir_all(&instance).unwrap();
+        let config_path = instance.join("xpressclaw.yaml");
+        let mut config = Config::default();
+        config.system.data_dir = instance.clone();
+        config.system.workspace_dir = instance.join("workspaces");
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            false,
+        );
+        let app = Router::new().nest("/setup", routes()).with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "agents": [] }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.system.data_dir, instance);
+        assert_eq!(saved.system.workspace_dir, instance.join("workspaces"));
+    }
+
+    #[tokio::test]
+    async fn complete_setup_preserves_existing_top_level_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("xpressclaw.yaml");
+        let mut config = Config::default();
+        config.system.budget.daily = Some("$12.00".into());
+        config.tools.insert(
+            "shell".into(),
+            ToolConfig {
+                enabled: false,
+                confirmation_required: true,
+                ..Default::default()
+            },
+        );
+        config.tool_policies.push(ToolPolicyRule {
+            pattern: "dangerous_*".into(),
+            action: PolicyAction::Deny,
+            approval: None,
+        });
+        config.memory.near_term_slots = 3;
+        config.memory.eviction = "custom-eviction".into();
+        config.mcp_servers.insert(
+            "existing-connector".into(),
+            McpServerConfig {
+                server_type: "http".into(),
+                url: Some("https://mcp.example.test".into()),
+                ..Default::default()
+            },
+        );
+
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            false,
+        );
+        let app = Router::new()
+            .nest("/setup", routes())
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/setup/complete")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "agents": [{
+                                "runner_kind": "codex",
+                                "runner_workspace": "/tmp/preserved-project"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.agents.len(), 1);
+        assert_eq!(saved.system.budget.daily.as_deref(), Some("$12.00"));
+        assert!(!saved.tools["shell"].enabled);
+        assert!(saved.tools["shell"].confirmation_required);
+        assert_eq!(saved.tool_policies[0].pattern, "dangerous_*");
+        assert_eq!(saved.memory.near_term_slots, 3);
+        assert_eq!(saved.memory.eviction, "custom-eviction");
+        assert!(saved.mcp_servers.contains_key("existing-connector"));
+
+        let live = state.config();
+        assert_eq!(live.system.budget.daily.as_deref(), Some("$12.00"));
+        assert_eq!(live.memory.near_term_slots, 3);
+        assert!(live.mcp_servers.contains_key("existing-connector"));
     }
 
     /// Verify native session configuration round-trips without profiles.

@@ -120,12 +120,12 @@ fn main() {
                 app.set_menu(menu)?;
             }
 
-            // Resolve working directory for the CLI sidecar
+            // Desktop owns the default local control-plane instance.
             let data_dir = dirs::home_dir()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
                 .join(".xpressclaw");
             std::fs::create_dir_all(&data_dir).ok();
-            let workdir = data_dir.to_string_lossy().to_string();
+            let instance = data_dir.to_string_lossy().to_string();
 
             // Resolve the sidecar binary path.
             let cli_name = if cfg!(target_os = "windows") {
@@ -187,7 +187,7 @@ fn main() {
 
             // Spawn the sidecar process
             let mut cmd = std::process::Command::new(&sidecar_path);
-            cmd.args(["up", "--port", &port.to_string(), "--workdir", &workdir])
+            cmd.args(["up", "--port", &port.to_string(), "--instance", &instance])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
 

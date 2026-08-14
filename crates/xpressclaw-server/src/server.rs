@@ -1,8 +1,11 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::Router;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -19,15 +22,52 @@ pub fn create_router(state: AppState) -> Router {
         // Base64 encoding expands image messages beyond Axum's 2 MiB JSON default.
         // Message handlers enforce tighter decoded per-image and aggregate limits.
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-/// Start the HTTP server.
+fn create_internal_router(state: AppState, token: Arc<str>) -> Router {
+    create_router(state).layer(middleware::from_fn_with_state(
+        token,
+        require_internal_token,
+    ))
+}
+
+async fn require_internal_token(
+    State(token): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let supplied = request
+        .headers()
+        .get("x-xpressclaw-internal-token")
+        .and_then(|value| value.to_str().ok());
+    if supplied != Some(token.as_ref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
+}
+
+/// Start the HTTP server on the safe local default.
 pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
+    serve_on(state, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port).await
+}
+
+/// Start the HTTP server on an explicitly selected client address.
+pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Result<()> {
     // Log frontend embed status (debug diagnostic)
     crate::frontend::log_frontend_status();
+
+    // Browsers use the requested address. Runner containers use a separate,
+    // ephemeral callback listener because Docker/Podman's host gateway cannot
+    // reach a host service bound only to loopback on Linux. Every callback
+    // request requires a per-process capability that is injected into the
+    // bundled MCP processes and never exposed to the browser.
+    let public_addr = SocketAddr::new(bind, port);
+    let public_listener = tokio::net::TcpListener::bind(public_addr).await?;
+    let internal_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    let internal_port = internal_listener.local_addr()?.port();
+    let internal_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
 
     let config = state.config();
 
@@ -98,6 +138,7 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
     let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_turn_controls = state.turn_controls.clone();
     let dispatcher_conversation_processes = state.conversation_processes.clone();
+    let dispatcher_control_token = internal_token.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tokio::select! {
@@ -110,8 +151,9 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
                     elicitation_broker: dispatcher_elicitations,
                     turn_controls: dispatcher_turn_controls,
                     conversation_processes: dispatcher_conversation_processes,
+                    control_plane_token: dispatcher_control_token,
                 },
-                port,
+                internal_port,
             ) => {}
             _ = dispatcher_shutdown.cancelled() => { info!("dispatcher stopped"); }
         }
@@ -166,18 +208,27 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
         }
     });
 
-    let app = create_router(state.clone());
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let public_app = create_router(state.clone());
+    let internal_app = create_internal_router(state.clone(), internal_token);
 
-    info!("xpressclaw server listening on http://{addr}");
+    info!("xpressclaw server listening on http://{public_addr}");
+    info!(port = internal_port, "runner callback listener ready");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
-    // Cancel all background tasks immediately
+    let signal_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_shutdown.cancel();
+    });
+    let public_shutdown = shutdown.clone();
+    let internal_shutdown = shutdown.clone();
+    let servers = tokio::try_join!(
+        axum::serve(public_listener, public_app)
+            .with_graceful_shutdown(public_shutdown.cancelled_owned()),
+        axum::serve(internal_listener, internal_app)
+            .with_graceful_shutdown(internal_shutdown.cancelled_owned()),
+    );
     shutdown.cancel();
+    servers?;
 
     // Graceful shutdown: stop containers with a timeout.
     // A second Ctrl+C during shutdown forces immediate exit.
@@ -224,5 +275,50 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install Ctrl+C handler");
         info!("received shutdown signal");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+    use xpressclaw_core::config::Config;
+    use xpressclaw_core::db::Database;
+
+    use super::*;
+
+    fn state() -> AppState {
+        AppState::new(
+            Arc::new(Config::default()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            "test.yaml".into(),
+            true,
+        )
+    }
+
+    #[tokio::test]
+    async fn runner_callback_listener_requires_its_ephemeral_capability() {
+        let token: Arc<str> = Arc::from("internal-secret");
+        let app = create_internal_router(state(), token);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = app
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-xpressclaw-internal-token", "internal-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 }

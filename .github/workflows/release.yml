@@ -172,6 +172,56 @@ jobs:
           TAURI_BUNDLES: "deb,rpm"
         run: bash build.sh --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
 
+      - name: Sign standalone CLI
+        if: runner.os == 'macOS'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --force --timestamp --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            target/${{ matrix.target }}/release/xpressclaw
+          codesign --verify --strict target/${{ matrix.target }}/release/xpressclaw
+
+      - name: Smoke-test standalone CLI (macOS and Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/release/xpressclaw --version \
+            | grep -F "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Smoke-test standalone CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = & "target\${{ matrix.target }}\release\xpressclaw.exe" --version
+          if ($output -notlike "*${{ needs.release-metadata.outputs.version }}*") {
+            throw "Standalone CLI reported an unexpected version: $output"
+          }
+
+      - name: Package standalone CLI (macOS and Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          archive="xpressclaw-cli-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" xpressclaw
+
+      - name: Package standalone CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "target\${{ matrix.target }}\release\xpressclaw.exe" `
+            -DestinationPath "xpressclaw-cli-${{ matrix.target }}.zip"
+
+      - name: Upload standalone CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: xpressclaw-cli-${{ matrix.label }}
+          path: |
+            xpressclaw-cli-*.tar.gz
+            xpressclaw-cli-*.zip
+          if-no-files-found: error
+
       - name: Upload macOS DMG
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
@@ -228,7 +278,20 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts/ -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-assets/ \;
+          find artifacts/ -type f \( \
+            -name '*.dmg' -o \
+            -name '*.msi' -o \
+            -name '*.exe' -o \
+            -name '*.deb' -o \
+            -name '*.rpm' -o \
+            -name 'xpressclaw-cli-*.tar.gz' -o \
+            -name 'xpressclaw-cli-*.zip' \
+          \) -exec cp {} release-assets/ \;
+          find release-assets -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 -I{} sha256sum "release-assets/{}" \
+            | sed 's#  release-assets/#  #' \
+            > release-assets/SHA256SUMS
           ls -lh release-assets/
 
       - name: Create pre-release
@@ -241,11 +304,27 @@ jobs:
 
             Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
 
-            **Downloads:**
+            **Desktop downloads:**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
             - macOS (Intel): `.dmg` x64 — signed and notarized
             - Windows: `.exe` NSIS installer, `.msi` MSI installer
             - Linux: `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL)
+
+            **Standalone CLI/server downloads:**
+            - macOS: signed `aarch64-apple-darwin` and `x86_64-apple-darwin` archives
+            - Linux: `x86_64-unknown-linux-gnu` archive
+            - Windows: `x86_64-pc-windows-msvc` archive
+            - `SHA256SUMS` covers every release asset
+
+            Install this prerelease explicitly:
+
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | XPRESSCLAW_VERSION=${{ needs.release-metadata.outputs.tag }} sh
+            ```
+
+            The unpinned installer follows GitHub's latest stable release and therefore ignores prereleases.
+
+            Desktop bundles and automatically starts the default local control-plane instance.
           prerelease: true
           make_latest: false
           files: release-assets/*

@@ -1,36 +1,47 @@
 # Getting Started
 
-## 1. Start the control plane
+## 1. Install and start your local instance
 
 ### Desktop
 
-Install and launch `xpressclaw-desktop`. It starts the bundled control plane
-from `~/.xpressclaw`, opens the setup screen, and stays available in the system
-tray. Do not run `xpressclaw init` or `xpressclaw up` separately.
+Install the `.dmg`, `.exe`/`.msi`, `.deb`, or `.rpm` for your platform from the
+official [Releases](https://github.com/XpressAI/xpressclaw/releases) page and
+launch XpressClaw. It starts its bundled control plane from
+`~/.xpressclaw`, opens setup, and stays available in the system tray. Do not
+run `xpressclaw init` or `xpressclaw up` separately. The Desktop package does
+not install the CLI on `PATH`.
 
-### CLI
+### Headless CLI/server
 
-Choose one durable control-plane directory for the installation. It holds
-`xpressclaw.yaml` and can manage many source repositories; it is not the Agent
-workspace selected later in the UI.
+Beginning with stable release `0.3.0`, install the standalone CLI/server on
+Apple Silicon or Intel macOS and x64 Linux:
 
 ```bash
-xpressclaw init ~/.xpressclaw
-xpressclaw up --workdir ~/.xpressclaw
+curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | sh
 ```
 
-Open `http://localhost:8935`. For development, the XpressClaw source checkout
-can instead be the control-plane directory: run both commands from that
-checkout and omit the path/options. An explicit `init` remains optional;
-`up` opens first-session setup when its selected directory has no config.
+The installer follows GitHub's latest stable release, ignores prereleases,
+verifies the release checksum, and writes `xpressclaw` to `~/.local/bin`.
+Add that directory to `PATH` if needed, then run:
 
-Use `xpressclaw up --detach` from the selected control-plane directory to keep
-the server in the background.
+```bash
+xpressclaw up
+```
 
-## 2. Create a Project and Agent
+Open `http://localhost:8935`. The CLI automatically uses
+`~/.xpressclaw` and opens setup when it has no configuration. `init` is not a
+normal onboarding step; it remains available to provision the default
+instance ahead of time or create an advanced alternate instance.
 
-Complete the first-run Agent setup, or create a Project and add one or more
-Agents. The Agent creator asks for:
+Use `xpressclaw up --detach` to keep the server in the background.
+Windows users should install Desktop; stable releases also include a
+standalone x64 CLI/server `.zip` for manual installation. Developers building
+from source should use the [Developer Guide](development.md).
+
+## 2. Add a repository and Agent
+
+Complete first-run setup. An existing repository is an Agent workspace, not an
+XpressClaw instance directory. The Agent creator asks for:
 
 - an Agent name;
 - Codex, Claude Code, OpenCode, or another ACP-compatible harness;
@@ -40,6 +51,10 @@ Agents. The Agent creator asks for:
 
 Each built-in product selects a separate minimal image. Xpressclaw never uses
 an all-in-one `xpressclaw-native-runner` image.
+
+First-run setup creates a Project around the Agent. A Project is the durable
+collaboration and memory boundary and can contain more Agents, Conversations,
+Tasks, and workflows. One instance can manage many Projects and repositories.
 
 ## 3. Check readiness
 
@@ -83,6 +98,21 @@ link directly to them in the editor.
 - **Automations → Schedules** send work to an Agent once or on a cron schedule.
 - **Automations → Workflows** coordinate Agents through implementation/review,
   goal, and custom loops; workflows started in a Conversation report there.
+
+## 6. Reconnect from another device
+
+The browser or Desktop window is only a client. Closing it does not stop the
+control plane or queued work. XpressClaw listens on loopback by default and has
+no built-in remote authentication yet, so connect through SSH rather than
+opening its port directly:
+
+```bash
+ssh -N -L 8935:127.0.0.1:8935 user@control-plane-host
+```
+
+Open `http://localhost:8935` on the client device. See
+[Remote access](remote-access.md) for authenticated reverse-proxy guidance,
+reconnection behavior, and current Desktop limitations.
 
 ## Lifecycle commands
 

@@ -440,6 +440,7 @@ export async function updatePullRequestRegistration(
   const controlPlane = environment.XPRESSCLAW_URL?.replace(/\/$/, '');
   const taskId = environment.XPRESSCLAW_TASK_ID;
   const agentId = environment.XPRESSCLAW_AGENT_ID;
+  const controlToken = environment.XPRESSCLAW_CONTROL_TOKEN;
   if (!controlPlane || !taskId || !agentId) {
     throw new Error('XpressClaw did not provide task review-lifecycle context');
   }
@@ -451,7 +452,10 @@ export async function updatePullRequestRegistration(
     `${controlPlane}/api/tasks/${encodeURIComponent(taskId)}/pull-requests`,
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(controlToken ? { 'x-xpressclaw-internal-token': controlToken } : {}),
+      },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
     },

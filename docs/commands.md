@@ -6,43 +6,69 @@ in the web UI and REST API. Git-backed Project synchronization is the explicit
 exception: it uses the `sync` commands below and never runs during ordinary
 Project updates.
 
-## `xpressclaw init`
-
-Create a control-plane directory, an empty `xpressclaw.yaml`, and the local
-data directory. The argument names the control plane, not a repository being
-managed. One control plane can manage many Project workspaces. This command
-does not create an Agent or pull a runner image; those choices are made in the
-UI.
-
-```bash
-xpressclaw init ~/.xpressclaw
-xpressclaw init /path/to/control-plane
-```
-
-`init` is optional. Running `xpressclaw up` without a configuration opens the
-first-session setup flow automatically. Desktop users do not run `init`;
-Desktop owns `~/.xpressclaw/xpressclaw.yaml` and creates it during setup.
-
 ## `xpressclaw up`
 
-Start the control plane, web UI, scheduler, workflow engine, and ACP task
-dispatcher.
+Start the default local instance, web UI, scheduler, workflow engine, and ACP
+task dispatcher:
 
 ```bash
 xpressclaw up
 xpressclaw up --detach
 xpressclaw up --port 9000
-xpressclaw up --workdir /path/to/control-plane
 ```
 
-The default UI is `http://localhost:8935`.
+The default UI is `http://localhost:8935`. XpressClaw discovers
+`~/.xpressclaw`, creates the directory when needed, and opens first-run setup
+when it has no configuration. If that default has not been configured, an
+existing current-directory `xpressclaw.yaml` is still honored for backward
+compatibility.
 
-`--workdir` is the control-plane directory containing `xpressclaw.yaml`, not
-an Agent's source workspace. Desktop always supplies `~/.xpressclaw` here.
+The server binds to `127.0.0.1` by default. Use an SSH tunnel or authenticated
+HTTPS proxy for remote access. Because XpressClaw does not yet provide native
+remote authentication, a non-loopback `--bind` is rejected unless the caller
+also passes `--allow-insecure-remote` to acknowledge that an external security
+layer is responsible for access control.
+
+## `xpressclaw init` (optional/advanced)
+
+Provision an instance directory before first launch. This does not add a
+repository, Project, Agent, or runner image:
+
+```bash
+xpressclaw init
+xpressclaw init /path/to/alternate-instance
+```
+
+Without a path, `init` targets `~/.xpressclaw`. Desktop users do not run it;
+Desktop creates and starts that instance itself. Older scripts that relied on
+the former current-directory default should pass `xpressclaw init .`
+explicitly. `init` takes the instance directory as a positional argument;
+start the resulting instance by passing that same directory to `up` with
+`--instance`:
+
+```bash
+xpressclaw init /path/to/alternate-instance
+xpressclaw up --instance /path/to/alternate-instance --port 9001
+```
+
+## Alternate instances
+
+Use alternate instances only for an independent state, credential/security,
+environment, or remote-host boundary:
+
+```bash
+xpressclaw up --instance /path/to/alternate-instance --port 9001
+xpressclaw status --port 9001
+xpressclaw down --instance /path/to/alternate-instance --port 9001
+```
+
+`--instance` always means the directory containing `xpressclaw.yaml`; it never
+means an Agent's source workspace. `--workdir` remains a deprecated alias for
+existing `up` and `down` scripts.
 
 ## `xpressclaw status`
 
-Check the server and list durable sessions with their current queue state.
+Check the server and list durable Agents with their current queue state.
 
 ```bash
 xpressclaw status
@@ -58,6 +84,8 @@ containers remain stopped on disk for the next launch.
 xpressclaw down
 xpressclaw down --port 9000
 ```
+
+Pass the matching `--instance` when stopping an alternate detached instance.
 
 ## `xpressclaw sync`
 
