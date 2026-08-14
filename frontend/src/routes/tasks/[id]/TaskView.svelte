@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
@@ -88,6 +89,7 @@
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
 	let dismissedAttemptErrorKey = $state<string | null>(null);
+	let retryingLoad = $state(false);
 	let loading = $state(true);
 	let editing = $state(false);
 	let editTitle = $state('');
@@ -716,6 +718,32 @@
 		}
 	}
 
+	async function retryTaskLoad() {
+		if (retryingLoad) return;
+		retryingLoad = true;
+		loading = true;
+		error = null;
+		try {
+			await load();
+		} finally {
+			loading = false;
+			retryingLoad = false;
+		}
+	}
+
+	function dismissTaskError() {
+		if (task) {
+			error = null;
+			return;
+		}
+		void goto('/tasks');
+	}
+
+	function dismissAttemptError() {
+		dismissedAttemptErrorKey = latestErrorKey;
+		requestAnimationFrame(() => messagesEl?.focus({ preventScroll: true }));
+	}
+
 	/** Poll semantic task activity without exposing the runner's terminal. */
 	async function poll() {
 		try {
@@ -1051,10 +1079,18 @@
 		{#if error}
 			<div role="alert" class="flex items-start gap-3 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
 				<span class="min-w-0 flex-1 whitespace-pre-wrap">{error}</span>
+				{#if !task}
+					<button
+						type="button"
+						onclick={retryTaskLoad}
+						disabled={retryingLoad}
+						class="shrink-0 rounded-md border border-destructive/30 px-2.5 py-1 text-xs font-medium hover:bg-destructive/10 disabled:opacity-50"
+					>{retryingLoad ? 'Retrying…' : 'Retry'}</button>
+				{/if}
 				<button
 					type="button"
-					onclick={() => (error = null)}
-					aria-label="Dismiss task error"
+					onclick={dismissTaskError}
+					aria-label={task ? 'Dismiss task error' : 'Dismiss task error and return to tasks'}
 					class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
 				>&times;</button>
 			</div>
@@ -1170,7 +1206,7 @@
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
 			<div class="flex-1 flex flex-col overflow-hidden">
-				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
+				<div bind:this={messagesEl} onscroll={handleTranscriptScroll} tabindex="-1" aria-label="Task transcript" data-task-transcript-scroll class="flex-1 space-y-4 overflow-y-auto px-3 py-4 sm:px-6 sm:py-5">
 					{#if hasEarlierActivity}
 						<div class="flex justify-center">
 							<button type="button" onclick={loadEarlierActivity} disabled={loadingEarlierActivity}
@@ -1278,7 +1314,7 @@
 								<div class="text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
 								<button
 									type="button"
-									onclick={() => (dismissedAttemptErrorKey = latestErrorKey)}
+									onclick={dismissAttemptError}
 									aria-label="Dismiss attempt error"
 									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
 								>&times;</button>

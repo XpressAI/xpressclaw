@@ -70,6 +70,7 @@ async function mockApi(
 	options: {
 		live?: boolean;
 		attemptError?: string;
+		taskLoadFailureOnce?: boolean;
 		agentTimeline?: boolean;
 		agentResponseLinks?: boolean;
 		richToolActivity?: boolean;
@@ -150,6 +151,7 @@ async function mockApi(
 	let workspaceFileContent = 'export const greeting = "hello";\n';
 	let workspaceFileRevision = 'revision-before-save';
 	let projectSyncConflictReturned = false;
+	let taskLoadFailed = false;
 	const status = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed';
 	const attemptStatus = options.attemptError
 		? 'failed'
@@ -589,6 +591,11 @@ async function mockApi(
 					}),
 			};
 		} else if (path === `/api/tasks/${taskId}`) {
+			if (options.taskLoadFailureOnce && !taskLoadFailed) {
+				taskLoadFailed = true;
+				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary task load failure' }) });
+				return;
+			}
 			response = task;
 		} else if (path === `/api/tasks/${taskId}/messages`) {
 			if (request.method() === 'POST') {
@@ -791,8 +798,30 @@ test('attempt errors can be dismissed', async ({ page }) => {
 	const notification = page.locator('[data-attempt-error]');
 	await expect(notification).toBeVisible();
 	await expect(notification).toContainText('ACP process stopped during the turn');
-	await notification.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	const dismiss = notification.getByRole('button', { name: 'Dismiss attempt error' });
+	await dismiss.focus();
+	await dismiss.press('Enter');
 	await expect(notification).toHaveCount(0);
+	await expect(page.locator('[data-task-transcript-scroll]')).toBeFocused();
+});
+
+test('failed initial task loads can be retried', async ({ page }) => {
+	await mockApi(page, { taskLoadFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	const alert = page.getByRole('alert');
+	await expect(alert).toContainText('Temporary task load failure');
+	await alert.getByRole('button', { name: 'Retry' }).click();
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(alert).toHaveCount(0);
+});
+
+test('dismissing an initial task load failure returns to the task list', async ({ page }) => {
+	await mockApi(page, { taskLoadFailureOnce: true });
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Dismiss task error and return to tasks' }).click();
+	await expect(page).toHaveURL('/tasks');
 });
 
 test('agent updates stay beside their tools while the final reply is shown once', async ({ page }) => {
