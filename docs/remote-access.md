@@ -94,5 +94,5 @@ or authenticated HTTPS proxy for remote instances. The intended future model
 is a client-side profile containing an instance URL and protected credential;
 that profile is distinct from the server-side instance directory.
 
-See [ADR-038](adr/ADR-038-instances-clients-and-remote-access.md) for the
-decision and deferred implementation boundary.
+These boundaries keep client connection details separate from the instance's
+state, credentials, and host-level execution environment.

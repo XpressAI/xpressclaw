@@ -13,8 +13,16 @@ not install the CLI on `PATH`.
 
 ### Headless CLI/server
 
-There is not yet a standalone CLI/server release artifact. Build from source
-using the commands in the README, then run:
+Beginning with stable release `0.3.0`, install the standalone CLI/server on
+Apple Silicon or Intel macOS and x64 Linux:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | sh
+```
+
+The installer follows GitHub's latest stable release, ignores prereleases,
+verifies the release checksum, and writes `xpressclaw` to `~/.local/bin`.
+Add that directory to `PATH` if needed, then run:
 
 ```bash
 xpressclaw up
@@ -26,6 +34,9 @@ normal onboarding step; it remains available to provision the default
 instance ahead of time or create an advanced alternate instance.
 
 Use `xpressclaw up --detach` to keep the server in the background.
+Windows users should install Desktop; stable releases also include a
+standalone x64 CLI/server `.zip` for manual installation. Developers building
+from source should use the [Developer Guide](development.md).
 
 ## 2. Add a repository and Agent
 

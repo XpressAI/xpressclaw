@@ -42,7 +42,14 @@ xpressclaw init /path/to/alternate-instance
 Without a path, `init` targets `~/.xpressclaw`. Desktop users do not run it;
 Desktop creates and starts that instance itself. Older scripts that relied on
 the former current-directory default should pass `xpressclaw init .`
-explicitly.
+explicitly. `init` takes the instance directory as a positional argument;
+start the resulting instance by passing that same directory to `up` with
+`--instance`:
+
+```bash
+xpressclaw init /path/to/alternate-instance
+xpressclaw up --instance /path/to/alternate-instance --port 9001
+```
 
 ## Alternate instances
 

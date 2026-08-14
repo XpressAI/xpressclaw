@@ -2,16 +2,16 @@
   <img src="https://github.com/XpressAI/xpressclaw/blob/7a455d7bf77caf6dafdead4d37c79c7e3f6be809/docs/assets/xpressclaw-banner.jpeg" alt="xpressclaw" width="600">
 </p>
 
-<h3 align="center">Control Plane for Native Agent Work</h3>
+<h3 align="center">Distributed, Multiplayer Control Plane for Native Agent Work</h3>
 
 <p align="center">
-Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers. Organize Agents, Conversations, Tasks, memory, and multi-agent workflows in durable Project spaces.
+Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers on an always-on machine. Coordinate people and Agents through durable Projects, Conversations, Tasks, memory, and multi-agent workflows from any connected client.
 </p>
 
 <p align="center">
 <a href="https://xpressclaw.ai">Website</a> &bull;
 <a href="https://hub.xpressclaw.ai">Hub</a> &bull;
-<a href="https://github.com/XpressAI/xpressclaw/blob/main/CONTRIBUTING.md">Contribute</a> &bull;
+<a href="https://github.com/XpressAI/xpressclaw/blob/main/docs/development.md">Develop</a> &bull;
 <a href="https://discord.com/invite/vgEg2ZtxCw">Discord</a>
 </p>
 
@@ -28,19 +28,14 @@ Download the macOS, Windows, or Linux Desktop installer from
 the repository you want an Agent to work in. Desktop creates and starts your
 default local XpressClaw instance automatically—there is no `init` step.
 
-The matching runner image is pulled automatically. To build the Codex runner
-locally instead:
-
-```bash
-docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
-# Or: podman build -f harnesses/native/codex/Dockerfile -t localhost/xpressclaw-runner-codex:latest harnesses/native
-```
+The matching runner image is pulled automatically.
 
 ## Why xpressclaw?
 
 Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
-- **Project collaboration spaces** — Keep related Conversations, Agents, Tasks, workflows, files, and shared memory in one durable context.
+- **Multiplayer Project spaces** — Coordinate people and specialized Agents through shared Conversations, Tasks, workflows, files, and memory.
+- **Distributed by design** — Keep Agents working on an always-on desktop or server while browsers and future native clients reconnect from other devices.
 - **Harness-owned intelligence** — The selected product owns reasoning, tools, and subagents; xpressclaw is its ACP client, not another agent framework in front of it.
 - **Structured interface** — See tasks, attempts, artifacts, questions, and review decisions without watching a terminal.
 - **Native desktop app** — Tauri installers for macOS, Windows, and Linux with a system tray. Runs in the background, always available.
@@ -120,13 +115,13 @@ Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know
 `xpressclaw.yaml` configures an instance; it does not add a repository and
 does not belong in every repository. Repository-local harness instructions
 such as `AGENTS.md`, `CLAUDE.md`, or product-specific equivalents stay with the
-repository and are read by the selected harness. See
-[ADR-038](docs/adr/ADR-038-instances-clients-and-remote-access.md) for the
-product boundary.
+repository and are read by the selected harness.
 
 ## Quick Start
 
-### 1. Install Desktop (recommended)
+### 1. Install XpressClaw
+
+#### Desktop (recommended)
 
 The official [Releases](https://github.com/XpressAI/xpressclaw/releases) page
 publishes these Desktop installers:
@@ -140,6 +135,28 @@ Install and launch the app. It starts the bundled control plane from
 The Desktop installer does not install a separate `xpressclaw` command on
 `PATH`.
 
+#### CLI/server (macOS and Linux)
+
+Beginning with the first stable `0.3.0` release, install the standalone
+CLI/server with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/XpressAI/xpressclaw/main/install.sh | sh
+```
+
+The script discovers GitHub's latest stable release at runtime, deliberately
+ignores prereleases, verifies the published SHA-256 checksum, and installs the
+single `xpressclaw` binary to `~/.local/bin`. It supports Apple Silicon and
+Intel macOS plus x64 Linux. Add that directory to `PATH` if needed, then run:
+
+```bash
+xpressclaw up
+```
+
+This discovers or creates the default instance at `~/.xpressclaw` and opens
+setup at `http://localhost:8935`. Windows users should install Desktop; stable
+Releases also attach a standalone x64 `.zip` for manual CLI/server installs.
+
 ### 2. Create your first Project and Agent
 
 Choose an existing repository folder or start with an empty managed workspace,
@@ -152,33 +169,6 @@ Projects and Agents from the UI; you do not run `init` for each repository.
 Open a Project Conversation for shared coordination, use **Continue with
 task** for durable work, or send private work directly to one Agent from
 **New Work**. Closing the window does not stop the local control plane.
-
-### Headless or server installation
-
-Releases do not currently publish a standalone CLI/server installer or a
-universal shell/PowerShell installer. For a headless machine, build the single
-CLI/server binary from source rather than copying a Desktop sidecar out of an
-application bundle. Install Git, the stable Rust toolchain, Node.js 20+, and
-Docker or Podman first:
-
-```bash
-git clone https://github.com/XpressAI/xpressclaw.git
-cd xpressclaw
-npm ci --prefix frontend
-npm run build --prefix frontend
-cargo build --release -p xpressclaw-cli
-./target/release/xpressclaw up --instance "$HOME/.xpressclaw"
-```
-
-On Windows PowerShell, the final command is
-`./target/release/xpressclaw.exe up --instance "$env:USERPROFILE/.xpressclaw"`.
-
-`xpressclaw up` discovers or creates the default local instance at
-`~/.xpressclaw` and opens setup at `http://localhost:8935`. The optional
-`xpressclaw init` command is only for provisioning an instance ahead of time
-or creating an advanced alternate instance. The source checkout itself carries
-a development `xpressclaw.yaml`, so the explicit instance in the build command
-avoids selecting that backward-compatible current-directory configuration.
 
 ### Requirements
 
@@ -249,8 +239,7 @@ For ordinary tasks, the scoped GitHub tool publishes completed work ready for
 review and keeps the task active. XpressClaw durably checks for review comments,
 resumes the same conversation to address them, and releases the next queued
 task only after approval or merge. Explicit workflow steps may still use draft
-PRs and their own wait logic. See
-[ADR-035](docs/adr/ADR-035-managed-pull-request-review-lifecycle.md).
+PRs and their own wait logic.
 
 ## Configuration
 
@@ -269,209 +258,11 @@ agents: []
 
 ```
 
-## Building
+## Development
 
-### Prerequisites
-
-- [Rust](https://rustup.rs/) stable toolchain
-- [Node.js](https://nodejs.org/) 20+
-- The [Tauri system dependencies](https://v2.tauri.app/start/prerequisites/) for your platform when building the desktop app
-- Docker or Podman (for isolated ACP harnesses)
-
-### Build Locally
-
-```bash
-git clone https://github.com/XpressAI/xpressclaw.git
-cd xpressclaw
-
-# Build the CLI, server, and desktop app
-./build.sh
-
-# Also build every native runner image (14 runners, two variants each)
-./build.sh --with-runners
-
-# Or build only the runner images you use; --runner is repeatable
-./build.sh --runner=codex --runner=claude
-```
-
-### Build Individual Targets
-
-```bash
-# CLI only (also embeds the frontend)
-cargo build --release -p xpressclaw-cli
-
-# Core library
-cargo build -p xpressclaw-core
-
-# Server
-cargo build -p xpressclaw-server
-
-# The release CLI binary is target/release/xpressclaw
-```
-
-### Build the Desktop App (Tauri)
-
-```bash
-# Build the CLI and Tauri desktop app
-./build.sh
-
-# For signed/notarized macOS builds
-./build-signed.sh
-```
-
-### Release Versioning
-
-The release line comes from `[workspace.package]` in `Cargo.toml`; run
-`node scripts/release-metadata.mjs --check` to verify the Tauri, frontend,
-lockfile, and bundled MCP metadata agree with it.
-
-Each successful release uses the next numeric build as its patch version, so
-build 54 on the `0.2` release line is version and tag `v0.2.54`. The release
-workflow continues the counter from both legacy and current release tags,
-stamps the resulting version into the app and package metadata, embeds the
-build in `/api/health` and the About screen, and uses it as the macOS bundle
-version. The Git commit remains available separately for diagnostics.
-
-### Build Native Worker Images
-
-Build only the product you use. Each image is deliberately independent so it
-can be versioned or extended without pulling in the other agent CLIs:
-
-```bash
-docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
-docker buildx build --load -f harnesses/native/claude/Dockerfile -t xpressclaw-runner-claude:latest -t localhost/xpressclaw-runner-claude:latest harnesses/native
-docker buildx build --load -f harnesses/native/opencode/Dockerfile -t xpressclaw-runner-opencode:latest -t localhost/xpressclaw-runner-opencode:latest harnesses/native
-```
-
-To build every standard and host-engine variant with whichever local runtime
-is available, run `scripts/build-runner-images.sh`. Set
-`CONTAINER_RUNTIME=docker` or `CONTAINER_RUNTIME=podman` to override automatic
-detection.
-
-The `Build & Push Runner Images` workflow publishes all six multi-architecture
-images whenever their sources change on `main`, then verifies that they can be
-pulled without credentials. GHCR creates each package as private on its first
-publication, so an XpressAI organization owner must change each new package to
-**Public** once in the package settings. Releases stop before publication if
-any runner is unavailable anonymously.
-
-The default images stay minimal. Add `--target runner-host` and use the
-corresponding `xpressclaw-runner-<product>-docker:latest` tag to build an
-opt-in image containing Docker CLI, Compose, and Buildx. Enabling host-engine
-access mounts the control plane's Docker or rootless Podman socket; this gives
-the runner control over that engine and is intended only for trusted harnesses.
-
-Use `podman build` with the `localhost/` tags when Podman is your runtime. The ACP
-compatibility label on current images prevents an older pre-ACP local tag from
-being selected silently.
-
-See `harnesses/native/README.md` for build commands, customization guidance,
-and the separation between agent runners and development environments.
-
-### Native harness capabilities
-
-Each Agent keeps the selected native harness's own configuration.
-When host login is enabled, XpressClaw mounts the complete Codex, Claude Code,
-or OpenCode configuration directory—not just its token—so native skills,
-plugins, hooks, custom agents, and user settings remain available. Project
-configuration in the Agent's mounted workspace is discovered normally. Extra config
-trees can be attached with per-session volume mounts and environment values.
-
-MCP servers are defined once and enabled per harness. Stdio commands must be
-absolute paths inside that harness image; remote HTTP and SSE endpoints do not
-need to be installed in the image. ACP supplies the selected servers when a
-session is created, resumed, or loaded.
-
-After the first turn, the task composer and workflow editor show the commands,
-modes, models, reasoning levels, and other controls that the ACP harness actually
-advertises. A workflow step can combine all of them:
-
-```yaml
-- id: optimize
-  agent: claude-site
-  command: /loop
-  prompt: Improve {{trigger.payload.page}} until the checks pass.
-  session_config:
-    mode: build
-    thought_level: high
-  mcp_server: seo
-  mcp_tool: audit_page
-  mcp_arguments:
-    url: "{{trigger.payload.page}}"
-  new_session: false
-```
-
-ACP standardizes attaching MCP servers, agent-advertised slash commands, and
-session configuration. It does not define a client-to-agent RPC for directly
-calling an MCP tool. The `mcp_*` workflow fields therefore ask the native
-agent to perform the tool call inside its turn, preserving the harness's
-own permissions, hooks, and tool-call activity.
-
-### Run Tests
-
-```bash
-# Rust tests
-cargo test -p xpressclaw-core -p xpressclaw-server
-
-# Frontend type check
-cd frontend
-npm run check
-npx playwright install chromium # once per machine
-npm run test:e2e
-cd ..
-
-# Formatting and linting
-./scripts/rustfmt.sh --check
-cargo clippy -p xpressclaw-core -p xpressclaw-server -p xpressclaw-cli -p xpressclaw-tauri --all-targets -- -D warnings
-```
-
-Use the formatting script instead of `cargo fmt --all`: Cargo's `--all` mode
-also formats local path dependencies and would modify the
-`external/ready-agent-cog` submodule.
-
-### Development Mode
-
-```bash
-# Terminal 1: Run the Rust server with auto-reload
-cargo run -- up --instance .
-
-# Terminal 2: Run the frontend dev server with hot reload
-cd frontend && npm run dev
-
-# The frontend dev server proxies API calls to localhost:8935
-```
-
-`--instance .` deliberately selects this checkout's development
-`xpressclaw.yaml`; omit it when exercising the normal `~/.xpressclaw`
-discovery flow.
-
-## Architecture
-
-xpressclaw is a Cargo workspace with four crates:
-
-| Crate | Purpose |
-|-------|---------|
-| `xpressclaw-core` | Business logic: Projects, Conversations, Agents, sessions, tasks, workflows, SQLite, and worker isolation |
-| `xpressclaw-server` | Axum REST API, SSE streaming, embedded SvelteKit frontend (rust-embed) |
-| `xpressclaw-cli` | Local control-plane lifecycle and health commands |
-| `xpressclaw-tauri` | Native desktop app with system tray (Tauri v2) |
-
-```
-xpressclaw
-+-- Axum server (REST API + embedded SvelteKit frontend)
-+-- Projects (Conversations, Agents, Tasks, shared memory, and files)
-+-- Durable task and Conversation event logs
-+-- SQLite (projects, messages, sessions, tasks, workflows, and schedules)
-+-- ACP clients + task/Conversation dispatchers (Codex / Claude Code / OpenCode / custom)
-+-- Docker Manager (retained per-Agent containers)
-```
-
-**Key design decisions:**
-- **Single binary** — server, API, frontend, and CLI in one executable
-- **Container runtime required** — Docker and Podman are detected automatically; worker isolation is not optional
-- **Durable local state** — Projects, Conversations, task queues, schedules, and workflow runs survive restarts
-- **Independent work lanes** — serialized Agent Tasks and per-Conversation ACP sessions share a retained container without blocking each other
-- **ACP boundary** — Harnesses own their instructions, tools, reasoning loop, and subagents; xpressclaw owns Projects, durable Agents, Conversations, Tasks, orchestration, and presentation
+Source builds, repository architecture, runner-image development, release
+mechanics, and test commands live in the
+[Developer Guide](docs/development.md).
 
 ## CLI Reference
 
@@ -483,12 +274,29 @@ xpressclaw status            Show Agent queue status
 xpressclaw sync ...          Explicitly fetch/publish portable Project state
 ```
 
-Advanced independent instances use `--instance <DIR>` and separate ports.
+`init` takes an optional positional directory, while `up` and `down` select
+that directory with `--instance`. For the default instance:
+
+```bash
+xpressclaw init
+xpressclaw up
+```
+
+For an alternate instance, use the same directory when starting and stopping
+it. Give concurrently running instances different ports:
+
+```bash
+xpressclaw init /srv/xpressclaw/staging
+xpressclaw up --detach --instance /srv/xpressclaw/staging --port 9001
+xpressclaw down --instance /srv/xpressclaw/staging --port 9001
+```
+
+The instance directory is the directory containing `xpressclaw.yaml`; it is
+not a Project repository or Agent workspace. `xpressclaw init .` followed by
+`xpressclaw up --instance .` preserves the former current-directory flow.
 `--workdir <DIR>` remains a deprecated alias for existing scripts, and an
 existing current-directory `xpressclaw.yaml` remains discoverable when no
-default instance has been configured. Scripts that relied on bare `init`
-targeting the current directory should use the explicit `xpressclaw init .`
-spelling. See [CLI commands](docs/commands.md).
+default instance has been configured. See [CLI commands](docs/commands.md).
 
 ### Git-backed Project Synchronization
 
@@ -590,13 +398,9 @@ xpressclaw is the open-source foundation. When your team needs collaboration, vi
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-```bash
-git clone https://github.com/XpressAI/xpressclaw.git
-cd xpressclaw
-./build.sh
-```
+We welcome contributions. Source-build instructions, architecture, runner
+development, tests, formatting, and release mechanics are in the
+[Developer Guide](docs/development.md).
 
 ## Community
 
