@@ -12,12 +12,12 @@ pub async fn run(port: u16) -> anyhow::Result<()> {
     );
     println!();
 
-    // Logical sessions
+    // Durable Agents
     let agents: Vec<serde_json::Value> = api.get("/agents").await?;
     if agents.is_empty() {
-        println!("No sessions configured.");
+        println!("No Agents configured.");
     } else {
-        println!("Sessions:");
+        println!("Agents:");
         for a in &agents {
             let name = a["name"].as_str().unwrap_or("?");
             let backend = a["backend"].as_str().unwrap_or("?");

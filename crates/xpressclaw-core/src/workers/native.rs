@@ -71,6 +71,7 @@ struct NativeAttemptRuntime {
     turn_controls: Arc<AcpTurnControlBroker>,
     processes: Arc<ProjectAcpProcesses>,
     control_plane_port: u16,
+    control_plane_token: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -329,6 +330,8 @@ pub struct NativeDispatcherServices {
     pub elicitation_broker: Arc<AcpElicitationBroker>,
     pub turn_controls: Arc<AcpTurnControlBroker>,
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Ephemeral capability used only on the container callback listener.
+    pub control_plane_token: Arc<str>,
 }
 
 /// Consume the durable task queue as an Agent Client Protocol client. Each
@@ -347,6 +350,7 @@ pub async fn start_dispatcher(
         elicitation_broker,
         turn_controls,
         conversation_processes,
+        control_plane_token,
     } = services;
     let installation_id = match db.installation_id() {
         Ok(installation_id) => installation_id,
@@ -367,6 +371,7 @@ pub async fn start_dispatcher(
     let conversation_elicitations = elicitation_broker.clone();
     let conversation_controls = turn_controls.clone();
     let conversation_base_processes = processes.clone();
+    let conversation_control_token = control_plane_token.clone();
     tokio::spawn(async move {
         start_conversation_dispatcher(
             conversation_db,
@@ -378,6 +383,7 @@ pub async fn start_dispatcher(
             conversation_base_processes,
             conversation_processes,
             control_plane_port,
+            conversation_control_token,
         )
         .await;
     });
@@ -412,6 +418,7 @@ pub async fn start_dispatcher(
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
                 let processes = processes.clone();
+                let control_plane_token = control_plane_token.clone();
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
                 }
@@ -427,6 +434,7 @@ pub async fn start_dispatcher(
                             turn_controls: turn_controls.clone(),
                             processes,
                             control_plane_port,
+                            control_plane_token,
                         },
                         item.clone(),
                     )
@@ -469,6 +477,7 @@ async fn start_conversation_dispatcher(
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
     control_plane_port: u16,
+    control_plane_token: Arc<str>,
 ) {
     info!("conversation ACP dispatcher started");
     let installation_id = match db.installation_id() {
@@ -511,6 +520,7 @@ async fn start_conversation_dispatcher(
                     project_processes: project_processes.clone(),
                     conversation_processes: conversation_processes.clone(),
                     control_plane_port,
+                    control_plane_token: control_plane_token.clone(),
                 };
                 let failure_db = runtime.db.clone();
                 let failure_bus = runtime.event_bus.clone();
@@ -559,6 +569,7 @@ struct ConversationAttemptRuntime {
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
     control_plane_port: u16,
+    control_plane_token: Arc<str>,
 }
 
 async fn execute_conversation_turn(
@@ -575,6 +586,7 @@ async fn execute_conversation_turn(
         project_processes,
         conversation_processes,
         control_plane_port,
+        control_plane_token,
     } = runtime;
     let queue = ConversationTurnQueue::new(db.clone());
     if !queue.is_running(&turn.id)? {
@@ -641,8 +653,11 @@ async fn execute_conversation_turn(
             Some(&turn.conversation_id),
             conversation.project_id.as_deref(),
             &container_workspace,
-            control_plane_port,
-            docker.runtime(),
+            RunnerCallback {
+                port: control_plane_port,
+                token: control_plane_token.as_ref(),
+                container_runtime: docker.runtime(),
+            },
         ));
     }
     if let Some(access) = github.as_ref() {
@@ -829,6 +844,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         turn_controls,
         processes,
         control_plane_port,
+        control_plane_token,
     } = runtime;
     let attempt_id = item
         .attempt_id
@@ -955,8 +971,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             task.conversation_id.as_deref(),
             task_project_id.as_deref(),
             &container_workspace,
-            control_plane_port,
-            docker.runtime(),
+            RunnerCallback {
+                port: control_plane_port,
+                token: control_plane_token.as_ref(),
+                container_runtime: docker.runtime(),
+            },
         ));
     }
     if let Some(access) = github.as_ref() {
@@ -965,6 +984,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 .as_ref()
                 .map(|task_id| github::GithubTaskContext {
                     control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+                    control_plane_token: control_plane_token.to_string(),
                     task_id: task_id.clone(),
                     agent_id: agent.name.clone(),
                     review_lifecycle: github_review_lifecycle,
@@ -1952,6 +1972,13 @@ fn control_plane_url(control_plane_port: u16, container_runtime: &str) -> String
     format!("http://{host}:{control_plane_port}")
 }
 
+#[derive(Clone, Copy)]
+struct RunnerCallback<'a> {
+    port: u16,
+    token: &'a str,
+    container_runtime: &'a str,
+}
+
 #[cfg(test)]
 fn xpressclaw_control_mcp_server(
     agent_id: &str,
@@ -1965,8 +1992,11 @@ fn xpressclaw_control_mcp_server(
         None,
         None,
         "/workspace",
-        control_plane_port,
-        container_runtime,
+        RunnerCallback {
+            port: control_plane_port,
+            token: "test-control-token",
+            container_runtime,
+        },
     )
 }
 
@@ -1976,16 +2006,16 @@ fn xpressclaw_control_mcp_server_for_context(
     conversation_id: Option<&str>,
     project_id: Option<&str>,
     workspace: &str,
-    control_plane_port: u16,
-    container_runtime: &str,
+    callback: RunnerCallback<'_>,
 ) -> McpServer {
     let mut env = vec![
         EnvVariable::new(
             "XPRESSCLAW_URL",
-            control_plane_url(control_plane_port, container_runtime),
+            control_plane_url(callback.port, callback.container_runtime),
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
         EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
+        EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", callback.token),
     ];
     if let Some(task_id) = task_id {
         env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
@@ -3685,6 +3715,9 @@ mod tests {
         }));
         assert!(server.env.iter().any(|variable| {
             variable.name == "XPRESSCLAW_TASK_ID" && variable.value == "task-123"
+        }));
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_CONTROL_TOKEN" && variable.value == "test-control-token"
         }));
 
         let McpServer::Stdio(podman) =

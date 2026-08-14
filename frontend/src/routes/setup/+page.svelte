@@ -249,12 +249,14 @@
 <div class="rounded-2xl border border-border bg-card shadow-sm">
 	<div class="flex items-start justify-between border-b border-border px-4 py-5 sm:px-6">
 		<div>
-			<p class="text-xs font-medium uppercase tracking-wider text-primary">Agent</p>
+			<p class="text-xs font-medium uppercase tracking-wider text-primary">{isAddSession ? 'Agent' : 'Project & Agent'}</p>
 			<h2 class="mt-1 text-xl font-semibold text-foreground">
-				{isAddSession ? 'Create an agent' : 'Create your first agent'}
+				{isAddSession ? 'Create an agent' : 'Create your first Project and Agent'}
 			</h2>
 			<p class="mt-1 text-sm text-muted-foreground">
-				Name its durable context, choose a coding harness, and optionally point it at a folder on this computer.
+				{isAddSession
+					? 'Name its durable context, choose a coding harness, and point it at a workspace.'
+					: 'Choose a repository or managed workspace and an Agent to begin. You can add more to this instance later.'}
 			</p>
 		</div>
 		{#if isAddSession}
@@ -334,7 +336,7 @@
 				<button type="button" onclick={() => (workspaceMode = 'managed')} class="rounded-md px-3 py-2 text-xs font-medium {workspaceMode === 'managed' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">Start without a folder</button>
 			</div>
 			{#if workspaceMode === 'existing'}
-				<label for="workspace-path" class="mb-1.5 block text-xs font-medium text-foreground">Workspace folder</label>
+				<label for="workspace-path" class="mb-1.5 block text-xs font-medium text-foreground">Repository or workspace folder</label>
 				<div class="flex gap-2">
 					<input
 						id="workspace-path"
@@ -347,7 +349,7 @@
 					<button type="button" onclick={() => (folderPicker = 'workspace')} class="rounded-lg border border-border px-3.5 py-2.5 text-sm hover:bg-accent">Browse…</button>
 				</div>
 				<p class="mt-1.5 text-xs text-muted-foreground">
-					The folder must exist on this machine.
+					This is the Agent's workspace, not another XpressClaw instance. The folder must exist on the control-plane machine.
 					{containerEngine === 'host'
 						? ' It is mounted at the same absolute path so Compose bind mounts resolve correctly.'
 						: ' It is mounted at /workspace.'}

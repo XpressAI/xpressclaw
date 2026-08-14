@@ -339,13 +339,16 @@ test('fails closed when review-lifecycle registration fails', () => {
 
 test('sends explicit begin, register, and cancel registration phases', async () => {
   const requests = [];
+  const headers = [];
   const environment = {
     XPRESSCLAW_URL: 'http://control-plane/',
+    XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
     XPRESSCLAW_TASK_ID: 'task/1',
     XPRESSCLAW_AGENT_ID: 'agent',
   };
   const fetchImplementation = async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
+    headers.push(options.headers);
     return { ok: true, status: 200, text: async () => '{"status":"ok"}' };
   };
 
@@ -390,6 +393,8 @@ test('sends explicit begin, register, and cancel registration phases', async () 
       },
     },
   ]);
+  assert.equal(headers.length, 3);
+  assert.ok(headers.every((value) => value['x-xpressclaw-internal-token'] === 'internal-secret'));
 });
 
 test('arms review monitoring before publishing and leaves the gate on registration failure', async () => {

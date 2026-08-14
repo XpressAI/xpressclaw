@@ -184,7 +184,9 @@ test('advertises project memory tools with conservative MCP annotations', () => 
 
 test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
   let createdBody = null;
+  const controlTokens = [];
   const server = createServer(async (request, response) => {
+    controlTokens.push(request.headers['x-xpressclaw-internal-token']);
     if (request.url === '/api/memory/project-a/index' && request.method === 'GET') {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
@@ -221,6 +223,7 @@ test('serves project memory discovery and writes over the stdio MCP protocol', {
       env: {
         ...process.env,
         XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+        XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
         XPRESSCLAW_AGENT_ID: 'project-a',
         XPRESSCLAW_TASK_ID: 'task-9',
       },
@@ -271,6 +274,8 @@ test('serves project memory discovery and writes over the stdio MCP protocol', {
       JSON.parse(notification.value).method,
       'notifications/resources/list_changed',
     );
+    assert.ok(controlTokens.length > 0);
+    assert.ok(controlTokens.every((token) => token === 'internal-secret'));
   } finally {
     child.stdin.end();
     if (child.exitCode === null) await once(child, 'exit');
@@ -284,7 +289,9 @@ test('conversation tools publish files, download attachments, and create linked 
   await writeFile(path.join(workspace, 'report.md'), '# Report\nUseful evidence.\n');
   let publishedBody = null;
   let taskBody = null;
+  const controlTokens = [];
   const server = createServer(async (request, response) => {
+    controlTokens.push(request.headers['x-xpressclaw-internal-token']);
     if (request.url === '/api/memory/project-a/index' && request.method === 'GET') {
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ active_notes: 0, pinned_notes: 0, note_types: [], top_tags: [], pinned: [], recent: [], hint: '' }));
@@ -326,6 +333,7 @@ test('conversation tools publish files, download attachments, and create linked 
       env: {
         ...process.env,
         XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+        XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
         XPRESSCLAW_AGENT_ID: 'atlas',
         XPRESSCLAW_TASK_ID: 'task-9',
         XPRESSCLAW_PROJECT_ID: 'project-a',
@@ -395,6 +403,8 @@ test('conversation tools publish files, download attachments, and create linked 
     assert.equal(taskBody.agent_id, 'atlas');
     assert.equal(taskBody.creator_agent_id, 'atlas');
     assert.equal(taskBody.project_id, 'project-a');
+    assert.ok(controlTokens.length > 0);
+    assert.ok(controlTokens.every((token) => token === 'internal-secret'));
   } finally {
     child.stdin.end();
     if (child.exitCode === null) await once(child, 'exit');

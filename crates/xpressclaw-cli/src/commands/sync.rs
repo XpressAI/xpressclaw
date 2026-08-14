@@ -183,7 +183,7 @@ fn resolve_control_plane_dir(
         let config_path = directory.join("xpressclaw.yaml");
         if !config_path.is_file() && !allow_missing_config {
             anyhow::bail!(
-                "no xpressclaw.yaml exists in control-plane directory {}. Desktop creates ~/.xpressclaw/xpressclaw.yaml after first-run setup. For CLI mode, pass the directory used with `xpressclaw up --workdir`, or run `xpressclaw init {}` to create a control plane here.",
+                "no xpressclaw.yaml exists in control-plane directory {}. Desktop creates ~/.xpressclaw/xpressclaw.yaml after first-run setup. For CLI mode, pass the directory used with `xpressclaw up --instance`, or run `xpressclaw init {}` to create a control plane here.",
                 directory.display(),
                 directory.display()
             );
@@ -228,7 +228,7 @@ fn select_discovered_control_plane(
                 ""
             };
             anyhow::bail!(
-                "could not discover a control plane from project repository {}. No xpressclaw.yaml was found in the repository, its parent directories, a single sibling control-plane repository, or the Desktop default ~/.xpressclaw. If you use Desktop, launch it and finish first-run setup, then retry. For CLI mode, rerun with `--control-plane-dir /path/to/xpressclaw-control` (the directory used with `xpressclaw up --workdir`).{fetch_hint}",
+                "could not discover a control plane from project repository {}. No xpressclaw.yaml was found in the repository, its parent directories, a single sibling control-plane repository, or the Desktop default ~/.xpressclaw. If you use Desktop, launch it and finish first-run setup, then retry. For CLI mode, rerun with `--control-plane-dir /path/to/xpressclaw-control` (the directory used with `xpressclaw up --instance`).{fetch_hint}",
                 project_dir.display()
             );
         }
@@ -449,7 +449,7 @@ mod tests {
         assert!(wrong_error.contains("no xpressclaw.yaml exists"));
         assert!(wrong_error.contains("xpressclaw init"));
         assert!(wrong_error.contains("Desktop creates ~/.xpressclaw/xpressclaw.yaml"));
-        assert!(wrong_error.contains("xpressclaw up --workdir"));
+        assert!(wrong_error.contains("xpressclaw up --instance"));
         assert_eq!(
             resolve_control_plane_dir(Some(&data_dir), root.path(), true).unwrap(),
             data_dir.canonicalize().unwrap()

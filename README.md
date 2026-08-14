@@ -23,15 +23,13 @@ Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers
 
 ---
 
-```bash
-xpressclaw init ~/.xpressclaw
-xpressclaw up --workdir ~/.xpressclaw
-```
+Download the macOS, Windows, or Linux Desktop installer from
+[Releases](https://github.com/XpressAI/xpressclaw/releases), launch it, and add
+the repository you want an Agent to work in. Desktop creates and starts your
+default local XpressClaw instance automatically—there is no `init` step.
 
-Open `http://localhost:8935`, create a Project, add an Agent with its harness
-and workspace, then start a Conversation or send it work. The matching runner
-image is pulled automatically. To build
-the Codex runner locally instead:
+The matching runner image is pulled automatically. To build the Codex runner
+locally instead:
 
 ```bash
 docker buildx build --load -f harnesses/native/codex/Dockerfile -t xpressclaw-runner-codex:latest -t localhost/xpressclaw-runner-codex:latest harnesses/native
@@ -106,37 +104,112 @@ development and test workflows can explicitly enable trusted host-engine access.
 
 Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know what ran at 3am and why.
 
+## The User Model
+
+- An **instance** is one long-running XpressClaw control plane plus its local
+  configuration and data. It can own many Projects and repositories. Desktop
+  manages one default local instance at `~/.xpressclaw`.
+- A **client** is the Desktop window or a browser connected to an instance.
+  Closing a client does not stop the instance, its queues, or its Agents.
+- A **Project** is the collaboration and memory boundary containing Agents,
+  Conversations, Tasks, and workflows.
+- An **Agent** is an execution identity with one ACP harness, retained
+  environment, and workspace. Its workspace may be an existing repository or
+  an XpressClaw-managed folder.
+
+`xpressclaw.yaml` configures an instance; it does not add a repository and
+does not belong in every repository. Repository-local harness instructions
+such as `AGENTS.md`, `CLAUDE.md`, or product-specific equivalents stay with the
+repository and are read by the selected harness. See
+[ADR-038](docs/adr/ADR-038-instances-clients-and-remote-access.md) for the
+product boundary.
+
 ## Quick Start
 
-### Option 1: Native App
+### 1. Install Desktop (recommended)
 
-Download the macOS, Windows, or Linux installer from
-[Releases](https://github.com/XpressAI/xpressclaw/releases), then launch the
-app. No CLI initialization is required: Desktop starts its bundled control
-plane from `~/.xpressclaw`, opens the first-run Agent setup, and keeps running
-in the system tray.
+The official [Releases](https://github.com/XpressAI/xpressclaw/releases) page
+publishes these Desktop installers:
 
-### Option 2: Download Binary
+- macOS: signed and notarized `.dmg` files for Apple Silicon and Intel;
+- Windows: `.exe` and `.msi` installers for x64; and
+- Linux: `.deb` and `.rpm` packages for x64.
 
-Grab the CLI release, choose one durable control-plane directory for this
-installation, and start it. That directory is not the source repository an
-Agent will work on; one control plane can manage many Project workspaces.
+Install and launch the app. It starts the bundled control plane from
+`~/.xpressclaw`, opens first-run setup, and stays available in the system tray.
+The Desktop installer does not install a separate `xpressclaw` command on
+`PATH`.
+
+### 2. Create your first Project and Agent
+
+Choose an existing repository folder or start with an empty managed workspace,
+name the Agent, and select Codex, Claude Code, OpenCode, or a custom ACP
+harness. XpressClaw creates the first Project around that Agent. Add more
+Projects and Agents from the UI; you do not run `init` for each repository.
+
+### 3. Start work
+
+Open a Project Conversation for shared coordination, use **Continue with
+task** for durable work, or send private work directly to one Agent from
+**New Work**. Closing the window does not stop the local control plane.
+
+### Headless or server installation
+
+Releases do not currently publish a standalone CLI/server installer or a
+universal shell/PowerShell installer. For a headless machine, build the single
+CLI/server binary from source rather than copying a Desktop sidecar out of an
+application bundle. Install Git, the stable Rust toolchain, Node.js 20+, and
+Docker or Podman first:
 
 ```bash
-xpressclaw init ~/.xpressclaw
-xpressclaw up --workdir ~/.xpressclaw
-# Open http://localhost:8935
+git clone https://github.com/XpressAI/xpressclaw.git
+cd xpressclaw
+npm ci --prefix frontend
+npm run build --prefix frontend
+cargo build --release -p xpressclaw-cli
+./target/release/xpressclaw up --instance "$HOME/.xpressclaw"
 ```
 
-### Option 3: Build from Source
+On Windows PowerShell, the final command is
+`./target/release/xpressclaw.exe up --instance "$env:USERPROFILE/.xpressclaw"`.
 
-See [Building](#building) below.
+`xpressclaw up` discovers or creates the default local instance at
+`~/.xpressclaw` and opens setup at `http://localhost:8935`. The optional
+`xpressclaw init` command is only for provisioning an instance ahead of time
+or creating an advanced alternate instance. The source checkout itself carries
+a development `xpressclaw.yaml`, so the explicit instance in the build command
+avoids selecting that backward-compatible current-directory configuration.
 
 ### Requirements
 
 - Docker or Podman (required for worker isolation)
 - At least one supported harness login on the host
 - A built-in ACP runner image, or your own ACP-compatible image
+
+## Remote Access
+
+The control plane is the durable machine running Agents; Desktop and the web
+UI are clients. To leave work running on a desktop or server and reconnect
+from a laptop or phone, keep XpressClaw bound to its default loopback address
+and put an authenticated transport in front of it.
+
+For example, from a laptop with SSH access to the control-plane host:
+
+```bash
+ssh -N -L 8935:127.0.0.1:8935 user@control-plane-host
+```
+
+Then open `http://localhost:8935` on that laptop. An authenticated HTTPS
+reverse proxy is another option. XpressClaw does not yet provide native remote
+authentication, so it refuses non-loopback binds unless
+`--allow-insecure-remote` explicitly acknowledges that another security layer
+protects the address. Never expose the port directly to a LAN or the internet.
+
+Browser disconnection does not cancel work. Reopening the same instance loads
+durable state and live streams reconnect; after a control-plane process
+restart, interrupted work is recovered into the queue. See
+[Remote access](docs/remote-access.md) for the current security boundary and
+Desktop limitations.
 
 ## What Can It Do?
 
@@ -181,12 +254,16 @@ PRs and their own wait logic. See
 
 ## Configuration
 
-`xpressclaw init` creates a minimal `xpressclaw.yaml`. Agents are added in the
-web UI, which records the selected harness image and workspace:
+The default instance is `~/.xpressclaw`; `xpressclaw up` creates its directory
+and opens first-run setup when needed. Setup writes `xpressclaw.yaml`, and
+Agents are added in the web UI. A new explicitly initialized instance keeps
+its database, managed workspaces, logs, and PID file under its own directory:
 
 ```yaml
 system:
   isolation: docker
+  data_dir: /home/me/.xpressclaw
+  workspace_dir: /home/me/.xpressclaw/workspaces
 
 agents: []
 
@@ -356,13 +433,17 @@ also formats local path dependencies and would modify the
 
 ```bash
 # Terminal 1: Run the Rust server with auto-reload
-cargo run -- up
+cargo run -- up --instance .
 
 # Terminal 2: Run the frontend dev server with hot reload
 cd frontend && npm run dev
 
 # The frontend dev server proxies API calls to localhost:8935
 ```
+
+`--instance .` deliberately selects this checkout's development
+`xpressclaw.yaml`; omit it when exercising the normal `~/.xpressclaw`
+discovery flow.
 
 ## Architecture
 
@@ -395,12 +476,19 @@ xpressclaw
 ## CLI Reference
 
 ```
-xpressclaw init              Create an empty workspace configuration
-xpressclaw up [--detach]     Start the control plane and worker dispatcher
-xpressclaw down              Stop the control plane and active workers
-xpressclaw status            Show logical session status
+xpressclaw init [INSTANCE]   Optionally provision a control-plane instance
+xpressclaw up [--detach]     Start the default local instance
+xpressclaw down              Stop its detached control-plane process
+xpressclaw status            Show Agent queue status
 xpressclaw sync ...          Explicitly fetch/publish portable Project state
 ```
+
+Advanced independent instances use `--instance <DIR>` and separate ports.
+`--workdir <DIR>` remains a deprecated alias for existing scripts, and an
+existing current-directory `xpressclaw.yaml` remains discoverable when no
+default instance has been configured. Scripts that relied on bare `init`
+targeting the current directory should use the explicit `xpressclaw init .`
+spelling. See [CLI commands](docs/commands.md).
 
 ### Git-backed Project Synchronization
 

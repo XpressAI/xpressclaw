@@ -773,6 +773,11 @@ export interface AgentLlmConfig {
 }
 
 export interface LiveConfig {
+	instance: {
+		config_path: string;
+		data_dir: string;
+		workspace_dir: string;
+	};
 	llm: {
 		// Per-agent provider summary. There is no global LLM config — each
 		// agent declares its own provider/model/key/base_url.

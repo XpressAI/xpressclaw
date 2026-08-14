@@ -49,6 +49,7 @@ whose GitHub tool does not advertise it.";
 #[derive(Debug, Clone)]
 pub struct GithubTaskContext {
     pub control_plane_url: String,
+    pub control_plane_token: String,
     pub task_id: String,
     pub agent_id: String,
     pub review_lifecycle: bool,
@@ -93,6 +94,7 @@ impl GithubSessionAccess {
         if let Some(task) = task {
             env.extend([
                 EnvVariable::new("XPRESSCLAW_URL", &task.control_plane_url),
+                EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", &task.control_plane_token),
                 EnvVariable::new("XPRESSCLAW_TASK_ID", &task.task_id),
                 EnvVariable::new("XPRESSCLAW_AGENT_ID", &task.agent_id),
             ]);
@@ -467,6 +469,7 @@ mod tests {
         };
         let value = serde_json::to_value(access.mcp_server(Some(&GithubTaskContext {
             control_plane_url: "http://host.docker.internal:8935".into(),
+            control_plane_token: "internal-secret".into(),
             task_id: "task-123".into(),
             agent_id: "xpressclaw-codex".into(),
             review_lifecycle: true,
@@ -474,6 +477,7 @@ mod tests {
         .unwrap();
         let env = value["env"].as_array().unwrap();
         for (name, expected) in [
+            ("XPRESSCLAW_CONTROL_TOKEN", "internal-secret"),
             ("XPRESSCLAW_TASK_ID", "task-123"),
             ("XPRESSCLAW_AGENT_ID", "xpressclaw-codex"),
             ("XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE", "1"),

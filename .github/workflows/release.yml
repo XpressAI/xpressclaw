@@ -241,11 +241,13 @@ jobs:
 
             Built from `main` at `${{ github.sha }}` (`${{ needs.release-metadata.outputs.sha }}`).
 
-            **Downloads:**
+            **Desktop downloads (the standalone CLI/server is not packaged separately):**
             - macOS (Apple Silicon): `.dmg` arm64 — signed and notarized
             - macOS (Intel): `.dmg` x64 — signed and notarized
             - Windows: `.exe` NSIS installer, `.msi` MSI installer
             - Linux: `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL)
+
+            Desktop bundles and automatically starts the default local control-plane instance.
           prerelease: true
           make_latest: false
           files: release-assets/*

@@ -1,3 +1,5 @@
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -9,42 +11,65 @@ use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
 
-pub async fn run(detach: bool, port: u16, workdir: Option<String>) -> anyhow::Result<()> {
-    if detach {
-        return run_detached(port);
+use super::instance::{self, Instance, InstanceSource};
+
+pub async fn run(
+    detach: bool,
+    port: u16,
+    instance_dir: Option<PathBuf>,
+    workdir: Option<PathBuf>,
+    bind: IpAddr,
+    allow_insecure_remote: bool,
+) -> anyhow::Result<()> {
+    validate_bind(bind, allow_insecure_remote)?;
+    if workdir.is_some() {
+        eprintln!("warning: --workdir is deprecated; use --instance instead");
+    }
+    let selected = instance::resolve(instance_dir.or(workdir))?;
+    if selected.source == InstanceSource::LegacyCurrentDirectory {
+        eprintln!(
+            "warning: using the legacy current-directory instance at {}; use --instance to select it explicitly",
+            selected.root.display()
+        );
     }
 
-    run_foreground(port, workdir).await
+    if detach {
+        return run_detached(port, bind, allow_insecure_remote, &selected);
+    }
+
+    run_foreground(port, bind, &selected).await
 }
 
 /// Run the server in the foreground (default).
-async fn run_foreground(port: u16, workdir: Option<String>) -> anyhow::Result<()> {
-    let state = build_state(port, workdir).await?;
+async fn run_foreground(port: u16, bind: IpAddr, instance: &Instance) -> anyhow::Result<()> {
+    let state = build_state(instance).await?;
+    let ui_url = ui_url(bind, port);
 
     if !state.is_setup_complete() {
-        println!("xpressclaw control plane is starting...");
+        println!("XpressClaw is starting its control plane...");
         println!();
-        println!("  Open http://localhost:{port} to create your first session.");
+        println!("  Open {ui_url} to create your first Project and Agent.");
         println!();
         println!("Press Ctrl+C to stop.");
     } else {
-        println!("xpressclaw control plane is starting...");
-        println!("  Web UI: http://localhost:{port}");
-        println!("  API:    http://localhost:{port}/api");
+        println!("XpressClaw control plane is starting...");
+        println!("  Instance: {}", instance.root.display());
+        println!("  Web UI:   {ui_url}");
+        println!("  API:      {ui_url}/api");
         let config = state.config();
         if config.agents.is_empty() {
             println!();
-            println!("  No sessions configured yet.");
-            println!("  Create one at http://localhost:{port}/setup?mode=add-session");
+            println!("  No Agents configured yet.");
+            println!("  Create one at {ui_url}/setup?mode=add-session");
         } else {
-            println!("  Sessions: {}", config.agents.len());
+            println!("  Agents:   {}", config.agents.len());
         }
 
         println!();
         println!("Press Ctrl+C to stop.");
     }
 
-    server::serve(state, port).await?;
+    server::serve_on(state, bind, port).await?;
 
     Ok(())
 }
@@ -53,15 +78,19 @@ async fn run_foreground(port: u16, workdir: Option<String>) -> anyhow::Result<()
 ///
 /// Re-executes `xpressclaw up` (without --detach) in a new process,
 /// redirecting stdout/stderr to a log file.
-fn run_detached(port: u16) -> anyhow::Result<()> {
+fn run_detached(
+    port: u16,
+    bind: IpAddr,
+    allow_insecure_remote: bool,
+    instance: &Instance,
+) -> anyhow::Result<()> {
     use std::fs::File;
     use std::process::Command;
 
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))?;
-    let data_dir = std::path::Path::new(&home).join(".xpressclaw");
-    std::fs::create_dir_all(&data_dir)?;
-    let log_path = data_dir.join("server.log");
-    let pid_path = data_dir.join("server.pid");
+    std::fs::create_dir_all(&instance.root)?;
+    let log_path = instance.root.join("server.log");
+    let pid_path = instance.root.join("server.pid");
+    let ui_url = ui_url(bind, port);
 
     // Check if already running
     if pid_path.exists() {
@@ -74,7 +103,7 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
                     .is_ok_and(|o| o.status.success());
                 if alive {
                     println!("xpressclaw is already running (pid {pid}).");
-                    println!("  Web UI: http://localhost:{port}");
+                    println!("  Web UI: {ui_url}");
                     println!("  Logs:   {}", log_path.display());
                     return Ok(());
                 }
@@ -86,8 +115,17 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
     let log_file = File::create(&log_path)?;
     let err_file = log_file.try_clone()?;
 
-    let child = Command::new(exe)
-        .args(["up", "--port", &port.to_string()])
+    let mut command = Command::new(exe);
+    command
+        .arg("up")
+        .args(["--port", &port.to_string()])
+        .args(["--bind", &bind.to_string()])
+        .arg("--instance")
+        .arg(&instance.root);
+    if allow_insecure_remote {
+        command.arg("--allow-insecure-remote");
+    }
+    let child = command
         .stdout(log_file)
         .stderr(err_file)
         .stdin(std::process::Stdio::null())
@@ -97,29 +135,36 @@ fn run_detached(port: u16) -> anyhow::Result<()> {
     std::fs::write(&pid_path, pid.to_string())?;
 
     println!("xpressclaw started in background (pid {pid}).");
-    println!("  Web UI: http://localhost:{port}");
+    println!("  Instance: {}", instance.root.display());
+    println!("  Web UI:   {ui_url}");
     println!("  Logs:   {}", log_path.display());
     println!("  PID:    {}", pid_path.display());
     println!();
-    println!("Stop with `xpressclaw down`.");
+    if instance.is_default() {
+        println!("Stop with `xpressclaw down`.");
+    } else {
+        println!(
+            "Stop with `xpressclaw down --instance \"{}\"`.",
+            instance.root.display()
+        );
+    }
 
     Ok(())
 }
 
 /// Build the AppState (shared between foreground and detached modes).
-async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppState> {
-    let work_dir = match workdir {
-        Some(dir) => std::path::PathBuf::from(dir),
-        None => std::env::current_dir().unwrap_or_default(),
-    };
-    let config_path = work_dir.join("xpressclaw.yaml");
+async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
+    std::fs::create_dir_all(&instance.root)?;
+    let config_path = instance.config_path();
 
     // Check if config exists — if not, start in setup mode
     if !config_path.exists() {
-        info!("no config file found — starting in setup mode");
-        let config = Config::default();
+        info!(instance = %instance.root.display(), "no instance config found — starting setup");
+        let mut config = Config::default();
+        config.system.data_dir = instance.root.clone();
+        config.system.workspace_dir = instance.root.join("workspaces");
         let db_path = config.system.data_dir.join("xpressclaw.db");
-        std::fs::create_dir_all(&config.system.data_dir).ok();
+        std::fs::create_dir_all(&config.system.workspace_dir)?;
         let db = Arc::new(Database::open(&db_path)?);
 
         return Ok(AppState::new(
@@ -177,6 +222,8 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
         }
     }
 
+    let setup_complete = !config.agents.is_empty();
+
     // Build LLM router
     let config = Arc::new(config);
     let llm_router = {
@@ -184,12 +231,78 @@ async fn build_state(port: u16, workdir: Option<String>) -> anyhow::Result<AppSt
         LlmRouter::build_from_config(&config)
     };
 
-    let _ = port; // available for future use (e.g., logging)
-
-    let state = AppState::new(config, db, Some(Arc::new(llm_router)), config_path, true);
+    let state = AppState::new(
+        config,
+        db,
+        Some(Arc::new(llm_router)),
+        config_path,
+        setup_complete,
+    );
 
     // No worker startup here. The server dispatches queued work into isolated,
     // short-lived ACP server containers (ADR-026).
 
     Ok(state)
+}
+
+fn validate_bind(bind: IpAddr, allow_insecure_remote: bool) -> anyhow::Result<()> {
+    if bind.is_loopback() || allow_insecure_remote {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to expose an unauthenticated XpressClaw control plane on {bind}. Keep the default loopback bind and use an SSH tunnel or authenticated TLS proxy. If another security layer already protects this address, rerun with --allow-insecure-remote to acknowledge the risk"
+    )
+}
+
+fn ui_url(bind: IpAddr, port: u16) -> String {
+    if bind.is_loopback() {
+        format!("http://localhost:{port}")
+    } else {
+        format!("http://{}", SocketAddr::new(bind, port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+
+    #[test]
+    fn loopback_bind_is_safe_by_default() {
+        assert!(validate_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), false).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_explicit_acknowledgement() {
+        let bind = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let error = validate_bind(bind, false).unwrap_err().to_string();
+        assert!(error.contains("unauthenticated"));
+        assert!(error.contains("SSH tunnel"));
+        assert!(validate_bind(bind, true).is_ok());
+    }
+
+    #[test]
+    fn formats_ipv6_listen_urls() {
+        assert_eq!(ui_url("::".parse().unwrap(), 8935), "http://[::]:8935");
+    }
+
+    #[tokio::test]
+    async fn initialized_empty_instance_still_opens_first_run_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let instance = Instance {
+            root: root.path().join("instance"),
+            source: InstanceSource::Explicit,
+        };
+        std::fs::create_dir_all(&instance.root).unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = instance.root.clone();
+        config.system.workspace_dir = instance.root.join("workspaces");
+        config.save(&instance.config_path()).unwrap();
+
+        let state = build_state(&instance).await.unwrap();
+
+        assert!(!state.is_setup_complete());
+    }
 }

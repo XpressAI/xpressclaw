@@ -10,6 +10,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const BASE_URL = (process.env.XPRESSCLAW_URL ?? '').replace(/\/$/, '');
+const CONTROL_TOKEN = process.env.XPRESSCLAW_CONTROL_TOKEN ?? '';
 const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
@@ -372,6 +373,7 @@ async function api(path, options = {}) {
     ...options,
     headers: {
       ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+      ...(CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {}),
       ...(options.headers ?? {}),
     },
   });
@@ -712,7 +714,9 @@ async function downloadConversationAttachment(argumentsValue) {
   const attachmentId = String(argumentsValue?.attachment_id ?? '').trim();
   if (!attachmentId) throw new Error('attachment_id must be a non-empty string');
   requireConfiguration();
-  const response = await fetch(`${BASE_URL}${conversationPath(`/attachments/${encodeURIComponent(attachmentId)}`)}`);
+  const response = await fetch(`${BASE_URL}${conversationPath(`/attachments/${encodeURIComponent(attachmentId)}`)}`, {
+    headers: CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {},
+  });
   if (!response.ok) {
 	const detail = await response.text();
 	throw new Error(detail || `conversation attachment download failed with HTTP ${response.status}`);

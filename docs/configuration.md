@@ -6,13 +6,13 @@ memory, and workspace configuration while its replaceable ACP harness owns
 reasoning, tools, and subagents. Xpressclaw does not define a persona or system
 prompt for the harness.
 
-The packaged Desktop app uses `~/.xpressclaw/xpressclaw.yaml` and starts its
-bundled server automatically. CLI users choose the directory: it is the
-argument to `xpressclaw init` and `xpressclaw up --workdir`. It is an
-installation-level control plane that can manage many Agent workspaces, not a
-requirement to place XpressClaw configuration in every source repository.
-`~/.xpressclaw` is also the default data directory, so Desktop intentionally
-keeps its config and local database under the same root.
+The packaged Desktop app uses the default local **instance** at
+`~/.xpressclaw` and starts its bundled server automatically. The CLI discovers
+the same instance, so ordinary use is simply `xpressclaw up`. An instance is
+an installation-level control plane that can manage many Projects and Agent
+workspaces; it is not a requirement to place XpressClaw configuration in every
+source repository. The default instance keeps its configuration, database,
+managed workspaces, background log, and PID file under the same root.
 
 This local `xpressclaw.yaml` is distinct from the optional
 `.xpressclaw.yml` Project synchronization manifest. The latter is a small,
@@ -20,12 +20,22 @@ portable pointer to a separate Git store and must never contain credentials or
 machine-specific runner settings. See [Git-backed Project
 synchronization](project-sync.md).
 
-`xpressclaw init` writes an empty starting point:
+`xpressclaw init` is optional. It provisions the default instance ahead of
+time, or an explicitly named advanced instance:
+
+```bash
+xpressclaw init
+xpressclaw init /srv/xpressclaw/staging
+```
+
+A newly initialized instance writes an empty starting point with explicit
+instance-local data paths:
 
 ```yaml
 system:
   isolation: docker
-  workspace_dir: .
+  data_dir: /home/me/.xpressclaw
+  workspace_dir: /home/me/.xpressclaw/workspaces
 
 agents: []
 ```
@@ -157,9 +167,29 @@ import `SSH_AUTH_SOCK` into the service manager and restart XpressClaw, for
 example with `systemctl --user import-environment SSH_AUTH_SOCK`. The Agent
 readiness panel reports the detected socket or a specific configuration issue.
 
-## Multiple agents and control planes
+## Advanced independent instances
 
-Use a separate working directory and `xpressclaw.yaml` for each independent
-control plane, or create multiple agents with different workspaces in one
-control plane. Select the server working directory with
-`xpressclaw up --workdir /path/to/control-plane`.
+Most people should use one default instance and create several Projects and
+Agents inside it. A separate instance is useful only when configuration,
+SQLite state, credentials, managed workspaces, logs, and runtime policy need
+an independent boundary—for example production versus testing, separate
+security contexts, or different remote hosts.
+
+Create and run an alternate instance on its own port:
+
+```bash
+xpressclaw init /srv/xpressclaw/staging
+xpressclaw up --instance /srv/xpressclaw/staging --port 9001
+```
+
+`--workdir` remains a deprecated alias for `--instance`. Existing CLI
+installations that have `xpressclaw.yaml` in the current directory remain
+discoverable when the default instance has not yet been configured. Existing
+YAML files also retain their configured/default data paths; XpressClaw does
+not silently move databases. To turn an older directory into a truly isolated
+instance, set `system.data_dir` explicitly before starting it. The former bare
+`xpressclaw init` current-directory behavior remains available as the explicit
+`xpressclaw init .` spelling.
+
+The word **profile** is reserved for a future client-side saved connection to
+an instance. It is not another name for the server's configuration directory.
