@@ -3,6 +3,7 @@
 	import { agents, tasks } from '$lib/api';
 	import type { Agent, Task, TaskCounts } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
 
 	const PAGE_SIZE = 20;
 	const FILTER_STATUSES = {
@@ -235,13 +236,13 @@
 		return agent?.title || agent?.name || agentId;
 	}
 
-	function statusMeta(status: string): { label: string; dot: string; tone: string } {
-		if (status === 'in_progress') return { label: 'Working', dot: 'bg-blue-400 animate-pulse', tone: 'text-blue-400' };
-		if (status === 'pending') return { label: 'Queued', dot: 'bg-amber-400', tone: 'text-amber-400' };
-		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-400 animate-pulse', tone: 'text-orange-400' };
-		if (status === 'blocked') return { label: 'Blocked', dot: 'bg-red-400', tone: 'text-red-400' };
-		if (status === 'completed') return { label: 'Completed', dot: 'bg-emerald-400', tone: 'text-emerald-400' };
-		return { label: 'Cancelled', dot: 'bg-muted-foreground', tone: 'text-muted-foreground' };
+	function statusMeta(status: string): { label: string; dot: string; tone: string; pill: string; glyph: string } {
+		if (status === 'in_progress') return { label: 'Working', dot: 'bg-blue-400 animate-pulse', tone: 'text-blue-500 dark:text-blue-300', pill: 'bg-blue-500/10', glyph: '2' };
+		if (status === 'pending') return { label: 'Queued', dot: 'bg-amber-400', tone: 'text-amber-600 dark:text-amber-300', pill: 'bg-amber-500/10', glyph: '1' };
+		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-400 animate-pulse', tone: 'text-orange-600 dark:text-orange-300', pill: 'bg-orange-500/10', glyph: '?' };
+		if (status === 'blocked') return { label: 'Blocked', dot: 'bg-red-400', tone: 'text-red-600 dark:text-red-300', pill: 'bg-red-500/10', glyph: '!' };
+		if (status === 'completed') return { label: 'Completed', dot: 'bg-emerald-400', tone: 'text-emerald-700 dark:text-emerald-300', pill: 'bg-emerald-500/10', glyph: '✓' };
+		return { label: 'Cancelled', dot: 'bg-muted-foreground', tone: 'text-muted-foreground', pill: 'bg-muted', glyph: '×' };
 	}
 </script>
 
@@ -362,7 +363,7 @@
 		</div>
 	{/if}
 
-	<div class="relative">
+	<div class="ai-control relative overflow-hidden">
 		<svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
 			<circle cx="11" cy="11" r="7" />
 			<path d="m20 20-3.5-3.5" />
@@ -377,7 +378,7 @@
 			maxlength="200"
 			aria-label="Search tasks"
 			placeholder="Search task titles, descriptions, and conversations…"
-			class="w-full rounded-lg border border-input bg-background py-2.5 pl-9 pr-10 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+			class="w-full bg-transparent py-2.5 pl-9 pr-10 text-sm placeholder:text-muted-foreground focus:outline-none"
 		/>
 		{#if searchText}
 			<button
@@ -389,31 +390,34 @@
 		{/if}
 	</div>
 
-	<div class="flex gap-1 overflow-x-auto rounded-xl border border-border bg-card p-1">
+	<div class="flex w-fit max-w-full gap-1 overflow-x-auto rounded-full bg-[hsl(var(--field))] p-0.5">
 		{#each [
 			{ id: 'attention', label: 'Needs you', count: statusCount('waiting_for_input') + statusCount('blocked') },
 			{ id: 'active', label: 'Active', count: countForFilter('active', counts) },
 			{ id: 'all', label: 'All', count: countForFilter('all', counts) },
 			{ id: 'done', label: 'Done', count: countForFilter('done', counts) }
 		] as item}
-			<button onclick={() => selectFilter(item.id as typeof filter)} class="shrink-0 rounded-lg px-3 py-2 text-xs font-medium {filter === item.id ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:text-foreground'}">
+			<button onclick={() => selectFilter(item.id as typeof filter)} class="shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition-all {filter === item.id ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}">
 				{item.label} <span class="ml-1 opacity-70">{item.count}</span>
 			</button>
 		{/each}
 	</div>
 
-	<div data-task-list class="overflow-hidden rounded-xl border border-border bg-card">
+	<div data-task-list class="space-y-2">
 		{#if loading && taskList.length === 0}
-			<div class="px-4 py-16 text-center text-sm text-muted-foreground">Loading tasks…</div>
+			<div class="flex justify-center px-4 py-16"><AgentLoading label="Loading tasks" /></div>
 		{:else}
 			{#each taskList as task (task.id)}
 				{@const meta = statusMeta(task.status)}
-				<a data-task-row href="/tasks/{task.id}" class="group flex items-start gap-3 border-b border-border px-4 py-4 last:border-b-0 hover:bg-accent/30">
-					<span class="mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full {meta.dot}"></span>
+				<a data-task-row href="/tasks/{task.id}" class="group ai-card flex min-h-14 items-start gap-3 px-3 py-3 transition-colors hover:bg-[hsl(var(--hover))]">
+					<span class="relative mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold {meta.tone} shadow-[inset_0_0_0_1.5px_hsl(var(--border-strong))]">
+						{meta.glyph}
+						{#if task.status === 'in_progress'}<span class="absolute inset-0 rounded-full border-2 border-transparent border-t-blue-400 animate-spin"></span>{/if}
+					</span>
 					<div class="min-w-0 flex-1">
 						<div class="flex items-start justify-between gap-3">
-							<h2 class="min-w-0 truncate text-sm font-medium group-hover:text-primary">{task.title}</h2>
-							<span class="shrink-0 text-[11px] {meta.tone}">{meta.label}</span>
+							<h2 class="min-w-0 truncate text-sm font-medium">{task.title}</h2>
+							<span class="ai-status-pill shrink-0 {meta.pill} {meta.tone}">{meta.label}</span>
 						</div>
 						{#if task.description}<p class="mt-1 line-clamp-2 text-xs text-muted-foreground">{task.description}</p>{/if}
 						<div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
@@ -428,7 +432,7 @@
 					</div>
 				</a>
 			{:else}
-				<div class="px-4 py-16 text-center text-sm text-muted-foreground">
+				<div class="ai-card px-4 py-16 text-center text-sm text-muted-foreground">
 					{searchQuery ? `No tasks match “${searchQuery}”.` : 'No tasks in this view.'}
 				</div>
 			{/each}

@@ -6,6 +6,8 @@
 	import { timeAgo } from '$lib/utils';
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import AiMessage from '$lib/components/AiMessage.svelte';
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
@@ -647,6 +649,18 @@
 		setTimeout(() => composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(), 0);
 	}
 
+	function handleSelectionAction(action: string, selection: string) {
+		const prompts: Record<string, string> = {
+			Explain: 'Explain this passage',
+			Improve: 'Improve this passage',
+			Shorten: 'Shorten this passage',
+			Tone: 'Adjust the tone of this passage',
+			Grammar: 'Correct the grammar in this passage',
+		};
+		messageInput = `${prompts[action] ?? action}:\n\n> ${selection.replaceAll('\n', '\n> ')}`;
+		setTimeout(() => composerEl?.querySelector<HTMLTextAreaElement>('textarea')?.focus(), 0);
+	}
+
 	function handleComposerPointerDown(event: PointerEvent) {
 		if (modelMenuOpen && composerEl && !composerEl.contains(event.target as Node)) {
 			modelMenuOpen = false;
@@ -1201,7 +1215,7 @@
 	{/if}
 
 	{#if loading}
-		<div class="flex-1 flex items-center justify-center text-muted-foreground text-sm">Loading...</div>
+		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading task" /></div>
 	{:else if task}
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
@@ -1251,35 +1265,22 @@
 					{#if transcriptItems.length > 0}
 						<div class="space-y-0.5" data-task-transcript>
 							{#each transcriptItems as item (item.key)}
-								{#if item.kind === 'message'}
+							{#if item.kind === 'message'}
 									{@const isSystem = item.role === 'system'}
 									{@const isAssistant = item.role === 'assistant'}
-									<div
-										class="flex gap-3 py-2 {isSystem ? '' : isAssistant ? '' : 'flex-row-reverse'}"
-										data-transcript-kind="message"
-										data-message-role={item.role}
-										data-transcript-timestamp={item.timestamp}
+									<AiMessage
+										role={item.role}
+										sender={isSystem ? 'system' : isAssistant ? 'agent' : 'you'}
+										timestampLabel={timeAgo(item.timestamp)}
+										content={item.content}
+										avatar={isSystem ? 'S' : isAssistant ? 'A' : 'Y'}
+										transcriptTimestamp={item.timestamp}
+										openLinksInNewWindow={isAssistant}
+										selectionActions={isAssistant}
+										onselectionaction={handleSelectionAction}
 									>
-										<div class="flex-shrink-0 h-7 w-7 rounded-full flex items-center justify-center text-xs font-bold
-											{isSystem ? 'bg-muted text-muted-foreground' :
-											 isAssistant ? 'bg-accent text-accent-foreground' :
-											 'bg-primary text-primary-foreground'}">
-											{#if isSystem}S{:else if isAssistant}A{:else}U{/if}
-										</div>
-										<div class="max-w-[80%]">
-											<div class="flex items-center gap-2 mb-0.5">
-												<span class="text-xs font-medium {isSystem ? 'text-muted-foreground' : ''}">{item.role}</span>
-												<span class="text-xs text-muted-foreground">{timeAgo(item.timestamp)}</span>
-											</div>
-											<div class="rounded-lg px-3 py-2 text-sm prose prose-invert prose-sm max-w-none
-											{isSystem ? 'bg-muted/50 text-muted-foreground text-xs italic' :
-											 isAssistant ? 'bg-accent text-accent-foreground' :
-											 'bg-primary text-primary-foreground'}">
-											{@html renderContent(item.content, { openLinksInNewWindow: isAssistant })}
-											<ImageAttachmentPreviews attachments={item.attachments} message />
-										</div>
-										</div>
-									</div>
+										<ImageAttachmentPreviews attachments={item.attachments} message />
+									</AiMessage>
 								{:else}
 									<div data-transcript-kind="activity" data-transcript-timestamp={item.timestamp}>
 										<ActivityEventRow event={item.event} />
@@ -1334,10 +1335,10 @@
 
 					{#if pendingElicitation?.kind === 'unsupported'}
 						{@const question = pendingElicitation}
-						<section class="rounded-xl border border-orange-500/35 bg-orange-500/5 shadow-sm" data-unsupported-elicitation aria-live="polite">
-							<div class="flex items-center gap-2 border-b border-orange-500/20 px-4 py-3">
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-unsupported-elicitation aria-live="polite">
+							<div class="flex items-center gap-2 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
 								<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
-								<span class="truncate text-xs font-semibold uppercase tracking-wide text-orange-300">Agent action required</span>
+								<span class="truncate text-xs font-semibold text-foreground">Agent action required</span>
 							</div>
 							<div class="space-y-3 p-4">
 								<div class="whitespace-pre-wrap text-sm font-medium leading-relaxed text-foreground">{question.message}</div>
@@ -1360,14 +1361,16 @@
 						{@const question = pendingElicitation}
 						{@const questionPage = elicitationPage[question.id] ?? 0}
 						{@const isReviewPage = questionPage >= question.fields.length}
-						<section class="rounded-xl border border-orange-500/35 bg-orange-500/5 shadow-sm">
-							<div class="flex items-center justify-between gap-3 border-b border-orange-500/20 px-4 py-3">
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-approval-card style:animation="ai-fade-up 350ms cubic-bezier(0.23,1,0.32,1) both">
+							<div class="flex items-center justify-between gap-3 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
 								<div class="flex min-w-0 items-center gap-2">
 									<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
-									<span class="truncate text-xs font-semibold uppercase tracking-wide text-orange-300">Agent question</span>
+									<span class="truncate text-xs font-semibold text-foreground">Agent question</span>
 								</div>
-								<span class="shrink-0 text-xs text-muted-foreground">
-									{isReviewPage ? 'Review' : `${questionPage + 1} / ${question.fields.length}`}
+								<span class="flex shrink-0 items-center gap-1" aria-label={isReviewPage ? 'Review answers' : `Question ${questionPage + 1} of ${question.fields.length}`}>
+									{#each question.fields as _, index}
+										<span class="rounded-full transition-all {index === questionPage ? 'h-2 w-2 border-2 border-foreground' : index < questionPage || isReviewPage ? 'h-1.5 w-1.5 bg-muted-foreground' : 'h-1.5 w-1.5 border border-muted-foreground'}"></span>
+									{/each}
 								</span>
 							</div>
 
@@ -1379,7 +1382,7 @@
 									</div>
 									<div class="space-y-2">
 										{#each question.fields as field}
-											<div class="rounded-lg border border-border/70 bg-background/50 px-3 py-2.5">
+											<div class="rounded-lg bg-[hsl(var(--inset))] px-3 py-2.5 shadow-[var(--shadow-hairline)]">
 												<div class="text-xs text-muted-foreground">{field.property.title || field.question}</div>
 												<div class="mt-1 whitespace-pre-wrap text-sm font-medium text-foreground">{displayElicitationAnswer(question, field)}</div>
 											</div>
@@ -1399,30 +1402,30 @@
 									{@const field = question.fields[questionPage]}
 									{@const fieldOptions = optionsFor(field)}
 									<div>
-										{#if field.property.title}
-											<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-orange-300">{field.property.title}</div>
+									{#if field.property.title}
+										<div class="mb-1 text-xs font-semibold uppercase tracking-wide text-[hsl(var(--warning))]">{field.property.title}</div>
 										{/if}
 										<div class="whitespace-pre-wrap text-sm font-medium leading-relaxed text-foreground">{field.question}</div>
 									</div>
 
 									{#if fieldOptions.length > 0}
 										<div class="grid gap-2">
-											{#each fieldOptions as option}
-												{@const selected = optionSelected(question.id, field, option.value)}
-												<button type="button" onclick={() => toggleElicitationOption(question.id, field, option.value)}
-													class="flex w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-colors {selected ? 'border-primary/60 bg-primary/15' : 'border-border/70 bg-background/50 hover:border-primary/35 hover:bg-accent/50'}">
-													<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border {field.property.type === 'array' ? 'rounded' : 'rounded-full'} {selected ? 'border-primary bg-primary text-primary-foreground' : 'border-muted-foreground/50'}">
-														{#if selected}<span class="text-[10px] leading-none">✓</span>{/if}
-													</span>
-													<span class="min-w-0">
-														<span class="block text-sm font-medium text-foreground">{option.title}</span>
-														{#if option.description}<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{option.description}</span>{/if}
-													</span>
-												</button>
-											{/each}
-										</div>
-									{:else if field.property.type === 'boolean'}
-										<label class="flex items-center gap-3 rounded-lg border border-border/70 bg-background/50 px-3 py-3 text-sm">
+										{#each fieldOptions as option}
+											{@const selected = optionSelected(question.id, field, option.value)}
+											<button type="button" onclick={() => toggleElicitationOption(question.id, field, option.value)}
+												class="-mx-1.5 flex w-[calc(100%+0.75rem)] items-start gap-3 rounded-lg px-2 py-2 text-left transition-colors {selected ? 'bg-accent text-foreground' : 'text-muted-foreground hover:bg-[hsl(var(--hover))] hover:text-foreground'}">
+												<span class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center {field.property.type === 'array' ? 'rounded-[5px]' : 'rounded-full'} {selected ? 'bg-foreground text-background' : 'shadow-[inset_0_0_0_1.5px_hsl(var(--border-strong))]'}">
+													{#if selected}<span class="text-[10px] leading-none">✓</span>{/if}
+												</span>
+												<span class="min-w-0">
+													<span class="block text-sm font-medium">{option.title}</span>
+													{#if option.description}<span class="mt-0.5 block text-xs leading-relaxed text-muted-foreground">{option.description}</span>{/if}
+												</span>
+											</button>
+										{/each}
+									</div>
+								{:else if field.property.type === 'boolean'}
+									<label class="flex items-center gap-3 rounded-lg bg-[hsl(var(--inset))] px-3 py-3 text-sm shadow-[var(--shadow-hairline)]">
 											<input type="checkbox" checked={Boolean(answersFor(question.id)[field.key] ?? field.property.default ?? false)}
 												onchange={(event) => setElicitationAnswer(question.id, field.key, event.currentTarget.checked)} />
 											<span>{field.property.title || 'Yes'}</span>
@@ -1468,17 +1471,14 @@
 
 					<!-- Live indicator -->
 					{#if runningAttempt}
-						<div class="flex items-center gap-2 text-xs text-muted-foreground">
-							<span class="h-2 w-2 rounded-full bg-blue-400 animate-pulse"></span>
-							{queuedAttempt
-								? 'New guidance queued; switching at the next safe break...'
-								: 'The agent is working on this task...'}
+						<div class="py-2 pl-10">
+							<AgentLoading
+								label={queuedAttempt ? 'New guidance queued; switching at the next safe break' : 'The agent is working on this task'}
+								startedAt={runningAttempt.started_at ?? runningAttempt.created_at}
+							/>
 						</div>
 					{:else if queuedAttempt}
-						<div class="flex items-center gap-2 text-xs text-muted-foreground">
-							<span class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
-							The next worker turn is queued...
-						</div>
+						<div class="py-2 pl-10"><AgentLoading label="The next worker turn is queued" startedAt={queuedAttempt.created_at} /></div>
 					{:else if task.status === 'waiting_for_input'}
 						<div class="flex items-center gap-2 text-xs text-orange-400">
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
@@ -1511,9 +1511,9 @@
 					{:else if !task.agent_id}
 						<div class="text-xs text-muted-foreground mb-2">Assign an agent before sending a message</div>
 					{/if}
-					<div bind:this={composerEl} class="relative rounded-xl border border-border bg-secondary/35 transition-all focus-within:border-primary/45 focus-within:ring-1 focus-within:ring-primary/20">
+					<div bind:this={composerEl} class="ai-card relative transition-all focus-within:ring-1 focus-within:ring-primary/35">
 						{#if slashMenuOpen}
-							<div class="absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto rounded-xl border border-border bg-card p-1.5 shadow-2xl sm:right-auto sm:w-96">
+							<div class="ai-raised absolute bottom-full left-0 right-0 z-40 mb-2 max-h-72 overflow-y-auto p-1.5 sm:right-auto sm:w-96">
 								{#if filteredCommands.length > 0}
 									{#each filteredCommands as command, index}
 										<button
@@ -1533,7 +1533,7 @@
 						{/if}
 
 						{#if modelMenuOpen && hasModelMenu}
-							<div class="absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto rounded-xl border border-border bg-card p-2 shadow-2xl sm:right-auto sm:w-80">
+							<div class="ai-raised absolute bottom-full left-0 right-0 z-30 mb-2 max-h-[65vh] overflow-y-auto p-2 sm:right-auto sm:w-80">
 								{#if modelOption}
 									<div class="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/60">Model</div>
 									<div class="space-y-0.5">
@@ -1646,7 +1646,7 @@
 									aria-label={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt and send now' : 'Interrupt agent now'}
 									title={!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0) ? 'Interrupt the current work and send this message now' : 'Interrupt the current work now'}
 									disabled={messageSending || interrupting}
-									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground shadow-[var(--shadow-control)] transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
 								>
 									{#if interrupting}
 										<svg class="h-4 w-4 animate-spin" fill="none" viewBox="0 0 24 24" aria-hidden="true"><circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3"/><path class="opacity-75" fill="currentColor" d="M21 12a9 9 0 0 0-9-9v3a6 6 0 0 1 6 6z"/></svg>
@@ -1659,9 +1659,9 @@
 								onclick={() => sendTaskMessage()}
 								aria-label="Send message"
 								disabled={(!messageInput.trim() && messageAttachments.length === 0) || messageSending || interrupting || !task.agent_id || composerBlockedByElicitation}
-								class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30"
-							>
-								<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+							class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+						>
+							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>
 							</button>
 						</div>
 					</div>

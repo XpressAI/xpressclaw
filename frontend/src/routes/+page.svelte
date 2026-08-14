@@ -7,6 +7,7 @@
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import { harnessMark } from '$lib/utils';
 
 	const messageDraftScope = 'new-work';
@@ -452,10 +453,7 @@
 </script>
 
 {#if loading}
-	<div class="flex h-full flex-col items-center justify-center gap-3">
-		<div class="h-8 w-8 animate-spin rounded-full border-2 border-muted-foreground border-t-primary"></div>
-		<span class="text-sm text-muted-foreground">{status_text}</span>
-	</div>
+	<div class="flex h-full items-center justify-center"><AgentLoading label={status_text} /></div>
 {:else}
 	<div data-new-work-scroll class="workspace-scroll-y flex h-full flex-col items-center px-4 sm:px-6">
 		<div class="my-auto w-full max-w-2xl shrink-0 space-y-6 py-8 sm:space-y-8">
@@ -474,20 +472,20 @@
 			{:else}
 				<div class="space-y-4">
 					<div class="flex justify-center">
-						<div class="inline-flex rounded-full bg-muted/80 p-1" role="group" aria-label="Work mode">
+						<div class="inline-flex rounded-full bg-[hsl(var(--field))] p-0.5" role="group" aria-label="Work mode">
 							<button type="button" onclick={() => setComposerMode('agent')} aria-label="Agent mode" aria-pressed={composerMode === 'agent'}
-								class="rounded-full px-4 py-1.5 text-xs font-medium transition-all {composerMode === 'agent' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">
+								class="rounded-full px-4 py-1.5 text-xs font-medium transition-all {composerMode === 'agent' ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}">
 								Agent
 							</button>
 							<button type="button" onclick={() => setComposerMode('workflow')} aria-label="Workflow mode" aria-pressed={composerMode === 'workflow'}
-								class="rounded-full px-4 py-1.5 text-xs font-medium transition-all {composerMode === 'workflow' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}">
+								class="rounded-full px-4 py-1.5 text-xs font-medium transition-all {composerMode === 'workflow' ? 'bg-card text-foreground shadow-[var(--shadow-control)]' : 'text-muted-foreground hover:text-foreground'}">
 								Workflow
 							</button>
 						</div>
 					</div>
 
 					<div>
-						<div data-new-work-composer class="relative z-10 overflow-hidden rounded-xl border border-border bg-secondary/35 shadow-sm transition-all focus-within:border-primary/45 focus-within:ring-1 focus-within:ring-primary/20">
+						<div data-new-work-composer class="ai-card relative z-10 overflow-hidden transition-all focus-within:ring-1 focus-within:ring-primary/35">
 							{#if composerMode === 'workflow'}
 								{#if compatibleWorkflows.length > 0}
 									<div class="flex items-start gap-2 px-4 pb-2 pt-3">
@@ -607,11 +605,11 @@
 									<div class="flex-1"></div>
 								{/if}
 								<button type="button" onclick={send} aria-label={composerMode === 'workflow' ? 'Run workflow' : 'Send work'} title={composerMode === 'workflow' ? 'Run workflow' : 'Send work'} disabled={!canSend}
-									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-30">
+									class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-[background-color,transform] hover:bg-primary/90 enabled:active:scale-95 disabled:cursor-not-allowed disabled:opacity-30">
 									{#if sending}
 										<span class="h-4 w-4 animate-spin rounded-full border-2 border-primary-foreground border-t-transparent"></span>
 									{:else}
-										<svg class="h-4 w-4" fill="currentColor" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+										<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>
 									{/if}
 								</button>
 							</div>

@@ -31,7 +31,7 @@
 			attempt_cancelled: 'Cancelled',
 			attempt_interrupted: 'Interrupted',
 			runner_progress: itemType === 'agent_message' ? 'Update' : 'Progress',
-			agent_thought: 'Thought',
+			agent_thought: 'Thinking',
 			tool_call: 'Tool',
 			session_fork: 'Session',
 			session_fork_fallback: 'Session',
@@ -132,16 +132,16 @@
 
 {#if isAgentUpdate}
 	<article class="flex gap-3 py-2" aria-label="Agent update" data-agent-update>
-		<div class="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full border border-primary/20 bg-accent/55 text-xs font-bold text-accent-foreground">
+		<div class="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-accent-foreground shadow-[var(--shadow-hairline)]">
 			A
 		</div>
 		<div class="min-w-0 max-w-[85%] sm:max-w-[80%]">
 			<div class="mb-0.5 flex flex-wrap items-center gap-2">
 				<span class="text-xs font-medium">agent</span>
-				<span class="rounded-full border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-primary/75">Update</span>
+				<span class="ai-status-pill h-5 bg-accent px-1.5 text-[9px] font-semibold uppercase tracking-wide text-accent-foreground">Update</span>
 				<span class="text-xs text-muted-foreground">{timeAgo(event.created_at)}</span>
 			</div>
-			<div class="rounded-lg border border-primary/15 bg-accent/35 px-3 py-2 text-sm text-foreground shadow-sm" data-agent-update-content>
+			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content>
 				<div class="prose-chat max-w-none break-words">
 					{@html renderContent(event.summary, { openLinksInNewWindow: true })}
 				</div>
@@ -156,9 +156,12 @@
 			type="button"
 			onclick={() => (expanded = !expanded)}
 			aria-expanded={expanded}
-			class="grid w-full grid-cols-[4.5rem_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-secondary/25 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:grid-cols-[5.25rem_minmax(0,1fr)_auto_auto]"
+			class="grid max-w-full grid-cols-[4.5rem_minmax(0,1fr)_auto_auto] items-center gap-2 px-2 py-1.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:grid-cols-[5.25rem_minmax(0,1fr)_auto_auto]
+				{isTool || richText ? 'w-fit rounded-lg bg-card shadow-[var(--shadow-control)] hover:bg-[hsl(var(--hover))]' : 'w-full rounded-md hover:bg-secondary/25'}"
 		>
-			<span class="truncate text-[11px] font-medium capitalize {labelTone(event.event_type)}">
+			<span class="flex items-center gap-1.5 truncate text-[11px] font-medium capitalize {labelTone(event.event_type)}">
+				{#if richText}<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="m12 2 2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" /></svg>{/if}
+				{#if isTool}<svg class="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M14.7 6.3a4 4 0 0 0-5-5l2.1 2.1-8.4 8.4a2 2 0 1 0 2.8 2.8l8.4-8.4 2.1 2.1a4 4 0 0 0-2-2z" /></svg>{/if}
 				{eventLabel(event.event_type)}
 			</span>
 			<span class="truncate text-xs text-muted-foreground/80 group-hover/event:text-muted-foreground" title={event.summary}>
@@ -172,7 +175,7 @@
 		</button>
 
 		{#if expanded}
-			<div class="mb-1 ml-[5.25rem] mr-2 border-l border-border/40 py-1.5 pl-3 text-xs sm:ml-[6rem]">
+			<div class="mb-1 mr-2 border-l border-border/60 py-2 pl-3 text-xs {isTool || richText ? 'ml-4' : 'ml-[5.25rem] sm:ml-[6rem]'}">
 				{#if richText}
 					<div class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
 						{@html renderContent(event.summary, { openLinksInNewWindow: true })}
@@ -183,8 +186,8 @@
 				{#if isTool && toolDiffs.length > 0}
 					<div class="space-y-3" data-tool-diffs>
 						{#each toolDiffs as diff}
-							<section class="overflow-hidden rounded-md border border-border/50">
-								<div class="border-b border-border/50 bg-secondary/25 px-3 py-1.5 font-mono text-[11px] text-foreground/80">{diff.path}</div>
+							<section class="ai-card overflow-hidden">
+								<div class="border-b border-border bg-[hsl(var(--inset))] px-3 py-2 font-mono text-[11px] font-medium text-foreground/80">{diff.path}</div>
 								<div class="grid gap-px bg-border/40 lg:grid-cols-2">
 									<div class="min-w-0 bg-background/95">
 										<div class="border-b border-red-500/15 bg-red-500/5 px-3 py-1 text-[10px] font-medium uppercase tracking-wide text-red-700 dark:text-red-300/75">Before</div>

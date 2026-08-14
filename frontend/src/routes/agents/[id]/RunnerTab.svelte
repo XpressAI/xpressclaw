@@ -305,7 +305,7 @@
 </script>
 
 <div class="mx-auto max-w-3xl space-y-6">
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">ACP harness</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 			XpressClaw talks to this coding harness over the Agent Client Protocol. New tasks branch from this agent's active conversation when the harness supports it, while follow-ups stay with their task; the harness keeps ownership of its reasoning, tools, and subagents.
@@ -361,7 +361,7 @@
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">Harness capabilities</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 			These controls come directly from this ACP harness. They become available after its first turn and are applied before every new task turn.
@@ -399,7 +399,7 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<div class="flex items-start justify-between gap-3">
 			<div>
 				<h2 class="text-sm font-semibold">MCP servers</h2>
@@ -459,7 +459,7 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 			With host login enabled, the harness's normal configuration directory is mounted read-write, so its installed skills, plugins, hooks, custom agents, and settings load normally. Project-local configuration is loaded from the workspace. Add explicit mounts for any other configuration directories.
@@ -477,7 +477,7 @@
 		<p class="mt-1 text-[11px] text-muted-foreground">One idempotent shell command per line. Commands run in the workspace before every short-lived ACP task.</p>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input id="ssh-agent-forwarding" type="checkbox" bind:checked={sshAgentForwarding} class="mt-0.5 h-4 w-4 rounded border-input" />
 			<div>
@@ -501,7 +501,7 @@
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input
 				id="container-engine"
@@ -524,7 +524,7 @@
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<div class="flex items-start gap-3">
 			<input id="subscription-auth" type="checkbox" bind:checked={subscriptionAuth} disabled={kind === 'custom'} class="mt-0.5 h-4 w-4 rounded border-input disabled:opacity-50" />
 			<div>
@@ -543,7 +543,7 @@
 		</div>
 	</div>
 
-	<div class="rounded-xl border border-border bg-card p-5">
+	<div class="ai-card p-5">
 		<h2 class="text-sm font-semibold">ACP server command</h2>
 		<p class="mt-1 text-xs text-muted-foreground">{kind === 'custom' ? 'Required for custom harnesses.' : 'Optional override for the built-in adapter.'} Enter one argument per line. Available placeholder: <code>{'{workspace}'}</code>.</p>
 		<textarea bind:value={commandText} rows="7" placeholder={'my-agent\nacp\n--cwd\n{workspace}'} class="mt-3 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs outline-none focus:ring-1 focus:ring-ring"></textarea>
