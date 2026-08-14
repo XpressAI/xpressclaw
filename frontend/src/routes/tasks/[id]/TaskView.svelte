@@ -87,6 +87,7 @@
 	let allTasks = $state<Task[]>([]);
 	let workspaceGit = $state<WorkspaceGitStatus | null>(null);
 	let error = $state<string | null>(null);
+	let dismissedAttemptErrorKey = $state<string | null>(null);
 	let loading = $state(true);
 	let editing = $state(false);
 	let editTitle = $state('');
@@ -237,7 +238,17 @@
 			? latestAttemptResult
 			: null
 	);
-	let latestError = $derived(attempts.find(attempt => attempt.error_message)?.error_message ?? null);
+	let latestErrorAttempt = $derived(attempts.find(attempt => attempt.error_message) ?? null);
+	let latestErrorKey = $derived(
+		latestErrorAttempt?.error_message
+			? `${latestErrorAttempt.id}:${latestErrorAttempt.error_message}`
+			: null
+	);
+	let latestError = $derived(
+		latestErrorKey && latestErrorKey !== dismissedAttemptErrorKey
+			? latestErrorAttempt?.error_message ?? null
+			: null
+	);
 	let messagePlaceholder = $derived(
 		!task?.agent_id
 			? 'Assign an agent to chat about this task'
@@ -1038,7 +1049,15 @@
 		</div>
 
 		{#if error}
-			<div class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>
+			<div role="alert" class="flex items-start gap-3 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+				<span class="min-w-0 flex-1 whitespace-pre-wrap">{error}</span>
+				<button
+					type="button"
+					onclick={() => (error = null)}
+					aria-label="Dismiss task error"
+					class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-destructive/70 hover:bg-destructive/10 hover:text-destructive"
+				>&times;</button>
+			</div>
 		{:else if task}
 			<div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
 				<div class="min-w-0">
@@ -1254,8 +1273,16 @@
 							<div class="prose prose-invert prose-sm max-w-none">{@html renderContent(latestResult, { openLinksInNewWindow: true })}</div>
 						</section>
 					{:else if latestError}
-						<section class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
-							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
+						<section role="alert" data-attempt-error class="rounded-lg border border-red-500/30 bg-red-500/5 p-4">
+							<div class="mb-2 flex items-start justify-between gap-3">
+								<div class="text-xs font-medium uppercase tracking-wide text-red-400">Attempt failed</div>
+								<button
+									type="button"
+									onclick={() => (dismissedAttemptErrorKey = latestErrorKey)}
+									aria-label="Dismiss attempt error"
+									class="flex h-6 w-6 shrink-0 items-center justify-center rounded text-lg leading-none text-red-300/70 hover:bg-red-500/10 hover:text-red-200"
+								>&times;</button>
+							</div>
 							<div class="whitespace-pre-wrap text-sm text-red-200">{latestError}</div>
 						</section>
 					{/if}

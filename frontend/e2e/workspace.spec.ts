@@ -43,7 +43,7 @@ function timelineEvent(id: number, second: number, eventType: string, summary: s
 	};
 }
 
-function attempt(status: string, contextUsed = 128_000) {
+function attempt(status: string, contextUsed = 128_000, errorMessage: string | null = null) {
 	return {
 		id: 'attempt-browser-test',
 		session_id: agentId,
@@ -56,7 +56,7 @@ function attempt(status: string, contextUsed = 128_000) {
 		native_session_id: 'native-browser-test',
 		container_id: 'container-browser-test',
 		result: null,
-		error_message: null,
+		error_message: errorMessage,
 		created_at: timestamp(0),
 		started_at: timestamp(1),
 		completed_at: status === 'completed' ? timestamp(61) : null,
@@ -69,6 +69,7 @@ async function mockApi(
 	page: Page,
 	options: {
 		live?: boolean;
+		attemptError?: string;
 		agentTimeline?: boolean;
 		agentResponseLinks?: boolean;
 		richToolActivity?: boolean;
@@ -150,7 +151,11 @@ async function mockApi(
 	let workspaceFileRevision = 'revision-before-save';
 	let projectSyncConflictReturned = false;
 	const status = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed';
-	const attemptStatus = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'running' : 'completed';
+	const attemptStatus = options.attemptError
+		? 'failed'
+		: options.pendingElicitation
+			? 'waiting_for_input'
+			: options.live ? 'running' : 'completed';
 	const firstAnswer = options.agentResponseLinks
 		? 'First answer with [agent docs](https://example.com/agent-docs).'
 		: 'First answer';
@@ -610,7 +615,7 @@ async function mockApi(
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: [attempt(attemptStatus)],
+					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
 					events: [
 						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
@@ -622,7 +627,7 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -631,14 +636,14 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed)],
+					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
 					events: options.pendingElicitation ? [
 						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
 							elicitationId: 'elicitation-browser-test',
@@ -777,6 +782,17 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 
 	await page.getByTitle('Model and reasoning effort').click();
 	await expect(page.getByText('Reasoning effort', { exact: true })).toBeVisible();
+});
+
+test('attempt errors can be dismissed', async ({ page }) => {
+	await mockApi(page, { attemptError: 'ACP process stopped during the turn' });
+	await page.goto(`/tasks/${taskId}`);
+
+	const notification = page.locator('[data-attempt-error]');
+	await expect(notification).toBeVisible();
+	await expect(notification).toContainText('ACP process stopped during the turn');
+	await notification.getByRole('button', { name: 'Dismiss attempt error' }).click();
+	await expect(notification).toHaveCount(0);
 });
 
 test('agent updates stay beside their tools while the final reply is shown once', async ({ page }) => {

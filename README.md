@@ -81,11 +81,9 @@ step back to the Conversation that started the run.
 - **OpenCode:** uses its built-in ACP server
 - **Custom:** any image and command that speaks ACP over stdin/stdout
 
-Codex and Claude use ACP Registry adapters. Each built-in runner image contains
-one harness product and its ACP server. Its Agent-owned writable layer keeps
-language SDKs, tools, and caches installed during earlier turns without baking
-them into the runner image. Agents whose workspaces need existing Compose-based
-development and test workflows can explicitly enable trusted host-engine access.
+Each Agent keeps an isolated, reusable environment for its selected harness,
+workspace, installed tools, and caches. Trusted workspaces can optionally use
+the host container engine for existing Compose-based workflows.
 
 ### Privacy & Safety
 
@@ -201,70 +199,22 @@ restart, interrupted work is recovered into the queue. See
 [Remote access](docs/remote-access.md) for the current security boundary and
 Desktop limitations.
 
-## What Can It Do?
+## Common Workflows
 
-**Talk to a Project or send durable work:**
+- Use a **Project Conversation** to coordinate people and several Agents, or
+  **New Work** to send private work directly to one Agent.
+- Turn larger requests into durable **Tasks** with progress, artifacts,
+  provenance, results, and errors that remain visible after reconnecting.
+- Use **Automations → Schedules** for recurring or one-off work and
+  **Automations → Workflows** for multi-Agent implementation/review or goal
+  loops.
+- Let the scoped GitHub integration publish a task's pull request, monitor
+  review feedback, and resume the same Agent context until approval or merge.
 
-Open a Project Conversation to coordinate with one or more Agents, attach
-files, and keep talking while task work runs. Use **Continue with task** when a
-request needs a durable work attempt, or send private work directly to one
-Agent from **New Work**.
+See the guides for [workflows](docs/workflows.md),
+[scheduling](docs/scheduling.md), and [remote access](docs/remote-access.md).
 
-**Schedule recurring tasks or one-off follow-ups:**
-
-Create a task in **Tasks**, select its agent, then add a cron schedule
-in **Automations → Schedules**. Scheduled work enters the same queue and timeline as a
-message sent by a person. Native harnesses can arm a durable `schedule_wakeup`
-when a long-running external job needs to be checked hours later; the future
-turn resumes the same agent conversation.
-
-**Review what happened while you were away:**
-
-Open the Agent task timeline for attempt status, results, artifacts, provenance,
-and errors. `xpressclaw status` remains available as a small health check for
-the local control plane.
-
-**Coordinate multiple products:**
-
-Use **Automations → Workflows** for implementation/review loops, goal loops,
-and other work that moves between Agents. Run them from a Conversation to keep
-their Tasks and results in that shared context, run them independently with
-typed inputs, or attach a recurring cron trigger. See
-[Workflows](docs/workflows.md) for the definition format and execution
-behavior. The CLI deliberately does not duplicate these product surfaces.
-
-**Finish pull requests through review:**
-
-For ordinary tasks, the scoped GitHub tool publishes completed work ready for
-review and keeps the task active. XpressClaw durably checks for review comments,
-resumes the same conversation to address them, and releases the next queued
-task only after approval or merge. Explicit workflow steps may still use draft
-PRs and their own wait logic.
-
-## Configuration
-
-The default instance is `~/.xpressclaw`; `xpressclaw up` creates its directory
-and opens first-run setup when needed. Setup writes `xpressclaw.yaml`, and
-Agents are added in the web UI. A new explicitly initialized instance keeps
-its database, managed workspaces, logs, and PID file under its own directory:
-
-```yaml
-system:
-  isolation: docker
-  data_dir: /home/me/.xpressclaw
-  workspace_dir: /home/me/.xpressclaw/workspaces
-
-agents: []
-
-```
-
-## Development
-
-Source builds, repository architecture, runner-image development, release
-mechanics, and test commands live in the
-[Developer Guide](docs/development.md).
-
-## CLI Reference
+## CLI Essentials
 
 ```
 xpressclaw init [INSTANCE]   Optionally provision a control-plane instance
@@ -274,16 +224,9 @@ xpressclaw status            Show Agent queue status
 xpressclaw sync ...          Explicitly fetch/publish portable Project state
 ```
 
-`init` takes an optional positional directory, while `up` and `down` select
-that directory with `--instance`. For the default instance:
-
-```bash
-xpressclaw init
-xpressclaw up
-```
-
-For an alternate instance, use the same directory when starting and stopping
-it. Give concurrently running instances different ports:
+Most CLI/server users only need `xpressclaw up`, `status`, and `down`. `init`
+is optional; it takes a positional instance directory, while `up` and `down`
+select an alternate directory with `--instance`:
 
 ```bash
 xpressclaw init /srv/xpressclaw/staging
@@ -292,88 +235,28 @@ xpressclaw down --instance /srv/xpressclaw/staging --port 9001
 ```
 
 The instance directory is the directory containing `xpressclaw.yaml`; it is
-not a Project repository or Agent workspace. `xpressclaw init .` followed by
-`xpressclaw up --instance .` preserves the former current-directory flow.
-`--workdir <DIR>` remains a deprecated alias for existing scripts, and an
-existing current-directory `xpressclaw.yaml` remains discoverable when no
-default instance has been configured. See [CLI commands](docs/commands.md).
+not a Project repository or Agent workspace. See the complete
+[CLI command reference](docs/commands.md) and
+[configuration reference](docs/configuration.md) for alternate instances,
+ports, compatibility flags, and YAML settings.
 
 ### Git-backed Project Synchronization
 
-XpressClaw can share a Project's portable collaboration state through a
-separate Git repository. Agents, Tasks, Conversations, workflows, and
-optionally Project memory are included. Runtime state, workspace paths,
-credentials, tokens, environment variables, and other user-specific settings
-remain local.
-
-Synchronization is always explicit: ordinary XpressClaw use and changes to the
-main project never fetch or publish this data. The main project does not need
-to be a Git repository; it only needs to preserve the generated
-`.xpressclaw.yml` manifest.
-
-First, create the remote synchronization repository and configure Git access
-with your own SSH agent or credential helper. Then initialize synchronization
-for an existing local Project from the repository being synchronized:
+Use **Settings → Project sync** to fetch or publish a Project's portable state
+through a separate Git repository. The CLI supports the same explicit flow:
 
 ```bash
 cd /path/to/platform
-xpressclaw sync init \
-  --project platform \
+xpressclaw sync init --project platform \
   --remote git@github.com:your-org/xpressclaw-data.git
-```
-
-`--project` accepts a visible name or exact canonical ID. Ambiguous names are
-reported with their IDs, and the Project page exposes a copyable canonical ID;
-the old `--project-id <ID>` spelling remains supported. XpressClaw discovers
-`xpressclaw.yaml` in the current/parent directories or in a single sibling
-control-plane repository, then falls back to Desktop's
-`~/.xpressclaw/xpressclaw.yaml`. Otherwise pass
-`--control-plane-dir /path/to/xpressclaw-control`. This is distinct from
-`--project-dir`, which means the repository receiving `.xpressclaw.yml`;
-`~/.xpressclaw` is both Desktop's control-plane directory and the default local
-data directory. CLI installations may keep `xpressclaw.yaml` elsewhere.
-`--workdir` remains a backward-compatible alias for `--control-plane-dir`.
-
-`--branch` defaults to `main`, and `--store-path` defaults to
-`projects/<canonical-project-id>`. Use `--no-project-memory` if memory should
-stay local. Initialization only creates `.xpressclaw.yml`; it does not contact
-the remote or synchronize any data. Preserve that manifest with the main
-project, but never put credentials in it.
-
-Publish the first shared snapshot:
-
-```bash
 xpressclaw sync publish
-```
-
-Anyone with the same manifest can explicitly fetch the snapshot into their
-local XpressClaw installation, work normally, and publish their updates:
-
-```bash
-# Before starting work
 xpressclaw sync fetch
-
-# After making XpressClaw Project changes
-xpressclaw sync publish
 ```
 
-Stop the control plane, or wait until the Project has no active work, before a
-fetch or publish. Restart it after a fetch so imported Agent configuration is
-reloaded. A first fetch into an already populated Project, or a two-sided
-change, fails safely; review the conflict before retrying fetch with `--force`.
-The forced fetch is a non-destructive merge and does not delete local-only
-records.
-
-Each user supplies their own Git and Agent credentials through local secure
-configuration. Those values are never copied into `.xpressclaw.yml` or the
-synchronized repository. For the full manifest schema, shared/private data
-boundary, conflict behavior, and merge-friendly record format, see the
+Synchronization never runs in the background, and credentials and local
+runtime settings are not published. For project-name discovery, manifests,
+the portable/private data boundary, and conflict handling, see the
 [Git-backed Project synchronization guide](docs/project-sync.md).
-
-Default port: `8935` (override with `--port`).
-
-Projects, Conversations, messages, tasks, schedules, workflows, results, and
-configuration live in the web UI rather than a second CLI interface.
 
 ## From Open Source to Enterprise
 
