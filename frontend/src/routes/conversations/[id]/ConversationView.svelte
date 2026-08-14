@@ -39,6 +39,7 @@
 	let messagePane = $state<HTMLDivElement>();
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let eventSource: EventSource | null = null;
+	let stopInitialScrollPin: (() => void) | null = null;
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === conversation?.project_id));
 	let participantAgentIds = $derived(conversation?.participants.filter((participant) => participant.participant_type === 'agent').map((participant) => participant.participant_id) ?? []);
@@ -70,6 +71,7 @@
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
 		eventSource?.close();
+		stopInitialScrollPin?.();
 	});
 
 	function parseWorkflow(workflow: Workflow | undefined): WorkflowSummary | null {
@@ -103,7 +105,7 @@
 		} finally {
 			loading = false;
 		}
-		if (scroll && loaded) await scrollToLatest('auto');
+		if (scroll && loaded) await scrollInitialHistoryToLatest();
 	}
 
 	async function refreshActivity() {
@@ -162,6 +164,54 @@
 	async function scrollToLatest(behavior: ScrollBehavior = 'smooth') {
 		await afterRender();
 		messagePane?.scrollTo({ top: messagePane.scrollHeight, behavior });
+	}
+
+	async function scrollInitialHistoryToLatest() {
+		await afterRender();
+		if (!messagePane) return;
+		const pane: HTMLDivElement = messagePane;
+
+		let pinned = true;
+		const pinToLatest = () => {
+			if (pinned && messagePane === pane) pane.scrollTo({ top: pane.scrollHeight, behavior: 'auto' });
+		};
+		const content = pane.firstElementChild;
+		const resizeObserver = new ResizeObserver(pinToLatest);
+		if (content) resizeObserver.observe(content);
+		let cancelMediaWait: (() => void) | null = null;
+		function stopPinning() {
+			cleanup();
+		}
+		function cleanup() {
+			pinned = false;
+			resizeObserver.disconnect();
+			pane.removeEventListener('wheel', stopPinning);
+			pane.removeEventListener('touchstart', stopPinning);
+			pane.removeEventListener('pointerdown', stopPinning);
+			cancelMediaWait?.();
+			cancelMediaWait = null;
+			if (stopInitialScrollPin === cleanup) stopInitialScrollPin = null;
+		}
+		stopInitialScrollPin?.();
+		stopInitialScrollPin = cleanup;
+		pane.addEventListener('wheel', stopPinning, { passive: true });
+		pane.addEventListener('touchstart', stopPinning, { passive: true });
+		pane.addEventListener('pointerdown', stopPinning, { passive: true });
+		pinToLatest();
+
+		const images = Array.from(pane.querySelectorAll('img'));
+		if (images.length > 0) {
+			await Promise.race([
+				Promise.allSettled(images.map((image) => image.decode())),
+				new Promise<void>((resolve) => {
+					cancelMediaWait = resolve;
+				}),
+			]);
+			cancelMediaWait = null;
+			await afterRender();
+			pinToLatest();
+		}
+		cleanup();
 	}
 
 	async function send() {
