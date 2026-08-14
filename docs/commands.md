@@ -29,7 +29,7 @@ dispatcher.
 xpressclaw up
 xpressclaw up --detach
 xpressclaw up --port 9000
-xpressclaw up --workdir /path/to/project
+xpressclaw up --workdir /path/to/control-plane
 ```
 
 The default UI is `http://localhost:8935`.
@@ -59,15 +59,19 @@ Create a portable `.xpressclaw.yml` pointer, fetch shared Project state, or
 publish local portable state through a separate Git repository:
 
 ```bash
-xpressclaw sync init --project-id <id> --remote git@github.com:org/data.git
+xpressclaw sync init --project platform --remote git@github.com:org/data.git
 xpressclaw sync fetch
 xpressclaw sync publish
 ```
 
-The main project need not be a Git repository. Use `--project-dir` to locate
-its manifest and `--workdir` to locate the local `xpressclaw.yaml`; they may be
-different directories. Fetch and publish require Git and use local SSH-agent or
-credential-helper credentials. See [Git-backed Project
+`--project` accepts a visible Project name or exact canonical ID; the legacy
+`--project-id <ID>` spelling remains supported. From a project repository,
+XpressClaw discovers a single control-plane checkout in a parent or sibling
+directory when practical. Use `--project-dir` for the repository containing
+`.xpressclaw.yml` and `--control-plane-dir` for the directory containing
+`xpressclaw.yaml` when discovery is not unique. (`--workdir` remains an alias
+for `--control-plane-dir`.) Fetch and publish require Git and use local
+SSH-agent or credential-helper credentials. See [Git-backed Project
 synchronization](project-sync.md) for the schema, conflict behavior, portable
 data boundary, and security model.
 

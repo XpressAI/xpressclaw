@@ -1039,6 +1039,68 @@ test('project conversations coordinate files and project-wide linked work', asyn
 	}]);
 });
 
+test('project pages expose a copyable canonical ID', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(navigator, 'clipboard', {
+			configurable: true,
+			value: {
+				writeText: async (value: string) => {
+					(window as unknown as { __copiedProjectId: string }).__copiedProjectId = value;
+				},
+			},
+		});
+	});
+	await mockApi(page);
+	await page.goto(`/projects/${projectId}`);
+
+	await expect(page.locator('[data-project-id]')).toHaveText(projectId);
+	await page.getByRole('button', { name: 'Copy project ID' }).click();
+	await expect(page.getByRole('button', { name: 'Copy project ID' })).toHaveText('Copied');
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __copiedProjectId?: string }
+	).__copiedProjectId)).toBe(projectId);
+});
+
+test('opening a conversation reveals its newest messages', async ({ page }) => {
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Long release history',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(60),
+		last_message_at: timestamp(60),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = Array.from({ length: 40 }, (_, index) => ({
+		id: index + 1,
+		conversation_id: conversationId,
+		sender_type: index % 2 === 0 ? 'agent' : 'user',
+		sender_id: index % 2 === 0 ? agentId : 'local',
+		sender_name: index % 2 === 0 ? 'Browser-tested workspace' : 'You',
+		content: `Conversation entry ${index + 1}. ${'This history is long enough to require scrolling. '.repeat(3)}`,
+		message_type: 'message',
+		linked_task_id: null,
+		metadata: {},
+		attachments: [],
+		created_at: timestamp(index + 1),
+	}));
+	await mockApi(page, { conversations: [conversation], conversationMessages });
+	await page.goto(`/projects/${projectId}`);
+	await page.locator(`[data-project-conversation="${conversationId}"]`).click();
+
+	const messagePane = page.locator('[data-conversation-message-pane]');
+	await expect(messagePane).toBeVisible();
+	await expect.poll(() => messagePane.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+	await expect.poll(() => messagePane.evaluate((element) => (
+		element.scrollHeight - element.clientHeight - element.scrollTop
+	))).toBeLessThan(2);
+	await expect.poll(() => messagePane.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+});
+
 test('running agents can be guided at a safe break or interrupted immediately', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	const interruptedAttempts: string[] = [];

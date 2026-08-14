@@ -78,6 +78,7 @@
 	}
 
 	async function loadAll(scroll = false) {
+		let loaded = false;
 		try {
 			conversation = await conversations.get(conversationId);
 			const [nextProject, nextAgents, nextTasks, nextWorkflows, nextMessages, nextTurns] = await Promise.all([
@@ -96,12 +97,13 @@
 			turns = nextTurns;
 			hasOlderMessages = nextMessages.length === MESSAGE_PAGE_SIZE;
 			if (!taskAgent) taskAgent = projectAgents[0]?.id ?? '';
-			if (scroll) await scrollToLatest();
+			loaded = true;
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load the conversation.';
 		} finally {
 			loading = false;
 		}
+		if (scroll && loaded) await scrollToLatest('auto');
 	}
 
 	async function refreshActivity() {
@@ -154,12 +156,12 @@
 
 	function connectEvents() {
 		eventSource = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/events`);
-		eventSource.onmessage = () => void refreshActivity().then(scrollToLatest);
+		eventSource.onmessage = () => void refreshActivity().then(() => scrollToLatest());
 	}
 
-	async function scrollToLatest() {
+	async function scrollToLatest(behavior: ScrollBehavior = 'smooth') {
 		await afterRender();
-		messagePane?.scrollTo({ top: messagePane.scrollHeight, behavior: 'smooth' });
+		messagePane?.scrollTo({ top: messagePane.scrollHeight, behavior });
 	}
 
 	async function send() {
@@ -314,7 +316,7 @@
 		{:else}
 			<div class="flex min-h-0 flex-1">
 				<div class="flex min-w-0 flex-1 flex-col">
-					<div bind:this={messagePane} class="workspace-scroll-y flex-1 px-4 py-5 sm:px-6"><div class="mx-auto max-w-4xl space-y-5">
+					<div bind:this={messagePane} data-conversation-message-pane class="workspace-scroll-y flex-1 px-4 py-5 sm:px-6"><div class="mx-auto max-w-4xl space-y-5">
 						{#if hasOlderMessages}<div class="flex justify-center"><button type="button" onclick={() => void loadOlderMessages()} disabled={loadingOlderMessages} class="rounded-full border border-border bg-card px-4 py-2 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50">{loadingOlderMessages ? 'Loading earlier messages…' : 'Load earlier messages'}</button></div>{/if}
 						{#if messages.length === 0}<div class="rounded-xl border border-dashed border-border p-10 text-center"><h2 class="font-medium">Start the conversation</h2><p class="mt-2 text-sm text-muted-foreground">Every participating Agent can answer, even while its task lane is busy.</p></div>{/if}
 						{#each messages as message (message.id)}

@@ -49,33 +49,59 @@ Existing local enable/disable state is preserved.
 
 ## Manifest
 
-Run `sync init` once for an existing local Project:
+Run `sync init` once from the repository being synchronized. A Project's
+visible name is accepted directly:
+
+```bash
+cd ~/Projects/acme/platform
+xpressclaw sync init \
+  --project platform \
+  --remote git@github.com:acme/xpressclaw-data.git
+```
+
+Names are matched case-insensitively. If more than one local Project has the
+same name, the command reports every matching canonical ID and asks for an
+exact one. An exact ID always wins and remains supported through either
+`--project <ID>` or the backward-compatible `--project-id <ID>` spelling. The
+Project page displays the canonical ID and provides a copy button.
+
+By default, the project repository is the current directory. XpressClaw looks
+for the control plane's `xpressclaw.yaml` in the current directory and its
+parents, then in a single sibling control-plane repository. For example,
+running in `~/Projects/acme/platform` discovers
+`~/Projects/acme/xpressclaw/xpressclaw.yaml` when it is the only sibling match.
+If the control plane is elsewhere or multiple matches exist, name it
+explicitly:
 
 ```bash
 xpressclaw sync init \
-  --project-id 3a2a4b0e-example \
+  --project platform \
   --remote git@github.com:acme/xpressclaw-data.git \
-  --branch main \
-  --store-path projects/product-api \
-  --no-project-memory \
-  --project-dir /work/product-api \
-  --workdir /work/xpressclaw-control
+  --project-dir ~/Projects/acme/platform \
+  --control-plane-dir ~/Projects/acme/xpressclaw
 ```
 
-`--store-path` defaults to `projects/<project-id>`, `--branch` defaults to
-`main`, and both directory options default to the current directory. The
-command creates `/work/product-api/.xpressclaw.yml` without contacting the
-remote:
+`--project-dir` always means the repository being synchronized;
+`--control-plane-dir` always means the directory containing
+`xpressclaw.yaml`. The old `--workdir` spelling remains an alias for scripts,
+but `~/.xpressclaw` is normally the runtime data directory, not the control
+plane. A missing or invalid control-plane path produces a specific error with
+the path and next command to use.
+
+`--store-path` defaults to `projects/<canonical-project-id>` and `--branch`
+defaults to `main`. Add `--store-path projects/platform`, `--branch <branch>`,
+or `--no-project-memory` when needed. Initialization creates
+`~/Projects/acme/platform/.xpressclaw.yml` without contacting the remote:
 
 ```yaml
 version: 1
-project_id: 3a2a4b0e-example
+project_id: f02a5914-6d85-490c-86cb-25b7e16fe000
 store:
   remote: git@github.com:acme/xpressclaw-data.git
   branch: main
-  path: projects/product-api
+  path: projects/f02a5914-6d85-490c-86cb-25b7e16fe000
 share:
-  project_memory: false
+  project_memory: true
 ```
 
 Commit or otherwise preserve only this manifest with the main project. The
@@ -101,9 +127,8 @@ Conversation turn, or workflow, before synchronizing.
 Publish the current portable snapshot:
 
 ```bash
-xpressclaw sync publish \
-  --project-dir /work/product-api \
-  --workdir /work/xpressclaw-control
+cd ~/Projects/acme/platform
+xpressclaw sync publish
 ```
 
 Once a Project workspace contains `.xpressclaw.yml`, the same explicit Fetch
@@ -123,9 +148,8 @@ remote update fails safely; fetch before retrying.
 Fetch on another installation:
 
 ```bash
-xpressclaw sync fetch \
-  --project-dir /work/product-api \
-  --workdir /work/xpressclaw-control
+cd ~/Projects/acme/platform
+xpressclaw sync fetch
 ```
 
 Fetch validates every YAML record and reference before updating SQLite or

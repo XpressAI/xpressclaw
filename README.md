@@ -411,32 +411,35 @@ to be a Git repository; it only needs to preserve the generated
 
 First, create the remote synchronization repository and configure Git access
 with your own SSH agent or credential helper. Then initialize synchronization
-for an existing local Project. You can copy the Project ID from its
-`/projects/<project-id>` URL in the web UI:
+for an existing local Project from the repository being synchronized:
 
 ```bash
+cd /path/to/platform
 xpressclaw sync init \
-  --project-id <project-id> \
-  --remote git@github.com:your-org/xpressclaw-data.git \
-  --branch main \
-  --store-path projects/<project-id> \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+  --project platform \
+  --remote git@github.com:your-org/xpressclaw-data.git
 ```
 
-`--branch` defaults to `main`, `--store-path` defaults to
-`projects/<project-id>`, and both directory options default to the current
-directory. Use `--no-project-memory` with `sync init` if memory should stay
-local. Initialization only creates `/path/to/main-project/.xpressclaw.yml`; it
-does not contact the remote or synchronize any data. Preserve that manifest
-with the main project, but never put credentials in it.
+`--project` accepts a visible name or exact canonical ID. Ambiguous names are
+reported with their IDs, and the Project page exposes a copyable canonical ID;
+the old `--project-id <ID>` spelling remains supported. XpressClaw discovers
+`xpressclaw.yaml` in the current/parent directories or in a single sibling
+control-plane repository. Otherwise pass
+`--control-plane-dir /path/to/xpressclaw-control`. This is distinct from
+`--project-dir`, which means the repository receiving `.xpressclaw.yml`;
+`~/.xpressclaw` is normally only the runtime data directory. `--workdir`
+remains a backward-compatible alias for `--control-plane-dir`.
+
+`--branch` defaults to `main`, and `--store-path` defaults to
+`projects/<canonical-project-id>`. Use `--no-project-memory` if memory should
+stay local. Initialization only creates `.xpressclaw.yml`; it does not contact
+the remote or synchronize any data. Preserve that manifest with the main
+project, but never put credentials in it.
 
 Publish the first shared snapshot:
 
 ```bash
-xpressclaw sync publish \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync publish
 ```
 
 Anyone with the same manifest can explicitly fetch the snapshot into their
@@ -444,14 +447,10 @@ local XpressClaw installation, work normally, and publish their updates:
 
 ```bash
 # Before starting work
-xpressclaw sync fetch \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync fetch
 
 # After making XpressClaw Project changes
-xpressclaw sync publish \
-  --project-dir /path/to/main-project \
-  --workdir /path/to/xpressclaw-control
+xpressclaw sync publish
 ```
 
 Stop the control plane, or wait until the Project has no active work, before a
