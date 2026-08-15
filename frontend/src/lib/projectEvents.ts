@@ -8,6 +8,14 @@ export type ProjectMutation =
 	| { kind: 'updated'; project: Project }
 	| { kind: 'deleted'; projectId: string };
 
+export function sortProjectsByRecency(projects: Project[]): Project[] {
+	return [...projects].sort((left, right) => {
+		const updatedAtDifference = Date.parse(right.updated_at) - Date.parse(left.updated_at);
+		if (Number.isFinite(updatedAtDifference) && updatedAtDifference !== 0) return updatedAtDifference;
+		return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+	});
+}
+
 interface ProjectMutationEnvelope {
 	mutation: ProjectMutation;
 }

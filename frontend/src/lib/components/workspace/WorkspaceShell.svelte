@@ -7,7 +7,7 @@
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
-	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
+	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -565,9 +565,9 @@
 		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
 		projectMutationVersion += 1;
 		if (mutation.kind === 'updated') {
-			projectList = projectList.some((project) => project.id === mutation.project.id)
+			projectList = sortProjectsByRecency(projectList.some((project) => project.id === mutation.project.id)
 				? projectList.map((project) => project.id === mutation.project.id ? mutation.project : project)
-				: [...projectList, mutation.project];
+				: [...projectList, mutation.project]);
 			refreshTabMetadata();
 			return;
 		}

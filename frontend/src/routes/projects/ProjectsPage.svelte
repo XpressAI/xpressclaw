@@ -2,7 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { projects, type Project } from '$lib/api';
-	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
+	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import { timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 
@@ -32,7 +32,9 @@
 		if (mutation.kind === 'deleted') {
 			return list.filter((project) => project.id !== mutation.projectId);
 		}
-		return list.map((project) => project.id === mutation.project.id ? mutation.project : project);
+		return sortProjectsByRecency(
+			list.map((project) => project.id === mutation.project.id ? mutation.project : project),
+		);
 	}
 
 	async function load() {
