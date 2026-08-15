@@ -360,7 +360,14 @@ async function mockApi(
 				suggestion: null,
 			};
 		} else if (path === '/api/settings/sync') {
-			response = { projects: options.projectSyncStatuses ?? [] };
+			const sharedProject = options.sharedProjectState?.project;
+			response = {
+				projects: (options.projectSyncStatuses ?? [])
+					.filter((syncProject) => syncProject.project_id !== projectId || !options.sharedProjectState?.deleted)
+					.map((syncProject) => syncProject.project_id === projectId && sharedProject
+						? { ...syncProject, project_name: sharedProject.name, project_icon: sharedProject.icon }
+						: syncProject),
+			};
 		} else if (/^\/api\/settings\/sync\/[^/]+\/(fetch|publish)$/.test(path)) {
 			const parts = path.split('/');
 			const projectId = decodeURIComponent(parts[4]);
@@ -1331,6 +1338,35 @@ test('project mutations synchronize split panes and separate workspace windows',
 	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
 	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
 
+	const newWorkPage = await context.newPage();
+	await mockApi(newWorkPage, { preserveWorkspace: true, sharedProjectState });
+	await newWorkPage.goto('/?_xpressclaw_window=workspace-12345-3');
+	const newWorkProject = newWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(newWorkProject).toHaveText('Browser collaboration project');
+
+	const syncPage = await context.newPage();
+	await mockApi(syncPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		projectSyncStatuses: [{
+			project_id: projectId,
+			project_name: 'Browser collaboration project',
+			project_icon: null,
+			status: 'ready',
+			project_dir: '/srv/repos/xpressclaw',
+			remote: 'git@github.com:XpressAI/project-data.git',
+			branch: 'main',
+			store_path: `projects/${projectId}`,
+			share_project_memory: true,
+			last_commit: null,
+			last_synced_at: null,
+			message: null,
+		}],
+	});
+	await syncPage.goto('/settings/sync?_xpressclaw_window=workspace-12345-4');
+	const syncProject = syncPage.locator(`[data-project-sync="${projectId}"]`);
+	await expect(syncProject.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	let dialog = page.getByRole('dialog');
 	await dialog.getByLabel('Project name').fill('Synchronized project');
@@ -1360,6 +1396,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(indexPage.locator('aside').first().getByText('Éclair project', { exact: true })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
 	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
+	await expect(newWorkProject).toHaveText('Synchronized project');
+	await expect(syncProject.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
 
 	await otherPage.evaluate(async (id) => {
 		const response = await fetch(`/api/projects/${id}`, {
@@ -1391,7 +1429,9 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(otherPane.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
 	await expect(indexPage.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Authoritative project', { exact: true })).toBeVisible();
-	expect(context.pages()).toHaveLength(3);
+	await expect(newWorkProject).toHaveText('Authoritative project');
+	await expect(syncProject.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	expect(context.pages()).toHaveLength(5);
 	for (const openPage of context.pages()) {
 		await expect(openPage.getByText('Stale concurrent project', { exact: true })).toHaveCount(0);
 	}
@@ -1408,9 +1448,14 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(indexPage.getByRole('heading', { name: 'Éclair project' })).toBeVisible();
 	await expect(indexPage.getByRole('heading', { name: 'Create your first project' })).toHaveCount(0);
 	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(syncPage.getByText('No Projects yet', { exact: true })).toBeVisible();
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);
 	await expect(otherPage.locator('[data-workspace-tab-title="Synchronized project"], [data-workspace-tab-title="Browser collaboration project"]')).toHaveCount(0);
 	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Projects"]')).toBeVisible();
+	await syncPage.close();
+	await newWorkPage.close();
 	await indexPage.close();
 	await otherPage.close();
 });

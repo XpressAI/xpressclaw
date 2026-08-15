@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { settings } from '$lib/api';
 	import type { ProjectSyncAction, ProjectSyncStatus } from '$lib/api';
+	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 
 	type SyncOperation = 'fetch' | 'publish';
 	type Notice = { tone: 'success' | 'error'; message: string };
@@ -12,19 +13,42 @@
 	let active = $state<{ projectId: string; operation: SyncOperation } | null>(null);
 	let notices = $state<Record<string, Notice>>({});
 	let forceAvailable = $state<Record<string, boolean>>({});
+	let loadVersion = 0;
 
-	onMount(() => load());
+	onMount(() => {
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		void load();
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+	});
 
 	async function load(showLoading = true) {
+		const version = ++loadVersion;
 		if (showLoading) loading = true;
 		loadError = '';
 		try {
-			projects = (await settings.listProjectSync()).projects;
+			const loadedProjects = (await settings.listProjectSync()).projects;
+			if (version === loadVersion) projects = loadedProjects;
 		} catch (reason) {
-			loadError = messageFrom(reason, 'Could not load Project sync settings');
+			if (version === loadVersion) loadError = messageFrom(reason, 'Could not load Project sync settings');
 		} finally {
-			if (showLoading) loading = false;
+			if (version === loadVersion) loading = false;
 		}
+	}
+
+	function handleProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (mutation?.kind === 'updated') {
+			projects = projects.map((project) => project.project_id === mutation.project.id
+				? { ...project, project_name: mutation.project.name, project_icon: mutation.project.icon }
+				: project);
+			void load(false);
+			return;
+		}
+		if (mutation?.kind !== 'deleted') return;
+		projects = projects.filter((project) => project.project_id !== mutation.projectId);
+		notices = withoutKey(notices, mutation.projectId);
+		forceAvailable = withoutKey(forceAvailable, mutation.projectId);
+		void load(false);
 	}
 
 	async function run(project: ProjectSyncStatus, operation: SyncOperation, force = false) {
