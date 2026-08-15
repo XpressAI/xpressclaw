@@ -16,6 +16,8 @@ You can create, track, and manage tasks on a kanban board. Tasks can have subtas
 - `complete_task(task_id, result)` — Mark a task as completed with a result summary.
 - `list_subtasks(parent_task_id)` — List subtasks of a parent task.
 
+ACP plan items are current-turn progress checklists and never replace durable delegation. Use `create_task(..., parent_task_id="<parent>")` only when unfinished work must remain visible and block the parent task until it is completed.
+
 ## When to Create Tasks
 
 - The user asks you to do something complex → break it into subtasks

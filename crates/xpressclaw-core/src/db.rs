@@ -1684,6 +1684,28 @@ CREATE TABLE project_sync_state (
 );
 ";
 
+const MIGRATION_V37: &str = "
+-- ACP plans are turn-local progress reports, not durable delegated work.
+-- Keep provenance and completion gating in first-class columns so task
+-- lifecycle decisions never depend on plan titles or other heuristics.
+ALTER TABLE tasks ADD COLUMN provenance TEXT NOT NULL DEFAULT 'durable';
+ALTER TABLE tasks ADD COLUMN blocks_parent INTEGER NOT NULL DEFAULT 1
+    CHECK (blocks_parent IN (0, 1));
+
+UPDATE tasks
+SET provenance = json_extract(context, '$.origin')
+WHERE context IS NOT NULL
+  AND json_valid(context)
+  AND json_type(context, '$.origin') = 'text';
+
+UPDATE tasks
+SET provenance = 'native_plan', blocks_parent = 0
+WHERE provenance = 'native_plan';
+
+CREATE INDEX idx_tasks_parent_gate
+    ON tasks(parent_task_id, blocks_parent, status);
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1722,6 +1744,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (34, MIGRATION_V34),
         (35, MIGRATION_V35),
         (36, MIGRATION_V36),
+        (37, MIGRATION_V37),
     ]
 }
 
@@ -1742,7 +1765,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "36");
+        assert_eq!(version, "37");
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -1791,6 +1814,56 @@ mod tests {
                 .unwrap();
             assert_eq!(project_id, "atlas", "scope for {task_id}");
         }
+    }
+
+    #[test]
+    fn v37_backfills_native_plan_provenance_and_non_blocking_policy() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 36 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO tasks (id, title, context)
+               VALUES ('parent', 'Parent', '{}');
+               INSERT INTO tasks (id, title, parent_task_id, context)
+               VALUES (
+                   'plan',
+                   'Address any further review feedback through approval or merge',
+                   'parent',
+                   '{"origin":"native_plan","attempt_id":"attempt-1","index":0}'
+               ), (
+                   'delegated',
+                   'Run durable delegated work',
+                   'parent',
+                   '{"origin":"delegated"}'
+               );"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V37).unwrap();
+
+        let plan: (String, bool) = conn
+            .query_row(
+                "SELECT provenance, blocks_parent FROM tasks WHERE id = 'plan'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan, ("native_plan".to_string(), false));
+        let delegated: (String, bool) = conn
+            .query_row(
+                "SELECT provenance, blocks_parent FROM tasks WHERE id = 'delegated'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(delegated, ("delegated".to_string(), true));
     }
 
     #[test]

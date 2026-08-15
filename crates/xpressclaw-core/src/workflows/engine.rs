@@ -3401,13 +3401,49 @@ flows:
             .as_deref()
             .unwrap()
             .contains("Add coverage"));
+        let board = TaskBoard::new(db.clone());
+        board
+            .sync_reported_subtasks(
+                &revise,
+                "revise-attempt",
+                &[
+                    crate::tasks::board::ReportedSubtask {
+                        title: "Address independent review feedback".to_string(),
+                        status: crate::tasks::board::TaskStatus::Completed,
+                    },
+                    crate::tasks::board::ReportedSubtask {
+                        title: "Address any further review feedback through approval or merge"
+                            .to_string(),
+                        status: crate::tasks::board::TaskStatus::InProgress,
+                    },
+                ],
+            )
+            .unwrap();
+        board
+            .defer_reported_subtasks(&revise, "successful_attempt_completed")
+            .unwrap();
+        assert!(board.subtasks_complete(&revise).unwrap());
         engine
             .on_task_completed(&revise, "completed", "Coverage added")
             .unwrap();
 
+        let repeated_review = running_task("review");
+        assert_ne!(repeated_review, first_review);
+        let future_plan = board
+            .list_subtasks(&revise)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.title.contains("approval or merge"))
+            .unwrap();
+        assert_eq!(
+            future_plan.status,
+            crate::tasks::board::TaskStatus::Cancelled
+        );
+        assert!(!future_plan.blocks_parent);
+
         engine
             .on_task_completed(
-                &running_task("review"),
+                &repeated_review,
                 "completed",
                 r#"{"verdict":"approved","feedback":"Looks good"}"#,
             )

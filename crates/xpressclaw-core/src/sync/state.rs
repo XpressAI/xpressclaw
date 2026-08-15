@@ -237,7 +237,7 @@ fn export_transaction(
         connection,
         "SELECT id, title, description, status, priority, task_type, hidden,
                 agent_id, parent_task_id, conversation_id, created_at, updated_at,
-                completed_at
+                completed_at, provenance, blocks_parent
          FROM tasks
          WHERE project_id = ?1 AND hidden = 0 AND UPPER(task_type) <> 'IDLE'
          ORDER BY id",
@@ -257,6 +257,8 @@ fn export_transaction(
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
                 completed_at: row.get(12)?,
+                provenance: row.get(13)?,
+                blocks_parent: row.get::<_, i32>(14)? != 0,
             })
         },
     )?;
@@ -1120,8 +1122,8 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
             "INSERT INTO tasks
                 (id, title, description, status, priority, agent_id, parent_task_id,
                  conversation_id, project_id, created_at, updated_at, completed_at,
-                 task_type, hidden)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 task_type, hidden, provenance, blocks_parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -1133,7 +1135,9 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 updated_at = excluded.updated_at,
                 completed_at = excluded.completed_at,
                 task_type = excluded.task_type,
-                hidden = excluded.hidden",
+                hidden = excluded.hidden,
+                provenance = excluded.provenance,
+                blocks_parent = excluded.blocks_parent",
             params![
                 task.id,
                 task.title,
@@ -1147,7 +1151,9 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 task.updated_at,
                 task.completed_at,
                 task.task_type,
-                task.hidden
+                task.hidden,
+                task.provenance,
+                task.blocks_parent
             ],
         )?;
     }

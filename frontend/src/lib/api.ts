@@ -484,6 +484,9 @@ export interface Task {
 	updated_at: string;
 	completed_at: string | null;
 	context: unknown;
+	provenance?: string;
+	blocks_parent?: boolean;
+	activity_status?: string;
 	depends_on?: string[];
 	dependents?: string[];
 	blocked_by?: string[];

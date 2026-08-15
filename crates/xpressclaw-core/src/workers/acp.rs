@@ -2972,6 +2972,8 @@ mod tests {
         let subtasks = TaskBoard::new(db).list_subtasks(&task_id).unwrap();
         assert_eq!(subtasks.len(), 2);
         assert_eq!(subtasks[0].title, "Implement ACP");
+        assert!(subtasks.iter().all(|task| task.is_native_plan_item()));
+        assert!(subtasks.iter().all(|task| !task.blocks_parent));
     }
 
     fn test_recorder(db: Arc<Database>) -> (AcpEventRecorder, String) {

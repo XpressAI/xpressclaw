@@ -65,6 +65,9 @@
 		if (status === 'waiting_for_input') return 'bg-orange-500 animate-pulse';
 		if (status === 'running' || status === 'in_progress' || status === 'preparing' || status === 'review') return 'bg-blue-500 animate-pulse';
 		if (status === 'queued' || status === 'pending') return 'bg-amber-400';
+		if (status === 'awaiting_review') return 'bg-violet-400';
+		if (status === 'waiting_for_subtasks') return 'bg-amber-400';
+		if (status === 'idle') return 'bg-muted-foreground';
 		if (status === 'cancelled') return 'bg-muted-foreground';
 		return 'bg-emerald-500';
 	}
@@ -76,8 +79,15 @@
 		if (status === 'running' || status === 'in_progress' || status === 'preparing') return 'Working';
 		if (status === 'review') return 'Ready for review';
 		if (status === 'queued' || status === 'pending') return 'Queued';
+		if (status === 'awaiting_review') return 'Awaiting review';
+		if (status === 'waiting_for_subtasks') return 'Waiting on subtasks';
+		if (status === 'idle') return 'Not running';
 		if (status === 'cancelled') return 'Cancelled';
 		return 'Completed';
+	}
+
+	function activityStatus(task: Task): string {
+		return task.activity_status ?? task.status;
 	}
 </script>
 
@@ -89,10 +99,10 @@
 				onclick={onnavigate}
 				aria-current={activeTaskId === task.id ? 'page' : undefined}
 				class="relative flex h-9 w-9 items-center justify-center rounded-lg text-xs font-semibold {activeTaskId === task.id ? 'bg-[hsl(var(--sidebar-active))]' : 'bg-muted/60 hover:bg-accent'}"
-				title="{task.title} — {statusLabel(task.status)}"
+				title="{task.title} — {statusLabel(activityStatus(task))}"
 			>
 				T
-				<span data-task-status={task.status} class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(task.status)}"></span>
+				<span data-task-status={activityStatus(task)} class="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full border-2 border-[hsl(var(--sidebar))] {statusDot(activityStatus(task))}"></span>
 			</a>
 		{/each}
 	</div>
@@ -128,12 +138,12 @@
 									>
 										<span class="min-w-0 flex-1">
 											<span class="block truncate text-xs">{task.title}</span>
-											<span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{statusLabel(task.status)} · {timeAgo(task.updated_at)}</span>
+											<span class="mt-0.5 block truncate text-[10px] font-normal text-muted-foreground">{statusLabel(activityStatus(task))} · {timeAgo(task.updated_at)}</span>
 										</span>
 										<span
-											data-task-status={task.status}
-											aria-label={statusLabel(task.status)}
-											class="mt-1.5 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"
+											data-task-status={activityStatus(task)}
+											aria-label={statusLabel(activityStatus(task))}
+											class="mt-1.5 h-2 w-2 shrink-0 rounded-full {statusDot(activityStatus(task))}"
 										></span>
 									</a>
 								{/each}

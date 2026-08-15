@@ -348,6 +348,9 @@ fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
             v["depends_on"] = json!(board.get_dependencies(&t.id).unwrap_or_default());
             v["blocked_by"] = json!(board.get_blockers(&t.id).unwrap_or_default());
             v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
+            v["activity_status"] = json!(board
+                .activity_status(t)
+                .unwrap_or_else(|_| t.status.as_str().to_string()));
             v
         })
         .collect()
@@ -398,6 +401,9 @@ async fn get_task(
     result["dependents"] = json!(dependents);
     result["blocked_by"] = json!(blocked_by);
     result["ready"] = json!(ready);
+    result["activity_status"] = json!(board
+        .activity_status(&task)
+        .unwrap_or_else(|_| task.status.as_str().to_string()));
     Ok(Json(result))
 }
 

@@ -86,6 +86,9 @@ async function mockApi(
 		completedTaskCount?: number;
 		taskTitle?: string;
 		taskDescription?: string;
+		taskStatus?: string;
+		taskActivityStatus?: string;
+		taskSubtasks?: Record<string, unknown>[];
 		mcpServers?: {
 			name: string;
 			type: 'stdio' | 'http' | 'sse';
@@ -153,7 +156,7 @@ async function mockApi(
 	let workspaceFileRevision = 'revision-before-save';
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
-	const status = options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed';
+	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
 	const attemptStatus = options.attemptError
 		? 'failed'
 		: options.pendingElicitation
@@ -185,6 +188,9 @@ async function mockApi(
 		updated_at: timestamp(61),
 		completed_at: status === 'completed' ? timestamp(61) : null,
 		context: {},
+		provenance: 'durable',
+		blocks_parent: true,
+		activity_status: options.taskActivityStatus ?? status,
 		depends_on: [],
 		dependents: [],
 		blocked_by: [],
@@ -535,7 +541,7 @@ async function mockApi(
 			};
 		} else if (path === '/api/tasks') {
 			if (url.searchParams.has('parent_task_id')) {
-				response = { tasks: [], counts: { ...counts, completed: 0 } };
+				response = { tasks: options.taskSubtasks ?? [], counts: { ...counts, completed: 0 } };
 			} else {
 				const searchTerms = (url.searchParams.get('search') ?? '')
 					.toLocaleLowerCase()
@@ -2108,6 +2114,42 @@ test('task list scrolls and requests one filtered page at a time', async ({ page
 	await expect(taskRows).toHaveCount(5);
 	await expect(page.getByText('Page 3 of 3')).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Next' })).toBeDisabled();
+});
+
+test('idle completed turns do not look active and future plan items are deferred', async ({ page }) => {
+	await mockApi(page, {
+		taskStatus: 'in_progress',
+		taskActivityStatus: 'idle',
+		taskSubtasks: [{
+			id: 'future-plan-step',
+			title: 'Address any further review feedback through approval or merge',
+			description: null,
+			status: 'cancelled',
+			priority: -1,
+			agent_id: null,
+			parent_task_id: taskId,
+			sop_id: null,
+			conversation_id: null,
+			created_at: timestamp(10),
+			updated_at: timestamp(61),
+			completed_at: null,
+			context: { origin: 'native_plan', plan_disposition: 'deferred' },
+			provenance: 'native_plan',
+			blocks_parent: false,
+			activity_status: 'cancelled',
+		}],
+	});
+
+	await page.goto('/tasks');
+	const row = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
+	await expect(row).toHaveAttribute('data-task-activity-status', 'idle');
+	await expect(row.getByText('Not running')).toBeVisible();
+	await expect(row.getByText('Working')).toHaveCount(0);
+
+	await row.click();
+	await expect(page.locator('[data-task-activity-status="idle"]').first()).toBeVisible();
+	await expect(page.getByText('No worker or required subtask is currently running.')).toBeVisible();
+	await expect(page.getByText('Deferred · does not block completion')).toBeVisible();
 });
 
 test('task search filters the full history with server-side counts', async ({ page }) => {

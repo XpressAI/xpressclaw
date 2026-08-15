@@ -175,6 +175,10 @@ pub struct PortableTask {
     pub parent_task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    #[serde(default = "default_task_provenance")]
+    pub provenance: String,
+    #[serde(default = "default_true")]
+    pub blocks_parent: bool,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +187,14 @@ pub struct PortableTask {
 
 fn default_task_type() -> String {
     "normal".to_string()
+}
+
+fn default_task_provenance() -> String {
+    "durable".to_string()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
