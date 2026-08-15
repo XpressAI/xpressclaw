@@ -43,7 +43,7 @@ function timelineEvent(id: number, second: number, eventType: string, summary: s
 	};
 }
 
-function attempt(status: string, contextUsed = 128_000, errorMessage: string | null = null) {
+function attempt(status: string, contextUsed = 128_000, errorMessage: string | null = null, result: string | null = null) {
 	return {
 		id: 'attempt-browser-test',
 		session_id: agentId,
@@ -55,7 +55,7 @@ function attempt(status: string, contextUsed = 128_000, errorMessage: string | n
 		prompt: 'Test the workspace',
 		native_session_id: 'native-browser-test',
 		container_id: 'container-browser-test',
-		result: null,
+		result,
 		error_message: errorMessage,
 		created_at: timestamp(0),
 		started_at: timestamp(1),
@@ -106,6 +106,9 @@ async function mockApi(
 		taskStatus?: string;
 		taskActivityStatus?: string;
 		taskSubtasks?: Record<string, unknown>[];
+		taskMessages?: Record<string, unknown>[];
+		taskActivityEvents?: Record<string, unknown>[];
+		attemptResult?: string;
 		mcpServers?: {
 			name: string;
 			type: 'stdio' | 'http' | 'sse';
@@ -190,6 +193,12 @@ async function mockApi(
 		: options.pendingElicitation
 			? 'waiting_for_input'
 			: options.live ? 'running' : 'completed';
+	const mockAttempt = () => attempt(
+		attemptStatus,
+		contextUsed,
+		options.attemptError ?? null,
+		options.attemptResult ?? null,
+	);
 	const firstAnswer = options.agentResponseLinks
 		? 'First answer with [agent docs](https://example.com/agent-docs).'
 		: 'First answer';
@@ -719,7 +728,7 @@ async function mockApi(
 					delivery: payload.delivery === 'immediate' ? 'immediate' : (options.live ? 'after_tool' : 'queued'),
 				};
 			} else {
-				response = [
+				response = options.taskMessages ?? [
 					{ id: 1, task_id: taskId, role: 'assistant', content: firstAnswer, attachments: [], timestamp: timestamp(25) },
 					{ id: 2, task_id: taskId, role: 'user', content: userFollowUp, attachments: [], timestamp: timestamp(40) },
 					{ id: 3, task_id: taskId, role: 'assistant', content: secondAnswer, attachments: [], timestamp: timestamp(55) },
@@ -733,7 +742,7 @@ async function mockApi(
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
+					attempts: [mockAttempt()],
 					events: [
 						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
@@ -745,7 +754,7 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
+					attempts: [mockAttempt()],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -754,15 +763,15 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
+					attempts: [mockAttempt()],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [attempt(attemptStatus, contextUsed, options.attemptError ?? null)],
-					events: options.pendingElicitation ? [
+					attempts: [mockAttempt()],
+					events: options.taskActivityEvents ?? (options.pendingElicitation ? [
 						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
 							elicitationId: 'elicitation-browser-test',
 							status: 'pending',
@@ -804,8 +813,8 @@ async function mockApi(
 								rawOutput: { formatted_output: 'Applied patch.' },
 							},
 						},
-					] : Array.from({ length: 40 }, (_, index) => activityEvent(index + 21)),
-					has_more_before: !options.richToolActivity,
+					] : Array.from({ length: 40 }, (_, index) => activityEvent(index + 21))),
+					has_more_before: options.taskActivityEvents ? false : !options.richToolActivity,
 					has_more_after: false,
 				};
 			}
@@ -903,12 +912,14 @@ test('activity stays chronological, compact, expandable, and pageable', async ({
 });
 
 test('attempt errors can be dismissed', async ({ page }) => {
-	await mockApi(page, { attemptError: 'ACP process stopped during the turn' });
+	const rawError = '<img src=x onerror="window.__rawHtmlExecuted = true"> ACP process stopped during the turn';
+	await mockApi(page, { attemptError: rawError });
 	await page.goto(`/tasks/${taskId}`);
 
 	const notification = page.locator('[data-attempt-error]');
 	await expect(notification).toBeVisible();
-	await expect(notification).toContainText('ACP process stopped during the turn');
+	await expect(notification).toContainText(rawError);
+	await expect(notification.locator('img')).toHaveCount(0);
 	const dismiss = notification.getByRole('button', { name: 'Dismiss attempt error' });
 	await dismiss.focus();
 	await dismiss.press('Enter');
@@ -989,7 +1000,7 @@ test('links in agent responses open in new windows without changing user links',
 
 	const transcript = page.locator('[data-task-transcript]');
 	const responseLinks = transcript.locator('[data-message-role="assistant"] a, [data-agent-update] a');
-	await expect(responseLinks).toHaveCount(3);
+	await expect(responseLinks).toHaveCount(2);
 	for (const link of await responseLinks.all()) {
 		await expect(link).toHaveAttribute('target', '_blank');
 		await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
@@ -1000,6 +1011,10 @@ test('links in agent responses open in new windows without changing user links',
 	await expect(userLink).not.toHaveAttribute('target', '_blank');
 	await expect(userLink).not.toHaveAttribute('rel', /noopener|noreferrer/);
 	await expect(userLink).toHaveCSS('color', 'rgb(255, 255, 255)');
+
+	const rawLinkMessage = transcript.locator('[data-message-role="assistant"]', { hasText: 'a raw agent link' });
+	await expect(rawLinkMessage.locator('.prose-chat')).toContainText('<a href="https://example.com/raw-agent-link" target="_self" rel="opener">a raw agent link</a>');
+	await expect(rawLinkMessage.locator('a')).toHaveCount(0);
 });
 
 test('assistant text selections offer follow-up actions in the task composer', async ({ page }) => {
@@ -1241,6 +1256,202 @@ test('project conversations coordinate files and project-wide linked work', asyn
 		description: 'Use the decisions and files already published here.',
 		agent_id: 'project-secondary-test',
 	}]);
+});
+
+test('raw HTML in user and agent conversation messages stays visible and inert', async ({ page }) => {
+	const userRawHtml = '<script>alert("wee");</script>';
+	const userReservedTags = '<think>literal user thinking</think> <tool_call name="demo">{"ok":true}</tool_call>';
+	const execution = 'window.__rawHtmlExecuted = true';
+	const agentRawHtml = [
+		'**Markdown stays bold.**',
+		'',
+		`<img src="missing-image" onerror="${execution}">`,
+		'',
+		`<svg onload="${execution}"><circle></circle></svg>`,
+		'',
+		`<iframe srcdoc="<script>${execution}</script>"></iframe>`,
+		'',
+		'<style>body { display: none; }</style>',
+		'',
+		'<custom-card data-kind="demo">custom content</custom-card>',
+		'',
+		'Mixed Markdown with <mark>benign HTML</mark> and <span data-raw-html="true">inline HTML</span>.',
+		'',
+		'<div data-raw-html="block">raw block</div>',
+		'**Adjacent Markdown stays bold.** and [adjacent link](https://example.com/adjacent)',
+		'',
+		'<broken attr="value"',
+		'',
+		`&lt;img src=x onerror="${execution}"&gt;`,
+		'',
+		'[Markdown link](https://example.com/safe)',
+	].join('\n');
+	const rawHtmlConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Raw HTML safety',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await page.addInitScript(() => {
+		(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+	});
+	await mockApi(page, {
+		conversations: [rawHtmlConversation],
+		conversationMessages: [
+			{
+				id: 1,
+				conversation_id: conversationId,
+				sender_type: 'user',
+				sender_id: 'local',
+				sender_name: 'You',
+				content: userRawHtml,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(10),
+			},
+			{
+				id: 2,
+				conversation_id: conversationId,
+				sender_type: 'user',
+				sender_id: 'local',
+				sender_name: 'You',
+				content: userReservedTags,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(15),
+			},
+			{
+				id: 3,
+				conversation_id: conversationId,
+				sender_type: 'agent',
+				sender_id: agentId,
+				sender_name: 'Browser-tested workspace',
+				content: agentRawHtml,
+				message_type: 'message',
+				linked_task_id: null,
+				metadata: {},
+				attachments: [],
+				created_at: timestamp(20),
+			},
+		],
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	let userContent = page.locator('[data-message-role="user"] .prose-chat').first();
+	let userReservedContent = page.locator('[data-message-role="user"] .prose-chat').nth(1);
+	let agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(userContent).toHaveText(userRawHtml);
+	expect(await userContent.textContent()).toBe(userRawHtml);
+	await expect(userReservedContent).toContainText('<think>literal user thinking</think>');
+	await expect(userReservedContent).toContainText('<tool_call name="demo">{"ok":true}</tool_call>');
+	await expect(userReservedContent.locator('details, tool_call, think')).toHaveCount(0);
+	await expect(agentContent.getByText('Markdown stays bold.', { exact: true })).toHaveCount(1);
+	await expect(agentContent.locator('strong', { hasText: /^Markdown stays bold\.$/ })).toHaveCount(1);
+	await expect(agentContent).toContainText('<img src="missing-image" onerror="window.__rawHtmlExecuted = true">');
+	await expect(agentContent).toContainText('<svg onload="window.__rawHtmlExecuted = true"><circle></circle></svg>');
+	await expect(agentContent).toContainText('<iframe srcdoc="<script>window.__rawHtmlExecuted = true</script>"></iframe>');
+	await expect(agentContent).toContainText('<style>body { display: none; }</style>');
+	await expect(agentContent).toContainText('<custom-card data-kind="demo">custom content</custom-card>');
+	await expect(agentContent).toContainText('<mark>benign HTML</mark>');
+	await expect(agentContent).toContainText('<span data-raw-html="true">inline HTML</span>');
+	await expect(agentContent).toContainText('<div data-raw-html="block">raw block</div>');
+	await expect(agentContent.locator('strong', { hasText: /^Adjacent Markdown stays bold\.$/ })).toHaveCount(1);
+	await expect(agentContent.getByRole('link', { name: 'adjacent link' })).toHaveAttribute('href', 'https://example.com/adjacent');
+	await expect(agentContent).toContainText('<broken attr="value"');
+	await expect(agentContent).toContainText('&lt;img src=x onerror="window.__rawHtmlExecuted = true"&gt;');
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
+	await expect(agentContent.getByRole('link', { name: 'Markdown link' })).toHaveAttribute('href', 'https://example.com/safe');
+	await expect.poll(() => page.evaluate(() => (
+		window as typeof window & { __rawHtmlExecuted?: boolean }
+	).__rawHtmlExecuted)).toBe(false);
+
+	await page.reload();
+	userContent = page.locator('[data-message-role="user"] .prose-chat').first();
+	userReservedContent = page.locator('[data-message-role="user"] .prose-chat').nth(1);
+	agentContent = page.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(userContent).toHaveText(userRawHtml);
+	expect(await userContent.textContent()).toBe(userRawHtml);
+	await expect(userContent).not.toContainText('&lt;script&gt;');
+	await expect(userReservedContent).toContainText(userReservedTags);
+	await expect(agentContent).toContainText('<custom-card data-kind="demo">custom content</custom-card>');
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await expect(userContent).toHaveText(userRawHtml);
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
+});
+
+test('raw HTML stays literal across task messages, activity, results, and previews', async ({ page }) => {
+	const execution = 'window.__rawHtmlExecuted = true';
+	const taskPrompt = '<custom-prompt data-value="1">task prompt</custom-prompt>';
+	const taskReply = `**Task Markdown** with <img src=x onerror="${execution}">`;
+	const streamingUpdate = `<svg onload="${execution}">streaming update</svg>`;
+	const thought = `**Thought Markdown** with <iframe src="javascript:${execution}">thought</iframe>`;
+	const result = `**Result Markdown** with <custom-result>result body</custom-result>`;
+	await page.addInitScript(() => {
+		(window as typeof window & { __rawHtmlExecuted?: boolean }).__rawHtmlExecuted = false;
+	});
+	await mockApi(page, {
+		taskDescription: taskPrompt,
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: taskReply,
+			attachments: [],
+			timestamp: timestamp(25),
+		}],
+		taskActivityEvents: [
+			timelineEvent(90, 30, 'runner_progress', streamingUpdate, { item_type: 'agent_message', message_id: 'raw-update' }),
+			timelineEvent(91, 35, 'agent_thought', thought, {}),
+		],
+		attemptResult: result,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const promptContent = transcript.locator('[data-message-role="user"] .prose-chat');
+	const replyContent = transcript.locator('[data-message-role="assistant"] .prose-chat');
+	await expect(promptContent).toHaveText(taskPrompt);
+	await expect(promptContent.locator('custom-prompt')).toHaveCount(0);
+	await expect(replyContent.locator('strong')).toHaveText('Task Markdown');
+	await expect(replyContent).toContainText(`<img src=x onerror="${execution}">`);
+	await expect(replyContent.locator('img')).toHaveCount(0);
+
+	const updateContent = transcript.locator('[data-agent-update-content]');
+	await expect(updateContent).toContainText(streamingUpdate);
+	await expect(updateContent.locator('svg')).toHaveCount(0);
+
+	const thoughtActivity = transcript.locator('[data-transcript-kind="activity"]', { hasText: 'Thought Markdown' });
+	await thoughtActivity.getByRole('button').click();
+	const thoughtContent = thoughtActivity.locator('[data-activity-rich-content]');
+	await expect(thoughtContent.locator('strong')).toHaveText('Thought Markdown');
+	await expect(thoughtContent).toContainText(`<iframe src="javascript:${execution}">thought</iframe>`);
+	await expect(thoughtContent.locator('iframe')).toHaveCount(0);
+
+	const resultContent = page.locator('[data-task-result-content]');
+	await expect(resultContent.locator('strong')).toHaveText('Result Markdown');
+	await expect(resultContent).toContainText('<custom-result>result body</custom-result>');
+	await expect(resultContent.locator('custom-result')).toHaveCount(0);
+	await expect.poll(() => page.evaluate(() => (
+		window as typeof window & { __rawHtmlExecuted?: boolean }
+	).__rawHtmlExecuted)).toBe(false);
+
+	await page.goto('/tasks');
+	await page.getByRole('button', { name: 'Done 1' }).click();
+	const preview = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
+	await expect(preview).toContainText(taskPrompt);
+	await expect(preview.locator('custom-prompt')).toHaveCount(0);
 });
 
 test('project pages expose a copyable canonical ID', async ({ page }) => {

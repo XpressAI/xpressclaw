@@ -118,7 +118,7 @@
 				'rounded-tl-[4px] bg-card pr-10 text-card-foreground shadow-[var(--shadow-card)]'}"
 		>
 			<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
-				{@html renderContent(content, { openLinksInNewWindow })}
+				{@html renderContent(content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant' })}
 			</div>
 			{#if children}{@render children()}{/if}
 
