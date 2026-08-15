@@ -1696,11 +1696,18 @@ UPDATE tasks
 SET provenance = json_extract(context, '$.origin')
 WHERE context IS NOT NULL
   AND json_valid(context)
-  AND json_type(context, '$.origin') = 'text';
+  AND json_type(context, '$.origin') = 'text'
+  AND json_extract(context, '$.origin') != 'native_plan';
 
 UPDATE tasks
 SET provenance = 'native_plan', blocks_parent = 0
-WHERE provenance = 'native_plan';
+WHERE context IS NOT NULL
+  AND json_valid(context)
+  AND json_extract(context, '$.origin') = 'native_plan'
+  AND json_type(context, '$.attempt_id') = 'text'
+  AND trim(json_extract(context, '$.attempt_id')) != ''
+  AND json_type(context, '$.index') = 'integer'
+  AND json_extract(context, '$.index') >= 0;
 
 CREATE INDEX idx_tasks_parent_gate
     ON tasks(parent_task_id, blocks_parent, status);
@@ -1842,6 +1849,11 @@ mod tests {
                    'Run durable delegated work',
                    'parent',
                    '{"origin":"delegated"}'
+               ), (
+                   'copied-plan-context',
+                   'Explicit work with copied internal context',
+                   'parent',
+                   '{"origin":"native_plan"}'
                );"#,
         )
         .unwrap();
@@ -1864,6 +1876,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(delegated, ("delegated".to_string(), true));
+        let copied_context: (String, bool) = conn
+            .query_row(
+                "SELECT provenance, blocks_parent FROM tasks WHERE id = 'copied-plan-context'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(copied_context, ("durable".to_string(), true));
     }
 
     #[test]
