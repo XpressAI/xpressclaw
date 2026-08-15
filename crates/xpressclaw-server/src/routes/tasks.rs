@@ -1319,6 +1319,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_status_completion_defers_unfinished_plan_items() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db);
+        let task = board
+            .create(&CreateTask {
+                title: "Manual completion".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &task.id,
+                "attempt-1",
+                &[xpressclaw_core::tasks::board::ReportedSubtask {
+                    title: "Future follow-up".to_string(),
+                    status: TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "completed");
+        let plan = board.list_subtasks(&task.id).unwrap().remove(0);
+        assert_eq!(plan.status, TaskStatus::Cancelled);
+        assert_eq!(
+            plan.context
+                .as_ref()
+                .and_then(|context| context.get("plan_disposition"))
+                .and_then(Value::as_str),
+            Some("deferred")
+        );
+    }
+
+    #[tokio::test]
     async fn cancelling_after_attempt_completion_preserves_terminal_state() {
         let (app, db) = test_app_with_db();
         let resp = app
