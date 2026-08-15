@@ -7,6 +7,7 @@
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, loadComposerTarget, saveComposerDraft, saveComposerTarget } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import { harnessMark } from '$lib/utils';
 
@@ -22,6 +23,7 @@
 	let conversationList = $state<Conversation[]>([]);
 	let selectedProject = $state('');
 	let selectedProjectReady = $state(false);
+	const projectMutations = new Map<string, ProjectMutation>();
 	let selectedConversation = $state('');
 	let selectedConversationReady = $state(false);
 	let selectedAgent = $state('');
@@ -55,21 +57,21 @@
 				return;
 			}
 
-			const [agts, projects, conversationRecords, workflowRecords] = await Promise.all([
+			const [agts, projectRecords, conversationRecords, workflowRecords] = await Promise.all([
 				agentsApi.list().catch(() => []),
 				projectsApi.list().catch(() => []),
 				conversationsApi.list(undefined, 200).catch(() => []),
 				workflowsApi.list().catch(() => []),
 			]);
 			agentList = agts;
-			projectList = projects;
+			projectList = [...projectMutations.values()].reduce(applyProjectMutation, projectRecords);
 			conversationList = conversationRecords;
 			workflowList = workflowRecords;
 			const savedAgent = loadComposerTarget(messageDraftScope);
 			const savedProject = loadComposerTarget(`${messageDraftScope}-project`);
-			selectedProject = projects.find((project) => project.id === savedProject)?.id
+			selectedProject = projectList.find((project) => project.id === savedProject)?.id
 				?? agts.find((agent) => agent.id === savedAgent)?.project_id
-				?? projects[0]?.id
+				?? projectList[0]?.id
 				?? '';
 			selectedProjectReady = true;
 			selectedAgent = agts.find((agent) => agent.id === savedAgent && (!selectedProject || agent.project_id === selectedProject))?.id
@@ -121,10 +123,35 @@
 	});
 
 	onMount(() => {
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		message = loadComposerDraft(messageDraftScope);
 		messageDraftReady = true;
 		void checkReady();
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 	});
+
+	function handleProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
+		const projectId = mutation.kind === 'updated' ? mutation.project.id : mutation.projectId;
+		projectMutations.set(projectId, mutation);
+		projectList = applyProjectMutation(projectList, mutation);
+		if (mutation.kind === 'deleted' && selectedProject === mutation.projectId) {
+			selectedProject = projectList[0]?.id ?? '';
+		}
+	}
+
+	function applyProjectMutation(list: Project[], mutation: ProjectMutation): Project[] {
+		if (mutation.kind === 'deleted') {
+			return list.filter((project) => project.id !== mutation.projectId);
+		}
+		if (list.some((project) => project.id === mutation.project.id)) {
+			return sortProjectsByRecency(
+				list.map((project) => project.id === mutation.project.id ? mutation.project : project),
+			);
+		}
+		return mutation.authoritative ? sortProjectsByRecency([...list, mutation.project]) : list;
+	}
 
 	function greeting(): string {
 		const hour = new Date().getHours();

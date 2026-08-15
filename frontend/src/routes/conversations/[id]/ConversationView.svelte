@@ -3,6 +3,7 @@
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
+	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 	import { harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
@@ -42,6 +43,8 @@
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let eventSource: EventSource | null = null;
 	let stopInitialScrollPin: (() => void) | null = null;
+	let projectMutationVersion = 0;
+	const projectMutations = new Map<string, ProjectMutation>();
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === conversation?.project_id));
 	let participantAgentIds = $derived(conversation?.participants.filter((participant) => participant.participant_type === 'agent').map((participant) => participant.participant_id) ?? []);
@@ -63,11 +66,13 @@
 	$effect(() => { if (draftReady) saveComposerDraft(draftScope, content); });
 
 	onMount(() => {
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		content = loadComposerDraft(draftScope);
 		draftReady = true;
 		void loadAll(true);
 		connectEvents();
 		pollTimer = setInterval(() => void refreshActivity(), 2500);
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 	});
 
 	onDestroy(() => {
@@ -85,6 +90,7 @@
 		let loaded = false;
 		try {
 			conversation = await conversations.get(conversationId);
+			const projectMutationVersionAtStart = projectMutationVersion;
 			const [nextProject, nextAgents, nextTasks, nextWorkflows, nextMessages, nextTurns] = await Promise.all([
 				conversation.project_id ? projects.get(conversation.project_id) : Promise.resolve(null),
 				agents.list(),
@@ -93,7 +99,10 @@
 				conversations.messages(conversationId, MESSAGE_PAGE_SIZE),
 				conversations.turns(conversationId),
 			]);
-			project = nextProject;
+			if (projectMutationVersion === projectMutationVersionAtStart) {
+				const pendingMutation = conversation.project_id ? projectMutations.get(conversation.project_id) : undefined;
+				project = pendingMutation ? applyProjectMutation(nextProject, pendingMutation) : nextProject;
+			}
 			agentList = nextAgents;
 			taskList = nextTasks;
 			workflowList = nextWorkflows;
@@ -108,6 +117,24 @@
 			loading = false;
 		}
 		if (scroll && loaded) await scrollInitialHistoryToLatest();
+	}
+
+	function handleProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
+		const projectId = mutation.kind === 'updated' ? mutation.project.id : mutation.projectId;
+		projectMutations.set(projectId, mutation);
+		if (conversation?.project_id !== projectId) return;
+		projectMutationVersion += 1;
+		project = applyProjectMutation(project, mutation);
+	}
+
+	function applyProjectMutation(currentProject: Project | null, mutation: ProjectMutation): Project | null {
+		if (mutation.kind === 'deleted') return null;
+		if (mutation.authoritative || !currentProject || currentProject.updated_at < mutation.project.updated_at) {
+			return mutation.project;
+		}
+		return currentProject;
 	}
 
 	async function refreshActivity() {

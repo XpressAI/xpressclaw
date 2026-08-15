@@ -7,6 +7,7 @@
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
+	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -65,6 +66,8 @@
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
+	let projectMutationVersion = 0;
+	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
 
 	let dockerAvailable = $state(true);
 	let dockerInstalled = $state(true);
@@ -534,6 +537,7 @@
 	}
 
 	async function loadWorkspaceSummary() {
+		const startingProjectMutationVersion = projectMutationVersion;
 		try {
 			const [nextProjects, nextConversations, nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules] = await Promise.all([
 				projectsApi.list().catch(() => projectList),
@@ -544,7 +548,9 @@
 				workflowsApi.list().catch(() => workflowList),
 				schedulesApi.list().catch(() => scheduleList),
 			]);
-			projectList = nextProjects;
+			projectList = [...projectMutations.values()]
+				.filter(({ version }) => version > startingProjectMutationVersion)
+				.reduce((list, { mutation }) => applyProjectMutation(list, mutation), nextProjects);
 			conversationList = nextConversations;
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
@@ -553,6 +559,54 @@
 			scheduleList = nextSchedules;
 			refreshTabMetadata();
 		} catch {}
+	}
+
+	function handleProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
+		projectMutationVersion += 1;
+		const projectId = mutation.kind === 'updated' ? mutation.project.id : mutation.projectId;
+		projectMutations.set(projectId, { version: projectMutationVersion, mutation });
+		if (mutation.kind === 'updated') {
+			projectList = applyProjectMutation(projectList, mutation);
+			refreshTabMetadata();
+			return;
+		}
+		const focusedProjectWasDeleted = focusedTab?.kind === 'project' && focusedTab.resourceId === mutation.projectId;
+		projectList = projectList.filter((project) => project.id !== mutation.projectId);
+		panes = panes.map((pane) => {
+			const tabs = pane.tabs.filter((tab) => !(tab.kind === 'project' && tab.resourceId === mutation.projectId));
+			if (tabs.length > 0) {
+				return {
+					...pane,
+					tabs,
+					activeTabId: tabs.some((tab) => tab.id === pane.activeTabId) ? pane.activeTabId : tabs[0].id,
+				};
+			}
+			const fallback = { ...createWorkspaceTab('/projects'), lastActiveAt: nextTabRecency() };
+			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
+		});
+		persistWorkspace();
+		if (focusedProjectWasDeleted) {
+			const nextPane = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
+			const nextTab = activeTabFor(nextPane);
+			if (currentRoute() !== nextTab.path) {
+				lastSyncedPath = nextTab.path;
+				void goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
+			}
+		}
+	}
+
+	function applyProjectMutation(list: Project[], mutation: ProjectMutation): Project[] {
+		if (mutation.kind === 'deleted') {
+			return list.filter((project) => project.id !== mutation.projectId);
+		}
+		if (list.some((project) => project.id === mutation.project.id)) {
+			return sortProjectsByRecency(
+				list.map((project) => project.id === mutation.project.id ? mutation.project : project),
+			);
+		}
+		return mutation.authoritative ? sortProjectsByRecency([...list, mutation.project]) : list;
 	}
 
 	async function checkDocker() {
@@ -647,6 +701,7 @@
 		checkDocker();
 		const handleOnline = () => void checkConnection();
 		window.addEventListener('online', handleOnline);
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		const interval = setInterval(() => {
 			loadWorkspaceSummary();
 			checkConnection();
@@ -655,6 +710,7 @@
 		return () => {
 			clearInterval(interval);
 			window.removeEventListener('online', handleOnline);
+			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		};
 	});
 </script>

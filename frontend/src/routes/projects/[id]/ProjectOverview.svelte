@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, type Agent, type Conversation, type Project, type Task } from '$lib/api';
+	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
+	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
 
 	let { projectId }: { projectId: string } = $props();
 	let project = $state<Project | null>(null);
@@ -16,21 +18,40 @@
 	let selectedAgents = $state<string[]>([]);
 	let selectedAgentToMove = $state('');
 	let projectIdCopied = $state(false);
+	let showingProjectSettings = $state(false);
 	let error = $state('');
+	let projectMutationVersion = 0;
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
 
-	onMount(() => void load());
+	onMount(() => {
+		const handleProjectMutation = (event: Event) => {
+			const mutation = (event as CustomEvent<ProjectMutation>).detail;
+			if (mutation?.kind !== 'updated' || mutation.project.id !== projectId) return;
+			projectMutationVersion += 1;
+			if (mutation.authoritative || !project || project.updated_at < mutation.project.updated_at) {
+				project = mutation.project;
+			}
+		};
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		void load();
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+	});
 
 	async function load() {
+		const mutationVersionAtStart = projectMutationVersion;
 		try {
-			[project, projectConversations, agentList, taskList] = await Promise.all([
+			const [loadedProject, loadedConversations, loadedAgents, loadedTasks] = await Promise.all([
 				projects.get(projectId),
 				conversations.list(projectId),
 				agents.list(),
 				projects.tasks(projectId),
 			]);
+			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
+			projectConversations = loadedConversations;
+			agentList = loadedAgents;
+			taskList = loadedTasks;
 			if (selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load this project.';
@@ -86,6 +107,18 @@
 		}
 	}
 
+	function projectUpdated(updated: Project) {
+		project = updated;
+		showingProjectSettings = false;
+		error = '';
+		publishProjectMutation({ kind: 'updated', project: updated });
+	}
+
+	function projectDeleted(deletedProjectId: string) {
+		showingProjectSettings = false;
+		publishProjectMutation({ kind: 'deleted', projectId: deletedProjectId });
+	}
+
 	function taskDot(status: string): string {
 		if (status === 'failed' || status === 'blocked') return 'bg-red-500';
 		if (status === 'in_progress' || status === 'running') return 'bg-blue-500 animate-pulse';
@@ -104,7 +137,10 @@
 					<span class="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-xl font-semibold text-primary">{project.icon || project.name.slice(0, 1).toUpperCase()}</span>
 					<div class="min-w-0"><p class="text-xs text-muted-foreground"><a href="/projects" class="hover:text-foreground">Projects</a> /</p><h1 class="truncate text-2xl font-bold">{project.name}</h1><p class="mt-1 text-sm text-muted-foreground">{project.description || 'A shared context for conversations, Agents, tasks, and memory.'}</p><div class="mt-2 flex min-w-0 items-center gap-2 text-[11px] text-muted-foreground"><span class="shrink-0 font-medium">Project ID</span><code data-project-id class="min-w-0 select-all truncate rounded bg-muted px-1.5 py-0.5 font-mono">{project.id}</code><button type="button" aria-label="Copy project ID" onclick={() => void copyProjectId()} class="shrink-0 font-medium text-primary hover:underline">{projectIdCopied ? 'Copied' : 'Copy ID'}</button></div></div>
 				</div>
-				<button type="button" onclick={() => (creatingConversation = !creatingConversation)} class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">+ Conversation</button>
+				<div class="flex shrink-0 items-center gap-2">
+					<button type="button" onclick={() => (showingProjectSettings = true)} class="rounded-lg border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">Project settings</button>
+					<button type="button" onclick={() => (creatingConversation = !creatingConversation)} class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">+ Conversation</button>
+				</div>
 			</header>
 
 			{#if error}<div class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>{/if}
@@ -143,3 +179,12 @@
 		<div class="p-6 text-sm text-destructive">{error || 'Project not found.'}</div>
 	{/if}
 </div>
+
+{#if project && showingProjectSettings}
+	<ProjectSettingsDialog
+		{project}
+		onclose={() => (showingProjectSettings = false)}
+		onupdated={projectUpdated}
+		ondeleted={projectDeleted}
+	/>
+{/if}

@@ -65,6 +65,23 @@ function attempt(status: string, contextUsed = 128_000, errorMessage: string | n
 	};
 }
 
+interface MockProject {
+	id: string;
+	name: string;
+	description: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	agent_ids: string[];
+	conversation_count: number;
+	task_count: number;
+}
+
+interface SharedProjectState {
+	project?: MockProject;
+	deleted?: boolean;
+}
+
 async function mockApi(
 	page: Page,
 	options: {
@@ -146,6 +163,17 @@ async function mockApi(
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
 		projectSyncFetchConflictOnce?: boolean;
+		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
+		projectDeleteRequests?: string[];
+		projectDeleteError?: string;
+		projectGetRequests?: string[];
+		projectGetGate?: Promise<void>;
+		projectListRequests?: string[];
+		projectListGate?: Promise<void>;
+		projectListTargetLast?: boolean;
+		secondaryProjectName?: string;
+		secondaryProjectUpdatedAt?: string;
+		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 	} = {},
 ) {
@@ -266,7 +294,7 @@ async function mockApi(
 		completed: 0,
 		cancelled: 0,
 	});
-	const project = {
+	let project: MockProject = {
 		id: projectId,
 		name: 'Browser collaboration project',
 		description: 'A project with conversations, Agents, and tasks.',
@@ -277,18 +305,27 @@ async function mockApi(
 		conversation_count: options.conversations?.length ?? 0,
 		task_count: listedTasks.length,
 	};
-	const availableProjects = options.projectCount
+	if (options.sharedProjectState?.project) {
+		project = { ...project, ...options.sharedProjectState.project };
+	} else if (options.sharedProjectState) {
+		options.sharedProjectState.project = { ...project };
+	}
+	let availableProjects = options.projectCount
 		? availableAgents.map((availableAgent, index) => ({
 			...project,
 			id: index === 0 ? project.id : availableAgent.project_id,
-			name: index === 0 ? project.name : `Mobile project ${index + 1}`,
+			name: index === 0 ? project.name : options.secondaryProjectName ?? `Mobile project ${index + 1}`,
 			description: index === 0
 				? project.description
 				: `Project ${index + 1} verifies the mobile hierarchy can scroll.`,
+			updated_at: index === 0 ? project.updated_at : options.secondaryProjectUpdatedAt ?? project.updated_at,
 			agent_ids: [availableAgent.id],
 			task_count: listedTasks.filter((listedTask) => listedTask.agent_id === availableAgent.id).length,
 		}))
 		: [project];
+	if (options.projectListTargetLast && availableProjects.length > 1) {
+		availableProjects = [...availableProjects.slice(1), availableProjects[0]];
+	}
 	let conversationMessages = [...(options.conversationMessages ?? [])];
 
 	if (!options.preserveWorkspace) {
@@ -323,7 +360,14 @@ async function mockApi(
 				suggestion: null,
 			};
 		} else if (path === '/api/settings/sync') {
-			response = { projects: options.projectSyncStatuses ?? [] };
+			const sharedProject = options.sharedProjectState?.project;
+			response = {
+				projects: (options.projectSyncStatuses ?? [])
+					.filter((syncProject) => syncProject.project_id !== projectId || !options.sharedProjectState?.deleted)
+					.map((syncProject) => syncProject.project_id === projectId && sharedProject
+						? { ...syncProject, project_name: sharedProject.name, project_icon: sharedProject.icon }
+						: syncProject),
+			};
 		} else if (/^\/api\/settings\/sync\/[^/]+\/(fetch|publish)$/.test(path)) {
 			const parts = path.split('/');
 			const projectId = decodeURIComponent(parts[4]);
@@ -347,9 +391,67 @@ async function mockApi(
 				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
 			};
 		} else if (path === '/api/projects') {
-			response = availableProjects;
+			const sharedProject = options.sharedProjectState?.project;
+			const projectListSnapshot = availableProjects
+				.filter((availableProject) => availableProject.id !== projectId || !options.sharedProjectState?.deleted)
+				.map((availableProject) => ({
+					...availableProject,
+					...(availableProject.id === projectId && sharedProject ? sharedProject : {}),
+					agent_ids: [...availableProject.agent_ids],
+				}));
+			options.projectListRequests?.push(path);
+			await options.projectListGate;
+			response = projectListSnapshot;
 		} else if (path === `/api/projects/${projectId}`) {
-			response = project;
+			if (request.method() === 'PATCH') {
+				const data = request.postDataJSON() as Record<string, unknown>;
+				options.projectUpdateRequests?.push({ projectId, data });
+				project = {
+					...project,
+					name: typeof data.name === 'string' ? data.name : project.name,
+					description: typeof data.description === 'string' ? data.description : project.description,
+					updated_at: timestamp(120),
+				};
+				if (options.sharedProjectState) {
+					options.sharedProjectState.project = { ...project };
+					options.sharedProjectState.deleted = false;
+				}
+				availableProjects = availableProjects.map((availableProject) =>
+					availableProject.id === projectId ? { ...availableProject, ...project } : availableProject
+				);
+				response = project;
+			} else if (request.method() === 'DELETE') {
+				options.projectDeleteRequests?.push(projectId);
+				if (options.projectDeleteError) {
+					await route.fulfill({
+						status: 409,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: options.projectDeleteError }),
+					});
+					return;
+				}
+				availableProjects = availableProjects.filter((availableProject) => availableProject.id !== projectId);
+				if (options.sharedProjectState) options.sharedProjectState.deleted = true;
+				await route.fulfill({ status: 204, body: '' });
+				return;
+			} else {
+				const projectWasDeleted = options.sharedProjectState?.deleted === true;
+				const projectSnapshot = {
+					...project,
+					...(options.sharedProjectState?.project ?? {}),
+				};
+				options.projectGetRequests?.push(projectId);
+				await options.projectGetGate;
+				if (projectWasDeleted) {
+					await route.fulfill({
+						status: 404,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: 'Project not found' }),
+					});
+					return;
+				}
+				response = projectSnapshot;
+			}
 		} else if (path === `/api/projects/${projectId}/tasks`) {
 			response = listedTasks;
 		} else if (path === '/api/conversations') {
@@ -1161,6 +1263,303 @@ test('project pages expose a copyable canonical ID', async ({ page }) => {
 	await expect.poll(() => page.evaluate(() => (
 		window as unknown as { __copiedProjectId?: string }
 	).__copiedProjectId)).toBe(projectId);
+});
+
+test('project settings rename and delete a project', async ({ page }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await expect(dialog).toHaveAccessibleName('Project settings');
+	await dialog.getByLabel('Project name').fill('Renamed collaboration project');
+	await dialog.getByLabel('Description').fill('A clearer project description.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toEqual([{
+		projectId,
+		data: {
+			name: 'Renamed collaboration project',
+			description: 'A clearer project description.',
+		},
+	}]);
+	await expect(page.getByRole('heading', { name: 'Renamed collaboration project' })).toBeVisible();
+	await expect(page.getByText('A clearer project description.')).toBeVisible();
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab-title="Renamed collaboration project"]')).toBeVisible();
+	await expect(page.locator('aside').first().getByText('Renamed collaboration project', { exact: true })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
+});
+
+test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.getByRole('heading', { name: 'Browser collaboration project' })).toHaveCount(2);
+
+	let releaseProjectGet!: () => void;
+	const projectGetGate = new Promise<void>((resolve) => (releaseProjectGet = resolve));
+	const projectGetRequests: string[] = [];
+	const otherPage = await context.newPage();
+	await otherPage.addInitScript(() => {
+		window.addEventListener('xpressclaw:project-mutation', (event) => {
+			const mutation = (event as CustomEvent<{ kind: string; project?: { name?: string } }>).detail;
+			(window as typeof window & { __latestProjectMutation?: string }).__latestProjectMutation = mutation.project?.name;
+		});
+	});
+	await mockApi(otherPage, { preserveWorkspace: true, projectGetRequests, projectGetGate, sharedProjectState });
+	const otherNavigation = otherPage.goto(`/projects/${projectId}?_xpressclaw_window=workspace-12345-1`);
+	await expect.poll(() => projectGetRequests.length).toBeGreaterThan(0);
+	expect(projectGetRequests.every((requestedProjectId) => requestedProjectId === projectId)).toBe(true);
+
+	let releaseProjectList!: () => void;
+	const projectListGate = new Promise<void>((resolve) => (releaseProjectList = resolve));
+	const projectListRequests: string[] = [];
+	const indexPage = await context.newPage();
+	await mockApi(indexPage, {
+		preserveWorkspace: true,
+		projectCount: 2,
+		projectListRequests,
+		projectListGate,
+		projectListTargetLast: true,
+		secondaryProjectName: 'Éclair project',
+		secondaryProjectUpdatedAt: timestamp(120),
+		sharedProjectState,
+	});
+	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
+	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
+
+	const newWorkPage = await context.newPage();
+	await mockApi(newWorkPage, { preserveWorkspace: true, sharedProjectState });
+	await newWorkPage.goto('/?_xpressclaw_window=workspace-12345-3');
+	const newWorkProject = newWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(newWorkProject).toHaveText('Browser collaboration project');
+
+	const syncPage = await context.newPage();
+	await mockApi(syncPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		projectSyncStatuses: [{
+			project_id: projectId,
+			project_name: 'Browser collaboration project',
+			project_icon: null,
+			status: 'ready',
+			project_dir: '/srv/repos/xpressclaw',
+			remote: 'git@github.com:XpressAI/project-data.git',
+			branch: 'main',
+			store_path: `projects/${projectId}`,
+			share_project_memory: true,
+			last_commit: null,
+			last_synced_at: null,
+			message: null,
+		}],
+	});
+	await syncPage.goto('/settings/sync?_xpressclaw_window=workspace-12345-4');
+	const syncProject = syncPage.locator(`[data-project-sync="${projectId}"]`);
+	await expect(syncProject.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+
+	const conversationPage = await context.newPage();
+	await mockApi(conversationPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Mounted project conversation',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(61),
+			last_message_at: timestamp(61),
+			participants: [],
+		}],
+	});
+	await conversationPage.goto(`/conversations/${conversationId}?_xpressclaw_window=workspace-12345-5`);
+	const conversationProjectLink = conversationPage.locator('header p a');
+	await expect(conversationProjectLink).toHaveText('Browser collaboration project');
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Synchronized project');
+	await dialog.getByLabel('Description').fill('Visible in every project view.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toHaveLength(1);
+	await expect(panes.getByRole('heading', { name: 'Synchronized project' })).toHaveCount(2);
+	await expect(panes.getByText('Visible in every project view.', { exact: true })).toHaveCount(2);
+	await expect.poll(() => otherPage.evaluate(() => (
+		window as typeof window & { __latestProjectMutation?: string }
+	).__latestProjectMutation)).toBe('Synchronized project');
+	releaseProjectGet();
+	releaseProjectList();
+	await otherNavigation;
+	await indexNavigation;
+	const otherPane = otherPage.locator('[data-workspace-pane]');
+	await expect(otherPane.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(otherPane.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Synchronized project"]')).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(indexPage.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	const projectCards = indexPage.locator('[data-projects-scroll] a[href^="/projects/"]');
+	await expect(projectCards).toHaveCount(2);
+	await expect(projectCards.first().getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Synchronized project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Éclair project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
+	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
+	await expect(newWorkProject).toHaveText('Synchronized project');
+	await expect(syncProject.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(conversationProjectLink).toHaveText('Synchronized project');
+
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Authoritative project',
+				description: 'The final concurrent update.',
+			}),
+		});
+		const authoritativeProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: authoritativeProject } });
+		channel.postMessage({
+			mutation: {
+				kind: 'updated',
+				project: {
+					...authoritativeProject,
+					name: 'Stale concurrent project',
+					description: 'This delayed response must not win.',
+				},
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(panes.getByRole('heading', { name: 'Authoritative project' })).toHaveCount(2);
+	await expect(otherPane.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Authoritative project', { exact: true })).toBeVisible();
+	await expect(newWorkProject).toHaveText('Authoritative project');
+	await expect(syncProject.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(conversationProjectLink).toHaveText('Authoritative project');
+	expect(context.pages()).toHaveLength(6);
+	for (const openPage of context.pages()) {
+		await expect(openPage.getByText('Stale concurrent project', { exact: true })).toHaveCount(0);
+	}
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Unsaved local project name');
+	await dialog.getByLabel('Description').fill('Keep this draft while remote updates arrive.');
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Remote project rename',
+				description: 'The remote update should not dismiss an active editor.',
+			}),
+		});
+		const remoteProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: remoteProject } });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByLabel('Project name')).toHaveValue('Unsaved local project name');
+	await expect(dialog.getByLabel('Description')).toHaveValue('Keep this draft while remote updates arrive.');
+	await expect(panes.getByRole('heading', { name: 'Remote project rename' })).toHaveCount(2);
+	await expect(conversationProjectLink).toHaveText('Remote project rename');
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	await conversationPage.close();
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(otherPage).toHaveURL(/\/projects$/);
+	await expect(otherPage.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Éclair project' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Create your first project' })).toHaveCount(0);
+	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(syncPage.getByText('No Projects yet', { exact: true })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-tab-title="Synchronized project"], [data-workspace-tab-title="Browser collaboration project"]')).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Projects"]')).toBeVisible();
+
+	const lateProjectGetRequests: string[] = [];
+	const lateNewWorkPage = await context.newPage();
+	await mockApi(lateNewWorkPage, {
+		preserveWorkspace: true,
+		projectGetRequests: lateProjectGetRequests,
+		sharedProjectState,
+	});
+	await lateNewWorkPage.goto('/?_xpressclaw_window=workspace-12345-6');
+	const lateNewWorkProject = lateNewWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(lateNewWorkProject).toHaveCount(0);
+
+	await lateNewWorkPage.evaluate(async ({ id, staleProject }) => {
+		const modulePath = '/src/lib/projectEvents.ts';
+		const projectEvents = await import(modulePath);
+		projectEvents.publishProjectMutation({
+			kind: 'updated',
+			project: { ...staleProject, id, name: 'Delayed deleted project' },
+		});
+	}, { id: projectId, staleProject: sharedProjectState.project! });
+
+	await expect.poll(() => lateProjectGetRequests).toContain(projectId);
+	await expect(lateNewWorkProject).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await lateNewWorkPage.close();
+	await syncPage.close();
+	await newWorkPage.close();
+	await indexPage.close();
+	await otherPage.close();
+});
+
+test('project settings keep deletion errors visible and actionable', async ({ page }) => {
+	const projectDeleteRequests: string[] = [];
+	const projectDeleteError = "move or remove this project's agents, conversations, and tasks first";
+	await mockApi(page, { projectDeleteRequests, projectDeleteError });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
+	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
+	await expect(dialog.getByRole('button', { name: 'Delete project' })).toBeEnabled();
 });
 
 test('opening a conversation reveals its newest messages after media loads', async ({ page }) => {
