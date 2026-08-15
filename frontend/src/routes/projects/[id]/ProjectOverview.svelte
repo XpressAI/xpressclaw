@@ -20,6 +20,7 @@
 	let projectIdCopied = $state(false);
 	let showingProjectSettings = $state(false);
 	let error = $state('');
+	let projectMutationVersion = 0;
 
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
@@ -28,6 +29,7 @@
 		const handleProjectMutation = (event: Event) => {
 			const mutation = (event as CustomEvent<ProjectMutation>).detail;
 			if (mutation?.kind !== 'updated' || mutation.project.id !== projectId) return;
+			projectMutationVersion += 1;
 			project = mutation.project;
 			showingProjectSettings = false;
 			error = '';
@@ -38,13 +40,18 @@
 	});
 
 	async function load() {
+		const mutationVersionAtStart = projectMutationVersion;
 		try {
-			[project, projectConversations, agentList, taskList] = await Promise.all([
+			const [loadedProject, loadedConversations, loadedAgents, loadedTasks] = await Promise.all([
 				projects.get(projectId),
 				conversations.list(projectId),
 				agents.list(),
 				projects.tasks(projectId),
 			]);
+			if (projectMutationVersion === mutationVersionAtStart) project = loadedProject;
+			projectConversations = loadedConversations;
+			agentList = loadedAgents;
+			taskList = loadedTasks;
 			if (selectedAgents.length === 0) selectedAgents = project?.agent_ids.slice() ?? [];
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load this project.';
