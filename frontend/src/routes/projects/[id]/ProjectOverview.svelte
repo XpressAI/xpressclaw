@@ -1,8 +1,7 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, type Agent, type Conversation, type Project, type Task } from '$lib/api';
-	import { publishProjectMutation } from '$lib/projectEvents';
+	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import ProjectSettingsDialog from '$lib/components/ProjectSettingsDialog.svelte';
@@ -25,7 +24,18 @@
 	let projectAgents = $derived(agentList.filter((agent) => agent.project_id === projectId));
 	let availableAgents = $derived(agentList.filter((agent) => agent.project_id !== projectId));
 
-	onMount(() => void load());
+	onMount(() => {
+		const handleProjectMutation = (event: Event) => {
+			const mutation = (event as CustomEvent<ProjectMutation>).detail;
+			if (mutation?.kind !== 'updated' || mutation.project.id !== projectId) return;
+			project = mutation.project;
+			showingProjectSettings = false;
+			error = '';
+		};
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		void load();
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+	});
 
 	async function load() {
 		try {
@@ -100,7 +110,6 @@
 	function projectDeleted(deletedProjectId: string) {
 		showingProjectSettings = false;
 		publishProjectMutation({ kind: 'deleted', projectId: deletedProjectId });
-		void goto('/projects', { replaceState: true, noScroll: true });
 	}
 
 	function taskDot(status: string): string {

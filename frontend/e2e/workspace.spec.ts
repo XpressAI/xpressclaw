@@ -1232,6 +1232,51 @@ test('project settings rename and delete a project', async ({ page }) => {
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
 });
 
+test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	const otherPage = await context.newPage();
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	await mockApi(otherPage, { preserveWorkspace: true });
+	await Promise.all([
+		page.goto(`/projects/${projectId}`),
+		otherPage.goto(`/projects/${projectId}`),
+	]);
+	await expect(otherPage.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.getByRole('heading', { name: 'Browser collaboration project' })).toHaveCount(2);
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Synchronized project');
+	await dialog.getByLabel('Description').fill('Visible in every project view.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toHaveLength(1);
+	await expect(panes.getByRole('heading', { name: 'Synchronized project' })).toHaveCount(2);
+	await expect(panes.getByText('Visible in every project view.', { exact: true })).toHaveCount(2);
+	await expect(otherPage.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(otherPage.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Synchronized project"]')).toBeVisible();
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(otherPage).toHaveURL(/\/projects$/);
+	await expect(otherPage.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-tab-title="Synchronized project"], [data-workspace-tab-title="Browser collaboration project"]')).toHaveCount(0);
+	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Projects"]')).toBeVisible();
+	await otherPage.close();
+});
+
 test('project settings keep deletion errors visible and actionable', async ({ page }) => {
 	const projectDeleteRequests: string[] = [];
 	const projectDeleteError = "move or remove this project's agents, conversations, and tasks first";

@@ -567,6 +567,7 @@
 		}
 		if (mutation?.kind !== 'deleted') return;
 
+		const focusedProjectWasDeleted = focusedTab?.kind === 'project' && focusedTab.resourceId === mutation.projectId;
 		projectList = projectList.filter((project) => project.id !== mutation.projectId);
 		panes = panes.map((pane) => {
 			const tabs = pane.tabs.filter((tab) => !(tab.kind === 'project' && tab.resourceId === mutation.projectId));
@@ -581,6 +582,14 @@
 			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
 		});
 		persistWorkspace();
+		if (focusedProjectWasDeleted) {
+			const nextPane = panes.find((pane) => pane.id === focusedPaneId) ?? panes[0];
+			const nextTab = activeTabFor(nextPane);
+			if (currentRoute() !== nextTab.path) {
+				lastSyncedPath = nextTab.path;
+				void goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
+			}
+		}
 	}
 
 	async function checkDocker() {
