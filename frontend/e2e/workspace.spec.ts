@@ -154,6 +154,8 @@ async function mockApi(
 		projectListRequests?: string[];
 		projectListGate?: Promise<void>;
 		projectListTargetLast?: boolean;
+		secondaryProjectName?: string;
+		secondaryProjectUpdatedAt?: string;
 		preserveWorkspace?: boolean;
 	} = {},
 ) {
@@ -289,10 +291,11 @@ async function mockApi(
 		? availableAgents.map((availableAgent, index) => ({
 			...project,
 			id: index === 0 ? project.id : availableAgent.project_id,
-			name: index === 0 ? project.name : `Mobile project ${index + 1}`,
+			name: index === 0 ? project.name : options.secondaryProjectName ?? `Mobile project ${index + 1}`,
 			description: index === 0
 				? project.description
 				: `Project ${index + 1} verifies the mobile hierarchy can scroll.`,
+			updated_at: index === 0 ? project.updated_at : options.secondaryProjectUpdatedAt ?? project.updated_at,
 			agent_ids: [availableAgent.id],
 			task_count: listedTasks.filter((listedTask) => listedTask.agent_id === availableAgent.id).length,
 		}))
@@ -1285,6 +1288,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 		projectListRequests,
 		projectListGate,
 		projectListTargetLast: true,
+		secondaryProjectName: 'Éclair project',
+		secondaryProjectUpdatedAt: timestamp(120),
 	});
 	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
 	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
@@ -1315,7 +1320,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(projectCards).toHaveCount(2);
 	await expect(projectCards.first().getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Synchronized project', { exact: true })).toBeVisible();
-	await expect(indexPage.locator('aside').first().getByText('Mobile project 2', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Éclair project', { exact: true })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
 	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
 
@@ -1328,7 +1333,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(page).toHaveURL(/\/projects$/);
 	await expect(otherPage).toHaveURL(/\/projects$/);
 	await expect(otherPage.getByRole('heading', { name: 'Projects' })).toBeVisible();
-	await expect(indexPage.getByRole('heading', { name: 'Mobile project 2' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Éclair project' })).toBeVisible();
 	await expect(indexPage.getByRole('heading', { name: 'Create your first project' })).toHaveCount(0);
 	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);

@@ -8,11 +8,23 @@ export type ProjectMutation =
 	| { kind: 'updated'; project: Project }
 	| { kind: 'deleted'; projectId: string };
 
+const textEncoder = new TextEncoder();
+
+function compareSqliteNoCase(left: string, right: string): number {
+	const encode = (value: string) => textEncoder.encode(value.replace(/[A-Z]/g, (character) => character.toLowerCase()));
+	const leftBytes = encode(left);
+	const rightBytes = encode(right);
+	for (let index = 0; index < Math.min(leftBytes.length, rightBytes.length); index += 1) {
+		if (leftBytes[index] !== rightBytes[index]) return leftBytes[index] - rightBytes[index];
+	}
+	return leftBytes.length - rightBytes.length;
+}
+
 export function sortProjectsByRecency(projects: Project[]): Project[] {
 	return [...projects].sort((left, right) => {
 		const updatedAtDifference = Date.parse(right.updated_at) - Date.parse(left.updated_at);
 		if (Number.isFinite(updatedAtDifference) && updatedAtDifference !== 0) return updatedAtDifference;
-		return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+		return compareSqliteNoCase(left.name, right.name);
 	});
 }
 
