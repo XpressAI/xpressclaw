@@ -1315,6 +1315,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(projectCards).toHaveCount(2);
 	await expect(projectCards.first().getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Synchronized project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Mobile project 2', { exact: true })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
 	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
 

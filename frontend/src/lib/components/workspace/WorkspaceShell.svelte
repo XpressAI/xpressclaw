@@ -67,6 +67,7 @@
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
 	let projectMutationVersion = 0;
+	const projectMutations = new Map<string, { version: number; mutation: ProjectMutation }>();
 
 	let dockerAvailable = $state(true);
 	let dockerInstalled = $state(true);
@@ -547,9 +548,9 @@
 				workflowsApi.list().catch(() => workflowList),
 				schedulesApi.list().catch(() => scheduleList),
 			]);
-			if (projectMutationVersion === startingProjectMutationVersion) {
-				projectList = nextProjects;
-			}
+			projectList = [...projectMutations.values()]
+				.filter(({ version }) => version > startingProjectMutationVersion)
+				.reduce((list, { mutation }) => applyProjectMutation(list, mutation), nextProjects);
 			conversationList = nextConversations;
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
@@ -564,10 +565,10 @@
 		const mutation = (event as CustomEvent<ProjectMutation>).detail;
 		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
 		projectMutationVersion += 1;
+		const projectId = mutation.kind === 'updated' ? mutation.project.id : mutation.projectId;
+		projectMutations.set(projectId, { version: projectMutationVersion, mutation });
 		if (mutation.kind === 'updated') {
-			projectList = sortProjectsByRecency(projectList.some((project) => project.id === mutation.project.id)
-				? projectList.map((project) => project.id === mutation.project.id ? mutation.project : project)
-				: [...projectList, mutation.project]);
+			projectList = applyProjectMutation(projectList, mutation);
 			refreshTabMetadata();
 			return;
 		}
@@ -594,6 +595,15 @@
 				void goto(nextTab.path, { replaceState: true, keepFocus: true, noScroll: true });
 			}
 		}
+	}
+
+	function applyProjectMutation(list: Project[], mutation: ProjectMutation): Project[] {
+		if (mutation.kind === 'deleted') {
+			return list.filter((project) => project.id !== mutation.projectId);
+		}
+		return sortProjectsByRecency(list.some((project) => project.id === mutation.project.id)
+			? list.map((project) => project.id === mutation.project.id ? mutation.project : project)
+			: [...list, mutation.project]);
 	}
 
 	async function checkDocker() {
