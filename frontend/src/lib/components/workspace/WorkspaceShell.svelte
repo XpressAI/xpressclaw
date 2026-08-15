@@ -7,6 +7,7 @@
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
+	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -555,6 +556,33 @@
 		} catch {}
 	}
 
+	function handleProjectMutation(event: Event) {
+		const mutation = (event as CustomEvent<ProjectMutation>).detail;
+		if (mutation?.kind === 'updated') {
+			projectList = projectList.some((project) => project.id === mutation.project.id)
+				? projectList.map((project) => project.id === mutation.project.id ? mutation.project : project)
+				: [...projectList, mutation.project];
+			refreshTabMetadata();
+			return;
+		}
+		if (mutation?.kind !== 'deleted') return;
+
+		projectList = projectList.filter((project) => project.id !== mutation.projectId);
+		panes = panes.map((pane) => {
+			const tabs = pane.tabs.filter((tab) => !(tab.kind === 'project' && tab.resourceId === mutation.projectId));
+			if (tabs.length > 0) {
+				return {
+					...pane,
+					tabs,
+					activeTabId: tabs.some((tab) => tab.id === pane.activeTabId) ? pane.activeTabId : tabs[0].id,
+				};
+			}
+			const fallback = { ...createWorkspaceTab('/projects'), lastActiveAt: nextTabRecency() };
+			return { ...pane, tabs: [fallback], activeTabId: fallback.id };
+		});
+		persistWorkspace();
+	}
+
 	async function checkDocker() {
 		try {
 			const response = await fetch('/api/setup/check-docker');
@@ -647,6 +675,7 @@
 		checkDocker();
 		const handleOnline = () => void checkConnection();
 		window.addEventListener('online', handleOnline);
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		const interval = setInterval(() => {
 			loadWorkspaceSummary();
 			checkConnection();
@@ -655,6 +684,7 @@
 		return () => {
 			clearInterval(interval);
 			window.removeEventListener('online', handleOnline);
+			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		};
 	});
 </script>

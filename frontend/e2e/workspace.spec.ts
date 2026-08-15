@@ -146,6 +146,9 @@ async function mockApi(
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
 		projectSyncFetchConflictOnce?: boolean;
+		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
+		projectDeleteRequests?: string[];
+		projectDeleteError?: string;
 		preserveWorkspace?: boolean;
 	} = {},
 ) {
@@ -266,7 +269,7 @@ async function mockApi(
 		completed: 0,
 		cancelled: 0,
 	});
-	const project = {
+	let project = {
 		id: projectId,
 		name: 'Browser collaboration project',
 		description: 'A project with conversations, Agents, and tasks.',
@@ -277,7 +280,7 @@ async function mockApi(
 		conversation_count: options.conversations?.length ?? 0,
 		task_count: listedTasks.length,
 	};
-	const availableProjects = options.projectCount
+	let availableProjects = options.projectCount
 		? availableAgents.map((availableAgent, index) => ({
 			...project,
 			id: index === 0 ? project.id : availableAgent.project_id,
@@ -349,7 +352,35 @@ async function mockApi(
 		} else if (path === '/api/projects') {
 			response = availableProjects;
 		} else if (path === `/api/projects/${projectId}`) {
-			response = project;
+			if (request.method() === 'PATCH') {
+				const data = request.postDataJSON() as Record<string, unknown>;
+				options.projectUpdateRequests?.push({ projectId, data });
+				project = {
+					...project,
+					name: typeof data.name === 'string' ? data.name : project.name,
+					description: typeof data.description === 'string' ? data.description : project.description,
+					updated_at: timestamp(120),
+				};
+				availableProjects = availableProjects.map((availableProject) =>
+					availableProject.id === projectId ? { ...availableProject, ...project } : availableProject
+				);
+				response = project;
+			} else if (request.method() === 'DELETE') {
+				options.projectDeleteRequests?.push(projectId);
+				if (options.projectDeleteError) {
+					await route.fulfill({
+						status: 409,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: options.projectDeleteError }),
+					});
+					return;
+				}
+				availableProjects = availableProjects.filter((availableProject) => availableProject.id !== projectId);
+				await route.fulfill({ status: 204, body: '' });
+				return;
+			} else {
+				response = project;
+			}
 		} else if (path === `/api/projects/${projectId}/tasks`) {
 			response = listedTasks;
 		} else if (path === '/api/conversations') {
@@ -1161,6 +1192,61 @@ test('project pages expose a copyable canonical ID', async ({ page }) => {
 	await expect.poll(() => page.evaluate(() => (
 		window as unknown as { __copiedProjectId?: string }
 	).__copiedProjectId)).toBe(projectId);
+});
+
+test('project settings rename and delete a project', async ({ page }) => {
+	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
+	const projectDeleteRequests: string[] = [];
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	let dialog = page.getByRole('dialog');
+	await expect(dialog).toHaveAccessibleName('Project settings');
+	await dialog.getByLabel('Project name').fill('Renamed collaboration project');
+	await dialog.getByLabel('Description').fill('A clearer project description.');
+	await dialog.getByRole('button', { name: 'Save changes' }).click();
+
+	await expect.poll(() => projectUpdateRequests).toEqual([{
+		projectId,
+		data: {
+			name: 'Renamed collaboration project',
+			description: 'A clearer project description.',
+		},
+	}]);
+	await expect(page.getByRole('heading', { name: 'Renamed collaboration project' })).toBeVisible();
+	await expect(page.getByText('A clearer project description.')).toBeVisible();
+	await expect(page.locator('[data-workspace-pane] [data-workspace-tab-title="Renamed collaboration project"]')).toBeVisible();
+	await expect(page.locator('aside').first().getByText('Renamed collaboration project', { exact: true })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(page).toHaveURL(/\/projects$/);
+	await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible();
+	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
+});
+
+test('project settings keep deletion errors visible and actionable', async ({ page }) => {
+	const projectDeleteRequests: string[] = [];
+	const projectDeleteError = "move or remove this project's agents, conversations, and tasks first";
+	await mockApi(page, { projectDeleteRequests, projectDeleteError });
+	await page.goto(`/projects/${projectId}`);
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
+	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
+	await expect(dialog.getByRole('button', { name: 'Delete project' })).toBeEnabled();
 });
 
 test('opening a conversation reveals its newest messages after media loads', async ({ page }) => {
