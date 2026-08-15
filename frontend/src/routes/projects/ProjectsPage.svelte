@@ -2,6 +2,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { projects, type Project } from '$lib/api';
+	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 	import { timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 
@@ -11,11 +12,34 @@
 	let name = $state('');
 	let description = $state('');
 	let error = $state('');
+	const projectMutations = new Map<string, ProjectMutation>();
 
-	onMount(() => void load());
+	onMount(() => {
+		const handleProjectMutation = (event: Event) => {
+			const mutation = (event as CustomEvent<ProjectMutation>).detail;
+			if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
+			const projectId = mutation.kind === 'updated' ? mutation.project.id : mutation.projectId;
+			projectMutations.set(projectId, mutation);
+			projectList = applyProjectMutation(projectList, mutation);
+		};
+
+		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		void load();
+		return () => window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+	});
+
+	function applyProjectMutation(list: Project[], mutation: ProjectMutation): Project[] {
+		if (mutation.kind === 'deleted') {
+			return list.filter((project) => project.id !== mutation.projectId);
+		}
+		return list.map((project) => project.id === mutation.project.id ? mutation.project : project);
+	}
 
 	async function load() {
-		projectList = await projects.list().catch(() => projectList);
+		const loadedProjects = await projects.list().catch(() => null);
+		if (loadedProjects) {
+			projectList = [...projectMutations.values()].reduce(applyProjectMutation, loadedProjects);
+		}
 		loading = false;
 	}
 
