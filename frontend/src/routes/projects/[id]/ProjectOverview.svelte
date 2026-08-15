@@ -30,7 +30,9 @@
 			const mutation = (event as CustomEvent<ProjectMutation>).detail;
 			if (mutation?.kind !== 'updated' || mutation.project.id !== projectId) return;
 			projectMutationVersion += 1;
-			project = mutation.project;
+			if (mutation.authoritative || !project || project.updated_at < mutation.project.updated_at) {
+				project = mutation.project;
+			}
 			showingProjectSettings = false;
 			error = '';
 		};

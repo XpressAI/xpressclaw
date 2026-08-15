@@ -65,6 +65,23 @@ function attempt(status: string, contextUsed = 128_000, errorMessage: string | n
 	};
 }
 
+interface MockProject {
+	id: string;
+	name: string;
+	description: string | null;
+	icon: string | null;
+	created_at: string;
+	updated_at: string;
+	agent_ids: string[];
+	conversation_count: number;
+	task_count: number;
+}
+
+interface SharedProjectState {
+	project?: MockProject;
+	deleted?: boolean;
+}
+
 async function mockApi(
 	page: Page,
 	options: {
@@ -156,6 +173,7 @@ async function mockApi(
 		projectListTargetLast?: boolean;
 		secondaryProjectName?: string;
 		secondaryProjectUpdatedAt?: string;
+		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 	} = {},
 ) {
@@ -276,7 +294,7 @@ async function mockApi(
 		completed: 0,
 		cancelled: 0,
 	});
-	let project = {
+	let project: MockProject = {
 		id: projectId,
 		name: 'Browser collaboration project',
 		description: 'A project with conversations, Agents, and tasks.',
@@ -287,6 +305,11 @@ async function mockApi(
 		conversation_count: options.conversations?.length ?? 0,
 		task_count: listedTasks.length,
 	};
+	if (options.sharedProjectState?.project) {
+		project = { ...project, ...options.sharedProjectState.project };
+	} else if (options.sharedProjectState) {
+		options.sharedProjectState.project = { ...project };
+	}
 	let availableProjects = options.projectCount
 		? availableAgents.map((availableAgent, index) => ({
 			...project,
@@ -361,10 +384,14 @@ async function mockApi(
 				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
 			};
 		} else if (path === '/api/projects') {
-			const projectListSnapshot = availableProjects.map((availableProject) => ({
-				...availableProject,
-				agent_ids: [...availableProject.agent_ids],
-			}));
+			const sharedProject = options.sharedProjectState?.project;
+			const projectListSnapshot = availableProjects
+				.filter((availableProject) => availableProject.id !== projectId || !options.sharedProjectState?.deleted)
+				.map((availableProject) => ({
+					...availableProject,
+					...(availableProject.id === projectId && sharedProject ? sharedProject : {}),
+					agent_ids: [...availableProject.agent_ids],
+				}));
 			options.projectListRequests?.push(path);
 			await options.projectListGate;
 			response = projectListSnapshot;
@@ -378,6 +405,10 @@ async function mockApi(
 					description: typeof data.description === 'string' ? data.description : project.description,
 					updated_at: timestamp(120),
 				};
+				if (options.sharedProjectState) {
+					options.sharedProjectState.project = { ...project };
+					options.sharedProjectState.deleted = false;
+				}
 				availableProjects = availableProjects.map((availableProject) =>
 					availableProject.id === projectId ? { ...availableProject, ...project } : availableProject
 				);
@@ -393,10 +424,14 @@ async function mockApi(
 					return;
 				}
 				availableProjects = availableProjects.filter((availableProject) => availableProject.id !== projectId);
+				if (options.sharedProjectState) options.sharedProjectState.deleted = true;
 				await route.fulfill({ status: 204, body: '' });
 				return;
 			} else {
-				const projectSnapshot = { ...project };
+				const projectSnapshot = {
+					...project,
+					...(options.sharedProjectState?.project ?? {}),
+				};
 				options.projectGetRequests?.push(projectId);
 				await options.projectGetGate;
 				response = projectSnapshot;
@@ -1255,7 +1290,8 @@ test('project settings rename and delete a project', async ({ page }) => {
 test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
 	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
 	const projectDeleteRequests: string[] = [];
-	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectUpdateRequests, projectDeleteRequests, sharedProjectState });
 	await page.goto(`/projects/${projectId}`);
 
 	await page.getByRole('button', { name: 'Split active tab right' }).click();
@@ -1273,7 +1309,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 			(window as typeof window & { __latestProjectMutation?: string }).__latestProjectMutation = mutation.project?.name;
 		});
 	});
-	await mockApi(otherPage, { preserveWorkspace: true, projectGetRequests, projectGetGate });
+	await mockApi(otherPage, { preserveWorkspace: true, projectGetRequests, projectGetGate, sharedProjectState });
 	const otherNavigation = otherPage.goto(`/projects/${projectId}?_xpressclaw_window=workspace-12345-1`);
 	await expect.poll(() => projectGetRequests.length).toBeGreaterThan(0);
 	expect(projectGetRequests.every((requestedProjectId) => requestedProjectId === projectId)).toBe(true);
@@ -1290,6 +1326,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 		projectListTargetLast: true,
 		secondaryProjectName: 'Éclair project',
 		secondaryProjectUpdatedAt: timestamp(120),
+		sharedProjectState,
 	});
 	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
 	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
@@ -1323,6 +1360,41 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(indexPage.locator('aside').first().getByText('Éclair project', { exact: true })).toBeVisible();
 	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
 	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
+
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Authoritative project',
+				description: 'The final concurrent update.',
+			}),
+		});
+		const authoritativeProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: authoritativeProject } });
+		channel.postMessage({
+			mutation: {
+				kind: 'updated',
+				project: {
+					...authoritativeProject,
+					name: 'Stale concurrent project',
+					description: 'This delayed response must not win.',
+				},
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(panes.getByRole('heading', { name: 'Authoritative project' })).toHaveCount(2);
+	await expect(otherPane.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Authoritative project', { exact: true })).toBeVisible();
+	expect(context.pages()).toHaveLength(3);
+	for (const openPage of context.pages()) {
+		await expect(openPage.getByText('Stale concurrent project', { exact: true })).toHaveCount(0);
+	}
 
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');

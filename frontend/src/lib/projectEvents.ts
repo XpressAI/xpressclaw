@@ -1,11 +1,11 @@
-import type { Project } from '$lib/api';
+import { projects as projectsApi, type Project } from '$lib/api';
 
 export const PROJECT_MUTATION_EVENT = 'xpressclaw:project-mutation';
 const PROJECT_MUTATION_CHANNEL = 'xpressclaw:project-mutations:v1';
 const PROJECT_MUTATION_STORAGE_KEY = 'xpressclaw.project-mutation.v1';
 
 export type ProjectMutation =
-	| { kind: 'updated'; project: Project }
+	| { kind: 'updated'; project: Project; authoritative?: boolean }
 	| { kind: 'deleted'; projectId: string };
 
 const textEncoder = new TextEncoder();
@@ -22,8 +22,7 @@ function compareSqliteNoCase(left: string, right: string): number {
 
 export function sortProjectsByRecency(projects: Project[]): Project[] {
 	return [...projects].sort((left, right) => {
-		const updatedAtDifference = Date.parse(right.updated_at) - Date.parse(left.updated_at);
-		if (Number.isFinite(updatedAtDifference) && updatedAtDifference !== 0) return updatedAtDifference;
+		if (left.updated_at !== right.updated_at) return left.updated_at < right.updated_at ? 1 : -1;
 		return compareSqliteNoCase(left.name, right.name);
 	});
 }
@@ -33,6 +32,7 @@ interface ProjectMutationEnvelope {
 }
 
 let mutationChannel: BroadcastChannel | null = null;
+const projectRefreshVersions = new Map<string, number>();
 
 function isProjectMutation(value: unknown): value is ProjectMutation {
 	if (!value || typeof value !== 'object') return false;
@@ -51,6 +51,21 @@ function isProjectMutationEnvelope(value: unknown): value is ProjectMutationEnve
 
 function dispatchProjectMutation(mutation: ProjectMutation): void {
 	window.dispatchEvent(new CustomEvent<ProjectMutation>(PROJECT_MUTATION_EVENT, { detail: mutation }));
+	if (mutation.kind === 'updated' && !mutation.authoritative) {
+		void refreshUpdatedProject(mutation.project.id);
+	} else if (mutation.kind === 'deleted') {
+		projectRefreshVersions.set(mutation.projectId, (projectRefreshVersions.get(mutation.projectId) ?? 0) + 1);
+	}
+}
+
+async function refreshUpdatedProject(projectId: string): Promise<void> {
+	const refreshVersion = (projectRefreshVersions.get(projectId) ?? 0) + 1;
+	projectRefreshVersions.set(projectId, refreshVersion);
+	try {
+		const project = await projectsApi.get(projectId);
+		if (projectRefreshVersions.get(projectId) !== refreshVersion) return;
+		dispatchProjectMutation({ kind: 'updated', project, authoritative: true });
+	} catch {}
 }
 
 function receiveProjectMutation(value: unknown): void {
