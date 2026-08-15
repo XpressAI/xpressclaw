@@ -1,4 +1,4 @@
-import { Marked } from 'marked';
+import { Lexer, Marked } from 'marked';
 import DOMPurify from 'dompurify';
 
 interface RenderContentOptions {
@@ -15,9 +15,58 @@ function escapeHtml(value: string): string {
 		.replaceAll("'", '&#039;');
 }
 
-// Raw HTML is message text, not a Markdown extension. Escape HTML tokens before
-// sanitizing the Markdown output so dangerous elements remain visible instead
-// of being interpreted and then removed along with their contents.
+const rawInlineHtml = Lexer.rules.inline.gfm.tag;
+const rawBlockHtml = Lexer.rules.block.gfm.html;
+
+function isBackslashEscaped(value: string, index: number): boolean {
+	let backslashes = 0;
+	for (let cursor = index - 1; cursor >= 0 && value[cursor] === '\\'; cursor -= 1) backslashes += 1;
+	return backslashes % 2 === 1;
+}
+
+function protectRawHtmlTags(value: string): { content: string; marker: string; rawTags: string[] } {
+	let marker = '\uE000';
+	while (value.includes(marker)) marker += '\uE000';
+
+	let content = '';
+	let cursor = 0;
+	const rawTags: string[] = [];
+	while (cursor < value.length) {
+		const tagStart = value.indexOf('<', cursor);
+		if (tagStart < 0) {
+			content += value.slice(cursor);
+			break;
+		}
+
+		content += value.slice(cursor, tagStart);
+		const remainder = value.slice(tagStart);
+		const inlineMatch = !isBackslashEscaped(value, tagStart)
+			? rawInlineHtml.exec(remainder)
+			: null;
+		if (inlineMatch?.index === 0) {
+			content += marker;
+			rawTags.push(inlineMatch[0]);
+			cursor = tagStart + inlineMatch[0].length;
+			continue;
+		}
+
+		// Marked's block rule recognizes a few constructs outside its inline
+		// rule. Neutralizing their opener prevents it from swallowing adjacent
+		// Markdown; the HTML renderer below remains a defense-in-depth fallback.
+		if (!isBackslashEscaped(value, tagStart) && rawBlockHtml.test(remainder)) {
+			content += marker;
+			rawTags.push('<');
+		} else {
+			content += '<';
+		}
+		cursor = tagStart + 1;
+	}
+	return { content, marker, rawTags };
+}
+
+// The pre-parser pass below handles raw HTML one tag at a time. This
+// renderer remains a safe fallback if Marked recognizes a construct its exposed
+// HTML rules did not identify.
 const markdown = new Marked({
 	breaks: true,
 	gfm: true,
@@ -34,10 +83,19 @@ const markdown = new Marked({
 });
 
 function renderMarkdown(content: string, allowDetails = false): string {
-	return DOMPurify.sanitize(markdown.parse(content) as string, allowDetails ? {
+	// Protect individual HTML tags before block tokenization. Escaping a completed
+	// HTML block token would also capture adjacent Markdown through the next blank
+	// line, while protecting only "<" would let URLs in attributes become links.
+	const protectedHtml = protectRawHtmlTags(content);
+	const sanitized = DOMPurify.sanitize(markdown.parse(protectedHtml.content) as string, allowDetails ? {
 		ADD_TAGS: ['details', 'summary'],
 		ADD_ATTR: ['open'],
 	} : undefined);
+	let result = sanitized.trimEnd();
+	for (const rawTag of protectedHtml.rawTags) {
+		result = result.replace(protectedHtml.marker, escapeHtml(rawTag));
+	}
+	return result;
 }
 
 function openLinksInNewWindow(html: string): string {

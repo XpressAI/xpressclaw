@@ -1175,6 +1175,9 @@ test('raw HTML in user and agent conversation messages stays visible and inert',
 		'',
 		'Mixed Markdown with <mark>benign HTML</mark> and <span data-raw-html="true">inline HTML</span>.',
 		'',
+		'<div data-raw-html="block">raw block</div>',
+		'**Adjacent Markdown stays bold.** and [adjacent link](https://example.com/adjacent)',
+		'',
 		'<broken attr="value"',
 		'',
 		`&lt;img src=x onerror="${execution}"&gt;`,
@@ -1252,7 +1255,7 @@ test('raw HTML in user and agent conversation messages stays visible and inert',
 	await expect(userReservedContent).toContainText('<tool_call name="demo">{"ok":true}</tool_call>');
 	await expect(userReservedContent.locator('details, tool_call, think')).toHaveCount(0);
 	await expect(agentContent.getByText('Markdown stays bold.', { exact: true })).toHaveCount(1);
-	await expect(agentContent.locator('strong')).toHaveText('Markdown stays bold.');
+	await expect(agentContent.locator('strong', { hasText: /^Markdown stays bold\.$/ })).toHaveCount(1);
 	await expect(agentContent).toContainText('<img src="missing-image" onerror="window.__rawHtmlExecuted = true">');
 	await expect(agentContent).toContainText('<svg onload="window.__rawHtmlExecuted = true"><circle></circle></svg>');
 	await expect(agentContent).toContainText('<iframe srcdoc="<script>window.__rawHtmlExecuted = true</script>"></iframe>');
@@ -1260,9 +1263,12 @@ test('raw HTML in user and agent conversation messages stays visible and inert',
 	await expect(agentContent).toContainText('<custom-card data-kind="demo">custom content</custom-card>');
 	await expect(agentContent).toContainText('<mark>benign HTML</mark>');
 	await expect(agentContent).toContainText('<span data-raw-html="true">inline HTML</span>');
+	await expect(agentContent).toContainText('<div data-raw-html="block">raw block</div>');
+	await expect(agentContent.locator('strong', { hasText: /^Adjacent Markdown stays bold\.$/ })).toHaveCount(1);
+	await expect(agentContent.getByRole('link', { name: 'adjacent link' })).toHaveAttribute('href', 'https://example.com/adjacent');
 	await expect(agentContent).toContainText('<broken attr="value"');
 	await expect(agentContent).toContainText('&lt;img src=x onerror="window.__rawHtmlExecuted = true"&gt;');
-	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, span[data-raw-html]')).toHaveCount(0);
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
 	await expect(agentContent.getByRole('link', { name: 'Markdown link' })).toHaveAttribute('href', 'https://example.com/safe');
 	await expect.poll(() => page.evaluate(() => (
 		window as typeof window & { __rawHtmlExecuted?: boolean }
@@ -1280,7 +1286,7 @@ test('raw HTML in user and agent conversation messages stays visible and inert',
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	await expect(userContent).toHaveText(userRawHtml);
-	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, span[data-raw-html]')).toHaveCount(0);
+	await expect(agentContent.locator('script, img, svg, iframe, style, custom-card, mark, div[data-raw-html], span[data-raw-html]')).toHaveCount(0);
 });
 
 test('raw HTML stays literal across task messages, activity, results, and previews', async ({ page }) => {
