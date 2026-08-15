@@ -119,6 +119,26 @@ pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Resul
         _ => {}
     }
 
+    // Older builds treated ACP plan rows as durable child tasks. Reconcile
+    // only parents whose latest attempt already succeeded and which have no
+    // queued or active work, then let workflow recovery advance any repaired
+    // step normally.
+    match xpressclaw_core::tasks::board::TaskBoard::new(state.db.clone())
+        .reconcile_finished_reported_plans()
+    {
+        Ok(reconciliation)
+            if reconciliation.deferred_items > 0 || !reconciliation.completed_tasks.is_empty() =>
+        {
+            info!(
+                deferred_plan_items = reconciliation.deferred_items,
+                completed_tasks = reconciliation.completed_tasks.len(),
+                "reconciled completed work stranded by legacy ACP plans"
+            )
+        }
+        Err(error) => warn!(error = %error, "failed to reconcile legacy ACP plans"),
+        _ => {}
+    }
+
     // Recover workflow bookkeeping before workers can claim recovered tasks.
     {
         let engine = xpressclaw_core::workflows::engine::WorkflowEngine::new(state.db.clone());

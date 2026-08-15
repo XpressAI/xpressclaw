@@ -935,41 +935,27 @@ fn finalize_if_satisfied(
             return Ok(None);
         }
 
-        let mut statement = transaction.prepare(
-            "SELECT id, context FROM tasks
-             WHERE parent_task_id = ?1 AND status != 'completed'",
-        )?;
-        let reported_subtask_ids = statement
-            .query_map([&item.task_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
-            .filter_map(|row| row.ok())
-            .filter_map(|(id, context)| {
-                context
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                    .and_then(|value| {
-                        (value.get("origin").and_then(Value::as_str) == Some("native_plan"))
-                            .then_some(id)
-                    })
-            })
-            .collect::<Vec<_>>();
-        drop(statement);
         let completed_at = Utc::now()
             .naive_utc()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        for subtask_id in reported_subtask_ids {
-            transaction.execute(
-                "UPDATE tasks SET status = 'completed', updated_at = ?1, completed_at = ?1
-                 WHERE id = ?2",
-                rusqlite::params![completed_at, subtask_id],
-            )?;
-        }
+        transaction.execute(
+            "UPDATE tasks SET status = 'cancelled', updated_at = ?1, completed_at = NULL,
+                context = json_set(
+                    COALESCE(context, '{}'),
+                    '$.plan_disposition', 'deferred',
+                    '$.resolved_reason', 'review_gate_satisfied',
+                    '$.resolved_at', ?1
+                )
+             WHERE parent_task_id = ?2 AND provenance = 'native_plan'
+               AND status NOT IN ('completed', 'cancelled')",
+            rusqlite::params![completed_at, item.task_id],
+        )?;
         let subtasks_complete: bool = transaction.query_row(
             "SELECT NOT EXISTS(
                 SELECT 1 FROM tasks
-                WHERE parent_task_id = ?1 AND status != 'completed'
+                WHERE parent_task_id = ?1 AND blocks_parent = 1
+                  AND status != 'completed'
              )",
             [&item.task_id],
             |row| row.get(0),
@@ -1715,16 +1701,18 @@ mod tests {
             )
             .unwrap();
         let plan_step = board
-            .create(&CreateTask {
-                title: "Run the tests".into(),
-                description: None,
-                agent_id: Some("project-codex".into()),
-                parent_task_id: Some(task_id.clone()),
-                sop_id: None,
-                conversation_id: None,
-                priority: None,
-                context: Some(serde_json::json!({"origin": "native_plan"})),
-            })
+            .sync_reported_subtasks(
+                &task_id,
+                "attempt-1",
+                &[crate::tasks::board::ReportedSubtask {
+                    title: "Run the tests".into(),
+                    status: TaskStatus::Pending,
+                }],
+            )
+            .unwrap();
+        let plan_step = plan_step
+            .into_iter()
+            .find(|task| task.is_native_plan_item())
             .unwrap();
 
         // Models cancellation after the poll captured `item` but before the

@@ -864,6 +864,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     if session_start == AcpSessionStart::New {
         prepend_unresumed_interrupted_prompt(&db, &item, attempt_id, &mut prompt)?;
     }
+    append_plan_lifecycle_guidance(&mut prompt.content);
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE work_attempts SET runner = ?1, prompt = ?2 WHERE id = ?3",
@@ -1148,6 +1149,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
+    if !continuation_queued && !waiting_for_user {
+        board.defer_reported_subtasks(&item.task_id, "successful_attempt_completed")?;
+    }
     let review_gate =
         crate::workers::github_review::GithubReviewManager::new(db.clone()).gate(&item.task_id)?;
     let completed_tasks = if continuation_queued {
@@ -1326,6 +1330,20 @@ pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
 struct AgentPrompt {
     content: String,
     attachments: Vec<PromptImageAttachment>,
+}
+
+const PLAN_LIFECYCLE_GUIDANCE: &str = "<xpressclaw-plan-lifecycle>\n\
+ACP plan items are current-turn checklists, not durable future work. Before finishing, mark completed current-turn items complete and do not leave speculative review, approval, merge, or other future work in progress. Use create_task with this task as parent when work must be explicitly delegated and block completion.\n\
+</xpressclaw-plan-lifecycle>";
+
+fn append_plan_lifecycle_guidance(prompt: &mut String) {
+    if prompt.contains(PLAN_LIFECYCLE_GUIDANCE) {
+        return;
+    }
+    if !prompt.trim().is_empty() {
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(PLAN_LIFECYCLE_GUIDANCE);
 }
 
 fn prepend_unresumed_interrupted_prompt(
@@ -4372,6 +4390,18 @@ mod tests {
         assert_eq!(prompt.attachments.len(), 1);
         assert_eq!(prompt.attachments[0].name, "screen.png");
         assert_eq!(prompt.attachments[0].data, b"original image");
+    }
+
+    #[test]
+    fn task_prompts_explain_plan_and_durable_delegation_semantics() {
+        let mut prompt = "Implement the requested change".to_string();
+        append_plan_lifecycle_guidance(&mut prompt);
+        append_plan_lifecycle_guidance(&mut prompt);
+
+        assert!(prompt.contains("current-turn checklists"));
+        assert!(prompt.contains("do not leave speculative review"));
+        assert!(prompt.contains("Use create_task with this task as parent"));
+        assert_eq!(prompt.matches(PLAN_LIFECYCLE_GUIDANCE).count(), 1);
     }
 
     #[test]

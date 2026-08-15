@@ -253,6 +253,7 @@
 			? latestErrorAttempt?.error_message ?? null
 			: null
 	);
+	let taskActivityStatus = $derived(task?.activity_status ?? task?.status ?? '');
 	let messagePlaceholder = $derived(
 		!task?.agent_id
 			? 'Assign an agent to chat about this task'
@@ -1026,12 +1027,35 @@
 		switch (status) {
 			case 'completed': return 'text-emerald-400';
 			case 'in_progress': return 'text-blue-400';
+			case 'awaiting_review': return 'text-violet-400';
+			case 'waiting_for_subtasks': return 'text-amber-400';
+			case 'idle': return 'text-muted-foreground';
 			case 'pending': return 'text-amber-400';
 			case 'blocked': return 'text-red-400';
 			case 'waiting_for_input': return 'text-orange-400';
 			case 'cancelled': return 'text-muted-foreground';
 			default: return 'text-muted-foreground';
 		}
+	}
+
+	function statusLabel(status: string): string {
+		if (status === 'in_progress') return 'working';
+		if (status === 'awaiting_review') return 'awaiting review';
+		if (status === 'waiting_for_subtasks') return 'waiting on subtasks';
+		if (status === 'idle') return 'not running';
+		return status.replaceAll('_', ' ');
+	}
+
+	function isDeferredPlanItem(subtask: Task): boolean {
+		return subtask.provenance === 'native_plan' && subtask.status === 'cancelled';
+	}
+
+	function completedStepCount(): number {
+		return subtaskList.filter((step) => step.status === 'completed').length;
+	}
+
+	function deferredStepCount(): number {
+		return subtaskList.filter(isDeferredPlanItem).length;
 	}
 
 	function statusBg(status: string): string {
@@ -1115,14 +1139,15 @@
 					<h1 class="text-lg font-bold sm:text-xl">{task.title}</h1>
 					<div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs sm:text-sm">
 						<span class="flex items-center gap-1.5">
-							<span class="h-2 w-2 rounded-full {task.status === 'in_progress' ? 'animate-pulse' : ''}
-								{task.status === 'completed' ? 'bg-emerald-400' :
-								 task.status === 'in_progress' ? 'bg-blue-400' :
-								 task.status === 'pending' ? 'bg-amber-400' :
-								 task.status === 'waiting_for_input' ? 'bg-orange-400' :
-								 task.status === 'blocked' ? 'bg-red-400' :
+							<span data-task-activity-status={taskActivityStatus} class="h-2 w-2 rounded-full {taskActivityStatus === 'in_progress' ? 'animate-pulse' : ''}
+								{taskActivityStatus === 'completed' ? 'bg-emerald-400' :
+								 taskActivityStatus === 'in_progress' ? 'bg-blue-400' :
+								 taskActivityStatus === 'awaiting_review' ? 'bg-violet-400' :
+								 ['pending', 'waiting_for_subtasks'].includes(taskActivityStatus) ? 'bg-amber-400' :
+								 taskActivityStatus === 'waiting_for_input' ? 'bg-orange-400' :
+								 taskActivityStatus === 'blocked' ? 'bg-red-400' :
 								 'bg-muted-foreground'}"></span>
-							<span class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</span>
+							<span class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</span>
 						</span>
 						{#if task.agent_id}
 							<span class="text-muted-foreground">{sessionLabel(task.agent_id)}</span>
@@ -1293,10 +1318,17 @@
 
 					{#if subtaskList.length > 0}
 					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {compact ? '' : 'lg:hidden'}">
-							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Steps ({subtaskList.filter((step) => step.status === 'completed').length}/{subtaskList.length})</div>
+							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
+							</div>
 							<div class="space-y-2">
 								{#each subtaskList as subtask}
-									<div class="flex items-start gap-2 text-sm"><span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : '○'}</span><span class={subtask.status === 'completed' ? 'text-muted-foreground line-through' : ''}>{subtask.title}</span></div>
+									{@const deferred = isDeferredPlanItem(subtask)}
+									<div class="flex items-start gap-2 text-sm">
+										<span class="mt-0.5 {subtask.status === 'completed' ? 'text-emerald-400' : subtask.status === 'in_progress' ? 'text-blue-400' : 'text-muted-foreground'}">{subtask.status === 'completed' ? '✓' : subtask.status === 'in_progress' ? '●' : deferred ? '↳' : '○'}</span>
+										<span class={subtask.status === 'completed' ? 'text-muted-foreground line-through' : deferred ? 'text-muted-foreground italic' : ''}>{subtask.title}</span>
+										{#if deferred}<span class="ai-status-pill bg-muted text-muted-foreground">Deferred</span>{/if}
+									</div>
 								{/each}
 							</div>
 						</section>
@@ -1485,10 +1517,20 @@
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>
 							Waiting for your response...
 						</div>
-					{:else if task.status === 'in_progress' && subtaskList.some(subtask => subtask.status !== 'completed')}
+					{:else if taskActivityStatus === 'awaiting_review'}
+						<div class="flex items-center gap-2 text-xs text-violet-400">
+							<span class="h-2 w-2 rounded-full bg-violet-400"></span>
+							The implementation is awaiting review; no worker is running.
+						</div>
+					{:else if taskActivityStatus === 'waiting_for_subtasks'}
 						<div class="flex items-center gap-2 text-xs text-amber-400">
 							<span class="h-2 w-2 rounded-full bg-amber-400"></span>
-							This task still has unfinished steps.
+							This task is waiting on explicitly delegated subtasks.
+						</div>
+					{:else if taskActivityStatus === 'idle'}
+						<div class="flex items-center gap-2 text-xs text-muted-foreground">
+							<span class="h-2 w-2 rounded-full bg-muted-foreground"></span>
+							No worker or required subtask is currently running.
 						</div>
 					{/if}
 				</div>
@@ -1681,7 +1723,7 @@
 						</div>
 						<div class="flex justify-between">
 							<dt class="text-muted-foreground">Status</dt>
-							<dd class="{statusColor(task.status)}">{task.status.replaceAll('_', ' ')}</dd>
+							<dd class="{statusColor(taskActivityStatus)}">{statusLabel(taskActivityStatus)}</dd>
 						</div>
 						<div class="flex justify-between">
 							<dt class="text-muted-foreground">Priority</dt>
@@ -1758,10 +1800,11 @@
 				{#if subtaskList.length > 0}
 					<div class="space-y-2">
 						<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-							Steps ({subtaskList.filter(s => s.status === 'completed').length}/{subtaskList.length})
+							Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 						</h3>
 						<div class="space-y-1.5">
 							{#each subtaskList as sub}
+								{@const deferred = isDeferredPlanItem(sub)}
 								<div class="flex items-start gap-2 rounded p-1.5 text-sm">
 									<span class="mt-0.5 flex-shrink-0 h-4 w-4 rounded border flex items-center justify-center
 										{sub.status === 'completed'
@@ -1775,10 +1818,13 @@
 											</svg>
 										{:else if sub.status === 'in_progress'}
 											<span class="h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"></span>
+										{:else if deferred}
+											<span class="text-[10px] text-muted-foreground">↳</span>
 										{/if}
 									</span>
 									<div class="flex-1 min-w-0">
-										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : ''}">{sub.title}</span>
+										<span class="block truncate {sub.status === 'completed' ? 'line-through text-muted-foreground' : deferred ? 'italic text-muted-foreground' : ''}">{sub.title}</span>
+										{#if deferred}<span class="mt-0.5 block text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Deferred · does not block completion</span>{/if}
 										{#if sub.description}
 											<span class="block text-xs text-muted-foreground mt-0.5 line-clamp-2">{sub.description}</span>
 										{/if}

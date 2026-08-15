@@ -237,9 +237,10 @@ fn export_transaction(
         connection,
         "SELECT id, title, description, status, priority, task_type, hidden,
                 agent_id, parent_task_id, conversation_id, created_at, updated_at,
-                completed_at
+                completed_at, provenance, blocks_parent
          FROM tasks
          WHERE project_id = ?1 AND hidden = 0 AND UPPER(task_type) <> 'IDLE'
+           AND provenance != 'native_plan'
          ORDER BY id",
         [&manifest.project_id],
         |row| {
@@ -257,6 +258,8 @@ fn export_transaction(
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
                 completed_at: row.get(12)?,
+                provenance: row.get(13)?,
+                blocks_parent: row.get::<_, i32>(14)? != 0,
             })
         },
     )?;
@@ -296,6 +299,8 @@ fn export_transaction(
            AND task.hidden = 0 AND prerequisite.hidden = 0
            AND UPPER(task.task_type) <> 'IDLE'
            AND UPPER(prerequisite.task_type) <> 'IDLE'
+           AND task.provenance != 'native_plan'
+           AND prerequisite.provenance != 'native_plan'
          ORDER BY dependency.task_id, dependency.depends_on_id",
         [&manifest.project_id],
         |row| {
@@ -518,6 +523,7 @@ fn export_task_messages(
          JOIN tasks task ON task.id = message.task_id
          LEFT JOIN task_message_sync sync ON sync.message_id = message.id
          WHERE task.project_id = ?1 AND task.hidden = 0 AND UPPER(task.task_type) <> 'IDLE'
+           AND task.provenance != 'native_plan'
          ORDER BY message.task_id, message.timestamp, message.id",
         [project_id],
         |row| {
@@ -1120,8 +1126,8 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
             "INSERT INTO tasks
                 (id, title, description, status, priority, agent_id, parent_task_id,
                  conversation_id, project_id, created_at, updated_at, completed_at,
-                 task_type, hidden)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 task_type, hidden, provenance, blocks_parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 description = excluded.description,
@@ -1133,7 +1139,9 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 updated_at = excluded.updated_at,
                 completed_at = excluded.completed_at,
                 task_type = excluded.task_type,
-                hidden = excluded.hidden",
+                hidden = excluded.hidden,
+                provenance = excluded.provenance,
+                blocks_parent = excluded.blocks_parent",
             params![
                 task.id,
                 task.title,
@@ -1147,7 +1155,9 @@ fn import_tasks(connection: &Connection, snapshot: &PortableSnapshot) -> Result<
                 task.updated_at,
                 task.completed_at,
                 task.task_type,
-                task.hidden
+                task.hidden,
+                task.provenance,
+                task.blocks_parent
             ],
         )?;
     }
@@ -1700,6 +1710,97 @@ mod tests {
         assert!(!serialized.contains("must-stay-local"));
         assert!(!serialized.contains("/private/workspace"));
         assert!(!serialized.contains("SECRET"));
+    }
+
+    #[test]
+    fn sync_omits_ephemeral_plan_rows_without_duplicate_recreation() {
+        let source = std::sync::Arc::new(Database::open_memory().unwrap());
+        insert_project_data(&source);
+        let source_board = crate::tasks::board::TaskBoard::new(source.clone());
+        let plan_rows = source_board
+            .sync_reported_subtasks(
+                "task-one",
+                "attempt-one",
+                &[
+                    crate::tasks::board::ReportedSubtask {
+                        title: "Inspect the current change".into(),
+                        status: crate::tasks::board::TaskStatus::Completed,
+                    },
+                    crate::tasks::board::ReportedSubtask {
+                        title: "Address future review feedback".into(),
+                        status: crate::tasks::board::TaskStatus::InProgress,
+                    },
+                ],
+            )
+            .unwrap();
+        let config = Config {
+            agents: vec![AgentConfig {
+                name: "atlas".into(),
+                backend: "codex".into(),
+                ..AgentConfig::default()
+            }],
+            ..Config::default()
+        };
+
+        let snapshot = export_snapshot(&source, &config, &manifest()).unwrap();
+        assert!(snapshot
+            .tasks
+            .iter()
+            .all(|task| task.provenance != "native_plan"));
+        assert_eq!(plan_rows.len(), 2);
+
+        let target = std::sync::Arc::new(Database::open_memory().unwrap());
+        target
+            .with_conn(|connection| {
+                let transaction = connection.unchecked_transaction()?;
+                import_transaction(&transaction, &snapshot)?;
+                transaction.commit()?;
+                Ok::<_, Error>(())
+            })
+            .unwrap();
+        let target_board = crate::tasks::board::TaskBoard::new(target);
+        assert!(target_board.list_subtasks("task-one").unwrap().is_empty());
+
+        let first = target_board
+            .sync_reported_subtasks(
+                "task-one",
+                "attempt-two",
+                &[crate::tasks::board::ReportedSubtask {
+                    title: "Implement the current revision".into(),
+                    status: crate::tasks::board::TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+        let first_id = first
+            .iter()
+            .find(|task| task.provenance == "native_plan")
+            .unwrap()
+            .id
+            .clone();
+        let second = target_board
+            .sync_reported_subtasks(
+                "task-one",
+                "attempt-two",
+                &[crate::tasks::board::ReportedSubtask {
+                    title: "Implement the current revision".into(),
+                    status: crate::tasks::board::TaskStatus::Completed,
+                }],
+            )
+            .unwrap();
+        let plan_rows = second
+            .iter()
+            .filter(|task| task.provenance == "native_plan")
+            .collect::<Vec<_>>();
+        assert_eq!(plan_rows.len(), 1);
+        assert_eq!(plan_rows[0].id, first_id);
+        assert_eq!(
+            plan_rows[0]
+                .context
+                .as_ref()
+                .and_then(|context| context.get("attempt_id"))
+                .and_then(Value::as_str),
+            Some("attempt-two")
+        );
     }
 
     #[test]

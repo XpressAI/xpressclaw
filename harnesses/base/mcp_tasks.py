@@ -24,8 +24,10 @@ TOOLS = [
     {
         "name": "create_task",
         "description": (
-            "Create a new task on the task board. Can assign to yourself or "
-            "another agent. Use parent_task_id to create subtasks."
+            "Create durable delegated work on the task board. Can assign to "
+            "yourself or another agent. A task created with parent_task_id "
+            "blocks that parent until the delegated task completes; use the "
+            "ACP plan only for a current-turn checklist."
         ),
         "inputSchema": {
             "type": "object",
@@ -41,7 +43,7 @@ TOOLS = [
                 },
                 "parent_task_id": {
                     "type": "string",
-                    "description": "Parent task ID to create this as a subtask",
+                    "description": "Parent task ID; this durable subtask gates parent completion",
                 },
                 "conversation_id": {
                     "type": "string",

@@ -348,6 +348,9 @@ fn enrich_tasks(board: &TaskBoard, tasks: &[Task]) -> Vec<Value> {
             v["depends_on"] = json!(board.get_dependencies(&t.id).unwrap_or_default());
             v["blocked_by"] = json!(board.get_blockers(&t.id).unwrap_or_default());
             v["ready"] = json!(board.is_ready(&t.id).unwrap_or(true));
+            v["activity_status"] = json!(board
+                .activity_status(t)
+                .unwrap_or_else(|_| t.status.as_str().to_string()));
             v
         })
         .collect()
@@ -398,6 +401,9 @@ async fn get_task(
     result["dependents"] = json!(dependents);
     result["blocked_by"] = json!(blocked_by);
     result["ready"] = json!(ready);
+    result["activity_status"] = json!(board
+        .activity_status(&task)
+        .unwrap_or_else(|_| task.status.as_str().to_string()));
     Ok(Json(result))
 }
 
@@ -1310,6 +1316,53 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["status"], "in_progress");
         assert_eq!(body["agent_id"], "atlas");
+    }
+
+    #[tokio::test]
+    async fn manual_status_completion_defers_unfinished_plan_items() {
+        let (app, db) = test_app_with_db();
+        let board = TaskBoard::new(db);
+        let task = board
+            .create(&CreateTask {
+                title: "Manual completion".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        board
+            .sync_reported_subtasks(
+                &task.id,
+                "attempt-1",
+                &[xpressclaw_core::tasks::board::ReportedSubtask {
+                    title: "Future follow-up".to_string(),
+                    status: TaskStatus::InProgress,
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/tasks/{}/status", task.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "status": "completed" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response.into_body()).await;
+        assert_eq!(body["status"], "completed");
+        let plan = board.list_subtasks(&task.id).unwrap().remove(0);
+        assert_eq!(plan.status, TaskStatus::Cancelled);
+        assert_eq!(
+            plan.context
+                .as_ref()
+                .and_then(|context| context.get("plan_disposition"))
+                .and_then(Value::as_str),
+            Some("deferred")
+        );
     }
 
     #[tokio::test]

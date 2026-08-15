@@ -238,6 +238,9 @@
 
 	function statusMeta(status: string): { label: string; dot: string; tone: string; pill: string; glyph: string } {
 		if (status === 'in_progress') return { label: 'Working', dot: 'bg-blue-400 animate-pulse', tone: 'text-blue-500 dark:text-blue-300', pill: 'bg-blue-500/10', glyph: '2' };
+		if (status === 'awaiting_review') return { label: 'Awaiting review', dot: 'bg-violet-400', tone: 'text-violet-600 dark:text-violet-300', pill: 'bg-violet-500/10', glyph: 'R' };
+		if (status === 'waiting_for_subtasks') return { label: 'Waiting on subtasks', dot: 'bg-amber-400', tone: 'text-amber-600 dark:text-amber-300', pill: 'bg-amber-500/10', glyph: '↳' };
+		if (status === 'idle') return { label: 'Not running', dot: 'bg-muted-foreground', tone: 'text-muted-foreground', pill: 'bg-muted', glyph: '–' };
 		if (status === 'pending') return { label: 'Queued', dot: 'bg-amber-400', tone: 'text-amber-600 dark:text-amber-300', pill: 'bg-amber-500/10', glyph: '1' };
 		if (status === 'waiting_for_input') return { label: 'Waiting for you', dot: 'bg-orange-400 animate-pulse', tone: 'text-orange-600 dark:text-orange-300', pill: 'bg-orange-500/10', glyph: '?' };
 		if (status === 'blocked') return { label: 'Blocked', dot: 'bg-red-400', tone: 'text-red-600 dark:text-red-300', pill: 'bg-red-500/10', glyph: '!' };
@@ -408,11 +411,12 @@
 			<div class="flex justify-center px-4 py-16"><AgentLoading label="Loading tasks" /></div>
 		{:else}
 			{#each taskList as task (task.id)}
-				{@const meta = statusMeta(task.status)}
-				<a data-task-row href="/tasks/{task.id}" class="group ai-card flex min-h-14 items-start gap-3 px-3 py-3 transition-colors hover:bg-[hsl(var(--hover))]">
+				{@const displayStatus = task.activity_status ?? task.status}
+				{@const meta = statusMeta(displayStatus)}
+				<a data-task-row data-task-activity-status={displayStatus} href="/tasks/{task.id}" class="group ai-card flex min-h-14 items-start gap-3 px-3 py-3 transition-colors hover:bg-[hsl(var(--hover))]">
 					<span class="relative mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold {meta.tone} shadow-[inset_0_0_0_1.5px_hsl(var(--border-strong))]">
 						{meta.glyph}
-						{#if task.status === 'in_progress'}<span class="absolute inset-0 rounded-full border-2 border-transparent border-t-blue-400 animate-spin"></span>{/if}
+						{#if displayStatus === 'in_progress'}<span class="absolute inset-0 rounded-full border-2 border-transparent border-t-blue-400 animate-spin"></span>{/if}
 					</span>
 					<div class="min-w-0 flex-1">
 						<div class="flex items-start justify-between gap-3">
