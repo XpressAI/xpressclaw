@@ -1277,7 +1277,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 	const indexPage = await context.newPage();
 	await mockApi(indexPage, { preserveWorkspace: true, projectListRequests, projectListGate });
 	const indexNavigation = indexPage.goto('/projects?_xpressclaw_window=workspace-12345-2');
-	await expect.poll(() => projectListRequests.length).toBeGreaterThan(0);
+	await expect.poll(() => projectListRequests.length).toBeGreaterThan(1);
 
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	let dialog = page.getByRole('dialog');
@@ -1301,6 +1301,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Synchronized project"]')).toBeVisible();
 	await expect(indexPage.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
 	await expect(indexPage.getByText('Visible in every project view.', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Synchronized project', { exact: true })).toBeVisible();
+	await expect(indexPage.locator('aside').first().getByText('Browser collaboration project', { exact: true })).toHaveCount(0);
 
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');

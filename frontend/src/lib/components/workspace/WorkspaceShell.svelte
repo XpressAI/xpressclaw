@@ -66,6 +66,7 @@
 	let workflowList = $state<Workflow[]>([]);
 	let scheduleList = $state<Schedule[]>([]);
 	let contextMenu = $state<WorkspaceContextMenu | null>(null);
+	let projectMutationVersion = 0;
 
 	let dockerAvailable = $state(true);
 	let dockerInstalled = $state(true);
@@ -535,6 +536,7 @@
 	}
 
 	async function loadWorkspaceSummary() {
+		const startingProjectMutationVersion = projectMutationVersion;
 		try {
 			const [nextProjects, nextConversations, nextAgents, taskResult, sidebarTaskResult, nextWorkflows, nextSchedules] = await Promise.all([
 				projectsApi.list().catch(() => projectList),
@@ -545,7 +547,9 @@
 				workflowsApi.list().catch(() => workflowList),
 				schedulesApi.list().catch(() => scheduleList),
 			]);
-			projectList = nextProjects;
+			if (projectMutationVersion === startingProjectMutationVersion) {
+				projectList = nextProjects;
+			}
 			conversationList = nextConversations;
 			agentList = nextAgents;
 			taskList = taskResult.tasks;
@@ -558,15 +562,15 @@
 
 	function handleProjectMutation(event: Event) {
 		const mutation = (event as CustomEvent<ProjectMutation>).detail;
-		if (mutation?.kind === 'updated') {
+		if (!mutation || (mutation.kind !== 'updated' && mutation.kind !== 'deleted')) return;
+		projectMutationVersion += 1;
+		if (mutation.kind === 'updated') {
 			projectList = projectList.some((project) => project.id === mutation.project.id)
 				? projectList.map((project) => project.id === mutation.project.id ? mutation.project : project)
 				: [...projectList, mutation.project];
 			refreshTabMetadata();
 			return;
 		}
-		if (mutation?.kind !== 'deleted') return;
-
 		const focusedProjectWasDeleted = focusedTab?.kind === 'project' && focusedTab.resourceId === mutation.projectId;
 		projectList = projectList.filter((project) => project.id !== mutation.projectId);
 		panes = panes.map((pane) => {
