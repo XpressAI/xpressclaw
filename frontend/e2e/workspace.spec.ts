@@ -1376,6 +1376,25 @@ test('project mutations synchronize split panes and separate workspace windows',
 	const syncProject = syncPage.locator(`[data-project-sync="${projectId}"]`);
 	await expect(syncProject.getByRole('heading', { name: 'Browser collaboration project' })).toBeVisible();
 
+	const conversationPage = await context.newPage();
+	await mockApi(conversationPage, {
+		preserveWorkspace: true,
+		sharedProjectState,
+		conversations: [{
+			id: conversationId,
+			project_id: projectId,
+			title: 'Mounted project conversation',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(61),
+			last_message_at: timestamp(61),
+			participants: [],
+		}],
+	});
+	await conversationPage.goto(`/conversations/${conversationId}?_xpressclaw_window=workspace-12345-5`);
+	const conversationProjectLink = conversationPage.locator('header p a');
+	await expect(conversationProjectLink).toHaveText('Browser collaboration project');
+
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	let dialog = page.getByRole('dialog');
 	await dialog.getByLabel('Project name').fill('Synchronized project');
@@ -1407,6 +1426,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(indexPage.locator('aside').first().locator(`a[href="/projects/${projectId}"]`)).toContainText('Synchronized project');
 	await expect(newWorkProject).toHaveText('Synchronized project');
 	await expect(syncProject.getByRole('heading', { name: 'Synchronized project' })).toBeVisible();
+	await expect(conversationProjectLink).toHaveText('Synchronized project');
 
 	await otherPage.evaluate(async (id) => {
 		const response = await fetch(`/api/projects/${id}`, {
@@ -1440,7 +1460,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(indexPage.locator('aside').first().getByText('Authoritative project', { exact: true })).toBeVisible();
 	await expect(newWorkProject).toHaveText('Authoritative project');
 	await expect(syncProject.getByRole('heading', { name: 'Authoritative project' })).toBeVisible();
-	expect(context.pages()).toHaveLength(5);
+	await expect(conversationProjectLink).toHaveText('Authoritative project');
+	expect(context.pages()).toHaveLength(6);
 	for (const openPage of context.pages()) {
 		await expect(openPage.getByText('Stale concurrent project', { exact: true })).toHaveCount(0);
 	}
@@ -1469,7 +1490,9 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(dialog.getByLabel('Project name')).toHaveValue('Unsaved local project name');
 	await expect(dialog.getByLabel('Description')).toHaveValue('Keep this draft while remote updates arrive.');
 	await expect(panes.getByRole('heading', { name: 'Remote project rename' })).toHaveCount(2);
+	await expect(conversationProjectLink).toHaveText('Remote project rename');
 	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	await conversationPage.close();
 
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');
@@ -1497,7 +1520,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 		projectGetRequests: lateProjectGetRequests,
 		sharedProjectState,
 	});
-	await lateNewWorkPage.goto('/?_xpressclaw_window=workspace-12345-5');
+	await lateNewWorkPage.goto('/?_xpressclaw_window=workspace-12345-6');
 	const lateNewWorkProject = lateNewWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
 	await expect(lateNewWorkProject).toHaveCount(0);
 
