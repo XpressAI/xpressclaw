@@ -143,7 +143,7 @@
 			</div>
 			<div class="rounded-lg rounded-tl-[4px] bg-accent/55 px-3.5 py-2.5 text-sm text-foreground shadow-[var(--shadow-hairline)]" data-agent-update-content>
 				<div class="prose-chat max-w-none break-words">
-					{@html renderContent(event.summary, { openLinksInNewWindow: true })}
+					{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 				</div>
 			</div>
 		</div>
@@ -177,8 +177,8 @@
 		{#if expanded}
 			<div class="mb-1 mr-2 border-l border-border/60 py-2 pl-3 text-xs {isTool || richText ? 'ml-4' : 'ml-[5.25rem] sm:ml-[6rem]'}">
 				{#if richText}
-					<div class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
-						{@html renderContent(event.summary, { openLinksInNewWindow: true })}
+					<div data-activity-rich-content class="prose prose-invert prose-sm max-w-none text-xs text-foreground/80">
+						{@html renderContent(event.summary, { openLinksInNewWindow: true, renderStructuredAgentMarkup: true })}
 					</div>
 				{:else if !isTool}
 					<div class="whitespace-pre-wrap text-foreground/75">{event.summary}</div>
