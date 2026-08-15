@@ -1,4 +1,4 @@
-import { projects as projectsApi, type Project } from '$lib/api';
+import { ApiError, projects as projectsApi, type Project } from '$lib/api';
 
 export const PROJECT_MUTATION_EVENT = 'xpressclaw:project-mutation';
 const PROJECT_MUTATION_CHANNEL = 'xpressclaw:project-mutations:v1';
@@ -33,6 +33,7 @@ interface ProjectMutationEnvelope {
 
 let mutationChannel: BroadcastChannel | null = null;
 const projectRefreshVersions = new Map<string, number>();
+const deletedProjectIds = new Set<string>();
 
 function isProjectMutation(value: unknown): value is ProjectMutation {
 	if (!value || typeof value !== 'object') return false;
@@ -50,12 +51,21 @@ function isProjectMutationEnvelope(value: unknown): value is ProjectMutationEnve
 }
 
 function dispatchProjectMutation(mutation: ProjectMutation): void {
-	window.dispatchEvent(new CustomEvent<ProjectMutation>(PROJECT_MUTATION_EVENT, { detail: mutation }));
-	if (mutation.kind === 'updated' && !mutation.authoritative) {
-		void refreshUpdatedProject(mutation.project.id);
-	} else if (mutation.kind === 'deleted') {
+	if (mutation.kind === 'deleted') {
+		deletedProjectIds.add(mutation.projectId);
 		projectRefreshVersions.set(mutation.projectId, (projectRefreshVersions.get(mutation.projectId) ?? 0) + 1);
+		window.dispatchEvent(new CustomEvent<ProjectMutation>(PROJECT_MUTATION_EVENT, { detail: mutation }));
+		return;
 	}
+
+	const projectId = mutation.project.id;
+	if (!mutation.authoritative && deletedProjectIds.has(projectId)) {
+		void refreshUpdatedProject(projectId);
+		return;
+	}
+	if (mutation.authoritative) deletedProjectIds.delete(projectId);
+	window.dispatchEvent(new CustomEvent<ProjectMutation>(PROJECT_MUTATION_EVENT, { detail: mutation }));
+	if (!mutation.authoritative) void refreshUpdatedProject(projectId);
 }
 
 async function refreshUpdatedProject(projectId: string): Promise<void> {
@@ -65,7 +75,12 @@ async function refreshUpdatedProject(projectId: string): Promise<void> {
 		const project = await projectsApi.get(projectId);
 		if (projectRefreshVersions.get(projectId) !== refreshVersion) return;
 		dispatchProjectMutation({ kind: 'updated', project, authoritative: true });
-	} catch {}
+	} catch (cause) {
+		if (projectRefreshVersions.get(projectId) !== refreshVersion) return;
+		if (cause instanceof ApiError && cause.status === 404) {
+			dispatchProjectMutation({ kind: 'deleted', projectId });
+		}
+	}
 }
 
 function receiveProjectMutation(value: unknown): void {

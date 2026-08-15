@@ -601,9 +601,12 @@
 		if (mutation.kind === 'deleted') {
 			return list.filter((project) => project.id !== mutation.projectId);
 		}
-		return sortProjectsByRecency(list.some((project) => project.id === mutation.project.id)
-			? list.map((project) => project.id === mutation.project.id ? mutation.project : project)
-			: [...list, mutation.project]);
+		if (list.some((project) => project.id === mutation.project.id)) {
+			return sortProjectsByRecency(
+				list.map((project) => project.id === mutation.project.id ? mutation.project : project),
+			);
+		}
+		return mutation.authoritative ? sortProjectsByRecency([...list, mutation.project]) : list;
 	}
 
 	async function checkDocker() {

@@ -435,12 +435,21 @@ async function mockApi(
 				await route.fulfill({ status: 204, body: '' });
 				return;
 			} else {
+				const projectWasDeleted = options.sharedProjectState?.deleted === true;
 				const projectSnapshot = {
 					...project,
 					...(options.sharedProjectState?.project ?? {}),
 				};
 				options.projectGetRequests?.push(projectId);
 				await options.projectGetGate;
+				if (projectWasDeleted) {
+					await route.fulfill({
+						status: 404,
+						contentType: 'application/json',
+						body: JSON.stringify({ error: 'Project not found' }),
+					});
+					return;
+				}
 				response = projectSnapshot;
 			}
 		} else if (path === `/api/projects/${projectId}/tasks`) {
@@ -1438,6 +1447,32 @@ test('project mutations synchronize split panes and separate workspace windows',
 
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');
+	await dialog.getByLabel('Project name').fill('Unsaved local project name');
+	await dialog.getByLabel('Description').fill('Keep this draft while remote updates arrive.');
+	await otherPage.evaluate(async (id) => {
+		const response = await fetch(`/api/projects/${id}`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Remote project rename',
+				description: 'The remote update should not dismiss an active editor.',
+			}),
+		});
+		const remoteProject = await response.json();
+		const channel = new BroadcastChannel('xpressclaw:project-mutations:v1');
+		channel.postMessage({ mutation: { kind: 'updated', project: remoteProject } });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		channel.close();
+	}, projectId);
+
+	await expect(dialog).toBeVisible();
+	await expect(dialog.getByLabel('Project name')).toHaveValue('Unsaved local project name');
+	await expect(dialog.getByLabel('Description')).toHaveValue('Keep this draft while remote updates arrive.');
+	await expect(panes.getByRole('heading', { name: 'Remote project rename' })).toHaveCount(2);
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+
+	await panes.first().getByRole('button', { name: 'Project settings' }).click();
+	dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
 
@@ -1454,6 +1489,33 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Synchronized project"]`)).toHaveCount(0);
 	await expect(otherPage.locator('[data-workspace-tab-title="Synchronized project"], [data-workspace-tab-title="Browser collaboration project"]')).toHaveCount(0);
 	await expect(otherPage.locator('[data-workspace-pane] [data-workspace-tab-title="Projects"]')).toBeVisible();
+
+	const lateProjectGetRequests: string[] = [];
+	const lateNewWorkPage = await context.newPage();
+	await mockApi(lateNewWorkPage, {
+		preserveWorkspace: true,
+		projectGetRequests: lateProjectGetRequests,
+		sharedProjectState,
+	});
+	await lateNewWorkPage.goto('/?_xpressclaw_window=workspace-12345-5');
+	const lateNewWorkProject = lateNewWorkPage.getByLabel('Project').locator(`option[value="${projectId}"]`);
+	await expect(lateNewWorkProject).toHaveCount(0);
+
+	await lateNewWorkPage.evaluate(async ({ id, staleProject }) => {
+		const modulePath = '/src/lib/projectEvents.ts';
+		const projectEvents = await import(modulePath);
+		projectEvents.publishProjectMutation({
+			kind: 'updated',
+			project: { ...staleProject, id, name: 'Delayed deleted project' },
+		});
+	}, { id: projectId, staleProject: sharedProjectState.project! });
+
+	await expect.poll(() => lateProjectGetRequests).toContain(projectId);
+	await expect(lateNewWorkProject).toHaveCount(0);
+	await expect(newWorkProject).toHaveCount(0);
+	await expect(syncProject).toHaveCount(0);
+	await expect(indexPage.locator(`a[href="/projects/${projectId}"]`)).toHaveCount(0);
+	await lateNewWorkPage.close();
 	await syncPage.close();
 	await newWorkPage.close();
 	await indexPage.close();

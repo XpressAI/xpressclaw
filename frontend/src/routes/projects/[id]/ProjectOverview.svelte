@@ -33,8 +33,6 @@
 			if (mutation.authoritative || !project || project.updated_at < mutation.project.updated_at) {
 				project = mutation.project;
 			}
-			showingProjectSettings = false;
-			error = '';
 		};
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
 		void load();
