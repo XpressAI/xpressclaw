@@ -209,31 +209,91 @@ impl TaskQueue {
         message_id: i64,
         message_timestamp: &str,
     ) -> Result<Option<QueueItem>> {
-        let created = self.enqueue_continuation(task_id, agent_id)?;
-        let item = if let Some(item) = created.as_ref() {
-            Some(item.clone())
-        } else {
-            let existing_id = self.db.with_conn(|conn| {
-                conn.query_row(
-                    "SELECT id FROM task_queue
+        let created = self.db.with_conn(|conn| {
+            // Reserve the writer before looking for a coalescible continuation.
+            // Otherwise the dispatcher can claim that row between the lookup
+            // and trigger update, leaving this message attached to no response.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let queued_attempt_id = transaction
+                .query_row(
+                    "SELECT attempt_id FROM task_queue
                      WHERE task_id = ?1 AND status = 'queued'
                      ORDER BY id DESC LIMIT 1",
                     [task_id],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
-                .optional()
-                .map_err(Error::from)
-            })?;
-            existing_id.map(|id| self.get(id)).transpose()?
-        };
-        if let Some(attempt_id) = item.as_ref().and_then(|item| item.attempt_id.as_deref()) {
-            SessionManager::new(self.db.clone()).associate_response_trigger(
-                attempt_id,
-                message_id,
-                message_timestamp,
-            )?;
+                .optional()?;
+
+            let item = match queued_attempt_id {
+                Some(Some(attempt_id)) => {
+                    Self::associate_response_trigger_in_transaction(
+                        &transaction,
+                        &attempt_id,
+                        message_id,
+                        message_timestamp,
+                    )?;
+                    None
+                }
+                Some(None) => {
+                    return Err(Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    )));
+                }
+                None => {
+                    let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
+                    let attempt_id = item.attempt_id.as_deref().ok_or_else(|| {
+                        Error::Task(format!(
+                            "queued continuation for task {task_id} has no work attempt"
+                        ))
+                    })?;
+                    Self::associate_response_trigger_in_transaction(
+                        &transaction,
+                        attempt_id,
+                        message_id,
+                        message_timestamp,
+                    )?;
+                    Some(item)
+                }
+            };
+            transaction.commit()?;
+            Ok::<_, Error>(item)
+        })?;
+
+        if let Some(item) = created.as_ref() {
+            debug!(
+                task_id,
+                agent_id,
+                queue_id = item.id,
+                "enqueued task continuation"
+            );
         }
         Ok(created)
+    }
+
+    fn associate_response_trigger_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        attempt_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<()> {
+        let updated = transaction.execute(
+            "UPDATE work_attempts
+             SET response_queued_at = CASE
+                    WHEN COALESCE(trigger_message_id, 0) <= ?1 THEN ?2
+                    ELSE response_queued_at END,
+                 trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
+             WHERE id = ?3",
+            rusqlite::params![message_id, message_timestamp, attempt_id],
+        )?;
+        if updated != 1 {
+            return Err(Error::Task(format!(
+                "queued continuation attempt {attempt_id} was not found"
+            )));
+        }
+        Ok(())
     }
 
     /// Add GitHub review feedback and enqueue a continuation for the task's
