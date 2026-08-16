@@ -408,7 +408,7 @@
 
 	<div data-task-list class="space-y-2">
 		{#if loading && taskList.length === 0}
-			<div class="flex justify-center px-4 py-16"><AgentLoading label="Loading tasks" /></div>
+			<div class="flex justify-center px-4 py-16"><AgentLoading label="Loading tasks" phase="loading" /></div>
 		{:else}
 			{#each taskList as task (task.id)}
 				{@const displayStatus = task.activity_status ?? task.status}

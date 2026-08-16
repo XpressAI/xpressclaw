@@ -79,7 +79,7 @@
 		{/if}
 
 		{#if loading}
-			<div class="flex justify-center py-12"><AgentLoading label="Loading projects" /></div>
+			<div class="flex justify-center py-12"><AgentLoading label="Loading projects" phase="loading" /></div>
 		{:else if projectList.length === 0}
 			<div class="rounded-xl border border-dashed border-border p-12 text-center">
 				<h2 class="font-semibold">Create your first project</h2>

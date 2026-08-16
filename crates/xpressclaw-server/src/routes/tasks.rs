@@ -817,7 +817,7 @@ async fn add_message(
 
         let queue = TaskQueue::new(state.db.clone());
         continuation = queue
-            .enqueue_continuation(&id, agent_id)
+            .enqueue_continuation_for_message(&id, agent_id, msg.id, &msg.timestamp)
             .map_err(internal_error)?;
         delivery = if let Some(active_attempt) = active_attempt {
             // A deferred interruption cannot reach a turn parked on an elicitation.
@@ -1759,6 +1759,7 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], true);
         assert!(body["attempt_id"].is_string());
+        let continuation_attempt_id = body["attempt_id"].as_str().unwrap().to_string();
         assert_eq!(body["delivery"], "queued");
         let reopened = TaskBoard::new(db.clone()).get(&task_id).unwrap();
         assert_eq!(reopened.status, TaskStatus::Pending);
@@ -1768,6 +1769,22 @@ mod tests {
         let body = body_json(resp.into_body()).await;
         assert_eq!(body["continuation_queued"], false);
         assert_eq!(queue.pending_count("developer").unwrap(), 1);
+        let latest_message = TaskConversation::new(db.clone())
+            .get_messages(&task_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let continuation_attempt = SessionManager::new(db)
+            .get_attempt(&continuation_attempt_id)
+            .unwrap();
+        assert_eq!(
+            continuation_attempt.trigger_message_id,
+            Some(latest_message.id)
+        );
+        assert_eq!(
+            continuation_attempt.response_queued_at.as_deref(),
+            Some(latest_message.timestamp.as_str())
+        );
     }
 
     #[tokio::test]

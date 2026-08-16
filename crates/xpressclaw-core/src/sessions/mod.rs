@@ -43,6 +43,12 @@ pub struct WorkAttempt {
     pub completed_at: Option<String>,
     pub context_used: Option<i64>,
     pub context_size: Option<i64>,
+    /// User message that triggered this response cycle, when applicable.
+    pub trigger_message_id: Option<i64>,
+    /// UTC timestamp at which this response cycle entered the queue.
+    pub response_queued_at: Option<String>,
+    /// UTC timestamp at which the agent began the active response phase.
+    pub response_started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,8 +259,9 @@ impl SessionManager {
             let transaction = conn.unchecked_transaction()?;
             transaction.execute(
                 "INSERT INTO work_attempts
-                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                  response_queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, CURRENT_TIMESTAMP)",
                 rusqlite::params![id, session_id, task_id, queue_id, kind, runner, prompt],
             )?;
             transaction.execute(
@@ -294,7 +301,8 @@ impl SessionManager {
             conn.query_row(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE id = ?1",
                 [attempt_id],
                 row_to_attempt,
@@ -313,7 +321,8 @@ impl SessionManager {
             let mut sql = String::from(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE session_id = ?1",
             );
             let mut values: Vec<Box<dyn rusqlite::types::ToSql>> =
@@ -356,7 +365,8 @@ impl SessionManager {
             let mut attempt_stmt = conn.prepare(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts WHERE task_id = ?1
                  ORDER BY created_at DESC LIMIT ?2",
             )?;
@@ -445,6 +455,10 @@ impl SessionManager {
                 "UPDATE work_attempts SET status = ?1,
                     started_at = CASE WHEN ?1 IN ('preparing', 'running')
                         THEN COALESCE(started_at, CURRENT_TIMESTAMP) ELSE started_at END,
+                    response_started_at = CASE
+                        WHEN ?1 = 'running' AND status != 'running' THEN CURRENT_TIMESTAMP
+                        WHEN ?1 = 'running' THEN COALESCE(response_started_at, CURRENT_TIMESTAMP)
+                        ELSE response_started_at END,
                     completed_at = CASE WHEN ?2 = 1 THEN CURRENT_TIMESTAMP ELSE completed_at END,
                     result = COALESCE(?3, result), error_message = ?4
                  WHERE id = ?5
@@ -493,6 +507,29 @@ impl SessionManager {
         self.get_attempt(attempt_id)
     }
 
+    /// Associate a queued continuation with the latest user message it will
+    /// answer. Updating an already-queued attempt is intentional: consecutive
+    /// guidance is coalesced into one response cycle whose queue latency starts
+    /// at the newest message included in that response.
+    pub fn associate_response_trigger(
+        &self,
+        attempt_id: &str,
+        message_id: i64,
+        queued_at: &str,
+    ) -> Result<()> {
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts
+                 SET trigger_message_id = ?1, response_queued_at = ?2
+                 WHERE id = ?3
+                   AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                   AND (trigger_message_id IS NULL OR trigger_message_id <= ?1)",
+                rusqlite::params![message_id, queued_at, attempt_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Cancel every live attempt for a task before any asynchronous container
     /// cleanup begins. Selecting the attempts and transitioning the attempts,
     /// queued dispatches, task, active-attempt pointer, logical sessions, and
@@ -522,7 +559,8 @@ impl SessionManager {
             let mut statement = transaction.prepare(
                 "SELECT id, session_id, task_id, queue_id, kind, runner, status, prompt,
                         native_session_id, container_id, result, error_message,
-                        created_at, started_at, completed_at, context_used, context_size
+                        created_at, started_at, completed_at, context_used, context_size,
+                        trigger_message_id, response_queued_at, response_started_at
                  FROM work_attempts
                  WHERE task_id = ?1
                    AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
@@ -841,6 +879,9 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkAttempt> {
         completed_at: row.get(14)?,
         context_used: row.get(15)?,
         context_size: row.get(16)?,
+        trigger_message_id: row.get(17)?,
+        response_queued_at: row.get(18)?,
+        response_started_at: row.get(19)?,
     })
 }
 
@@ -905,10 +946,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt.status, "queued");
+        assert!(attempt.response_queued_at.is_some());
+        assert!(attempt.response_started_at.is_none());
 
-        manager
+        let running = manager
             .transition_attempt(&attempt.id, "running", "Codex is working", None, None)
             .unwrap();
+        assert!(running.response_started_at.is_some());
         manager
             .add_artifact(
                 &attempt.id,
@@ -937,6 +981,68 @@ mod tests {
             .recent_events
             .iter()
             .any(|event| event.event_type == "attempt_completed"));
+    }
+
+    #[test]
+    fn response_phase_resets_after_waiting_without_rewriting_attempt_start() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("builder", Some("Builder")).unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tasks (id, title) VALUES ('task-1', 'Build it')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_queue (id, task_id, agent_id, status)
+                 VALUES (1, 'task-1', 'builder', 'queued')",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+        let attempt = manager
+            .create_attempt(
+                "builder", "task-1", 1, "codex", "task", "task", None, "Build it",
+            )
+            .unwrap();
+        manager
+            .transition_attempt(&attempt.id, "running", "Responding", None, None)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts
+                 SET started_at = '2020-01-01 00:00:00',
+                     response_started_at = '2020-01-01 00:00:05'
+                 WHERE id = ?1",
+                [&attempt.id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        let waiting = manager
+            .transition_attempt(
+                &attempt.id,
+                "waiting_for_input",
+                "Waiting for input",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            waiting.response_started_at.as_deref(),
+            Some("2020-01-01 00:00:05")
+        );
+        let resumed = manager
+            .transition_attempt(&attempt.id, "running", "Responding again", None, None)
+            .unwrap();
+
+        assert_eq!(resumed.started_at.as_deref(), Some("2020-01-01 00:00:00"));
+        assert_ne!(
+            resumed.response_started_at.as_deref(),
+            Some("2020-01-01 00:00:05")
+        );
     }
 
     #[test]

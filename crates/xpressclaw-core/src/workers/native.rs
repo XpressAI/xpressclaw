@@ -713,12 +713,6 @@ async fn execute_conversation_turn(
         agent,
         previous_trigger_message_id,
     )?;
-    event_bus.send(
-        &turn.conversation_id,
-        ConversationEvent::Thinking {
-            agent_id: turn.agent_id.clone(),
-        },
-    );
     turn_controls.begin_attempt(&turn.id);
     if !queue.is_running(&turn.id)? {
         turn_controls.finish_attempt(&turn.id);
@@ -727,6 +721,19 @@ async fn execute_conversation_turn(
             .await;
         return Ok(());
     }
+    if !queue.start_response(&turn.id)? {
+        turn_controls.finish_attempt(&turn.id);
+        conversation_processes
+            .retire_agent(&turn.conversation_id, &turn.agent_id)
+            .await;
+        return Ok(());
+    }
+    event_bus.send(
+        &turn.conversation_id,
+        ConversationEvent::Thinking {
+            agent_id: turn.agent_id.clone(),
+        },
+    );
     let recorder = AcpEventRecorder::for_conversation(
         db.clone(),
         turn.conversation_id.clone(),
@@ -3331,6 +3338,8 @@ mod tests {
             queued_at: "now".into(),
             started_at: None,
             completed_at: None,
+            response_queued_at: None,
+            response_started_at: None,
         };
         let agent = AgentConfig {
             name: "atlas".into(),

@@ -10,12 +10,22 @@ function timestamp(second: number): string {
 	return new Date(startTime + second * 1_000).toISOString();
 }
 
+function recentSqliteTimestamp(millisecondsAgo: number): string {
+	return new Date(Date.now() - millisecondsAgo).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 async function expectVerticalScroll(scroller: Locator) {
 	await expect(scroller).toBeVisible();
 	await expect(scroller).toHaveCSS('overflow-y', 'auto');
 	await expect.poll(() => scroller.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
 	await scroller.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
 	await expect.poll(() => scroller.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+}
+
+async function elapsedSeconds(indicator: Locator): Promise<number> {
+	const text = await indicator.locator('[data-elapsed-time]').innerText();
+	expect(text).toMatch(/^\d{1,2}\.\d+s$/);
+	return Number.parseFloat(text);
 }
 
 function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Current activity') {
@@ -43,7 +53,13 @@ function timelineEvent(id: number, second: number, eventType: string, summary: s
 	};
 }
 
-function attempt(status: string, contextUsed = 128_000, errorMessage: string | null = null, result: string | null = null) {
+function attempt(
+	status: string,
+	contextUsed = 128_000,
+	errorMessage: string | null = null,
+	result: string | null = null,
+	overrides: Record<string, unknown> = {},
+) {
 	return {
 		id: 'attempt-browser-test',
 		session_id: agentId,
@@ -62,6 +78,10 @@ function attempt(status: string, contextUsed = 128_000, errorMessage: string | n
 		completed_at: status === 'completed' ? timestamp(61) : null,
 		context_used: contextUsed,
 		context_size: 256_000,
+		trigger_message_id: null,
+		response_queued_at: timestamp(0),
+		response_started_at: status === 'running' ? timestamp(1) : null,
+		...overrides,
 	};
 }
 
@@ -108,6 +128,7 @@ async function mockApi(
 		taskSubtasks?: Record<string, unknown>[];
 		taskMessages?: Record<string, unknown>[];
 		taskActivityEvents?: Record<string, unknown>[];
+		taskAttempts?: Record<string, unknown>[];
 		attemptResult?: string;
 		mcpServers?: {
 			name: string;
@@ -161,6 +182,7 @@ async function mockApi(
 		includeDeletedWorkspaceFile?: boolean;
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
+		conversationTurns?: Record<string, unknown>[];
 		conversationMessageRequests?: Record<string, unknown>[];
 		conversationTaskRequests?: Record<string, unknown>[];
 		projectSyncStatuses?: Record<string, unknown>[];
@@ -490,7 +512,7 @@ async function mockApi(
 					: { ...task, id: 'conversation-task-test', title: payload.title, description: payload.description ?? null, agent_id: payload.agent_id ?? null, conversation_id: conversationId };
 			} else response = listedTasks.filter((listedTask) => listedTask.conversation_id === conversationId);
 		} else if (path === `/api/conversations/${conversationId}/turns`) {
-			response = [];
+			response = options.conversationTurns ?? [];
 		} else if (path === `/api/conversations/${conversationId}/events`) {
 			await route.fulfill({ status: 200, contentType: 'text/event-stream', body: ': connected\n\n' });
 			return;
@@ -742,7 +764,7 @@ async function mockApi(
 		} else if (path === `/api/tasks/${taskId}/activity`) {
 			if (options.agentTimeline) {
 				response = {
-					attempts: [mockAttempt()],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: [
 						timelineEvent(1, 10, 'runner_progress', firstAgentUpdate, { item_type: 'agent_message', message_id: 'status-1' }),
 						timelineEvent(2, 15, 'tool_call', 'Read the project', { toolCallId: 'tool-1', status: 'in_progress' }),
@@ -754,7 +776,7 @@ async function mockApi(
 				};
 			} else if (url.searchParams.has('before')) {
 				response = {
-					attempts: [mockAttempt()],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: Array.from({ length: 20 }, (_, index) => activityEvent(index + 1)),
 					has_more_before: false,
 					has_more_after: true,
@@ -763,14 +785,14 @@ async function mockApi(
 				liveEvent += 1;
 				contextUsed += 1_000;
 				response = {
-					attempts: [mockAttempt()],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: options.live ? [activityEvent(60 + liveEvent, 'New background activity')] : [],
 					has_more_before: false,
 					has_more_after: false,
 				};
 			} else {
 				response = {
-					attempts: [mockAttempt()],
+					attempts: options.taskAttempts ?? [mockAttempt()],
 					events: options.taskActivityEvents ?? (options.pendingElicitation ? [
 						timelineEvent(42, 58, 'elicitation_pending', 'The agent needs your input', {
 							elicitationId: 'elicitation-browser-test',
@@ -1042,13 +1064,182 @@ test('assistant text selections offer follow-up actions in the task composer', a
 });
 
 test('active work uses the elapsed agent loading indicator', async ({ page }) => {
-	await mockApi(page, { live: true });
+	await mockApi(page, {
+		live: true,
+		taskAttempts: [attempt('running', 128_000, null, null, {
+			started_at: recentSqliteTimestamp(60_000),
+			response_started_at: recentSqliteTimestamp(3_000),
+		})],
+	});
 	await page.goto(`/tasks/${taskId}`);
 
-	const loadingIndicator = page.locator('[data-agent-loading]', { hasText: 'The agent is working on this task' });
+	const loadingIndicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
 	await expect(loadingIndicator).toBeVisible();
+	await expect(loadingIndicator).toHaveAttribute('data-agent-phase', 'active');
 	await expect(loadingIndicator.locator('[aria-hidden="true"]').first().locator('span')).toHaveCount(9);
-	await expect(loadingIndicator).toContainText(/\d+(?:\.\d)?(?:s|m)/);
+	await expect.poll(() => elapsedSeconds(loadingIndicator)).toBeGreaterThan(1);
+	await expect.poll(() => elapsedSeconds(loadingIndicator)).toBeLessThan(60);
+	await expect(loadingIndicator.locator('[data-elapsed-time]')).toHaveAttribute('aria-label', /Elapsed \d{1,2}\.\d+s/);
+});
+
+test.describe('current response timing semantics', () => {
+	test.use({ timezoneId: 'America/Los_Angeles' });
+
+	test('task guidance keeps the active timer and gets a distinct queue timer', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [
+				attempt('queued', 128_000, null, null, {
+					id: 'attempt-follow-up',
+					created_at: recentSqliteTimestamp(20_000),
+					response_queued_at: recentSqliteTimestamp(2_000),
+				}),
+				attempt('running', 128_000, null, null, {
+					id: 'attempt-current',
+					started_at: recentSqliteTimestamp(90_000),
+					response_started_at: recentSqliteTimestamp(7_000),
+				}),
+			],
+		});
+		await page.goto(`/tasks/${taskId}`);
+
+		const active = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		const queued = page.locator('[data-agent-loading]', { hasText: 'New guidance is queued for the next safe break' });
+		await expect(active).toHaveAttribute('data-agent-phase', 'active');
+		await expect(queued).toHaveAttribute('data-agent-phase', 'queued');
+		await expect.poll(async () => (await elapsedSeconds(active)) - (await elapsedSeconds(queued))).toBeGreaterThan(3);
+		await expect.poll(async () => (await elapsedSeconds(active)) - (await elapsedSeconds(queued))).toBeLessThan(8);
+	});
+
+	test('qualified API timestamps are not double-zoned', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [attempt('running', 128_000, null, null, {
+				response_started_at: new Date(Date.now() - 3_000).toISOString(),
+			})],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const indicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		await expect.poll(() => elapsedSeconds(indicator)).toBeGreaterThan(0.5);
+		await expect.poll(() => elapsedSeconds(indicator)).toBeLessThan(60);
+	});
+
+	test('a task follow-up uses its new response anchor', async ({ page }) => {
+		await mockApi(page, {
+			live: true,
+			taskAttempts: [
+				attempt('running', 128_000, null, null, {
+					id: 'attempt-follow-up',
+					started_at: recentSqliteTimestamp(600_000),
+					response_started_at: recentSqliteTimestamp(2_000),
+					trigger_message_id: 42,
+				}),
+				attempt('completed', 128_000, null, null, {
+					id: 'attempt-initial',
+					started_at: recentSqliteTimestamp(900_000),
+					response_started_at: recentSqliteTimestamp(899_000),
+				}),
+			],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		const indicator = page.locator('[data-agent-loading]', { hasText: 'The agent is responding' });
+		await expect.poll(() => elapsedSeconds(indicator)).toBeGreaterThan(0.5);
+		await expect.poll(() => elapsedSeconds(indicator)).toBeLessThan(60);
+	});
+
+	test('waiting for input stops the response timer', async ({ page }) => {
+		await mockApi(page, {
+			taskStatus: 'waiting_for_input',
+			taskActivityStatus: 'waiting_for_input',
+			taskAttempts: [attempt('waiting_for_input', 128_000, null, null, {
+				response_started_at: recentSqliteTimestamp(500_000),
+			})],
+		});
+		await page.goto(`/tasks/${taskId}`);
+		await expect(page.getByText('Waiting for your response...')).toBeVisible();
+		await expect(page.locator('[data-agent-loading]')).toHaveCount(0);
+	});
+
+	test('conversation follow-ups and concurrent agents have independent response timers', async ({ page }) => {
+		const conversation = {
+			id: conversationId,
+			project_id: projectId,
+			title: 'Timed collaboration',
+			icon: null,
+			created_at: timestamp(1),
+			updated_at: timestamp(20),
+			last_message_at: timestamp(20),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+			],
+		};
+		await mockApi(page, {
+			multipleAgents: true,
+			conversations: [conversation],
+			conversationTurns: [
+				{
+					id: 'turn-current', conversation_id: conversationId, agent_id: agentId,
+					trigger_message_id: 20, status: 'running', result_message_id: null,
+					error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(90_000), started_at: recentSqliteTimestamp(60_000),
+					completed_at: null, response_queued_at: recentSqliteTimestamp(8_000),
+					response_started_at: recentSqliteTimestamp(7_000),
+				},
+				{
+					id: 'turn-secondary', conversation_id: conversationId, agent_id: 'project-secondary-test',
+					trigger_message_id: 20, status: 'running', result_message_id: null,
+					error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(90_000), started_at: recentSqliteTimestamp(50_000),
+					completed_at: null, response_queued_at: recentSqliteTimestamp(4_000),
+					response_started_at: recentSqliteTimestamp(2_000),
+				},
+			],
+		});
+		await page.goto(`/conversations/${conversationId}`);
+
+		const primary = page.locator('[data-agent-loading]', { hasText: 'Browser-tested workspace is responding' });
+		const secondary = page.locator('[data-agent-loading]', { hasText: 'Secondary browser workspace is responding' });
+		await expect.poll(async () => (await elapsedSeconds(primary)) - (await elapsedSeconds(secondary))).toBeGreaterThan(3);
+		await expect.poll(async () => (await elapsedSeconds(primary)) - (await elapsedSeconds(secondary))).toBeLessThan(8);
+		await expect(page.locator('[data-agent-loading]')).toHaveCount(2);
+	});
+
+	test('conversation queue and preparation durations are labelled without claiming active thinking', async ({ page }) => {
+		const conversation = {
+			id: conversationId, project_id: projectId, title: 'Queued collaboration', icon: null,
+			created_at: timestamp(1), updated_at: timestamp(20), last_message_at: timestamp(20),
+			participants: [
+				{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+				{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+				{ participant_type: 'agent', participant_id: 'project-secondary-test', joined_at: timestamp(2) },
+			],
+		};
+		await mockApi(page, {
+			multipleAgents: true,
+			conversations: [conversation],
+			conversationTurns: [
+				{
+					id: 'turn-queued', conversation_id: conversationId, agent_id: agentId,
+					status: 'queued', error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(80_000), started_at: null, completed_at: null,
+					response_queued_at: recentSqliteTimestamp(3_000), response_started_at: null,
+				},
+				{
+					id: 'turn-preparing', conversation_id: conversationId, agent_id: 'project-secondary-test',
+					status: 'running', error_message: null, context_used: null, context_size: null,
+					queued_at: recentSqliteTimestamp(80_000), started_at: recentSqliteTimestamp(5_000), completed_at: null,
+					response_queued_at: recentSqliteTimestamp(8_000), response_started_at: null,
+				},
+			],
+		});
+		await page.goto(`/conversations/${conversationId}`);
+
+		await expect(page.locator('[data-agent-loading]', { hasText: 'Browser-tested workspace is queued to respond' })).toHaveAttribute('data-agent-phase', 'queued');
+		await expect(page.locator('[data-agent-loading]', { hasText: 'Preparing Secondary browser workspace' })).toHaveAttribute('data-agent-phase', 'preparing');
+		await expect(page.getByText(/Secondary browser workspace is responding/)).toHaveCount(0);
+	});
 });
 
 test('context usage is stateful and tool completion details stay on one row', async ({ page }) => {
@@ -2758,6 +2949,7 @@ test('idle completed turns do not look active and future plan items are deferred
 
 	await row.click();
 	await expect(page.locator('[data-task-activity-status="idle"]').first()).toBeVisible();
+	await expect(page.locator('[data-agent-loading]')).toHaveCount(0);
 	await expect(page.getByText('No worker or required subtask is currently running.')).toBeVisible();
 	await expect(page.getByText('Deferred · does not block completion')).toBeVisible();
 });

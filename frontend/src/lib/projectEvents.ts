@@ -1,4 +1,5 @@
 import { ApiError, projects as projectsApi, type Project } from '$lib/api';
+import { serverTimestampMs } from '$lib/serverTime';
 
 export const PROJECT_MUTATION_EVENT = 'xpressclaw:project-mutation';
 const PROJECT_MUTATION_CHANNEL = 'xpressclaw:project-mutations:v1';
@@ -22,7 +23,8 @@ function compareSqliteNoCase(left: string, right: string): number {
 
 export function sortProjectsByRecency(projects: Project[]): Project[] {
 	return [...projects].sort((left, right) => {
-		if (left.updated_at !== right.updated_at) return left.updated_at < right.updated_at ? 1 : -1;
+		const recency = (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0);
+		if (recency !== 0) return recency;
 		return compareSqliteNoCase(left.name, right.name);
 	});
 }

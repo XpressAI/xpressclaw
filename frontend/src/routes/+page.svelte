@@ -480,7 +480,7 @@
 </script>
 
 {#if loading}
-	<div class="flex h-full items-center justify-center"><AgentLoading label={status_text} /></div>
+	<div class="flex h-full items-center justify-center"><AgentLoading label={status_text} phase="loading" /></div>
 {:else}
 	<div data-new-work-scroll class="workspace-scroll-y flex h-full flex-col items-center px-4 sm:px-6">
 		<div class="my-auto w-full max-w-2xl shrink-0 space-y-6 py-8 sm:space-y-8">

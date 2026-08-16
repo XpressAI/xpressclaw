@@ -447,7 +447,12 @@ impl ScheduleManager {
         let conversation = TaskConversation::new(self.db.clone());
         let message = conversation.add_message(task_id, "user", &content)?;
         let queue = TaskQueue::new(self.db.clone());
-        if let Err(error) = queue.enqueue_continuation(task_id, &schedule.agent_id) {
+        if let Err(error) = queue.enqueue_continuation_for_message(
+            task_id,
+            &schedule.agent_id,
+            message.id,
+            &message.timestamp,
+        ) {
             let _ = self.db.with_conn(|conn| {
                 conn.execute("DELETE FROM task_messages WHERE id = ?1", [message.id])
             });

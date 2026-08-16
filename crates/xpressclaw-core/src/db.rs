@@ -1713,6 +1713,32 @@ CREATE INDEX idx_tasks_parent_gate
     ON tasks(parent_task_id, blocks_parent, status);
 ";
 
+const MIGRATION_V38: &str = "
+-- Work timers measure one response cycle, not the lifetime of an Agent,
+-- logical session, or durable task. Legacy timestamps remain unchanged for
+-- API compatibility; these fields make the current queue and response phases
+-- explicit and associate task continuations with the message that triggered
+-- them.
+ALTER TABLE work_attempts ADD COLUMN trigger_message_id INTEGER
+    REFERENCES task_messages(id) ON DELETE SET NULL;
+ALTER TABLE work_attempts ADD COLUMN response_queued_at TIMESTAMP;
+ALTER TABLE work_attempts ADD COLUMN response_started_at TIMESTAMP;
+
+UPDATE work_attempts
+SET response_queued_at = created_at,
+    response_started_at = started_at;
+
+ALTER TABLE conversation_turns ADD COLUMN response_queued_at TIMESTAMP;
+ALTER TABLE conversation_turns ADD COLUMN response_started_at TIMESTAMP;
+
+UPDATE conversation_turns
+SET response_queued_at = queued_at,
+    response_started_at = started_at;
+
+CREATE INDEX idx_work_attempts_trigger_message
+    ON work_attempts(trigger_message_id);
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1752,6 +1778,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (35, MIGRATION_V35),
         (36, MIGRATION_V36),
         (37, MIGRATION_V37),
+        (38, MIGRATION_V38),
     ]
 }
 
@@ -1772,7 +1799,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "37");
+        assert_eq!(version, "38");
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -1884,6 +1911,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(copied_context, ("durable".to_string(), true));
+    }
+
+    #[test]
+    fn v38_backfills_response_phase_timestamps_without_rewriting_legacy_history() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 37 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO projects (id, name) VALUES ('p', 'Project');
+             INSERT INTO agents (id, name, backend, config, project_id)
+             VALUES ('atlas', 'Atlas', 'native', '{}', 'p');
+             INSERT INTO tasks (id, title, project_id)
+             VALUES ('task', 'Investigate', 'p');
+             INSERT INTO logical_sessions (id, agent_id)
+             VALUES ('atlas', 'atlas');
+             INSERT INTO work_attempts
+                 (id, session_id, task_id, runner, status, prompt, created_at, started_at)
+             VALUES
+                 ('attempt', 'atlas', 'task', 'codex', 'running', 'Investigate',
+                  '2026-08-16 10:00:00', '2026-08-16 10:00:05');
+             INSERT INTO conversations (id, title, project_id)
+             VALUES ('conversation', 'Discuss', 'p');
+             INSERT INTO conversation_turns
+                 (id, conversation_id, agent_id, status, queued_at, started_at)
+             VALUES
+                 ('turn', 'conversation', 'atlas', 'running',
+                  '2026-08-16 11:00:00', '2026-08-16 11:00:07');",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V38).unwrap();
+
+        let attempt: (String, String, String, String) = conn
+            .query_row(
+                "SELECT created_at, started_at, response_queued_at, response_started_at
+                 FROM work_attempts WHERE id = 'attempt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            attempt,
+            (
+                "2026-08-16 10:00:00".into(),
+                "2026-08-16 10:00:05".into(),
+                "2026-08-16 10:00:00".into(),
+                "2026-08-16 10:00:05".into(),
+            )
+        );
+        let turn: (String, String, String, String) = conn
+            .query_row(
+                "SELECT queued_at, started_at, response_queued_at, response_started_at
+                 FROM conversation_turns WHERE id = 'turn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            turn,
+            (
+                "2026-08-16 11:00:00".into(),
+                "2026-08-16 11:00:07".into(),
+                "2026-08-16 11:00:00".into(),
+                "2026-08-16 11:00:07".into(),
+            )
+        );
     }
 
     #[test]

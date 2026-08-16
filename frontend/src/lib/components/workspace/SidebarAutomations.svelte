@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Schedule, Workflow } from '$lib/api';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { timeAgo } from '$lib/utils';
 
 	let {
@@ -19,18 +20,19 @@
 	} = $props();
 
 	let sortedWorkflows = $derived([...workflowList].sort((left, right) =>
-		Date.parse(right.updated_at) - Date.parse(left.updated_at)
+		(serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)
 		|| right.id.localeCompare(left.id)
 	));
 	let sortedSchedules = $derived([...scheduleList].sort((left, right) =>
 		Number(right.enabled) - Number(left.enabled)
-		|| Date.parse(right.last_run ?? right.created_at) - Date.parse(left.last_run ?? left.created_at)
+		|| (serverTimestampMs(right.last_run ?? right.created_at) ?? 0) - (serverTimestampMs(left.last_run ?? left.created_at) ?? 0)
 		|| right.id.localeCompare(left.id)
 	));
 
 	function scheduleTiming(schedule: Schedule): string {
 		if (schedule.schedule_type === 'once' && schedule.run_at) {
-			return `Once · ${new Date(schedule.run_at).toLocaleString()}`;
+			const parsed = serverTimestampMs(schedule.run_at);
+			return `Once · ${parsed === null ? schedule.run_at : new Date(parsed).toLocaleString()}`;
 		}
 		return schedule.cron;
 	}

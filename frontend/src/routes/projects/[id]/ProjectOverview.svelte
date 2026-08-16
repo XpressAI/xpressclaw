@@ -129,7 +129,7 @@
 
 <div class="workspace-scroll-y h-full">
 	{#if loading}
-		<div class="flex h-full items-center justify-center"><AgentLoading label="Loading project" /></div>
+		<div class="flex h-full items-center justify-center"><AgentLoading label="Loading project" phase="loading" /></div>
 	{:else if project}
 		<div class="mx-auto max-w-6xl space-y-8 p-4 sm:p-6">
 			<header class="flex flex-wrap items-start justify-between gap-4">

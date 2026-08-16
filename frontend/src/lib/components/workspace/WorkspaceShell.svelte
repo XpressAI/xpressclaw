@@ -8,6 +8,7 @@
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
 	import { PROJECT_MUTATION_EVENT, sortProjectsByRecency, type ProjectMutation } from '$lib/projectEvents';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { agentRuntimeSummary, agentRuntimeTitle, timeAgo } from '$lib/utils';
 	import {
 		createWorkspaceTab,
@@ -93,7 +94,7 @@
 	let attentionTasks = $derived(taskList
 		.filter((task) => task.status === 'waiting_for_input' || task.status === 'blocked')
 		.sort((left, right) => statusPriority(right.status) - statusPriority(left.status)
-			|| Date.parse(right.updated_at) - Date.parse(left.updated_at)));
+			|| (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)));
 	let focusedAgent = $derived((() => {
 		if (!focusedTab) return null;
 		if (focusedTab.kind === 'agent') return agentList.find((agent) => agent.id === focusedTab.resourceId) ?? null;
