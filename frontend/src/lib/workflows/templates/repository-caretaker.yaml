@@ -1,0 +1,134 @@
+name: __WORKFLOW_NAME__
+description: Periodically inspect repository health and route a safe maintenance response.
+version: 1
+
+inputs:
+  scope:
+    type: string
+    description: Repository health areas to inspect.
+    default: CI status, dependency health, security signals, and documentation drift
+  allow_safe_edits:
+    type: boolean
+    description: Allow narrow local edits; publishing is never automatic.
+    default: false
+  caretaker:
+    type: agent
+    description: Agent context with the repository and maintenance tools.
+    required: true
+    primary: true
+
+schedule:
+  cron: __SCHEDULE_CRON__
+  inputs:
+    scope: CI status, dependency health, security signals, and documentation drift
+    allow_safe_edits: false
+    caretaker: __SCHEDULE_AGENT_ID__
+
+flows:
+  main:
+    color: "#0ea5e9"
+    steps:
+      - id: inspect_health
+        type: step
+        label: Inspect repository health
+        agent: "@caretaker"
+        new_session: true
+        prompt: |
+          Inspect the current repository for this maintenance scope:
+
+          @scope
+
+          Use available repository and project-scoped tools to collect concrete
+          evidence. Do not commit, push, open or update a pull request, merge,
+          publish, rotate credentials, or make destructive changes. Classify the
+          repository as exactly "healthy", "changes", or "blocked".
+        outputs:
+          status:
+            type: string
+            description: healthy, changes, or blocked.
+          findings:
+            type: array
+            description: Evidence-backed findings ordered by urgency.
+          recommended_action:
+            type: string
+            description: Safest useful next action.
+
+      - id: health_route
+        type: when
+        label: Repository health
+        switch: "@inspect_health.status"
+        arms:
+          - match: healthy
+            goto: flow healthy
+          - match: changes
+            goto: flow changes
+          - match: blocked
+            goto: flow blocked
+          - match: default
+            goto: flow blocked
+
+  healthy:
+    color: "#22c55e"
+    steps:
+      - id: report_healthy
+        type: step
+        label: Record healthy result
+        agent: "@caretaker"
+        prompt: |
+          Produce a concise repository-health report from these findings:
+
+          @inspect_health.findings
+
+          State what was checked, the evidence, and when it should be checked
+          again. Make no repository or publishing changes.
+        outputs:
+          report:
+            type: string
+            description: Evidence-backed healthy-state summary.
+
+  changes:
+    color: "#f59e0b"
+    steps:
+      - id: prepare_maintenance
+        type: step
+        label: Prepare safe maintenance
+        agent: "@caretaker"
+        prompt: |
+          Repository maintenance is recommended:
+
+          @inspect_health.findings
+
+          Safe local edits are allowed: @allow_safe_edits
+
+          If false, prepare an ordered proposal only. If true, make only narrow,
+          reversible edits in the current workspace and run focused checks. In
+          either case, do not commit, push, open or update a pull request, merge,
+          publish, or change credentials. Clearly report every action and any
+          decision that still needs a person.
+        outputs:
+          outcome:
+            type: string
+            description: proposal_only, local_changes, or blocked.
+          report:
+            type: string
+            description: Changes proposed or made, evidence, and verification.
+
+  blocked:
+    color: "#ef4444"
+    steps:
+      - id: report_blocker
+        type: step
+        label: Report maintenance blocker
+        agent: "@caretaker"
+        prompt: |
+          Repository health could not be established safely.
+
+          Findings: @inspect_health.findings
+          Recommended action: @inspect_health.recommended_action
+
+          Report the missing access, failing prerequisite, or decision needed.
+          Do not attempt to bypass permissions or publish changes.
+        outputs:
+          report:
+            type: string
+            description: Actionable blocker report.

@@ -6,6 +6,45 @@ declared outputs become available to later steps. A run can be independent or
 bound to a Project Conversation, in which case its Tasks and results remain
 linked to that shared context.
 
+## Start from a template
+
+Open **Automations → New workflow** to choose one of six working templates:
+
+1. **Goal loop** makes one verified increment at a time until its Agent returns
+   `complete`. The workflow cycle guard prevents an accidental infinite loop.
+2. **Implementation + independent review** uses reusable `implementer` and
+   `reviewer` roles, a draft pull request as the cross-context handoff, and a
+   durable GitHub activity wait after the pull request is ready for a person.
+3. **Scheduled repository caretaker** checks CI, dependencies, security
+   signals, and documentation on a real cron schedule, then follows a healthy,
+   changes, or blocked path. Automatic publishing is forbidden; optional edits
+   stay local for a person to inspect.
+4. **Periodic issue/backlog processor** asks an MCP-capable Agent to fetch and
+   normalize a bounded batch from its configured provider, processes the items
+   serially and durably, and writes back only when explicitly enabled and
+   supported. It works with GitHub, Jira, Linear, or another source without
+   depending on a disabled connector trigger.
+5. **Requirements → detailed specification** gathers context, drafts a
+   high-level design, gives an independent role a clean-session challenge, and
+   produces acceptance criteria plus independently useful delivery slices. It
+   works for product, policy, operations, research, and software work.
+6. **UI regression tester** runs scoped browser flows, records concrete
+   evidence, classifies findings, and can optionally make one narrow local fix
+   and retest pass. It never publishes that fix automatically.
+
+The compact **Start blank** action retains the original one-step starter for
+people who want an executable empty canvas instead of a primary gallery card.
+Every template uses typed inputs and reusable Agent roles rather than fixed
+Agent IDs.
+
+The two periodic templates ask for a cron expression and an Agent when they are
+created. That selected Agent ID is stored only in `schedule.inputs` so automatic
+runs are executable; manual runs can bind the same role to another Agent. Cron
+uses server-local time, the new schedule starts enabled, and both its cadence
+and binding remain editable in **Inputs & trigger**. For the backlog template,
+configure the chosen Agent with the provider's MCP tools first—XpressClaw does
+not present generic connector triggers or sinks as functional in this beta.
+
 ## Run a workflow
 
 Open **Automations → Workflows** and select **Run**. Workflows may declare
@@ -125,6 +164,12 @@ timeout fails the workflow; otherwise it follows the named step or flow.
   `schedule.inputs`, so the same generic workflow runs unattended.
 - **Batch work:** a `loop` walks an array serially and durably resumes each
   nested agent task, including after restart.
+- **Independent specification challenge:** give the challenger a reusable Agent
+  role and `new_session: true`, then pass its structured gaps and recommendations
+  to the final drafting step.
+- **Evidence-based UI regression:** keep the browser, optional local fix, and
+  retest in one Agent role so the workspace and captured evidence remain
+  coherent; branch around the fix when `allow_fix` is false.
 - **Failure handling:** an `on_error` flow catches failed agent tasks; explicit
   timeout flows handle external systems that never respond.
 

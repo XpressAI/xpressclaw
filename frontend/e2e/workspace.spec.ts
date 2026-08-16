@@ -3064,13 +3064,131 @@ test('the new-schedule sidebar shortcut remains reusable after cancellation and 
 	await expect(page).toHaveURL('/automations#schedules');
 });
 
+test('workflow gallery has six primary templates, distinct selection, and unique default names', async ({ page }) => {
+	const existing = (name: string, index: number) => ({
+		id: `existing-workflow-${index}`,
+		name,
+		description: null,
+		yaml_content: 'name: existing\nflows:\n  main:\n    steps: []',
+		enabled: true,
+		version: 1,
+		created_at: timestamp(index),
+		updated_at: timestamp(index),
+		last_triggered_at: null,
+		trigger_count: 0,
+		trigger_error: null,
+	});
+	await mockApi(page, {
+		workflows: [
+			existing('Goal Loop', 1),
+			existing('Goal Loop 2', 2),
+			existing('UI Regression Test', 3),
+		],
+	});
+	await page.goto('/workflows/new');
+
+	const cards = page.locator('[data-workflow-template-card]');
+	await expect(cards).toHaveCount(6);
+	expect(await cards.evaluateAll((items) => items.map((item) => item.getAttribute('data-workflow-template-card')))).toEqual([
+		'goal-loop',
+		'code-review',
+		'repository-caretaker',
+		'backlog-processor',
+		'requirements-specification',
+		'ui-regression',
+	]);
+	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.getByLabel('Name')).toHaveValue('Goal Loop 3');
+	await expect(page.getByRole('button', { name: /Start blank/ })).not.toHaveAttribute('data-workflow-template-card');
+
+	const reviewCard = cards.filter({ hasText: 'Implementation + independent review' });
+	await reviewCard.focus();
+	await page.keyboard.press('Enter');
+	await expect(reviewCard).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.getByLabel('Name')).toHaveValue('Code Review Loop');
+
+	await page.getByRole('button', { name: /UI regression tester/ }).click();
+	await expect(cards.filter({ hasText: 'UI regression tester' })).toHaveAttribute('aria-pressed', 'true');
+	await expect(cards.filter({ hasText: 'Goal loop' })).toHaveAttribute('aria-pressed', 'false');
+	await expect(page.getByLabel('Name')).toHaveValue('UI Regression Test 2');
+
+	await page.getByRole('button', { name: /Start blank/ }).click();
+	await expect(page.locator('[data-workflow-template-card][aria-pressed="true"]')).toHaveCount(0);
+	await expect(page.getByLabel('Name')).toHaveValue('New Workflow');
+	await expect(page.getByText('One-step starter')).toBeVisible();
+});
+
+test('scheduled workflow templates bind a real agent and editable cron schedule', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+	await page.goto('/workflows/new');
+
+	await page.getByRole('button', { name: /Scheduled repository caretaker/ }).click();
+	await expect(page.getByLabel('Workflow schedule')).toHaveValue('0 9 * * 1');
+	await expect(page.getByLabel('Scheduled agent')).toHaveValue(agentId);
+	await page.getByLabel('Workflow schedule').fill('30 8 * * 2');
+	await page.getByRole('button', { name: 'Create scheduled workflow' }).click();
+
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const yaml = workflowCreateRequests[0].yaml_content;
+	expect(yaml).toContain('cron: "30 8 * * 2"');
+	expect(yaml).toContain(`caretaker: "${agentId}"`);
+	expect(yaml).toContain('agent: "@caretaker"');
+	expect(yaml).toContain('match: healthy');
+	expect(yaml).toContain('match: changes');
+	expect(yaml).toContain('match: blocked');
+	expect(yaml).not.toContain('trigger:');
+	expect(yaml).not.toContain('type: sink');
+});
+
+test('specialized templates generate bounded backlog, specification, and UI evidence flows', async ({ page }) => {
+	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
+	await mockApi(page, { workflowCreateRequests });
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Periodic issue\/backlog processor/ }).click();
+	await page.getByRole('button', { name: 'Create scheduled workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(1);
+	const backlog = workflowCreateRequests[0].yaml_content;
+	expect(backlog).toContain(`processor: "${agentId}"`);
+	expect(backlog).toContain('type: loop');
+	expect(backlog).toContain('over: "@fetch_batch.items"');
+	expect(backlog).toContain('Jira, GitHub, Linear, or another system');
+	expect(backlog).toContain('write_back: false');
+	expect(backlog).not.toContain('trigger:');
+	expect(backlog).not.toContain('type: sink');
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /Requirements → detailed specification/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(2);
+	const specification = workflowCreateRequests[1].yaml_content;
+	expect(specification).toContain('drafter:\n    type: agent');
+	expect(specification).toContain('challenger:\n    type: agent');
+	expect(specification).toContain('new_session: true');
+	expect(specification).toContain('acceptance_criteria:');
+	expect(specification).toContain('implementation_slices:');
+
+	await page.goto('/workflows/new');
+	await page.getByRole('button', { name: /UI regression tester/ }).click();
+	await page.getByRole('button', { name: 'Create workflow' }).click();
+	await expect.poll(() => workflowCreateRequests.length).toBe(3);
+	const regression = workflowCreateRequests[2].yaml_content;
+	expect(regression).toContain('target_url:\n    type: string');
+	expect(regression).toContain('test_scope:\n    type: string');
+	expect(regression).toContain('switch: "@allow_fix"');
+	expect(regression).toContain('switch: "@apply_fix.outcome"');
+	expect(regression).toContain('Capture fresh evidence');
+	expect(regression).toContain('Do not commit, push, open or update a pull request');
+});
+
 test('goal-loop workflow template is bounded and reusable across agents', async ({ page }) => {
 	const workflowCreateRequests: { name: string; description?: string; yaml_content: string }[] = [];
 	await mockApi(page, { workflowCreateRequests });
 	await page.goto('/workflows/new');
 
 	await page.getByRole('button', { name: /Goal loop/ }).click();
-	await expect(page.getByText('Each run chooses the worker Agent, so this definition can be reused in any Project.')).toBeVisible();
+	await expect(page.getByText('Each run chooses one worker Agent. The same definition can be reused in any Project.')).toBeVisible();
 	await page.getByRole('button', { name: 'Create workflow' }).click();
 
 	await expect.poll(() => workflowCreateRequests.length).toBe(1);
@@ -3092,6 +3210,7 @@ test('code-review template waits durably for human GitHub activity', async ({ pa
 	await mockApi(page, { workflowCreateRequests });
 	await page.goto('/workflows/new');
 
+	await page.getByRole('button', { name: /Implementation \+ independent review/ }).click();
 	await page.getByRole('button', { name: 'Create workflow' }).click();
 	await expect.poll(() => workflowCreateRequests.length).toBe(1);
 	const yaml = workflowCreateRequests[0].yaml_content;
