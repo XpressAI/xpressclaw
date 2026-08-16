@@ -1,0 +1,177 @@
+name: __WORKFLOW_NAME__
+description: Periodically process a bounded batch from an Agent's configured issue-provider MCP tools.
+version: 1
+
+inputs:
+  source:
+    type: string
+    description: Human-readable issue or backlog source configured on the Agent.
+    default: Configured issue tracker
+  query:
+    type: string
+    description: Provider-neutral criteria for choosing the next batch.
+    default: Open actionable items ordered by priority and age
+  max_items:
+    type: number
+    description: Maximum items to fetch and process in one run.
+    default: 5
+  allow_changes:
+    type: boolean
+    description: Allow scoped implementation work for an item.
+    default: false
+  write_back:
+    type: boolean
+    description: Allow non-destructive status comments where the provider supports them.
+    default: false
+  processor:
+    type: agent
+    description: Agent context with MCP access to the chosen issue source.
+    required: true
+    primary: true
+
+schedule:
+  cron: __SCHEDULE_CRON__
+  inputs:
+    source: Configured issue tracker
+    query: Open actionable items ordered by priority and age
+    max_items: 5
+    allow_changes: false
+    write_back: false
+    processor: __SCHEDULE_AGENT_ID__
+
+flows:
+  main:
+    color: "#14b8a6"
+    steps:
+      - id: fetch_batch
+        type: step
+        label: Fetch and normalize backlog
+        agent: "@processor"
+        new_session: true
+        prompt: |
+          Use the issue-provider MCP tools already configured for this Agent to
+          query this source:
+
+          Source: @source
+          Criteria: @query
+          Maximum items: @max_items
+
+          The provider may be Jira, GitHub, Linear, or another system. Do not
+          assume vendor-specific fields. Fetch no more than the requested maximum,
+          normalize each item to id, title, url, priority, status, and summary,
+          then order the batch by urgency and actionability. Return status as
+          exactly "ready", "empty", or "blocked". If no suitable MCP integration
+          is available, return blocked and explain which capability is missing.
+        outputs:
+          status:
+            type: string
+            description: ready, empty, or blocked.
+          items:
+            type: array
+            description: Bounded, normalized, prioritized issue objects.
+          source_capabilities:
+            type: string
+            description: Available read and write-back operations.
+          summary:
+            type: string
+            description: Fetch result or actionable blocker.
+
+      - id: fetch_route
+        type: when
+        label: Batch available?
+        switch: "@fetch_batch.status"
+        arms:
+          - match: ready
+            continue: true
+          - match: empty
+            goto: flow summary
+          - match: blocked
+            goto: flow blocked
+          - match: default
+            goto: flow blocked
+
+      - id: process_items
+        type: loop
+        label: Process bounded batch
+        over: "@fetch_batch.items"
+        as: item
+        steps:
+          - id: process_item
+            type: step
+            label: Act or skip safely
+            agent: "@processor"
+            prompt: |
+              Process this normalized backlog item:
+
+              @item
+
+              Provider capabilities: @fetch_batch.source_capabilities
+              Scoped implementation allowed: @allow_changes
+              Non-destructive write-back allowed: @write_back
+
+              Re-read the source item before acting. Choose exactly one outcome:
+              "acted", "skipped", or "blocked". Never delete or close an item,
+              merge, publish, deploy, or bypass permissions. Only make scoped local
+              implementation changes when allow_changes is true. Only add a concise
+              status comment or equivalent when write_back is true and the provider
+              supports it; do not change ownership, priority, or lifecycle state
+              unless the item explicitly instructs that exact action.
+            outputs:
+              outcome:
+                type: string
+                description: acted, skipped, or blocked.
+              summary:
+                type: string
+                description: Evidence, action taken, and verification.
+              write_back:
+                type: string
+                description: Provider update made, or why none was made.
+
+      - id: finish_batch
+        type: jump
+        label: Summarize the run
+        target: flow summary
+
+  summary:
+    color: "#22c55e"
+    steps:
+      - id: summarize_batch
+        type: step
+        label: Summarize and safely write back
+        agent: "@processor"
+        prompt: |
+          Summarize this bounded backlog run using the original normalized batch:
+
+          @fetch_batch.items
+
+          Re-read those items through the configured provider tools to report what
+          changed, what was skipped, and what remains blocked. Non-destructive
+          write-back is allowed: @write_back. When allowed and supported, add one
+          concise run summary without closing, deleting, reassigning, reprioritizing,
+          or otherwise changing item lifecycle state.
+        outputs:
+          processed:
+            type: number
+            description: Number of items examined.
+          summary:
+            type: string
+            description: Outcomes, evidence, and recommended next actions.
+
+  blocked:
+    color: "#ef4444"
+    steps:
+      - id: report_source_blocker
+        type: step
+        label: Report source blocker
+        agent: "@processor"
+        prompt: |
+          The backlog batch could not be fetched safely.
+
+          @fetch_batch.summary
+
+          Report the exact MCP integration, permission, query, or source detail
+          needed for a future run. Do not fabricate items or use a connector trigger.
+        outputs:
+          report:
+            type: string
+            description: Actionable provider or access blocker.
