@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { mcpServers, sessions, setup } from '$lib/api';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
+	import { openExternal } from '$lib/utils';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
@@ -45,12 +46,24 @@
 	let verifyingMcp = $state<string | null>(null);
 	let mcpVerification = $state<Record<string, McpVerificationResult>>({});
 	let modelOptions = $derived(selectChoices(configOptions.find((option) => option.category === 'model' || option.id === 'model')));
+	const mcpRegistryUrl = 'https://registry.modelcontextprotocol.io/';
+	const skillsDocumentation: Record<string, string> = {
+		codex: 'https://learn.chatgpt.com/docs/build-skills',
+		claude: 'https://code.claude.com/docs/en/skills',
+		'github-copilot': 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills',
+		opencode: 'https://opencode.ai/docs/skills/',
+		qwen: 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/',
+		cline: 'https://docs.cline.bot/customization/skills'
+	};
 	const fallbackAgents = [
-		{ kind: 'codex', name: 'Codex', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
-		{ kind: 'claude', name: 'Claude Agent', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
-		{ kind: 'opencode', name: 'OpenCode', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' }
+		{ kind: 'codex', name: 'Codex', install_url: 'https://developers.openai.com/codex/cli/', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
+		{ kind: 'claude', name: 'Claude Agent', install_url: 'https://docs.anthropic.com/en/docs/claude-code/setup', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
+		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' }
 	];
 	let agentOptions = $derived(agentCatalog.length > 0 ? agentCatalog : fallbackAgents);
+	let selectedAgent = $derived(agentOptions.find((agent) => agent.kind === kind));
+	let extensionDocumentationUrl = $derived(skillsDocumentation[kind] ?? selectedAgent?.install_url ?? '');
+	let hasSkillsGuide = $derived(Boolean(skillsDocumentation[kind]));
 
 	function defaultImage(): string {
 		const agent = agentOptions.find((option) => option.kind === kind);
@@ -405,7 +418,10 @@
 				<h2 class="text-sm font-semibold">MCP servers</h2>
 				<p class="mt-1 text-xs leading-relaxed text-muted-foreground">Attach only the servers this harness needs. Stdio commands are paths inside its image; HTTP and SSE servers can be remote.</p>
 			</div>
-			<button type="button" onclick={openNewMcp} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">+ Server</button>
+			<div class="flex shrink-0 flex-wrap justify-end gap-2">
+				<button type="button" onclick={() => openExternal(mcpRegistryUrl)} class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">Registry</button>
+				<button type="button" onclick={openNewMcp} class="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">+ Server</button>
+			</div>
 		</div>
 
 		{#if serverCatalog.length === 0 && !addingMcp}
@@ -460,7 +476,14 @@
 	</div>
 
 	<div class="ai-card p-5">
-		<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
+		<div class="flex flex-wrap items-start justify-between gap-3">
+			<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
+			{#if extensionDocumentationUrl}
+				<button type="button" onclick={() => openExternal(extensionDocumentationUrl)} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">
+					{hasSkillsGuide ? `${selectedAgent?.name ?? 'Harness'} skills guide` : `${selectedAgent?.name ?? 'Harness'} docs`}
+				</button>
+			{/if}
+		</div>
 		<p class="mt-1 text-xs leading-relaxed text-muted-foreground">
 			With host login enabled, the harness's normal configuration directory is mounted read-write, so its installed skills, plugins, hooks, custom agents, and settings load normally. Project-local configuration is loaded from the workspace. Add explicit mounts for any other configuration directories.
 		</p>
