@@ -92,6 +92,19 @@ Harnesses own their instructions, tools, reasoning loops, and subagents.
 XpressClaw owns durable coordination, isolation, orchestration, and
 presentation.
 
+### API timestamp contract
+
+All server timestamps represent UTC. SQLite-backed fields may be serialized as
+`YYYY-MM-DD HH:mm:ss` without an explicit zone; RFC 3339 producers retain their
+existing `Z` or numeric offset. Frontend code must parse both forms through
+`frontend/src/lib/serverTime.ts` so a zone is added only to zone-less SQLite
+values.
+
+Work timing is phase-specific. `response_queued_at` anchors queue wait and
+`response_started_at` anchors active response generation. Legacy `created_at`
+and `started_at` fields remain available for compatibility but must not be used
+as current-turn response-latency anchors when the explicit fields are present.
+
 ## Native runner images
 
 Build all standard and host-engine runner variants:

@@ -1,12 +1,15 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { serverTimestampMs } from './serverTime';
 
 export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
 }
 
 export function timeAgo(dateStr: string): string {
-	const date = new Date(dateStr + 'Z');
+	const parsed = serverTimestampMs(dateStr);
+	if (parsed === null) return '';
+	const date = new Date(parsed);
 	const now = new Date();
 	const seconds = Math.floor((now.getTime() - date.getTime()) / 1000);
 

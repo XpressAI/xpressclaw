@@ -4,6 +4,7 @@
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
 	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
 	import ActivityEventRow from '$lib/components/ActivityEventRow.svelte';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
@@ -230,6 +231,9 @@
 	let runningAttempt = $derived(
 		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
 	);
+	let workingAttempt = $derived(
+		attempts.find(attempt => attempt.status === 'preparing' || attempt.status === 'running') ?? null
+	);
 	let queuedAttempt = $derived(attempts.find(attempt => attempt.status === 'queued') ?? null);
 	let activeAttempt = $derived(runningAttempt ?? queuedAttempt);
 	let usageAttempt = $derived(activeAttempt ?? attempts[0] ?? null);
@@ -290,9 +294,7 @@
 	);
 
 	function transcriptTimestamp(value: string): number {
-		const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
-		const parsed = Date.parse(normalized);
-		return Number.isNaN(parsed) ? 0 : parsed;
+		return serverTimestampMs(value) ?? 0;
 	}
 
 	function transcriptRank(item: TranscriptItem): number {
@@ -1241,7 +1243,7 @@
 	{/if}
 
 	{#if loading}
-		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading task" /></div>
+		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading task" phase="loading" /></div>
 	{:else if task}
 		<div class="flex min-h-0 flex-1 overflow-hidden">
 			<!-- Left: conversation -->
@@ -1503,15 +1505,25 @@
 					{/if}
 
 					<!-- Live indicator -->
-					{#if runningAttempt}
-						<div class="py-2 pl-10">
+					{#if workingAttempt}
+						<div class="space-y-2 py-2 pl-10">
 							<AgentLoading
-								label={queuedAttempt ? 'New guidance queued; switching at the next safe break' : 'The agent is working on this task'}
-								startedAt={runningAttempt.started_at ?? runningAttempt.created_at}
+								label={workingAttempt.status === 'preparing' ? 'Preparing the agent' : 'The agent is responding'}
+								phase={workingAttempt.status === 'preparing' ? 'preparing' : 'active'}
+								startedAt={workingAttempt.status === 'preparing'
+									? workingAttempt.started_at
+									: workingAttempt.response_started_at ?? workingAttempt.started_at}
 							/>
+							{#if queuedAttempt}
+								<AgentLoading
+									label="New guidance is queued for the next safe break"
+									phase="queued"
+									startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at}
+								/>
+							{/if}
 						</div>
 					{:else if queuedAttempt}
-						<div class="py-2 pl-10"><AgentLoading label="The next worker turn is queued" startedAt={queuedAttempt.created_at} /></div>
+						<div class="py-2 pl-10"><AgentLoading label="The agent is queued to respond" phase="queued" startedAt={queuedAttempt.response_queued_at ?? queuedAttempt.created_at} /></div>
 					{:else if task.status === 'waiting_for_input'}
 						<div class="flex items-center gap-2 text-xs text-orange-400">
 							<span class="h-2 w-2 rounded-full bg-orange-400 animate-pulse"></span>

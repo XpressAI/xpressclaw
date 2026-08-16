@@ -3,6 +3,7 @@
 	import { schedules } from '$lib/api';
 	import type { Schedule } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
+	import { serverTimestampMs } from '$lib/serverTime';
 
 	interface Props {
 		agentId: string;
@@ -68,7 +69,8 @@
 
 	function timing(schedule: Schedule): string {
 		if (schedule.schedule_type === 'once' && schedule.run_at) {
-			return `Once · ${new Date(schedule.run_at).toLocaleString()}`;
+			const parsed = serverTimestampMs(schedule.run_at);
+			return `Once · ${parsed === null ? schedule.run_at : new Date(parsed).toLocaleString()}`;
 		}
 		return schedule.cron;
 	}

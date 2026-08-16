@@ -13,6 +13,7 @@
 	import type { WorkflowInputDefinition, WorkflowScheduleDefinition } from '$lib/components/blocks/WorkflowConfiguration.svelte';
 	import VariablePopup from '$lib/components/blocks/VariablePopup.svelte';
 	import JumpArrows from '$lib/components/blocks/JumpArrows.svelte';
+	import { serverTimestampMs } from '$lib/serverTime';
 
 	let { workflowId }: { workflowId: string } = $props();
 
@@ -21,6 +22,11 @@
 	interface OutputSchema { type?: string; description?: string }
 	interface SinkCfg { connector: string; channel: string; template?: string }
 	interface WhenArmDef { match?: string; continue?: boolean; goto?: string }
+
+	function serverTimeOfDay(value: string): string {
+		const parsed = serverTimestampMs(value);
+		return parsed === null ? value : new Date(parsed).toLocaleTimeString();
+	}
 
 	interface Block {
 		id: string;
@@ -1036,7 +1042,7 @@
 									</span>
 								</td>
 								<td class="px-4 py-1.5 text-muted-foreground">{inst.current_step_index}</td>
-								<td class="px-4 py-1.5 text-muted-foreground">{new Date(inst.started_at + 'Z').toLocaleTimeString()}</td>
+								<td class="px-4 py-1.5 text-muted-foreground">{serverTimeOfDay(inst.started_at)}</td>
 								<td class="px-4 py-1.5 text-right">
 									{#if inst.status === 'running' || inst.status === 'waiting'}
 										<button onclick={async () => { await workflows.cancelInstance(inst.id); loadInstances(); }}

@@ -3,6 +3,7 @@
 	import { settings } from '$lib/api';
 	import type { ProjectSyncAction, ProjectSyncStatus } from '$lib/api';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
+	import { serverTimestampMs } from '$lib/serverTime';
 
 	type SyncOperation = 'fetch' | 'publish';
 	type Notice = { tone: 'success' | 'error'; message: string };
@@ -104,9 +105,8 @@
 
 	function syncTime(value: string | null): string {
 		if (!value) return 'Never';
-		const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
-		const date = new Date(normalized);
-		return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+		const parsed = serverTimestampMs(value);
+		return parsed === null ? value : new Date(parsed).toLocaleString();
 	}
 
 	function statusLabel(status: ProjectSyncStatus['status']): string {

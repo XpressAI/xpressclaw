@@ -86,6 +86,16 @@
 		try { return yaml.load(workflow.yaml_content) as WorkflowSummary; } catch { return null; }
 	}
 
+	function turnAgentName(turn: ConversationTurn): string {
+		return projectAgents.find((agent) => agent.id === turn.agent_id)?.title || turn.agent_id;
+	}
+
+	function responseStartedAt(turn: ConversationTurn): string | null {
+		// Older servers do not expose the explicit response timestamp, so retain
+		// their legacy running anchor without conflating preparation on new APIs.
+		return turn.response_started_at === undefined ? turn.started_at : turn.response_started_at;
+	}
+
 	async function loadAll(scroll = false) {
 		let loaded = false;
 		try {
@@ -389,7 +399,7 @@
 
 <div class="flex h-full min-h-0 flex-col bg-background">
 	{#if loading}
-		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading conversation" /></div>
+		<div class="flex flex-1 items-center justify-center"><AgentLoading label="Loading conversation" phase="loading" /></div>
 	{:else if conversation}
 		<header class="shrink-0 border-b border-border bg-card/30 px-4 pt-3 sm:px-6">
 			<div class="flex flex-wrap items-center justify-between gap-3">
@@ -443,7 +453,22 @@
 							</AiMessage>
 						{/each}
 						{#if activeTurns.length}
-							<div class="py-2 pl-10"><AgentLoading label={`${activeTurns.map((turn) => projectAgents.find((agent) => agent.id === turn.agent_id)?.title || turn.agent_id).join(', ')} ${activeTurns.length === 1 ? 'is' : 'are'} responding`} startedAt={activeTurns[0].started_at ?? activeTurns[0].queued_at} /></div>
+							<div class="space-y-2 py-2 pl-10">
+								{#each activeTurns as turn (turn.id)}
+									{@const responseStart = responseStartedAt(turn)}
+									<AgentLoading
+										label={turn.status === 'queued'
+											? `${turnAgentName(turn)} is queued to respond`
+											: responseStart
+												? `${turnAgentName(turn)} is responding`
+												: `Preparing ${turnAgentName(turn)}`}
+										phase={turn.status === 'queued' ? 'queued' : responseStart ? 'active' : 'preparing'}
+										startedAt={turn.status === 'queued'
+											? turn.response_queued_at ?? turn.queued_at
+											: responseStart ?? turn.started_at}
+									/>
+								{/each}
+							</div>
 						{/if}
 					</div></div>
 

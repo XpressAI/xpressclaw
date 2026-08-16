@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Agent, Conversation, Project, Task } from '$lib/api';
+	import { serverTimestampMs } from '$lib/serverTime';
 	import { timeAgo } from '$lib/utils';
 
 	const TASKS_PER_PROJECT = 5;
@@ -46,8 +47,8 @@
 	let compactTasks = $derived(sortedTasks.slice(0, TASKS_PER_PROJECT));
 
 	function compareTaskRecency(left: Task, right: Task): number {
-		return Date.parse(right.updated_at) - Date.parse(left.updated_at)
-			|| Date.parse(right.created_at) - Date.parse(left.created_at)
+		return (serverTimestampMs(right.updated_at) ?? 0) - (serverTimestampMs(left.updated_at) ?? 0)
+			|| (serverTimestampMs(right.created_at) ?? 0) - (serverTimestampMs(left.created_at) ?? 0)
 			|| right.id.localeCompare(left.id);
 	}
 

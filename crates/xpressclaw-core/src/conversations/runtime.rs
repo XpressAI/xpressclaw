@@ -22,6 +22,10 @@ pub struct ConversationTurn {
     pub queued_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+    /// UTC timestamp of the latest message included in this response cycle.
+    pub response_queued_at: Option<String>,
+    /// UTC timestamp at which the agent began generating this response.
+    pub response_started_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +163,19 @@ impl ConversationTurnQueue {
         agent_id: &str,
         trigger_message_id: i64,
     ) -> Result<bool> {
+        let trigger_exists = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_messages
+                WHERE id = ?1 AND conversation_id = ?2
+             )",
+            rusqlite::params![trigger_message_id, conversation_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !trigger_exists {
+            return Err(Error::Conversation(format!(
+                "message {trigger_message_id} does not belong to conversation {conversation_id}"
+            )));
+        }
         let is_participant = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM conversation_participants
@@ -187,7 +204,12 @@ impl ConversationTurnQueue {
             if status == "queued" {
                 transaction.execute(
                     "UPDATE conversation_turns
-                     SET trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
+                     SET response_queued_at = CASE
+                            WHEN COALESCE(trigger_message_id, 0) <= ?1
+                            THEN (SELECT created_at FROM conversation_messages
+                                  WHERE id = ?1 AND conversation_id = conversation_turns.conversation_id)
+                            ELSE response_queued_at END,
+                         trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
                      WHERE id = ?2",
                     rusqlite::params![trigger_message_id, id],
                 )?;
@@ -197,8 +219,9 @@ impl ConversationTurnQueue {
         let id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO conversation_turns
-             (id, conversation_id, agent_id, trigger_message_id)
-             VALUES (?1, ?2, ?3, ?4)",
+             (id, conversation_id, agent_id, trigger_message_id, response_queued_at)
+             SELECT ?1, ?2, ?3, ?4, created_at
+             FROM conversation_messages WHERE id = ?4 AND conversation_id = ?2",
             rusqlite::params![id, conversation_id, agent_id, trigger_message_id],
         )?;
         transaction.execute(
@@ -276,6 +299,20 @@ impl ConversationTurnQueue {
             )?;
             tx.commit()?;
             Ok(Some(turn))
+        })
+    }
+
+    /// Mark the true response boundary after process/session preparation and
+    /// immediately before the ACP turn begins.
+    pub fn start_response(&self, turn_id: &str) -> Result<bool> {
+        self.db.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE conversation_turns
+                 SET response_started_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND status = 'running' AND response_started_at IS NULL",
+                [turn_id],
+            )?;
+            Ok(changed == 1)
         })
     }
 
@@ -491,7 +528,7 @@ impl ConversationTurnQueue {
         let after_id = turn.trigger_message_id.unwrap_or(0);
         let latest_addressed = {
             let mut statement = transaction.prepare(
-                "SELECT id, sender_type, sender_id, content, metadata
+                "SELECT id, sender_type, sender_id, content, metadata, created_at
                  FROM conversation_messages
                  WHERE conversation_id = ?1 AND id > ?2
                  ORDER BY id DESC",
@@ -504,11 +541,12 @@ impl ConversationTurnQueue {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 })?;
             let mut latest = None;
             for message in messages {
-                let (id, sender_type, sender_id, content, metadata) = message?;
+                let (id, sender_type, sender_id, content, metadata, created_at) = message?;
                 let agent_mentions = Self::agent_mentions(&content);
                 let routed_target_agent_id = serde_json::from_str::<serde_json::Value>(&metadata)
                     .ok()
@@ -525,19 +563,25 @@ impl ConversationTurnQueue {
                     &agent_mentions,
                     routed_target_agent_id.as_deref(),
                 ) {
-                    latest = Some(id);
+                    latest = Some((id, created_at));
                     break;
                 }
             }
             latest
         };
-        if let Some(latest_addressed) = latest_addressed {
+        if let Some((latest_addressed, response_queued_at)) = latest_addressed {
             let id = Uuid::new_v4().to_string();
             transaction.execute(
                 "INSERT INTO conversation_turns
-                     (id, conversation_id, agent_id, trigger_message_id)
-                     VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![id, turn.conversation_id, turn.agent_id, latest_addressed],
+                     (id, conversation_id, agent_id, trigger_message_id, response_queued_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    id,
+                    turn.conversation_id,
+                    turn.agent_id,
+                    latest_addressed,
+                    response_queued_at
+                ],
             )?;
             transaction.execute(
                 "UPDATE conversation_agent_sessions
@@ -572,6 +616,7 @@ impl ConversationTurnQueue {
             let changed = conn.execute(
                 "UPDATE conversation_turns
                  SET status = 'queued', started_at = NULL,
+                     response_queued_at = CURRENT_TIMESTAMP, response_started_at = NULL,
                      error_message = 'Recovered after XpressClaw restart'
                  WHERE status = 'running'",
                 [],
@@ -617,6 +662,8 @@ fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConversationTurn> {
         queued_at: row.get("queued_at")?,
         started_at: row.get("started_at")?,
         completed_at: row.get("completed_at")?,
+        response_queued_at: row.get("response_queued_at")?,
+        response_started_at: row.get("response_started_at")?,
     })
 }
 
@@ -698,13 +745,13 @@ mod tests {
                 &second.content,
             )
             .unwrap();
-        assert_eq!(
-            queue
-                .list_for_conversation(&conversation.id, 10)
-                .unwrap()
-                .len(),
-            2
-        );
+        let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert!(turns.iter().all(|turn| {
+            turn.trigger_message_id == Some(second.id)
+                && turn.response_queued_at.as_deref() == Some(second.created_at.as_str())
+                && turn.response_started_at.is_none()
+        }));
     }
 
     #[test]
@@ -836,6 +883,16 @@ mod tests {
             .unwrap();
         let running = queue.claim_next().unwrap().unwrap();
         assert_eq!(running.agent_id, "atlas");
+        assert!(running.response_started_at.is_none());
+        assert!(queue.start_response(&running.id).unwrap());
+        let responding = queue
+            .list_for_conversation(&conversation.id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|turn| turn.id == running.id)
+            .unwrap();
+        assert!(responding.response_started_at.is_some());
+        assert!(!queue.start_response(&running.id).unwrap());
 
         let second = manager
             .send_message(
@@ -884,6 +941,12 @@ mod tests {
         assert_eq!(
             turns.iter().filter(|turn| turn.status == "queued").count(),
             1
+        );
+        let follow_up = turns.iter().find(|turn| turn.status == "queued").unwrap();
+        assert_eq!(follow_up.trigger_message_id, Some(second.id));
+        assert_eq!(
+            follow_up.response_queued_at.as_deref(),
+            Some(second.created_at.as_str())
         );
     }
 

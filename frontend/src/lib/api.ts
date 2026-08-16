@@ -151,6 +151,8 @@ export interface ConversationTurn {
 	queued_at: string;
 	started_at: string | null;
 	completed_at: string | null;
+	response_queued_at?: string | null;
+	response_started_at?: string | null;
 }
 
 export interface ConversationMessageUpload {
@@ -255,6 +257,9 @@ export interface WorkAttempt {
 	completed_at: string | null;
 	context_used: number | null;
 	context_size: number | null;
+	trigger_message_id?: number | null;
+	response_queued_at?: string | null;
+	response_started_at?: string | null;
 }
 
 export interface SessionEvent {

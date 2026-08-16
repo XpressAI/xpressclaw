@@ -101,8 +101,9 @@ impl TaskQueue {
         )?;
         transaction.execute(
             "INSERT INTO work_attempts
-             (id, session_id, task_id, queue_id, kind, runner, status, prompt)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6)",
+             (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+              response_queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6, CURRENT_TIMESTAMP)",
             rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
         )?;
         transaction.execute(
@@ -198,6 +199,103 @@ impl TaskQueue {
             .transpose()
     }
 
+    /// Enqueue (or coalesce into) the response cycle triggered by a user
+    /// message, retaining an explicit association instead of inferring the
+    /// timer anchor from unrelated task history.
+    pub fn enqueue_continuation_for_message(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<Option<QueueItem>> {
+        let created = self.db.with_conn(|conn| {
+            // Reserve the writer before looking for a coalescible continuation.
+            // Otherwise the dispatcher can claim that row between the lookup
+            // and trigger update, leaving this message attached to no response.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let queued_attempt_id = transaction
+                .query_row(
+                    "SELECT attempt_id FROM task_queue
+                     WHERE task_id = ?1 AND status = 'queued'
+                     ORDER BY id DESC LIMIT 1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+
+            let item = match queued_attempt_id {
+                Some(Some(attempt_id)) => {
+                    Self::associate_response_trigger_in_transaction(
+                        &transaction,
+                        &attempt_id,
+                        message_id,
+                        message_timestamp,
+                    )?;
+                    None
+                }
+                Some(None) => {
+                    return Err(Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    )));
+                }
+                None => {
+                    let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
+                    let attempt_id = item.attempt_id.as_deref().ok_or_else(|| {
+                        Error::Task(format!(
+                            "queued continuation for task {task_id} has no work attempt"
+                        ))
+                    })?;
+                    Self::associate_response_trigger_in_transaction(
+                        &transaction,
+                        attempt_id,
+                        message_id,
+                        message_timestamp,
+                    )?;
+                    Some(item)
+                }
+            };
+            transaction.commit()?;
+            Ok::<_, Error>(item)
+        })?;
+
+        if let Some(item) = created.as_ref() {
+            debug!(
+                task_id,
+                agent_id,
+                queue_id = item.id,
+                "enqueued task continuation"
+            );
+        }
+        Ok(created)
+    }
+
+    fn associate_response_trigger_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        attempt_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<()> {
+        let updated = transaction.execute(
+            "UPDATE work_attempts
+             SET response_queued_at = CASE
+                    WHEN COALESCE(trigger_message_id, 0) <= ?1 THEN ?2
+                    ELSE response_queued_at END,
+                 trigger_message_id = MAX(COALESCE(trigger_message_id, 0), ?1)
+             WHERE id = ?3",
+            rusqlite::params![message_id, message_timestamp, attempt_id],
+        )?;
+        if updated != 1 {
+            return Err(Error::Task(format!(
+                "queued continuation attempt {attempt_id} was not found"
+            )));
+        }
+        Ok(())
+    }
+
     /// Add GitHub review feedback and enqueue a continuation for the task's
     /// current assignment as one atomic unit.
     ///
@@ -246,6 +344,12 @@ impl TaskQueue {
                 "INSERT INTO task_messages (task_id, role, content) VALUES (?1, 'user', ?2)",
                 rusqlite::params![task_id, message],
             )?;
+            let message_id = transaction.last_insert_rowid();
+            let message_timestamp: String = transaction.query_row(
+                "SELECT timestamp FROM task_messages WHERE id = ?1",
+                [message_id],
+                |row| row.get(0),
+            )?;
             let already_queued: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM task_queue WHERE task_id = ?1 AND status = 'queued'
@@ -254,6 +358,16 @@ impl TaskQueue {
                 |row| row.get(0),
             )?;
             if already_queued {
+                transaction.execute(
+                    "UPDATE work_attempts
+                     SET trigger_message_id = ?1, response_queued_at = ?2
+                     WHERE id = (
+                        SELECT attempt_id FROM task_queue
+                        WHERE task_id = ?3 AND status = 'queued'
+                        ORDER BY id DESC LIMIT 1
+                     )",
+                    rusqlite::params![message_id, message_timestamp, task_id],
+                )?;
                 transaction.execute(
                     "UPDATE tasks SET status = 'in_progress', completed_at = NULL,
                         updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -299,9 +413,19 @@ impl TaskQueue {
             )?;
             transaction.execute(
                 "INSERT INTO work_attempts
-                 (id, session_id, task_id, queue_id, kind, runner, status, prompt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6)",
-                rusqlite::params![attempt_id, agent_id, task_id, queue_id, kind, prompt],
+                 (id, session_id, task_id, queue_id, kind, runner, status, prompt,
+                  trigger_message_id, response_queued_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'auto', 'queued', ?6, ?7, ?8)",
+                rusqlite::params![
+                    attempt_id,
+                    agent_id,
+                    task_id,
+                    queue_id,
+                    kind,
+                    prompt,
+                    message_id,
+                    message_timestamp
+                ],
             )?;
             transaction.execute(
                 "UPDATE task_queue SET attempt_id = ?1 WHERE id = ?2",
@@ -606,7 +730,8 @@ impl TaskQueue {
                 )?;
                 tx.execute(
                     "UPDATE work_attempts SET status = 'queued', container_id = NULL,
-                        started_at = NULL, completed_at = NULL, error_message = NULL
+                        started_at = NULL, completed_at = NULL, error_message = NULL,
+                        response_queued_at = CURRENT_TIMESTAMP, response_started_at = NULL
                      WHERE id = ?1",
                     [attempt_id],
                 )?;
@@ -1371,7 +1496,7 @@ mod tests {
     #[test]
     fn coalesces_messages_into_one_queued_continuation() {
         let (db, queue) = setup();
-        let board = TaskBoard::new(db);
+        let board = TaskBoard::new(db.clone());
         let task = board
             .create(&CreateTask {
                 title: "Conversation".into(),
@@ -1393,16 +1518,41 @@ mod tests {
         let running = queue.claim("atlas").unwrap().unwrap();
         assert_eq!(running.id, first.id);
 
+        let conversation = crate::tasks::conversation::TaskConversation::new(db.clone());
+        let first_message = conversation
+            .add_message(&task.id, "user", "First follow-up")
+            .unwrap();
         let continuation = queue
-            .enqueue_continuation(&task.id, "atlas")
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                first_message.id,
+                &first_message.timestamp,
+            )
             .unwrap()
             .unwrap();
         assert_ne!(continuation.id, first.id);
         assert!(queue.has_queued_for_task(&task.id).unwrap());
+        let second_message = conversation
+            .add_message(&task.id, "user", "More context")
+            .unwrap();
         assert!(queue
-            .enqueue_continuation(&task.id, "atlas")
+            .enqueue_continuation_for_message(
+                &task.id,
+                "atlas",
+                second_message.id,
+                &second_message.timestamp,
+            )
             .unwrap()
             .is_none());
         assert_eq!(queue.pending_count("atlas").unwrap(), 1);
+        let attempt = SessionManager::new(db)
+            .get_attempt(continuation.attempt_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(attempt.trigger_message_id, Some(second_message.id));
+        assert_eq!(
+            attempt.response_queued_at.as_deref(),
+            Some(second_message.timestamp.as_str())
+        );
     }
 }
