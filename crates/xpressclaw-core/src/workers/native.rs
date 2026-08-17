@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::acp::{agent_definition, local_runner_image};
+use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
     NativeRunnerConfig,
@@ -605,6 +606,7 @@ async fn execute_conversation_turn(
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let collaboration_token = configure_local_collaboration_access(&db, &config, agent, &mut spec)?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -657,6 +659,7 @@ async fn execute_conversation_turn(
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
@@ -912,6 +915,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let collaboration_token = configure_local_collaboration_access(&db, &config, agent, &mut spec)?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -983,6 +987,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
@@ -2002,6 +2007,7 @@ struct RunnerCallback<'a> {
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
+    collaboration_token: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -2021,6 +2027,7 @@ fn xpressclaw_control_mcp_server(
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
+            collaboration_token: None,
         },
     )
 }
@@ -2054,6 +2061,10 @@ fn xpressclaw_control_mcp_server_for_context(
     if let Some(project_id) = project_id {
         env.push(EnvVariable::new("XPRESSCLAW_PROJECT_ID", project_id));
     }
+    if let Some(token) = callback.collaboration_token {
+        env.push(EnvVariable::new("XPRESSCLAW_LOCAL_COLLABORATION", "1"));
+        env.push(EnvVariable::new("XPRESSCLAW_COLLABORATION_TOKEN", token));
+    }
     // The control MCP must move in lockstep with the control plane. Runner
     // images are cached independently and can legitimately remain on an older
     // build, so execute the source embedded in this XpressClaw binary instead
@@ -2067,6 +2078,26 @@ fn xpressclaw_control_mcp_server_for_context(
             ])
             .env(env),
     )
+}
+
+fn configure_local_collaboration_access(
+    db: &Arc<Database>,
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let secrets = CollaborationSecrets::load(&config.system.data_dir)?.ok_or_else(|| {
+        Error::Backend(
+            "Local collaboration access is assigned to this Agent, but the services are not installed; open Settings → Local collaboration and choose Install services"
+                .to_string(),
+        )
+    })?;
+    let installation_id = db.installation_id()?;
+    spec.network_mode = Some(collaboration_network_name(&installation_id));
+    Ok(Some(secrets.agent_capability_token))
 }
 
 fn is_absolute_container_path(path: &str) -> bool {
@@ -4323,6 +4354,56 @@ mod tests {
         assert_eq!(
             container_spec_fingerprint(&task).unwrap(),
             container_spec_fingerprint(&conversation).unwrap()
+        );
+    }
+
+    #[test]
+    fn local_collaboration_network_and_capability_are_assigned_per_agent() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let expected_token = CollaborationSecrets::generate();
+        expected_token.save(data_dir.path()).unwrap();
+
+        let allowed = AgentConfig {
+            name: "allowed".to_string(),
+            ..Default::default()
+        };
+        let mut allowed_spec = ContainerSpec::default();
+        let token = configure_local_collaboration_access(&db, &config, &allowed, &mut allowed_spec)
+            .unwrap();
+        assert_eq!(
+            token.as_deref(),
+            Some(expected_token.agent_capability_token.as_str())
+        );
+        let expected_network = collaboration_network_name(&db.installation_id().unwrap());
+        assert_eq!(
+            allowed_spec.network_mode.as_deref(),
+            Some(expected_network.as_str())
+        );
+
+        let unassigned = AgentConfig {
+            name: "unassigned".to_string(),
+            ..Default::default()
+        };
+        let mut unassigned_spec = ContainerSpec {
+            network_mode: Some("existing-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access(
+            &db,
+            &config,
+            &unassigned,
+            &mut unassigned_spec,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            unassigned_spec.network_mode.as_deref(),
+            Some("existing-network")
         );
     }
 

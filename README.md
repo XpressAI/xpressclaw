@@ -210,9 +210,12 @@ Desktop limitations.
   loops.
 - Let the scoped GitHub integration publish a task's pull request, monitor
   review feedback, and resume the same Agent context until approval or merge.
+- Optionally run local GitBucket and Jenkins collaboration services for
+  selected Agents without changing existing GitHub flows.
 
 See the guides for [workflows](docs/workflows.md),
-[scheduling](docs/scheduling.md), and [remote access](docs/remote-access.md).
+[scheduling](docs/scheduling.md), [local collaboration](docs/local-collaboration.md),
+and [remote access](docs/remote-access.md).
 
 ## CLI Essentials
 

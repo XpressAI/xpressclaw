@@ -27,6 +27,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+serde_urlencoded = "0.7"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }

@@ -163,6 +163,7 @@ async fn delete_agent(
         .collect();
     let new_config = xpressclaw_core::config::Config {
         agents: new_agents,
+        collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         mcp_servers: old_config.mcp_servers.clone(),
         system: old_config.system.clone(),
@@ -326,6 +327,7 @@ async fn update_agent_config(
     // Save updated config — preserve all top-level fields
     let new_config = xpressclaw_core::config::Config {
         agents: new_agents,
+        collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         mcp_servers: old_config.mcp_servers.clone(),
         system: old_config.system.clone(),

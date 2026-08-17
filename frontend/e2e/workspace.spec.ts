@@ -188,6 +188,8 @@ async function mockApi(
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
 		projectSyncFetchConflictOnce?: boolean;
+		collaborationSettings?: Record<string, unknown>;
+		collaborationActions?: string[];
 		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
 		projectDeleteRequests?: string[];
 		projectDeleteError?: string;
@@ -421,6 +423,24 @@ async function mockApi(
 				commit: operation === 'fetch' ? '12345678fetch' : '87654321publish',
 				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
 			};
+		} else if (path === '/api/settings/collaboration') {
+			response = options.collaborationSettings ?? {
+				config: {
+					enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+					gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+					authorized_agents: [],
+				},
+				status: {
+					configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+					gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+					jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+				},
+				credentials_configured: false, reset_confirmation: 'RESET LOCAL COLLABORATION',
+			};
+			if (request.method() === 'PUT') options.collaborationActions?.push('save');
+		} else if (/^\/api\/settings\/collaboration\/(install|start|stop|restart|upgrade|reset)$/.test(path)) {
+			options.collaborationActions?.push(path.split('/').at(-1) ?? '');
+			response = options.collaborationSettings;
 		} else if (path === '/api/projects') {
 			const sharedProject = options.sharedProjectState?.project;
 			const projectListSnapshot = availableProjects
@@ -3206,6 +3226,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
 		'P Profile',
 		'↕ Project sync',
+		'C Local collaboration',
 		'M MCP servers',
 		'I Instance',
 	]);
@@ -3225,7 +3246,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(4);
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(5);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
@@ -3605,6 +3626,45 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 	await ready.getByRole('button', { name: 'Publish' }).click();
 	await expect.poll(() => projectSyncRequests.at(-1)).toEqual({ projectId, operation: 'publish', force: false });
 	await expect(ready).toContainText('Published 2 Agents, 8 tasks, 3 Conversations, and 1 workflow at 87654321.');
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration settings stay opt-in and expose safe lifecycle controls', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: ['browser-tested-workspace'],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await expect(page.getByRole('heading', { name: 'Local collaboration services' })).toBeVisible();
+	await expect(page.locator('[data-sidebar-setting="settings-collaboration"]')).toHaveAttribute('aria-current', 'page');
+	await expect(page.getByText('Healthy', { exact: true })).toHaveCount(2);
+	await expect(page.getByText('http://gitbucket:8080')).toBeVisible();
+	await expect(page.getByText('http://jenkins:8080')).toBeVisible();
+	await expect(page.getByText('browser-tested-workspace', { exact: true })).toBeVisible();
+	await expect(page.getByText(/no host Docker socket/i)).toBeVisible();
+
+	await page.getByRole('button', { name: 'stop', exact: true }).click();
+	await expect.poll(() => collaborationActions).toContain('stop');
+	await page.getByText('Permanently reset local collaboration data').click();
+	const destructive = page.getByRole('button', { name: 'Delete services and persistent data' });
+	await expect(destructive).toBeDisabled();
+	await page.getByLabel(/Type RESET LOCAL COLLABORATION/).fill('RESET LOCAL COLLABORATION');
+	await expect(destructive).toBeEnabled();
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);

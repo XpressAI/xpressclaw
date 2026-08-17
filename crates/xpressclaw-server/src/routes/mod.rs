@@ -12,6 +12,7 @@ mod projects;
 mod schedules;
 mod sessions;
 mod settings;
+mod settings_collaboration;
 mod settings_sync;
 mod setup;
 mod tasks;

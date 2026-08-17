@@ -182,6 +182,35 @@ test('advertises project memory tools with conservative MCP annotations', () => 
   assert.equal(archive.annotations.destructiveHint, true);
 });
 
+test('local collaboration tools are visible only to explicitly authorized Agent processes', async () => {
+  assert.equal(TOOLS.some((tool) => tool.name === 'local_forge_create_repository'), false);
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: 'http://127.0.0.1:1',
+        XPRESSCLAW_AGENT_ID: 'authorized-agent',
+        XPRESSCLAW_LOCAL_COLLABORATION: '1',
+        XPRESSCLAW_COLLABORATION_TOKEN: 'scoped-capability',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`);
+  const listed = JSON.parse((await output.next()).value);
+  const names = listed.result.tools.map((tool) => tool.name);
+  assert.ok(names.includes('local_forge_create_repository'));
+  assert.ok(names.includes('local_forge_push_branch'));
+  assert.ok(names.includes('local_build_trigger'));
+  child.stdin.end();
+  if (child.exitCode === null) await once(child, 'exit');
+  lines.close();
+});
+
 test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
   let createdBody = null;
   const controlTokens = [];

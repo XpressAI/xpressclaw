@@ -40,6 +40,25 @@ system:
 agents: []
 ```
 
+## Optional local collaboration services
+
+GitBucket and Jenkins remain disabled until a person explicitly enables,
+installs, and starts them in **Settings → Local collaboration**. The
+non-secret instance configuration is:
+
+    collaboration:
+      enabled: false
+      bind_address: 127.0.0.1
+      gitbucket_port: 8088
+      jenkins_port: 8089
+      gitbucket_image: ghcr.io/gitbucket/gitbucket:4.46.1
+      jenkins_image: jenkins/jenkins:2.568.1-jdk21
+      authorized_agents: []
+
+Credentials never appear in YAML. See [Local collaboration
+services](local-collaboration.md) for lifecycle, backup, resource, security,
+and capability details.
+
 ## Agent and ACP harness representation
 
 Internally, durable sessions remain in the `agents` array for file and API

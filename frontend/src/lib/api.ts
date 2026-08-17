@@ -933,6 +933,41 @@ export interface ProjectSyncAction {
 	counts: ProjectSyncCounts;
 }
 
+export interface CollaborationConfig {
+	enabled: boolean;
+	bind_address: string;
+	gitbucket_port: number;
+	jenkins_port: number;
+	gitbucket_image: string;
+	jenkins_image: string;
+	authorized_agents: string[];
+}
+
+export interface CollaborationServiceStatus {
+	state: string;
+	health: string;
+	image: string;
+	version: string;
+	host_url: string;
+	internal_url: string;
+	volume: string;
+	error: string | null;
+}
+
+export interface CollaborationSettings {
+	config: CollaborationConfig;
+	status: {
+		configured: boolean;
+		docker_available: boolean;
+		network: string;
+		data_path: string;
+		gitbucket: CollaborationServiceStatus;
+		jenkins: CollaborationServiceStatus;
+	};
+	credentials_configured: boolean;
+	reset_confirmation: string;
+}
+
 export const settings = {
 	getProfile: () => request<UserProfile>('/api/settings/profile'),
 	putProfile: (profile: UserProfile) =>
@@ -950,7 +985,22 @@ export const settings = {
 		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/publish`, {
 			method: 'POST',
 			body: '{}'
-		})
+		}),
+	getCollaboration: () => request<CollaborationSettings>('/api/settings/collaboration'),
+	putCollaboration: (config: CollaborationConfig) =>
+		request<CollaborationSettings>('/api/settings/collaboration', {
+			method: 'PUT', body: JSON.stringify(config)
+		}),
+	runCollaborationAction: (action: 'install' | 'start' | 'stop' | 'restart' | 'upgrade') =>
+		request<CollaborationSettings>(`/api/settings/collaboration/${action}`, {
+			method: 'POST', body: '{}'
+		}),
+	resetCollaboration: (confirmation: string) =>
+		request<CollaborationSettings>('/api/settings/collaboration/reset', {
+			method: 'POST', body: JSON.stringify({ confirmation })
+		}),
+	getCollaborationLogs: (service: 'gitbucket' | 'jenkins') =>
+		request<{ logs: string }>(`/api/settings/collaboration/logs/${service}`)
 };
 
 // -- Connectors --

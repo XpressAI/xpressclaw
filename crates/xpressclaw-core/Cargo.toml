@@ -9,6 +9,7 @@ description = "Core runtime library for xpressclaw — the AI agent OS"
 [dependencies]
 tokio = { workspace = true }
 reqwest = { workspace = true }
+serde_urlencoded = { workspace = true }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 zerocopy = { workspace = true }
