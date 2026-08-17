@@ -113,12 +113,13 @@
 		if (status === 'ready') return 'Ready';
 		if (status === 'unconfigured') return 'Needs setup';
 		if (status === 'unavailable') return 'No workspace';
+		if (status === 'conflict') return 'Configuration conflict';
 		return 'Needs attention';
 	}
 
 	function statusTone(status: ProjectSyncStatus['status']): string {
 		if (status === 'ready') return 'border-emerald-500/25 bg-emerald-500/10 text-emerald-600';
-		if (status === 'error') return 'border-destructive/25 bg-destructive/5 text-destructive';
+		if (status === 'error' || status === 'conflict') return 'border-destructive/25 bg-destructive/5 text-destructive';
 		return 'border-amber-500/25 bg-amber-500/10 text-amber-600';
 	}
 </script>
@@ -126,14 +127,14 @@
 <div class="space-y-6 p-4 sm:p-6">
 	<div>
 		<h1 class="text-2xl font-bold">Project sync</h1>
-		<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Fetch or publish portable Project data through the Git store configured in each Project's <code class="font-mono text-xs">.xpressclaw.yml</code>.</p>
+		<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Fetch or publish portable Project data through the Git store configured in each Project's <code class="font-mono text-xs">.xpressclaw.yml</code>. Matching copies across assigned clones and worktrees are treated as one configuration.</p>
 	</div>
 
 	<div class="flex items-start gap-3 rounded-xl border border-border bg-muted/35 px-4 py-3">
 		<svg class="mt-0.5 h-4 w-4 shrink-0 text-primary" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14"/></svg>
 		<div class="min-w-0">
 			<p class="text-xs font-medium text-foreground">Sync stays explicit</p>
-			<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">XpressClaw never fetches or publishes in the background. Wait for active tasks, Conversation turns, and workflows to finish first. Git uses the credentials available to this control-plane process.</p>
+			<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">XpressClaw never fetches or publishes in the background. Wait for active tasks, Conversation turns, and workflows to finish first. Git uses the credentials available to this control-plane process. Only manifest copies whose effective settings disagree require attention.</p>
 		</div>
 	</div>
 
@@ -172,7 +173,7 @@
 									{#if project.status === 'ready'}
 										<p class="mt-1 break-all font-mono text-[11px] text-muted-foreground">{project.remote}</p>
 									{:else}
-										<p class="mt-1 text-xs leading-relaxed text-muted-foreground">{project.message}</p>
+										<p class="mt-1 whitespace-pre-line text-xs leading-relaxed text-muted-foreground">{project.message}</p>
 									{/if}
 								</div>
 							</div>
@@ -198,6 +199,17 @@
 								</button>
 							</div>
 						</div>
+
+						{#if project.warnings.length > 0}
+							<div data-project-sync-warnings role="status" class="mt-4 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2.5 text-xs text-amber-700 dark:text-amber-400">
+								<p class="font-medium">Some assigned workspaces were ignored</p>
+								<ul class="mt-1 list-disc space-y-1 pl-4 text-muted-foreground">
+									{#each project.warnings as warning}
+										<li class="break-words">{warning}</li>
+									{/each}
+								</ul>
+							</div>
+						{/if}
 
 						{#if project.status === 'ready'}
 							<dl class="mt-4 grid gap-x-6 gap-y-3 border-t border-border/70 pt-4 text-xs sm:grid-cols-2 xl:grid-cols-3">

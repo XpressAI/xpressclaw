@@ -1772,6 +1772,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 			last_commit: null,
 			last_synced_at: null,
 			message: null,
+			warnings: [],
 		}],
 	});
 	await syncPage.goto('/settings/sync?_xpressclaw_window=workspace-12345-4');
@@ -3562,6 +3563,9 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 				last_commit: 'abcdef1234567890',
 				last_synced_at: '2026-07-19 00:01:01',
 				message: null,
+				warnings: [
+					'No .xpressclaw.yml was found in these assigned Agent workspaces: /srv/repos/temporary-clone.',
+				],
 			},
 			{
 				project_id: 'project-without-manifest',
@@ -3576,6 +3580,22 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 				last_commit: null,
 				last_synced_at: null,
 				message: 'No .xpressclaw.yml was found in this Project workspace. Run `xpressclaw sync init` there first.',
+				warnings: [],
+			},
+			{
+				project_id: 'project-with-conflict',
+				project_name: 'Conflicting project',
+				project_icon: null,
+				status: 'conflict',
+				project_dir: null,
+				remote: null,
+				branch: null,
+				store_path: null,
+				share_project_memory: null,
+				last_commit: null,
+				last_synced_at: null,
+				message: 'Project sync configuration conflict. Differing fields: store.branch.\n- branch=main: /srv/repos/one\n- branch=release: /srv/repos/two',
+				warnings: [],
 			},
 		],
 	});
@@ -3587,11 +3607,20 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 	await expect(ready).toContainText('git@github.com:XpressAI/project-data.git');
 	await expect(ready).toContainText(`projects/${projectId}`);
 	await expect(ready).toContainText('Included');
+	await expect(ready).toContainText('Ready');
+	await expect(ready.locator('[data-project-sync-warnings]')).toContainText('/srv/repos/temporary-clone');
 
 	const unconfigured = page.locator('[data-project-sync="project-without-manifest"]');
 	await expect(unconfigured).toContainText('Needs setup');
 	await expect(unconfigured.getByRole('button', { name: 'Fetch' })).toBeDisabled();
 	await expect(unconfigured.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+	const conflict = page.locator('[data-project-sync="project-with-conflict"]');
+	await expect(conflict).toContainText('Configuration conflict');
+	await expect(conflict).toContainText('Differing fields: store.branch');
+	await expect(conflict).toContainText('/srv/repos/one');
+	await expect(conflict.getByRole('button', { name: 'Fetch' })).toBeDisabled();
+	await expect(conflict.getByRole('button', { name: 'Publish' })).toBeDisabled();
 
 	await ready.getByRole('button', { name: 'Fetch' }).click();
 	await expect(ready).toContainText('rerun with --force');
