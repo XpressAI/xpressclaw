@@ -55,11 +55,12 @@ async fn put_settings(
     collaboration.authorized_agents.sort();
     collaboration.authorized_agents.dedup();
 
-    // Read and validate the Agent set only after joining the same protected
-    // config-write critical section used by Agent deletion. Otherwise a PUT
-    // can validate a stale Agent, wait for deletion, and write the assignment
-    // back after that Agent no longer exists.
-    let _guard = state.config_write_lock.lock().await;
+    // Use the same lifecycle-then-config lock order as Reset. This prevents a
+    // saved port/image change from racing an Install or Upgrade that retained
+    // the previous configuration snapshot, while keeping Agent deletion's
+    // config-only critical section compatible with this route.
+    let _lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+    let _config_guard = state.config_write_lock.lock().await;
     let current_config = state.config();
     let known_agents = current_config
         .agents
@@ -142,7 +143,8 @@ async fn reset(
     // Revoke all Agent access before deleting credentials and Docker data.
     // If Docker cleanup later fails, ordinary Agent work still remains usable
     // and no stale assignment points at missing secrets.
-    let _guard = state.config_write_lock.lock().await;
+    let _lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+    let _config_guard = state.config_write_lock.lock().await;
     let mut config = (*state.config()).clone();
     revoke_collaboration_access(&mut config);
     config
@@ -155,7 +157,7 @@ async fn reset(
             xpressclaw_core::llm::router::LlmRouter::build_from_config(&config),
         )),
     );
-    with_stack(&state, |stack| Box::pin(async move { stack.reset().await })).await?;
+    with_stack_locked(&state, |stack| Box::pin(async move { stack.reset().await })).await?;
     response(&state).await.map(Json)
 }
 
@@ -342,6 +344,25 @@ where
     // operation so concurrent Settings requests cannot remove or recreate one
     // another's containers, network, volumes, or bootstrap helpers.
     let _lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+    with_stack_locked(state, operation).await
+}
+
+async fn with_stack_locked<F>(
+    state: &AppState,
+    operation: F,
+) -> Result<CollaborationStackStatus, ApiError>
+where
+    F: for<'a> FnOnce(
+        CollaborationStack<'a>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = xpressclaw_core::error::Result<CollaborationStackStatus>,
+                > + Send
+                + 'a,
+        >,
+    >,
+{
     let docker = state
         .docker()
         .await
@@ -385,7 +406,8 @@ async fn agent_tool(
         &config.collaboration.jenkins_url(),
         "xpressclaw",
         &secrets.jenkins_password,
-    );
+    )
+    .map_err(ApiError::internal)?;
 
     let value = match tool.as_str() {
         "capabilities" => json!({
@@ -729,6 +751,70 @@ mod tests {
             .collaboration
             .authorized_agents
             .contains(&"deleted-agent".to_string()));
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn settings_save_waits_for_collaboration_lifecycle_reconciliation() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-collaboration-lifecycle-race-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = Config::default();
+        config.save(&config_path).unwrap();
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            true,
+        );
+        let app = Router::new()
+            .nest("/settings/collaboration", routes())
+            .with_state(state.clone());
+        let submitted = CollaborationConfig {
+            gitbucket_port: 18_088,
+            ..Default::default()
+        };
+
+        let lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/settings/collaboration")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&submitted).unwrap()))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            Config::load(&config_path)
+                .unwrap()
+                .collaboration
+                .gitbucket_port
+                != submitted.gitbucket_port
+        );
+
+        drop(lifecycle_guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if Config::load(&config_path)
+                    .unwrap()
+                    .collaboration
+                    .gitbucket_port
+                    == submitted.gitbucket_port
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        let _ = request.await;
         let _ = std::fs::remove_file(config_path);
     }
 

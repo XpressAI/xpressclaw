@@ -16,8 +16,8 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    network_name, resource_prefix, CollaborationConfig, CollaborationSecrets,
-    GITBUCKET_INTERNAL_URL, JENKINS_INTERNAL_URL,
+    local_http_client_builder, network_name, resource_prefix, CollaborationConfig,
+    CollaborationSecrets, GITBUCKET_INTERNAL_URL, JENKINS_INTERNAL_URL,
 };
 use crate::docker::manager::DockerManager;
 use crate::error::{Error, Result};
@@ -194,24 +194,35 @@ impl<'a> CollaborationStack<'a> {
         let mut secrets = CollaborationSecrets::load_or_create(self.data_dir)?;
         self.docker.pull_image(&self.config.gitbucket_image).await?;
         self.docker.pull_image(&self.config.jenkins_image).await?;
-        self.ensure_network().await?;
         self.ensure_volumes().await?;
+        let bootstrap_network = bootstrap_network_name(self.installation_id);
+        self.ensure_network_named(&bootstrap_network, "gitbucket-bootstrap-network")
+            .await?;
 
-        // The first phase deliberately has no host port. A short-lived helper
-        // on the private managed network replaces root/root and provisions the
-        // service account before the browser-facing container is created.
+        // The first phase deliberately uses a separate bootstrap-only network
+        // and no host port. Authorized Agent containers can join only the
+        // final collaboration network, so they cannot reach root/root while a
+        // fresh GitBucket volume is being hardened.
         let gitbucket_result: Result<()> = async {
-            self.recreate_gitbucket(false).await?;
+            self.recreate_gitbucket(false, &bootstrap_network).await?;
             self.wait_container_healthy(&self.container_names()[0], "GitBucket")
                 .await?;
-            let token = self.bootstrap_gitbucket_internal(&secrets).await?;
+            let token = self
+                .bootstrap_gitbucket_internal(&secrets, &bootstrap_network)
+                .await?;
             if secrets.gitbucket_service_token.as_deref() != Some(token.as_str()) {
                 secrets.gitbucket_service_token = Some(token);
                 secrets.save(self.data_dir)?;
             }
-            self.recreate_gitbucket(true).await?;
+            self.ensure_network().await?;
+            let collaboration_network = network_name(self.installation_id);
+            self.recreate_gitbucket(true, &collaboration_network)
+                .await?;
+            self.wait_container_healthy(&self.container_names()[0], "GitBucket")
+                .await?;
             self.wait_http(&self.config.gitbucket_url(), "GitBucket")
                 .await?;
+            self.remove_managed_network(&bootstrap_network).await?;
             Ok(())
         }
         .await;
@@ -264,13 +275,14 @@ impl<'a> CollaborationStack<'a> {
     }
 
     async fn remove_gitbucket_after_failed_setup(&self) {
-        let prefix = resource_prefix(self.installation_id);
         for name in [
             self.container_names()[0].clone(),
-            format!("{prefix}-gitbucket-bootstrap"),
+            bootstrap_container_name(self.installation_id),
         ] {
             self.remove_owned_container_after_failed_setup(&name).await;
         }
+        self.remove_owned_network_after_failed_setup(&bootstrap_network_name(self.installation_id))
+            .await;
     }
 
     async fn remove_jenkins_after_failed_setup(&self) {
@@ -309,8 +321,26 @@ impl<'a> CollaborationStack<'a> {
             .await;
     }
 
+    async fn remove_owned_network_after_failed_setup(&self, name: &str) {
+        let Ok(existing) = self
+            .docker
+            .client()
+            .inspect_network::<String>(name, None)
+            .await
+        else {
+            return;
+        };
+        if !resource_owned(existing.labels.as_ref(), self.installation_id) {
+            return;
+        }
+        let _ = self.docker.client().remove_network(name).await;
+    }
+
     async fn jenkins_auth_valid(&self, password: &str) -> bool {
-        reqwest::Client::new()
+        let Ok(client) = local_http_client_builder().build() else {
+            return false;
+        };
+        client
             .get(format!("{}/me/api/json", self.config.jenkins_url()))
             .basic_auth(JENKINS_USER, Some(password))
             .send()
@@ -388,7 +418,7 @@ impl<'a> CollaborationStack<'a> {
     /// exact confirmation phrase before calling this method.
     pub async fn reset(&self) -> Result<CollaborationStackStatus> {
         self.stop().await?;
-        for name in self.container_names() {
+        for name in reset_container_names(self.installation_id) {
             if self.managed_container_present(&name).await? {
                 self.docker
                     .client()
@@ -425,25 +455,11 @@ impl<'a> CollaborationStack<'a> {
                     })?;
             }
         }
-        let network = network_name(self.installation_id);
-        if let Ok(existing) = self
-            .docker
-            .client()
-            .inspect_network::<String>(&network, None)
-            .await
-        {
-            if !resource_owned(existing.labels.as_ref(), self.installation_id) {
-                return Err(Error::Container(format!(
-                    "Docker network {network} exists but is not managed by this XpressClaw installation"
-                )));
-            }
-            self.docker
-                .client()
-                .remove_network(&network)
-                .await
-                .map_err(|error| {
-                    Error::Container(format!("failed to remove network {network}: {error}"))
-                })?;
+        for network in [
+            bootstrap_network_name(self.installation_id),
+            network_name(self.installation_id),
+        ] {
+            self.remove_managed_network(&network).await?;
         }
         let secret_path = CollaborationSecrets::path(self.data_dir);
         if secret_path.exists() {
@@ -480,10 +496,14 @@ impl<'a> CollaborationStack<'a> {
 
     async fn ensure_network(&self) -> Result<()> {
         let name = network_name(self.installation_id);
+        self.ensure_network_named(&name, "network").await
+    }
+
+    async fn ensure_network_named(&self, name: &str, service: &str) -> Result<()> {
         if let Ok(existing) = self
             .docker
             .client()
-            .inspect_network::<String>(&name, None)
+            .inspect_network::<String>(name, None)
             .await
         {
             if !resource_owned(existing.labels.as_ref(), self.installation_id) {
@@ -496,13 +516,13 @@ impl<'a> CollaborationStack<'a> {
         self.docker
             .client()
             .create_network(CreateNetworkOptions {
-                name: name.clone(),
+                name: name.to_string(),
                 check_duplicate: true,
                 driver: "bridge".to_string(),
                 internal: false,
                 attachable: false,
                 ingress: false,
-                labels: self.labels("network"),
+                labels: self.labels(service),
                 ..Default::default()
             })
             .await
@@ -510,6 +530,27 @@ impl<'a> CollaborationStack<'a> {
                 Error::Container(format!("failed to create network {name}: {error}"))
             })?;
         Ok(())
+    }
+
+    async fn remove_managed_network(&self, name: &str) -> Result<()> {
+        let Ok(existing) = self
+            .docker
+            .client()
+            .inspect_network::<String>(name, None)
+            .await
+        else {
+            return Ok(());
+        };
+        if !resource_owned(existing.labels.as_ref(), self.installation_id) {
+            return Err(Error::Container(format!(
+                "Docker network {name} exists but is not managed by this XpressClaw installation"
+            )));
+        }
+        self.docker
+            .client()
+            .remove_network(name)
+            .await
+            .map_err(|error| Error::Container(format!("failed to remove network {name}: {error}")))
     }
 
     async fn ensure_volumes(&self) -> Result<()> {
@@ -542,11 +583,12 @@ impl<'a> CollaborationStack<'a> {
         Ok(())
     }
 
-    async fn recreate_gitbucket(&self, publish_host_port: bool) -> Result<()> {
+    async fn recreate_gitbucket(&self, publish_host_port: bool, network: &str) -> Result<()> {
         let prefix = resource_prefix(self.installation_id);
         self.recreate_container(
             gitbucket_service(self.config, &prefix, publish_host_port),
             None,
+            network,
         )
         .await
     }
@@ -565,6 +607,7 @@ impl<'a> CollaborationStack<'a> {
                 ),
             ]
         });
+        let network = network_name(self.installation_id);
         self.recreate_container(
             ServiceContainer {
                 name: format!("{prefix}-jenkins"),
@@ -579,6 +622,7 @@ impl<'a> CollaborationStack<'a> {
                     .to_string(),
             },
             command,
+            &network,
         )
         .await
     }
@@ -662,6 +706,7 @@ impl<'a> CollaborationStack<'a> {
         &self,
         service: ServiceContainer,
         command: Option<Vec<String>>,
+        network: &str,
     ) -> Result<()> {
         if let Some(existing) = self.docker.inspect_by_name(&service.name).await {
             let labels = existing
@@ -673,6 +718,22 @@ impl<'a> CollaborationStack<'a> {
                     "container {} exists but belongs to another installation",
                     service.name
                 )));
+            }
+            if existing
+                .state
+                .as_ref()
+                .is_some_and(|state| state.running == Some(true))
+            {
+                self.docker
+                    .client()
+                    .stop_container(&service.name, Some(StopContainerOptions { t: 20 }))
+                    .await
+                    .map_err(|error| {
+                        Error::Container(format!(
+                            "failed to stop {} before replacement: {error}",
+                            service.name
+                        ))
+                    })?;
             }
             self.docker
                 .client()
@@ -690,7 +751,6 @@ impl<'a> CollaborationStack<'a> {
         }
 
         let port = "8080/tcp".to_string();
-        let network = network_name(self.installation_id);
         let port_bindings = service.host_port.map(|host_port| {
             HashMap::from([(
                 port.clone(),
@@ -713,7 +773,7 @@ impl<'a> CollaborationStack<'a> {
                     name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                     maximum_retry_count: None,
                 }),
-                network_mode: Some(network.clone()),
+                network_mode: Some(network.to_string()),
                 port_bindings,
                 mounts: Some(vec![Mount {
                     target: Some(service.volume_target),
@@ -736,7 +796,7 @@ impl<'a> CollaborationStack<'a> {
             labels: Some(self.labels(&service.name)),
             networking_config: Some(NetworkingConfig {
                 endpoints_config: HashMap::from([(
-                    network,
+                    network.to_string(),
                     EndpointSettings {
                         aliases: Some(vec![service.alias]),
                         ..Default::default()
@@ -792,7 +852,7 @@ impl<'a> CollaborationStack<'a> {
     }
 
     async fn wait_http(&self, url: &str, service: &str) -> Result<()> {
-        let client = reqwest::Client::builder()
+        let client = local_http_client_builder()
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|error| Error::Container(format!("failed to build health client: {error}")))?;
@@ -812,9 +872,12 @@ impl<'a> CollaborationStack<'a> {
         )))
     }
 
-    async fn bootstrap_gitbucket_internal(&self, secrets: &CollaborationSecrets) -> Result<String> {
-        let prefix = resource_prefix(self.installation_id);
-        let helper = format!("{prefix}-gitbucket-bootstrap");
+    async fn bootstrap_gitbucket_internal(
+        &self,
+        secrets: &CollaborationSecrets,
+        network: &str,
+    ) -> Result<String> {
+        let helper = bootstrap_container_name(self.installation_id);
         if let Some(existing) = self.docker.inspect_by_name(&helper).await {
             let labels = existing
                 .config
@@ -840,7 +903,6 @@ impl<'a> CollaborationStack<'a> {
                 })?;
         }
 
-        let network = network_name(self.installation_id);
         let config = ContainerConfig {
             image: Some(self.config.jenkins_image.clone()),
             entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
@@ -862,13 +924,13 @@ impl<'a> CollaborationStack<'a> {
             host_config: Some(HostConfig {
                 memory: Some(256 * 1024 * 1024),
                 nano_cpus: Some(1_000_000_000),
-                network_mode: Some(network.clone()),
+                network_mode: Some(network.to_string()),
                 ..Default::default()
             }),
             labels: Some(self.labels("gitbucket-bootstrap")),
             networking_config: Some(NetworkingConfig {
                 endpoints_config: HashMap::from([(
-                    network,
+                    network.to_string(),
                     EndpointSettings {
                         aliases: Some(vec!["gitbucket-bootstrap".to_string()]),
                         ..Default::default()
@@ -981,7 +1043,9 @@ impl<'a> CollaborationStack<'a> {
 
     async fn run_jenkins_script(&self, password: &str, script: &str) -> Result<String> {
         let base = self.config.jenkins_url();
-        let client = reqwest::Client::new();
+        let client = local_http_client_builder().build().map_err(|error| {
+            Error::Container(format!("failed to build Jenkins HTTP client: {error}"))
+        })?;
         let (crumb_field, crumb, session_cookie) = jenkins_crumb(&client, &base, password).await?;
         let mut request = client
             .post(format!("{base}/scriptText"))
@@ -1028,7 +1092,7 @@ impl<'a> CollaborationStack<'a> {
     }
 
     async fn wait_jenkins_agent_online(&self, password: &str) -> Result<()> {
-        let client = reqwest::Client::builder()
+        let client = local_http_client_builder()
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|error| Error::Container(format!("failed to build health client: {error}")))?;
@@ -1065,7 +1129,9 @@ impl<'a> CollaborationStack<'a> {
 
     async fn ensure_jenkins_job(&self, password: &str) -> Result<()> {
         let base = self.config.jenkins_url();
-        let client = reqwest::Client::new();
+        let client = local_http_client_builder().build().map_err(|error| {
+            Error::Container(format!("failed to build Jenkins HTTP client: {error}"))
+        })?;
         let existing = client
             .get(format!("{base}/job/{JENKINS_JOB}/api/json"))
             .basic_auth(JENKINS_USER, Some(password))
@@ -1242,6 +1308,24 @@ fn resource_owned(labels: Option<&HashMap<String, String>>, installation_id: &st
     labels
         .and_then(|labels| labels.get(INSTALLATION_LABEL))
         .is_some_and(|installation| installation == installation_id)
+}
+
+fn bootstrap_container_name(installation_id: &str) -> String {
+    format!("{}-gitbucket-bootstrap", resource_prefix(installation_id))
+}
+
+fn bootstrap_network_name(installation_id: &str) -> String {
+    format!("{}-bootstrap-network", resource_prefix(installation_id))
+}
+
+fn reset_container_names(installation_id: &str) -> Vec<String> {
+    let prefix = resource_prefix(installation_id);
+    vec![
+        bootstrap_container_name(installation_id),
+        format!("{prefix}-jenkins-agent"),
+        format!("{prefix}-jenkins"),
+        format!("{prefix}-gitbucket"),
+    ]
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -1429,6 +1513,17 @@ mod tests {
     }
 
     #[test]
+    fn gitbucket_bootstrap_resources_are_isolated_and_resettable() {
+        let installation = "12345678-90ab-cdef";
+        let bootstrap_container = bootstrap_container_name(installation);
+        let bootstrap_network = bootstrap_network_name(installation);
+        assert_ne!(bootstrap_network, network_name(installation));
+        assert!(bootstrap_container.ends_with("-gitbucket-bootstrap"));
+        assert!(bootstrap_network.ends_with("-bootstrap-network"));
+        assert!(reset_container_names(installation).contains(&bootstrap_container));
+    }
+
+    #[test]
     fn docker_integration_test_requires_an_explicit_opt_in() {
         assert!(!docker_integration_opted_in(None));
         assert!(!docker_integration_opted_in(Some("true")));
@@ -1562,8 +1657,14 @@ mod tests {
         stack.install().await.unwrap();
         stack.install().await.unwrap();
 
-        let helper = format!("{}-gitbucket-bootstrap", resource_prefix(&installation));
+        let helper = bootstrap_container_name(&installation);
         assert!(docker.inspect_by_name(&helper).await.is_none());
+        let bootstrap_network = bootstrap_network_name(&installation);
+        assert!(docker
+            .client()
+            .inspect_network::<String>(&bootstrap_network, None)
+            .await
+            .is_err());
         let gitbucket = docker
             .inspect_by_name(&stack.container_names()[0])
             .await
@@ -1580,7 +1681,7 @@ mod tests {
             .host_config
             .and_then(|host| host.mounts)
             .is_none_or(|mounts| mounts.is_empty()));
-        let client = reqwest::Client::builder()
+        let client = local_http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
@@ -1721,7 +1822,8 @@ mod tests {
             &config.jenkins_url(),
             JENKINS_USER,
             &secrets.jenkins_password,
-        );
+        )
+        .unwrap();
         let build = builds
             .trigger(&BuildRequest {
                 repository: format!(
@@ -1744,8 +1846,36 @@ mod tests {
         let logs = builds.logs(build.number, 100_000).await.unwrap();
         assert!(logs.contains("xpressclaw-local-build-ok"));
         assert!(logs.contains("node=xpressclaw-builder"));
+
+        // Simulate a crash after the credential-bearing bootstrap helper and
+        // private network were created. Reset must remove both before it can
+        // safely delete the collaboration data and final network.
+        stack
+            .ensure_network_named(&bootstrap_network, "gitbucket-bootstrap-network")
+            .await
+            .unwrap();
+        docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: helper.clone(),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(config.jenkins_image.clone()),
+                    env: Some(vec!["GITBUCKET_ROOT_PASSWORD=must-be-removed".to_string()]),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(bootstrap_network.clone()),
+                        ..Default::default()
+                    }),
+                    labels: Some(stack.labels("gitbucket-bootstrap")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         stack.reset().await.unwrap();
-        for container in stack.container_names() {
+        for container in reset_container_names(&installation) {
             assert!(docker.inspect_by_name(&container).await.is_none());
         }
         let prefix = resource_prefix(&installation);
@@ -1758,6 +1888,11 @@ mod tests {
         assert!(docker
             .client()
             .inspect_network::<String>(&network_name(&installation), None)
+            .await
+            .is_err());
+        assert!(docker
+            .client()
+            .inspect_network::<String>(&bootstrap_network, None)
             .await
             .is_err());
     }

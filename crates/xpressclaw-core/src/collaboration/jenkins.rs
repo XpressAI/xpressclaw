@@ -5,7 +5,10 @@ use bytes::Bytes;
 use futures_util::{pin_mut, Stream, StreamExt};
 use serde::Deserialize;
 
-use super::{Build, BuildCapabilities, BuildProvider, BuildRequest, GITBUCKET_INTERNAL_URL};
+use super::{
+    local_http_client_builder, Build, BuildCapabilities, BuildProvider, BuildRequest,
+    GITBUCKET_INTERNAL_URL,
+};
 use crate::error::{Error, Result};
 
 const JOB: &str = "xpressclaw-local-build";
@@ -20,13 +23,15 @@ pub struct JenkinsProvider {
 }
 
 impl JenkinsProvider {
-    pub fn new(base_url: &str, username: &str, password: &str) -> Self {
-        Self {
-            client: reqwest::Client::new(),
+    pub fn new(base_url: &str, username: &str, password: &str) -> Result<Self> {
+        Ok(Self {
+            client: local_http_client_builder().build().map_err(|error| {
+                Error::Config(format!("failed to build Jenkins HTTP client: {error}"))
+            })?,
             base_url: base_url.trim_end_matches('/').to_string(),
             username: username.to_string(),
             password: password.to_string(),
-        }
+        })
     }
 
     fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -375,7 +380,7 @@ mod tests {
 
     #[test]
     fn capabilities_make_minimal_plugin_limitations_explicit() {
-        let provider = JenkinsProvider::new("http://jenkins:8080", "xpressclaw", "secret");
+        let provider = JenkinsProvider::new("http://jenkins:8080", "xpressclaw", "secret").unwrap();
         let capabilities = provider.capabilities();
         assert!(capabilities.trigger);
         assert!(capabilities.logs);

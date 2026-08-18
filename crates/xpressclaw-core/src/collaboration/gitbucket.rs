@@ -3,7 +3,9 @@ use reqwest::header::{HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ForgeCapabilities, ForgeProvider, Issue, PullRequest, Repository};
+use super::{
+    local_http_client_builder, ForgeCapabilities, ForgeProvider, Issue, PullRequest, Repository,
+};
 use crate::error::{Error, Result};
 
 #[derive(Clone)]
@@ -19,7 +21,9 @@ impl GitBucketProvider {
         let authorization = HeaderValue::from_str(&format!("token {token}"))
             .map_err(|_| Error::Config("invalid GitBucket service token".to_string()))?;
         Ok(Self {
-            client: reqwest::Client::new(),
+            client: local_http_client_builder().build().map_err(|error| {
+                Error::Config(format!("failed to build GitBucket HTTP client: {error}"))
+            })?,
             base_url: base_url.trim_end_matches('/').to_string(),
             owner: owner.to_string(),
             authorization,

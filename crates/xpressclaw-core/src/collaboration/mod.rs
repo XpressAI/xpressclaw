@@ -25,6 +25,13 @@ pub const JENKINS_IMAGE: &str = "jenkins/jenkins:2.568.1-jdk21";
 pub const GITBUCKET_INTERNAL_URL: &str = "http://gitbucket:8080";
 pub const JENKINS_INTERNAL_URL: &str = "http://jenkins:8080";
 
+/// Local collaboration credentials must travel directly to the configured
+/// service endpoint. Inherited host proxy settings are outside XpressClaw's
+/// managed trust boundary and must never receive forge or build credentials.
+pub(crate) fn local_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}
+
 fn default_bind_address() -> String {
     "127.0.0.1".to_string()
 }
@@ -153,6 +160,75 @@ pub fn network_name(installation_id: &str) -> String {
 mod tests {
     use super::*;
 
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket};
+
+    static PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct ProxyEnvironment(Vec<(&'static str, Option<String>)>);
+
+    impl ProxyEnvironment {
+        fn point_at(proxy: &str) -> Self {
+            let values = [
+                ("HTTP_PROXY", proxy),
+                ("http_proxy", proxy),
+                ("HTTPS_PROXY", proxy),
+                ("https_proxy", proxy),
+                ("ALL_PROXY", proxy),
+                ("all_proxy", proxy),
+                ("NO_PROXY", ""),
+                ("no_proxy", ""),
+            ];
+            let previous = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect();
+            for (key, value) in values {
+                std::env::set_var(key, value);
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for ProxyEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    fn serve_once(listener: TcpListener, body: &'static str) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request);
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("local HTTP test server failed: {error}"),
+                }
+            }
+            false
+        })
+    }
+
     #[test]
     fn defaults_are_opt_in_and_loopback_only() {
         let config = CollaborationConfig::default();
@@ -161,6 +237,41 @@ mod tests {
         assert!(config.authorized_agents.is_empty());
         assert_eq!(config.gitbucket_image, GITBUCKET_IMAGE);
         assert_eq!(config.jenkins_image, JENKINS_IMAGE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_http_clients_ignore_inherited_proxy_settings() {
+        let _environment_lock = PROXY_ENV_LOCK.lock().await;
+        let target = TcpListener::bind("0.0.0.0:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let local_ip = UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("192.0.2.1:9")?;
+                socket.local_addr()
+            })
+            .unwrap()
+            .ip();
+        assert!(!local_ip.is_loopback());
+
+        let target_server = serve_once(target, "target");
+        let proxy_server = serve_once(proxy, "proxy");
+        let _proxy_environment = ProxyEnvironment::point_at(&proxy_url);
+        let response = local_http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{local_ip}:{target_port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert_eq!(response, "target");
+        assert!(target_server.join().unwrap());
+        assert!(!proxy_server.join().unwrap());
     }
 
     #[test]
