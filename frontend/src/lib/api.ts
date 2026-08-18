@@ -905,7 +905,7 @@ export interface ProjectSyncStatus {
 	project_id: string;
 	project_name: string;
 	project_icon: string | null;
-	status: 'ready' | 'unconfigured' | 'unavailable' | 'error';
+	status: 'ready' | 'unconfigured' | 'unavailable' | 'conflict' | 'error';
 	project_dir: string | null;
 	remote: string | null;
 	branch: string | null;
@@ -914,6 +914,7 @@ export interface ProjectSyncStatus {
 	last_commit: string | null;
 	last_synced_at: string | null;
 	message: string | null;
+	warnings: string[];
 }
 
 export interface ProjectSyncCounts {
