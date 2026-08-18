@@ -2136,7 +2136,7 @@ fn configure_local_collaboration_access_for_network(
         }
     };
     spec.network_mode = Some(network.to_string());
-    Ok(Some(secrets.agent_capability_token))
+    Ok(Some(secrets.capability_token_for_agent(&agent.name)))
 }
 
 fn is_absolute_container_path(path: &str) -> bool {
@@ -4422,7 +4422,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             token.as_deref(),
-            Some(expected_token.agent_capability_token.as_str())
+            Some(
+                expected_token
+                    .capability_token_for_agent("allowed")
+                    .as_str()
+            )
+        );
+        assert_ne!(
+            token.as_deref(),
+            Some(
+                expected_token
+                    .capability_token_for_agent("another-agent")
+                    .as_str()
+            )
         );
         assert_eq!(
             allowed_spec.network_mode.as_deref(),

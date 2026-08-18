@@ -2,6 +2,9 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -93,6 +96,32 @@ impl CollaborationSecrets {
         })?;
         Ok(())
     }
+
+    /// Derives a capability that is valid only for one Agent identity.
+    ///
+    /// The stored random value is a signing key, not a bearer capability. This
+    /// lets the control plane revoke one Agent without rotating the credentials
+    /// of every other assigned Agent or persisting a second token registry.
+    pub fn capability_token_for_agent(&self, agent: &str) -> String {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.agent_capability_token.as_bytes());
+        URL_SAFE_NO_PAD.encode(hmac::sign(&key, &agent_capability_message(agent)).as_ref())
+    }
+
+    pub fn capability_token_matches_agent(&self, agent: &str, supplied: &str) -> bool {
+        let Ok(supplied) = URL_SAFE_NO_PAD.decode(supplied) else {
+            return false;
+        };
+        let key = hmac::Key::new(hmac::HMAC_SHA256, self.agent_capability_token.as_bytes());
+        hmac::verify(&key, &agent_capability_message(agent), &supplied).is_ok()
+    }
+}
+
+fn agent_capability_message(agent: &str) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"xpressclaw/local-collaboration/agent/v1\0";
+    let mut message = Vec::with_capacity(DOMAIN.len() + agent.len());
+    message.extend_from_slice(DOMAIN);
+    message.extend_from_slice(agent.as_bytes());
+    message
 }
 
 fn random_secret() -> String {
@@ -163,5 +192,18 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn agent_capabilities_are_stable_and_identity_bound() {
+        let secrets = CollaborationSecrets::generate();
+        let atlas = secrets.capability_token_for_agent("atlas");
+        let zephyr = secrets.capability_token_for_agent("zephyr");
+
+        assert_eq!(atlas, secrets.capability_token_for_agent("atlas"));
+        assert_ne!(atlas, zephyr);
+        assert!(secrets.capability_token_matches_agent("atlas", &atlas));
+        assert!(!secrets.capability_token_matches_agent("zephyr", &atlas));
+        assert!(!secrets.capability_token_matches_agent("atlas", &secrets.agent_capability_token));
     }
 }

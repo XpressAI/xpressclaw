@@ -7973,6 +7973,7 @@ dependencies = [
  "notify",
  "ready-agent-cog",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

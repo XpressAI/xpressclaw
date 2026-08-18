@@ -52,11 +52,17 @@
 	}
 
 	async function run(action: Action) {
-		if (busy) return;
+		if (busy || (action === 'install' && !form?.enabled)) return;
 		busy = action;
 		error = '';
 		notice = '';
 		try {
+			// Install uses persisted server configuration. Save the visible form
+			// first so the common enable-and-install flow cannot run against stale
+			// ports, images, assignments, or a still-disabled configuration.
+			if (action === 'install' && form) {
+				apply(await settings.putCollaboration(form));
+			}
 			apply(await settings.runCollaborationAction(action));
 			notice = action === 'stop'
 				? 'Services stopped. Persistent repositories, build history, and credentials were preserved.'

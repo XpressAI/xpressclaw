@@ -564,8 +564,9 @@ fn authorize_agent<'a>(
     let agent = headers
         .get(AGENT_HEADER)
         .and_then(|value| value.to_str().ok())?;
-    (supplied == Some(secrets.agent_capability_token.as_str()) && config.agent_authorized(agent))
-        .then_some(agent)
+    (config.agent_authorized(agent)
+        && supplied.is_some_and(|token| secrets.capability_token_matches_agent(agent, token)))
+    .then_some(agent)
 }
 
 fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str, ApiError> {
@@ -819,11 +820,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_access_requires_both_assignment_and_scoped_capability() {
+    fn agent_access_requires_assignment_and_an_identity_bound_capability() {
         let secrets = CollaborationSecrets::generate();
         let config = CollaborationConfig {
             enabled: true,
-            authorized_agents: vec!["allowed".to_string()],
+            authorized_agents: vec!["allowed".to_string(), "other".to_string()],
             ..Default::default()
         };
         let mut headers = HeaderMap::new();
@@ -831,14 +832,40 @@ mod tests {
         assert!(authorize_agent(&headers, &config, &secrets).is_none());
         headers.insert(
             CAPABILITY_HEADER,
-            secrets.agent_capability_token.parse().unwrap(),
+            secrets
+                .capability_token_for_agent("allowed")
+                .parse()
+                .unwrap(),
         );
         assert_eq!(
             authorize_agent(&headers, &config, &secrets),
             Some("allowed")
         );
-        headers.insert(AGENT_HEADER, "unassigned".parse().unwrap());
+
+        // A retained token cannot impersonate another still-authorized Agent.
+        headers.insert(AGENT_HEADER, "other".parse().unwrap());
         assert!(authorize_agent(&headers, &config, &secrets).is_none());
+        headers.insert(
+            CAPABILITY_HEADER,
+            secrets.capability_token_for_agent("other").parse().unwrap(),
+        );
+        assert_eq!(authorize_agent(&headers, &config, &secrets), Some("other"));
+
+        // Removing one assignment immediately revokes only that Agent.
+        let revoked = CollaborationConfig {
+            enabled: true,
+            authorized_agents: vec!["other".to_string()],
+            ..Default::default()
+        };
+        headers.insert(AGENT_HEADER, "allowed".parse().unwrap());
+        headers.insert(
+            CAPABILITY_HEADER,
+            secrets
+                .capability_token_for_agent("allowed")
+                .parse()
+                .unwrap(),
+        );
+        assert!(authorize_agent(&headers, &revoked, &secrets).is_none());
     }
 
     #[test]

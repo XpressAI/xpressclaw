@@ -437,7 +437,11 @@ async function mockApi(
 				},
 				credentials_configured: false, reset_confirmation: 'RESET LOCAL COLLABORATION',
 			};
-			if (request.method() === 'PUT') options.collaborationActions?.push('save');
+			if (request.method() === 'PUT') {
+				options.collaborationActions?.push('save');
+				response = { ...response, config: request.postDataJSON() };
+				options.collaborationSettings = response;
+			}
 		} else if (/^\/api\/settings\/collaboration\/(install|start|stop|restart|upgrade|reset)$/.test(path)) {
 			options.collaborationActions?.push(path.split('/').at(-1) ?? '');
 			response = options.collaborationSettings;
@@ -3668,4 +3672,33 @@ test('local collaboration settings stay opt-in and expose safe lifecycle control
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration install persists the visible enabled configuration first', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: false,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	const install = page.getByRole('button', { name: 'Install services' });
+	await expect(install).toBeDisabled();
+	await page.getByLabel('Enable local collaboration configuration').check();
+	await expect(install).toBeEnabled();
+	await install.click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'install']);
+	await expect(page.getByText('Install completed.')).toBeVisible();
 });
