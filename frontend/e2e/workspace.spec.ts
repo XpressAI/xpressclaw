@@ -2047,6 +2047,86 @@ test('running agents can be guided at a safe break or interrupted immediately', 
 	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
 });
 
+test('Codex plugin install elicitations can be accepted', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'plugin',
+				suggest_type: 'install',
+				suggest_reason: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+				tool_id: 'stripe@openai-curated-remote',
+				tool_name: 'Stripe',
+				remote_plugin_id: 'stripe',
+				app_connector_ids: ['stripe'],
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toBeVisible();
+	await expect(request).toContainText('Plugin installation requested');
+	await expect(request).toContainText('Install Stripe?');
+	await expect(request).toContainText('The Stripe plugin can verify coupon and promotion-code configuration.');
+	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await request.getByRole('button', { name: 'Install plugin' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: {
+			action: 'accept',
+			content: {},
+			message: 'Approved installing the Stripe plugin.',
+		},
+	}]);
+	await expect(request).toHaveCount(0);
+});
+
+test('Codex connector install elicitations can be declined', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Connect GitHub to inspect pull requests.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'connector',
+				suggest_type: 'install',
+				suggest_reason: 'Connect GitHub to inspect pull requests.',
+				tool_id: 'github',
+				tool_name: 'GitHub',
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toContainText('Connector installation requested');
+	await expect(request.getByRole('button', { name: 'Install connector' })).toBeVisible();
+	await request.getByRole('button', { name: 'Not now' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: { action: 'decline' },
+	}]);
+	await expect(request).toHaveCount(0);
+});
+
 test('unsupported ACP elicitations stay visible and actionable', async ({ page }) => {
 	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
 	const interruptedAttempts: string[] = [];
