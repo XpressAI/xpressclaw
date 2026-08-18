@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 
 const JOB: &str = "xpressclaw-local-build";
 const MAX_LOG_BYTES: usize = 1_000_000;
+const MAX_LOG_TAIL_ATTEMPTS: usize = 4;
 
 #[derive(Clone)]
 pub struct JenkinsProvider {
@@ -146,6 +147,25 @@ impl JenkinsProvider {
             return Err(Error::ToolExecution("invalid Git ref".to_string()));
         }
         Ok(())
+    }
+
+    async fn progressive_log_response(
+        &self,
+        progressive_url: &str,
+        start: usize,
+    ) -> Result<reqwest::Response> {
+        let response = self
+            .authenticated(self.client.get(progressive_url).query(&[("start", start)]))
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} for build logs",
+                response.status()
+            )));
+        }
+        Ok(response)
     }
 }
 
@@ -322,60 +342,69 @@ impl BuildProvider for JenkinsProvider {
         );
         // Jenkins exposes the current byte offset in the response headers.
         // Drop this body immediately, then request only the bounded tail.
-        let probe = self
-            .authenticated(self.client.get(&progressive_url).query(&[("start", 0)]))
-            .send()
-            .await
-            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
-        if !probe.status().is_success() {
-            return Err(Error::ToolExecution(format!(
-                "Jenkins returned HTTP {} for build logs",
-                probe.status()
-            )));
-        }
-        let log_size = probe
-            .headers()
-            .get("x-text-size")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| {
-                Error::ToolExecution(
-                    "Jenkins omitted the bounded progressive-log offset".to_string(),
-                )
-            })?;
+        let probe = self.progressive_log_response(&progressive_url, 0).await?;
+        let (mut observed_size, _) = progressive_log_metadata(&probe)?;
         drop(probe);
 
-        let start = log_size.saturating_sub(limit);
-        let response = self
-            .authenticated(self.client.get(&progressive_url).query(&[("start", start)]))
-            .send()
-            .await
-            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
-        if !response.status().is_success() {
-            return Err(Error::ToolExecution(format!(
-                "Jenkins returned HTTP {} for build logs",
-                response.status()
-            )));
-        }
-        let more_data = response
-            .headers()
-            .get("x-more-data")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let (bytes, reached_limit) =
-            read_bounded(response.bytes_stream(), limit)
+        for attempt in 0..MAX_LOG_TAIL_ATTEMPTS {
+            let start = observed_size.saturating_sub(limit);
+            let response = self
+                .progressive_log_response(&progressive_url, start)
+                .await?;
+            let (response_size, more_data) = progressive_log_metadata(&response)?;
+            if response_size < start {
+                return Err(Error::ToolExecution(
+                    "Jenkins returned an invalid progressive-log offset".to_string(),
+                ));
+            }
+
+            // If the log grew by more than the remaining window before this
+            // response started, reposition from the newly announced end. Do
+            // not read a known-stale prefix and present it as the tail.
+            if response_size - start > limit {
+                observed_size = response_size;
+                drop(response);
+                if attempt + 1 == MAX_LOG_TAIL_ATTEMPTS {
+                    return Err(log_growing_too_quickly(limit));
+                }
+                continue;
+            }
+
+            let (bytes, reached_limit) = read_bounded(response.bytes_stream(), limit)
                 .await
                 .map_err(|error| {
                     Error::ToolExecution(format!("failed to read Jenkins logs: {error}"))
                 })?;
-        let mut logs = String::from_utf8_lossy(&bytes).to_string();
-        if start > 0 || (reached_limit && more_data) {
-            logs.insert_str(
-                0,
-                &format!("[log truncated; showing at most the last {limit} bytes]\n"),
-            );
+
+            // A running build can append after the response headers were
+            // produced. Re-probe from the announced end and retry if Jenkins
+            // reports newer bytes, so a stale window is never called "last".
+            if more_data {
+                let verification = self
+                    .progressive_log_response(&progressive_url, response_size)
+                    .await?;
+                let (latest_size, _) = progressive_log_metadata(&verification)?;
+                drop(verification);
+                if latest_size > response_size {
+                    observed_size = latest_size;
+                    if attempt + 1 == MAX_LOG_TAIL_ATTEMPTS {
+                        return Err(log_growing_too_quickly(limit));
+                    }
+                    continue;
+                }
+            }
+
+            let mut logs = String::from_utf8_lossy(&bytes).to_string();
+            if start > 0 || (reached_limit && more_data) {
+                logs.insert_str(
+                    0,
+                    &format!("[log truncated; showing at most the last {limit} bytes]\n"),
+                );
+            }
+            return Ok(logs);
         }
-        Ok(logs)
+
+        Err(log_growing_too_quickly(limit))
     }
 
     async fn cancel(&self, number: u64) -> Result<()> {
@@ -390,6 +419,29 @@ impl BuildProvider for JenkinsProvider {
                 .to_string(),
         ))
     }
+}
+
+fn progressive_log_metadata(response: &reqwest::Response) -> Result<(usize, bool)> {
+    let size = response
+        .headers()
+        .get("x-text-size")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| {
+            Error::ToolExecution("Jenkins omitted the bounded progressive-log offset".to_string())
+        })?;
+    let more_data = response
+        .headers()
+        .get("x-more-data")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    Ok((size, more_data))
+}
+
+fn log_growing_too_quickly(limit: usize) -> Error {
+    Error::ToolExecution(format!(
+        "Jenkins logs are growing too quickly to return a reliable last {limit} bytes; retry after the build slows or completes"
+    ))
 }
 
 async fn read_bounded<S, E>(stream: S, limit: usize) -> std::result::Result<(Vec<u8>, bool), E>
@@ -416,6 +468,55 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct ProgressiveResponse {
+        expected_start: usize,
+        size: usize,
+        more_data: bool,
+        body: &'static str,
+    }
+
+    async fn serve_progressive_logs(
+        responses: Vec<ProgressiveResponse>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(
+                    request.starts_with(&format!(
+                        "GET /job/{JOB}/42/logText/progressiveText?start={} HTTP/1.1\r\n",
+                        response.expected_start
+                    )),
+                    "unexpected progressive-log request: {request}"
+                );
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Text-Size: {}\r\nX-More-Data: {}\r\nConnection: close\r\n\r\n",
+                    response.body.len(),
+                    response.size,
+                    response.more_data
+                );
+                stream.write_all(headers.as_bytes()).await.unwrap();
+                stream.write_all(response.body.as_bytes()).await.unwrap();
+            }
+        });
+        (base_url, server)
+    }
 
     #[test]
     fn build_requests_are_limited_to_managed_gitbucket_repositories() {
@@ -483,5 +584,75 @@ mod tests {
         let (bytes, truncated) = read_bounded(stream, 4).await.unwrap();
         assert!(truncated);
         assert_eq!(String::from_utf8_lossy(&bytes), "ab�");
+    }
+
+    #[tokio::test]
+    async fn growing_logs_reposition_before_reading_a_stale_window() {
+        let (base_url, server) = serve_progressive_logs(vec![
+            ProgressiveResponse {
+                expected_start: 0,
+                size: 10,
+                more_data: true,
+                body: "0123456789",
+            },
+            ProgressiveResponse {
+                expected_start: 6,
+                size: 14,
+                more_data: true,
+                body: "6789ABCD",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: false,
+                body: "ABCD",
+            },
+        ])
+        .await;
+        let provider = JenkinsProvider::new(&base_url, "xpressclaw", "secret").unwrap();
+
+        let logs = provider.logs(42, 4).await.unwrap();
+
+        assert!(logs.ends_with("ABCD"), "{logs}");
+        assert!(!logs.contains("6789"), "{logs}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_logs_are_reprobed_before_returning_the_tail() {
+        let (base_url, server) = serve_progressive_logs(vec![
+            ProgressiveResponse {
+                expected_start: 0,
+                size: 10,
+                more_data: true,
+                body: "0123456789",
+            },
+            ProgressiveResponse {
+                expected_start: 6,
+                size: 10,
+                more_data: true,
+                body: "6789",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: true,
+                body: "ABCD",
+            },
+            ProgressiveResponse {
+                expected_start: 10,
+                size: 14,
+                more_data: false,
+                body: "ABCD",
+            },
+        ])
+        .await;
+        let provider = JenkinsProvider::new(&base_url, "xpressclaw", "secret").unwrap();
+
+        let logs = provider.logs(42, 4).await.unwrap();
+
+        assert!(logs.ends_with("ABCD"), "{logs}");
+        assert!(!logs.contains("6789"), "{logs}");
+        server.await.unwrap();
     }
 }

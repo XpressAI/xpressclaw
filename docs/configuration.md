@@ -57,7 +57,8 @@ non-secret instance configuration is:
 
 Credentials never appear in YAML. See [Local collaboration
 services](local-collaboration.md) for lifecycle, backup, resource, security,
-and capability details.
+and capability details. `bind_address` must be a connectable IP address;
+wildcard listener addresses (`0.0.0.0` and `::`) are rejected.
 
 ## Agent and ACP harness representation
 

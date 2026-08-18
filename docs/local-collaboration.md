@@ -10,7 +10,9 @@ Use the same Docker Desktop (macOS/Windows) or Docker Engine/compatible runtime
 (Linux) required for Agent isolation. In Settings → Local collaboration:
 
 1. Enable configuration and keep 127.0.0.1 unless a secured remote setup needs
-   another address.
+   another concrete host address. Wildcard listener addresses (`0.0.0.0` and
+   `::`) are not accepted because they cannot also serve as browser or
+   control-plane destinations.
 2. Choose unused ports. Defaults are 8088 for GitBucket and 8089 for Jenkins.
 3. Save, then choose Install services.
 4. Select the Agents allowed to use the services and save again.

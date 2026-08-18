@@ -98,8 +98,15 @@ impl CollaborationConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.bind_address.parse::<std::net::IpAddr>().is_err() {
-            return Err("local collaboration bind_address must be an IP address".to_string());
+        let bind_address = self
+            .bind_address
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "local collaboration bind_address must be an IP address".to_string())?;
+        if bind_address.is_unspecified() {
+            return Err(
+                "local collaboration bind_address cannot be a wildcard (0.0.0.0 or ::); use a connectable IP such as 127.0.0.1 or the host's LAN address"
+                    .to_string(),
+            );
         }
         if self.gitbucket_port == self.jenkins_port {
             return Err("GitBucket and Jenkins must use different host ports".to_string());
@@ -297,5 +304,18 @@ mod tests {
         assert!(config.validate().is_ok());
         config.jenkins_image = "jenkins/jenkins:latest".to_string();
         assert!(config.validate().unwrap_err().contains("explicit version"));
+    }
+
+    #[test]
+    fn wildcard_bind_addresses_are_rejected_as_unconnectable() {
+        for bind_address in ["0.0.0.0", "::"] {
+            let config = CollaborationConfig {
+                bind_address: bind_address.to_string(),
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(error.contains("cannot be a wildcard"), "{error}");
+            assert!(error.contains("connectable IP"), "{error}");
+        }
     }
 }
