@@ -52,7 +52,7 @@
 	}
 
 	async function run(action: Action) {
-		if (busy || (action === 'install' && !form?.enabled)) return;
+		if (busy || ((action === 'install' || action === 'restart') && !form?.enabled)) return;
 		busy = action;
 		error = '';
 		notice = '';
@@ -217,7 +217,7 @@
 			<div class="flex flex-wrap gap-2">
 				<button class="rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50" disabled={busy !== null || !form.enabled} onclick={() => run('install')}>{busy === 'install' ? 'Installing…' : 'Install services'}</button>
 				{#each ['start', 'stop', 'restart', 'upgrade'] as action}
-					<button class="rounded-md border border-border px-3 py-2 text-xs capitalize disabled:opacity-50" disabled={busy !== null} onclick={() => run(action as Action)}>
+					<button class="rounded-md border border-border px-3 py-2 text-xs capitalize disabled:opacity-50" disabled={busy !== null || (action === 'restart' && !form.enabled)} onclick={() => run(action as Action)}>
 						{busy === action ? action + '…' : action === 'upgrade' ? 'Upgrade pinned images' : action === 'restart' ? 'Restart & apply configuration' : action}
 					</button>
 				{/each}
