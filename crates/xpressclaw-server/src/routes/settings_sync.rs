@@ -575,6 +575,16 @@ mod tests {
             .success());
     }
 
+    fn resolved_test_workspace(state: &AppState, agent_id: &str) -> PathBuf {
+        let config = state.config();
+        let agent = config
+            .agents
+            .iter()
+            .find(|agent| agent.name == agent_id)
+            .unwrap();
+        resolved_workspace(&config, agent)
+    }
+
     #[tokio::test]
     async fn lists_one_configured_project_and_publishes() {
         if Command::new("git").arg("--version").output().is_err() {
@@ -691,7 +701,10 @@ mod tests {
 
         let inspection = inspect_project(&state, "project-one").unwrap();
         assert_eq!(inspection.status, "ready");
-        assert_eq!(inspection.project_dir, Some(first.canonicalize().unwrap()));
+        assert_eq!(
+            inspection.project_dir,
+            Some(resolved_test_workspace(&state, "agent-a"))
+        );
         assert!(inspection.warnings.is_empty());
 
         let app = Router::new()
@@ -776,14 +789,17 @@ mod tests {
         assert_eq!(inspection.status, "conflict");
         assert!(inspection.project_dir.is_none());
         let message = inspection.message.unwrap();
+        let first_workspace = resolved_test_workspace(&state, "agent-one");
+        let second_workspace = resolved_test_workspace(&state, "agent-two");
+        let third_workspace = resolved_test_workspace(&state, "agent-three");
         assert!(message.contains("Differing fields: store.branch, share.project_memory"));
-        assert!(message.contains(&first.display().to_string()));
-        assert!(message.contains(&second.display().to_string()));
-        assert!(message.contains(&third.display().to_string()));
+        assert!(message.contains(&first_workspace.display().to_string()));
+        assert!(message.contains(&second_workspace.display().to_string()));
+        assert!(message.contains(&third_workspace.display().to_string()));
         let main_group = format!(
             "project memory=included: {}, {}",
-            first.display(),
-            second.display()
+            first_workspace.display(),
+            second_workspace.display()
         );
         assert!(message.contains(&main_group));
     }
@@ -824,12 +840,19 @@ mod tests {
 
         let inspection = inspect_project(&state, "project-one").unwrap();
         assert_eq!(inspection.status, "ready");
-        assert_eq!(inspection.project_dir, Some(valid.canonicalize().unwrap()));
+        assert_eq!(
+            inspection.project_dir,
+            Some(resolved_test_workspace(&state, "agent-valid"))
+        );
         let warnings = inspection.warnings.join("\n");
-        assert!(warnings.contains(&invalid.join(MANIFEST_FILE).display().to_string()));
-        assert!(warnings.contains(&wrong.join(MANIFEST_FILE).display().to_string()));
+        let invalid_workspace = resolved_test_workspace(&state, "agent-invalid");
+        let wrong_workspace = resolved_test_workspace(&state, "agent-wrong");
+        let missing_workspace = resolved_test_workspace(&state, "agent-missing");
+        let unavailable_workspace = resolved_test_workspace(&state, "agent-unavailable");
+        assert!(warnings.contains(&invalid_workspace.join(MANIFEST_FILE).display().to_string()));
+        assert!(warnings.contains(&wrong_workspace.join(MANIFEST_FILE).display().to_string()));
         assert!(warnings.contains("belongs to Project 'another-project'"));
-        assert!(warnings.contains(&missing.display().to_string()));
-        assert!(warnings.contains(&unavailable.display().to_string()));
+        assert!(warnings.contains(&missing_workspace.display().to_string()));
+        assert!(warnings.contains(&unavailable_workspace.display().to_string()));
     }
 }
