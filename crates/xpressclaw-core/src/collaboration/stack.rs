@@ -10,7 +10,7 @@ use bollard::models::{
     EndpointSettings, HealthConfig, HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy,
     RestartPolicyNameEnum,
 };
-use bollard::network::CreateNetworkOptions;
+use bollard::network::{CreateNetworkOptions, DisconnectNetworkOptions};
 use bollard::volume::{CreateVolumeOptions, RemoveVolumeOptions};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -434,6 +434,16 @@ impl<'a> CollaborationStack<'a> {
                     })?;
             }
         }
+        // Remove networks before persistent data. Retained Agent containers
+        // can still be attached after access is revoked; detach only this
+        // installation's endpoints so a network failure cannot leave service
+        // volumes deleted but credentials and the network stranded.
+        for network in [
+            bootstrap_network_name(self.installation_id),
+            network_name(self.installation_id),
+        ] {
+            self.remove_managed_network(&network).await?;
+        }
         let prefix = resource_prefix(self.installation_id);
         for volume in [
             format!("{prefix}-gitbucket-data"),
@@ -453,12 +463,6 @@ impl<'a> CollaborationStack<'a> {
                         Error::Container(format!("failed to remove volume {volume}: {error}"))
                     })?;
             }
-        }
-        for network in [
-            bootstrap_network_name(self.installation_id),
-            network_name(self.installation_id),
-        ] {
-            self.remove_managed_network(&network).await?;
         }
         let secret_path = CollaborationSecrets::path(self.data_dir);
         if secret_path.exists() {
@@ -544,6 +548,53 @@ impl<'a> CollaborationStack<'a> {
             return Err(Error::Container(format!(
                 "Docker network {name} exists but is not managed by this XpressClaw installation"
             )));
+        }
+        let mut endpoints = existing
+            .containers
+            .unwrap_or_default()
+            .into_keys()
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        for container_id in endpoints {
+            let container = self
+                .docker
+                .client()
+                .inspect_container(&container_id, None)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!(
+                        "failed to inspect container {container_id} attached to network {name}: {error}"
+                    ))
+                })?;
+            let labels = container
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref());
+            if !resource_owned(labels, self.installation_id) {
+                let container_name = container
+                    .name
+                    .as_deref()
+                    .unwrap_or(&container_id)
+                    .trim_start_matches('/');
+                return Err(Error::Container(format!(
+                    "Docker network {name} is still attached to container {container_name}, which is not managed by this XpressClaw installation; disconnect it before resetting"
+                )));
+            }
+            self.docker
+                .client()
+                .disconnect_network(
+                    name,
+                    DisconnectNetworkOptions {
+                        container: container_id.clone(),
+                        force: true,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    Error::Container(format!(
+                        "failed to detach managed container {container_id} from network {name}: {error}"
+                    ))
+                })?;
         }
         self.docker
             .client()
@@ -1899,11 +1950,88 @@ mod tests {
             )
             .await
             .unwrap();
+
+        // A retained Agent may still be attached to the final network after
+        // its access is revoked. Reset must detach it without deleting its
+        // reusable project environment.
+        let collaboration_network = network_name(&installation);
+        let retained_agent = format!("xpressclaw-reset-agent-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: retained_agent.clone(),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(config.jenkins_image.clone()),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(collaboration_network.clone()),
+                        ..Default::default()
+                    }),
+                    labels: Some(HashMap::from([
+                        (INSTALLATION_LABEL.to_string(), installation.to_string()),
+                        ("io.xpressclaw.lifecycle".to_string(), "project".to_string()),
+                        (
+                            "io.xpressclaw.agent-id".to_string(),
+                            "reset-fixture".to_string(),
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // An endpoint without this installation's ownership label must block
+        // network removal before persistent volumes or credentials are lost.
+        let unowned_endpoint =
+            format!("xpressclaw-reset-blocker-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: unowned_endpoint.clone(),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(config.jenkins_image.clone()),
+                    host_config: Some(HostConfig {
+                        network_mode: Some(collaboration_network.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let reset_error = stack.reset().await.unwrap_err().to_string();
+        assert!(reset_error.contains("is not managed by this XpressClaw installation"));
+        let prefix = resource_prefix(&installation);
+        for volume in [
+            format!("{prefix}-gitbucket-data"),
+            format!("{prefix}-jenkins-data"),
+        ] {
+            assert!(docker.client().inspect_volume(&volume).await.is_ok());
+        }
+        assert!(CollaborationSecrets::path(data.path()).exists());
+        docker
+            .client()
+            .remove_container(
+                &unowned_endpoint,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
         stack.reset().await.unwrap();
         for container in reset_container_names(&installation) {
             assert!(docker.inspect_by_name(&container).await.is_none());
         }
-        let prefix = resource_prefix(&installation);
         for volume in [
             format!("{prefix}-gitbucket-data"),
             format!("{prefix}-jenkins-data"),
@@ -1912,7 +2040,7 @@ mod tests {
         }
         assert!(docker
             .client()
-            .inspect_network::<String>(&network_name(&installation), None)
+            .inspect_network::<String>(&collaboration_network, None)
             .await
             .is_err());
         assert!(docker
@@ -1920,5 +2048,21 @@ mod tests {
             .inspect_network::<String>(&bootstrap_network, None)
             .await
             .is_err());
+        let retained = docker.inspect_by_name(&retained_agent).await.unwrap();
+        assert!(retained
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .is_none_or(|networks| !networks.contains_key(&collaboration_network)));
+        docker
+            .client()
+            .remove_container(
+                &retained_agent,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
     }
 }

@@ -68,7 +68,9 @@ XpressClaw or Docker restarts.
   recreating managed containers while preserving volumes and credentials.
 - Stop preserves repositories, builds, and credentials.
 - Upgrade pulls configured tags and recreates containers while preserving data.
-- Reset requires exact confirmation and deletes both volumes and secrets.
+- Reset requires exact confirmation, detaches retained Agent containers from
+  the collaboration network without deleting them, and deletes both service
+  volumes and secrets.
 
 Neither service is required or automatically enabled for existing users.
 
