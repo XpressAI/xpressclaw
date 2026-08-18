@@ -134,8 +134,29 @@ async fn reset(
             "type {RESET_CONFIRMATION:?} to permanently remove both volumes and credentials"
         )));
     }
+    // Revoke all Agent access before deleting credentials and Docker data.
+    // If Docker cleanup later fails, ordinary Agent work still remains usable
+    // and no stale assignment points at missing secrets.
+    let _guard = state.config_write_lock.lock().await;
+    let mut config = (*state.config()).clone();
+    revoke_collaboration_access(&mut config);
+    config
+        .save(&state.config_path)
+        .map_err(ApiError::internal)?;
+    let config = std::sync::Arc::new(config);
+    state.apply_config(
+        config.clone(),
+        Some(std::sync::Arc::new(
+            xpressclaw_core::llm::router::LlmRouter::build_from_config(&config),
+        )),
+    );
     with_stack(&state, |stack| Box::pin(async move { stack.reset().await })).await?;
     response(&state).await.map(Json)
+}
+
+fn revoke_collaboration_access(config: &mut xpressclaw_core::config::Config) {
+    config.collaboration.enabled = false;
+    config.collaboration.authorized_agents.clear();
 }
 
 async fn logs(
@@ -613,6 +634,16 @@ mod tests {
     #[test]
     fn destructive_reset_requires_exact_confirmation() {
         assert_eq!(RESET_CONFIRMATION, "RESET LOCAL COLLABORATION");
+    }
+
+    #[test]
+    fn destructive_reset_disables_and_clears_agent_access() {
+        let mut config = xpressclaw_core::config::Config::default();
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["assigned".to_string()];
+        revoke_collaboration_access(&mut config);
+        assert!(!config.collaboration.enabled);
+        assert!(config.collaboration.authorized_agents.is_empty());
     }
 
     #[test]

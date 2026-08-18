@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, NetworkingConfig, RemoveContainerOptions,
-    StopContainerOptions,
+    Config as ContainerConfig, CreateContainerOptions, LogOutput, LogsOptions, NetworkingConfig,
+    RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::models::{
     EndpointSettings, HealthConfig, HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicy,
@@ -12,6 +12,7 @@ use bollard::models::{
 };
 use bollard::network::CreateNetworkOptions;
 use bollard::volume::{CreateVolumeOptions, RemoveVolumeOptions};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -195,29 +196,27 @@ impl<'a> CollaborationStack<'a> {
         self.ensure_network().await?;
         self.ensure_volumes().await?;
 
-        self.recreate_gitbucket().await?;
-        if let Err(error) = self
-            .wait_http(&self.config.gitbucket_url(), "GitBucket")
-            .await
-        {
-            self.stop_gitbucket_after_insecure_setup().await;
-            return Err(error);
-        }
-        let gitbucket_ready = match secrets.gitbucket_service_token.as_deref() {
-            Some(token) => self.gitbucket_token_valid(token).await,
-            None => false,
-        };
-        if !gitbucket_ready {
-            match self.bootstrap_gitbucket(&secrets).await {
-                Ok(token) => {
-                    secrets.gitbucket_service_token = Some(token);
-                    secrets.save(self.data_dir)?;
-                }
-                Err(error) => {
-                    self.stop_gitbucket_after_insecure_setup().await;
-                    return Err(error);
-                }
+        // The first phase deliberately has no host port. A short-lived helper
+        // on the private managed network replaces root/root and provisions the
+        // service account before the browser-facing container is created.
+        let gitbucket_result: Result<()> = async {
+            self.recreate_gitbucket(false).await?;
+            self.wait_container_healthy(&self.container_names()[0], "GitBucket")
+                .await?;
+            let token = self.bootstrap_gitbucket_internal(&secrets).await?;
+            if secrets.gitbucket_service_token.as_deref() != Some(token.as_str()) {
+                secrets.gitbucket_service_token = Some(token);
+                secrets.save(self.data_dir)?;
             }
+            self.recreate_gitbucket(true).await?;
+            self.wait_http(&self.config.gitbucket_url(), "GitBucket")
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = gitbucket_result {
+            self.remove_gitbucket_after_failed_setup().await;
+            return Err(error);
         }
 
         let jenkins_result: Result<()> = async {
@@ -257,13 +256,24 @@ impl<'a> CollaborationStack<'a> {
         Ok(self.status().await)
     }
 
-    async fn stop_gitbucket_after_insecure_setup(&self) {
-        let name = self.container_names()[0].clone();
-        let _ = self
-            .docker
-            .client()
-            .stop_container(&name, Some(StopContainerOptions { t: 5 }))
-            .await;
+    async fn remove_gitbucket_after_failed_setup(&self) {
+        let prefix = resource_prefix(self.installation_id);
+        for name in [
+            self.container_names()[0].clone(),
+            format!("{prefix}-gitbucket-bootstrap"),
+        ] {
+            let _ = self
+                .docker
+                .client()
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
     }
 
     async fn remove_jenkins_after_failed_setup(&self) {
@@ -279,15 +289,6 @@ impl<'a> CollaborationStack<'a> {
                 }),
             )
             .await;
-    }
-
-    async fn gitbucket_token_valid(&self, token: &str) -> bool {
-        reqwest::Client::new()
-            .get(format!("{}/api/v3/user", self.config.gitbucket_url()))
-            .header(reqwest::header::AUTHORIZATION, format!("token {token}"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
     }
 
     async fn jenkins_auth_valid(&self, password: &str) -> bool {
@@ -519,20 +520,10 @@ impl<'a> CollaborationStack<'a> {
         Ok(())
     }
 
-    async fn recreate_gitbucket(&self) -> Result<()> {
+    async fn recreate_gitbucket(&self, publish_host_port: bool) -> Result<()> {
         let prefix = resource_prefix(self.installation_id);
         self.recreate_container(
-            ServiceContainer {
-                name: format!("{prefix}-gitbucket"),
-                alias: "gitbucket".to_string(),
-                image: self.config.gitbucket_image.clone(),
-                host_port: self.config.gitbucket_port,
-                volume: format!("{prefix}-gitbucket-data"),
-                volume_target: "/gitbucket".to_string(),
-                memory: 1024 * 1024 * 1024,
-                environment: Vec::new(),
-                health_command: "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1".to_string(),
-            },
+            gitbucket_service(self.config, &prefix, publish_host_port),
             None,
         )
         .await
@@ -557,7 +548,7 @@ impl<'a> CollaborationStack<'a> {
                 name: format!("{prefix}-jenkins"),
                 alias: "jenkins".to_string(),
                 image: self.config.jenkins_image.clone(),
-                host_port: self.config.jenkins_port,
+                host_port: Some(self.config.jenkins_port),
                 volume: format!("{prefix}-jenkins-data"),
                 volume_target: "/var/jenkins_home".to_string(),
                 memory: 2 * 1024 * 1024 * 1024,
@@ -603,6 +594,18 @@ impl<'a> CollaborationStack<'a> {
 
         let port = "8080/tcp".to_string();
         let network = network_name(self.installation_id);
+        let port_bindings = service.host_port.map(|host_port| {
+            HashMap::from([(
+                port.clone(),
+                Some(vec![PortBinding {
+                    host_ip: Some(self.config.bind_address.clone()),
+                    host_port: Some(host_port.to_string()),
+                }]),
+            )])
+        });
+        let exposed_ports = service
+            .host_port
+            .map(|_| HashMap::from([(port.clone(), HashMap::new())]));
         let config = ContainerConfig {
             image: Some(service.image),
             env: (!service.environment.is_empty()).then_some(service.environment),
@@ -614,13 +617,7 @@ impl<'a> CollaborationStack<'a> {
                     maximum_retry_count: None,
                 }),
                 network_mode: Some(network.clone()),
-                port_bindings: Some(HashMap::from([(
-                    port.clone(),
-                    Some(vec![PortBinding {
-                        host_ip: Some(self.config.bind_address.clone()),
-                        host_port: Some(service.host_port.to_string()),
-                    }]),
-                )])),
+                port_bindings,
                 mounts: Some(vec![Mount {
                     target: Some(service.volume_target),
                     source: Some(service.volume),
@@ -630,7 +627,7 @@ impl<'a> CollaborationStack<'a> {
                 }]),
                 ..Default::default()
             }),
-            exposed_ports: Some(HashMap::from([(port, HashMap::new())])),
+            exposed_ports,
             healthcheck: Some(HealthConfig {
                 test: Some(vec!["CMD-SHELL".to_string(), service.health_command]),
                 interval: Some(15_000_000_000),
@@ -672,6 +669,31 @@ impl<'a> CollaborationStack<'a> {
         Ok(())
     }
 
+    async fn wait_container_healthy(&self, name: &str, service: &str) -> Result<()> {
+        for _ in 0..90 {
+            if let Some(container) = self.docker.inspect_by_name(name).await {
+                let state = container.state.unwrap_or_default();
+                let health = state
+                    .health
+                    .and_then(|health| health.status)
+                    .map(|status| status.to_string())
+                    .unwrap_or_default();
+                if health == "healthy" {
+                    return Ok(());
+                }
+                if health == "unhealthy" || state.running == Some(false) {
+                    return Err(Error::Container(format!(
+                        "{service} stopped or became unhealthy during private setup; inspect its Docker logs"
+                    )));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Err(Error::Container(format!(
+            "{service} did not become healthy during private setup; inspect its Docker logs"
+        )))
+    }
+
     async fn wait_http(&self, url: &str, service: &str) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -693,104 +715,171 @@ impl<'a> CollaborationStack<'a> {
         )))
     }
 
-    async fn bootstrap_gitbucket(&self, secrets: &CollaborationSecrets) -> Result<String> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| {
-                Error::Container(format!("failed to build GitBucket client: {error}"))
-            })?;
-        let base = self.config.gitbucket_url();
-        // A prior install may have changed the built-in password and then
-        // stopped before persisting the service token. Accept either state so
-        // a retry remains idempotent without ever restoring root/root.
-        if let Ok(default_cookie) = sign_in(&client, &base, "root", "root").await {
-            let changed = client
-                .post(format!("{base}/root/_edit"))
-                .header(reqwest::header::COOKIE, default_cookie)
-                .form(&[
-                    ("password", secrets.gitbucket_root_password.as_str()),
-                    ("fullName", "XpressClaw Administrator"),
-                    ("mailAddress", "root@localhost"),
-                    ("description", "Managed by XpressClaw"),
-                    ("url", ""),
-                    ("clearImage", "false"),
-                ])
-                .send()
-                .await
-                .map_err(|error| {
-                    Error::Container(format!("failed to secure GitBucket: {error}"))
-                })?;
-            if !changed.status().is_redirection() && !changed.status().is_success() {
+    async fn bootstrap_gitbucket_internal(&self, secrets: &CollaborationSecrets) -> Result<String> {
+        let prefix = resource_prefix(self.installation_id);
+        let helper = format!("{prefix}-gitbucket-bootstrap");
+        if let Some(existing) = self.docker.inspect_by_name(&helper).await {
+            let labels = existing
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref());
+            if !resource_owned(labels, self.installation_id) {
                 return Err(Error::Container(format!(
-                    "GitBucket rejected its generated administrator password (HTTP {})",
-                    changed.status()
+                    "bootstrap container {helper} belongs to another installation"
                 )));
             }
+            self.docker
+                .client()
+                .remove_container(
+                    &helper,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|error| {
+                    Error::Container(format!("failed to clear stale bootstrap helper: {error}"))
+                })?;
         }
 
-        let root_cookie = sign_in(&client, &base, "root", &secrets.gitbucket_root_password).await?;
-        let created = client
-            .post(format!("{base}/api/v3/admin/users"))
-            .header(reqwest::header::COOKIE, root_cookie)
-            .json(&serde_json::json!({
-                "login": SERVICE_USER,
-                "password": secrets.gitbucket_service_password,
-                "email": "agent@localhost",
-                "fullName": "XpressClaw Agents",
-                "isAdmin": false,
-            }))
-            .send()
+        let network = network_name(self.installation_id);
+        let config = ContainerConfig {
+            image: Some(self.config.jenkins_image.clone()),
+            entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec![GITBUCKET_BOOTSTRAP_SCRIPT.to_string()]),
+            env: Some(vec![
+                format!(
+                    "GITBUCKET_ROOT_PASSWORD={}",
+                    secrets.gitbucket_root_password
+                ),
+                format!(
+                    "GITBUCKET_SERVICE_PASSWORD={}",
+                    secrets.gitbucket_service_password
+                ),
+                format!(
+                    "GITBUCKET_TOKEN={}",
+                    secrets.gitbucket_service_token.as_deref().unwrap_or("")
+                ),
+            ]),
+            host_config: Some(HostConfig {
+                memory: Some(256 * 1024 * 1024),
+                nano_cpus: Some(1_000_000_000),
+                network_mode: Some(network.clone()),
+                ..Default::default()
+            }),
+            labels: Some(self.labels("gitbucket-bootstrap")),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: HashMap::from([(
+                    network,
+                    EndpointSettings {
+                        aliases: Some(vec!["gitbucket-bootstrap".to_string()]),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            ..Default::default()
+        };
+        let created = self
+            .docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: helper.clone(),
+                    platform: None,
+                }),
+                config,
+            )
             .await
             .map_err(|error| {
-                Error::Container(format!("failed to create GitBucket service user: {error}"))
-            })?;
-        let created_status = created.status();
-        let service_cookie = sign_in(
-            &client,
-            &base,
-            SERVICE_USER,
-            &secrets.gitbucket_service_password,
-        )
-        .await
-        .map_err(|error| {
-            if created_status.is_success() {
-                error
-            } else {
                 Error::Container(format!(
-                    "GitBucket could not create or reuse its non-admin service user (HTTP {created_status}): {error}"
+                    "failed to create private GitBucket bootstrap: {error}"
                 ))
+            })?;
+        let setup_result: Result<String> = async {
+            self.docker
+                .client()
+                .start_container::<String>(&created.id, None)
+                .await
+                .map_err(|error| {
+                    Error::Container(format!(
+                        "failed to start private GitBucket bootstrap: {error}"
+                    ))
+                })?;
+            let mut exit_code = None;
+            for _ in 0..600 {
+                let inspected = self
+                    .docker
+                    .client()
+                    .inspect_container(&created.id, None)
+                    .await
+                    .map_err(|error| {
+                        Error::Container(format!("failed to inspect GitBucket bootstrap: {error}"))
+                    })?;
+                let state = inspected.state.unwrap_or_default();
+                if state.running == Some(false) {
+                    exit_code = Some(state.exit_code.unwrap_or(-1));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        })?;
-        let generated = client
-            .post(format!("{base}/{SERVICE_USER}/_personalToken"))
-            .header(reqwest::header::COOKIE, &service_cookie)
-            .form(&[("note", "XpressClaw local collaboration")])
-            .send()
-            .await
-            .map_err(|error| {
-                Error::Container(format!("failed to create GitBucket token: {error}"))
+            let exit_code = exit_code.ok_or_else(|| {
+                Error::Container("private GitBucket bootstrap timed out".to_string())
             })?;
-        if !generated.status().is_redirection() && !generated.status().is_success() {
-            return Err(Error::Container(format!(
-                "GitBucket rejected its managed service token (HTTP {})",
-                generated.status()
-            )));
+            let mut logs = self.docker.client().logs::<String>(
+                &created.id,
+                Some(LogsOptions {
+                    stdout: true,
+                    stderr: false,
+                    tail: "all".to_string(),
+                    ..Default::default()
+                }),
+            );
+            let mut output = String::new();
+            while let Some(chunk) = logs.next().await {
+                let chunk = chunk.map_err(|error| {
+                    Error::Container(format!(
+                        "failed to read GitBucket bootstrap result: {error}"
+                    ))
+                })?;
+                if let LogOutput::StdOut { message } = chunk {
+                    if output.len() + message.len() > 1024 * 1024 {
+                        return Err(Error::Container(
+                            "GitBucket bootstrap returned an oversized response".to_string(),
+                        ));
+                    }
+                    output.push_str(&String::from_utf8_lossy(&message));
+                }
+            }
+            if exit_code != 0 {
+                return Err(Error::Container(
+                    "private GitBucket bootstrap failed; the insecure container was removed"
+                        .to_string(),
+                ));
+            }
+            extract_generated_token(&output).ok_or_else(|| {
+                Error::Container("GitBucket did not return its generated service token".to_string())
+            })
         }
-        let application = client
-            .get(format!("{base}/{SERVICE_USER}/_application"))
-            .header(reqwest::header::COOKIE, service_cookie)
-            .send()
-            .await
-            .map_err(|error| Error::Container(format!("failed to read GitBucket token: {error}")))?
-            .text()
-            .await
-            .map_err(|error| {
-                Error::Container(format!("failed to read GitBucket token: {error}"))
-            })?;
-        extract_generated_token(&application).ok_or_else(|| {
-            Error::Container("GitBucket did not return its generated service token".to_string())
-        })
+        .await;
+        let cleanup = self
+            .docker
+            .client()
+            .remove_container(
+                &created.id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        match (setup_result, cleanup) {
+            (Ok(token), Ok(())) => Ok(token),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(Error::Container(format!(
+                "failed to remove private GitBucket bootstrap helper: {error}"
+            ))),
+        }
     }
 
     async fn ensure_jenkins_job(&self, password: &str) -> Result<()> {
@@ -829,7 +918,7 @@ struct ServiceContainer {
     name: String,
     alias: String,
     image: String,
-    host_port: u16,
+    host_port: Option<u16>,
     volume: String,
     volume_target: String,
     memory: i64,
@@ -837,6 +926,25 @@ struct ServiceContainer {
     health_command: String,
 }
 
+fn gitbucket_service(
+    config: &CollaborationConfig,
+    prefix: &str,
+    publish_host_port: bool,
+) -> ServiceContainer {
+    ServiceContainer {
+        name: format!("{prefix}-gitbucket"),
+        alias: "gitbucket".to_string(),
+        image: config.gitbucket_image.clone(),
+        host_port: publish_host_port.then_some(config.gitbucket_port),
+        volume: format!("{prefix}-gitbucket-data"),
+        volume_target: "/gitbucket".to_string(),
+        memory: 1024 * 1024 * 1024,
+        environment: Vec::new(),
+        health_command: "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1".to_string(),
+    }
+}
+
+#[cfg(test)]
 async fn sign_in(
     client: &reqwest::Client,
     base: &str,
@@ -902,11 +1010,15 @@ async fn jenkins_crumb(
     Ok((crumb.crumb_request_field, crumb.crumb))
 }
 
-fn port_or_container_error(name: &str, port: u16, error: bollard::errors::Error) -> Error {
+fn port_or_container_error(name: &str, port: Option<u16>, error: bollard::errors::Error) -> Error {
     let detail = error.to_string();
-    if detail.contains("port is already allocated") || detail.contains("address already in use") {
+    if port.is_some()
+        && (detail.contains("port is already allocated")
+            || detail.contains("address already in use"))
+    {
         Error::Container(format!(
-            "host port {port} is already in use; choose another port for {name}"
+            "host port {} is already in use; choose another port for {name}",
+            port.unwrap_or_default()
         ))
     } else {
         Error::Container(format!("failed to start {name}: {detail}"))
@@ -923,6 +1035,11 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(test)]
+fn docker_integration_opted_in(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 const JENKINS_BOOTSTRAP_GROOVY: &str = r#"import jenkins.model.Jenkins
 import hudson.security.FullControlOnceLoggedInAuthorizationStrategy
 import hudson.security.HudsonPrivateSecurityRealm
@@ -935,6 +1052,45 @@ authorization.setAllowAnonymousRead(false)
 instance.setAuthorizationStrategy(authorization)
 instance.save()
 new File('/var/jenkins_home/init.groovy.d/xpressclaw.groovy').delete()
+"#;
+
+const GITBUCKET_BOOTSTRAP_SCRIPT: &str = r#"set -eu
+base=http://gitbucket:8080
+cookies=/tmp/gitbucket-cookies
+request() {
+  curl --connect-timeout 5 --max-time 30 "$@"
+}
+signin() {
+  rm -f "$cookies"
+  status="$(request -sS -o /dev/null -c "$cookies" \
+    --data-urlencode "userName=$1" --data-urlencode "password=$2" \
+    --data-urlencode "hash=" -w '%{http_code}' "$base/signin")"
+  test "$status" = 302
+}
+if signin root root; then
+  request -fsS -o /dev/null -b "$cookies" \
+    --data-urlencode "password=$GITBUCKET_ROOT_PASSWORD" \
+    --data-urlencode "fullName=XpressClaw Administrator" \
+    --data-urlencode "mailAddress=root@localhost" \
+    --data-urlencode "description=Managed by XpressClaw" \
+    --data-urlencode "url=" --data-urlencode "clearImage=false" "$base/root/_edit"
+fi
+signin root "$GITBUCKET_ROOT_PASSWORD"
+if test -n "${GITBUCKET_TOKEN:-}" && \
+   request -fsS -o /dev/null -H "Authorization: token $GITBUCKET_TOKEN" "$base/api/v3/user"; then
+  printf '<input value="%s" id="generated-token">' "$GITBUCKET_TOKEN"
+  exit 0
+fi
+create_status="$(request -sS -o /dev/null -b "$cookies" -w '%{http_code}' \
+  -H 'Content-Type: application/json' \
+  --data "{\"login\":\"xpressclaw-agent\",\"password\":\"$GITBUCKET_SERVICE_PASSWORD\",\"email\":\"agent@localhost\",\"fullName\":\"XpressClaw Agents\",\"isAdmin\":false}" \
+  "$base/api/v3/admin/users")"
+case "$create_status" in 2*|4*) ;; *) exit 1;; esac
+signin xpressclaw-agent "$GITBUCKET_SERVICE_PASSWORD"
+request -fsS -o /dev/null -b "$cookies" \
+  --data-urlencode "note=XpressClaw local collaboration" \
+  "$base/xpressclaw-agent/_personalToken"
+request -fsS -b "$cookies" "$base/xpressclaw-agent/_application"
 "#;
 
 const JENKINS_JOB_XML: &str = r#"<?xml version="1.1" encoding="UTF-8"?>
@@ -989,7 +1145,35 @@ mod tests {
     #[test]
     fn bootstrap_and_job_never_mount_the_container_engine() {
         assert!(JENKINS_BOOTSTRAP_GROOVY.contains("System.getenv"));
+        assert!(GITBUCKET_BOOTSTRAP_SCRIPT.contains("http://gitbucket:8080"));
+        assert!(!GITBUCKET_BOOTSTRAP_SCRIPT.contains("127.0.0.1"));
+        assert!(
+            GITBUCKET_BOOTSTRAP_SCRIPT
+                .find("signin root \"$GITBUCKET_ROOT_PASSWORD\"")
+                .unwrap()
+                < GITBUCKET_BOOTSTRAP_SCRIPT
+                    .find("if test -n \"${GITBUCKET_TOKEN:-}\"")
+                    .unwrap(),
+            "the generated administrator password must be verified before a saved token can short-circuit setup"
+        );
         assert!(!JENKINS_JOB_XML.contains("docker.sock"));
+    }
+
+    #[test]
+    fn gitbucket_is_unpublished_until_private_bootstrap_completes() {
+        let config = CollaborationConfig::default();
+        assert_eq!(gitbucket_service(&config, "test", false).host_port, None);
+        assert_eq!(
+            gitbucket_service(&config, "test", true).host_port,
+            Some(config.gitbucket_port)
+        );
+    }
+
+    #[test]
+    fn docker_integration_test_requires_an_explicit_opt_in() {
+        assert!(!docker_integration_opted_in(None));
+        assert!(!docker_integration_opted_in(Some("true")));
+        assert!(docker_integration_opted_in(Some("1")));
     }
 
     #[test]
@@ -1009,7 +1193,7 @@ mod tests {
             status_code: 500,
             message: "driver failed: port is already allocated".to_string(),
         };
-        assert!(port_or_container_error("gitbucket", 8088, error)
+        assert!(port_or_container_error("gitbucket", Some(8088), error)
             .to_string()
             .contains("host port 8088 is already in use"));
     }
@@ -1017,11 +1201,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "opt-in Docker integration test; pulls GitBucket and Jenkins images"]
     async fn docker_stack_survives_restart_and_builds_a_fixture() {
-        assert_eq!(
-            std::env::var("XPRESSCLAW_DOCKER_INTEGRATION").as_deref(),
-            Ok("1"),
-            "set XPRESSCLAW_DOCKER_INTEGRATION=1 before running ignored tests"
-        );
+        let opt_in = std::env::var("XPRESSCLAW_DOCKER_INTEGRATION").ok();
+        if !docker_integration_opted_in(opt_in.as_deref()) {
+            eprintln!(
+                "skipping Docker collaboration integration test; set XPRESSCLAW_DOCKER_INTEGRATION=1 to run it"
+            );
+            return;
+        }
         fn free_port() -> u16 {
             std::net::TcpListener::bind("127.0.0.1:0")
                 .unwrap()
@@ -1056,6 +1242,24 @@ mod tests {
         let stack = CollaborationStack::new(&docker, &config, data.path(), &installation);
         stack.install().await.unwrap();
         stack.install().await.unwrap();
+
+        let helper = format!("{}-gitbucket-bootstrap", resource_prefix(&installation));
+        assert!(docker.inspect_by_name(&helper).await.is_none());
+        let gitbucket = docker
+            .inspect_by_name(&stack.container_names()[0])
+            .await
+            .unwrap();
+        assert!(gitbucket
+            .host_config
+            .and_then(|host| host.port_bindings)
+            .is_some_and(|bindings| bindings.contains_key("8080/tcp")));
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        assert!(sign_in(&client, &config.gitbucket_url(), "root", "root")
+            .await
+            .is_err());
 
         let secrets = CollaborationSecrets::load(data.path()).unwrap().unwrap();
         let forge = GitBucketProvider::new(
@@ -1183,6 +1387,9 @@ mod tests {
 
         stack.stop().await.unwrap();
         stack.start().await.unwrap();
+        assert!(sign_in(&client, &config.gitbucket_url(), "root", "root")
+            .await
+            .is_err());
         let builds = JenkinsProvider::new(
             &config.jenkins_url(),
             JENKINS_USER,
@@ -1213,5 +1420,20 @@ mod tests {
             .unwrap()
             .contains("xpressclaw-local-build-ok"));
         stack.reset().await.unwrap();
+        for container in stack.container_names() {
+            assert!(docker.inspect_by_name(&container).await.is_none());
+        }
+        let prefix = resource_prefix(&installation);
+        for volume in [
+            format!("{prefix}-gitbucket-data"),
+            format!("{prefix}-jenkins-data"),
+        ] {
+            assert!(docker.client().inspect_volume(&volume).await.is_err());
+        }
+        assert!(docker
+            .client()
+            .inspect_network::<String>(&network_name(&installation), None)
+            .await
+            .is_err());
     }
 }

@@ -6,7 +6,8 @@
 
 import { createInterface } from 'node:readline';
 import { execFile as execFileCallback } from 'node:child_process';
-import { mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -931,17 +932,52 @@ async function pushLocalForgeBranch(argumentsValue) {
   }
   const transport = await collaborationApi('git-transport');
   const remote = `${transport.base_url}/${transport.username}/${repository}.git`;
-  const privateDirectory = path.join(workspace, '.xpressclaw', 'local-collaboration');
-  const askpass = path.join(privateDirectory, 'git-askpass.sh');
-  await mkdir(privateDirectory, { recursive: true, mode: 0o700 });
+  const output = await runManagedGitPush({
+    directory,
+    remote,
+    branch,
+    username: transport.username,
+    token: transport.token,
+    forceWithLease: argumentsValue?.force_with_lease === true,
+  });
+  return {
+    status: 'pushed',
+    repository,
+    branch,
+    output,
+  };
+}
+
+function redactSecret(value, secret) {
+  const raw = String(secret ?? '');
+  return raw ? String(value ?? '').replaceAll(raw, '[REDACTED]') : String(value ?? '');
+}
+
+export async function runManagedGitPush({
+  directory,
+  remote,
+  branch,
+  username,
+  token,
+  forceWithLease = false,
+}) {
+  const credentialDirectory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-git-'));
+  const askpass = path.join(credentialDirectory, 'git-askpass.sh');
+  const emptyHooks = path.join(credentialDirectory, 'empty-hooks');
+  const hooksPath = emptyHooks.split(path.sep).join('/');
+  await mkdir(emptyHooks, { recursive: true, mode: 0o700 });
   await writeFile(
     askpass,
     '#!/bin/sh\ncase "$1" in *Username*) printf "%s" "$XPRESSCLAW_GIT_USERNAME" ;; *) printf "%s" "$XPRESSCLAW_GIT_TOKEN" ;; esac\n',
     { mode: 0o700 },
   );
   try {
-    const args = ['push'];
-    if (argumentsValue?.force_with_lease === true) args.push('--force-with-lease');
+    // Command-scoped core.hooksPath has higher precedence than repository and
+    // global configuration. Point it at a private empty directory so neither
+    // an in-repository hook nor a configured hooks path can inherit the
+    // short-lived transport credential.
+    const args = ['-c', `core.hooksPath=${hooksPath}`, 'push'];
+    if (forceWithLease) args.push('--force-with-lease');
     args.push(remote, `${branch}:${branch}`);
     const { stdout, stderr } = await execFile('git', args, {
       cwd: directory,
@@ -949,23 +985,20 @@ async function pushLocalForgeBranch(argumentsValue) {
         ...process.env,
         GIT_ASKPASS: askpass,
         GIT_TERMINAL_PROMPT: '0',
-        XPRESSCLAW_GIT_USERNAME: transport.username,
-        XPRESSCLAW_GIT_TOKEN: transport.token,
+        XPRESSCLAW_GIT_USERNAME: username,
+        XPRESSCLAW_GIT_TOKEN: token,
       },
       maxBuffer: 1024 * 1024,
     });
-    return {
-      status: 'pushed',
-      repository,
-      branch,
-      output: `${stdout}${stderr}`.trim().slice(-4000),
-    };
+    return redactSecret(`${stdout}${stderr}`, token).trim().slice(-4000);
   } catch (cause) {
-    const detail = String(cause?.stderr ?? cause?.message ?? cause)
-      .replaceAll(String(transport.token), '[REDACTED]');
+    const detail = redactSecret(
+      `${cause?.stdout ?? ''}${cause?.stderr ?? ''}${cause?.message ?? cause}`,
+      token,
+    );
     throw new Error(`git push failed: ${detail.slice(-4000)}`);
   } finally {
-    await rm(askpass, { force: true });
+    await rm(credentialDirectory, { recursive: true, force: true });
   }
 }
 

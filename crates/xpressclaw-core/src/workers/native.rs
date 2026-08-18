@@ -2089,12 +2089,24 @@ fn configure_local_collaboration_access(
     if !config.collaboration.agent_authorized(&agent.name) {
         return Ok(None);
     }
-    let secrets = CollaborationSecrets::load(&config.system.data_dir)?.ok_or_else(|| {
-        Error::Backend(
-            "Local collaboration access is assigned to this Agent, but the services are not installed; open Settings → Local collaboration and choose Install services"
-                .to_string(),
-        )
-    })?;
+    let secrets = match CollaborationSecrets::load(&config.system.data_dir) {
+        Ok(Some(secrets)) => secrets,
+        Ok(None) => {
+            warn!(
+                agent = %agent.name,
+                "local collaboration credentials are unavailable; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            warn!(
+                agent = %agent.name,
+                %error,
+                "local collaboration credentials could not be loaded; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+    };
     let installation_id = db.installation_id()?;
     spec.network_mode = Some(collaboration_network_name(&installation_id));
     Ok(Some(secrets.agent_capability_token))
@@ -4405,6 +4417,69 @@ mod tests {
             unassigned_spec.network_mode.as_deref(),
             Some("existing-network")
         );
+
+        std::fs::remove_file(CollaborationSecrets::path(data_dir.path())).unwrap();
+        let mut ordinary_turn_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access(
+            &db,
+            &config,
+            &allowed,
+            &mut ordinary_turn_spec,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            ordinary_turn_spec.network_mode.as_deref(),
+            Some("ordinary-network")
+        );
+
+        std::fs::create_dir_all(data_dir.path().join("collaboration")).unwrap();
+        std::fs::write(
+            CollaborationSecrets::path(data_dir.path()),
+            "not valid collaboration credentials",
+        )
+        .unwrap();
+        let mut malformed_credentials_spec = ContainerSpec::default();
+        let original_network = malformed_credentials_spec.network_mode.clone();
+        assert!(configure_local_collaboration_access(
+            &db,
+            &config,
+            &allowed,
+            &mut malformed_credentials_spec,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(malformed_credentials_spec.network_mode, original_network);
+    }
+
+    #[test]
+    fn reset_collaboration_access_keeps_task_and_conversation_specs_usable() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = false;
+        config.collaboration.authorized_agents.clear();
+        let agent = AgentConfig {
+            name: "formerly-assigned".to_string(),
+            ..Default::default()
+        };
+
+        for network in ["task-network", "conversation-network"] {
+            let mut spec = ContainerSpec {
+                network_mode: Some(network.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                configure_local_collaboration_access(&db, &config, &agent, &mut spec)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(spec.network_mode.as_deref(), Some(network));
+        }
     }
 
     #[test]

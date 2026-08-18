@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{pin_mut, Stream, StreamExt};
 use serde::Deserialize;
 
 use super::{Build, BuildCapabilities, BuildProvider, BuildRequest, GITBUCKET_INTERNAL_URL};
 use crate::error::{Error, Result};
 
 const JOB: &str = "xpressclaw-local-build";
+const MAX_LOG_BYTES: usize = 1_000_000;
 
 #[derive(Clone)]
 pub struct JenkinsProvider {
@@ -236,11 +239,42 @@ impl BuildProvider for JenkinsProvider {
     }
 
     async fn logs(&self, number: u64, max_bytes: usize) -> Result<String> {
+        let limit = max_bytes.min(MAX_LOG_BYTES);
+        if limit == 0 {
+            return Ok(String::new());
+        }
+        let progressive_url = format!(
+            "{}/job/{JOB}/{number}/logText/progressiveText",
+            self.base_url
+        );
+        // Jenkins exposes the current byte offset in the response headers.
+        // Drop this body immediately, then request only the bounded tail.
+        let probe = self
+            .authenticated(self.client.get(&progressive_url).query(&[("start", 0)]))
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !probe.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} for build logs",
+                probe.status()
+            )));
+        }
+        let log_size = probe
+            .headers()
+            .get("x-text-size")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| {
+                Error::ToolExecution(
+                    "Jenkins omitted the bounded progressive-log offset".to_string(),
+                )
+            })?;
+        drop(probe);
+
+        let start = log_size.saturating_sub(limit);
         let response = self
-            .authenticated(
-                self.client
-                    .get(format!("{}/job/{JOB}/{number}/consoleText", self.base_url)),
-            )
+            .authenticated(self.client.get(&progressive_url).query(&[("start", start)]))
             .send()
             .await
             .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
@@ -250,11 +284,25 @@ impl BuildProvider for JenkinsProvider {
                 response.status()
             )));
         }
-        let bytes = response.bytes().await.map_err(|error| {
-            Error::ToolExecution(format!("failed to read Jenkins logs: {error}"))
-        })?;
-        let start = bytes.len().saturating_sub(max_bytes.min(1_000_000));
-        Ok(String::from_utf8_lossy(&bytes[start..]).to_string())
+        let more_data = response
+            .headers()
+            .get("x-more-data")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let (bytes, reached_limit) =
+            read_bounded(response.bytes_stream(), limit)
+                .await
+                .map_err(|error| {
+                    Error::ToolExecution(format!("failed to read Jenkins logs: {error}"))
+                })?;
+        let mut logs = String::from_utf8_lossy(&bytes).to_string();
+        if start > 0 || (reached_limit && more_data) {
+            logs.insert_str(
+                0,
+                &format!("[log truncated; showing at most the last {limit} bytes]\n"),
+            );
+        }
+        Ok(logs)
     }
 
     async fn cancel(&self, number: u64) -> Result<()> {
@@ -271,9 +319,30 @@ impl BuildProvider for JenkinsProvider {
     }
 }
 
+async fn read_bounded<S, E>(stream: S, limit: usize) -> std::result::Result<(Vec<u8>, bool), E>
+where
+    S: Stream<Item = std::result::Result<Bytes, E>>,
+{
+    pin_mut!(stream);
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() >= remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            return Ok((bytes, true));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((bytes, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn build_requests_are_limited_to_managed_gitbucket_repositories() {
@@ -298,5 +367,33 @@ mod tests {
         assert!(capabilities.cancel);
         assert!(!capabilities.artifacts);
         assert!(!capabilities.retry);
+    }
+
+    #[tokio::test]
+    async fn verbose_logs_stop_streaming_at_the_server_side_limit() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&polls);
+        let stream = futures_util::stream::poll_fn(move |_| {
+            let poll = observed.fetch_add(1, Ordering::SeqCst);
+            assert!(poll < 16, "the response was polled after reaching the cap");
+            std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from(vec![
+                b'x';
+                64 * 1024
+            ]))))
+        });
+        let (bytes, truncated) = read_bounded(stream, MAX_LOG_BYTES).await.unwrap();
+        assert_eq!(bytes.len(), MAX_LOG_BYTES);
+        assert!(truncated);
+        assert_eq!(polls.load(Ordering::SeqCst), 16);
+    }
+
+    #[tokio::test]
+    async fn bounded_logs_handle_a_multibyte_boundary_safely() {
+        let stream = futures_util::stream::iter([Ok::<_, Infallible>(Bytes::from_static(
+            "ab日本語".as_bytes(),
+        ))]);
+        let (bytes, truncated) = read_bounded(stream, 4).await.unwrap();
+        assert!(truncated);
+        assert_eq!(String::from_utf8_lossy(&bytes), "ab�");
     }
 }

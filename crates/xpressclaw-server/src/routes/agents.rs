@@ -119,7 +119,7 @@ async fn delete_agent(
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let registry = AgentRegistry::new(state.db.clone());
-    registry.get(&id).map_err(|e| match &e {
+    let record = registry.get(&id).map_err(|e| match &e {
         xpressclaw_core::error::Error::AgentNotFound { .. } => not_found(&e),
         _ => internal_error(e),
     })?;
@@ -139,41 +139,41 @@ async fn delete_agent(
         let _ = docker.stop(&id).await;
     }
     let _config_guard = state.config_write_lock.lock().await;
-    registry
-        .delete_with_running_conversation_turns(&id, |turn_id| {
-            state
-                .turn_controls
-                .request_interrupt(turn_id, AcpInterruptMode::Immediate);
-            state.elicitations.cancel_attempt(turn_id);
-        })
+    let old_config = state.config();
+    let mut new_config = (*old_config).clone();
+    new_config.agents.retain(|agent| agent.name != record.name);
+    new_config
+        .collaboration
+        .authorized_agents
+        .retain(|agent| agent != &record.name && agent != &record.id);
+    // Persist the protected config mutation first. A write failure must not
+    // delete the database record and leave an assignment that Settings can no
+    // longer render or repair.
+    new_config
+        .save(&state.config_path)
         .map_err(internal_error)?;
+
+    if let Err(error) = registry.delete_with_running_conversation_turns(&id, |turn_id| {
+        state
+            .turn_controls
+            .request_interrupt(turn_id, AcpInterruptMode::Immediate);
+        state.elicitations.cancel_attempt(turn_id);
+    }) {
+        return match old_config.save(&state.config_path) {
+            Ok(()) => Err(internal_error(error)),
+            Err(rollback_error) => Err(internal_error(format!(
+                "failed to delete Agent ({error}) and failed to restore its configuration ({rollback_error})"
+            ))),
+        };
+    }
+
+    let new_config = std::sync::Arc::new(new_config);
+    state.apply_config(new_config, state.llm_router());
     state
         .conversation_processes
         .retire_agent_everywhere(&id)
         .await;
     sessions.delete(&id).map_err(internal_error)?;
-
-    // Remove from YAML config
-    let old_config = state.config();
-    let new_agents: Vec<_> = old_config
-        .agents
-        .iter()
-        .filter(|a| a.name != id)
-        .cloned()
-        .collect();
-    let new_config = xpressclaw_core::config::Config {
-        agents: new_agents,
-        collaboration: old_config.collaboration.clone(),
-        llm: old_config.llm.clone(),
-        mcp_servers: old_config.mcp_servers.clone(),
-        system: old_config.system.clone(),
-        tools: old_config.tools.clone(),
-        tool_policies: old_config.tool_policies.clone(),
-        memory: old_config.memory.clone(),
-    };
-    let _ = new_config.save(&state.config_path);
-    let new_config = std::sync::Arc::new(new_config);
-    state.apply_config(new_config, state.llm_router());
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -569,6 +569,68 @@ mod tests {
         let state = AppState::new(config, db, None, config_path.clone(), true);
         let app = Router::new().nest("/agents", routes()).with_state(state);
         (app, config_path)
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_removes_its_collaboration_assignment() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-agent-collaboration-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = Arc::new(Database::open_memory().unwrap());
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "atlas".to_string(),
+            backend: "generic".to_string(),
+            ..Default::default()
+        });
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["atlas".to_string()];
+        config.save(&config_path).unwrap();
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "generic")
+            .unwrap();
+        let state = AppState::new(Arc::new(config), db, None, config_path.clone(), true);
+        let app = Router::new()
+            .nest("/agents", routes())
+            .nest(
+                "/settings/collaboration",
+                crate::routes::settings_collaboration::routes(),
+            )
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/agents/atlas")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let saved = Config::load(&config_path).unwrap();
+        assert!(!saved.agents.iter().any(|agent| agent.name == "atlas"));
+        assert!(saved.collaboration.authorized_agents.is_empty());
+        saved.collaboration.validate().unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/settings/collaboration")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&saved.collaboration).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[tokio::test]

@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   briefingMarkdown,
@@ -15,8 +16,11 @@ import {
   buildProjectMemoryRequest,
   buildWakeupRequest,
   memoryResourceTemplates,
+  runManagedGitPush,
   TOOLS,
 } from './mcp-xpressclaw.mjs';
+
+const execFile = promisify(execFileCallback);
 
 test('binds a scheduled wake-up to the task that armed it', () => {
   const request = buildWakeupRequest(
@@ -209,6 +213,92 @@ test('local collaboration tools are visible only to explicitly authorized Agent 
   child.stdin.end();
   if (child.exitCode === null) await once(child, 'exit');
   lines.close();
+});
+
+test('managed forge pushes disable repository and configured Git hooks', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-push-'));
+  const checkout = path.join(root, 'checkout');
+  const remote = path.join(root, 'remote.git');
+  const configuredHooks = path.join(root, 'configured-hooks');
+  const repositoryMarker = path.join(root, 'repository-hook-ran');
+  const configuredMarker = path.join(root, 'configured-hook-ran');
+  const token = 'malicious-hook-must-not-see-this-token';
+  const git = (argumentsValue, cwd = checkout) => execFile('git', argumentsValue, { cwd });
+
+  try {
+    await mkdir(checkout);
+    await mkdir(configuredHooks);
+    await git(['init', '-b', 'main']);
+    await git(['config', 'user.name', 'XpressClaw test']);
+    await git(['config', 'user.email', 'test@localhost']);
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'fixture']);
+    await execFile('git', ['init', '--bare', remote]);
+
+    const repositoryHook = path.join(checkout, '.git', 'hooks', 'pre-push');
+    await writeFile(
+      repositoryHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN"\ntouch ${JSON.stringify(repositoryMarker)}\n`,
+    );
+    await chmod(repositoryHook, 0o700);
+    const configuredHook = path.join(configuredHooks, 'pre-push');
+    await writeFile(
+      configuredHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN" >&2\ntouch ${JSON.stringify(configuredMarker)}\n`,
+    );
+    await chmod(configuredHook, 0o700);
+    const remoteHook = path.join(remote, 'hooks', 'pre-receive');
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\n`);
+    await chmod(remoteHook, 0o700);
+
+    const output = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(output.includes(token), false);
+    assert.match(output, /\[REDACTED\]/);
+    await assert.rejects(readFile(repositoryMarker), { code: 'ENOENT' });
+
+    await git(['config', 'core.hooksPath', configuredHooks]);
+    await writeFile(path.join(checkout, 'README.md'), '# configured hook fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise configured hook suppression']);
+    const configuredOutput = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(configuredOutput.includes(token), false);
+    assert.match(configuredOutput, /\[REDACTED\]/);
+    await assert.rejects(readFile(configuredMarker), { code: 'ENOENT' });
+
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\nexit 1\n`);
+    await writeFile(path.join(checkout, 'README.md'), '# changed fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise failed push redaction']);
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        assert.match(error.message, /\[REDACTED\]/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
