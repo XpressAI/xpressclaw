@@ -332,6 +332,11 @@ where
         >,
     >,
 {
+    // Install/start/stop/restart/upgrade/reset all reconcile the same fixed
+    // Docker resource names. Hold one installation-wide lock for the complete
+    // operation so concurrent Settings requests cannot remove or recreate one
+    // another's containers, network, volumes, or bootstrap helpers.
+    let _lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
     let docker = state
         .docker()
         .await

@@ -52,8 +52,9 @@ explicitly trigger Jenkins after a push or pull request.
 
 Default pinned images are ghcr.io/gitbucket/gitbucket:4.46.1 and
 jenkins/jenkins:2.568.1-jdk21. Settings shows exact container, network, and
-volume names. GitBucket has a 1 GiB memory limit; Jenkins has 2 GiB; each has two
-CPUs and an unless-stopped policy. Docker health checks expose stopped,
+volume names. GitBucket has a 1 GiB memory limit; the Jenkins controller has 2
+GiB; and its isolated build Agent has 1 GiB. Each has two CPUs and an
+unless-stopped policy. Docker health checks expose stopped,
 starting, healthy, unhealthy, port-conflict, and image-pull states after
 XpressClaw or Docker restarts.
 
@@ -81,10 +82,13 @@ Host ports bind to loopback by default. For remote instances, expose browser
 URLs only through authenticated HTTPS or SSH. Agent endpoints are Docker aliases
 and must not be published externally.
 
-Jenkins has no privileged mode, Docker-in-Docker, or host Docker socket. Docker
-image builds are outside this slice; use ordinary compiler/test jobs or separate
-Jenkins build Agents. XpressClaw does not install GitBucket's experimental CI
-plugin.
+Jenkins has no privileged mode, Docker-in-Docker, or host Docker socket. The
+controller has zero build executors. Repository scripts run on a dedicated
+inbound build Agent that has no controller-data mount, so a build cannot modify
+Jenkins configuration or credentials through `/var/jenkins_home`. Docker image
+builds are outside this slice; use ordinary compiler/test jobs or separately
+managed Jenkins build Agents. XpressClaw does not install GitBucket's
+experimental CI plugin.
 
 Authorized Agents use a non-admin GitBucket account. Administrator and Jenkins
 credentials stay server-side. The collaboration capability is separate from the

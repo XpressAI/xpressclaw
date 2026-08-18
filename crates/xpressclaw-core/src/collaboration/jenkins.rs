@@ -33,7 +33,7 @@ impl JenkinsProvider {
         request.basic_auth(&self.username, Some(&self.password))
     }
 
-    async fn crumb(&self) -> Result<Option<(String, String)>> {
+    async fn crumb(&self) -> Result<Option<(String, String, Option<String>)>> {
         let response = self
             .authenticated(
                 self.client
@@ -51,16 +51,31 @@ impl JenkinsProvider {
                 response.status()
             )));
         }
+        let cookies = response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| value.split(';').next())
+            .collect::<Vec<_>>();
+        let session_cookie = (!cookies.is_empty()).then(|| cookies.join("; "));
         let crumb: Crumb = response.json().await.map_err(|error| {
             Error::ToolExecution(format!("Jenkins returned an invalid crumb: {error}"))
         })?;
-        Ok(Some((crumb.crumb_request_field, crumb.crumb)))
+        Ok(Some((
+            crumb.crumb_request_field,
+            crumb.crumb,
+            session_cookie,
+        )))
     }
 
     async fn post(&self, url: String) -> Result<reqwest::Response> {
         let mut request = self.authenticated(self.client.post(url));
-        if let Some((field, crumb)) = self.crumb().await? {
+        if let Some((field, crumb, session_cookie)) = self.crumb().await? {
             request = request.header(field, crumb);
+            if let Some(cookie) = session_cookie {
+                request = request.header(reqwest::header::COOKIE, cookie);
+            }
         }
         let response = request
             .send()

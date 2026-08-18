@@ -57,9 +57,41 @@ impl GitBucketProvider {
                 detail.chars().take(500).collect::<String>()
             )));
         }
-        response.json().await.map_err(|error| {
-            Error::ToolExecution(format!("GitBucket returned an invalid response: {error}"))
-        })
+        let body = response.bytes().await.map_err(|error| {
+            Error::ToolExecution(format!("failed to read GitBucket response: {error}"))
+        })?;
+        decode_response(&body)
+    }
+}
+
+fn decode_response<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T> {
+    match serde_json::from_slice(body) {
+        Ok(value) => Ok(value),
+        Err(outer_error) => {
+            // GitBucket 4.46 double-encodes some otherwise GitHub-compatible
+            // API responses (notably pull-request creation) as a JSON string.
+            // Accept that provider quirk without weakening status checks or
+            // changing the normalized provider model.
+            if let Ok(encoded) = serde_json::from_slice::<String>(body) {
+                return serde_json::from_str(&encoded).map_err(|inner_error| {
+                    Error::ToolExecution(format!(
+                        "GitBucket returned invalid nested JSON at line {} column {}",
+                        inner_error.line(),
+                        inner_error.column()
+                    ))
+                });
+            }
+            Err(Error::ToolExecution(format!(
+                "GitBucket returned invalid JSON at line {} column {}: {}",
+                outer_error.line(),
+                outer_error.column(),
+                String::from_utf8_lossy(body)
+                    .trim()
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            )))
+        }
     }
 }
 
@@ -285,5 +317,14 @@ mod tests {
             GitBucketProvider::new("http://gitbucket:8080", "xpressclaw", "secret").unwrap();
         assert!(provider.ensure_managed_owner("xpressclaw", "write").is_ok());
         assert!(provider.ensure_managed_owner("root", "write").is_err());
+    }
+
+    #[test]
+    fn decodes_gitbuckets_double_encoded_pull_request_response() {
+        let pull_request = r#"{"number":2,"title":"Review","state":"open","html_url":"http://gitbucket/pull/2","head":{"ref":"feature"},"base":{"ref":"main"}}"#;
+        let encoded = serde_json::to_vec(pull_request).unwrap();
+        let decoded: ApiPullRequest = decode_response(&encoded).unwrap();
+        assert_eq!(decoded.number, 2);
+        assert_eq!(decoded.head.reference, "feature");
     }
 }

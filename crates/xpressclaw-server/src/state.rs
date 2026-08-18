@@ -43,6 +43,10 @@ pub struct AppState {
     /// Serialize explicit Git-backed Project sync operations so fetch and
     /// publish cannot race through the same temporary Git store state.
     pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize Docker lifecycle reconciliation for the local collaboration
+    /// stack. Every clone shares this lock, so fixed container, network, and
+    /// volume names cannot be concurrently recreated or removed.
+    pub collaboration_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
@@ -70,6 +74,7 @@ impl AppState {
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -205,5 +210,36 @@ impl AppState {
         }
         sessions.refresh_status(&current.session_id)?;
         Ok(interrupted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_state_serializes_collaboration_lifecycle_operations() {
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            PathBuf::from("test.yaml"),
+            true,
+        );
+        let concurrent_request = state.clone();
+        let first = state.collaboration_lifecycle_lock.lock().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .is_err());
+        drop(first);
+        let _second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .expect("the next lifecycle operation should proceed after release");
     }
 }

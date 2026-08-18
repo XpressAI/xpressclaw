@@ -963,31 +963,58 @@ export async function runManagedGitPush({
 }) {
   const credentialDirectory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-git-'));
   const askpass = path.join(credentialDirectory, 'git-askpass.sh');
+  const globalConfig = path.join(credentialDirectory, 'global-gitconfig');
   const emptyHooks = path.join(credentialDirectory, 'empty-hooks');
   const hooksPath = emptyHooks.split(path.sep).join('/');
   await mkdir(emptyHooks, { recursive: true, mode: 0o700 });
+  await writeFile(globalConfig, '', { mode: 0o600 });
   await writeFile(
     askpass,
     '#!/bin/sh\ncase "$1" in *Username*) printf "%s" "$XPRESSCLAW_GIT_USERNAME" ;; *) printf "%s" "$XPRESSCLAW_GIT_TOKEN" ;; esac\n',
     { mode: 0o700 },
   );
   try {
-    // Command-scoped core.hooksPath has higher precedence than repository and
-    // global configuration. Point it at a private empty directory so neither
-    // an in-repository hook nor a configured hooks path can inherit the
-    // short-lived transport credential.
-    const args = ['-c', `core.hooksPath=${hooksPath}`, 'push'];
-    if (forceWithLease) args.push('--force-with-lease');
+    // Isolate both executable Git extension points that could inherit the
+    // short-lived transport credential. The empty credential.helper value
+    // resets any helpers accumulated from repository configuration.
+    const gitConfig = [
+      '-c', `core.hooksPath=${hooksPath}`,
+      '-c', 'credential.helper=',
+    ];
+    const gitEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => (
+        key !== 'GIT_CONFIG_PARAMETERS'
+        && key !== 'GIT_CONFIG_COUNT'
+        && !/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)
+      )),
+    );
+    Object.assign(gitEnvironment, {
+      GIT_ASKPASS: askpass,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: globalConfig,
+      XPRESSCLAW_GIT_USERNAME: username,
+      XPRESSCLAW_GIT_TOKEN: token,
+    });
+
+    let lease = null;
+    if (forceWithLease) {
+      const remoteRef = `refs/heads/${branch}`;
+      const { stdout } = await execFile(
+        'git',
+        [...gitConfig, 'ls-remote', '--refs', remote, remoteRef],
+        { cwd: directory, env: gitEnvironment, maxBuffer: 1024 * 1024 },
+      );
+      const match = stdout.trim().match(/^([0-9a-fA-F]{40,64})\s+refs\/heads\//);
+      lease = `--force-with-lease=${remoteRef}:${match?.[1] ?? ''}`;
+    }
+
+    const args = [...gitConfig, 'push'];
+    if (lease) args.push(lease);
     args.push(remote, `${branch}:${branch}`);
     const { stdout, stderr } = await execFile('git', args, {
       cwd: directory,
-      env: {
-        ...process.env,
-        GIT_ASKPASS: askpass,
-        GIT_TERMINAL_PROMPT: '0',
-        XPRESSCLAW_GIT_USERNAME: username,
-        XPRESSCLAW_GIT_TOKEN: token,
-      },
+      env: gitEnvironment,
       maxBuffer: 1024 * 1024,
     });
     return redactSecret(`${stdout}${stderr}`, token).trim().slice(-4000);

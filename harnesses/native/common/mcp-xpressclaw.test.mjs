@@ -278,6 +278,16 @@ test('managed forge pushes disable repository and configured Git hooks', { timeo
     assert.match(configuredOutput, /\[REDACTED\]/);
     await assert.rejects(readFile(configuredMarker), { code: 'ENOENT' });
 
+    await git(['commit', '--amend', '--no-edit']);
+    await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+      forceWithLease: true,
+    });
+
     await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\nexit 1\n`);
     await writeFile(path.join(checkout, 'README.md'), '# changed fixture\n');
     await git(['add', 'README.md']);
@@ -297,6 +307,77 @@ test('managed forge pushes disable repository and configured Git hooks', { timeo
       },
     );
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed forge pushes do not execute configured credential helpers', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-credentials-'));
+  const checkout = path.join(root, 'checkout');
+  const marker = path.join(root, 'credential-helper-ran');
+  const globalMarker = path.join(root, 'global-credential-helper-ran');
+  const globalConfig = path.join(root, 'malicious-global-gitconfig');
+  const token = 'credential-helper-must-not-see-this-token';
+  const server = createServer((_request, response) => {
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="test"' });
+    response.end('authentication required');
+  });
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', 'credential.helper', `!touch ${JSON.stringify(marker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+      { cwd: checkout },
+    );
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    assert.equal(typeof address, 'object');
+
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        return true;
+      },
+    );
+    await assert.rejects(readFile(marker), { code: 'ENOENT' });
+
+    await execFile('git', ['config', '--unset-all', 'credential.helper'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', '--file', globalConfig, 'credential.helper', `!touch ${JSON.stringify(globalMarker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+    );
+    const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      await assert.rejects(runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }));
+    } finally {
+      if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+    await assert.rejects(readFile(globalMarker), { code: 'ENOENT' });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     await rm(root, { recursive: true, force: true });
   }
 });

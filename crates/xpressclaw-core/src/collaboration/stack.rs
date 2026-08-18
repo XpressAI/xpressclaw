@@ -26,6 +26,7 @@ pub const INSTALLATION_LABEL: &str = "io.xpressclaw.installation";
 const SERVICE_USER: &str = "xpressclaw-agent";
 const JENKINS_USER: &str = "xpressclaw";
 const JENKINS_JOB: &str = "xpressclaw-local-build";
+const JENKINS_AGENT: &str = "xpressclaw-builder";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollaborationStackStatus {
@@ -239,6 +240,12 @@ impl<'a> CollaborationStack<'a> {
                 self.wait_http(&self.config.jenkins_url(), "Jenkins")
                     .await?;
             }
+            let agent_secret = self
+                .ensure_jenkins_agent_node(&secrets.jenkins_password)
+                .await?;
+            self.recreate_jenkins_agent(&agent_secret).await?;
+            self.wait_jenkins_agent_online(&secrets.jenkins_password)
+                .await?;
             self.ensure_jenkins_job(&secrets.jenkins_password).await?;
             if first_jenkins_install {
                 secrets.jenkins_initialized = true;
@@ -277,18 +284,19 @@ impl<'a> CollaborationStack<'a> {
     }
 
     async fn remove_jenkins_after_failed_setup(&self) {
-        let name = self.container_names()[1].clone();
-        let _ = self
-            .docker
-            .client()
-            .remove_container(
-                &name,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
+        for name in &self.container_names()[1..] {
+            let _ = self
+                .docker
+                .client()
+                .remove_container(
+                    name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+        }
     }
 
     async fn jenkins_auth_valid(&self, password: &str) -> bool {
@@ -324,7 +332,7 @@ impl<'a> CollaborationStack<'a> {
     }
 
     pub async fn stop(&self) -> Result<CollaborationStackStatus> {
-        for name in self.container_names() {
+        for name in self.container_names().into_iter().rev() {
             if self.managed_container_present(&name).await?
                 && self.docker.is_container_running(&name).await
             {
@@ -438,9 +446,13 @@ impl<'a> CollaborationStack<'a> {
         Ok(self.status().await)
     }
 
-    fn container_names(&self) -> [String; 2] {
+    fn container_names(&self) -> [String; 3] {
         let prefix = resource_prefix(self.installation_id);
-        [format!("{prefix}-gitbucket"), format!("{prefix}-jenkins")]
+        [
+            format!("{prefix}-gitbucket"),
+            format!("{prefix}-jenkins"),
+            format!("{prefix}-jenkins-agent"),
+        ]
     }
 
     fn labels(&self, service: &str) -> HashMap<String, String> {
@@ -559,6 +571,81 @@ impl<'a> CollaborationStack<'a> {
             command,
         )
         .await
+    }
+
+    async fn recreate_jenkins_agent(&self, secret: &str) -> Result<()> {
+        let prefix = resource_prefix(self.installation_id);
+        let name = format!("{prefix}-jenkins-agent");
+        if let Some(existing) = self.docker.inspect_by_name(&name).await {
+            let labels = existing
+                .config
+                .as_ref()
+                .and_then(|config| config.labels.as_ref());
+            if !resource_owned(labels, self.installation_id) {
+                return Err(Error::Container(format!(
+                    "container {name} exists but belongs to another installation"
+                )));
+            }
+            self.docker
+                .client()
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|error| Error::Container(format!("failed to replace {name}: {error}")))?;
+        }
+
+        let network = network_name(self.installation_id);
+        let config = ContainerConfig {
+            image: Some(self.config.jenkins_image.clone()),
+            entrypoint: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+            cmd: Some(vec![JENKINS_AGENT_COMMAND.to_string()]),
+            env: Some(vec![format!("XPRESSCLAW_JENKINS_AGENT_SECRET={secret}")]),
+            host_config: Some(HostConfig {
+                memory: Some(1024 * 1024 * 1024),
+                nano_cpus: Some(2_000_000_000),
+                restart_policy: Some(RestartPolicy {
+                    name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
+                network_mode: Some(network.clone()),
+                mounts: Some(Vec::new()),
+                ..Default::default()
+            }),
+            labels: Some(self.labels("jenkins-agent")),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: HashMap::from([(
+                    network,
+                    EndpointSettings {
+                        aliases: Some(vec!["jenkins-agent".to_string()]),
+                        ..Default::default()
+                    },
+                )]),
+            }),
+            ..Default::default()
+        };
+        let created = self
+            .docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: name.clone(),
+                    platform: None,
+                }),
+                config,
+            )
+            .await
+            .map_err(|error| Error::Container(format!("failed to create {name}: {error}")))?;
+        self.docker
+            .client()
+            .start_container::<String>(&created.id, None)
+            .await
+            .map_err(|error| Error::Container(format!("failed to start {name}: {error}")))?;
+        Ok(())
     }
 
     async fn recreate_container(
@@ -882,6 +969,90 @@ impl<'a> CollaborationStack<'a> {
         }
     }
 
+    async fn run_jenkins_script(&self, password: &str, script: &str) -> Result<String> {
+        let base = self.config.jenkins_url();
+        let client = reqwest::Client::new();
+        let (crumb_field, crumb, session_cookie) = jenkins_crumb(&client, &base, password).await?;
+        let mut request = client
+            .post(format!("{base}/scriptText"))
+            .basic_auth(JENKINS_USER, Some(password))
+            .header(crumb_field, crumb)
+            .form(&[("script", script)]);
+        if let Some(cookie) = session_cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request.send().await.map_err(|error| {
+            Error::Container(format!("failed to configure Jenkins build Agent: {error}"))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            Error::Container(format!(
+                "failed to read Jenkins build Agent configuration: {error}"
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(Error::Container(format!(
+                "Jenkins rejected build Agent configuration (HTTP {status}): {}",
+                body.trim().chars().take(500).collect::<String>()
+            )));
+        }
+        Ok(body)
+    }
+
+    async fn ensure_jenkins_agent_node(&self, password: &str) -> Result<String> {
+        let secret = self
+            .run_jenkins_script(password, JENKINS_AGENT_GROOVY)
+            .await?
+            .trim()
+            .to_string();
+        if secret.is_empty()
+            || !secret
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        {
+            return Err(Error::Container(
+                "Jenkins returned an invalid inbound build Agent secret".to_string(),
+            ));
+        }
+        Ok(secret)
+    }
+
+    async fn wait_jenkins_agent_online(&self, password: &str) -> Result<()> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| Error::Container(format!("failed to build health client: {error}")))?;
+        let url = format!(
+            "{}/computer/{JENKINS_AGENT}/api/json",
+            self.config.jenkins_url()
+        );
+        for _ in 0..90 {
+            let online = match client
+                .get(&url)
+                .basic_auth(JENKINS_USER, Some(password))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {
+                    response
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|body| body.get("offline").and_then(serde_json::Value::as_bool))
+                        == Some(false)
+                }
+                _ => false,
+            };
+            if online {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Err(Error::Container(
+            "the isolated Jenkins build Agent did not connect; inspect its Docker logs".to_string(),
+        ))
+    }
+
     async fn ensure_jenkins_job(&self, password: &str) -> Result<()> {
         let base = self.config.jenkins_url();
         let client = reqwest::Client::new();
@@ -891,22 +1062,35 @@ impl<'a> CollaborationStack<'a> {
             .send()
             .await
             .map_err(|error| Error::Container(format!("failed to inspect Jenkins job: {error}")))?;
-        if existing.status().is_success() {
-            return Ok(());
+        let exists = existing.status().is_success();
+        if !exists && existing.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::Container(format!(
+                "Jenkins rejected managed job inspection (HTTP {})",
+                existing.status()
+            )));
         }
-        let (crumb_field, crumb) = jenkins_crumb(&client, &base, password).await?;
-        let response = client
-            .post(format!("{base}/createItem?name={JENKINS_JOB}"))
+        let (crumb_field, crumb, session_cookie) = jenkins_crumb(&client, &base, password).await?;
+        let url = if exists {
+            format!("{base}/job/{JENKINS_JOB}/config.xml")
+        } else {
+            format!("{base}/createItem?name={JENKINS_JOB}")
+        };
+        let mut request = client
+            .post(url)
             .basic_auth(JENKINS_USER, Some(password))
             .header(crumb_field, crumb)
             .header(reqwest::header::CONTENT_TYPE, "application/xml")
-            .body(JENKINS_JOB_XML)
+            .body(JENKINS_JOB_XML);
+        if let Some(cookie) = session_cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| Error::Container(format!("failed to create Jenkins job: {error}")))?;
         if !response.status().is_success() {
             return Err(Error::Container(format!(
-                "Jenkins rejected the managed build job (HTTP {})",
+                "Jenkins rejected the managed build job configuration (HTTP {})",
                 response.status()
             )));
         }
@@ -963,6 +1147,16 @@ async fn sign_in(
             response.status()
         )));
     }
+    if response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|location| location.contains("/signin"))
+    {
+        return Err(Error::Container(
+            "GitBucket rejected a managed account during secure setup".to_string(),
+        ));
+    }
     let cookies = response
         .headers()
         .get_all(reqwest::header::SET_COOKIE)
@@ -991,23 +1185,32 @@ async fn jenkins_crumb(
     client: &reqwest::Client,
     base: &str,
     password: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Option<String>)> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Crumb {
         crumb_request_field: String,
         crumb: String,
     }
-    let crumb = client
+    let response = client
         .get(format!("{base}/crumbIssuer/api/json"))
         .basic_auth(JENKINS_USER, Some(password))
         .send()
         .await
-        .map_err(|error| Error::Container(format!("failed to request Jenkins crumb: {error}")))?
+        .map_err(|error| Error::Container(format!("failed to request Jenkins crumb: {error}")))?;
+    let cookies = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .collect::<Vec<_>>();
+    let session_cookie = (!cookies.is_empty()).then(|| cookies.join("; "));
+    let crumb = response
         .json::<Crumb>()
         .await
         .map_err(|error| Error::Container(format!("invalid Jenkins crumb response: {error}")))?;
-    Ok((crumb.crumb_request_field, crumb.crumb))
+    Ok((crumb.crumb_request_field, crumb.crumb, session_cookie))
 }
 
 fn port_or_container_error(name: &str, port: Option<u16>, error: bollard::errors::Error) -> Error {
@@ -1044,6 +1247,7 @@ const JENKINS_BOOTSTRAP_GROOVY: &str = r#"import jenkins.model.Jenkins
 import hudson.security.FullControlOnceLoggedInAuthorizationStrategy
 import hudson.security.HudsonPrivateSecurityRealm
 def instance = Jenkins.get()
+instance.setNumExecutors(0)
 def realm = new HudsonPrivateSecurityRealm(false)
 realm.createAccount('xpressclaw', System.getenv('XPRESSCLAW_JENKINS_PASSWORD'))
 instance.setSecurityRealm(realm)
@@ -1054,6 +1258,36 @@ instance.save()
 new File('/var/jenkins_home/init.groovy.d/xpressclaw.groovy').delete()
 "#;
 
+const JENKINS_AGENT_GROOVY: &str = r#"import jenkins.model.Jenkins
+import hudson.model.Node
+import hudson.slaves.DumbSlave
+import hudson.slaves.JNLPLauncher
+import hudson.slaves.RetentionStrategy
+def instance = Jenkins.get()
+instance.setNumExecutors(0)
+def existing = instance.getNode('xpressclaw-builder')
+if (existing != null) {
+  instance.removeNode(existing)
+}
+def agent = new DumbSlave('xpressclaw-builder', '/tmp/xpressclaw-jenkins-agent', new JNLPLauncher())
+agent.setNumExecutors(1)
+agent.setMode(Node.Mode.EXCLUSIVE)
+agent.setLabelString('xpressclaw-isolated')
+agent.setRetentionStrategy(new RetentionStrategy.Always())
+instance.addNode(agent)
+instance.save()
+print instance.getComputer('xpressclaw-builder').getJnlpMac()
+"#;
+
+const JENKINS_AGENT_COMMAND: &str = r#"set -eu
+work=/tmp/xpressclaw-jenkins-agent
+mkdir -p "$work"
+curl -fsS --connect-timeout 5 --max-time 60 http://jenkins:8080/jnlpJars/agent.jar -o "$work/agent.jar"
+agent_secret="$XPRESSCLAW_JENKINS_AGENT_SECRET"
+unset XPRESSCLAW_JENKINS_AGENT_SECRET
+exec java -jar "$work/agent.jar" -url http://jenkins:8080/ -secret "$agent_secret" -name xpressclaw-builder -webSocket -workDir "$work"
+"#;
+
 const GITBUCKET_BOOTSTRAP_SCRIPT: &str = r#"set -eu
 base=http://gitbucket:8080
 cookies=/tmp/gitbucket-cookies
@@ -1062,10 +1296,12 @@ request() {
 }
 signin() {
   rm -f "$cookies"
-  status="$(request -sS -o /dev/null -c "$cookies" \
+  headers=/tmp/gitbucket-signin-headers
+  status="$(request -sS -D "$headers" -o /dev/null -c "$cookies" \
     --data-urlencode "userName=$1" --data-urlencode "password=$2" \
     --data-urlencode "hash=" -w '%{http_code}' "$base/signin")"
   test "$status" = 302
+  ! grep -Eqi '^Location: .*\/signin([;?]|$)' "$headers"
 }
 if signin root root; then
   request -fsS -o /dev/null -b "$cookies" \
@@ -1076,10 +1312,16 @@ if signin root root; then
     --data-urlencode "url=" --data-urlencode "clearImage=false" "$base/root/_edit"
 fi
 signin root "$GITBUCKET_ROOT_PASSWORD"
-if test -n "${GITBUCKET_TOKEN:-}" && \
-   request -fsS -o /dev/null -H "Authorization: token $GITBUCKET_TOKEN" "$base/api/v3/user"; then
-  printf '<input value="%s" id="generated-token">' "$GITBUCKET_TOKEN"
-  exit 0
+if test -n "${GITBUCKET_TOKEN:-}"; then
+  attempt=0
+  while test "$attempt" -lt 30; do
+    if request -fsS -o /dev/null -H "Authorization: token $GITBUCKET_TOKEN" "$base/api/v3/user"; then
+      printf '<input value="%s" id="generated-token">' "$GITBUCKET_TOKEN"
+      exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
 fi
 create_status="$(request -sS -o /dev/null -b "$cookies" -w '%{http_code}' \
   -H 'Content-Type: application/json' \
@@ -1102,7 +1344,7 @@ const JENKINS_JOB_XML: &str = r#"<?xml version="1.1" encoding="UTF-8"?>
     <hudson.model.StringParameterDefinition><name>REPOSITORY_URL</name><defaultValue></defaultValue><trim>true</trim></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>GIT_REF</name><defaultValue>main</defaultValue><trim>true</trim></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
-  <scm class="hudson.scm.NullSCM"/><canRoam>true</canRoam><disabled>false</disabled>
+  <scm class="hudson.scm.NullSCM"/><assignedNode>xpressclaw-isolated</assignedNode><canRoam>false</canRoam><disabled>false</disabled>
   <blockBuildWhenDownstreamBuilding>false</blockBuildWhenDownstreamBuilding>
   <blockBuildWhenUpstreamBuilding>false</blockBuildWhenUpstreamBuilding>
   <triggers/><concurrentBuild>false</concurrentBuild>
@@ -1147,6 +1389,7 @@ mod tests {
         assert!(JENKINS_BOOTSTRAP_GROOVY.contains("System.getenv"));
         assert!(GITBUCKET_BOOTSTRAP_SCRIPT.contains("http://gitbucket:8080"));
         assert!(!GITBUCKET_BOOTSTRAP_SCRIPT.contains("127.0.0.1"));
+        assert!(GITBUCKET_BOOTSTRAP_SCRIPT.contains("Location: .*\\/signin"));
         assert!(
             GITBUCKET_BOOTSTRAP_SCRIPT
                 .find("signin root \"$GITBUCKET_ROOT_PASSWORD\"")
@@ -1157,6 +1400,12 @@ mod tests {
             "the generated administrator password must be verified before a saved token can short-circuit setup"
         );
         assert!(!JENKINS_JOB_XML.contains("docker.sock"));
+        assert!(JENKINS_BOOTSTRAP_GROOVY.contains("setNumExecutors(0)"));
+        assert!(JENKINS_AGENT_GROOVY.contains("Node.Mode.EXCLUSIVE"));
+        assert!(JENKINS_JOB_XML.contains("<assignedNode>xpressclaw-isolated</assignedNode>"));
+        assert!(JENKINS_JOB_XML.contains("<canRoam>false</canRoam>"));
+        assert!(JENKINS_AGENT_COMMAND.contains("-webSocket"));
+        assert!(!JENKINS_AGENT_COMMAND.contains("/var/jenkins_home"));
     }
 
     #[test]
@@ -1253,6 +1502,14 @@ mod tests {
             .host_config
             .and_then(|host| host.port_bindings)
             .is_some_and(|bindings| bindings.contains_key("8080/tcp")));
+        let jenkins_agent = docker
+            .inspect_by_name(&stack.container_names()[2])
+            .await
+            .unwrap();
+        assert!(jenkins_agent
+            .host_config
+            .and_then(|host| host.mounts)
+            .is_none_or(|mounts| mounts.is_empty()));
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -1280,7 +1537,7 @@ mod tests {
         std::fs::create_dir_all(checkout.path().join(".xpressclaw")).unwrap();
         std::fs::write(
             checkout.path().join(".xpressclaw/jenkins.sh"),
-            "#!/bin/sh\nset -eu\necho xpressclaw-local-build-ok\n",
+            "#!/bin/sh\nset -eu\necho xpressclaw-local-build-ok\necho node=$NODE_NAME\n",
         )
         .unwrap();
         git(checkout.path(), &["add", ".xpressclaw/jenkins.sh"]);
@@ -1414,11 +1671,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
         assert_eq!(completed.unwrap().state, "success");
-        assert!(builds
-            .logs(build.number, 100_000)
-            .await
-            .unwrap()
-            .contains("xpressclaw-local-build-ok"));
+        let logs = builds.logs(build.number, 100_000).await.unwrap();
+        assert!(logs.contains("xpressclaw-local-build-ok"));
+        assert!(logs.contains("node=xpressclaw-builder"));
         stack.reset().await.unwrap();
         for container in stack.container_names() {
             assert!(docker.inspect_by_name(&container).await.is_none());
