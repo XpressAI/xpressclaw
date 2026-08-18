@@ -42,7 +42,15 @@ async fn require_internal_token(
         .headers()
         .get("x-xpressclaw-internal-token")
         .and_then(|value| value.to_str().ok());
-    if supplied != Some(token.as_ref()) {
+    // Git's smart-HTTP client cannot attach the callback header. This one
+    // narrow route authenticates independently with a per-Agent revocable
+    // Basic capability before proxying to GitBucket; every other callback
+    // route still requires the process-scoped internal token.
+    let collaboration_git_proxy = request
+        .uri()
+        .path()
+        .starts_with("/api/settings/collaboration/agent/git/");
+    if supplied != Some(token.as_ref()) && !collaboration_git_proxy {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
@@ -309,8 +317,13 @@ mod tests {
     use super::*;
 
     fn state() -> AppState {
+        let mut config = Config::default();
+        config.system.data_dir = std::env::temp_dir().join(format!(
+            "xpressclaw-empty-callback-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         AppState::new(
-            Arc::new(Config::default()),
+            Arc::new(config),
             Arc::new(Database::open_memory().unwrap()),
             None,
             "test.yaml".into(),
@@ -329,6 +342,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let independently_authenticated_git_proxy = app
+            .clone()
+            .oneshot(
+                Request::get(
+                    "/api/settings/collaboration/agent/git/xpressclaw-agent/demo/info/refs?service=git-receive-pack",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            independently_authenticated_git_proxy.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
 
         let authorized = app
             .oneshot(

@@ -1,7 +1,15 @@
-use axum::extract::{Path, State};
+use axum::body::Body;
+use axum::extract::{Path, Request, State};
+use axum::http::header::{
+    ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPIRES,
+    PRAGMA, WWW_AUTHENTICATE,
+};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bollard::container::{LogOutput, LogsOptions};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -32,6 +40,10 @@ pub fn routes() -> Router<AppState> {
         .route("/upgrade", post(upgrade))
         .route("/reset", post(reset))
         .route("/logs/{service}", get(logs))
+        .route(
+            "/agent/git/{owner}/{repository}/{*path}",
+            get(agent_git_proxy).post(agent_git_proxy),
+        )
         .route("/agent/{tool}", post(agent_tool))
 }
 
@@ -389,7 +401,7 @@ async fn agent_tool(
     let secrets = CollaborationSecrets::load(&config.system.data_dir)
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::unavailable("Local collaboration is not installed"))?;
-    let _agent = authorize_agent(&headers, &config.collaboration, &secrets).ok_or_else(|| {
+    let agent = authorize_agent(&headers, &config.collaboration, &secrets).ok_or_else(|| {
         ApiError::forbidden("this Agent does not have Local collaboration access")
     })?;
     let forge_token = secrets
@@ -418,9 +430,11 @@ async fn agent_tool(
             "owner": CollaborationStack::service_user(),
         }),
         "git-transport" => json!({
-            "base_url": GITBUCKET_INTERNAL_URL,
-            "username": CollaborationStack::service_user(),
-            "token": forge_token,
+            "base_path": format!(
+                "/api/settings/collaboration/agent/git/{}",
+                CollaborationStack::service_user()
+            ),
+            "username": agent,
         }),
         "get-repository" => serde_json::to_value(
             forge
@@ -553,6 +567,116 @@ async fn agent_tool(
     Ok(Json(value))
 }
 
+/// Streams the narrow Git smart-HTTP surface through the control plane.
+///
+/// Agents authenticate with their revocable, identity-bound collaboration
+/// capability. The long-lived GitBucket service token is added only to the
+/// server-side upstream request and never enters an Agent container.
+async fn agent_git_proxy(
+    State(state): State<AppState>,
+    Path((owner, repository, path)): Path<(String, String, String)>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    let config = state.config();
+    let secrets = CollaborationSecrets::load(&config.system.data_dir)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::unavailable("Local collaboration is not installed"))?;
+    authorize_git_agent(request.headers(), &config.collaboration, &secrets).ok_or_else(|| {
+        ApiError::unauthorized("this Agent does not have Local collaboration access")
+    })?;
+
+    let owner = validate_git_name(&owner, "owner")?;
+    if owner != CollaborationStack::service_user() {
+        return Err(ApiError::forbidden(
+            "managed Git transport is restricted to the local service account",
+        ));
+    }
+    let repository = validate_git_name(&repository, "repository")?;
+    let (parts, body) = request.into_parts();
+    let query = parts.uri.query();
+    let has_body = parts.method == axum::http::Method::POST;
+    let valid_operation = matches!(
+        (parts.method.as_str(), path.as_str(), query),
+        (
+            "GET",
+            "info/refs",
+            Some("service=git-receive-pack" | "service=git-upload-pack")
+        ) | ("POST", "git-receive-pack", None)
+    );
+    if !valid_operation {
+        return Err(ApiError::bad_request(
+            "managed Git transport supports only ref discovery and branch pushes",
+        ));
+    }
+
+    let forge_token = secrets
+        .gitbucket_service_token
+        .as_deref()
+        .ok_or_else(|| ApiError::unavailable("GitBucket setup is incomplete"))?;
+    let mut upstream_url = format!(
+        "{}/{owner}/{repository}.git/{path}",
+        config.collaboration.gitbucket_url()
+    );
+    if let Some(query) = query {
+        upstream_url.push('?');
+        upstream_url.push_str(query);
+    }
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(ApiError::internal)?;
+    let mut upstream = client
+        .request(parts.method, upstream_url)
+        .basic_auth(CollaborationStack::service_user(), Some(forge_token));
+    for name in [ACCEPT, CONTENT_TYPE, CONTENT_ENCODING, CONTENT_LENGTH] {
+        if let Some(value) = parts.headers.get(&name) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    if let Some(value) = parts.headers.get("git-protocol") {
+        upstream = upstream.header("git-protocol", value);
+    }
+    if has_body {
+        upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    }
+    let upstream = upstream.send().await.map_err(ApiError::tool)?;
+
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let mut response = Response::builder().status(status);
+    for name in [
+        CONTENT_TYPE,
+        CONTENT_ENCODING,
+        CONTENT_LENGTH,
+        CACHE_CONTROL,
+        EXPIRES,
+        PRAGMA,
+    ] {
+        if let Some(value) = headers.get(&name) {
+            response = response.header(name, value);
+        }
+    }
+    response
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .map_err(ApiError::internal)
+}
+
+fn authorize_git_agent(
+    headers: &HeaderMap,
+    config: &CollaborationConfig,
+    secrets: &CollaborationSecrets,
+) -> Option<String> {
+    let encoded = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())?
+        .strip_prefix("Basic ")?;
+    let credentials = STANDARD.decode(encoded).ok()?;
+    let credentials = std::str::from_utf8(&credentials).ok()?;
+    let (agent, token) = credentials.split_once(':')?;
+    (config.agent_authorized(agent) && secrets.capability_token_matches_agent(agent, token))
+        .then(|| agent.to_string())
+}
+
 fn authorize_agent<'a>(
     headers: &'a HeaderMap,
     config: &CollaborationConfig,
@@ -579,6 +703,10 @@ fn required<'a>(value: &'a Value, field: &str) -> Result<&'a str, ApiError> {
 
 fn git_name<'a>(value: &'a Value, field: &str) -> Result<&'a str, ApiError> {
     let name = required(value, field)?;
+    validate_git_name(name, field)
+}
+
+fn validate_git_name<'a>(name: &'a str, field: &str) -> Result<&'a str, ApiError> {
     if name.len() > 100
         || !name
             .chars()
@@ -615,6 +743,13 @@ impl ApiError {
         )
     }
 
+    fn unauthorized(message: impl std::fmt::Display) -> Self {
+        Self(
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": message.to_string() })),
+        )
+    }
+
     fn unavailable(message: impl std::fmt::Display) -> Self {
         Self(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -639,7 +774,15 @@ impl ApiError {
 
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.0, self.1).into_response()
+        let status = self.0;
+        let mut response = (status, self.1).into_response();
+        if status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                WWW_AUTHENTICATE,
+                "Basic realm=\"XpressClaw local forge\"".parse().unwrap(),
+            );
+        }
+        response
     }
 }
 
@@ -648,9 +791,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::Request;
     use axum::Router;
+    use http_body_util::BodyExt;
     use tower::ServiceExt;
     use xpressclaw_core::config::{AgentConfig, Config};
     use xpressclaw_core::db::Database;
@@ -866,6 +1010,140 @@ mod tests {
                 .unwrap(),
         );
         assert!(authorize_agent(&headers, &revoked, &secrets).is_none());
+    }
+
+    #[tokio::test]
+    async fn git_transport_keeps_the_shared_forge_token_server_side() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = directory.path().join("data");
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let mut secrets = CollaborationSecrets::generate();
+        secrets.gitbucket_service_token = Some("shared-forge-token".to_string());
+        secrets.save(&config.system.data_dir).unwrap();
+        let capability = secrets.capability_token_for_agent("allowed");
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            directory.path().join("xpressclaw.yaml"),
+            true,
+        );
+        let app = Router::new()
+            .nest("/settings/collaboration", routes())
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::post("/settings/collaboration/agent/git-transport")
+                    .header("content-type", "application/json")
+                    .header(AGENT_HEADER, "allowed")
+                    .header(CAPABILITY_HEADER, capability)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!raw.contains("shared-forge-token"));
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        assert!(payload.get("token").is_none());
+        assert_eq!(payload["username"], "allowed");
+        assert_eq!(
+            payload["base_path"],
+            "/api/settings/collaboration/agent/git/xpressclaw-agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_proxy_streams_with_server_credentials_and_rechecks_revocation() {
+        let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream = Router::new().route(
+            "/xpressclaw-agent/demo.git/git-receive-pack",
+            post({
+                let forwarded = forwarded.clone();
+                move |headers: HeaderMap, body: Bytes| {
+                    let forwarded = forwarded.clone();
+                    async move {
+                        forwarded.lock().unwrap().push((
+                            headers
+                                .get(AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                            body.to_vec(),
+                        ));
+                        (
+                            [(CONTENT_TYPE, "application/x-git-receive-pack-result")],
+                            "proxy-result",
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = directory.path().join("data");
+        config.collaboration.enabled = true;
+        config.collaboration.gitbucket_port = port;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let mut secrets = CollaborationSecrets::generate();
+        secrets.gitbucket_service_token = Some("shared-forge-token".to_string());
+        secrets.save(&config.system.data_dir).unwrap();
+        let capability = secrets.capability_token_for_agent("allowed");
+        let basic = STANDARD.encode(format!("allowed:{capability}"));
+        let state = AppState::new(
+            Arc::new(config.clone()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            directory.path().join("xpressclaw.yaml"),
+            true,
+        );
+        let app = Router::new()
+            .nest("/settings/collaboration", routes())
+            .with_state(state.clone());
+        let request = || {
+            Request::post(
+                "/settings/collaboration/agent/git/xpressclaw-agent/demo/git-receive-pack",
+            )
+            .header(AUTHORIZATION, format!("Basic {basic}"))
+            .header(CONTENT_TYPE, "application/x-git-receive-pack-request")
+            .body(Body::from("pack-data"))
+            .unwrap()
+        };
+
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/x-git-receive-pack-result"
+        );
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "proxy-result"
+        );
+        let expected_upstream = STANDARD.encode("xpressclaw-agent:shared-forge-token");
+        assert_eq!(
+            forwarded.lock().unwrap().as_slice(),
+            &[(format!("Basic {expected_upstream}"), b"pack-data".to_vec())]
+        );
+
+        config.collaboration.authorized_agents.clear();
+        state.apply_config(Arc::new(config), None);
+        let response = app.oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key(WWW_AUTHENTICATE));
+        assert_eq!(forwarded.lock().unwrap().len(), 1);
+        upstream_task.abort();
     }
 
     #[test]

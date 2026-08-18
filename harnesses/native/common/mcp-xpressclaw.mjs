@@ -361,7 +361,7 @@ export const TOOLS = [
     },
     {
       name: 'local_forge_push_branch',
-      description: 'Push one local workspace branch to a repository owned by the managed GitBucket service account. Credentials are passed to git through a temporary askpass helper and are not returned.',
+      description: 'Push one local workspace branch to a repository owned by the managed GitBucket service account. A revocable Agent capability is passed to git through a temporary askpass helper; the forge bearer token stays server-side.',
       inputSchema: { type: 'object', properties: {
         repository: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' },
         branch: { type: 'string', minLength: 1, maxLength: 200 },
@@ -931,13 +931,13 @@ async function pushLocalForgeBranch(argumentsValue) {
     throw new Error('Git repository must be inside the assigned workspace');
   }
   const transport = await collaborationApi('git-transport');
-  const remote = `${transport.base_url}/${transport.username}/${repository}.git`;
+  const remote = `${BASE_URL}${transport.base_path}/${repository}`;
   const output = await runManagedGitPush({
     directory,
     remote,
     branch,
     username: transport.username,
-    token: transport.token,
+    token: COLLABORATION_TOKEN,
     forceWithLease: argumentsValue?.force_with_lease === true,
   });
   return {
@@ -976,7 +976,7 @@ export async function runManagedGitPush({
   );
   try {
     // Put only the requested local branch into a clean temporary bare
-    // repository before adding the short-lived credential. Credential-bearing
+    // repository before adding the revocable Agent capability. Authenticated
     // Git commands consequently cannot read hooks, helpers, URL rewrites, or
     // other transport configuration from the untrusted assigned checkout.
     const gitConfig = [

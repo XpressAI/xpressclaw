@@ -39,11 +39,13 @@ password is replaced during setup before a non-admin service account is made.
 Jenkins is bootstrapped without the unlock-secret flow; its bootstrap password
 environment is removed by recreating the container after persistence.
 
-An authorized Agent can push through a temporary askpass helper using the
-non-admin GitBucket account. Credentials are never tool output. Jenkins receives
-no privileged mode, Docker-in-Docker, or host Docker socket. Its no-plugin job
-accepts only a managed GitBucket URL and ref and runs .xpressclaw/jenkins.sh
-from a public repository.
+An authorized Agent can push through a temporary askpass helper into a
+streaming control-plane Git proxy. The proxy rechecks the Agent's current
+assignment on every request and adds the non-admin GitBucket bearer token only
+to the server-side upstream request. Shared forge credentials never enter the
+Agent container. Jenkins receives no privileged mode, Docker-in-Docker, or host
+Docker socket. Its no-plugin job accepts only a managed GitBucket URL and ref
+and runs .xpressclaw/jenkins.sh from a public repository.
 
 ## Consequences
 

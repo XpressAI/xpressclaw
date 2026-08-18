@@ -90,9 +90,12 @@ builds are outside this slice; use ordinary compiler/test jobs or separately
 managed Jenkins build Agents. XpressClaw does not install GitBucket's
 experimental CI plugin.
 
-Authorized Agents use a non-admin GitBucket account. Administrator and Jenkins
-credentials stay server-side. The collaboration capability is separate from the
-general callback token and appears only in assigned runners.
+Authorized Agents use a non-admin GitBucket account through a streaming,
+revocation-enforcing Git proxy. The shared forge bearer token, administrator
+credential, and Jenkins credential stay server-side. Each assigned runner gets
+an identity-bound collaboration capability; removing the assignment blocks the
+next API or Git request even if its retained container is still on the network.
+The capability is separate from the general callback token.
 
 ## Git mirroring is not failover
 
