@@ -269,34 +269,44 @@ impl<'a> CollaborationStack<'a> {
             self.container_names()[0].clone(),
             format!("{prefix}-gitbucket-bootstrap"),
         ] {
-            let _ = self
-                .docker
-                .client()
-                .remove_container(
-                    &name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            self.remove_owned_container_after_failed_setup(&name).await;
         }
     }
 
     async fn remove_jenkins_after_failed_setup(&self) {
         for name in &self.container_names()[1..] {
-            let _ = self
-                .docker
-                .client()
-                .remove_container(
-                    name,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
+            self.remove_owned_container_after_failed_setup(name).await;
         }
+    }
+
+    /// Best-effort failure cleanup must never turn a name collision into a
+    /// destructive operation. Inspect ownership first and remove by immutable
+    /// container ID so an external name replacement cannot redirect cleanup.
+    async fn remove_owned_container_after_failed_setup(&self, name: &str) {
+        let Some(existing) = self.docker.inspect_by_name(name).await else {
+            return;
+        };
+        let labels = existing
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref());
+        if !resource_owned(labels, self.installation_id) {
+            return;
+        }
+        let Some(id) = existing.id.as_deref() else {
+            return;
+        };
+        let _ = self
+            .docker
+            .client()
+            .remove_container(
+                id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
     }
 
     async fn jenkins_auth_valid(&self, password: &str) -> bool {
@@ -1445,6 +1455,66 @@ mod tests {
         assert!(port_or_container_error("gitbucket", Some(8088), error)
             .to_string()
             .contains("host port 8088 is already in use"));
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in Docker integration test; pulls GitBucket and Jenkins images"]
+    async fn docker_failure_cleanup_preserves_an_unowned_name_collision() {
+        let opt_in = std::env::var("XPRESSCLAW_DOCKER_INTEGRATION").ok();
+        if !docker_integration_opted_in(opt_in.as_deref()) {
+            eprintln!(
+                "skipping Docker collaboration integration test; set XPRESSCLAW_DOCKER_INTEGRATION=1 to run it"
+            );
+            return;
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let installation = uuid::Uuid::new_v4().to_string();
+        let docker = DockerManager::connect_for_installation(&installation)
+            .await
+            .unwrap();
+        let config = CollaborationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let stack = CollaborationStack::new(&docker, &config, data.path(), &installation);
+        docker.pull_image(&config.gitbucket_image).await.unwrap();
+        let collision = stack.container_names()[0].clone();
+        docker
+            .client()
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: collision.clone(),
+                    platform: None,
+                }),
+                ContainerConfig {
+                    image: Some(config.gitbucket_image.clone()),
+                    labels: Some(HashMap::from([(
+                        INSTALLATION_LABEL.to_string(),
+                        "another-installation".to_string(),
+                    )])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let collision_error = stack.install().await.unwrap_err().to_string();
+        assert!(collision_error.contains("belongs to another installation"));
+        assert!(docker.inspect_by_name(&collision).await.is_some());
+
+        docker
+            .client()
+            .remove_container(
+                &collision,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        stack.reset().await.unwrap();
     }
 
     #[tokio::test]

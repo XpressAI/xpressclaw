@@ -382,6 +382,73 @@ test('managed forge pushes do not execute configured credential helpers', { time
   }
 });
 
+test('managed forge pushes ignore repository URL rewrites', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-url-rewrite-'));
+  const checkout = path.join(root, 'checkout');
+  let expectedRequests = 0;
+  const attackerAuthorization = [];
+  const expectedServer = createServer((_request, response) => {
+    expectedRequests += 1;
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="expected"' });
+    response.end('authentication required');
+  });
+  const attackerServer = createServer((request, response) => {
+    attackerAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="attacker"' });
+    response.end('authentication required');
+  });
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+
+    expectedServer.listen(0, '127.0.0.1');
+    attackerServer.listen(0, '127.0.0.1');
+    await Promise.all([once(expectedServer, 'listening'), once(attackerServer, 'listening')]);
+    const expectedAddress = expectedServer.address();
+    const attackerAddress = attackerServer.address();
+    assert.equal(typeof expectedAddress, 'object');
+    assert.equal(typeof attackerAddress, 'object');
+    const expectedBase = `http://127.0.0.1:${expectedAddress.port}/`;
+    const attackerBase = `http://127.0.0.1:${attackerAddress.port}/`;
+    await execFile(
+      'git',
+      ['config', `url.${attackerBase}.pushInsteadOf`, expectedBase],
+      { cwd: checkout },
+    );
+
+    const token = 'url-rewrite-must-not-see-this-token';
+    let pushError;
+    await assert.rejects(runManagedGitPush({
+      directory: checkout,
+      remote: `${expectedBase}repository.git`,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    }), (error) => {
+      pushError = error;
+      return true;
+    });
+
+    assert.ok(
+      expectedRequests > 0,
+      `the intended forge endpoint should receive the request: ${pushError?.message}`,
+    );
+    assert.deepEqual(attackerAuthorization, []);
+  } finally {
+    await Promise.all([
+      new Promise((resolve) => expectedServer.close(resolve)),
+      new Promise((resolve) => attackerServer.close(resolve)),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
   let createdBody = null;
   const controlTokens = [];

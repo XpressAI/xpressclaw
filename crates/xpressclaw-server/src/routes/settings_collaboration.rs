@@ -54,6 +54,12 @@ async fn put_settings(
     collaboration.validate().map_err(ApiError::bad_request)?;
     collaboration.authorized_agents.sort();
     collaboration.authorized_agents.dedup();
+
+    // Read and validate the Agent set only after joining the same protected
+    // config-write critical section used by Agent deletion. Otherwise a PUT
+    // can validate a stale Agent, wait for deletion, and write the assignment
+    // back after that Agent no longer exists.
+    let _guard = state.config_write_lock.lock().await;
     let current_config = state.config();
     let known_agents = current_config
         .agents
@@ -70,8 +76,7 @@ async fn put_settings(
         )));
     }
 
-    let _guard = state.config_write_lock.lock().await;
-    let mut config = (*state.config()).clone();
+    let mut config = (*current_config).clone();
     config.collaboration = collaboration;
     config
         .save(&state.config_path)
@@ -617,6 +622,16 @@ impl axum::response::IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::Router;
+    use tower::ServiceExt;
+    use xpressclaw_core::config::{AgentConfig, Config};
+    use xpressclaw_core::db::Database;
+
     use super::*;
 
     #[test]
@@ -649,6 +664,72 @@ mod tests {
         revoke_collaboration_access(&mut config);
         assert!(!config.collaboration.enabled);
         assert!(config.collaboration.authorized_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assignment_validation_uses_the_locked_agent_snapshot() {
+        let config_path = std::env::temp_dir().join(format!(
+            "test-xpressclaw-collaboration-race-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut config = Config::default();
+        config.agents.push(AgentConfig {
+            name: "deleted-agent".to_string(),
+            backend: "generic".to_string(),
+            ..Default::default()
+        });
+        config.save(&config_path).unwrap();
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            config_path.clone(),
+            true,
+        );
+        let app = Router::new()
+            .nest("/settings/collaboration", routes())
+            .with_state(state.clone());
+        let submitted = CollaborationConfig {
+            authorized_agents: vec!["deleted-agent".to_string()],
+            ..Default::default()
+        };
+
+        // Hold the shared writer lock so this request is queued at the same
+        // boundary as a concurrent Agent deletion. The protected mutation
+        // below then wins the lock and removes the Agent before PUT validates.
+        let guard = state.config_write_lock.lock().await;
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/settings/collaboration")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&submitted).unwrap()))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut after_deletion = (*state.config()).clone();
+        after_deletion
+            .agents
+            .retain(|agent| agent.name != "deleted-agent");
+        after_deletion.collaboration.authorized_agents.clear();
+        after_deletion.save(&config_path).unwrap();
+        state.apply_config(Arc::new(after_deletion), None);
+        drop(guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let saved = Config::load(&config_path).unwrap();
+        assert!(!saved
+            .collaboration
+            .authorized_agents
+            .contains(&"deleted-agent".to_string()));
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]

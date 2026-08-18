@@ -965,6 +965,7 @@ export async function runManagedGitPush({
   const askpass = path.join(credentialDirectory, 'git-askpass.sh');
   const globalConfig = path.join(credentialDirectory, 'global-gitconfig');
   const emptyHooks = path.join(credentialDirectory, 'empty-hooks');
+  const transportRepository = path.join(credentialDirectory, 'transport.git');
   const hooksPath = emptyHooks.split(path.sep).join('/');
   await mkdir(emptyHooks, { recursive: true, mode: 0o700 });
   await writeFile(globalConfig, '', { mode: 0o600 });
@@ -974,46 +975,69 @@ export async function runManagedGitPush({
     { mode: 0o700 },
   );
   try {
-    // Isolate both executable Git extension points that could inherit the
-    // short-lived transport credential. The empty credential.helper value
-    // resets any helpers accumulated from repository configuration.
+    // Put only the requested local branch into a clean temporary bare
+    // repository before adding the short-lived credential. Credential-bearing
+    // Git commands consequently cannot read hooks, helpers, URL rewrites, or
+    // other transport configuration from the untrusted assigned checkout.
     const gitConfig = [
       '-c', `core.hooksPath=${hooksPath}`,
       '-c', 'credential.helper=',
     ];
-    const gitEnvironment = Object.fromEntries(
-      Object.entries(process.env).filter(([key]) => (
-        key !== 'GIT_CONFIG_PARAMETERS'
-        && key !== 'GIT_CONFIG_COUNT'
-        && !/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(key)
-      )),
-    );
-    Object.assign(gitEnvironment, {
-      GIT_ASKPASS: askpass,
+    const inheritedEnvironment = {};
+    for (const key of [
+      'PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR',
+      'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+      'SSL_CERT_FILE', 'SSL_CERT_DIR',
+      'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+      'http_proxy', 'https_proxy', 'no_proxy',
+    ]) {
+      if (process.env[key] !== undefined) inheritedEnvironment[key] = process.env[key];
+    }
+    const isolatedGitEnvironment = {
+      ...inheritedEnvironment,
       GIT_TERMINAL_PROMPT: '0',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: globalConfig,
+    };
+    await execFile('git', ['init', '--bare', transportRepository], {
+      cwd: credentialDirectory,
+      env: isolatedGitEnvironment,
+      maxBuffer: 1024 * 1024,
+    });
+    await execFile(
+      'git',
+      [
+        '--git-dir', transportRepository,
+        'fetch', '--no-tags', '--no-write-fetch-head',
+        directory, `refs/heads/${branch}:refs/heads/${branch}`,
+      ],
+      { cwd: credentialDirectory, env: isolatedGitEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    const gitEnvironment = {
+      ...isolatedGitEnvironment,
+      GIT_ASKPASS: askpass,
       XPRESSCLAW_GIT_USERNAME: username,
       XPRESSCLAW_GIT_TOKEN: token,
-    });
+    };
+    const repositoryArgs = ['--git-dir', transportRepository];
 
     let lease = null;
     if (forceWithLease) {
       const remoteRef = `refs/heads/${branch}`;
       const { stdout } = await execFile(
         'git',
-        [...gitConfig, 'ls-remote', '--refs', remote, remoteRef],
-        { cwd: directory, env: gitEnvironment, maxBuffer: 1024 * 1024 },
+        [...repositoryArgs, ...gitConfig, 'ls-remote', '--refs', remote, remoteRef],
+        { cwd: credentialDirectory, env: gitEnvironment, maxBuffer: 1024 * 1024 },
       );
       const match = stdout.trim().match(/^([0-9a-fA-F]{40,64})\s+refs\/heads\//);
       lease = `--force-with-lease=${remoteRef}:${match?.[1] ?? ''}`;
     }
 
-    const args = [...gitConfig, 'push'];
+    const args = [...repositoryArgs, ...gitConfig, 'push'];
     if (lease) args.push(lease);
     args.push(remote, `${branch}:${branch}`);
     const { stdout, stderr } = await execFile('git', args, {
-      cwd: directory,
+      cwd: credentialDirectory,
       env: gitEnvironment,
       maxBuffer: 1024 * 1024,
     });
