@@ -163,7 +163,7 @@ jobs:
       # Windows
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        run: powershell -File build.ps1 --skip-test --skip-docker --skip-check --target=${{ matrix.target }}
+        run: powershell -File build.ps1 --skip-docker --skip-check --target=${{ matrix.target }}
 
       # Linux
       - name: Build (Linux)
