@@ -324,6 +324,22 @@ impl DockerManager {
         self.socket_path.as_deref()
     }
 
+    /// Whether a named Docker network exists and belongs to this control-plane
+    /// installation. Optional features must verify this before selecting a
+    /// network because Docker rejects container creation for a missing network
+    /// and a same-named network owned by another installation is not trusted.
+    pub async fn installation_network_present(&self, name: &str) -> bool {
+        let Ok(installation_id) = self.installation_id() else {
+            return false;
+        };
+        self.docker
+            .inspect_network::<String>(name, None)
+            .await
+            .ok()
+            .and_then(|network| network.labels)
+            .is_some_and(|labels| installation_labels_match(&labels, installation_id))
+    }
+
     /// Docker-compatible runtime selected by automatic detection.
     pub fn runtime(&self) -> &'static str {
         self.runtime
@@ -1564,6 +1580,10 @@ fn project_ownership_matches(
         && labels.get(AGENT_ID_LABEL).map(String::as_str) == Some(agent_id)
 }
 
+fn installation_labels_match(labels: &HashMap<String, String>, installation_id: &str) -> bool {
+    labels.get(INSTALLATION_LABEL).map(String::as_str) == Some(installation_id)
+}
+
 fn project_labels_match(
     labels: &HashMap<String, String>,
     fingerprint: &str,
@@ -1818,6 +1838,18 @@ mod tests {
             "expected",
             "installation-a",
             "agent-a"
+        ));
+    }
+
+    #[test]
+    fn installation_network_labels_must_match_the_current_control_plane() {
+        let labels =
+            HashMap::from([(INSTALLATION_LABEL.to_string(), "installation-a".to_string())]);
+        assert!(installation_labels_match(&labels, "installation-a"));
+        assert!(!installation_labels_match(&labels, "installation-b"));
+        assert!(!installation_labels_match(
+            &HashMap::new(),
+            "installation-a"
         ));
     }
 

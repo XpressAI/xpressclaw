@@ -382,7 +382,7 @@ test('managed forge pushes do not execute configured credential helpers', { time
   }
 });
 
-test('managed forge pushes ignore repository URL rewrites', { timeout: 10000 }, async () => {
+test('managed forge pushes ignore repository URL rewrites and inherited proxies', { timeout: 10000 }, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-url-rewrite-'));
   const checkout = path.join(root, 'checkout');
   let expectedRequests = 0;
@@ -397,6 +397,16 @@ test('managed forge pushes ignore repository URL rewrites', { timeout: 10000 }, 
     response.writeHead(401, { 'www-authenticate': 'Basic realm="attacker"' });
     response.end('authentication required');
   });
+  const proxyAuthorization = [];
+  const proxyServer = createServer((request, response) => {
+    proxyAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="proxy"' });
+    response.end('authentication required');
+  });
+  const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
+  const previousProxyEnvironment = Object.fromEntries(
+    proxyKeys.map((key) => [key, process.env[key]]),
+  );
 
   try {
     await mkdir(checkout);
@@ -409,18 +419,34 @@ test('managed forge pushes ignore repository URL rewrites', { timeout: 10000 }, 
 
     expectedServer.listen(0, '127.0.0.1');
     attackerServer.listen(0, '127.0.0.1');
-    await Promise.all([once(expectedServer, 'listening'), once(attackerServer, 'listening')]);
+    proxyServer.listen(0, '127.0.0.1');
+    await Promise.all([
+      once(expectedServer, 'listening'),
+      once(attackerServer, 'listening'),
+      once(proxyServer, 'listening'),
+    ]);
     const expectedAddress = expectedServer.address();
     const attackerAddress = attackerServer.address();
+    const proxyAddress = proxyServer.address();
     assert.equal(typeof expectedAddress, 'object');
     assert.equal(typeof attackerAddress, 'object');
+    assert.equal(typeof proxyAddress, 'object');
     const expectedBase = `http://127.0.0.1:${expectedAddress.port}/`;
     const attackerBase = `http://127.0.0.1:${attackerAddress.port}/`;
+    const proxyBase = `http://127.0.0.1:${proxyAddress.port}`;
     await execFile(
       'git',
       ['config', `url.${attackerBase}.pushInsteadOf`, expectedBase],
       { cwd: checkout },
     );
+    Object.assign(process.env, {
+      HTTP_PROXY: proxyBase,
+      HTTPS_PROXY: proxyBase,
+      NO_PROXY: '',
+      http_proxy: proxyBase,
+      https_proxy: proxyBase,
+      no_proxy: '',
+    });
 
     const token = 'url-rewrite-must-not-see-this-token';
     let pushError;
@@ -440,10 +466,16 @@ test('managed forge pushes ignore repository URL rewrites', { timeout: 10000 }, 
       `the intended forge endpoint should receive the request: ${pushError?.message}`,
     );
     assert.deepEqual(attackerAuthorization, []);
+    assert.deepEqual(proxyAuthorization, []);
   } finally {
+    for (const [key, value] of Object.entries(previousProxyEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     await Promise.all([
       new Promise((resolve) => expectedServer.close(resolve)),
       new Promise((resolve) => attackerServer.close(resolve)),
+      new Promise((resolve) => proxyServer.close(resolve)),
     ]);
     await rm(root, { recursive: true, force: true });
   }

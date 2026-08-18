@@ -606,7 +606,8 @@ async fn execute_conversation_turn(
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
-    let collaboration_token = configure_local_collaboration_access(&db, &config, agent, &mut spec)?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -915,7 +916,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
-    let collaboration_token = configure_local_collaboration_access(&db, &config, agent, &mut spec)?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -2080,15 +2082,41 @@ fn xpressclaw_control_mcp_server_for_context(
     )
 }
 
-fn configure_local_collaboration_access(
+async fn configure_local_collaboration_access(
     db: &Arc<Database>,
     config: &Config,
     agent: &AgentConfig,
     spec: &mut ContainerSpec,
+    docker: &DockerManager,
 ) -> Result<Option<String>> {
     if !config.collaboration.agent_authorized(&agent.name) {
         return Ok(None);
     }
+    let installation_id = db.installation_id()?;
+    let network = collaboration_network_name(&installation_id);
+    let network = docker
+        .installation_network_present(&network)
+        .await
+        .then_some(network);
+    configure_local_collaboration_access_for_network(config, agent, spec, network.as_deref())
+}
+
+fn configure_local_collaboration_access_for_network(
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    network: Option<&str>,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let Some(network) = network else {
+        warn!(
+            agent = %agent.name,
+            "local collaboration network is unavailable or not owned by this installation; continuing without collaboration tools"
+        );
+        return Ok(None);
+    };
     let secrets = match CollaborationSecrets::load(&config.system.data_dir) {
         Ok(Some(secrets)) => secrets,
         Ok(None) => {
@@ -2107,8 +2135,7 @@ fn configure_local_collaboration_access(
             return Ok(None);
         }
     };
-    let installation_id = db.installation_id()?;
-    spec.network_mode = Some(collaboration_network_name(&installation_id));
+    spec.network_mode = Some(network.to_string());
     Ok(Some(secrets.agent_capability_token))
 }
 
@@ -4384,17 +4411,39 @@ mod tests {
             name: "allowed".to_string(),
             ..Default::default()
         };
+        let expected_network = collaboration_network_name(&db.installation_id().unwrap());
         let mut allowed_spec = ContainerSpec::default();
-        let token = configure_local_collaboration_access(&db, &config, &allowed, &mut allowed_spec)
-            .unwrap();
+        let token = configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut allowed_spec,
+            Some(&expected_network),
+        )
+        .unwrap();
         assert_eq!(
             token.as_deref(),
             Some(expected_token.agent_capability_token.as_str())
         );
-        let expected_network = collaboration_network_name(&db.installation_id().unwrap());
         assert_eq!(
             allowed_spec.network_mode.as_deref(),
             Some(expected_network.as_str())
+        );
+
+        let mut missing_network_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut missing_network_spec,
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            missing_network_spec.network_mode.as_deref(),
+            Some("ordinary-network")
         );
 
         let unassigned = AgentConfig {
@@ -4405,11 +4454,11 @@ mod tests {
             network_mode: Some("existing-network".to_string()),
             ..Default::default()
         };
-        assert!(configure_local_collaboration_access(
-            &db,
+        assert!(configure_local_collaboration_access_for_network(
             &config,
             &unassigned,
             &mut unassigned_spec,
+            Some(&expected_network),
         )
         .unwrap()
         .is_none());
@@ -4423,11 +4472,11 @@ mod tests {
             network_mode: Some("ordinary-network".to_string()),
             ..Default::default()
         };
-        assert!(configure_local_collaboration_access(
-            &db,
+        assert!(configure_local_collaboration_access_for_network(
             &config,
             &allowed,
             &mut ordinary_turn_spec,
+            Some(&expected_network),
         )
         .unwrap()
         .is_none());
@@ -4444,11 +4493,11 @@ mod tests {
         .unwrap();
         let mut malformed_credentials_spec = ContainerSpec::default();
         let original_network = malformed_credentials_spec.network_mode.clone();
-        assert!(configure_local_collaboration_access(
-            &db,
+        assert!(configure_local_collaboration_access_for_network(
             &config,
             &allowed,
             &mut malformed_credentials_spec,
+            Some(&expected_network),
         )
         .unwrap()
         .is_none());
@@ -4457,7 +4506,6 @@ mod tests {
 
     #[test]
     fn reset_collaboration_access_keeps_task_and_conversation_specs_usable() {
-        let db = Arc::new(Database::open_memory().unwrap());
         let data_dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.system.data_dir = data_dir.path().to_path_buf();
@@ -4473,11 +4521,14 @@ mod tests {
                 network_mode: Some(network.to_string()),
                 ..Default::default()
             };
-            assert!(
-                configure_local_collaboration_access(&db, &config, &agent, &mut spec)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(configure_local_collaboration_access_for_network(
+                &config,
+                &agent,
+                &mut spec,
+                Some("collaboration-network"),
+            )
+            .unwrap()
+            .is_none());
             assert_eq!(spec.network_mode.as_deref(), Some(network));
         }
     }

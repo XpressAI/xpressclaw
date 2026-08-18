@@ -988,8 +988,6 @@ export async function runManagedGitPush({
       'PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR',
       'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
       'SSL_CERT_FILE', 'SSL_CERT_DIR',
-      'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
-      'http_proxy', 'https_proxy', 'no_proxy',
     ]) {
       if (process.env[key] !== undefined) inheritedEnvironment[key] = process.env[key];
     }
