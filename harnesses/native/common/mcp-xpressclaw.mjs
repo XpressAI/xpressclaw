@@ -5,9 +5,12 @@
 // local API or allowing work to be scheduled for another project.
 
 import { createInterface } from 'node:readline';
-import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { execFile as execFileCallback } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 const BASE_URL = (process.env.XPRESSCLAW_URL ?? '').replace(/\/$/, '');
 const CONTROL_TOKEN = process.env.XPRESSCLAW_CONTROL_TOKEN ?? '';
@@ -15,6 +18,9 @@ const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
 const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
+const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
+const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
+const execFile = promisify(execFileCallback);
 
 const INSTRUCTIONS = `Use schedule_wakeup whenever work must pause and resume later.
 
@@ -326,6 +332,113 @@ export const TOOLS = [
         idempotentHint: false,
         openWorldHint: false,
       },
+    },
+	] : []),
+  ...(LOCAL_COLLABORATION ? [
+    {
+      name: 'local_collaboration_info',
+      description: 'Discover the capabilities and internal endpoints of this Agent\'s explicitly assigned local GitBucket and Jenkins services.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      annotations: { title: 'Inspect local collaboration', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_create_repository',
+      description: 'Create a repository owned by the constrained non-admin local GitBucket service account.',
+      inputSchema: {
+        type: 'object', properties: {
+          name: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' },
+          private: { type: 'boolean', default: false },
+        }, required: ['name'], additionalProperties: false,
+      },
+    },
+    {
+      name: 'local_forge_get_repository',
+      description: 'Read a repository from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+      }, required: ['owner', 'repository'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_push_branch',
+      description: 'Push one local workspace branch to a repository owned by the managed GitBucket service account. A revocable Agent capability is passed to git through a temporary askpass helper; the forge bearer token stays server-side.',
+      inputSchema: { type: 'object', properties: {
+        repository: { type: 'string', minLength: 1, maxLength: 100, pattern: '^[A-Za-z0-9._-]+$' },
+        branch: { type: 'string', minLength: 1, maxLength: 200 },
+        directory: { type: 'string', description: 'Workspace-relative repository directory. Defaults to the workspace root.' },
+        force_with_lease: { type: 'boolean', default: false },
+      }, required: ['repository', 'branch'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_create_issue',
+      description: 'Create an issue in a repository on the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        title: { type: 'string', minLength: 1 }, body: { type: 'string' },
+      }, required: ['owner', 'repository', 'title'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_get_issue',
+      description: 'Read one issue from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 },
+      }, required: ['owner', 'repository', 'number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_create_pull_request',
+      description: 'Open a pull request on the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        title: { type: 'string', minLength: 1 }, body: { type: 'string' },
+        head: { type: 'string', minLength: 1 }, base: { type: 'string', default: 'main' },
+      }, required: ['owner', 'repository', 'title', 'head'], additionalProperties: false },
+    },
+    {
+      name: 'local_forge_get_pull_request',
+      description: 'Read one pull request from the assigned local GitBucket forge.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 },
+      }, required: ['owner', 'repository', 'number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_forge_comment_pull_request',
+      description: 'Add a discussion comment to a local GitBucket pull request. Native GitHub-style review approvals are not supported.',
+      inputSchema: { type: 'object', properties: {
+        owner: { type: 'string', minLength: 1 }, repository: { type: 'string', minLength: 1 },
+        number: { type: 'integer', minimum: 1 }, body: { type: 'string', minLength: 1 },
+      }, required: ['owner', 'repository', 'number', 'body'], additionalProperties: false },
+    },
+    {
+      name: 'local_build_trigger',
+      description: 'Trigger the constrained Jenkins job for a public managed GitBucket repository and Git ref. XpressClaw replaces the isolated build Agent before the job; wait for any current build to finish first. The repository must provide .xpressclaw/jenkins.sh.',
+      inputSchema: { type: 'object', properties: {
+        repository: { type: 'string', pattern: '^http://gitbucket:8080/xpressclaw-agent/.+\\.git$' },
+        git_ref: { type: 'string', minLength: 1, maxLength: 200 },
+      }, required: ['repository', 'git_ref'], additionalProperties: false },
+    },
+    {
+      name: 'local_build_get',
+      description: 'Read the current state of a Jenkins build.',
+      inputSchema: { type: 'object', properties: { number: { type: 'integer', minimum: 1 } }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_build_logs',
+      description: 'Read the tail of a Jenkins build log.',
+      inputSchema: { type: 'object', properties: {
+        number: { type: 'integer', minimum: 1 }, max_bytes: { type: 'integer', minimum: 1, maximum: 1000000, default: 100000 },
+      }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    {
+      name: 'local_build_cancel',
+      description: 'Cancel a running Jenkins build.',
+      inputSchema: { type: 'object', properties: { number: { type: 'integer', minimum: 1 } }, required: ['number'], additionalProperties: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
   ] : []),
 ];
@@ -760,6 +873,184 @@ async function createConversationTask(argumentsValue) {
   });
 }
 
+async function collaborationApi(tool, argumentsValue = {}) {
+  if (!LOCAL_COLLABORATION || !COLLABORATION_TOKEN) {
+    throw new Error('this Agent does not have Local collaboration access');
+  }
+  requireConfiguration();
+  const response = await fetch(
+    `${BASE_URL}/api/settings/collaboration/agent/${encodeURIComponent(tool)}`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-xpressclaw-internal-token': CONTROL_TOKEN,
+        'x-xpressclaw-collaboration-token': COLLABORATION_TOKEN,
+        'x-xpressclaw-agent-id': AGENT_ID,
+      },
+      body: JSON.stringify(argumentsValue ?? {}),
+    },
+  );
+  const raw = await response.text();
+  let payload = null;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = raw;
+  }
+  if (!response.ok) {
+    throw new Error(String(payload?.error ?? payload ?? `HTTP ${response.status}`));
+  }
+  return payload;
+}
+
+function validGitName(value, label) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error(`${label} may contain only letters, numbers, dot, underscore, and hyphen`);
+  }
+  return value;
+}
+
+function validGitRef(value) {
+  if (typeof value !== 'string' || !value || value.length > 200
+      || value.startsWith('-') || value.includes('..') || value.includes(' ') || /[~^:?*[\\\x00-\x1f\x7f]/.test(value)) {
+    throw new Error('branch is not a safe Git ref');
+  }
+  return value;
+}
+
+async function pushLocalForgeBranch(argumentsValue) {
+  const repository = validGitName(argumentsValue?.repository, 'repository');
+  const branch = validGitRef(argumentsValue?.branch);
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const requested = argumentsValue?.directory
+    ? path.resolve(workspace, String(argumentsValue.directory))
+    : workspace;
+  const directory = await realpath(requested);
+  if (directory !== workspace && !directory.startsWith(`${workspace}${path.sep}`)) {
+    throw new Error('Git repository must be inside the assigned workspace');
+  }
+  const transport = await collaborationApi('git-transport');
+  const remote = `${BASE_URL}${transport.base_path}/${repository}`;
+  const output = await runManagedGitPush({
+    directory,
+    remote,
+    branch,
+    username: transport.username,
+    token: COLLABORATION_TOKEN,
+    forceWithLease: argumentsValue?.force_with_lease === true,
+  });
+  return {
+    status: 'pushed',
+    repository,
+    branch,
+    output,
+  };
+}
+
+function redactSecret(value, secret) {
+  const raw = String(secret ?? '');
+  return raw ? String(value ?? '').replaceAll(raw, '[REDACTED]') : String(value ?? '');
+}
+
+export async function runManagedGitPush({
+  directory,
+  remote,
+  branch,
+  username,
+  token,
+  forceWithLease = false,
+}) {
+  const credentialDirectory = await mkdtemp(path.join(tmpdir(), 'xpressclaw-git-'));
+  const askpass = path.join(credentialDirectory, 'git-askpass.sh');
+  const globalConfig = path.join(credentialDirectory, 'global-gitconfig');
+  const emptyHooks = path.join(credentialDirectory, 'empty-hooks');
+  const transportRepository = path.join(credentialDirectory, 'transport.git');
+  const hooksPath = emptyHooks.split(path.sep).join('/');
+  await mkdir(emptyHooks, { recursive: true, mode: 0o700 });
+  await writeFile(globalConfig, '', { mode: 0o600 });
+  await writeFile(
+    askpass,
+    '#!/bin/sh\ncase "$1" in *Username*) printf "%s" "$XPRESSCLAW_GIT_USERNAME" ;; *) printf "%s" "$XPRESSCLAW_GIT_TOKEN" ;; esac\n',
+    { mode: 0o700 },
+  );
+  try {
+    // Put only the requested local branch into a clean temporary bare
+    // repository before adding the revocable Agent capability. Authenticated
+    // Git commands consequently cannot read hooks, helpers, URL rewrites, or
+    // other transport configuration from the untrusted assigned checkout.
+    const gitConfig = [
+      '-c', `core.hooksPath=${hooksPath}`,
+      '-c', 'credential.helper=',
+    ];
+    const inheritedEnvironment = {};
+    for (const key of [
+      'PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR',
+      'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+      'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    ]) {
+      if (process.env[key] !== undefined) inheritedEnvironment[key] = process.env[key];
+    }
+    const isolatedGitEnvironment = {
+      ...inheritedEnvironment,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: globalConfig,
+    };
+    await execFile('git', ['init', '--bare', transportRepository], {
+      cwd: credentialDirectory,
+      env: isolatedGitEnvironment,
+      maxBuffer: 1024 * 1024,
+    });
+    await execFile(
+      'git',
+      [
+        '--git-dir', transportRepository,
+        'fetch', '--no-tags', '--no-write-fetch-head',
+        directory, `refs/heads/${branch}:refs/heads/${branch}`,
+      ],
+      { cwd: credentialDirectory, env: isolatedGitEnvironment, maxBuffer: 1024 * 1024 },
+    );
+    const gitEnvironment = {
+      ...isolatedGitEnvironment,
+      GIT_ASKPASS: askpass,
+      XPRESSCLAW_GIT_USERNAME: username,
+      XPRESSCLAW_GIT_TOKEN: token,
+    };
+    const repositoryArgs = ['--git-dir', transportRepository];
+
+    let lease = null;
+    if (forceWithLease) {
+      const remoteRef = `refs/heads/${branch}`;
+      const { stdout } = await execFile(
+        'git',
+        [...repositoryArgs, ...gitConfig, 'ls-remote', '--refs', remote, remoteRef],
+        { cwd: credentialDirectory, env: gitEnvironment, maxBuffer: 1024 * 1024 },
+      );
+      const match = stdout.trim().match(/^([0-9a-fA-F]{40,64})\s+refs\/heads\//);
+      lease = `--force-with-lease=${remoteRef}:${match?.[1] ?? ''}`;
+    }
+
+    const args = [...repositoryArgs, ...gitConfig, 'push'];
+    if (lease) args.push(lease);
+    args.push(remote, `${branch}:${branch}`);
+    const { stdout, stderr } = await execFile('git', args, {
+      cwd: credentialDirectory,
+      env: gitEnvironment,
+      maxBuffer: 1024 * 1024,
+    });
+    return redactSecret(`${stdout}${stderr}`, token).trim().slice(-4000);
+  } catch (cause) {
+    const detail = redactSecret(
+      `${cause?.stdout ?? ''}${cause?.stderr ?? ''}${cause?.message ?? cause}`,
+      token,
+    );
+    throw new Error(`git push failed: ${detail.slice(-4000)}`);
+  } finally {
+    await rm(credentialDirectory, { recursive: true, force: true });
+  }
+}
+
 async function callTool(name, argumentsValue) {
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
@@ -774,6 +1065,19 @@ async function callTool(name, argumentsValue) {
   if (name === 'send_conversation_message') return sendConversationMessage(argumentsValue);
   if (name === 'download_conversation_attachment') return downloadConversationAttachment(argumentsValue);
   if (name === 'create_conversation_task') return createConversationTask(argumentsValue);
+  if (name === 'local_collaboration_info') return collaborationApi('capabilities');
+  if (name === 'local_forge_create_repository') return collaborationApi('create-repository', argumentsValue);
+  if (name === 'local_forge_get_repository') return collaborationApi('get-repository', argumentsValue);
+  if (name === 'local_forge_push_branch') return pushLocalForgeBranch(argumentsValue);
+  if (name === 'local_forge_create_issue') return collaborationApi('create-issue', argumentsValue);
+  if (name === 'local_forge_get_issue') return collaborationApi('get-issue', argumentsValue);
+  if (name === 'local_forge_create_pull_request') return collaborationApi('create-pull-request', argumentsValue);
+  if (name === 'local_forge_get_pull_request') return collaborationApi('get-pull-request', argumentsValue);
+  if (name === 'local_forge_comment_pull_request') return collaborationApi('comment-pull-request', argumentsValue);
+  if (name === 'local_build_trigger') return collaborationApi('trigger-build', argumentsValue);
+  if (name === 'local_build_get') return collaborationApi('get-build', argumentsValue);
+  if (name === 'local_build_logs') return collaborationApi('build-logs', argumentsValue);
+  if (name === 'local_build_cancel') return collaborationApi('cancel-build', argumentsValue);
   throw new Error(`unknown tool: ${name ?? ''}`);
 }
 

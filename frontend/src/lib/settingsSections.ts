@@ -8,6 +8,7 @@ export const SETTINGS_SECTIONS: {
 }[] = [
 	{ kind: 'settings', label: 'Profile', shortLabel: 'P', href: '/settings' },
 	{ kind: 'settings-sync', label: 'Project sync', shortLabel: '↕', href: '/settings/sync' },
+	{ kind: 'settings-collaboration', label: 'Local collaboration', shortLabel: 'C', href: '/settings/collaboration' },
 	{ kind: 'settings-mcp', label: 'MCP servers', shortLabel: 'M', href: '/settings/mcp' },
 	{ kind: 'settings-server', label: 'Instance', shortLabel: 'I', href: '/settings/server' },
 ];

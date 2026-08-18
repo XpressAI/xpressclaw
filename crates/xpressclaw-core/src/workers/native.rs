@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::acp::{agent_definition, local_runner_image};
+use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
     NativeRunnerConfig,
@@ -605,6 +606,8 @@ async fn execute_conversation_turn(
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -657,6 +660,7 @@ async fn execute_conversation_turn(
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
@@ -912,6 +916,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let workspace = resolved_workspace(&config, agent);
     let github = github::discover(&db, &workspace);
     let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
@@ -983,6 +989,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
@@ -2002,6 +2009,7 @@ struct RunnerCallback<'a> {
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
+    collaboration_token: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -2021,6 +2029,7 @@ fn xpressclaw_control_mcp_server(
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
+            collaboration_token: None,
         },
     )
 }
@@ -2054,6 +2063,10 @@ fn xpressclaw_control_mcp_server_for_context(
     if let Some(project_id) = project_id {
         env.push(EnvVariable::new("XPRESSCLAW_PROJECT_ID", project_id));
     }
+    if let Some(token) = callback.collaboration_token {
+        env.push(EnvVariable::new("XPRESSCLAW_LOCAL_COLLABORATION", "1"));
+        env.push(EnvVariable::new("XPRESSCLAW_COLLABORATION_TOKEN", token));
+    }
     // The control MCP must move in lockstep with the control plane. Runner
     // images are cached independently and can legitimately remain on an older
     // build, so execute the source embedded in this XpressClaw binary instead
@@ -2067,6 +2080,63 @@ fn xpressclaw_control_mcp_server_for_context(
             ])
             .env(env),
     )
+}
+
+async fn configure_local_collaboration_access(
+    db: &Arc<Database>,
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    docker: &DockerManager,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let installation_id = db.installation_id()?;
+    let network = collaboration_network_name(&installation_id);
+    let network = docker
+        .installation_network_present(&network)
+        .await
+        .then_some(network);
+    configure_local_collaboration_access_for_network(config, agent, spec, network.as_deref())
+}
+
+fn configure_local_collaboration_access_for_network(
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    network: Option<&str>,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let Some(network) = network else {
+        warn!(
+            agent = %agent.name,
+            "local collaboration network is unavailable or not owned by this installation; continuing without collaboration tools"
+        );
+        return Ok(None);
+    };
+    let secrets = match CollaborationSecrets::load(&config.system.data_dir) {
+        Ok(Some(secrets)) => secrets,
+        Ok(None) => {
+            warn!(
+                agent = %agent.name,
+                "local collaboration credentials are unavailable; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            warn!(
+                agent = %agent.name,
+                %error,
+                "local collaboration credentials could not be loaded; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+    };
+    spec.network_mode = Some(network.to_string());
+    Ok(Some(secrets.capability_token_for_agent(&agent.name)))
 }
 
 fn is_absolute_container_path(path: &str) -> bool {
@@ -4324,6 +4394,155 @@ mod tests {
             container_spec_fingerprint(&task).unwrap(),
             container_spec_fingerprint(&conversation).unwrap()
         );
+    }
+
+    #[test]
+    fn local_collaboration_network_and_capability_are_assigned_per_agent() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let expected_token = CollaborationSecrets::generate();
+        expected_token.save(data_dir.path()).unwrap();
+
+        let allowed = AgentConfig {
+            name: "allowed".to_string(),
+            ..Default::default()
+        };
+        let expected_network = collaboration_network_name(&db.installation_id().unwrap());
+        let mut allowed_spec = ContainerSpec::default();
+        let token = configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut allowed_spec,
+            Some(&expected_network),
+        )
+        .unwrap();
+        assert_eq!(
+            token.as_deref(),
+            Some(
+                expected_token
+                    .capability_token_for_agent("allowed")
+                    .as_str()
+            )
+        );
+        assert_ne!(
+            token.as_deref(),
+            Some(
+                expected_token
+                    .capability_token_for_agent("another-agent")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            allowed_spec.network_mode.as_deref(),
+            Some(expected_network.as_str())
+        );
+
+        let mut missing_network_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut missing_network_spec,
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            missing_network_spec.network_mode.as_deref(),
+            Some("ordinary-network")
+        );
+
+        let unassigned = AgentConfig {
+            name: "unassigned".to_string(),
+            ..Default::default()
+        };
+        let mut unassigned_spec = ContainerSpec {
+            network_mode: Some("existing-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &unassigned,
+            &mut unassigned_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            unassigned_spec.network_mode.as_deref(),
+            Some("existing-network")
+        );
+
+        std::fs::remove_file(CollaborationSecrets::path(data_dir.path())).unwrap();
+        let mut ordinary_turn_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut ordinary_turn_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            ordinary_turn_spec.network_mode.as_deref(),
+            Some("ordinary-network")
+        );
+
+        std::fs::create_dir_all(data_dir.path().join("collaboration")).unwrap();
+        std::fs::write(
+            CollaborationSecrets::path(data_dir.path()),
+            "not valid collaboration credentials",
+        )
+        .unwrap();
+        let mut malformed_credentials_spec = ContainerSpec::default();
+        let original_network = malformed_credentials_spec.network_mode.clone();
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut malformed_credentials_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(malformed_credentials_spec.network_mode, original_network);
+    }
+
+    #[test]
+    fn reset_collaboration_access_keeps_task_and_conversation_specs_usable() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = false;
+        config.collaboration.authorized_agents.clear();
+        let agent = AgentConfig {
+            name: "formerly-assigned".to_string(),
+            ..Default::default()
+        };
+
+        for network in ["task-network", "conversation-network"] {
+            let mut spec = ContainerSpec {
+                network_mode: Some(network.to_string()),
+                ..Default::default()
+            };
+            assert!(configure_local_collaboration_access_for_network(
+                &config,
+                &agent,
+                &mut spec,
+                Some("collaboration-network"),
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(spec.network_mode.as_deref(), Some(network));
+        }
     }
 
     #[test]

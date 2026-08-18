@@ -616,6 +616,9 @@ pub struct LlmConfig {
 #[serde(default)]
 pub struct Config {
     pub system: SystemConfig,
+    /// Optional instance-local GitBucket/Jenkins services. Disabled by
+    /// default and never started as a side effect of loading configuration.
+    pub collaboration: crate::collaboration::CollaborationConfig,
     #[serde(default)]
     pub agents: Vec<AgentConfig>,
     #[serde(default)]
@@ -758,6 +761,10 @@ impl Config {
                 "near_term_slots must be between 1 and 16".to_string(),
             ));
         }
+
+        self.collaboration
+            .validate()
+            .map_err(Error::ConfigValidation)?;
 
         Ok(())
     }

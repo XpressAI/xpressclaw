@@ -2,6 +2,7 @@
 	import type { WorkspaceTabKind } from '$lib/workspace';
 	import SettingsPage from '../../../routes/settings/+page.svelte';
 	import McpSettingsPage from '../../../routes/settings/mcp/+page.svelte';
+	import CollaborationSettingsPage from '../../../routes/settings/collaboration/+page.svelte';
 	import ServerSettingsPage from '../../../routes/settings/server/+page.svelte';
 	import SyncSettingsPage from '../../../routes/settings/sync/+page.svelte';
 
@@ -11,6 +12,8 @@
 <div class="h-full min-h-0 overflow-y-auto">
 	{#if kind === 'settings-server'}
 		<ServerSettingsPage />
+	{:else if kind === 'settings-collaboration'}
+		<CollaborationSettingsPage />
 	{:else if kind === 'settings-mcp'}
 		<McpSettingsPage />
 	{:else if kind === 'settings-sync'}
