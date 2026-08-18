@@ -1503,6 +1503,9 @@ const JENKINS_JOB_XML: &str = r#"<?xml version="1.1" encoding="UTF-8"?>
   <triggers/><concurrentBuild>false</concurrentBuild>
   <builders><hudson.tasks.Shell><command>set -eu
 case "$REPOSITORY_URL" in http://gitbucket:8080/xpressclaw-agent/*.git) ;; *) echo "Repository is outside the managed local forge account" >&amp;2; exit 2;; esac
+repository_name=${REPOSITORY_URL#http://gitbucket:8080/xpressclaw-agent/}
+repository_name=${repository_name%.git}
+case "$repository_name" in ''|.|..|*[!A-Za-z0-9._-]*) echo "Repository is outside the managed local forge account" >&amp;2; exit 2;; esac
 rm -rf source
 git clone --depth 1 --branch "$GIT_REF" "$REPOSITORY_URL" source
 cd source
@@ -1557,6 +1560,9 @@ mod tests {
         assert!(JENKINS_AGENT_GROOVY.contains("Node.Mode.EXCLUSIVE"));
         assert!(JENKINS_JOB_XML.contains("<assignedNode>xpressclaw-isolated</assignedNode>"));
         assert!(JENKINS_JOB_XML.contains("<canRoam>false</canRoam>"));
+        assert!(JENKINS_JOB_XML
+            .contains("repository_name=${REPOSITORY_URL#http://gitbucket:8080/xpressclaw-agent/}"));
+        assert!(JENKINS_JOB_XML.contains("''|.|..|*[!A-Za-z0-9._-]*"));
         assert!(JENKINS_AGENT_COMMAND.contains("-webSocket"));
         assert!(!JENKINS_AGENT_COMMAND.contains("/var/jenkins_home"));
     }

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{pin_mut, Stream, StreamExt};
 use serde::Deserialize;
+use url::Url;
 
 use super::{
     local_http_client_builder, Build, BuildCapabilities, BuildProvider, BuildRequest,
@@ -131,12 +132,40 @@ impl JenkinsProvider {
     }
 
     fn validate_request(request: &BuildRequest) -> Result<()> {
-        let expected = format!("{GITBUCKET_INTERNAL_URL}/xpressclaw-agent/");
-        if !request.repository.starts_with(&expected) || !request.repository.ends_with(".git") {
-            return Err(Error::ToolPermission(
+        let denied = || {
+            Error::ToolPermission(
                 "Jenkins builds may only clone repositories owned by the managed local forge account"
                     .to_string(),
-            ));
+            )
+        };
+        let managed_forge = Url::parse(GITBUCKET_INTERNAL_URL)
+            .expect("the managed GitBucket URL must be a valid absolute URL");
+        let repository = Url::parse(&request.repository).map_err(|_| denied())?;
+        let segments = repository
+            .path_segments()
+            .ok_or_else(&denied)?
+            .collect::<Vec<_>>();
+        let repository_name = segments
+            .as_slice()
+            .strip_prefix(&["xpressclaw-agent"])
+            .and_then(|segments| (segments.len() == 1).then_some(segments[0]))
+            .and_then(|name| name.strip_suffix(".git"));
+        if repository.scheme() != managed_forge.scheme()
+            || repository.host_str() != managed_forge.host_str()
+            || repository.port_or_known_default() != managed_forge.port_or_known_default()
+            || !repository.username().is_empty()
+            || repository.password().is_some()
+            || repository.query().is_some()
+            || repository.fragment().is_some()
+            || repository_name.is_none_or(|name| {
+                name.is_empty()
+                    || matches!(name, "." | "..")
+                    || !name.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "-_.".contains(character)
+                    })
+            })
+        {
+            return Err(denied());
         }
         if request.git_ref.is_empty()
             || request.git_ref.len() > 200
@@ -530,6 +559,24 @@ mod tests {
             git_ref: "main".to_string(),
         })
         .is_err());
+
+        for repository in [
+            "http://gitbucket:8080/xpressclaw-agent/../root/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/%2e%2e/root/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/nested/demo.git",
+            "http://gitbucket:8080/xpressclaw-agent/demo%2fgraft.git",
+            "http://gitbucket:8080/xpressclaw-agent/demo.git?mirror=1",
+            "http://user@gitbucket:8080/xpressclaw-agent/demo.git",
+        ] {
+            assert!(
+                JenkinsProvider::validate_request(&BuildRequest {
+                    repository: repository.to_string(),
+                    git_ref: "main".to_string(),
+                })
+                .is_err(),
+                "unexpectedly accepted {repository}"
+            );
+        }
     }
 
     #[test]

@@ -57,10 +57,10 @@
 		error = '';
 		notice = '';
 		try {
-			// Install and Restart reconcile immutable Docker configuration. Save
+			// Install, Restart, and Upgrade reconcile immutable Docker configuration. Save
 			// the visible form first so they cannot run against stale ports, images,
 			// assignments, or a still-disabled configuration.
-			if ((action === 'install' || action === 'restart') && form) {
+			if ((action === 'install' || action === 'restart' || action === 'upgrade') && form) {
 				apply(await settings.putCollaboration(form));
 			}
 			apply(await settings.runCollaborationAction(action));
