@@ -536,6 +536,16 @@ async fn agent_tool(
             authorize_agent(&headers, &current_config.collaboration, &secrets).ok_or_else(
                 || ApiError::forbidden("this Agent no longer has Local collaboration access"),
             )?;
+            // A Settings save and queued Restart may have replaced Jenkins
+            // while this trigger waited for the lifecycle lock. Rebuild the
+            // client from the protected snapshot instead of retaining the
+            // endpoint captured before the wait.
+            let builds = JenkinsProvider::new(
+                &current_config.collaboration.jenkins_url(),
+                "xpressclaw",
+                &secrets.jenkins_password,
+            )
+            .map_err(ApiError::internal)?;
             builds.ensure_idle().await.map_err(ApiError::tool)?;
             let docker = state
                 .docker()
@@ -983,6 +993,95 @@ mod tests {
         request.abort();
         let _ = request.await;
         let _ = std::fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn trigger_build_rebuilds_jenkins_client_after_lifecycle_wait() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn idle_jenkins(hits: Arc<AtomicUsize>) -> (u16, tokio::task::JoinHandle<()>) {
+            let app = Router::new().route(
+                "/job/xpressclaw-local-build/api/json",
+                get(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "inQueue": false, "lastBuild": null }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (port, server)
+        }
+
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        let (old_port, old_server) = idle_jenkins(old_hits.clone()).await;
+        let (new_port, new_server) = idle_jenkins(new_hits.clone()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = directory.path().join("data");
+        config.collaboration.enabled = true;
+        config.collaboration.jenkins_port = old_port;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let mut secrets = CollaborationSecrets::generate();
+        secrets.gitbucket_service_token = Some("test-forge-token".to_string());
+        secrets.save(&config.system.data_dir).unwrap();
+        let capability = secrets.capability_token_for_agent("allowed");
+        let state = AppState::new(
+            Arc::new(config),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            directory.path().join("xpressclaw.yaml"),
+            true,
+        );
+        let app = Router::new()
+            .nest("/settings/collaboration", routes())
+            .with_state(state.clone());
+
+        let lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+        let request = tokio::spawn(
+            app.oneshot(
+                Request::post("/settings/collaboration/agent/trigger-build")
+                    .header("content-type", "application/json")
+                    .header(AGENT_HEADER, "allowed")
+                    .header(CAPABILITY_HEADER, capability)
+                    .body(Body::from(
+                        json!({
+                            "repository": "http://gitbucket:8080/xpressclaw-agent/demo.git",
+                            "git_ref": "main",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            ),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let mut reconciled = (*state.config()).clone();
+        reconciled.collaboration.jenkins_port = new_port;
+        state.apply_config(Arc::new(reconciled), None);
+        drop(lifecycle_guard);
+
+        let reached_new_endpoint = tokio::time::timeout(Duration::from_secs(2), async {
+            while new_hits.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        request.abort();
+        let _ = request.await;
+        assert_eq!(old_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            reached_new_endpoint.is_ok(),
+            "the trigger never contacted Jenkins at the reconciled endpoint"
+        );
+        assert_eq!(new_hits.load(Ordering::SeqCst), 1);
+        old_server.abort();
+        new_server.abort();
     }
 
     #[test]
