@@ -3702,3 +3702,30 @@ test('local collaboration install persists the visible enabled configuration fir
 	await expect.poll(() => collaborationActions).toEqual(['save', 'install']);
 	await expect(page.getByText('Install completed.')).toBeVisible();
 });
+
+test('local collaboration restart saves and applies visible port changes', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await page.getByLabel('Jenkins port').fill('9089');
+	await page.getByRole('button', { name: 'Restart & apply configuration' }).click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'restart']);
+	await expect(page.getByLabel('Jenkins port')).toHaveValue('9089');
+	await expect(page.getByText('Restart completed.')).toBeVisible();
+});

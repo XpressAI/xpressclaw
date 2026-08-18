@@ -54,11 +54,16 @@ Default pinned images are ghcr.io/gitbucket/gitbucket:4.46.1 and
 jenkins/jenkins:2.568.1-jdk21. Settings shows exact container, network, and
 volume names. GitBucket has a 1 GiB memory limit; the Jenkins controller has 2
 GiB; and its isolated build Agent has 1 GiB. Each has two CPUs and an
-unless-stopped policy. Docker health checks expose stopped,
+unless-stopped policy. XpressClaw replaces the isolated Jenkins build Agent
+before every accepted job and rejects overlapping triggers, so repository code,
+background processes, and user-level Git configuration cannot cross build
+boundaries. Docker health checks expose stopped,
 starting, healthy, unhealthy, port-conflict, and image-pull states after
 XpressClaw or Docker restarts.
 
-- Start/Restart uses existing containers and volumes.
+- Start uses existing containers and volumes.
+- Restart reconciles the saved ports, images, and container settings by
+  recreating managed containers while preserving volumes and credentials.
 - Stop preserves repositories, builds, and credentials.
 - Upgrade pulls configured tags and recreates containers while preserving data.
 - Reset requires exact confirmation and deletes both volumes and secrets.
@@ -106,7 +111,7 @@ release does not claim automatic GitHub outage failover.
 ## Troubleshooting
 
 - Docker unavailable: start Docker Desktop or Docker Engine, then reload.
-- Port conflict: choose different ports, save, and install/restart.
+- Port conflict: choose different ports, then use Restart & apply configuration.
 - Image unavailable: verify registry access and the explicit tag.
 - Starting/unhealthy: inspect redacted service logs in Settings.
 - Agent cannot resolve a service: assign access, save, and let its retained

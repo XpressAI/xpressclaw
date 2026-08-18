@@ -522,16 +522,38 @@ async fn agent_tool(
                 .map_err(ApiError::tool)?;
             json!({ "status": "commented" })
         }
-        "trigger-build" => serde_json::to_value(
-            builds
-                .trigger(&BuildRequest {
-                    repository: required(&arguments, "repository")?.to_string(),
-                    git_ref: required(&arguments, "git_ref")?.to_string(),
-                })
+        "trigger-build" => {
+            let request = BuildRequest {
+                repository: required(&arguments, "repository")?.to_string(),
+                git_ref: required(&arguments, "git_ref")?.to_string(),
+            };
+            // Serialize the idle check, disposable Agent replacement, and
+            // queue submission with service lifecycle operations. A second
+            // trigger is rejected while the first build is queued/running
+            // instead of destroying its Agent underneath it.
+            let _lifecycle_guard = state.collaboration_lifecycle_lock.lock().await;
+            let current_config = state.config();
+            authorize_agent(&headers, &current_config.collaboration, &secrets).ok_or_else(
+                || ApiError::forbidden("this Agent no longer has Local collaboration access"),
+            )?;
+            builds.ensure_idle().await.map_err(ApiError::tool)?;
+            let docker = state
+                .docker()
                 .await
-                .map_err(ApiError::tool)?,
-        )
-        .map_err(ApiError::internal)?,
+                .ok_or_else(|| ApiError::unavailable("Docker is unavailable"))?;
+            let installation = state.db.installation_id().map_err(ApiError::internal)?;
+            CollaborationStack::new(
+                &docker,
+                &current_config.collaboration,
+                &current_config.system.data_dir,
+                &installation,
+            )
+            .prepare_jenkins_build_agent(&secrets.jenkins_password)
+            .await
+            .map_err(ApiError::tool)?;
+            serde_json::to_value(builds.trigger(&request).await.map_err(ApiError::tool)?)
+                .map_err(ApiError::internal)?
+        }
         "get-build" => serde_json::to_value(
             builds
                 .get(required_u64(&arguments, "number")?)

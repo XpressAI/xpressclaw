@@ -57,10 +57,10 @@
 		error = '';
 		notice = '';
 		try {
-			// Install uses persisted server configuration. Save the visible form
-			// first so the common enable-and-install flow cannot run against stale
-			// ports, images, assignments, or a still-disabled configuration.
-			if (action === 'install' && form) {
+			// Install and Restart reconcile immutable Docker configuration. Save
+			// the visible form first so they cannot run against stale ports, images,
+			// assignments, or a still-disabled configuration.
+			if ((action === 'install' || action === 'restart') && form) {
 				apply(await settings.putCollaboration(form));
 			}
 			apply(await settings.runCollaborationAction(action));
@@ -213,12 +213,12 @@
 		<p class="text-xs text-muted-foreground">Managed data directory: <span class="font-mono">{data.status.data_path}</span></p>
 
 		<section class="rounded-lg border border-border bg-card p-4 space-y-3">
-			<div><h2 class="text-sm font-semibold">Service lifecycle</h2><p class="mt-1 text-xs text-muted-foreground">Stop preserves all data. Install is idempotent; Restart and Upgrade retain named volumes.</p></div>
+			<div><h2 class="text-sm font-semibold">Service lifecycle</h2><p class="mt-1 text-xs text-muted-foreground">Stop preserves all data. Restart applies the visible configuration and recreates containers while retaining named volumes.</p></div>
 			<div class="flex flex-wrap gap-2">
 				<button class="rounded-md bg-primary px-3 py-2 text-xs font-medium text-primary-foreground disabled:opacity-50" disabled={busy !== null || !form.enabled} onclick={() => run('install')}>{busy === 'install' ? 'Installing…' : 'Install services'}</button>
 				{#each ['start', 'stop', 'restart', 'upgrade'] as action}
 					<button class="rounded-md border border-border px-3 py-2 text-xs capitalize disabled:opacity-50" disabled={busy !== null} onclick={() => run(action as Action)}>
-						{busy === action ? action + '…' : action === 'upgrade' ? 'Upgrade pinned images' : action}
+						{busy === action ? action + '…' : action === 'upgrade' ? 'Upgrade pinned images' : action === 'restart' ? 'Restart & apply configuration' : action}
 					</button>
 				{/each}
 			</div>

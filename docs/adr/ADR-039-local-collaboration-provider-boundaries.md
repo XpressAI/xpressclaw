@@ -45,7 +45,9 @@ assignment on every request and adds the non-admin GitBucket bearer token only
 to the server-side upstream request. Shared forge credentials never enter the
 Agent container. Jenkins receives no privileged mode, Docker-in-Docker, or host
 Docker socket. Its no-plugin job accepts only a managed GitBucket URL and ref
-and runs .xpressclaw/jenkins.sh from a public repository.
+and runs .xpressclaw/jenkins.sh from a public repository. The control plane
+rejects overlapping builds and replaces the unmounted build Agent container,
+including its writable layer and node secret, before every accepted job.
 
 ## Consequences
 

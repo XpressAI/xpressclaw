@@ -414,7 +414,7 @@ export const TOOLS = [
     },
     {
       name: 'local_build_trigger',
-      description: 'Trigger the constrained Jenkins job for a public managed GitBucket repository and Git ref. The repository must provide .xpressclaw/jenkins.sh.',
+      description: 'Trigger the constrained Jenkins job for a public managed GitBucket repository and Git ref. XpressClaw replaces the isolated build Agent before the job; wait for any current build to finish first. The repository must provide .xpressclaw/jenkins.sh.',
       inputSchema: { type: 'object', properties: {
         repository: { type: 'string', pattern: '^http://gitbucket:8080/xpressclaw-agent/.+\\.git$' },
         git_ref: { type: 'string', minLength: 1, maxLength: 200 },

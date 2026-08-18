@@ -38,6 +38,40 @@ impl JenkinsProvider {
         request.basic_auth(&self.username, Some(&self.password))
     }
 
+    /// Reject overlapping managed builds before the control plane replaces the
+    /// disposable Jenkins Agent container. The job itself also disables
+    /// concurrency, but an explicit preflight avoids terminating a build that
+    /// is already using the Agent.
+    pub async fn ensure_idle(&self) -> Result<()> {
+        let response = self
+            .authenticated(self.client.get(format!(
+                "{}/job/{JOB}/api/json?tree=inQueue,lastBuild[building]",
+                self.base_url
+            )))
+            .send()
+            .await
+            .map_err(|error| Error::ToolExecution(format!("Jenkins request failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(Error::ToolExecution(format!(
+                "Jenkins returned HTTP {} while checking build availability",
+                response.status()
+            )));
+        }
+        let activity = response
+            .json::<JenkinsJobActivity>()
+            .await
+            .map_err(|error| {
+                Error::ToolExecution(format!("invalid Jenkins job response: {error}"))
+            })?;
+        if activity.is_busy() {
+            return Err(Error::ToolExecution(
+                "another managed Jenkins build is queued or running; wait for it to finish before triggering the next build"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn crumb(&self) -> Result<Option<(String, String, Option<String>)>> {
         let response = self
             .authenticated(
@@ -140,6 +174,25 @@ struct JenkinsBuild {
     url: String,
     building: bool,
     result: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JenkinsJobActivity {
+    #[serde(default)]
+    in_queue: bool,
+    last_build: Option<JenkinsBuildActivity>,
+}
+
+impl JenkinsJobActivity {
+    fn is_busy(&self) -> bool {
+        self.in_queue || self.last_build.as_ref().is_some_and(|build| build.building)
+    }
+}
+
+#[derive(Deserialize)]
+struct JenkinsBuildActivity {
+    building: bool,
 }
 
 impl From<JenkinsBuild> for Build {
@@ -387,6 +440,21 @@ mod tests {
         assert!(capabilities.cancel);
         assert!(!capabilities.artifacts);
         assert!(!capabilities.retry);
+    }
+
+    #[test]
+    fn build_activity_distinguishes_idle_queued_and_running_jobs() {
+        let idle: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":false,"lastBuild":{"building":false}}"#).unwrap();
+        assert!(!idle.is_busy());
+
+        let queued: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":true,"lastBuild":null}"#).unwrap();
+        assert!(queued.is_busy());
+
+        let running: JenkinsJobActivity =
+            serde_json::from_str(r#"{"inQueue":false,"lastBuild":{"building":true}}"#).unwrap();
+        assert!(running.is_busy());
     }
 
     #[tokio::test]

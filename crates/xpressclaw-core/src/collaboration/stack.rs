@@ -251,11 +251,7 @@ impl<'a> CollaborationStack<'a> {
                 self.wait_http(&self.config.jenkins_url(), "Jenkins")
                     .await?;
             }
-            let agent_secret = self
-                .ensure_jenkins_agent_node(&secrets.jenkins_password)
-                .await?;
-            self.recreate_jenkins_agent(&agent_secret).await?;
-            self.wait_jenkins_agent_online(&secrets.jenkins_password)
+            self.prepare_jenkins_build_agent(&secrets.jenkins_password)
                 .await?;
             self.ensure_jenkins_job(&secrets.jenkins_password).await?;
             if first_jenkins_install {
@@ -403,8 +399,11 @@ impl<'a> CollaborationStack<'a> {
     }
 
     pub async fn restart(&self) -> Result<CollaborationStackStatus> {
-        self.stop().await?;
-        self.start().await
+        // Docker port bindings, images, and several resource settings are
+        // immutable after container creation. Use the same idempotent
+        // reconciliation path as Install/Upgrade so Restart applies the saved
+        // configuration instead of reporting URLs for stale containers.
+        self.install().await
     }
 
     pub async fn upgrade(&self) -> Result<CollaborationStackStatus> {
@@ -700,6 +699,15 @@ impl<'a> CollaborationStack<'a> {
             .await
             .map_err(|error| Error::Container(format!("failed to start {name}: {error}")))?;
         Ok(())
+    }
+
+    /// Replace the build Agent's entire writable container layer and rotate
+    /// its Jenkins node secret before an accepted build. No repository code or
+    /// background process from the previous job can reach the next job.
+    pub async fn prepare_jenkins_build_agent(&self, password: &str) -> Result<()> {
+        let agent_secret = self.ensure_jenkins_agent_node(password).await?;
+        self.recreate_jenkins_agent(&agent_secret).await?;
+        self.wait_jenkins_agent_online(password).await
     }
 
     async fn recreate_container(
@@ -1846,6 +1854,23 @@ mod tests {
         let logs = builds.logs(build.number, 100_000).await.unwrap();
         assert!(logs.contains("xpressclaw-local-build-ok"));
         assert!(logs.contains("node=xpressclaw-builder"));
+
+        let completed_agent_id = docker
+            .inspect_by_name(&stack.container_names()[2])
+            .await
+            .and_then(|container| container.id)
+            .unwrap();
+        builds.ensure_idle().await.unwrap();
+        stack
+            .prepare_jenkins_build_agent(&secrets.jenkins_password)
+            .await
+            .unwrap();
+        let replacement_agent_id = docker
+            .inspect_by_name(&stack.container_names()[2])
+            .await
+            .and_then(|container| container.id)
+            .unwrap();
+        assert_ne!(completed_agent_id, replacement_agent_id);
 
         // Simulate a crash after the credential-bearing bootstrap helper and
         // private network were created. Reset must remove both before it can
