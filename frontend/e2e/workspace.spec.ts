@@ -3695,11 +3695,14 @@ test('local collaboration install persists the visible enabled configuration fir
 
 	const install = page.getByRole('button', { name: 'Install services' });
 	const restart = page.getByRole('button', { name: 'Restart & apply configuration' });
+	const upgrade = page.getByRole('button', { name: 'Upgrade pinned images' });
 	await expect(install).toBeDisabled();
 	await expect(restart).toBeDisabled();
+	await expect(upgrade).toBeDisabled();
 	await page.getByLabel('Enable local collaboration configuration').check();
 	await expect(install).toBeEnabled();
 	await expect(restart).toBeEnabled();
+	await expect(upgrade).toBeEnabled();
 	await install.click();
 
 	await expect.poll(() => collaborationActions).toEqual(['save', 'install']);

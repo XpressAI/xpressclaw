@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -89,10 +90,35 @@ impl CollaborationSecrets {
                 "failed to create collaboration secret directory: {error}"
             ))
         })?;
-        let temporary = path.with_extension("json.tmp");
-        write_private(&temporary, &serde_json::to_vec(self)?)?;
-        fs::rename(&temporary, &path).map_err(|error| {
-            Error::Config(format!("failed to commit collaboration secrets: {error}"))
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".collaboration-secrets-")
+            .tempfile_in(parent)
+            .map_err(|error| {
+                Error::Config(format!("failed to create collaboration secrets: {error}"))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temporary
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    Error::Config(format!("failed to protect collaboration secrets: {error}"))
+                })?;
+        }
+        temporary
+            .write_all(&serde_json::to_vec(self)?)
+            .map_err(|error| {
+                Error::Config(format!("failed to write collaboration secrets: {error}"))
+            })?;
+        temporary.as_file().sync_all().map_err(|error| {
+            Error::Config(format!("failed to sync collaboration secrets: {error}"))
+        })?;
+        temporary.persist(&path).map_err(|error| {
+            Error::Config(format!(
+                "failed to commit collaboration secrets: {}",
+                error.error
+            ))
         })?;
         Ok(())
     }
@@ -132,30 +158,6 @@ fn random_password() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-#[cfg(unix)]
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| {
-            Error::Config(format!("failed to write collaboration secrets: {error}"))
-        })?;
-    file.write_all(contents)
-        .map_err(|error| Error::Config(format!("failed to write collaboration secrets: {error}")))
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    fs::write(path, contents)
-        .map_err(|error| Error::Config(format!("failed to write collaboration secrets: {error}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +182,16 @@ mod tests {
                 .agent_capability_token,
             secrets.agent_capability_token
         );
+        let mut updated = secrets.clone();
+        updated.gitbucket_service_token = Some("generated-token".to_string());
+        updated.jenkins_initialized = true;
+        updated.save(dir.path()).unwrap();
+        let reloaded = CollaborationSecrets::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            reloaded.gitbucket_service_token.as_deref(),
+            Some("generated-token")
+        );
+        assert!(reloaded.jenkins_initialized);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
