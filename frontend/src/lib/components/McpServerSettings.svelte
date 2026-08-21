@@ -147,12 +147,12 @@
 </script>
 
 <div class="space-y-6 p-4 sm:p-6">
-	<div class="flex items-start justify-between gap-4">
+	<div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
 		<div>
 			<h1 class="text-2xl font-bold">MCP servers</h1>
 			<p class="mt-1 max-w-2xl text-sm text-muted-foreground">Create a shared catalog of tools that can be attached to any agent from its Harness tab. Servers are never attached automatically.</p>
 		</div>
-		<div class="flex shrink-0 flex-wrap justify-end gap-2">
+		<div class="flex flex-wrap gap-2 sm:shrink-0 sm:justify-end">
 			<button type="button" onclick={() => openExternal(mcpRegistryUrl)} class="rounded-lg border border-border px-3.5 py-2 text-sm font-medium hover:bg-accent">Official MCP Registry</button>
 			<button type="button" onclick={createServer} class="rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Add server</button>
 		</div>

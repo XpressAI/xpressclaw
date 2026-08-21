@@ -3171,7 +3171,11 @@ test('skills and MCP settings surface official discovery documentation', async (
 	const openUrlRequests: string[] = [];
 	await mockApi(page, { mcpServers: [], openUrlRequests, agentKind: { value: 'claude' } });
 
+	await page.setViewportSize({ width: 390, height: 844 });
 	await page.goto('/settings/mcp');
+	await expect(page.getByRole('button', { name: 'Official MCP Registry' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Add server' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 	await page.getByRole('button', { name: 'Official MCP Registry' }).click();
 	await expect(page.getByText('Find published packages and remote endpoints')).toBeVisible();
 
@@ -3184,7 +3188,6 @@ test('skills and MCP settings surface official discovery documentation', async (
 		'https://code.claude.com/docs/en/skills',
 	]);
 
-	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
