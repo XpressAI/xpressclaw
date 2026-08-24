@@ -244,6 +244,11 @@ impl InstanceManager {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            // Validate the instance's current ownership before allowing its
+            // context to move. Otherwise a concurrent cascade could mark the
+            // source Project for deletion and this update could detach the
+            // instance before the cascade's final ownership sweep sees it.
+            ensure_instance_accepts_work(&transaction, instance_id)?;
             let conversation_project = if let Some(conversation_id) = conversation_id {
                 transaction
                     .query_row(
@@ -1028,6 +1033,54 @@ mod tests {
         let claim_error = mgr.claim_wait(&waiting.id, "approved").unwrap_err();
         assert!(claim_error.to_string().contains("being deleted"));
         assert_eq!(mgr.get_instance(&instance.id).unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn deleting_project_scope_cannot_be_moved_to_another_project() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO projects (id, name) VALUES ('project-two', 'Project Two');
+                 INSERT INTO tasks (id, title, status, project_id)
+                 VALUES ('project-task', 'Project task', 'pending', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        let scoped = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let task_scoped = mgr.create_instance("wf1", None, None).unwrap();
+        let execution = mgr
+            .create_step_execution(&task_scoped.id, "main", "work", None)
+            .unwrap();
+        mgr.set_step_task(&execution.id, "project-task").unwrap();
+
+        crate::projects::ProjectManager::new(db)
+            .begin_cascade("project-one")
+            .unwrap();
+
+        for instance_id in [&scoped.id, &task_scoped.id] {
+            let error = mgr
+                .set_context(instance_id, Some("project-two"), None)
+                .unwrap_err();
+            assert!(error.to_string().contains("being deleted"));
+        }
+        assert_eq!(
+            mgr.get_instance(&scoped.id).unwrap().project_id.as_deref(),
+            Some("project-one")
+        );
+        assert_eq!(mgr.get_instance(&task_scoped.id).unwrap().project_id, None);
     }
 
     #[test]

@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -202,7 +204,12 @@ impl ConnectorManager {
             .map_err(|e| Error::Connector(format!("failed to serialize channel config: {e}")))?;
 
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_agent_accepts_channel_binding(&transaction, req.agent_id.as_deref())?;
+            transaction.execute(
                 "INSERT INTO connector_channels (id, connector_id, name, channel_type, config, agent_id, enabled, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
                 rusqlite::params![
@@ -214,8 +221,9 @@ impl ConnectorManager {
                     req.agent_id,
                     now,
                 ],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<(), Error>(())
         })?;
 
         self.get_channel(&id)
@@ -254,17 +262,22 @@ impl ConnectorManager {
 
     /// Update a channel's agent binding.
     pub fn update_channel(&self, id: &str, agent_id: Option<&str>) -> Result<ChannelRecord> {
-        let affected = self.db.with_conn(|conn| {
-            conn.execute(
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_agent_accepts_channel_binding(&transaction, agent_id)?;
+            let affected = transaction.execute(
                 "UPDATE connector_channels SET agent_id = ?1 WHERE id = ?2",
                 rusqlite::params![agent_id, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            if affected == 0 {
+                return Err(Error::ChannelNotFound { id: id.to_string() });
+            }
+            transaction.commit()?;
+            Ok::<(), Error>(())
         })?;
-
-        if affected == 0 {
-            return Err(Error::ChannelNotFound { id: id.to_string() });
-        }
         self.get_channel(id)
     }
 
@@ -303,6 +316,34 @@ impl ConnectorManager {
     }
 }
 
+/// Validate an optional direct Agent binding while holding the same SQLite
+/// writer reservation used to persist it. This serializes channel assignment
+/// with Project deletion: an assignment that commits first is cleared by the
+/// cascade, while one that starts afterward observes the deletion marker or
+/// missing Agent and fails closed.
+fn ensure_agent_accepts_channel_binding(
+    conn: &rusqlite::Connection,
+    agent_id: Option<&str>,
+) -> Result<()> {
+    let Some(agent_id) = agent_id else {
+        return Ok(());
+    };
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
+    if let Some(project_id) = project_id {
+        ensure_project_accepts_work(conn, &project_id)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Row mapping helpers
 // ---------------------------------------------------------------------------
@@ -339,5 +380,75 @@ fn row_to_channel(row: &rusqlite::Row) -> ChannelRecord {
         agent_id: row.get("agent_id").unwrap_or_default(),
         enabled: row.get::<_, i32>("enabled").unwrap_or(1) != 0,
         created_at: row.get("created_at").unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::registry::AgentRegistry;
+    use crate::projects::{CreateProject, ProjectManager};
+
+    #[test]
+    fn channel_bindings_reject_deleting_and_deleted_agents() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let projects = ProjectManager::new(db.clone());
+        let project = projects
+            .create(&CreateProject {
+                name: "Project One".into(),
+                description: None,
+                icon: None,
+            })
+            .unwrap();
+        AgentRegistry::new(db.clone())
+            .create_in_project("project-agent", "codex", &project.id)
+            .unwrap();
+        let manager = ConnectorManager::new(db);
+        let connector = manager
+            .create(&CreateConnector {
+                name: "Local webhook".into(),
+                connector_type: "webhook".into(),
+                config: Value::Object(Default::default()),
+            })
+            .unwrap();
+        let channel = manager
+            .create_channel(
+                &connector.id,
+                &CreateChannel {
+                    name: "Inbox".into(),
+                    channel_type: "both".into(),
+                    config: Value::Object(Default::default()),
+                    agent_id: None,
+                },
+            )
+            .unwrap();
+
+        projects.begin_cascade(&project.id).unwrap();
+
+        let update_error = manager
+            .update_channel(&channel.id, Some("project-agent"))
+            .unwrap_err();
+        assert!(update_error.to_string().contains("being deleted"));
+        let create_error = manager
+            .create_channel(
+                &connector.id,
+                &CreateChannel {
+                    name: "Late inbox".into(),
+                    channel_type: "both".into(),
+                    config: Value::Object(Default::default()),
+                    agent_id: Some("project-agent".into()),
+                },
+            )
+            .unwrap_err();
+        assert!(create_error.to_string().contains("being deleted"));
+        assert_eq!(manager.get_channel(&channel.id).unwrap().agent_id, None);
+        assert_eq!(manager.list_channels(&connector.id).unwrap().len(), 1);
+
+        projects.finish_cascade(&project.id).unwrap();
+        let deleted_error = manager
+            .update_channel(&channel.id, Some("project-agent"))
+            .unwrap_err();
+        assert!(matches!(deleted_error, Error::AgentNotFound { .. }));
+        assert_eq!(manager.get_channel(&channel.id).unwrap().agent_id, None);
     }
 }
