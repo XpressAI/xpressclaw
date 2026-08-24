@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { agents, conversations, projects, type Agent, type Conversation, type Project, type Task } from '$lib/api';
 	import { PROJECT_MUTATION_EVENT, publishProjectMutation, type ProjectMutation } from '$lib/projectEvents';
@@ -114,9 +115,14 @@
 		publishProjectMutation({ kind: 'updated', project: updated });
 	}
 
-	function projectDeleted(deletedProjectId: string) {
+	async function projectDeleted(deletedProjectId: string) {
 		showingProjectSettings = false;
 		publishProjectMutation({ kind: 'deleted', projectId: deletedProjectId });
+		const remainingProjects = await projects.list().catch(() => []);
+		const nextProject = remainingProjects.find((candidate) => candidate.id !== deletedProjectId);
+		await goto(nextProject ? `/projects/${encodeURIComponent(nextProject.id)}` : '/projects', {
+			replaceState: true,
+		});
 	}
 
 	function taskDot(status: string): string {
@@ -132,6 +138,9 @@
 		<div class="flex h-full items-center justify-center"><AgentLoading label="Loading project" phase="loading" /></div>
 	{:else if project}
 		<div class="mx-auto max-w-6xl space-y-8 p-4 sm:p-6">
+			{#if project.deletion_started_at}
+				<div role="alert" class="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">Deletion was interrupted after this Project stopped accepting new work. Open Project settings and confirm deletion again to finish cleanup.</div>
+			{/if}
 			<header class="flex flex-wrap items-start justify-between gap-4">
 				<div class="flex min-w-0 items-center gap-4">
 					<span class="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-primary/10 text-xl font-semibold text-primary">{project.icon || project.name.slice(0, 1).toUpperCase()}</span>

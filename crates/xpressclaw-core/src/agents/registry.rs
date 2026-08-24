@@ -6,6 +6,7 @@ use tracing::debug;
 use crate::agents::state::AgentStatus;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 /// Agent record combining YAML config identity with DB runtime state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,16 +95,7 @@ impl AgentRegistry {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
-            let project_exists = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                [project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !project_exists {
-                return Err(Error::ProjectNotFound {
-                    id: project_id.to_string(),
-                });
-            }
+            ensure_project_accepts_work(&transaction, project_id)?;
             transaction.execute(
                 "INSERT INTO agents (id, name, backend, config, status, project_id)
                  VALUES (?1, ?1, ?2, '{}', 'stopped', ?3)",

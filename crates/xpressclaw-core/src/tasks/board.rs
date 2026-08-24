@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,18 +290,6 @@ impl TaskBoard {
                 )));
             }
         }
-        if let Some(project_id) = requested_project {
-            let exists = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                [project_id],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !exists {
-                return Err(Error::ProjectNotFound {
-                    id: project_id.to_string(),
-                });
-            }
-        }
         let agent_project = if let Some(agent_id) = req.agent_id.as_deref() {
             transaction
                 .query_row(
@@ -334,6 +323,9 @@ impl TaskBoard {
             ("Agent", agent_project.as_deref()),
             ("parent task", parent_project.as_deref()),
         ])?;
+        if let Some(project_id) = project_id.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
         if req.parent_task_id.is_some() && parent_project.is_none() && project_id.is_some() {
             return Err(Error::Task(
                 "a task in a Project cannot be added beneath a projectless parent task".into(),
@@ -372,15 +364,31 @@ impl TaskBoard {
             .to_string();
         let title = format!("[Idle] {agent_id}");
 
-        {
-            let conn = self.db.conn();
-            conn.execute(
+        self.db.with_conn(|conn| {
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [agent_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
                 "INSERT INTO tasks (id, title, description, status, priority, agent_id, task_type, hidden, created_at, updated_at, project_id)
                  VALUES (?1, ?2, ?3, 'pending', 0, ?4, 'IDLE', 1, ?5, ?6,
                          (SELECT project_id FROM agents WHERE id = ?4))",
                 rusqlite::params![id, title, description, agent_id, now, now],
             )?;
-        }
+            transaction.commit()?;
+            Ok::<_, Error>(())
+        })?;
 
         self.get(&id)
     }
@@ -439,6 +447,7 @@ impl TaskBoard {
             ("Agent", agent_project.as_deref()),
         ])?
         .expect("the conversation always supplies a project");
+        ensure_project_accepts_work(&transaction, &project_id)?;
         ensure_task_hierarchy_project(&transaction, task_id, &project_id)?;
 
         transaction.execute(
@@ -742,6 +751,16 @@ impl TaskBoard {
                 return Err(Error::TaskNotFound {
                     id: task_id.to_string(),
                 });
+            }
+            if parsed != TaskStatus::Cancelled {
+                let project_id = transaction.query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                if let Some(project_id) = project_id.as_deref() {
+                    ensure_project_accepts_work(&transaction, project_id)?;
+                }
             }
 
             // Update status. Reopening a completed task must also clear its
@@ -1518,6 +1537,7 @@ fn ensure_task_agent_project(
         ("Agent", agent_project.as_deref()),
     ])?;
     if let Some(project_id) = project_id {
+        ensure_project_accepts_work(conn, &project_id)?;
         ensure_task_hierarchy_project(conn, task_id, &project_id)?;
     }
     Ok(())

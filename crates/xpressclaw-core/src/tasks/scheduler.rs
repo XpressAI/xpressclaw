@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -8,6 +9,7 @@ use uuid::Uuid;
 use crate::conversations::{ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::sessions::{NewEvent, SessionManager};
 use crate::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus};
 use crate::tasks::conversation::TaskConversation;
@@ -117,12 +119,18 @@ impl ScheduleManager {
             .to_string();
 
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_agent_project_accepts_work(&transaction, &req.agent_id)?;
+            transaction.execute(
                 "INSERT INTO schedules (id, name, cron, agent_id, title, description, enabled, run_count, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, ?7)",
                 rusqlite::params![id, req.name, req.cron, req.agent_id, req.title, req.description, now],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         self.get(&id)
@@ -156,6 +164,7 @@ impl ScheduleManager {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            ensure_agent_project_accepts_work(&transaction, &req.agent_id)?;
             if let Some(conversation_id) = req.conversation_id.as_deref() {
                 let is_participant = transaction.query_row(
                     "SELECT EXISTS(
@@ -267,26 +276,33 @@ impl ScheduleManager {
     }
 
     fn set_enabled(&self, id: &str, enabled: bool) -> Result<Schedule> {
-        if enabled {
-            let schedule = self.get(id)?;
-            if schedule.schedule_type == SCHEDULE_TYPE_ONCE && schedule.run_count > 0 {
-                return Err(Error::Schedule(
-                    "a completed one-shot schedule cannot be enabled again".to_string(),
-                ));
+        self.db.with_conn(|conn| {
+            // Reserve the write transaction before checking the Project marker
+            // so deletion cannot begin between validation and re-enabling.
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let schedule = transaction
+                .query_row("SELECT * FROM schedules WHERE id = ?1", [id], |row| {
+                    Ok(row_to_schedule(row))
+                })
+                .map_err(|_| Error::ScheduleNotFound { id: id.to_string() })?;
+            if enabled {
+                if schedule.schedule_type == SCHEDULE_TYPE_ONCE && schedule.run_count > 0 {
+                    return Err(Error::Schedule(
+                        "a completed one-shot schedule cannot be enabled again".to_string(),
+                    ));
+                }
+                ensure_agent_project_accepts_work(&transaction, &schedule.agent_id)?;
             }
-        }
-
-        let affected = self.db.with_conn(|conn| {
-            conn.execute(
+            transaction.execute(
                 "UPDATE schedules SET enabled = ?1 WHERE id = ?2",
                 rusqlite::params![enabled as i32, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
-
-        if affected == 0 {
-            return Err(Error::ScheduleNotFound { id: id.to_string() });
-        }
         self.get(id)
     }
 
@@ -545,6 +561,21 @@ impl ScheduleManager {
     }
 }
 
+fn ensure_agent_project_accepts_work(conn: &rusqlite::Connection, agent_id: &str) -> Result<()> {
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(project_id) = project_id.as_deref() {
+        ensure_project_accepts_work(conn, project_id)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Background cron runner
 // ---------------------------------------------------------------------------
@@ -740,6 +771,14 @@ mod tests {
 
     fn setup() -> (Arc<Database>, ScheduleManager, TaskBoard) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('atlas', 'Atlas', 'native', '{}'),
+                        ('scout', 'Scout', 'native', '{}');",
+            )
+        })
+        .unwrap();
         let mgr = ScheduleManager::new(db.clone());
         let board = TaskBoard::new(db.clone());
         (db, mgr, board)
@@ -870,6 +909,28 @@ mod tests {
 
         let enabled = mgr.enable(&schedule.id).unwrap();
         assert!(enabled.enabled);
+    }
+
+    #[test]
+    fn deleting_project_cannot_reenable_its_schedule() {
+        let (db, mgr, _) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 UPDATE agents SET project_id = 'project-one' WHERE id = 'atlas';",
+            )
+        })
+        .unwrap();
+        let schedule = create_schedule(&mgr);
+        mgr.disable(&schedule.id).unwrap();
+
+        crate::projects::ProjectManager::new(db)
+            .begin_cascade("project-one")
+            .unwrap();
+
+        let error = mgr.enable(&schedule.id).unwrap_err();
+        assert!(error.to_string().contains("being deleted"));
+        assert!(!mgr.get(&schedule.id).unwrap().enabled);
     }
 
     #[test]

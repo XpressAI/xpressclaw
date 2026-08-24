@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 /// A running (or completed) workflow instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,16 +161,9 @@ impl InstanceManager {
             }
             let resolved_project = scope.project_id.or(conversation_project.as_deref());
             if let Some(project_id) = resolved_project {
-                let exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                    [project_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !exists {
-                    return Err(Error::Workflow(format!(
-                        "project '{project_id}' not found"
-                    )));
-                }
+                ensure_project_accepts_work(&transaction, project_id).map_err(|error| {
+                    Error::Workflow(error.to_string())
+                })?;
             }
             if let Some(creator_agent_id) = scope.creator_agent_id {
                 let conversation_id = scope.conversation_id.ok_or_else(|| {
@@ -246,11 +240,47 @@ impl InstanceManager {
         conversation_id: Option<&str>,
     ) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let conversation_project = if let Some(conversation_id) = conversation_id {
+                transaction
+                    .query_row(
+                        "SELECT project_id FROM conversations WHERE id = ?1",
+                        [conversation_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        Error::Workflow(format!("conversation '{conversation_id}' not found"))
+                    })?
+            } else {
+                None
+            };
+            if let (Some(requested), Some(actual)) = (project_id, conversation_project.as_deref()) {
+                if requested != actual {
+                    return Err(Error::Workflow(format!(
+                        "conversation '{}' belongs to project '{actual}', not '{requested}'",
+                        conversation_id.unwrap_or_default()
+                    )));
+                }
+            }
+            if let Some(project_id) = project_id.or(conversation_project.as_deref()) {
+                ensure_project_accepts_work(&transaction, project_id)
+                    .map_err(|error| Error::Workflow(error.to_string()))?;
+            }
+            let updated = transaction.execute(
                 "UPDATE workflow_instances SET project_id = ?1, conversation_id = ?2 WHERE id = ?3",
                 rusqlite::params![project_id, conversation_id, instance_id],
-            )
-            .map_err(|error| Error::Database(error.to_string()))
+            )?;
+            if updated == 0 {
+                return Err(Error::WorkflowInstanceNotFound {
+                    id: instance_id.to_string(),
+                });
+            }
+            transaction.commit()?;
+            Ok(())
         })?;
         Ok(())
     }
@@ -309,11 +339,17 @@ impl InstanceManager {
     /// completion timestamp.
     pub fn set_active_status(&self, id: &str, status: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_instance_accepts_work(&transaction, id)?;
+            transaction.execute(
                 "UPDATE workflow_instances SET status = ?1, completed_at = NULL, error_message = NULL WHERE id = ?2",
                 rusqlite::params![status, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
         Ok(())
     }
@@ -326,11 +362,19 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            if status != "cancelled" {
+                ensure_instance_accepts_work(&transaction, id)?;
+            }
+            transaction.execute(
                 "UPDATE workflow_instances SET status = ?1, error_message = ?2, completed_at = ?3 WHERE id = ?4",
                 rusqlite::params![status, error_msg, now, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         Ok(())
@@ -415,15 +459,24 @@ impl InstanceManager {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        let attempt = self.get_step_attempt_count(instance_id, step_id)? + 1;
-
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
+            let attempt = transaction.query_row(
+                "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
+                rusqlite::params![instance_id, step_id],
+                |row| row.get::<_, i32>(0),
+            )? + 1;
+            transaction.execute(
                 "INSERT INTO workflow_step_executions (id, instance_id, flow_name, step_id, status, input_context, attempt, started_at)
                  VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
                 rusqlite::params![id, instance_id, flow_name, step_id, input_context, attempt, now],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         self.get_step_execution(&id)
@@ -499,9 +552,12 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| -> Result<()> {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|error| Error::Database(error.to_string()))?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|error| Error::Database(error.to_string()))?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
             let attempt = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
@@ -564,9 +620,12 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| -> Result<()> {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|error| Error::Database(error.to_string()))?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|error| Error::Database(error.to_string()))?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
             let attempt = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
@@ -647,13 +706,18 @@ impl InstanceManager {
     /// after a crash, while competing pollers can no longer claim it twice.
     pub fn claim_wait(&self, id: &str, output: &str) -> Result<bool> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, id)?;
+            let changed = transaction.execute(
                 "UPDATE workflow_step_executions SET status = 'resuming', output = ?1
                  WHERE id = ?2 AND status = 'waiting'",
                 rusqlite::params![output, id],
-            )
-            .map(|changed| changed == 1)
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(changed == 1)
         })
     }
 
@@ -674,11 +738,17 @@ impl InstanceManager {
     /// Link a step execution to a task.
     pub fn set_step_task(&self, execution_id: &str, task_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            transaction.execute(
                 "UPDATE workflow_step_executions SET task_id = ?1, status = 'running' WHERE id = ?2",
                 rusqlite::params![task_id, execution_id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         Ok(())
@@ -686,11 +756,17 @@ impl InstanceManager {
 
     pub fn mark_step_running(&self, execution_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            transaction.execute(
                 "UPDATE workflow_step_executions SET status = 'running' WHERE id = ?1",
                 [execution_id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
         Ok(())
     }
@@ -747,6 +823,54 @@ impl InstanceManager {
             Ok(count)
         })
     }
+}
+
+fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
+    let (project_id, conversation_project_id) = conn
+        .query_row(
+            "SELECT instance.project_id, conversation.project_id
+             FROM workflow_instances instance
+             LEFT JOIN conversations conversation
+               ON conversation.id = instance.conversation_id
+             WHERE instance.id = ?1",
+            [instance_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::WorkflowInstanceNotFound {
+            id: instance_id.to_string(),
+        })?;
+    if let Some(project_id) = project_id.as_deref() {
+        ensure_project_accepts_work(conn, project_id)
+            .map_err(|error| Error::Workflow(error.to_string()))?;
+    }
+    if conversation_project_id.as_deref() != project_id.as_deref() {
+        if let Some(project_id) = conversation_project_id.as_deref() {
+            ensure_project_accepts_work(conn, project_id)
+                .map_err(|error| Error::Workflow(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_step_execution_accepts_work(
+    conn: &rusqlite::Connection,
+    execution_id: &str,
+) -> Result<()> {
+    let instance_id = conn
+        .query_row(
+            "SELECT instance_id FROM workflow_step_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Workflow(format!("step execution not found: {execution_id}")))?;
+    ensure_instance_accepts_work(conn, &instance_id)
 }
 
 fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
@@ -834,6 +958,56 @@ mod tests {
             .unwrap();
 
         assert_eq!(inst.variable_store, r#"{"default_agent": "atlas"}"#);
+    }
+
+    #[test]
+    fn deleting_project_blocks_new_and_resumed_workflow_work() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One')",
+                [],
+            )
+        })
+        .unwrap();
+        let instance = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let waiting = mgr
+            .create_wait_execution(&instance.id, "main", "review", "{}")
+            .unwrap();
+
+        crate::projects::ProjectManager::new(db)
+            .begin_cascade("project-one")
+            .unwrap();
+
+        let create_error = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap_err();
+        assert!(create_error.to_string().contains("being deleted"));
+        let resume_error = mgr.set_active_status(&instance.id, "running").unwrap_err();
+        assert!(resume_error.to_string().contains("being deleted"));
+        let claim_error = mgr.claim_wait(&waiting.id, "approved").unwrap_err();
+        assert!(claim_error.to_string().contains("being deleted"));
+        assert_eq!(mgr.get_instance(&instance.id).unwrap().status, "cancelled");
     }
 
     #[test]

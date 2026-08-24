@@ -6,12 +6,14 @@
 
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogicalSession {
@@ -253,10 +255,30 @@ impl SessionManager {
         source_id: Option<&str>,
         prompt: &str,
     ) -> Result<WorkAttempt> {
-        self.ensure(session_id, None)?;
         let id = Uuid::new_v4().to_string();
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::TaskNotFound {
+                    id: task_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
+                "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title)
+                 VALUES (?1, ?1, NULL)",
+                [session_id],
+            )?;
             transaction.execute(
                 "INSERT INTO work_attempts
                  (id, session_id, task_id, queue_id, kind, runner, status, prompt,

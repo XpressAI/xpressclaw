@@ -746,6 +746,75 @@ impl DockerManager {
             .is_some_and(|labels| project_ownership_matches(&labels, installation_id, agent_id))
     }
 
+    /// Remove every retained or transient container that this installation
+    /// owns for one workload ID. Missing containers are idempotent no-ops;
+    /// inspect failures are reported instead of being mistaken for absence.
+    /// A same-named container without matching ownership labels is preserved.
+    pub async fn remove_owned_workload(&self, agent_id: &str) -> Result<()> {
+        let mut candidates = Vec::with_capacity(2);
+        if let Some(installation_id) = self.installation_id.as_deref() {
+            candidates.push(project_container_name(installation_id, agent_id));
+        }
+        candidates.push(format!("xpressclaw-{agent_id}"));
+        candidates.sort();
+        candidates.dedup();
+
+        for container_name in candidates {
+            let container = match self.docker.inspect_container(&container_name, None).await {
+                Ok(container) => container,
+                Err(BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => continue,
+                Err(error) => {
+                    return Err(Error::Docker(format!(
+                        "failed to inspect runtime '{container_name}': {error}"
+                    )))
+                }
+            };
+            let labels = container
+                .config
+                .and_then(|config| config.labels)
+                .unwrap_or_default();
+            if !workload_ownership_matches(
+                &container_name,
+                &labels,
+                self.installation_id.as_deref(),
+                agent_id,
+            ) {
+                continue;
+            }
+
+            let stop_opts = StopContainerOptions { t: 2 };
+            if let Err(error) = self
+                .docker
+                .stop_container(&container_name, Some(stop_opts))
+                .await
+            {
+                warn!(agent_id, container_name, %error, "error stopping owned container before removal");
+            }
+            let opts = RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            };
+            match self
+                .docker
+                .remove_container(&container_name, Some(opts))
+                .await
+            {
+                Ok(())
+                | Err(BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => {
+                    return Err(Error::Container(format!(
+                        "failed to remove owned runtime '{container_name}': {error}"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Start an interactive shell inside this installation's retained project
     /// container. A stopped retained container is restarted on demand so a
     /// user can repair credentials after a control-plane restart without
@@ -1617,6 +1686,20 @@ fn listed_container_agent_id(
         .map(str::to_string)
 }
 
+fn workload_ownership_matches(
+    container_name: &str,
+    labels: &HashMap<String, String>,
+    installation_id: Option<&str>,
+    agent_id: &str,
+) -> bool {
+    if let Some(installation_id) = installation_id {
+        if container_name == project_container_name(installation_id, agent_id) {
+            return project_ownership_matches(labels, installation_id, agent_id);
+        }
+    }
+    listed_container_agent_id(container_name, labels, installation_id).as_deref() == Some(agent_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,5 +1992,35 @@ mod tests {
             .as_deref(),
             Some("attempt-123")
         );
+    }
+
+    #[test]
+    fn destructive_workload_cleanup_requires_matching_ownership() {
+        let retained_name = project_container_name("installation-a", "atlas");
+        let retained_labels = project_container_labels("fingerprint", "installation-a", "atlas");
+        assert!(workload_ownership_matches(
+            &retained_name,
+            &retained_labels,
+            Some("installation-a"),
+            "atlas"
+        ));
+        assert!(!workload_ownership_matches(
+            &retained_name,
+            &project_container_labels("fingerprint", "installation-b", "atlas"),
+            Some("installation-a"),
+            "atlas"
+        ));
+        assert!(workload_ownership_matches(
+            "xpressclaw-attempt-123",
+            &HashMap::from([(INSTALLATION_LABEL.to_string(), "installation-a".to_string())]),
+            Some("installation-a"),
+            "attempt-123"
+        ));
+        assert!(!workload_ownership_matches(
+            "xpressclaw-attempt-123",
+            &HashMap::new(),
+            Some("installation-a"),
+            "attempt-123"
+        ));
     }
 }

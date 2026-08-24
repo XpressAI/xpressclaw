@@ -13,6 +13,7 @@ use crate::config::{
 use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::simple_embedding;
+use crate::projects::ensure_project_accepts_work;
 
 use super::manifest::ProjectSyncManifest;
 use super::model::{
@@ -884,6 +885,14 @@ fn portable_budget(budget: &PortableBudgetSettings) -> Result<BudgetConfig> {
 }
 
 fn import_transaction(connection: &Connection, snapshot: &PortableSnapshot) -> Result<()> {
+    let project_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        [&snapshot.project.id],
+        |row| row.get(0),
+    )?;
+    if project_exists {
+        ensure_project_accepts_work(connection, &snapshot.project.id)?;
+    }
     if project_is_active(connection, &snapshot.project.id)? {
         return Err(quiescent_error());
     }

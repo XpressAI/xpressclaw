@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::conversations::{row_to_message, ConversationManager, ConversationMessage, SendMessage};
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -145,7 +146,10 @@ impl ConversationTurnQueue {
         trigger_message_id: i64,
     ) -> Result<bool> {
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let inserted = Self::enqueue_in_transaction(
                 &transaction,
                 conversation_id,
@@ -163,6 +167,19 @@ impl ConversationTurnQueue {
         agent_id: &str,
         trigger_message_id: i64,
     ) -> Result<bool> {
+        let project_id = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conversation_id.to_string(),
+            })?;
+        if let Some(project_id) = project_id.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
         let trigger_exists = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM conversation_messages

@@ -1678,6 +1678,30 @@ fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
     data_dir.join("runtime").join("pi-mcp").join(agent_hash)
 }
 
+/// Remove XpressClaw-generated per-Agent runtime files after an Agent is
+/// permanently deleted. Repository and managed-workspace directories are
+/// intentionally outside these hashed runtime roots and are never touched.
+pub fn remove_agent_runtime_state(data_dir: &Path, agent_id: &str) -> Result<()> {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+        let path = data_dir
+            .join("runtime")
+            .join(runtime_kind)
+            .join(&agent_hash);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Backend(format!(
+                    "failed to remove Agent runtime directory {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pi_mcp_config(mcp_servers: &[McpServer]) -> Result<Vec<u8>> {
     let mut servers = serde_json::Map::new();
     for server in mcp_servers {
@@ -3312,6 +3336,40 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_runtime_cleanup_is_idempotent_and_preserves_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let agent_id = "atlas";
+        let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+            let runtime_dir = data_dir
+                .join("runtime")
+                .join(runtime_kind)
+                .join(&agent_hash);
+            std::fs::create_dir_all(&runtime_dir).unwrap();
+            std::fs::write(runtime_dir.join("generated.conf"), "owned").unwrap();
+        }
+        let workspace = data_dir.join("workspaces").join(agent_id);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("user-source.txt"), "preserve").unwrap();
+
+        remove_agent_runtime_state(&data_dir, agent_id).unwrap();
+        remove_agent_runtime_state(&data_dir, agent_id).unwrap();
+
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+            assert!(!data_dir
+                .join("runtime")
+                .join(runtime_kind)
+                .join(&agent_hash)
+                .exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("user-source.txt")).unwrap(),
+            "preserve"
+        );
+    }
 
     #[tokio::test]
     async fn retiring_conversations_removes_all_registered_acp_lanes() {

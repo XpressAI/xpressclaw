@@ -1739,6 +1739,14 @@ CREATE INDEX idx_work_attempts_trigger_message
     ON work_attempts(trigger_message_id);
 ";
 
+const MIGRATION_V39: &str = "
+-- Cascading Project deletion is a recoverable two-phase operation. The
+-- durable marker is set before workers and retained runtimes are stopped, so
+-- no new work can attach while asynchronous cleanup is in progress. A failed
+-- cleanup can be retried without making a bare DELETE destructive.
+ALTER TABLE projects ADD COLUMN deletion_started_at TIMESTAMP;
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1779,6 +1787,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (36, MIGRATION_V36),
         (37, MIGRATION_V37),
         (38, MIGRATION_V38),
+        (39, MIGRATION_V39),
     ]
 }
 
@@ -1799,7 +1808,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "38");
+        assert_eq!(version, "39");
+        let deletion_marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('projects')
+                 WHERE name = 'deletion_started_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deletion_marker, 1);
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
