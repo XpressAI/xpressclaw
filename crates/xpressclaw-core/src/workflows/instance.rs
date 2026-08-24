@@ -855,6 +855,26 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
                 .map_err(|error| Error::Workflow(error.to_string()))?;
         }
     }
+    let step_project_ids = {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT task.project_id
+             FROM workflow_step_executions execution
+             JOIN tasks task ON task.id = execution.task_id
+             WHERE execution.instance_id = ?1 AND task.project_id IS NOT NULL",
+        )?;
+        let project_ids = statement
+            .query_map([instance_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        project_ids
+    };
+    for step_project_id in step_project_ids {
+        if Some(step_project_id.as_str()) != project_id.as_deref()
+            && Some(step_project_id.as_str()) != conversation_project_id.as_deref()
+        {
+            ensure_project_accepts_work(conn, &step_project_id)
+                .map_err(|error| Error::Workflow(error.to_string()))?;
+        }
+    }
     Ok(())
 }
 

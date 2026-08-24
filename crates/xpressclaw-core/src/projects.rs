@@ -515,7 +515,13 @@ impl ProjectManager {
                    + (SELECT COUNT(*) FROM workflow_instances
                       WHERE project_id = ?1
                          OR conversation_id IN
-                            (SELECT id FROM conversations WHERE project_id = ?1))
+                            (SELECT id FROM conversations WHERE project_id = ?1)
+                         OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                            SELECT execution.instance_id
+                            FROM workflow_step_executions execution
+                            JOIN tasks task ON task.id = execution.task_id
+                            WHERE task.project_id = ?1
+                         )))
                    + (SELECT COUNT(*) FROM schedules
                       WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
                          OR continuation_task_id IN
@@ -727,7 +733,13 @@ impl ProjectManager {
                  SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
                      error_message = 'Project deleted'
                  WHERE (project_id = ?1 OR conversation_id IN
-                       (SELECT id FROM conversations WHERE project_id = ?1))
+                       (SELECT id FROM conversations WHERE project_id = ?1)
+                    OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                       SELECT execution.instance_id
+                       FROM workflow_step_executions execution
+                       JOIN tasks task ON task.id = execution.task_id
+                       WHERE task.project_id = ?1
+                    )))
                    AND status IN ('running', 'waiting')",
                 [id],
             )?;
@@ -926,7 +938,13 @@ impl ProjectManager {
                 "DELETE FROM workflow_instances
                  WHERE project_id = ?1
                     OR conversation_id IN
-                       (SELECT id FROM conversations WHERE project_id = ?1)",
+                       (SELECT id FROM conversations WHERE project_id = ?1)
+                    OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                       SELECT execution.instance_id
+                       FROM workflow_step_executions execution
+                       JOIN tasks task ON task.id = execution.task_id
+                       WHERE task.project_id = ?1
+                    ))",
                 [id],
             )?;
             transaction.execute("DELETE FROM conversations WHERE project_id = ?1", [id])?;
@@ -988,7 +1006,13 @@ fn row_to_project(
              (SELECT COUNT(*) FROM workflow_instances
               WHERE project_id = ?1
                  OR conversation_id IN
-                    (SELECT id FROM conversations WHERE project_id = ?1)),
+                    (SELECT id FROM conversations WHERE project_id = ?1)
+                 OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                    SELECT execution.instance_id
+                    FROM workflow_step_executions execution
+                    JOIN tasks task ON task.id = execution.task_id
+                    WHERE task.project_id = ?1
+                 ))),
              (SELECT COUNT(*) FROM schedules
               WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
                  OR continuation_task_id IN
@@ -1703,10 +1727,12 @@ mod tests {
                  INSERT INTO workflow_instances
                     (id, workflow_id, status, project_id, conversation_id)
                     VALUES ('run-one', 'shared-workflow', 'waiting', 'one', 'conversation-one'),
+                           ('run-via-task', 'shared-workflow', 'running', NULL, NULL),
                            ('run-two', 'shared-workflow', 'completed', 'two', 'conversation-two');
                  INSERT INTO workflow_step_executions
                     (id, instance_id, flow_name, step_id, task_id, status)
-                    VALUES ('step-one', 'run-one', 'main', 'work', 'task-one', 'running');
+                    VALUES ('step-one', 'run-one', 'main', 'work', 'task-one', 'running'),
+                           ('step-via-task', 'run-via-task', 'main', 'work', 'task-one', 'running');
                  INSERT INTO schedules (id, name, cron, agent_id, title, continuation_task_id)
                     VALUES ('schedule-one', 'Delete schedule', '', 'atlas', 'Wake', 'task-one');
                  INSERT INTO project_sync_state
@@ -1748,10 +1774,26 @@ mod tests {
         assert_eq!(counts.conversations, 1);
         assert_eq!(counts.conversation_messages, 1);
         assert_eq!(counts.memory_notes, 1);
-        assert_eq!(counts.workflow_runs, 1);
+        assert_eq!(counts.workflow_runs, 2);
         assert_eq!(counts.schedules, 1);
 
         manager.begin_cascade("one").unwrap();
+        db.with_conn(|conn| {
+            for instance_id in ["run-one", "run-via-task"] {
+                let status: String = conn.query_row(
+                    "SELECT status FROM workflow_instances WHERE id = ?1",
+                    [instance_id],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(status, "cancelled");
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+        let resume_error = crate::workflows::instance::InstanceManager::new(db.clone())
+            .set_active_status("run-via-task", "running")
+            .unwrap_err();
+        assert!(resume_error.to_string().contains("being deleted"));
         manager.finish_cascade("one").unwrap();
 
         assert!(matches!(

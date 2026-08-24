@@ -145,22 +145,13 @@ async fn delete_project_cascade(
     state.apply_config(new_config, state.llm_router());
 
     for agent in &plan.agents {
-        native::remove_agent_runtime_state(&old_config.system.data_dir, &agent.name).map_err(
+        native::remove_agent_runtime_state(&old_config.system.data_dir, &agent.id).map_err(
             |error| {
                 project_cleanup_error(format!(
                     "Project configuration was updated, but Agent runtime files could not be removed: {error}. Retry deletion after fixing the path permissions"
                 ))
             },
         )?;
-        if agent.id != agent.name {
-            native::remove_agent_runtime_state(&old_config.system.data_dir, &agent.id).map_err(
-                |error| {
-                    project_cleanup_error(format!(
-                        "Project configuration was updated, but Agent runtime files could not be removed: {error}. Retry deletion after fixing the path permissions"
-                    ))
-                },
-            )?;
-        }
     }
 
     manager.finish_cascade(id).map_err(project_error)?;
@@ -179,7 +170,7 @@ fn remove_project_agents_from_config(
     let deleted_agent_ids = plan
         .agents
         .iter()
-        .flat_map(|agent| [agent.id.as_str(), agent.name.as_str()])
+        .map(|agent| agent.id.as_str())
         .collect::<BTreeSet<_>>();
     config
         .agents
@@ -217,12 +208,6 @@ async fn interrupt_project_work(state: &AppState, plan: &ProjectDeletionPlan) {
             .conversation_processes
             .retire_agent_everywhere(&agent.id)
             .await;
-        if agent.id != agent.name {
-            state
-                .conversation_processes
-                .retire_agent_everywhere(&agent.name)
-                .await;
-        }
     }
 }
 
@@ -257,7 +242,6 @@ async fn remove_project_containers(
     }
     let mut workload_ids = BTreeSet::new();
     for agent in &plan.agents {
-        workload_ids.insert(agent.name.clone());
         workload_ids.insert(agent.id.clone());
     }
     workload_ids.extend(
@@ -609,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn config_cleanup_removes_only_deleted_project_agents_and_access() {
-        let agents = ["atlas", "alias", "other"]
+    fn config_cleanup_uses_stable_ids_when_a_display_name_collides() {
+        let agents = ["agent-id", "atlas", "other"]
             .into_iter()
             .map(|name| AgentConfig {
                 name: name.to_string(),
@@ -650,8 +634,11 @@ mod tests {
                 .iter()
                 .map(|agent| agent.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["alias", "other"]
+            vec!["atlas", "other"]
         );
-        assert_eq!(config.collaboration.authorized_agents, vec!["other"]);
+        assert_eq!(
+            config.collaboration.authorized_agents,
+            vec!["atlas", "other"]
+        );
     }
 }
