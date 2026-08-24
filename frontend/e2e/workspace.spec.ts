@@ -2093,6 +2093,43 @@ test('project settings rename and delete a project', async ({ page }) => {
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
 });
 
+test('project deletion refreshes the authoritative name and counts before confirmation', async ({ page }) => {
+	const projectGetRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectGetRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+	await expect.poll(() => projectGetRequests).toHaveLength(1);
+
+	sharedProjectState.project = {
+		...sharedProjectState.project!,
+		name: 'Current Project name',
+		updated_at: timestamp(120),
+		deletion_counts: {
+			agents: 2,
+			tasks: 9,
+			task_messages: 13,
+			conversations: 4,
+			conversation_messages: 17,
+			memory_notes: 3,
+			workflow_runs: 5,
+			schedules: 6,
+		},
+	};
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectGetRequests).toHaveLength(2);
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await expect(dialog.getByText('This permanently deletes “Current Project name” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
+	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
+});
+
 test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
 	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
 	const projectDeleteRequests: string[] = [];
