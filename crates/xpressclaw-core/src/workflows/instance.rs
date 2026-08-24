@@ -285,9 +285,15 @@ impl InstanceManager {
                     )));
                 }
             }
-            if let Some(project_id) = project_id.or(conversation_project.as_deref()) {
+            let resolved_project = project_id.or(conversation_project.as_deref());
+            if let Some(project_id) = resolved_project {
                 ensure_project_accepts_work(&transaction, project_id)
                     .map_err(|error| Error::Workflow(error.to_string()))?;
+                ensure_instance_project_matches_durable_work(
+                    &transaction,
+                    instance_id,
+                    project_id,
+                )?;
             }
             let updated = transaction.execute(
                 "UPDATE workflow_instances SET project_id = ?1, conversation_id = ?2 WHERE id = ?3",
@@ -908,22 +914,7 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
                 .map_err(|error| Error::Workflow(error.to_string()))?;
         }
     }
-    let derived_project_ids = {
-        let mut statement = conn.prepare(
-            "SELECT binding.project_id
-             FROM workflow_instance_agent_bindings binding
-             WHERE binding.instance_id = ?1
-             UNION
-             SELECT task.project_id
-             FROM workflow_step_executions execution
-             JOIN tasks task ON task.id = execution.task_id
-             WHERE execution.instance_id = ?1 AND task.project_id IS NOT NULL",
-        )?;
-        let project_ids = statement
-            .query_map([instance_id], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        project_ids
-    };
+    let derived_project_ids = instance_durable_project_ids(conn, instance_id)?;
     for derived_project_id in derived_project_ids {
         if Some(derived_project_id.as_str()) != project_id.as_deref()
             && Some(derived_project_id.as_str()) != conversation_project_id.as_deref()
@@ -933,6 +924,49 @@ fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) 
         }
     }
     Ok(())
+}
+
+fn ensure_instance_project_matches_durable_work(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let conflicting_projects = instance_durable_project_ids(conn, instance_id)?
+        .into_iter()
+        .filter(|derived_project_id| derived_project_id != project_id)
+        .collect::<Vec<_>>();
+    if conflicting_projects.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Workflow(format!(
+        "workflow instance '{instance_id}' has durable Agent or task work bound to project(s) {} and cannot move to project '{project_id}'",
+        conflicting_projects.join(", ")
+    )))
+}
+
+fn instance_durable_project_ids(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT project_id
+         FROM (
+             SELECT binding.project_id AS project_id
+             FROM workflow_instance_agent_bindings binding
+             WHERE binding.instance_id = ?1
+             UNION
+             SELECT task.project_id AS project_id
+             FROM workflow_step_executions execution
+             JOIN tasks task ON task.id = execution.task_id
+             WHERE execution.instance_id = ?1 AND task.project_id IS NOT NULL
+         )
+         ORDER BY project_id",
+    )?;
+    let project_ids = statement
+        .query_map([instance_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(project_ids)
 }
 
 fn bind_instance_to_agent_project(
@@ -1257,6 +1291,61 @@ mod tests {
             Some("project-one")
         );
         assert_eq!(mgr.get_instance(&task_scoped.id).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn workflow_context_cannot_cross_durable_project_boundaries() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO projects (id, name) VALUES ('project-two', 'Project Two');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('project-agent', 'Project Agent', 'codex', '{}', 'stopped', 'project-one');
+                 INSERT INTO tasks (id, title, status, project_id)
+                 VALUES ('project-task', 'Project task', 'pending', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        let agent_inputs = vec![("worker".to_string(), "project-agent".to_string())];
+        let agent_scoped = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    workflow_agent_bindings: &agent_inputs,
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let task_scoped = mgr.create_instance("wf1", None, None).unwrap();
+        let execution = mgr
+            .create_step_execution(&task_scoped.id, "main", "work", None)
+            .unwrap();
+        mgr.set_step_task(&execution.id, "project-task").unwrap();
+
+        for instance_id in [&agent_scoped.id, &task_scoped.id] {
+            let error = mgr
+                .set_context(instance_id, Some("project-two"), None)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("durable Agent or task work bound to project(s) project-one"));
+            assert_eq!(mgr.get_instance(instance_id).unwrap().project_id, None);
+        }
+
+        let projects = crate::projects::ProjectManager::new(db);
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+        for instance_id in [&agent_scoped.id, &task_scoped.id] {
+            assert!(matches!(
+                mgr.get_instance(instance_id),
+                Err(Error::WorkflowInstanceNotFound { .. })
+            ));
+        }
     }
 
     #[test]
