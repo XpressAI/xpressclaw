@@ -168,7 +168,9 @@ mod tests {
     use super::*;
 
     use std::io::{Read, Write};
-    use std::net::{TcpListener, UdpSocket};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     static PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -209,31 +211,101 @@ mod tests {
         }
     }
 
-    fn serve_once(listener: TcpListener, body: &'static str) -> std::thread::JoinHandle<bool> {
-        std::thread::spawn(move || {
+    struct LocalHttpTestServer {
+        address: SocketAddr,
+        shutdown: mpsc::Sender<()>,
+        handle: Option<std::thread::JoinHandle<Vec<String>>>,
+    }
+
+    impl LocalHttpTestServer {
+        fn start(body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
             listener.set_nonblocking(true).unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while std::time::Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 2048];
-                        let _ = stream.read(&mut request);
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
-                        .unwrap();
-                        return true;
+            let (shutdown, shutdown_receiver) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut requests = Vec::new();
+                while Instant::now() < deadline {
+                    match shutdown_receiver.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {}
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(250)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_millis(250)))
+                                .unwrap();
+                            requests.push(read_http_request(&mut stream));
+                            write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("local HTTP test server failed: {error}"),
                     }
-                    Err(error) => panic!("local HTTP test server failed: {error}"),
                 }
+                requests
+            });
+            Self {
+                address,
+                shutdown,
+                handle: Some(handle),
             }
-            false
-        })
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            let _ = self.shutdown.send(());
+            self.handle
+                .take()
+                .unwrap()
+                .join()
+                .expect("local HTTP test server panicked")
+        }
+    }
+
+    impl Drop for LocalHttpTestServer {
+        fn drop(&mut self) {
+            let _ = self.shutdown.send(());
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        const MAX_REQUEST_SIZE: usize = 16 * 1024;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 2048];
+        while request.len() < MAX_REQUEST_SIZE {
+            match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    request.extend_from_slice(&buffer[..bytes_read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("local HTTP test server could not read request: {error}"),
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
     }
 
     #[test]
@@ -248,27 +320,37 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_http_clients_ignore_inherited_proxy_settings() {
-        let _environment_lock = PROXY_ENV_LOCK.lock().await;
-        let target = TcpListener::bind("0.0.0.0:0").unwrap();
-        let target_port = target.local_addr().unwrap().port();
-        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
-        let local_ip = UdpSocket::bind("0.0.0.0:0")
-            .and_then(|socket| {
-                socket.connect("192.0.2.1:9")?;
-                socket.local_addr()
-            })
-            .unwrap()
-            .ip();
-        assert!(!local_ip.is_loopback());
+        const TEST_HOST: &str = "collaboration.xpressclaw.test";
+        const PROXY_CANARY: &str = "would-leak-without-no-proxy";
+        const LOCAL_CREDENTIAL: &str = "local-collaboration-credential";
 
-        let target_server = serve_once(target, "target");
-        let proxy_server = serve_once(proxy, "proxy");
+        let _environment_lock = PROXY_ENV_LOCK.lock().await;
+        let target_server = LocalHttpTestServer::start("target");
+        let proxy_server = LocalHttpTestServer::start("proxy");
+        let target_url = format!("http://{TEST_HOST}:{}/health", target_server.address.port());
+        let proxy_url = format!("http://{}", proxy_server.address);
         let _proxy_environment = ProxyEnvironment::point_at(&proxy_url);
-        let response = local_http_client_builder()
+
+        let proxied_response = reqwest::Client::builder()
+            .resolve(TEST_HOST, target_server.address)
+            .timeout(Duration::from_secs(2))
             .build()
             .unwrap()
-            .get(format!("http://{local_ip}:{target_port}/health"))
+            .get(&target_url)
+            .bearer_auth(PROXY_CANARY)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let direct_response = local_http_client_builder()
+            .resolve(TEST_HOST, target_server.address)
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(&target_url)
+            .bearer_auth(LOCAL_CREDENTIAL)
             .send()
             .await
             .unwrap()
@@ -276,9 +358,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response, "target");
-        assert!(target_server.join().unwrap());
-        assert!(!proxy_server.join().unwrap());
+        let proxy_requests = proxy_server.finish();
+        let target_requests = target_server.finish();
+        drop(_proxy_environment);
+
+        assert_eq!(proxied_response, "proxy");
+        assert_eq!(direct_response, "target");
+        assert_eq!(proxy_requests.len(), 1, "{proxy_requests:#?}");
+        assert_eq!(target_requests.len(), 1, "{target_requests:#?}");
+
+        let proxy_request = proxy_requests[0].to_ascii_lowercase();
+        assert!(proxy_request.contains(&target_url));
+        assert!(proxy_request.contains(&format!("authorization: bearer {PROXY_CANARY}")));
+        assert!(!proxy_request.contains(LOCAL_CREDENTIAL));
+
+        let target_request = target_requests[0].to_ascii_lowercase();
+        assert!(target_request.contains(&format!("host: {TEST_HOST}")));
+        assert!(target_request.contains(&format!("authorization: bearer {LOCAL_CREDENTIAL}")));
+        assert!(!target_request.contains(PROXY_CANARY));
     }
 
     #[test]
