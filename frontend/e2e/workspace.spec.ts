@@ -28,6 +28,84 @@ async function elapsedSeconds(indicator: Locator): Promise<number> {
 	return Number.parseFloat(text);
 }
 
+function cssRgb(value: string): [number, number, number] {
+	const channels = value.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+	if (!channels || channels.length !== 3) throw new Error(`Could not parse CSS color: ${value}`);
+	return channels as [number, number, number];
+}
+
+function contrastRatio(foreground: string, background: string): number {
+	const luminance = (value: string) => {
+		const channels = cssRgb(value).map((channel) => {
+			const normalized = channel / 255;
+			return normalized <= 0.04045
+				? normalized / 12.92
+				: ((normalized + 0.055) / 1.055) ** 2.4;
+		});
+		return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+	};
+	const lighter = Math.max(luminance(foreground), luminance(background));
+	const darker = Math.min(luminance(foreground), luminance(background));
+	return (lighter + 0.05) / (darker + 0.05);
+}
+
+async function expectReadableCode(message: Locator) {
+	const inlineCode = message.locator('.prose-chat p code').first();
+	const fencedCode = message.locator('.prose-chat pre').first();
+	await expect(inlineCode).toBeVisible();
+	await expect(fencedCode).toBeVisible();
+
+	const inlineStyles = await inlineCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		return {
+			color: styles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			userSelect: styles.userSelect,
+		};
+	});
+	const fencedStyles = await fencedCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		const codeStyles = getComputedStyle(element.querySelector('code')!);
+		return {
+			color: codeStyles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			overflowX: styles.overflowX,
+			userSelect: codeStyles.userSelect,
+		};
+	});
+
+	expect(contrastRatio(inlineStyles.color, inlineStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(contrastRatio(fencedStyles.color, fencedStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(inlineStyles.borderStyle).not.toBe('none');
+	expect(inlineStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.borderStyle).not.toBe('none');
+	expect(fencedStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.overflowX).toBe('auto');
+	expect(inlineStyles.userSelect).not.toBe('none');
+	expect(fencedStyles.userSelect).not.toBe('none');
+}
+
+async function installTauriClipboardImage(page: Page) {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands = [];
+		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands.push(command);
+				if (command === 'plugin:clipboard-manager|read_image') return 42;
+				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
+				if (command === 'plugin:image|size') return { width: 1, height: 1 };
+				if (command === 'plugin:resources|close') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+}
+
 function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Current activity') {
 	return {
 		id,
@@ -517,12 +595,26 @@ async function mockApi(
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
 				options.conversationMessageRequests?.push(payload);
+				const messageId = conversationMessages.length + 100;
+				const uploads = Array.isArray(payload.attachments)
+					? payload.attachments as { name: string; mime_type: string; data: string }[]
+					: [];
 				const sent = {
-					id: conversationMessages.length + 100,
+					id: messageId,
 					conversation_id: conversationId,
 					sender_type: 'user', sender_id: 'local', sender_name: 'You',
 					content: payload.content, message_type: 'message', linked_task_id: null,
-					metadata: {}, attachments: [], created_at: timestamp(200),
+					metadata: {},
+					attachments: uploads.map((attachment, index) => ({
+						id: `sent-attachment-${index}`,
+						message_id: messageId,
+						name: attachment.name,
+						mime_type: attachment.mime_type,
+						size: Math.floor(attachment.data.length * 3 / 4),
+						source_task_id: null,
+						created_at: timestamp(200),
+					})),
+					created_at: timestamp(200),
 				};
 				conversationMessages.push(sent);
 				response = { message: sent, queued_agents: [agentId] };
@@ -1313,18 +1405,7 @@ test('new activity follows only while the transcript is at the bottom', async ({
 
 test('task messages accept selected and pasted images', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
-	await page.addInitScript(() => {
-		Object.defineProperty(window, 'isTauri', { value: true });
-		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
-			invoke: async (command: string) => {
-				if (command === 'plugin:clipboard-manager|read_image') return 42;
-				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
-				if (command === 'plugin:image|size') return { width: 1, height: 1 };
-				if (command === 'plugin:resources|close') return null;
-				throw new Error(`Unexpected Tauri command: ${command}`);
-			},
-		};
-	});
+	await installTauriClipboardImage(page);
 	await mockApi(page, { postedMessages });
 	await page.goto(`/tasks/${taskId}`);
 
@@ -1378,6 +1459,219 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	expect(postedMessages[0].content).toBe('');
 	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png', 'pasted-image.png']);
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
+});
+
+test('inline and fenced code stay readable in user and agent chat bubbles in both themes', async ({ page }) => {
+	const codeConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Code contrast review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = [
+		{
+			id: 1,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: 'Conversation user `conversation-inline-user`.\n\n```ts\nconst conversationUserBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(10),
+		},
+		{
+			id: 2,
+			conversation_id: conversationId,
+			sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace',
+			content: 'Conversation agent `conversation-inline-agent`.\n\n```ts\nconst conversationAgentBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(20),
+		},
+	];
+	const taskMessages = [
+		{
+			id: 1, task_id: taskId, role: 'user', attachments: [], timestamp: timestamp(25),
+			content: 'Task user `task-inline-user`.\n\n```ts\nconst taskUserBlock = true;\n```',
+		},
+		{
+			id: 2, task_id: taskId, role: 'assistant', attachments: [], timestamp: timestamp(30),
+			content: 'Task agent `task-inline-agent`.\n\n```ts\nconst taskAgentBlock = true;\n```',
+		},
+	];
+	await mockApi(page, {
+		conversations: [codeConversation],
+		conversationMessages,
+		taskMessages,
+	});
+
+	await page.goto(`/conversations/${conversationId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'conversation-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'conversation-inline-agent' }));
+	}
+
+	await page.goto(`/tasks/${taskId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'task-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'task-inline-agent' }));
+	}
+});
+
+test('project conversations accept picker, browser, and native clipboard attachments', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const attachmentConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Image handoff',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2QAAAABJRU5ErkJggg==', 'base64');
+	await installTauriClipboardImage(page);
+	await mockApi(page, {
+		conversations: [attachmentConversation],
+		conversationMessageRequests,
+	});
+	await page.route(new RegExp(`/api/conversations/${conversationId}/attachments/sent-attachment-(1|2)$`), async (route) => {
+		await route.fulfill({ status: 200, contentType: 'image/png', body: png });
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	const fileInput = page.locator('[data-conversation-attachment-input]');
+	await fileInput.setInputFiles([
+		{ name: 'selected.png', mimeType: 'image/png', buffer: png },
+		{ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('supporting notes') },
+	]);
+	const composer = page.getByPlaceholder('Message #Image handoff…');
+	const composerShell = page.locator('[data-conversation-composer]');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+	await expect(composerShell.getByAltText('selected.png')).toHaveAttribute('src', /^data:image\/png;base64,/);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toBeVisible();
+
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.items.add(new File(
+			[new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			'pasted.png',
+			{ type: 'image/png' },
+		));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted.png')).toBeVisible();
+
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted-image.png')).toBeVisible();
+
+	const textPasteAllowed = await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'ordinary text');
+		return element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	expect(textPasteAllowed).toBe(true);
+
+	await composer.fill('Keep this draft');
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'clipboard caption');
+		transfer.items.add(new File([new Uint8Array([1, 2, 3, 4])], 'mixed.png', { type: 'image/png' }));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composer).toHaveValue('Keep this draft');
+	await expect(composerShell.getByAltText('mixed.png')).toBeVisible();
+
+	await fileInput.setInputFiles(Array.from({ length: 6 }, (_, index) => ({
+		name: `overflow-${index + 1}.txt`,
+		mimeType: 'text/plain',
+		buffer: Buffer.from('x'),
+	})));
+	await expect(composerShell.getByRole('alert')).toHaveText('A message can include up to 10 files.');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+
+	await composerShell.getByRole('button', { name: 'Remove selected.png' }).click();
+	await composerShell.getByRole('button', { name: 'Remove mixed.png' }).click();
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+	await expect(composerShell.getByAltText('selected.png')).toHaveCount(0);
+	await page.evaluate(() => {
+		const target = window as unknown as {
+			__clipboardCommands: string[];
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__TAURI_INTERNALS__.invoke = async (command: string) => {
+			target.__clipboardCommands.push(command);
+			if (command === 'plugin:clipboard-manager|read_image') throw new Error('Clipboard unavailable');
+			throw new Error(`Unexpected Tauri command: ${command}`);
+		};
+	});
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByRole('alert')).toHaveText('Could not read an image from the system clipboard.');
+	await composer.fill('');
+	await page.getByRole('button', { name: 'Send', exact: true }).click();
+
+	await expect.poll(() => conversationMessageRequests.length).toBe(1);
+	const request = conversationMessageRequests[0];
+	const attachments = request.attachments as { name: string; mime_type: string; data: string }[];
+	expect(request.content).toBe('');
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['notes.txt', 'pasted.png', 'pasted-image.png']);
+	expect(attachments.every((attachment) => attachment.data.length > 0)).toBe(true);
+	await expect(composerShell.locator('[data-image-attachments]')).toHaveCount(0);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toHaveCount(0);
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+
+	const sentPastedImage = page.getByAltText('pasted.png');
+	const sentNativeImage = page.getByAltText('pasted-image.png');
+	await expect(sentPastedImage).toBeVisible();
+	await expect(sentNativeImage).toBeVisible();
+	await expect.poll(() => sentPastedImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	await expect.poll(() => sentNativeImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
 });
 
 test('project conversations coordinate files and project-wide linked work', async ({ page }) => {

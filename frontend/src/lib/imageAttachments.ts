@@ -39,17 +39,21 @@ export async function appendImageFiles(
 	return [...current, ...additions];
 }
 
-export function clipboardImageFiles(event: ClipboardEvent): File[] {
+export function clipboardFiles(event: ClipboardEvent): File[] {
 	const clipboard = event.clipboardData;
 	if (!clipboard) return [];
 
-	const files = Array.from(clipboard.files).filter((file) => file.type.startsWith('image/'));
+	const files = Array.from(clipboard.files);
 	if (files.length > 0) return files;
 
 	return Array.from(clipboard.items)
-		.filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+		.filter((item) => item.kind === 'file')
 		.map((item) => item.getAsFile())
 		.filter((file): file is File => file !== null);
+}
+
+export function clipboardImageFiles(event: ClipboardEvent): File[] {
+	return clipboardFiles(event).filter((file) => file.type.startsWith('image/'));
 }
 
 export function shouldHandleImagePaste(event: ClipboardEvent): boolean {
