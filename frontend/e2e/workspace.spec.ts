@@ -2616,6 +2616,18 @@ test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) 
 	);
 });
 
+test('custom runner kinds containing a built-in name stay custom in Agent settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'codex-proxy' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('codex-proxy');
+	await expect(page.locator('#runner-kind').locator('option:checked')).toHaveText(
+		'Other ACP harness (codex-proxy)',
+	);
+	await expect(page.locator('#runner-image')).toHaveValue('xpressclaw-runner-codex-proxy:latest');
+});
+
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {
 	const connection = { online: true };
 	await page.setViewportSize({ width: 390, height: 844 });

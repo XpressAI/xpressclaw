@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::acp::{infer_agent_kind, ACP_AGENTS};
+use xpressclaw_core::acp::{canonical_agent_kind, infer_agent_kind_from_backend, ACP_AGENTS};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
@@ -789,19 +789,21 @@ struct AgentSetup {
 }
 
 fn runner_kind_from_setup(setup: &AgentSetup) -> String {
-    let configured = setup
-        .runner_kind
-        .as_deref()
-        .or(setup.backend.as_deref())
-        .unwrap_or("codex")
-        .to_lowercase();
-    if configured == "auto" {
-        "codex".to_string()
-    } else {
-        infer_agent_kind(&configured)
-            .unwrap_or(configured.as_str())
-            .to_string()
+    if let Some(configured) = setup.runner_kind.as_deref() {
+        let configured = configured.to_lowercase();
+        return if configured == "auto" {
+            "codex".to_string()
+        } else {
+            canonical_agent_kind(&configured)
+                .unwrap_or(configured.as_str())
+                .to_string()
+        };
     }
+
+    let backend = setup.backend.as_deref().unwrap_or("codex").to_lowercase();
+    infer_agent_kind_from_backend(&backend)
+        .unwrap_or(backend.as_str())
+        .to_string()
 }
 
 fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
@@ -2494,6 +2496,17 @@ mod tests {
                 "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
             );
         }
+    }
+
+    #[test]
+    fn setup_does_not_reclassify_an_explicit_custom_kind() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex-proxy",
+            "backend": "codex",
+            "runner_command": ["codex-proxy", "acp"]
+        }))
+        .unwrap();
+        assert_eq!(runner_kind_from_setup(&setup), "codex-proxy");
     }
 
     #[test]

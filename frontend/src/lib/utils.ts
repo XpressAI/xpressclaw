@@ -60,16 +60,23 @@ export function harnessMark(backend: string): string {
 	return 'R';
 }
 
-/** Normalize legacy/backend aliases to the stable built-in harness kind. */
+/** Normalize exact supported aliases to a stable built-in harness kind. */
 export function canonicalHarnessKind(backend: string): string {
 	const normalized = backend.trim().toLowerCase();
-	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp'].includes(normalized)
-		|| normalized.includes('deepseek-harness')) return 'deepseek-harness';
+	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp', '@openma/deepseek-harness-acp'].includes(normalized)) return 'deepseek-harness';
+	if (normalized === 'copilot') return 'github-copilot';
+	if (normalized === 'pi-acp') return 'pi';
+	return normalized;
+}
+
+/** Infer a built-in kind from a legacy backend label, where fuzzy matching is intentional. */
+export function inferHarnessKindFromBackend(backend: string): string {
+	const normalized = canonicalHarnessKind(backend);
+	if (normalized.includes('deepseek-harness')) return 'deepseek-harness';
 	if (normalized.includes('claude')) return 'claude';
 	if (normalized.includes('opencode')) return 'opencode';
 	if (normalized.includes('codex')) return 'codex';
 	if (normalized.includes('copilot')) return 'github-copilot';
-	if (normalized === 'pi-acp') return 'pi';
 	return normalized;
 }
 

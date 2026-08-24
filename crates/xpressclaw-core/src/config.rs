@@ -419,12 +419,12 @@ impl AgentConfig {
         let configured_kind = self.runner.kind.trim().to_lowercase();
         let kind = if configured_kind.is_empty() || configured_kind == "auto" {
             let backend = self.backend.to_lowercase();
-            let Some(kind) = crate::acp::infer_agent_kind(&backend) else {
+            let Some(kind) = crate::acp::infer_agent_kind_from_backend(&backend) else {
                 return false;
             };
             kind
         } else {
-            crate::acp::infer_agent_kind(&configured_kind).unwrap_or(configured_kind.as_str())
+            crate::acp::canonical_agent_kind(&configured_kind).unwrap_or(configured_kind.as_str())
         };
 
         if let Some(image) = default_native_runner_image(kind, ContainerEngineAccess::None) {
@@ -1030,6 +1030,26 @@ agents:
         assert_eq!(
             config.agents[0].runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
+        );
+    }
+
+    #[test]
+    fn retired_shared_runner_image_does_not_reclassify_an_explicit_custom_kind() {
+        let yaml = r#"
+agents:
+  - name: proxy
+    backend: codex
+    runner:
+      kind: codex-proxy
+      image: xpressclaw-native-runner:latest
+      command: [codex-proxy, acp]
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.agents[0].migrate_legacy_runner_image());
+        assert_eq!(config.agents[0].runner.kind, "codex-proxy");
+        assert_eq!(
+            config.agents[0].runner.image,
+            "xpressclaw-native-runner:latest"
         );
     }
 

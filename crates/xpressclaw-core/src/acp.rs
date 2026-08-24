@@ -347,26 +347,44 @@ pub fn agent_definition(kind: &str) -> Option<&'static AcpAgentDefinition> {
     ACP_AGENTS.iter().find(|agent| agent.kind == kind)
 }
 
-/// Resolve a configured runner kind or legacy backend label to a catalog ID.
+/// Resolve an exact configured runner kind or supported product alias.
 ///
-/// Product aliases live beside the catalog so setup, migrations, and runtime
-/// dispatch cannot disagree about whether a built-in harness is custom.
-pub fn infer_agent_kind(value: &str) -> Option<&'static str> {
+/// Keep this exact: callers use the result to decide which sensitive host
+/// configuration directories may be mounted into a runner container.
+pub fn canonical_agent_kind(value: &str) -> Option<&'static str> {
     let normalized = value.trim().to_ascii_lowercase();
-    ACP_AGENTS
-        .iter()
-        .find(|agent| {
-            normalized == agent.kind
-                || (agent.kind.len() >= 4 && normalized.contains(agent.kind))
-                || (agent.kind == "github-copilot" && normalized.contains("copilot"))
-                || (agent.kind == "deepseek-harness"
-                    && matches!(
-                        normalized.as_str(),
-                        "deepseek" | "dsh" | "dsh-acp" | "deepseek-harness-acp"
-                    ))
-                || (agent.kind == "pi" && normalized == "pi-acp")
-        })
-        .map(|agent| agent.kind)
+    if let Some(agent) = ACP_AGENTS.iter().find(|agent| normalized == agent.kind) {
+        return Some(agent.kind);
+    }
+    match normalized.as_str() {
+        "copilot" => Some("github-copilot"),
+        "deepseek"
+        | "dsh"
+        | "dsh-acp"
+        | "deepseek-harness-acp"
+        | "@openma/deepseek-harness-acp" => Some("deepseek-harness"),
+        "pi-acp" => Some("pi"),
+        _ => None,
+    }
+}
+
+/// Infer a built-in product from a legacy backend label.
+///
+/// Old configurations used backend strings such as package names instead of
+/// catalog IDs, so this path deliberately retains fuzzy matching. Never use it
+/// for an explicit `runner.kind`: doing so could grant a custom runner a
+/// built-in product's host credential mounts.
+pub fn infer_agent_kind_from_backend(value: &str) -> Option<&'static str> {
+    canonical_agent_kind(value).or_else(|| {
+        let normalized = value.trim().to_ascii_lowercase();
+        ACP_AGENTS
+            .iter()
+            .find(|agent| {
+                (agent.kind.len() >= 4 && normalized.contains(agent.kind))
+                    || (agent.kind == "github-copilot" && normalized.contains("copilot"))
+            })
+            .map(|agent| agent.kind)
+    })
 }
 
 pub fn default_runner_image(
@@ -450,10 +468,15 @@ mod tests {
         assert_eq!(dsh.host_executables, ["dsh-acp", "dsh"]);
         assert_eq!(dsh.auth_mounts, DEEPSEEK_HARNESS_AUTH);
         assert!(!dsh.auth_mounts[0].read_only);
-        assert_eq!(infer_agent_kind("dsh"), Some("deepseek-harness"));
+        assert_eq!(canonical_agent_kind("dsh"), Some("deepseek-harness"));
         assert_eq!(
-            infer_agent_kind("@openma/deepseek-harness-acp"),
+            canonical_agent_kind("@openma/deepseek-harness-acp"),
             Some("deepseek-harness")
+        );
+        assert_eq!(canonical_agent_kind("my-codex-runner"), None);
+        assert_eq!(
+            infer_agent_kind_from_backend("legacy-my-codex-runner"),
+            Some("codex")
         );
         assert_eq!(
             default_runner_image("deepseek-harness", ContainerEngineAccess::None),

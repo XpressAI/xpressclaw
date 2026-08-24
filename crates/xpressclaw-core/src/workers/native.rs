@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::acp::{agent_definition, infer_agent_kind, local_runner_image};
+use crate::acp::{
+    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend, local_runner_image,
+};
 use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
@@ -1323,12 +1325,12 @@ fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str, output: &st
 pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
     if agent.runner.kind != "auto" {
         let configured = agent.runner.kind.to_lowercase();
-        return Ok(infer_agent_kind(&configured)
+        return Ok(canonical_agent_kind(&configured)
             .unwrap_or(configured.as_str())
             .to_string());
     }
     let backend = agent.backend.to_lowercase();
-    if let Some(kind) = infer_agent_kind(&backend) {
+    if let Some(kind) = infer_agent_kind_from_backend(&backend) {
         Ok(kind.to_string())
     } else if !agent.runner.command.is_empty() {
         Ok("custom".to_string())
@@ -3955,6 +3957,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_runner_kind(&agent).unwrap(), "deepseek-harness");
+    }
+
+    #[test]
+    fn explicit_custom_kind_is_not_reclassified_as_a_builtin() {
+        let agent = AgentConfig {
+            backend: "codex".into(),
+            runner: NativeRunnerConfig {
+                kind: "codex-proxy".into(),
+                command: vec!["codex-proxy".into(), "acp".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let kind = resolve_runner_kind(&agent).unwrap();
+        assert_eq!(kind, "codex-proxy");
+        assert!(agent_definition(&kind).is_none());
     }
 
     #[test]

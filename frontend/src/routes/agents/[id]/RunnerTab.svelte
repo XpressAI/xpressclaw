@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { mcpServers, sessions, setup } from '$lib/api';
-	import { canonicalHarnessKind } from '$lib/utils';
+	import { canonicalHarnessKind, inferHarnessKindFromBackend } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
 
@@ -144,7 +144,7 @@
 
 		const configuredKind = config.runner.kind;
 		kind = configuredKind === 'auto'
-			? canonicalHarnessKind(config.backend)
+			? inferHarnessKindFromBackend(config.backend)
 			: canonicalHarnessKind(configuredKind);
 		containerEngine = config.runner.container_engine ?? 'none';
 		image = isBuiltInImage(config.runner.image) ? defaultImage() : config.runner.image;
@@ -325,6 +325,9 @@
 					{#each agentOptions as agent}
 						<option value={agent.kind}>{agent.name}</option>
 					{/each}
+					{#if kind !== 'custom' && !agentOptions.some((agent) => agent.kind === kind)}
+						<option value={kind}>Other ACP harness ({kind})</option>
+					{/if}
 					<option value="custom">Other ACP harness</option>
 				</select>
 			</div>
