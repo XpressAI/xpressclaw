@@ -125,16 +125,34 @@ impl SessionManager {
     /// valid, but titles are always refreshed from the current project path.
     pub fn ensure(&self, session_id: &str, title: Option<&str>) -> Result<LogicalSession> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let project_id = transaction
+                .query_row(
+                    "SELECT project_id FROM agents WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: session_id.to_string(),
+                })?;
+            if let Some(project_id) = project_id.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
+            transaction.execute(
                 "INSERT OR IGNORE INTO logical_sessions (id, agent_id, title) VALUES (?1, ?1, ?2)",
                 rusqlite::params![session_id, title],
             )?;
             if title.is_some() {
-                conn.execute(
+                transaction.execute(
                     "UPDATE logical_sessions SET title = ?1 WHERE id = ?2",
                     rusqlite::params![title, session_id],
                 )?;
             }
+            transaction.commit()?;
             Ok::<_, Error>(())
         })?;
         self.get(session_id)
@@ -940,9 +958,61 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptArtifact>
 mod tests {
     use super::*;
 
+    fn insert_agent(db: &Arc<Database>, id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES (?1, ?1, 'native', '{}')",
+                [id],
+            )
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ensuring_a_session_serializes_with_project_deletion() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'project-one');",
+            )
+        })
+        .unwrap();
+        let manager = SessionManager::new(db.clone());
+        manager.ensure("atlas", Some("Before deletion")).unwrap();
+
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        let deleting_error = manager
+            .ensure("atlas", Some("After deletion started"))
+            .unwrap_err();
+        assert!(deleting_error.to_string().contains("being deleted"));
+        assert_eq!(
+            manager.get("atlas").unwrap().title.as_deref(),
+            Some("Before deletion")
+        );
+
+        projects.finish_cascade("project-one").unwrap();
+        assert!(matches!(
+            manager.ensure("atlas", Some("Stale request")),
+            Err(Error::AgentNotFound { .. })
+        ));
+        let session_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM logical_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(session_count, 0);
+    }
+
     #[test]
     fn session_timeline_and_attempt_lifecycle() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -1008,6 +1078,7 @@ mod tests {
     #[test]
     fn response_phase_resets_after_waiting_without_rewriting_attempt_start() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -1070,6 +1141,7 @@ mod tests {
     #[test]
     fn event_provenance_is_preserved() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "seo");
         let manager = SessionManager::new(db);
         manager.ensure("seo", None).unwrap();
         let event = manager
@@ -1095,6 +1167,7 @@ mod tests {
     #[test]
     fn task_activity_is_scoped_and_incremental() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("website")).unwrap();
         db.with_conn(|conn| {
@@ -1159,6 +1232,7 @@ mod tests {
     #[test]
     fn task_activity_pages_back_through_older_events() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("website")).unwrap();
         db.with_conn(|conn| {
@@ -1211,6 +1285,7 @@ mod tests {
     #[test]
     fn deleting_a_session_clears_task_and_queue_pointers() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {
@@ -1260,6 +1335,7 @@ mod tests {
     #[test]
     fn terminal_attempt_cannot_be_revived_by_a_late_worker_transition() {
         let db = Arc::new(Database::open_memory().unwrap());
+        insert_agent(&db, "builder");
         let manager = SessionManager::new(db.clone());
         manager.ensure("builder", Some("Builder")).unwrap();
         db.with_conn(|conn| {

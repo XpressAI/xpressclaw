@@ -3023,10 +3023,11 @@ mod tests {
     fn task_search_matches_all_terms_across_task_conversations() {
         let (db, board) = setup();
         db.with_conn(|conn| {
-            conn.execute(
+            conn.execute_batch(
                 "INSERT INTO agents (id, name, backend, config)
-                 VALUES ('developer', 'Developer', 'native', '{}')",
-                [],
+                 VALUES ('developer', 'Developer', 'native', '{}');
+                 INSERT INTO agents (id, name, backend, config)
+                 VALUES ('search-session', 'Search session', 'native', '{}');",
             )
         })
         .unwrap();
