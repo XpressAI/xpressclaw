@@ -14,7 +14,10 @@ use agent_client_protocol::schema::v1::{
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
+    Semaphore,
+};
 use tracing::{error, info, warn};
 
 use crate::acp::{
@@ -73,6 +76,7 @@ struct NativeAttemptRuntime {
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
     processes: Arc<ProjectAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 }
@@ -105,6 +109,49 @@ struct PiMcpBridge {
 #[derive(Default)]
 pub struct ConversationAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
+}
+
+/// Per-Agent barrier covering native runtime preparation, launch, and use.
+///
+/// Destructive Project lifecycle operations take the write side for their
+/// stable Agent IDs after signalling cancellation. This waits for workers that
+/// already passed their durable queue checks and prevents a claimed worker
+/// from launching a new retained runtime until deletion has finalized.
+#[derive(Default)]
+pub struct NativeRuntimeLifecycle {
+    slots: StdMutex<HashMap<String, Arc<AsyncRwLock<()>>>>,
+}
+
+impl NativeRuntimeLifecycle {
+    fn slot(&self, agent_id: &str) -> Arc<AsyncRwLock<()>> {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncRwLock::new(())))
+            .clone()
+    }
+
+    async fn enter(&self, agent_id: &str) -> OwnedRwLockReadGuard<()> {
+        self.slot(agent_id).read_owned().await
+    }
+
+    /// Wait for all in-flight native work using these stable Agent IDs and
+    /// prevent new work from entering until the returned guards are dropped.
+    pub async fn quiesce_agents(&self, agent_ids: &[String]) -> Vec<OwnedRwLockWriteGuard<()>> {
+        let mut agent_ids = agent_ids.to_vec();
+        agent_ids.sort();
+        agent_ids.dedup();
+        let slots = agent_ids
+            .iter()
+            .map(|agent_id| self.slot(agent_id))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(slots.len());
+        for slot in slots {
+            guards.push(slot.write_owned().await);
+        }
+        guards
+    }
 }
 
 impl ConversationAcpProcesses {
@@ -333,6 +380,8 @@ pub struct NativeDispatcherServices {
     pub elicitation_broker: Arc<AcpElicitationBroker>,
     pub turn_controls: Arc<AcpTurnControlBroker>,
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Per-Agent launch/use barrier shared with destructive lifecycle routes.
+    pub runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Ephemeral capability used only on the container callback listener.
     pub control_plane_token: Arc<str>,
 }
@@ -353,6 +402,7 @@ pub async fn start_dispatcher(
         elicitation_broker,
         turn_controls,
         conversation_processes,
+        runtime_lifecycle,
         control_plane_token,
     } = services;
     let installation_id = match db.installation_id() {
@@ -374,6 +424,7 @@ pub async fn start_dispatcher(
     let conversation_elicitations = elicitation_broker.clone();
     let conversation_controls = turn_controls.clone();
     let conversation_base_processes = processes.clone();
+    let conversation_runtime_lifecycle = runtime_lifecycle.clone();
     let conversation_control_token = control_plane_token.clone();
     tokio::spawn(async move {
         start_conversation_dispatcher(
@@ -385,6 +436,7 @@ pub async fn start_dispatcher(
             conversation_controls,
             conversation_base_processes,
             conversation_processes,
+            conversation_runtime_lifecycle,
             control_plane_port,
             conversation_control_token,
         )
@@ -421,6 +473,7 @@ pub async fn start_dispatcher(
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
                 let processes = processes.clone();
+                let runtime_lifecycle = runtime_lifecycle.clone();
                 let control_plane_token = control_plane_token.clone();
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
@@ -436,6 +489,7 @@ pub async fn start_dispatcher(
                             elicitation_broker,
                             turn_controls: turn_controls.clone(),
                             processes,
+                            runtime_lifecycle,
                             control_plane_port,
                             control_plane_token,
                         },
@@ -479,6 +533,7 @@ async fn start_conversation_dispatcher(
     turn_controls: Arc<AcpTurnControlBroker>,
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 ) {
@@ -522,6 +577,7 @@ async fn start_conversation_dispatcher(
                     turn_controls: turn_controls.clone(),
                     project_processes: project_processes.clone(),
                     conversation_processes: conversation_processes.clone(),
+                    runtime_lifecycle: runtime_lifecycle.clone(),
                     control_plane_port,
                     control_plane_token: control_plane_token.clone(),
                 };
@@ -571,6 +627,7 @@ struct ConversationAttemptRuntime {
     turn_controls: Arc<AcpTurnControlBroker>,
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 }
@@ -588,9 +645,11 @@ async fn execute_conversation_turn(
         turn_controls,
         project_processes,
         conversation_processes,
+        runtime_lifecycle,
         control_plane_port,
         control_plane_token,
     } = runtime;
+    let _runtime_lifecycle_guard = runtime_lifecycle.enter(&turn.agent_id).await;
     let queue = ConversationTurnQueue::new(db.clone());
     if !queue.is_running(&turn.id)? {
         return Ok(());
@@ -688,6 +747,10 @@ async fn execute_conversation_turn(
     } else {
         (None, Vec::new())
     };
+
+    if !queue.is_running(&turn.id)? {
+        return Ok(());
+    }
 
     let base = project_processes
         .get_or_start(&docker, &agent.name, &spec)
@@ -856,9 +919,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         elicitation_broker,
         turn_controls,
         processes,
+        runtime_lifecycle,
         control_plane_port,
         control_plane_token,
     } = runtime;
+    let _runtime_lifecycle_guard = runtime_lifecycle.enter(&item.agent_id).await;
     let attempt_id = item
         .attempt_id
         .as_deref()
@@ -1032,6 +1097,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     } else {
         None
     };
+    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+        return Ok(());
+    }
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
@@ -3389,6 +3457,44 @@ mod tests {
             1
         );
         assert_eq!(processes.slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_quiescence_waits_for_only_the_selected_agents() {
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        let active = lifecycle.enter("atlas").await;
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let quiescing = lifecycle.clone();
+        tokio::spawn(async move {
+            let guards = quiescing.quiesce_agents(&["atlas".to_string()]).await;
+            let _ = sender.send(guards);
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let other_agent = tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("reviewer"))
+            .await
+            .expect("an unrelated Agent must not be blocked");
+        drop(other_agent);
+
+        drop(active);
+        let guards = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("quiescence should acquire after active work exits")
+            .expect("quiescence task should return its guards");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lifecycle.enter("atlas"))
+                .await
+                .is_err(),
+            "new work must wait while destructive cleanup holds the barrier"
+        );
+        drop(guards);
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("atlas"))
+            .await
+            .expect("new work should resume after cleanup releases the barrier");
     }
 
     #[test]

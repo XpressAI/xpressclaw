@@ -9,7 +9,7 @@ use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
-use xpressclaw_core::workers::native::ConversationAcpProcesses;
+use xpressclaw_core::workers::native::{ConversationAcpProcesses, NativeRuntimeLifecycle};
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -37,6 +37,9 @@ pub struct AppState {
     pub turn_controls: Arc<AcpTurnControlBroker>,
     /// Retained per-Conversation ACP lanes shared with the native dispatcher.
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Per-Agent barrier shared by native dispatchers and destructive Project
+    /// lifecycle operations.
+    pub native_runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Serialize writes that replace the file-backed and in-memory
     /// configuration so handlers cannot persist and apply stale snapshots.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -72,6 +75,7 @@ impl AppState {
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),

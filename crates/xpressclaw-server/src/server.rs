@@ -166,6 +166,7 @@ pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Resul
     let dispatcher_elicitations = state.elicitations.clone();
     let dispatcher_turn_controls = state.turn_controls.clone();
     let dispatcher_conversation_processes = state.conversation_processes.clone();
+    let dispatcher_runtime_lifecycle = state.native_runtime_lifecycle.clone();
     let dispatcher_control_token = internal_token.clone();
     let dispatcher_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -179,6 +180,7 @@ pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Resul
                     elicitation_broker: dispatcher_elicitations,
                     turn_controls: dispatcher_turn_controls,
                     conversation_processes: dispatcher_conversation_processes,
+                    runtime_lifecycle: dispatcher_runtime_lifecycle,
                     control_plane_token: dispatcher_control_token,
                 },
                 internal_port,

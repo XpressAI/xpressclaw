@@ -124,6 +124,23 @@ async fn delete_project_cascade(
     let plan = manager.begin_cascade(id).map_err(project_error)?;
 
     interrupt_project_work(state, &plan).await;
+    let agent_ids = plan
+        .agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    let runtime_guards = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        state
+            .native_runtime_lifecycle
+            .quiesce_agents(&agent_ids),
+    )
+    .await
+    .map_err(|_| {
+        project_cleanup_error(
+            "Project work was cancelled, but an Agent runtime is still stopping. Wait for its current container operation to finish, then retry deletion",
+        )
+    })?;
     remove_project_containers(state, &plan).await?;
     for runtime_id in plan
         .active_attempt_ids
@@ -155,6 +172,7 @@ async fn delete_project_cascade(
     }
 
     manager.finish_cascade(id).map_err(project_error)?;
+    drop(runtime_guards);
     for conversation_id in &plan.conversation_ids {
         state
             .event_bus
