@@ -206,6 +206,13 @@ impl InstanceManager {
                             "workflow agent input '{input_name}' references Agent '{agent_id}' outside project '{project_id}'"
                         )));
                     }
+                } else if let Some(project_id) = agent_project.as_deref() {
+                    // A projectless workflow still creates work through its
+                    // selected Agents. Validate each Agent's owning Project
+                    // before inserting the instance so a deletion marker
+                    // cannot leave an undiscoverable pre-step run behind.
+                    ensure_project_accepts_work(&transaction, project_id)
+                        .map_err(|error| Error::Workflow(error.to_string()))?;
                 }
             }
             transaction.execute(
@@ -989,9 +996,10 @@ mod tests {
     fn deleting_project_blocks_new_and_resumed_workflow_work() {
         let (db, mgr) = setup();
         db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One')",
-                [],
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('project-agent', 'Project Agent', 'codex', '{}', 'stopped', 'project-one');",
             )
         })
         .unwrap();
@@ -1011,7 +1019,7 @@ mod tests {
             .create_wait_execution(&instance.id, "main", "review", "{}")
             .unwrap();
 
-        crate::projects::ProjectManager::new(db)
+        crate::projects::ProjectManager::new(db.clone())
             .begin_cascade("project-one")
             .unwrap();
 
@@ -1028,6 +1036,28 @@ mod tests {
             )
             .unwrap_err();
         assert!(create_error.to_string().contains("being deleted"));
+        let agent_inputs = vec![("worker".to_string(), "project-agent".to_string())];
+        let projectless_error = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    workflow_agent_inputs: &agent_inputs,
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap_err();
+        assert!(projectless_error.to_string().contains("being deleted"));
+        let instance_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(instance_count, 1);
         let resume_error = mgr.set_active_status(&instance.id, "running").unwrap_err();
         assert!(resume_error.to_string().contains("being deleted"));
         let claim_error = mgr.claim_wait(&waiting.id, "approved").unwrap_err();
