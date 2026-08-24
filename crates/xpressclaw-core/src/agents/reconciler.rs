@@ -1020,6 +1020,9 @@ mod tests {
     #[test]
     fn test_create_idle_task() {
         let db = Arc::new(crate::db::Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
         let board = TaskBoard::new(db.clone());
 
         let task = board
@@ -1036,6 +1039,9 @@ mod tests {
     #[test]
     fn test_idle_tasks_hidden_from_default_list() {
         let db = Arc::new(crate::db::Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
         let board = TaskBoard::new(db.clone());
 
         // Create a normal task and an idle task

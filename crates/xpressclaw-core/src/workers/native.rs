@@ -4012,6 +4012,9 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
         let board = TaskBoard::new(db);
         let visible = board
             .create(&CreateTask {
@@ -4977,6 +4980,9 @@ mod tests {
         use crate::tasks::scheduler::{CreateOneShotSchedule, ScheduleManager};
 
         let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("dgx-codex", "codex")
+            .unwrap();
         let board = TaskBoard::new(db.clone());
         let sessions = SessionManager::new(db.clone());
         sessions.ensure("dgx-codex", Some("DGX")).unwrap();

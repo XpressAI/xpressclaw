@@ -173,7 +173,7 @@ impl WorkflowEngine {
         F: FnOnce(&rusqlite::Transaction<'_>, &str) -> Result<T>,
     {
         let record = self.manager.get(workflow_id)?;
-        let definition = WorkflowDefinition::parse(&record.yaml_content)?;
+        let mut definition = WorkflowDefinition::parse(&record.yaml_content)?;
         let trigger_data = definition.resolve_inputs(&trigger_data)?;
         if let Some(conversation_id) = workflow_context.conversation_id.as_deref() {
             let conversation_project = self.db.with_conn(|conn| {
@@ -211,7 +211,10 @@ impl WorkflowEngine {
             }
         }
         let registry = AgentRegistry::new(self.db.clone());
-        let mut workflow_agent_bindings = definition.literal_agent_bindings();
+        let initial_context =
+            context::build_context(&trigger_data, &definition.variables, &HashMap::new());
+        let (mut workflow_agent_bindings, agent_selectors_frozen) = definition
+            .resolve_agent_bindings(&initial_context, workflow_context.project_id.is_none())?;
         for (name, input) in &definition.inputs {
             if input.input_type != WorkflowInputType::Agent {
                 continue;
@@ -220,6 +223,8 @@ impl WorkflowEngine {
                 workflow_agent_bindings.push((format!("input '{name}'"), agent_id.to_string()));
             }
         }
+        workflow_agent_bindings.sort();
+        workflow_agent_bindings.dedup();
         for (source, agent_id) in &workflow_agent_bindings {
             let agent = registry.get(agent_id).map_err(|_| {
                 Error::Workflow(format!(
@@ -237,6 +242,11 @@ impl WorkflowEngine {
 
         let trigger_json = serde_json::to_string(&trigger_data)
             .map_err(|e| Error::Workflow(format!("failed to serialize trigger data: {e}")))?;
+        let definition_snapshot = if agent_selectors_frozen {
+            definition.to_yaml()?
+        } else {
+            record.yaml_content.clone()
+        };
 
         // Serialize global variables for the variable store
         let vars_json = if definition.variables.is_empty() {
@@ -254,7 +264,7 @@ impl WorkflowEngine {
                 workflow_id,
                 Some(&trigger_json),
                 vars_json.as_deref(),
-                Some(&record.yaml_content),
+                Some(&definition_snapshot),
                 WorkflowInstanceScope {
                     project_id: workflow_context.project_id.as_deref(),
                     conversation_id: workflow_context.conversation_id.as_deref(),
@@ -2239,6 +2249,125 @@ flows:
             instance_count,
             "a rejected static-Agent run must not leave a detached instance"
         );
+    }
+
+    #[test]
+    fn rendered_agent_binding_is_frozen_before_a_projectless_run_is_inserted() {
+        let (db, engine) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One')",
+                [],
+            )
+        })
+        .unwrap();
+        AgentRegistry::new(db.clone())
+            .create_in_project("project-agent", "codex", "project-one")
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: rendered-future-agent
+flows:
+  main:
+    steps:
+      - id: wait_elsewhere
+        type: wait
+        agent: atlas
+        event: github.pull_request.activity
+        resource: https://github.com/example/repository/pull/1
+  future:
+    steps:
+      - id: future-work
+        agent: "{{trigger.worker}}"
+        prompt: Do future work
+"#,
+        );
+        let trigger = json!({"trigger": {"worker": "project-agent"}});
+
+        let instance_id = engine
+            .start_instance(&workflow_id, trigger.clone())
+            .unwrap();
+        let instance = engine.instances.get_instance(&instance_id).unwrap();
+        assert_eq!(instance.status, "waiting");
+        let snapshot =
+            WorkflowDefinition::parse(instance.definition_yaml.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            snapshot.flows["future"].steps[0].agent.as_deref(),
+            Some("project-agent"),
+            "the rendered selector must remain stable when the run resumes"
+        );
+        let binding: (String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id, project_id
+                     FROM workflow_instance_agent_bindings
+                     WHERE instance_id = ?1 AND agent_id = 'project-agent'",
+                    [&instance_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(binding, ("project-agent".into(), "project-one".into()));
+
+        crate::projects::ProjectManager::new(db.clone())
+            .begin_cascade("project-one")
+            .unwrap();
+        assert_eq!(
+            engine.instances.get_instance(&instance_id).unwrap().status,
+            "cancelled",
+            "the future rendered Agent binding must make the waiting run discoverable"
+        );
+        let instance_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        let error = engine.start_instance(&workflow_id, trigger).unwrap_err();
+        assert!(error.to_string().contains("being deleted"));
+        assert_eq!(
+            db.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap(),
+            instance_count
+        );
+    }
+
+    #[test]
+    fn projectless_agent_selector_cannot_depend_on_future_output() {
+        let (db, engine) = setup();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: unresolved-future-agent
+flows:
+  main:
+    steps: []
+  future:
+    steps:
+      - id: future-work
+        agent: "{{choose.agent_id}}"
+        prompt: Do future work
+"#,
+        );
+
+        let error = engine.start_instance(&workflow_id, json!({})).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must resolve when the run starts"));
+        let instance_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(instance_count, 0);
     }
 
     #[test]

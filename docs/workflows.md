@@ -92,6 +92,13 @@ reviewer, receives its own workflow input. A literal agent ID remains supported
 for intentionally fixed workflows and appears in Workflow mode when its Agent
 belongs to the selected Project.
 
+Agent selectors are resolved and frozen when a run starts. A projectless run
+may use a literal Agent, a typed Agent input, or a template that resolves from
+its initial inputs, trigger payload, or variables. It cannot choose an Agent
+from a future step's output because XpressClaw must record Project ownership
+before inserting the durable run; bind the run to a Project or model that
+choice as a typed Agent input instead.
+
 ### Start new work through a workflow
 
 The **New Work** composer has separate **Agent** and **Workflow** modes. Agent

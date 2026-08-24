@@ -569,7 +569,9 @@ fn ensure_agent_project_accepts_work(conn: &rusqlite::Connection, agent_id: &str
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
-        .flatten();
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
     if let Some(project_id) = project_id.as_deref() {
         ensure_project_accepts_work(conn, project_id)?;
     }
@@ -931,6 +933,53 @@ mod tests {
         let error = mgr.enable(&schedule.id).unwrap_err();
         assert!(error.to_string().contains("being deleted"));
         assert!(!mgr.get(&schedule.id).unwrap().enabled);
+    }
+
+    #[test]
+    fn deleted_agents_cannot_receive_new_schedules() {
+        let (db, mgr, _) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 UPDATE agents SET project_id = 'project-one' WHERE id = 'atlas';",
+            )
+        })
+        .unwrap();
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let recurring_error = mgr
+            .create(&CreateSchedule {
+                name: "Stale recurring work".into(),
+                cron: "0 9 * * *".into(),
+                agent_id: "atlas".into(),
+                title: "Do stale work".into(),
+                description: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            recurring_error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+
+        let one_shot_error = mgr
+            .create_one_shot(&CreateOneShotSchedule {
+                name: "Stale wake-up".into(),
+                run_at: None,
+                delay_seconds: Some(60),
+                agent_id: "atlas".into(),
+                title: "Resume stale work".into(),
+                description: None,
+                continuation_task_id: None,
+                conversation_id: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            one_shot_error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+        assert!(mgr.list(None, false).unwrap().is_empty());
     }
 
     #[test]

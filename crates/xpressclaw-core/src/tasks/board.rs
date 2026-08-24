@@ -376,7 +376,9 @@ impl TaskBoard {
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
-                .flatten();
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: agent_id.to_string(),
+                })?;
             if let Some(project_id) = project_id.as_deref() {
                 ensure_project_accepts_work(&transaction, project_id)?;
             }
@@ -2976,6 +2978,14 @@ mod tests {
     #[test]
     fn task_search_matches_all_terms_across_task_conversations() {
         let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('developer', 'Developer', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let described = board
             .create(&CreateTask {
                 title: "Review connection handling".to_string(),
@@ -3046,6 +3056,53 @@ mod tests {
 
         let counts = board.counts_for_search(Some("jira callback")).unwrap();
         assert_eq!(counts.pending, 1);
+    }
+
+    #[test]
+    fn idle_task_creation_rejects_an_agent_deleted_after_reconciliation() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'running', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        // Simulate the desired-state reconciler reading the running Agent
+        // before a confirmed cascade wins the writer and removes it.
+        let was_running = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status = 'running' FROM agents WHERE id = 'atlas'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(was_running);
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let error = board
+            .create_idle_task("atlas", "Look for proactive work")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+        let idle_tasks = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE task_type = 'IDLE'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(idle_tasks, 0);
     }
 
     #[test]

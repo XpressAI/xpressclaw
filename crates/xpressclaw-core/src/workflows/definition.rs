@@ -4,6 +4,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 
+use super::context;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowDefinition {
     pub name: String,
@@ -221,43 +223,92 @@ impl WorkflowDefinition {
         })
     }
 
-    /// Return every concrete Agent selected directly by this definition.
+    /// Resolve and freeze every Agent selector known when a run starts.
     ///
-    /// Typed `@role` inputs are resolved from run inputs separately. Literal
-    /// bindings must still be known before an instance is inserted so a
-    /// projectless run cannot outlive the Project that owns a future step's
-    /// Agent. The stable source labels also make validation errors actionable.
-    pub(crate) fn literal_agent_bindings(&self) -> Vec<(String, String)> {
+    /// Projectless instances must persist the Project provenance of every
+    /// future Agent before the instance is inserted. Selectors based on
+    /// trigger data, variables, or typed Agent inputs are therefore rendered
+    /// against the initial context and replaced with their concrete value.
+    /// A selector that depends on a future step output is safe only when the
+    /// instance already has an explicit Project scope.
+    pub(crate) fn resolve_agent_bindings(
+        &mut self,
+        initial_context: &Value,
+        require_all: bool,
+    ) -> Result<(Vec<(String, String)>, bool)> {
         let mut bindings = BTreeSet::new();
-        for (flow_name, flow) in &self.flows {
-            Self::collect_literal_agent_bindings(flow_name, &flow.steps, &mut bindings);
+        let mut changed = false;
+        for (flow_name, flow) in &mut self.flows {
+            Self::resolve_step_agent_bindings(
+                flow_name,
+                &mut flow.steps,
+                initial_context,
+                require_all,
+                &mut bindings,
+                &mut changed,
+            )?;
         }
-        bindings.into_iter().collect()
+        Ok((bindings.into_iter().collect(), changed))
     }
 
-    fn collect_literal_agent_bindings(
+    fn resolve_step_agent_bindings(
         flow_name: &str,
-        steps: &[Step],
+        steps: &mut [Step],
+        initial_context: &Value,
+        require_all: bool,
         bindings: &mut BTreeSet<(String, String)>,
-    ) {
+        changed: &mut bool,
+    ) -> Result<()> {
         for step in steps {
             if matches!(step.step_type.as_str(), "step" | "wait") {
-                if let Some(agent_id) = step
+                if let Some(configured) = step
                     .agent
                     .as_deref()
                     .map(str::trim)
-                    .filter(|id| !id.is_empty() && !id.starts_with('@') && !id.contains("{{"))
+                    .filter(|id| !id.is_empty())
                 {
-                    bindings.insert((
-                        format!("step '{flow_name}.{}'", step.id),
-                        agent_id.to_string(),
-                    ));
+                    let rendered = context::render_template(configured, initial_context);
+                    let agent_id = rendered.trim();
+                    let unresolved =
+                        agent_id.is_empty() || agent_id.starts_with('@') || agent_id.contains("{{");
+                    if unresolved {
+                        if require_all {
+                            return Err(Error::Workflow(format!(
+                                "projectless workflow step '{flow_name}.{}' agent binding '{configured}' must resolve when the run starts so Project ownership can be recorded; use a literal Agent, a typed Agent input, or explicit Project scope",
+                                step.id
+                            )));
+                        }
+                    } else {
+                        if configured != agent_id {
+                            step.agent = Some(agent_id.to_string());
+                            *changed = true;
+                        }
+                        let source = format!("step '{flow_name}.{}'", step.id);
+                        bindings.insert((source, agent_id.to_string()));
+                    }
                 }
             }
-            if let Some(body) = step.body.as_deref() {
-                Self::collect_literal_agent_bindings(flow_name, body, bindings);
+            if let Some(body) = step.body.as_deref_mut() {
+                Self::resolve_step_agent_bindings(
+                    flow_name,
+                    body,
+                    initial_context,
+                    require_all,
+                    bindings,
+                    changed,
+                )?;
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn agent_bindings_for_test(
+        &mut self,
+        initial_context: &Value,
+    ) -> Result<Vec<(String, String)>> {
+        self.resolve_agent_bindings(initial_context, true)
+            .map(|(bindings, _)| bindings)
     }
 
     /// Validate the definition:
@@ -1434,8 +1485,8 @@ flows:
     }
 
     #[test]
-    fn collects_literal_agent_bindings_across_flows_and_loop_bodies() {
-        let definition = WorkflowDefinition::parse(
+    fn resolves_and_freezes_agent_bindings_across_flows_and_loop_bodies() {
+        let mut definition = WorkflowDefinition::parse(
             r#"
 name: agent-bindings
 inputs:
@@ -1447,7 +1498,7 @@ flows:
         agent: "@worker"
         prompt: dynamic
       - id: templated
-        agent: "{{trigger.worker}}"
+        agent: "{{trigger.payload.templated_worker}}"
         prompt: templated
       - id: repeated
         type: loop
@@ -1468,13 +1519,61 @@ flows:
         )
         .unwrap();
 
+        let context = context::build_context(
+            &serde_json::json!({
+                "worker": "dynamic-agent",
+                "templated_worker": "templated-agent",
+            }),
+            &definition.variables,
+            &HashMap::new(),
+        );
+
         assert_eq!(
-            definition.literal_agent_bindings(),
+            definition.agent_bindings_for_test(&context).unwrap(),
             vec![
                 ("step 'later.wait'".into(), "review-agent".into()),
+                ("step 'main.dynamic'".into(), "dynamic-agent".into()),
                 ("step 'main.nested'".into(), "nested-agent".into()),
+                ("step 'main.templated'".into(), "templated-agent".into()),
             ]
         );
+        assert_eq!(
+            definition.flows["main"].steps[0].agent.as_deref(),
+            Some("dynamic-agent")
+        );
+        assert_eq!(
+            definition.flows["main"].steps[1].agent.as_deref(),
+            Some("templated-agent")
+        );
+    }
+
+    #[test]
+    fn projectless_agent_bindings_cannot_depend_on_future_step_output() {
+        let mut definition = WorkflowDefinition::parse(
+            r#"
+name: deferred-agent
+flows:
+  main:
+    steps:
+      - id: choose
+        agent: atlas
+        prompt: Choose an Agent
+      - id: work
+        agent: "{{choose.agent_id}}"
+        prompt: Do the work
+"#,
+        )
+        .unwrap();
+        let context = context::build_context(
+            &serde_json::json!({}),
+            &definition.variables,
+            &HashMap::new(),
+        );
+
+        let error = definition.agent_bindings_for_test(&context).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must resolve when the run starts"));
     }
 
     #[test]
