@@ -904,6 +904,13 @@ mod tests {
 
     fn setup() -> (Arc<Database>, TaskQueue) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let queue = TaskQueue::new(db.clone());
         (db, queue)
     }

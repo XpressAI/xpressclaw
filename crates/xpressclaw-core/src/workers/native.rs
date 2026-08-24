@@ -3409,6 +3409,16 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn add_test_agent(db: &Arc<Database>, agent_id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES (?1, ?1, 'native', '{}')",
+                [agent_id],
+            )
+        })
+        .unwrap();
+    }
+
     #[test]
     fn agent_runtime_cleanup_is_idempotent_and_preserves_workspaces() {
         let root = tempfile::tempdir().unwrap();
@@ -4037,6 +4047,7 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let sessions = SessionManager::new(db.clone());
         sessions.ensure("atlas", Some("Atlas")).unwrap();
         let task = TaskBoard::new(db.clone())
@@ -4763,6 +4774,7 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let board = TaskBoard::new(db.clone());
         SessionManager::new(db.clone())
             .ensure("atlas", Some("atlas"))
@@ -4849,6 +4861,7 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let board = TaskBoard::new(db.clone());
         SessionManager::new(db.clone())
             .ensure("atlas", Some("atlas"))

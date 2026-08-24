@@ -298,7 +298,9 @@ impl TaskBoard {
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .optional()?
-                .flatten()
+                .ok_or_else(|| Error::AgentNotFound {
+                    name: agent_id.to_string(),
+                })?
         } else {
             None
         };
@@ -1521,6 +1523,12 @@ fn ensure_task_agent_project(
     task_id: &str,
     agent_id: &str,
 ) -> Result<()> {
+    // The update API historically uses an empty string as its unassigned
+    // sentinel. Preserve that behavior; monitored pull requests apply their
+    // stricter unassignment rule immediately after this check.
+    if agent_id.is_empty() {
+        return Ok(());
+    }
     let task_project = conn.query_row(
         "SELECT project_id FROM tasks WHERE id = ?1",
         [task_id],
@@ -1533,7 +1541,9 @@ fn ensure_task_agent_project(
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()?
-        .flatten();
+        .ok_or_else(|| Error::AgentNotFound {
+            name: agent_id.to_string(),
+        })?;
     let project_id = consistent_project_id([
         ("task", task_project.as_deref()),
         ("Agent", agent_project.as_deref()),
@@ -1890,9 +1900,29 @@ mod tests {
         (db, board)
     }
 
+    fn add_test_agents(db: &Arc<Database>, agent_ids: &[&str]) {
+        db.with_conn(|conn| {
+            for agent_id in agent_ids {
+                conn.execute(
+                    "INSERT INTO agents (id, name, backend, config) VALUES (?1, ?1, 'native', '{}')",
+                    [agent_id],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_create_and_get_task() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let task = board
             .create(&CreateTask {
                 title: "Test task".to_string(),
@@ -2230,7 +2260,8 @@ mod tests {
 
     #[test]
     fn test_update_status() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
         let task = board
             .create(&CreateTask {
                 title: "Status test".to_string(),
@@ -2262,6 +2293,17 @@ mod tests {
     #[test]
     fn task_reassignment_transfers_active_pull_request_monitoring() {
         let (db, board) = setup();
+        add_test_agents(
+            &db,
+            &[
+                "project-codex",
+                "unverified-codex",
+                "other-project-codex",
+                "reviewer-codex",
+                "final-codex",
+                "late-codex",
+            ],
+        );
         let task = board
             .create(&CreateTask {
                 title: "Review ownership".to_string(),
@@ -2867,7 +2909,8 @@ mod tests {
 
     #[test]
     fn roll_up_never_overwrites_a_cancelled_task() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        add_test_agents(&db, &["developer"]);
         let task = board
             .create(&CreateTask {
                 title: "Cancelled work".to_string(),
@@ -2932,7 +2975,8 @@ mod tests {
 
     #[test]
     fn test_list_and_counts() {
-        let (_, board) = setup();
+        let (db, board) = setup();
+        add_test_agents(&db, &["atlas"]);
         let first = board
             .create(&CreateTask {
                 title: "Task 1".to_string(),
@@ -3103,6 +3147,92 @@ mod tests {
             })
             .unwrap();
         assert_eq!(idle_tasks, 0);
+    }
+
+    #[test]
+    fn task_creation_rejects_an_agent_deleted_after_a_stale_request_read() {
+        let (db, board) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('atlas', 'Atlas', 'native', '{}', 'running', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        // Simulate an API request that resolved the Agent before a confirmed
+        // cascade won the writer lock and removed it.
+        let request = CreateTask {
+            title: "Stale task request".to_string(),
+            agent_id: Some("atlas".to_string()),
+            ..Default::default()
+        };
+        let agent_existed = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id = 'atlas')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .unwrap();
+        assert!(agent_existed);
+
+        let projects = crate::projects::ProjectManager::new(db.clone());
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+
+        let error = board.create(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::AgentNotFound { ref name } if name == "atlas"
+        ));
+        let task_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+            })
+            .unwrap();
+        assert_eq!(task_count, 0);
+    }
+
+    #[test]
+    fn task_assignment_rejects_missing_agents() {
+        let (_, board) = setup();
+        let task = board
+            .create(&CreateTask {
+                title: "Unassigned task".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let update_error = board
+            .update(
+                &task.id,
+                &UpdateTask {
+                    title: None,
+                    description: None,
+                    agent_id: Some("missing-agent".to_string()),
+                    priority: None,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            update_error,
+            Error::AgentNotFound { ref name } if name == "missing-agent"
+        ));
+
+        let status_error = board
+            .update_status(&task.id, "in_progress", Some("missing-agent"))
+            .unwrap_err();
+        assert!(matches!(
+            status_error,
+            Error::AgentNotFound { ref name } if name == "missing-agent"
+        ));
+
+        let unchanged = board.get(&task.id).unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Pending);
+        assert_eq!(unchanged.agent_id, None);
     }
 
     #[test]
