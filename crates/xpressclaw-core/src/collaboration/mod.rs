@@ -233,6 +233,7 @@ mod tests {
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(Duration::from_millis(250)))
                                 .unwrap();
@@ -283,6 +284,7 @@ mod tests {
 
     fn read_http_request(stream: &mut TcpStream) -> String {
         const MAX_REQUEST_SIZE: usize = 16 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(1);
         let mut request = Vec::new();
         let mut buffer = [0_u8; 2048];
         while request.len() < MAX_REQUEST_SIZE {
@@ -293,6 +295,15 @@ mod tests {
                     if request.windows(4).any(|window| window == b"\r\n\r\n") {
                         break;
                     }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && Instant::now() < deadline =>
+                {
+                    continue;
                 }
                 Err(error)
                     if matches!(
