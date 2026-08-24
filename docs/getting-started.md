@@ -44,13 +44,23 @@ Complete first-run setup. An existing repository is an Agent workspace, not an
 XpressClaw instance directory. The Agent creator asks for:
 
 - an Agent name;
-- Codex, Claude Code, OpenCode, or another ACP-compatible harness;
+- Codex, Claude Code, DeepSeek Harness, OpenCode, or another ACP-compatible harness;
 - the host project folder mounted at `/workspace`;
 - whether to reuse a built-in harness's host subscription login;
 - optional image, ACP server command, and extra folder overrides.
 
 Each built-in product selects a separate minimal image. Xpressclaw never uses
 an all-in-one `xpressclaw-native-runner` image.
+
+For DeepSeek Harness, install its supported DSH runtime plus the maintained
+openma-ai adapter on the control-plane host and run `dsh-acp login`, or save the
+same credential through `dsh web` (Settings → Models). Both write under
+`~/.dsh`; the runner image itself already contains both packages. Enable **Use
+my existing DeepSeek Harness login** when creating the Agent; XpressClaw mounts
+that directory read-write so credential refreshes and native session logs
+survive runner replacement. Do not put an API key in XpressClaw configuration.
+See [DeepSeek Harness](deepseek-harness.md) for exact host commands,
+permissions, MCP, images, and session behavior.
 
 First-run setup creates a Project around the Agent. A Project is the durable
 collaboration and memory boundary and can contain more Agents, Conversations,

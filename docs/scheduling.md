@@ -24,7 +24,7 @@ job later. Set the target agent, an absolute local date and time, and the
 instruction to deliver. At the deadline, Xpressclaw queues one new turn and
 then disables the schedule.
 
-Built-in Codex, Claude Code, and OpenCode runners also receive a constrained
+Built-in runner images also receive a constrained
 `schedule_wakeup` tool. An agent can provide either `delay_seconds` (for
 example, `18000` for five hours) or an RFC 3339 `run_at` timestamp with a
 timezone offset. The tool is fixed to the current agent, so the future work

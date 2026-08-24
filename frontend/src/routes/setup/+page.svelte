@@ -112,13 +112,12 @@
 
 	function setContainerEngine(enabled: boolean) {
 		const defaults = new Set<string>([
-			...runnerOptions.flatMap((runner) => [runner.image, runner.host_image]),
-			'xpressclaw-runner-codex:latest',
-			'xpressclaw-runner-codex-docker:latest',
-			'xpressclaw-runner-claude:latest',
-			'xpressclaw-runner-claude-docker:latest',
-			'xpressclaw-runner-opencode:latest',
-			'xpressclaw-runner-opencode-docker:latest'
+			...runnerOptions.flatMap((runner) => [
+				runner.image,
+				runner.host_image,
+				runner.image.replace('ghcr.io/xpressai/', ''),
+				runner.host_image.replace('ghcr.io/xpressai/', '')
+			])
 		]);
 		const replaceImage = !runnerImage.trim() || defaults.has(runnerImage.trim());
 		containerEngine = enabled ? 'host' : 'none';

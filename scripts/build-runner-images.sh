@@ -2,7 +2,7 @@
 set -euo pipefail
 
 all_runners=(
-  codex claude github-copilot junie kimi opencode pi qwen
+  codex claude deepseek-harness github-copilot junie kimi opencode pi qwen
   cline cursor glm grok kilo mistral-vibe
 )
 
@@ -57,6 +57,19 @@ for runner in "${runners[@]}"; do
   dockerfile="$runner"
   build_args=()
   case "$runner" in
+    deepseek-harness)
+      dockerfile=npm
+      build_args=(
+        --build-arg AGENT_KIND=deepseek-harness
+        --build-arg AGENT_PACKAGE=@openma/deepseek-harness-acp@0.4.24
+        --build-arg AGENT_BINARY=dsh-acp
+        --build-arg AGENT_ACP_SMOKE=1
+        --build-arg AGENT_DSH_RUNTIME=1
+        --build-arg AGENT_DSH_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh
+        --build-arg AGENT_NODE_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules
+        --build-arg AGENT_DSH_SESSION_ROOT=/home/node/.dsh/acp-sessions
+      )
+      ;;
     github-copilot)
       dockerfile=npm
       build_args=(--build-arg AGENT_KIND=github-copilot --build-arg AGENT_PACKAGE=@github/copilot@1.0.71 --build-arg AGENT_BINARY=copilot)

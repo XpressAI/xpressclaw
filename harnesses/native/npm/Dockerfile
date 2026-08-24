@@ -8,6 +8,11 @@ ARG AGENT_BINARY
 # Companion agent for bridge packages (e.g. pi-acp needs pi); binary verified on PATH.
 ARG AGENT_EXTRA_PACKAGES=""
 ARG AGENT_EXTRA_BINARY=""
+ARG AGENT_ACP_SMOKE=""
+ARG AGENT_DSH_RUNTIME=""
+ARG AGENT_DSH_PATH=""
+ARG AGENT_NODE_PATH=""
+ARG AGENT_DSH_SESSION_ROOT=""
 ARG PI_MCP_PACKAGE="pi-mcp-adapter@2.21.0"
 LABEL io.xpressclaw.protocol="acp-xpressclaw-v2" \
     io.xpressclaw.agent="${AGENT_KIND}" \
@@ -32,17 +37,32 @@ RUN test -n "${AGENT_KIND}" \
 COPY --chmod=0755 common/mcp-github.mjs /opt/xpressclaw/mcp-github.mjs
 COPY --chmod=0755 common/mcp-xpressclaw.mjs /opt/xpressclaw/mcp-xpressclaw.mjs
 COPY --chmod=0755 common/pi-with-mcp /opt/xpressclaw/pi-with-mcp
+COPY --chmod=0755 common/prepare-deepseek-harness.mjs /opt/xpressclaw/prepare-deepseek-harness.mjs
+COPY --chmod=0755 common/verify-acp-stdio.mjs /opt/xpressclaw/verify-acp-stdio.mjs
 COPY --chmod=0755 common/git-credential-xpressclaw /usr/local/bin/git-credential-xpressclaw
 
 RUN /opt/xpressclaw/libexec/gh --version \
     && node --check /opt/xpressclaw/mcp-github.mjs \
     && node --check /opt/xpressclaw/mcp-xpressclaw.mjs \
+    && node --check /opt/xpressclaw/prepare-deepseek-harness.mjs \
+    && node --check /opt/xpressclaw/verify-acp-stdio.mjs \
+    && { [ "${AGENT_DSH_RUNTIME}" != "1" ] || node /opt/xpressclaw/prepare-deepseek-harness.mjs; } \
+    && npm cache clean --force \
     && test -x /opt/xpressclaw/pi-with-mcp
 
 USER node
 ENV HOME=/home/node \
     CI=1 \
-    NO_COLOR=1
+    NO_COLOR=1 \
+    DSH_PATH="${AGENT_DSH_PATH}" \
+    NODE_PATH="${AGENT_NODE_PATH}" \
+    DSH_SESSION_ROOT="${AGENT_DSH_SESSION_ROOT}"
+RUN if [ "${AGENT_DSH_RUNTIME}" = "1" ]; then \
+      test "${DSH_SESSION_ROOT}" = "/home/node/.dsh/acp-sessions"; \
+    fi \
+    && if [ "${AGENT_ACP_SMOKE}" = "1" ]; then \
+      node /opt/xpressclaw/verify-acp-stdio.mjs "${AGENT_BINARY}"; \
+    fi
 WORKDIR /workspace
 ENTRYPOINT []
 
