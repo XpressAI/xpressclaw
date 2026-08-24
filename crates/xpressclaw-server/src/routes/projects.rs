@@ -230,7 +230,11 @@ async fn remove_project_containers(
     state: &AppState,
     plan: &ProjectDeletionPlan,
 ) -> Result<(), (StatusCode, Json<Value>)> {
-    if plan.agents.is_empty() && plan.active_attempt_ids.is_empty() && plan.app_ids.is_empty() {
+    if plan.agents.is_empty()
+        && plan.active_attempt_ids.is_empty()
+        && plan.app_ids.is_empty()
+        && plan.recorded_container_ids.is_empty()
+    {
         return Ok(());
     }
     let docker = state.docker().await.ok_or_else(|| {
@@ -241,6 +245,16 @@ async fn remove_project_containers(
             })),
         )
     })?;
+    for container_id in &plan.recorded_container_ids {
+        docker
+            .remove_recorded_workload(container_id)
+            .await
+            .map_err(|error| {
+                project_cleanup_error(format!(
+                    "Project work was cancelled, but recorded runtime '{container_id}' could not be removed: {error}. Fix Docker or Podman and retry deletion"
+                ))
+            })?;
+    }
     let mut workload_ids = BTreeSet::new();
     for agent in &plan.agents {
         workload_ids.insert(agent.name.clone());
@@ -620,6 +634,7 @@ mod tests {
                 name: "atlas".into(),
                 container_id: None,
             }],
+            recorded_container_ids: vec![],
             conversation_ids: vec![],
             task_ids: vec![],
             active_attempt_ids: vec![],

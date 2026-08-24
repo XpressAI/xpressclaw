@@ -783,36 +783,69 @@ impl DockerManager {
             ) {
                 continue;
             }
-
-            let stop_opts = StopContainerOptions { t: 2 };
-            if let Err(error) = self
-                .docker
-                .stop_container(&container_name, Some(stop_opts))
-                .await
-            {
-                warn!(agent_id, container_name, %error, "error stopping owned container before removal");
-            }
-            let opts = RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            };
-            match self
-                .docker
-                .remove_container(&container_name, Some(opts))
-                .await
-            {
-                Ok(())
-                | Err(BollardError::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => {}
-                Err(error) => {
-                    return Err(Error::Container(format!(
-                        "failed to remove owned runtime '{container_name}': {error}"
-                    )))
-                }
-            }
+            self.remove_container_reference(&container_name, agent_id)
+                .await?;
         }
         Ok(())
+    }
+
+    /// Remove an exact container ID read from a Project-owned durable row.
+    ///
+    /// Older XpressClaw versions did not attach installation ownership labels,
+    /// so the durable full ID is the ownership proof for those runtimes. The
+    /// inspected container must report that same full ID; names and shortened
+    /// IDs are rejected to avoid broadening destructive cleanup.
+    pub async fn remove_recorded_workload(&self, container_id: &str) -> Result<()> {
+        let container = match self.docker.inspect_container(container_id, None).await {
+            Ok(container) => container,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(()),
+            Err(error) => {
+                return Err(Error::Docker(format!(
+                    "failed to inspect recorded runtime '{container_id}': {error}"
+                )))
+            }
+        };
+        if !recorded_container_id_matches(container.id.as_deref(), container_id) {
+            return Err(Error::Container(format!(
+                "recorded runtime reference '{container_id}' did not resolve to that exact container ID; refusing deletion"
+            )));
+        }
+        self.remove_container_reference(container_id, container_id)
+            .await
+    }
+
+    async fn remove_container_reference(
+        &self,
+        container_reference: &str,
+        workload_id: &str,
+    ) -> Result<()> {
+        let stop_opts = StopContainerOptions { t: 2 };
+        if let Err(error) = self
+            .docker
+            .stop_container(container_reference, Some(stop_opts))
+            .await
+        {
+            warn!(workload_id, container_reference, %error, "error stopping owned container before removal");
+        }
+        let opts = RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
+        match self
+            .docker
+            .remove_container(container_reference, Some(opts))
+            .await
+        {
+            Ok(())
+            | Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(error) => Err(Error::Container(format!(
+                "failed to remove owned runtime '{workload_id}': {error}"
+            ))),
+        }
     }
 
     /// Start an interactive shell inside this installation's retained project
@@ -1700,6 +1733,10 @@ fn workload_ownership_matches(
     listed_container_agent_id(container_name, labels, installation_id).as_deref() == Some(agent_id)
 }
 
+fn recorded_container_id_matches(actual_id: Option<&str>, recorded_id: &str) -> bool {
+    !recorded_id.is_empty() && actual_id == Some(recorded_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2022,5 +2059,22 @@ mod tests {
             Some("installation-a"),
             "attempt-123"
         ));
+    }
+
+    #[test]
+    fn legacy_cleanup_requires_the_exact_recorded_container_id() {
+        let recorded = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        assert!(recorded_container_id_matches(Some(recorded), recorded));
+        assert!(!recorded_container_id_matches(
+            Some("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            recorded
+        ));
+        assert!(!recorded_container_id_matches(
+            Some(recorded),
+            &recorded[..12]
+        ));
+        assert!(!recorded_container_id_matches(None, recorded));
+        assert!(!recorded_container_id_matches(Some(""), ""));
     }
 }

@@ -52,6 +52,10 @@ pub struct ProjectDeletionPlan {
     pub project_id: String,
     pub project_name: String,
     pub agents: Vec<ProjectDeletionAgent>,
+    /// Exact container IDs recorded on Project-owned durable rows. These are
+    /// an ownership proof for runtimes created before installation labels
+    /// were introduced.
+    pub recorded_container_ids: Vec<String>,
     pub conversation_ids: Vec<String>,
     pub task_ids: Vec<String>,
     pub active_attempt_ids: Vec<String>,
@@ -623,6 +627,40 @@ impl ProjectManager {
                  ORDER BY app.id",
                 id,
             )?;
+            let mut recorded_container_ids = agents
+                .iter()
+                .filter_map(|agent| agent.container_id.clone())
+                .filter(|container_id| !container_id.trim().is_empty())
+                .collect::<Vec<_>>();
+            recorded_container_ids.extend(collect_ids(
+                &transaction,
+                "SELECT DISTINCT attempt.container_id
+                 FROM work_attempts attempt
+                 LEFT JOIN tasks task ON task.id = attempt.task_id
+                 LEFT JOIN logical_sessions session ON session.id = attempt.session_id
+                 LEFT JOIN agents agent ON agent.id = session.agent_id
+                 WHERE (task.project_id = ?1 OR agent.project_id = ?1)
+                   AND attempt.container_id IS NOT NULL
+                   AND TRIM(attempt.container_id) != ''
+                 ORDER BY attempt.container_id",
+                id,
+            )?);
+            recorded_container_ids.extend(collect_ids(
+                &transaction,
+                "SELECT DISTINCT app.container_id
+                 FROM apps app
+                 WHERE (
+                       app.agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
+                       OR app.conversation_id IN
+                          (SELECT id FROM conversations WHERE project_id = ?1)
+                 )
+                   AND app.container_id IS NOT NULL
+                   AND TRIM(app.container_id) != ''
+                 ORDER BY app.container_id",
+                id,
+            )?);
+            recorded_container_ids.sort();
+            recorded_container_ids.dedup();
 
             transaction.execute(
                 "UPDATE work_attempts
@@ -722,6 +760,7 @@ impl ProjectManager {
                 project_id: id.to_string(),
                 project_name,
                 agents,
+                recorded_container_ids,
                 conversation_ids,
                 task_ids,
                 active_attempt_ids,
@@ -1421,6 +1460,48 @@ mod tests {
                 Some("target")
             );
         }
+    }
+
+    #[test]
+    fn cascade_records_legacy_runtime_ids_from_every_project_owned_row() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents
+                    (id, name, backend, config, project_id, container_id)
+                    VALUES
+                    ('atlas', 'Atlas', 'native', '{}', 'one', 'agent-container'),
+                    ('other', 'Other', 'native', '{}', 'two', 'other-container');
+                 INSERT INTO logical_sessions (id, agent_id, status)
+                    VALUES ('atlas', 'atlas', 'idle'), ('other', 'other', 'idle');
+                 INSERT INTO tasks (id, title, status, agent_id, project_id)
+                    VALUES
+                    ('task-one', 'One', 'completed', 'atlas', 'one'),
+                    ('task-two', 'Two', 'completed', 'other', 'two');
+                 INSERT INTO work_attempts
+                    (id, session_id, task_id, runner, status, container_id)
+                    VALUES
+                    ('attempt-one', 'atlas', 'task-one', 'native', 'completed',
+                     'attempt-container'),
+                    ('attempt-two', 'other', 'task-two', 'native', 'completed',
+                     'other-attempt-container');
+                 INSERT INTO apps (id, title, agent_id, container_id)
+                    VALUES
+                    ('app-one', 'One app', 'atlas', 'app-container'),
+                    ('app-two', 'Two app', 'other', 'other-app-container');",
+            )
+        })
+        .unwrap();
+
+        let plan = ProjectManager::new(db).begin_cascade("one").unwrap();
+
+        assert_eq!(
+            plan.recorded_container_ids,
+            vec!["agent-container", "app-container", "attempt-container"]
+        );
+        assert_eq!(plan.active_attempt_ids, vec!["attempt-one"]);
+        assert_eq!(plan.app_ids, vec!["app-one"]);
     }
 
     #[test]
