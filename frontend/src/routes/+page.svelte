@@ -493,7 +493,7 @@
 			{#if agentList.length === 0}
 				<div class="rounded-2xl border border-dashed border-border bg-card p-8 text-center">
 					<h2 class="text-base font-semibold">Create an agent first</h2>
-					<p class="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Give a durable context a workspace and a Codex, Claude, OpenCode, or custom harness.</p>
+					<p class="mx-auto mt-2 max-w-md text-sm text-muted-foreground">Give a durable context a workspace and a Codex, Claude, DeepSeek Harness, OpenCode, or custom harness.</p>
 					<a href="/setup?mode=add-session" class="mt-5 inline-flex rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Create agent</a>
 				</div>
 			{:else}

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::acp::{agent_definition, local_runner_image};
+use crate::acp::{agent_definition, infer_agent_kind, local_runner_image};
 use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
@@ -1322,15 +1322,14 @@ fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str, output: &st
 
 pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
     if agent.runner.kind != "auto" {
-        return Ok(agent.runner.kind.to_lowercase());
+        let configured = agent.runner.kind.to_lowercase();
+        return Ok(infer_agent_kind(&configured)
+            .unwrap_or(configured.as_str())
+            .to_string());
     }
     let backend = agent.backend.to_lowercase();
-    if let Some(agent) = crate::acp::ACP_AGENTS.iter().find(|agent| {
-        backend == agent.kind
-            || (agent.kind.len() >= 4 && backend.contains(agent.kind))
-            || (agent.kind == "github-copilot" && backend.contains("copilot"))
-    }) {
-        Ok(agent.kind.to_string())
+    if let Some(kind) = infer_agent_kind(&backend) {
+        Ok(kind.to_string())
     } else if !agent.runner.command.is_empty() {
         Ok("custom".to_string())
     } else {
@@ -3939,6 +3938,26 @@ mod tests {
     }
 
     #[test]
+    fn resolves_deepseek_harness_aliases_to_the_builtin_runner() {
+        for backend in ["deepseek-harness", "dsh", "dsh-acp"] {
+            let agent = AgentConfig {
+                backend: backend.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(resolve_runner_kind(&agent).unwrap(), "deepseek-harness");
+        }
+
+        let agent = AgentConfig {
+            runner: NativeRunnerConfig {
+                kind: "dsh".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve_runner_kind(&agent).unwrap(), "deepseek-harness");
+    }
+
+    #[test]
     fn recognizes_explicit_native_questions() {
         assert!(needs_user_input(
             "I need one decision.\n\nNEEDS_USER_INPUT: Which database should I use?"
@@ -3996,6 +4015,10 @@ mod tests {
         assert_eq!(
             acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
+        );
+        assert_eq!(
+            acp_command_for(&config, "deepseek-harness", "/workspace").unwrap(),
+            vec!["dsh-acp"]
         );
     }
 
@@ -4855,6 +4878,10 @@ mod tests {
         assert_eq!(
             default_native_runner_image("opencode", ContainerEngineAccess::None),
             Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
+        );
+        assert_eq!(
+            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None),
+            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
         );
         assert_eq!(
             default_native_runner_image("custom", ContainerEngineAccess::None),

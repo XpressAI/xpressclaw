@@ -419,17 +419,12 @@ impl AgentConfig {
         let configured_kind = self.runner.kind.trim().to_lowercase();
         let kind = if configured_kind.is_empty() || configured_kind == "auto" {
             let backend = self.backend.to_lowercase();
-            if backend.contains("codex") {
-                "codex"
-            } else if backend.contains("claude") {
-                "claude"
-            } else if backend.contains("opencode") {
-                "opencode"
-            } else {
+            let Some(kind) = crate::acp::infer_agent_kind(&backend) else {
                 return false;
-            }
+            };
+            kind
         } else {
-            configured_kind.as_str()
+            crate::acp::infer_agent_kind(&configured_kind).unwrap_or(configured_kind.as_str())
         };
 
         if let Some(image) = default_native_runner_image(kind, ContainerEngineAccess::None) {
@@ -1016,6 +1011,25 @@ agents:
         assert_eq!(
             config.agents[0].runner.image,
             "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
+        );
+    }
+
+    #[test]
+    fn retired_shared_runner_image_recognizes_a_dsh_backend_alias() {
+        let yaml = r#"
+agents:
+  - name: deepseek
+    backend: dsh-acp
+    runner:
+      kind: auto
+      image: xpressclaw-native-runner:latest
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.migrate_legacy_fields());
+        assert_eq!(config.agents[0].runner.kind, "deepseek-harness");
+        assert_eq!(
+            config.agents[0].runner.image,
+            "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
         );
     }
 

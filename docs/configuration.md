@@ -84,7 +84,7 @@ agents:
 
 | Field | Description |
 |---|---|
-| `kind` | `codex`, `claude`, `opencode`, or `custom` |
+| `kind` | Built-in catalog ID such as `codex`, `claude`, `deepseek-harness`, or `opencode`; otherwise `custom` |
 | `image` | Product-specific ACP server image or compatible derivative |
 | `workspace` | Host project mounted read-write at `/workspace`, or at the same absolute path in host-engine mode |
 | `project_name` | User-facing Agent name; falls back to the workspace folder when omitted |
@@ -121,6 +121,7 @@ their host directory conventions.
 |---|---|---|
 | Codex | `ghcr.io/xpressai/xpressclaw-runner-codex:latest` | `ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest` |
 | Claude Code | `ghcr.io/xpressai/xpressclaw-runner-claude:latest` | `ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest` |
+| DeepSeek Harness | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest` | `ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest` |
 | OpenCode | `ghcr.io/xpressai/xpressclaw-runner-opencode:latest` | `ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest` |
 
 The host-engine variants add Docker CLI, Compose, and Buildx. When
@@ -143,6 +144,14 @@ agent and runner image are trusted. It is not a security boundary.
 
 The retired `xpressclaw-native-runner:latest` tag is migrated to the image for
 the configured product when an older file is loaded.
+
+The DeepSeek Harness catalog entry starts `dsh-acp`, supplied by the maintained
+openma-ai adapter, and mounts host `~/.dsh` at `/home/node/.dsh` only when
+`subscription_auth` is enabled. The mount is writable because DSH stores
+credentials, settings, and durable session logs there. `dsh`, `dsh-acp`, and
+`deepseek-harness-acp` backend aliases normalize to the stable
+`deepseek-harness` kind; existing custom runner kinds are unchanged. See
+[DeepSeek Harness](deepseek-harness.md).
 
 Codex starts in its `agent-full-access` mode by default. This disables Codex's
 nested filesystem sandbox and approval prompts **inside the Agent's retained

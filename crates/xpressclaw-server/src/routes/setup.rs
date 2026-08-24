@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::acp::ACP_AGENTS;
+use xpressclaw_core::acp::{infer_agent_kind, ACP_AGENTS};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
@@ -795,14 +795,12 @@ fn runner_kind_from_setup(setup: &AgentSetup) -> String {
         .or(setup.backend.as_deref())
         .unwrap_or("codex")
         .to_lowercase();
-    if configured.contains("claude") {
-        "claude".to_string()
-    } else if configured.contains("opencode") {
-        "opencode".to_string()
-    } else if configured.contains("codex") || configured == "auto" {
+    if configured == "auto" {
         "codex".to_string()
     } else {
-        configured
+        infer_agent_kind(&configured)
+            .unwrap_or(configured.as_str())
+            .to_string()
     }
 }
 
@@ -2483,6 +2481,22 @@ mod tests {
     }
 
     #[test]
+    fn setup_selects_deepseek_harness_by_catalog_id_or_dsh_alias() {
+        for kind in ["deepseek-harness", "dsh"] {
+            let setup: AgentSetup = serde_json::from_value(json!({
+                "runner_kind": kind
+            }))
+            .unwrap();
+            let runner = runner_from_setup(&setup);
+            assert_eq!(runner.kind, "deepseek-harness");
+            assert_eq!(
+                runner.image,
+                "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
+            );
+        }
+    }
+
+    #[test]
     fn managed_workspace_creates_a_durable_empty_project_folder() {
         let setup: AgentSetup = serde_json::from_value(json!({
             "runner_kind": "codex",
@@ -2509,6 +2523,13 @@ mod tests {
         assert_eq!(agents.len(), ACP_AGENTS.len());
         assert!(agents.iter().any(|agent| agent["kind"] == "cursor"));
         assert!(agents.iter().any(|agent| agent["kind"] == "mistral-vibe"));
+        let dsh = agents
+            .iter()
+            .find(|agent| agent["kind"] == "deepseek-harness")
+            .unwrap();
+        assert_eq!(dsh["command"], json!(["dsh-acp"]));
+        assert_eq!(dsh["login_command"], "dsh-acp login");
+        assert_eq!(dsh["mark"], "DS");
         assert!(!agents.iter().any(|agent| agent["kind"] == "agoragentic"));
     }
 

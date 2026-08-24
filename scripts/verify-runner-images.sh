@@ -5,7 +5,7 @@ wait_seconds="${1:-0}"
 deadline=$((SECONDS + wait_seconds))
 registry="${XPRESSCLAW_RUNNER_REGISTRY:-ghcr.io/xpressai}"
 agents=(
-  codex claude github-copilot junie kimi opencode pi qwen
+  codex claude deepseek-harness github-copilot junie kimi opencode pi qwen
   cline cursor glm grok kilo mistral-vibe
 )
 runners=()

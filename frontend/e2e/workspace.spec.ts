@@ -202,6 +202,7 @@ async function mockApi(
 		secondaryProjectUpdatedAt?: string;
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
+		agentRunnerKind?: string;
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -257,11 +258,12 @@ async function mockApi(
 		blocked_by: [],
 		ready: true,
 	};
+	const agentRunnerKind = options.agentRunnerKind ?? 'codex';
 	const agent = {
 		id: agentId,
 		name: 'browser-tested-workspace',
 		title: 'Browser-tested workspace',
-		backend: 'codex',
+		backend: agentRunnerKind,
 		project_id: projectId,
 		status: options.live ? 'running' : 'stopped',
 		desired_status: options.live ? 'running' : 'stopped',
@@ -269,7 +271,7 @@ async function mockApi(
 		container_id: options.live ? 'container-browser-test' : null,
 		config: {
 			runner: {
-				kind: 'codex',
+				kind: agentRunnerKind,
 				workspace: '/srv/repos/xpressclaw',
 				project_name: 'Browser-tested workspace',
 				session_config: {},
@@ -382,6 +384,21 @@ async function mockApi(
 			response = { setup_complete: true };
 		} else if (path === '/api/setup/mcp-servers') {
 			response = { servers: options.mcpServers ?? [] };
+		} else if (path === '/api/setup/agent-catalog') {
+			response = { agents: [
+				{
+					kind: 'codex', name: 'Codex', mark: 'C', description: 'Codex over ACP.',
+					command: ['codex-acp'], login_command: 'codex login', install_url: 'https://developers.openai.com/codex/cli/',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'codex',
+				},
+				{
+					kind: 'deepseek-harness', name: 'DeepSeek Harness', mark: 'DS', description: "DeepSeek Harness through openma-ai's maintained ACP adapter.",
+					command: ['dsh-acp'], login_command: 'dsh-acp login', install_url: 'https://github.com/openma-ai/deepseek-harness-acp',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'dsh-acp',
+				},
+			] };
 		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
 			const name = decodeURIComponent(path.split('/')[4]);
 			const payload = request.postDataJSON() as { agent_id: string | null };
@@ -607,8 +624,8 @@ async function mockApi(
 					backend: agent.backend,
 					model: null,
 					runner: {
-						kind: 'codex',
-						image: 'xpressclaw-runner-codex:latest',
+						kind: agentRunnerKind,
+						image: `xpressclaw-runner-${agentRunnerKind}:latest`,
 						workspace: '/workspace',
 						model: null,
 						session_config: {},
@@ -2582,6 +2599,21 @@ test('task details deep-link current Git changes into the workspace editor', asy
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+});
+
+test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'deepseek-harness' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('deepseek-harness');
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest',
+	);
+	await page.getByLabel('Host Docker or Podman access').check();
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+	);
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {

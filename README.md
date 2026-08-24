@@ -5,7 +5,7 @@
 <h3 align="center">Distributed, Multiplayer Control Plane for Native Agent Work</h3>
 
 <p align="center">
-Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers on an always-on machine. Coordinate people and Agents through durable Projects, Conversations, Tasks, memory, and multi-agent workflows from any connected client.
+Run Codex, Claude Code, DeepSeek Harness, OpenCode, and other native harnesses as isolated workers on an always-on machine. Coordinate people and Agents through durable Projects, Conversations, Tasks, memory, and multi-agent workflows from any connected client.
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ The matching runner image is pulled automatically.
 
 ## Why xpressclaw?
 
-Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
+Codex, Claude Code, DeepSeek Harness, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
 - **Multiplayer Project spaces** — Coordinate people and specialized Agents through shared Conversations, Tasks, workflows, files, and memory.
 - **Distributed by design** — Keep Agents working on an always-on desktop or server while browsers and future native clients reconnect from other devices.
@@ -78,12 +78,18 @@ step back to the Conversation that started the run.
 
 - **Codex:** reuses an eligible host ChatGPT/Codex login
 - **Claude Code:** reuses an eligible host Claude subscription login
+- **DeepSeek Harness:** runs through the maintained openma-ai ACP adapter and reuses `~/.dsh`
 - **OpenCode:** uses its built-in ACP server
 - **Custom:** any image and command that speaks ACP over stdin/stdout
 
 Each Agent keeps an isolated, reusable environment for its selected harness,
 workspace, installed tools, and caches. Trusted workspaces can optionally use
 the host container engine for existing Compose-based workflows.
+
+For DeepSeek Harness, sign in on the control-plane host with `dsh-acp login`
+or use `dsh web` and save a model credential in its Settings page. XpressClaw
+mounts the resulting `~/.dsh` directory only when host login is enabled; no API
+key belongs in `xpressclaw.yaml`. See the [DeepSeek Harness guide](docs/deepseek-harness.md).
 
 ### Privacy & Safety
 
@@ -158,7 +164,7 @@ Releases also attach a standalone x64 `.zip` for manual CLI/server installs.
 ### 2. Create your first Project and Agent
 
 Choose an existing repository folder or start with an empty managed workspace,
-name the Agent, and select Codex, Claude Code, OpenCode, or a custom ACP
+name the Agent, and select Codex, Claude Code, DeepSeek Harness, OpenCode, or a custom ACP
 harness. XpressClaw creates the first Project around that Agent. Add more
 Projects and Agents from the UI; you do not run `init` for each repository.
 

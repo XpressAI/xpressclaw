@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::config::ContainerEngineAccess;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AcpAuthMount {
     /// Path relative to the host user's home directory.
     pub source: &'static str,
@@ -58,6 +58,12 @@ const CLAUDE_AUTH: &[AcpAuthMount] = &[
 const COPILOT_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
     source: ".copilot",
     target: "/home/node/.copilot",
+    read_only: false,
+}];
+
+const DEEPSEEK_HARNESS_AUTH: &[AcpAuthMount] = &[AcpAuthMount {
+    source: ".dsh",
+    target: "/home/node/.dsh",
     read_only: false,
 }];
 
@@ -191,6 +197,17 @@ pub const ACP_AGENTS: &[AcpAgentDefinition] = &[
         "codex login",
         "https://developers.openai.com/codex/cli/",
         CODEX_AUTH
+    ),
+    agent!(
+        "deepseek-harness",
+        "DeepSeek Harness",
+        "DS",
+        "DeepSeek Harness through openma-ai's maintained ACP adapter.",
+        &["dsh-acp"],
+        &["dsh-acp", "dsh"],
+        "dsh-acp login",
+        "https://github.com/openma-ai/deepseek-harness-acp",
+        DEEPSEEK_HARNESS_AUTH
     ),
     agent!(
         "github-copilot",
@@ -330,6 +347,28 @@ pub fn agent_definition(kind: &str) -> Option<&'static AcpAgentDefinition> {
     ACP_AGENTS.iter().find(|agent| agent.kind == kind)
 }
 
+/// Resolve a configured runner kind or legacy backend label to a catalog ID.
+///
+/// Product aliases live beside the catalog so setup, migrations, and runtime
+/// dispatch cannot disagree about whether a built-in harness is custom.
+pub fn infer_agent_kind(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase();
+    ACP_AGENTS
+        .iter()
+        .find(|agent| {
+            normalized == agent.kind
+                || (agent.kind.len() >= 4 && normalized.contains(agent.kind))
+                || (agent.kind == "github-copilot" && normalized.contains("copilot"))
+                || (agent.kind == "deepseek-harness"
+                    && matches!(
+                        normalized.as_str(),
+                        "deepseek" | "dsh" | "dsh-acp" | "deepseek-harness-acp"
+                    ))
+                || (agent.kind == "pi" && normalized == "pi-acp")
+        })
+        .map(|agent| agent.kind)
+}
+
 pub fn default_runner_image(
     kind: &str,
     container_engine: ContainerEngineAccess,
@@ -401,5 +440,33 @@ mod tests {
         assert!(is_builtin_runner_image(codex.local_host_image));
         assert!(is_host_runner_image(codex.host_image));
         assert!(!is_host_runner_image(codex.minimal_image));
+    }
+
+    #[test]
+    fn deepseek_harness_catalog_contract_is_stable() {
+        let dsh = agent_definition("deepseek-harness").unwrap();
+        assert_eq!(dsh.command, ["dsh-acp"]);
+        assert_eq!(dsh.login_command, "dsh-acp login");
+        assert_eq!(dsh.host_executables, ["dsh-acp", "dsh"]);
+        assert_eq!(dsh.auth_mounts, DEEPSEEK_HARNESS_AUTH);
+        assert!(!dsh.auth_mounts[0].read_only);
+        assert_eq!(infer_agent_kind("dsh"), Some("deepseek-harness"));
+        assert_eq!(
+            infer_agent_kind("@openma/deepseek-harness-acp"),
+            Some("deepseek-harness")
+        );
+        assert_eq!(
+            default_runner_image("deepseek-harness", ContainerEngineAccess::None),
+            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
+        );
+        assert_eq!(
+            default_runner_image("deepseek-harness", ContainerEngineAccess::Host),
+            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest")
+        );
+        assert_eq!(
+            local_runner_image(dsh.minimal_image),
+            Some("xpressclaw-runner-deepseek-harness:latest")
+        );
+        assert!(is_host_runner_image(dsh.local_host_image));
     }
 }

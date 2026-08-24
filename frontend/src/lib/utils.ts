@@ -40,10 +40,11 @@ export async function openExternal(url: string): Promise<void> {
 
 /** Compact product mark for an ACP-backed agent. */
 export function harnessMark(backend: string): string {
-	const normalized = backend.toLowerCase();
+	const normalized = canonicalHarnessKind(backend);
 	if (normalized.includes('claude')) return 'A';
 	if (normalized.includes('opencode')) return 'O';
 	if (normalized.includes('codex')) return 'C';
+	if (normalized === 'deepseek-harness') return 'DS';
 	if (normalized.includes('copilot')) return 'GH';
 	if (normalized.includes('cursor')) return 'CU';
 	if (normalized.includes('cline')) return 'CL';
@@ -59,14 +60,28 @@ export function harnessMark(backend: string): string {
 	return 'R';
 }
 
+/** Normalize legacy/backend aliases to the stable built-in harness kind. */
+export function canonicalHarnessKind(backend: string): string {
+	const normalized = backend.trim().toLowerCase();
+	if (['deepseek', 'dsh', 'dsh-acp', 'deepseek-harness-acp'].includes(normalized)
+		|| normalized.includes('deepseek-harness')) return 'deepseek-harness';
+	if (normalized.includes('claude')) return 'claude';
+	if (normalized.includes('opencode')) return 'opencode';
+	if (normalized.includes('codex')) return 'codex';
+	if (normalized.includes('copilot')) return 'github-copilot';
+	if (normalized === 'pi-acp') return 'pi';
+	return normalized;
+}
+
 /** User-facing product name for an ACP harness identifier. */
 export function harnessName(backend: string): string {
-	const normalized = backend.trim().toLowerCase();
+	const normalized = canonicalHarnessKind(backend);
 	const names: Record<string, string> = {
 		claude: 'Claude Agent',
 		'claude-code': 'Claude Agent',
 		'claude-sdk': 'Claude Agent',
 		codex: 'Codex',
+		'deepseek-harness': 'DeepSeek Harness',
 		'github-copilot': 'GitHub Copilot',
 		junie: 'Junie',
 		kimi: 'Kimi CLI',
