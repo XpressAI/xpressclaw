@@ -714,9 +714,13 @@ impl WorkflowEngine {
         };
         let state_json = serde_json::to_string(&state)
             .map_err(|error| Error::Workflow(format!("failed to persist wait state: {error}")))?;
-        let execution =
-            self.instances
-                .create_wait_execution(instance_id, flow_name, &step.id, &state_json)?;
+        let execution = self.instances.create_agent_wait_execution(
+            instance_id,
+            flow_name,
+            &step.id,
+            &state.agent_id,
+            &state_json,
+        )?;
         info!(
             instance_id,
             flow_name,

@@ -310,6 +310,12 @@ impl ProjectManager {
                               WHERE execution.instance_id = instance.id
                                 AND task.agent_id = ?1
                           )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM workflow_instance_agent_bindings binding
+                              WHERE binding.instance_id = instance.id
+                                AND binding.agent_id = ?1
+                          )
                       )
                 )",
                 rusqlite::params![agent_id, previous_project_id],
@@ -521,6 +527,11 @@ impl ProjectManager {
                             FROM workflow_step_executions execution
                             JOIN tasks task ON task.id = execution.task_id
                             WHERE task.project_id = ?1
+                         ))
+                         OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                            SELECT binding.instance_id
+                            FROM workflow_instance_agent_bindings binding
+                            WHERE binding.project_id = ?1
                          )))
                    + (SELECT COUNT(*) FROM schedules
                       WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
@@ -739,6 +750,11 @@ impl ProjectManager {
                        FROM workflow_step_executions execution
                        JOIN tasks task ON task.id = execution.task_id
                        WHERE task.project_id = ?1
+                    ))
+                    OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                       SELECT binding.instance_id
+                       FROM workflow_instance_agent_bindings binding
+                       WHERE binding.project_id = ?1
                     )))
                    AND status IN ('running', 'waiting')",
                 [id],
@@ -944,6 +960,11 @@ impl ProjectManager {
                        FROM workflow_step_executions execution
                        JOIN tasks task ON task.id = execution.task_id
                        WHERE task.project_id = ?1
+                    ))
+                    OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                       SELECT binding.instance_id
+                       FROM workflow_instance_agent_bindings binding
+                       WHERE binding.project_id = ?1
                     ))",
                 [id],
             )?;
@@ -1012,6 +1033,11 @@ fn row_to_project(
                     FROM workflow_step_executions execution
                     JOIN tasks task ON task.id = execution.task_id
                     WHERE task.project_id = ?1
+                 ))
+                 OR (project_id IS NULL AND conversation_id IS NULL AND id IN (
+                    SELECT binding.instance_id
+                    FROM workflow_instance_agent_bindings binding
+                    WHERE binding.project_id = ?1
                  ))),
              (SELECT COUNT(*) FROM schedules
               WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
@@ -1309,7 +1335,11 @@ mod tests {
                     VALUES ('review', 'Review', 'name: Review');
                  INSERT INTO workflow_instances
                     (id, workflow_id, status, project_id)
-                    VALUES ('review-run', 'review', 'waiting', 'source');",
+                    VALUES ('review-run', 'review', 'waiting', 'source'),
+                           ('agent-bound-run', 'review', 'waiting', NULL);
+                 INSERT INTO workflow_instance_agent_bindings
+                    (instance_id, agent_id, project_id)
+                    VALUES ('agent-bound-run', 'atlas', 'source');",
             )
         })
         .unwrap();
@@ -1321,6 +1351,16 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "UPDATE workflow_instances SET status = 'completed' WHERE id = 'review-run'",
+                [],
+            )
+        })
+        .unwrap();
+        let error = manager.assign_agent("target", "atlas").unwrap_err();
+        assert!(error.to_string().contains("active Project workflow"));
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE workflow_instances SET status = 'completed'
+                 WHERE id = 'agent-bound-run'",
                 [],
             )
         })
@@ -1728,11 +1768,17 @@ mod tests {
                     (id, workflow_id, status, project_id, conversation_id)
                     VALUES ('run-one', 'shared-workflow', 'waiting', 'one', 'conversation-one'),
                            ('run-via-task', 'shared-workflow', 'running', NULL, NULL),
+                           ('run-via-agent', 'shared-workflow', 'waiting', NULL, NULL),
                            ('run-two', 'shared-workflow', 'completed', 'two', 'conversation-two');
                  INSERT INTO workflow_step_executions
-                    (id, instance_id, flow_name, step_id, task_id, status)
-                    VALUES ('step-one', 'run-one', 'main', 'work', 'task-one', 'running'),
-                           ('step-via-task', 'run-via-task', 'main', 'work', 'task-one', 'running');
+                    (id, instance_id, flow_name, step_id, task_id, status, input_context)
+                    VALUES ('step-one', 'run-one', 'main', 'work', 'task-one', 'running', NULL),
+                           ('step-via-task', 'run-via-task', 'main', 'work', 'task-one', 'running', NULL),
+                           ('wait-via-agent', 'run-via-agent', 'main', 'review', NULL, 'waiting',
+                            '{\"agent_id\":\"atlas\"}');
+                 INSERT INTO workflow_instance_agent_bindings
+                    (instance_id, agent_id, project_id)
+                    VALUES ('run-via-agent', 'atlas', 'one');
                  INSERT INTO schedules (id, name, cron, agent_id, title, continuation_task_id)
                     VALUES ('schedule-one', 'Delete schedule', '', 'atlas', 'Wake', 'task-one');
                  INSERT INTO project_sync_state
@@ -1774,12 +1820,12 @@ mod tests {
         assert_eq!(counts.conversations, 1);
         assert_eq!(counts.conversation_messages, 1);
         assert_eq!(counts.memory_notes, 1);
-        assert_eq!(counts.workflow_runs, 2);
+        assert_eq!(counts.workflow_runs, 3);
         assert_eq!(counts.schedules, 1);
 
         manager.begin_cascade("one").unwrap();
         db.with_conn(|conn| {
-            for instance_id in ["run-one", "run-via-task"] {
+            for instance_id in ["run-one", "run-via-task", "run-via-agent"] {
                 let status: String = conn.query_row(
                     "SELECT status FROM workflow_instances WHERE id = ?1",
                     [instance_id],
@@ -1791,7 +1837,7 @@ mod tests {
         })
         .unwrap();
         let resume_error = crate::workflows::instance::InstanceManager::new(db.clone())
-            .set_active_status("run-via-task", "running")
+            .set_active_status("run-via-agent", "running")
             .unwrap_err();
         assert!(resume_error.to_string().contains("being deleted"));
         manager.finish_cascade("one").unwrap();

@@ -1747,6 +1747,48 @@ const MIGRATION_V39: &str = "
 ALTER TABLE projects ADD COLUMN deletion_started_at TIMESTAMP;
 ";
 
+const MIGRATION_V40: &str = "
+-- A workflow can deliberately remain projectless while selecting Agents that
+-- belong to Projects. Persist that Agent-derived scope so taskless waits and
+-- pre-task runs still participate in Project lifecycle guards and deletion.
+-- agent_id is an immutable provenance snapshot rather than a foreign key: it
+-- must remain available until the owning workflow instance is removed, even
+-- while the Agent itself is being deleted.
+CREATE TABLE workflow_instance_agent_bindings (
+    instance_id TEXT NOT NULL
+        REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL
+        REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (instance_id, agent_id, project_id)
+);
+CREATE INDEX idx_workflow_instance_agent_bindings_project
+    ON workflow_instance_agent_bindings(project_id, instance_id);
+
+-- Existing taskless event waits persist their selected Agent in input_context.
+-- Recover that ownership without making runtime lifecycle queries depend on
+-- parsing JSON after this one-time migration.
+INSERT OR IGNORE INTO workflow_instance_agent_bindings
+    (instance_id, agent_id, project_id)
+SELECT execution.instance_id,
+       json_extract(execution.input_context, '$.agent_id'),
+       agent.project_id
+FROM workflow_step_executions execution
+JOIN agents agent
+  ON agent.id = CASE
+      WHEN json_valid(execution.input_context)
+      THEN json_extract(execution.input_context, '$.agent_id')
+  END
+WHERE execution.task_id IS NULL
+  AND execution.input_context IS NOT NULL
+  AND json_valid(execution.input_context)
+  AND CASE
+      WHEN json_valid(execution.input_context)
+      THEN json_type(execution.input_context, '$.agent_id')
+  END = 'text'
+  AND agent.project_id IS NOT NULL;
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1788,6 +1830,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (37, MIGRATION_V37),
         (38, MIGRATION_V38),
         (39, MIGRATION_V39),
+        (40, MIGRATION_V40),
     ]
 }
 
@@ -1808,7 +1851,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "39");
+        assert_eq!(version, "40");
         let deletion_marker: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('projects')
@@ -1818,6 +1861,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(deletion_marker, 1);
+        let workflow_agent_scope: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pragma_table_info('workflow_instance_agent_bindings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workflow_agent_scope, 3);
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -2001,6 +2053,63 @@ mod tests {
                 "2026-08-16 11:00:00".into(),
                 "2026-08-16 11:00:07".into(),
             )
+        );
+    }
+
+    #[test]
+    fn v40_backfills_agent_scope_for_taskless_waits() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 39 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO projects (id, name) VALUES ('p', 'Project');
+               INSERT INTO agents (id, name, backend, config, project_id)
+               VALUES ('atlas', 'Atlas', 'native', '{}', 'p');
+               INSERT INTO workflows (id, name, yaml_content)
+               VALUES ('workflow', 'Workflow', 'name: Workflow');
+               INSERT INTO workflow_instances (id, workflow_id, status)
+               VALUES ('valid', 'workflow', 'waiting'),
+                      ('malformed', 'workflow', 'waiting'),
+                      ('unknown', 'workflow', 'waiting');
+               INSERT INTO workflow_step_executions
+                   (id, instance_id, flow_name, step_id, task_id, status, input_context)
+               VALUES ('valid-wait', 'valid', 'main', 'review', NULL, 'waiting',
+                       '{"agent_id":"atlas"}'),
+                      ('malformed-wait', 'malformed', 'main', 'review', NULL, 'waiting',
+                       '{'),
+                      ('unknown-wait', 'unknown', 'main', 'review', NULL, 'waiting',
+                       '{"agent_id":"missing"}');"#,
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V40).unwrap();
+
+        let bindings = conn
+            .prepare(
+                "SELECT instance_id, agent_id, project_id
+                 FROM workflow_instance_agent_bindings ORDER BY instance_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            bindings,
+            vec![("valid".to_string(), "atlas".to_string(), "p".to_string())]
         );
     }
 
@@ -2441,5 +2550,6 @@ mod tests {
         assert!(tables.contains(&"task_message_sync".to_string()));
         assert!(tables.contains(&"project_workflows".to_string()));
         assert!(tables.contains(&"project_sync_state".to_string()));
+        assert!(tables.contains(&"workflow_instance_agent_bindings".to_string()));
     }
 }
