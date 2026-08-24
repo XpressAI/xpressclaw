@@ -33,6 +33,9 @@
 		--foreground-tertiary: 220 3% 62%;
 		--border-strong: 220 8% 88%;
 		--field: 240 4% 95%;
+		--code-background: 220 14% 94%;
+		--code-foreground: 220 20% 16%;
+		--code-border: 220 10% 82%;
 		--success: 145 73% 35%;
 		--success-tint: 145 48% 94%;
 		--warning: 27 93% 49%;
@@ -77,6 +80,9 @@
 		--foreground-tertiary: 220 4% 44%;
 		--border-strong: 220 5% 24%;
 		--field: 220 5% 18%;
+		--code-background: 220 8% 10%;
+		--code-foreground: 210 15% 92%;
+		--code-border: 220 7% 30%;
 		--success: 145 51% 49%;
 		--success-tint: 145 51% 49% / 14%;
 		--warning: 27 91% 60%;
@@ -189,13 +195,19 @@
 .prose-chat ol { list-style: decimal; }
 .prose-chat li { margin: 0.15em 0; }
 .prose-chat code {
-	background: hsl(var(--muted));
+	border: 1px solid hsl(var(--code-border));
+	background: hsl(var(--code-background));
+	color: hsl(var(--code-foreground));
 	padding: 0.15em 0.35em;
 	border-radius: 0.25rem;
 	font-size: 0.85em;
+	-webkit-box-decoration-break: clone;
+	box-decoration-break: clone;
 }
 .prose-chat pre {
-	background: hsl(var(--canvas));
+	border: 1px solid hsl(var(--code-border));
+	background: hsl(var(--code-background));
+	color: hsl(var(--code-foreground));
 	padding: 0.875rem 1rem;
 	border-radius: 0.625rem;
 	overflow-x: auto;
@@ -204,6 +216,8 @@
 }
 .prose-chat pre code {
 	background: none;
+	border: 0;
+	color: inherit;
 	padding: 0;
 	font-size: 0.85em;
 	line-height: 1.65;
