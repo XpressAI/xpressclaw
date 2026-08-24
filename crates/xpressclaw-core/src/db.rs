@@ -233,17 +233,20 @@ impl Database {
     }
 }
 
-/// Recover Project ownership for projectless workflow instances created
-/// before workflow Agent bindings became durable.
+/// Recover Project ownership for workflow instances created before workflow
+/// Agent bindings became durable.
 ///
 /// The SQL portion of v40 recovers the Agent attached to a current taskless
 /// wait. This pass also resolves typed inputs and Agent selectors from the
 /// immutable definition/trigger snapshot so future steps cannot outlive a
 /// Project cascade. An active legacy run whose complete Agent set cannot be
 /// recovered is cancelled rather than allowed to resume against a deleted
-/// Agent later.
+/// Agent later. Active scoped runs are also cancelled when their recovered
+/// Agent ownership contradicts their persisted Project scope.
 const UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR: &str =
     "Stopped during upgrade because not every Agent binding could be recovered safely";
+const CONFLICTING_WORKFLOW_BINDINGS_ERROR: &str =
+    "Stopped during upgrade because an Agent binding conflicts with the workflow Project scope";
 
 fn backfill_workflow_agent_bindings(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
     let agents = {
@@ -259,27 +262,39 @@ fn backfill_workflow_agent_bindings(transaction: &rusqlite::Transaction<'_>) -> 
         let mut statement = transaction.prepare(
             "SELECT instance.id,
                     instance.status,
+                    instance.project_id,
+                    conversation.project_id,
                     COALESCE(NULLIF(instance.definition_yaml, ''), workflow.yaml_content),
                     COALESCE(instance.trigger_data, '{}')
              FROM workflow_instances instance
              JOIN workflows workflow ON workflow.id = instance.workflow_id
-             WHERE instance.project_id IS NULL
-               AND instance.conversation_id IS NULL",
+             LEFT JOIN conversations conversation
+               ON conversation.id = instance.conversation_id",
         )?;
         let instances = statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         instances
     };
 
-    for (instance_id, status, definition_yaml, trigger_json) in instances {
+    for (
+        instance_id,
+        status,
+        instance_project_id,
+        conversation_project_id,
+        definition_yaml,
+        trigger_json,
+    ) in instances
+    {
         let recovered = (|| -> Result<(BTreeSet<String>, bool)> {
             let mut definition = WorkflowDefinition::parse(&definition_yaml)?;
             let provided_trigger = serde_json::from_str::<Value>(&trigger_json)
@@ -308,6 +323,18 @@ fn backfill_workflow_agent_bindings(transaction: &rusqlite::Transaction<'_>) -> 
         })();
 
         let (agent_ids, mut complete) = recovered.unwrap_or_else(|_| (BTreeSet::new(), false));
+        let scoped_project_id = instance_project_id
+            .as_deref()
+            .or(conversation_project_id.as_deref());
+        let mut scope_consistent = match (
+            instance_project_id.as_deref(),
+            conversation_project_id.as_deref(),
+        ) {
+            (Some(instance_project_id), Some(conversation_project_id)) => {
+                instance_project_id == conversation_project_id
+            }
+            _ => true,
+        };
         for agent_id in agent_ids {
             match agents.get(&agent_id) {
                 Some(Some(project_id)) => {
@@ -316,20 +343,36 @@ fn backfill_workflow_agent_bindings(transaction: &rusqlite::Transaction<'_>) -> 
                          (instance_id, agent_id, project_id) VALUES (?1, ?2, ?3)",
                         rusqlite::params![instance_id, agent_id, project_id],
                     )?;
+                    if scoped_project_id.is_some_and(|scope| project_id.as_str() != scope) {
+                        scope_consistent = false;
+                    }
                 }
-                Some(None) => {}
+                Some(None) => {
+                    if scoped_project_id.is_some() {
+                        scope_consistent = false;
+                    }
+                }
                 None => complete = false,
             }
         }
 
-        if !complete && matches!(status.as_str(), "running" | "waiting") {
-            transaction.execute(
-                "UPDATE workflow_instances
-                 SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
-                     error_message = ?1
-                 WHERE id = ?2 AND status IN ('running', 'waiting')",
-                rusqlite::params![UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR, instance_id],
-            )?;
+        let cancellation_error = if !complete {
+            Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR)
+        } else if !scope_consistent {
+            Some(CONFLICTING_WORKFLOW_BINDINGS_ERROR)
+        } else {
+            None
+        };
+        if let Some(cancellation_error) = cancellation_error {
+            if matches!(status.as_str(), "running" | "waiting") {
+                transaction.execute(
+                    "UPDATE workflow_instances
+                     SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                         error_message = ?1
+                     WHERE id = ?2 AND status IN ('running', 'waiting')",
+                    rusqlite::params![cancellation_error, instance_id],
+                )?;
+            }
         }
     }
 
@@ -2248,6 +2291,38 @@ flows:
                       ('unresolved-active', 'unresolved', 'waiting', '{}', NULL),
                       ('unresolved-complete', 'unresolved', 'completed', '{}', NULL),
                       ('missing-active', 'missing', 'running', '{}', NULL);
+               INSERT INTO workflow_instances
+                   (id, workflow_id, project_id, status, trigger_data, definition_yaml)
+               VALUES ('scoped-valid', 'workflow', 'p-current', 'waiting', '{}',
+                       'name: Scoped valid
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: atlas
+        prompt: Continue'),
+                      ('scoped-conflict', 'workflow', 'p-current', 'waiting',
+                       '{"trigger":{"future_agent":"reviewer"}}',
+                       'name: Scoped conflict
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: atlas
+        prompt: Continue
+  later:
+    steps:
+      - id: future-review
+        agent: "{{trigger.future_agent}}"
+        prompt: Review'),
+                      ('scoped-conflict-complete', 'workflow', 'p-current', 'completed', '{}',
+                       'name: Completed scoped conflict
+flows:
+  main:
+    steps:
+      - id: review
+        agent: reviewer
+        prompt: Review');
                INSERT INTO workflow_step_executions
                    (id, instance_id, flow_name, step_id, task_id, status, input_context)
                VALUES ('valid-wait', 'valid', 'main', 'review', NULL, 'waiting',
@@ -2289,6 +2364,26 @@ flows:
                     "p-current".to_string(),
                 ),
                 (
+                    "scoped-conflict".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "scoped-conflict".to_string(),
+                    "reviewer".to_string(),
+                    "p-input".to_string(),
+                ),
+                (
+                    "scoped-conflict-complete".to_string(),
+                    "reviewer".to_string(),
+                    "p-input".to_string(),
+                ),
+                (
+                    "scoped-valid".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
                     "unresolved-active".to_string(),
                     "atlas".to_string(),
                     "p-current".to_string(),
@@ -2318,7 +2413,8 @@ flows:
         let statuses = conn
             .prepare(
                 "SELECT id, status, error_message FROM workflow_instances
-                 WHERE id IN ('valid', 'unresolved-active', 'unresolved-complete', 'missing-active')
+                 WHERE id IN ('valid', 'unresolved-active', 'unresolved-complete', 'missing-active',
+                              'scoped-valid', 'scoped-conflict', 'scoped-conflict-complete')
                  ORDER BY id",
             )
             .unwrap()
@@ -2333,26 +2429,29 @@ flows:
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(
-            statuses[0],
-            (
-                "missing-active".into(),
-                "cancelled".into(),
-                Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
-            )
+            statuses,
+            vec![
+                (
+                    "missing-active".into(),
+                    "cancelled".into(),
+                    Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                (
+                    "scoped-conflict".into(),
+                    "cancelled".into(),
+                    Some(CONFLICTING_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                ("scoped-conflict-complete".into(), "completed".into(), None,),
+                ("scoped-valid".into(), "waiting".into(), None),
+                (
+                    "unresolved-active".into(),
+                    "cancelled".into(),
+                    Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                ("unresolved-complete".into(), "completed".into(), None),
+                ("valid".into(), "waiting".into(), None),
+            ]
         );
-        assert_eq!(
-            statuses[1],
-            (
-                "unresolved-active".into(),
-                "cancelled".into(),
-                Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
-            )
-        );
-        assert_eq!(
-            statuses[2],
-            ("unresolved-complete".into(), "completed".into(), None)
-        );
-        assert_eq!(statuses[3], ("valid".into(), "waiting".into(), None));
     }
 
     #[test]
