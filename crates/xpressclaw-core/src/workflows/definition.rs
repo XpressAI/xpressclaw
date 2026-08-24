@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 
@@ -219,6 +219,45 @@ impl WorkflowDefinition {
         steps.iter().any(|step| {
             step.step_type == "sink" || step.body.as_deref().is_some_and(Self::steps_use_connectors)
         })
+    }
+
+    /// Return every concrete Agent selected directly by this definition.
+    ///
+    /// Typed `@role` inputs are resolved from run inputs separately. Literal
+    /// bindings must still be known before an instance is inserted so a
+    /// projectless run cannot outlive the Project that owns a future step's
+    /// Agent. The stable source labels also make validation errors actionable.
+    pub(crate) fn literal_agent_bindings(&self) -> Vec<(String, String)> {
+        let mut bindings = BTreeSet::new();
+        for (flow_name, flow) in &self.flows {
+            Self::collect_literal_agent_bindings(flow_name, &flow.steps, &mut bindings);
+        }
+        bindings.into_iter().collect()
+    }
+
+    fn collect_literal_agent_bindings(
+        flow_name: &str,
+        steps: &[Step],
+        bindings: &mut BTreeSet<(String, String)>,
+    ) {
+        for step in steps {
+            if matches!(step.step_type.as_str(), "step" | "wait") {
+                if let Some(agent_id) = step
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty() && !id.starts_with('@') && !id.contains("{{"))
+                {
+                    bindings.insert((
+                        format!("step '{flow_name}.{}'", step.id),
+                        agent_id.to_string(),
+                    ));
+                }
+            }
+            if let Some(body) = step.body.as_deref() {
+                Self::collect_literal_agent_bindings(flow_name, body, bindings);
+            }
+        }
     }
 
     /// Validate the definition:
@@ -1392,6 +1431,50 @@ flows:
             .unwrap_err()
             .to_string()
             .contains("not type agent"));
+    }
+
+    #[test]
+    fn collects_literal_agent_bindings_across_flows_and_loop_bodies() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: agent-bindings
+inputs:
+  worker: { type: agent }
+flows:
+  main:
+    steps:
+      - id: dynamic
+        agent: "@worker"
+        prompt: dynamic
+      - id: templated
+        agent: "{{trigger.worker}}"
+        prompt: templated
+      - id: repeated
+        type: loop
+        over: "{{trigger.items}}"
+        as: item
+        steps:
+          - id: nested
+            agent: nested-agent
+            prompt: nested
+  later:
+    steps:
+      - id: wait
+        type: wait
+        agent: review-agent
+        event: github.pull_request.activity
+        resource: https://github.com/example/repo/pull/1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            definition.literal_agent_bindings(),
+            vec![
+                ("step 'later.wait'".into(), "review-agent".into()),
+                ("step 'main.nested'".into(), "nested-agent".into()),
+            ]
+        );
     }
 
     #[test]

@@ -52,6 +52,11 @@ pub struct ProjectDeletionPlan {
     pub project_id: String,
     pub project_name: String,
     pub agents: Vec<ProjectDeletionAgent>,
+    /// Stable Agent IDs whose runtime barriers cover Project-owned Agents,
+    /// tasks, conversations, or app containers. This can include an anomalous
+    /// cross-Project runtime owner without making that Agent itself part of
+    /// the deletion.
+    pub runtime_agent_ids: Vec<String>,
     /// Exact container IDs recorded on Project-owned durable rows. These are
     /// an ownership proof for runtimes created before installation labels
     /// were introduced.
@@ -644,6 +649,45 @@ impl ProjectManager {
                  ORDER BY app.id",
                 id,
             )?;
+            let runtime_agent_ids = collect_ids(
+                &transaction,
+                "SELECT agent.id
+                 FROM agents agent
+                 WHERE agent.project_id = ?1
+                 UNION
+                 SELECT app.agent_id
+                 FROM apps app
+                 WHERE app.agent_id IS NOT NULL
+                   AND (
+                       app.agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
+                       OR app.conversation_id IN
+                          (SELECT id FROM conversations WHERE project_id = ?1)
+                   )
+                 UNION
+                 SELECT task.agent_id
+                 FROM tasks task
+                 WHERE task.project_id = ?1 AND task.agent_id IS NOT NULL
+                 UNION
+                 SELECT queue.agent_id
+                 FROM task_queue queue
+                 JOIN tasks task ON task.id = queue.task_id
+                 WHERE task.project_id = ?1
+                 UNION
+                 SELECT participant.participant_id
+                 FROM conversation_participants participant
+                 JOIN conversations conversation
+                   ON conversation.id = participant.conversation_id
+                 WHERE conversation.project_id = ?1
+                   AND participant.participant_type = 'agent'
+                 UNION
+                 SELECT turn.agent_id
+                 FROM conversation_turns turn
+                 JOIN conversations conversation
+                   ON conversation.id = turn.conversation_id
+                 WHERE conversation.project_id = ?1
+                 ORDER BY 1",
+                id,
+            )?;
             let mut recorded_container_ids = agents
                 .iter()
                 .filter_map(|agent| agent.container_id.clone())
@@ -776,6 +820,14 @@ impl ProjectManager {
                 [id],
             )?;
             transaction.execute(
+                "UPDATE apps
+                 SET status = 'stopped', updated_at = CURRENT_TIMESTAMP
+                 WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)
+                    OR conversation_id IN
+                       (SELECT id FROM conversations WHERE project_id = ?1)",
+                [id],
+            )?;
+            transaction.execute(
                 "UPDATE agents
                  SET desired_status = 'stopped', status = 'stopped',
                      stopped_at = CURRENT_TIMESTAMP
@@ -788,6 +840,7 @@ impl ProjectManager {
                 project_id: id.to_string(),
                 project_name,
                 agents,
+                runtime_agent_ids,
                 recorded_container_ids,
                 conversation_ids,
                 task_ids,
@@ -1566,6 +1619,38 @@ mod tests {
         );
         assert_eq!(plan.active_attempt_ids, vec!["attempt-one"]);
         assert_eq!(plan.app_ids, vec!["app-one"]);
+    }
+
+    #[test]
+    fn cascade_quiesces_an_external_agent_that_owns_a_project_conversation_app() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('one', 'One'), ('two', 'Two');
+                 INSERT INTO agents (id, name, backend, config, project_id)
+                    VALUES ('atlas', 'Atlas', 'native', '{}', 'one'),
+                           ('other', 'Other', 'native', '{}', 'two');
+                 INSERT INTO conversations (id, title, project_id)
+                    VALUES ('conversation-one', 'One conversation', 'one');
+                 INSERT INTO apps
+                    (id, title, agent_id, conversation_id, status, start_command)
+                    VALUES ('cross-app', 'Cross app', 'other', 'conversation-one',
+                            'running', 'npm start');",
+            )
+        })
+        .unwrap();
+
+        let plan = ProjectManager::new(db).begin_cascade("one").unwrap();
+        assert_eq!(plan.app_ids, vec!["cross-app"]);
+        assert_eq!(plan.runtime_agent_ids, vec!["atlas", "other"]);
+        assert_eq!(
+            plan.agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["atlas"],
+            "quiescing an app owner must not broaden Agent deletion"
+        );
     }
 
     #[test]

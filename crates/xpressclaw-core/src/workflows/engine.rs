@@ -211,24 +211,26 @@ impl WorkflowEngine {
             }
         }
         let registry = AgentRegistry::new(self.db.clone());
-        let mut workflow_agent_inputs = Vec::new();
+        let mut workflow_agent_bindings = definition.literal_agent_bindings();
         for (name, input) in &definition.inputs {
             if input.input_type != WorkflowInputType::Agent {
                 continue;
             }
             if let Some(agent_id) = trigger_data.get(name).and_then(Value::as_str) {
-                workflow_agent_inputs.push((name.clone(), agent_id.to_string()));
-                let agent = registry.get(agent_id).map_err(|_| {
-                    Error::Workflow(format!(
-                        "workflow agent input '{name}' references unknown agent '{agent_id}'"
-                    ))
-                })?;
-                if let Some(project_id) = workflow_context.project_id.as_deref() {
-                    if agent.project_id.as_deref() != Some(project_id) {
-                        return Err(Error::Workflow(format!(
-                            "workflow agent input '{name}' references Agent '{agent_id}' outside project '{project_id}'"
-                        )));
-                    }
+                workflow_agent_bindings.push((format!("input '{name}'"), agent_id.to_string()));
+            }
+        }
+        for (source, agent_id) in &workflow_agent_bindings {
+            let agent = registry.get(agent_id).map_err(|_| {
+                Error::Workflow(format!(
+                    "workflow {source} references unknown agent '{agent_id}'"
+                ))
+            })?;
+            if let Some(project_id) = workflow_context.project_id.as_deref() {
+                if agent.project_id.as_deref() != Some(project_id) {
+                    return Err(Error::Workflow(format!(
+                        "workflow {source} references Agent '{agent_id}' outside project '{project_id}'"
+                    )));
                 }
             }
         }
@@ -257,7 +259,7 @@ impl WorkflowEngine {
                     project_id: workflow_context.project_id.as_deref(),
                     conversation_id: workflow_context.conversation_id.as_deref(),
                     creator_agent_id,
-                    workflow_agent_inputs: &workflow_agent_inputs,
+                    workflow_agent_bindings: &workflow_agent_bindings,
                 },
                 after_instance_insert,
             )?;
@@ -2017,6 +2019,10 @@ mod tests {
 
     fn setup() -> (Arc<Database>, WorkflowEngine) {
         let db = Arc::new(Database::open_memory().unwrap());
+        let registry = AgentRegistry::new(db.clone());
+        for agent_id in ["atlas", "dev", "reviewer"] {
+            registry.ensure(agent_id, "codex").unwrap();
+        }
         let engine = WorkflowEngine::new(db.clone());
         (db, engine)
     }
@@ -2168,6 +2174,71 @@ flows:
             )
             .unwrap_err();
         assert!(error.to_string().contains("unknown agent 'missing'"));
+    }
+
+    #[test]
+    fn literal_agent_binding_is_recorded_before_a_projectless_run_is_inserted() {
+        let (db, engine) = setup();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One')",
+                [],
+            )
+        })
+        .unwrap();
+        AgentRegistry::new(db.clone())
+            .create_in_project("project-agent", "codex", "project-one")
+            .unwrap();
+        let workflow_id = create_workflow(
+            &db,
+            r#"
+name: future-static-agent
+flows:
+  main:
+    steps: []
+  future:
+    steps:
+      - id: future-work
+        agent: project-agent
+        prompt: Do future work
+"#,
+        );
+
+        let instance_id = engine.start_instance(&workflow_id, json!({})).unwrap();
+        let binding: (String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id, project_id
+                     FROM workflow_instance_agent_bindings WHERE instance_id = ?1",
+                    [&instance_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(binding, ("project-agent".into(), "project-one".into()));
+
+        crate::projects::ProjectManager::new(db.clone())
+            .begin_cascade("project-one")
+            .unwrap();
+        let instance_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        let error = engine.start_instance(&workflow_id, json!({})).unwrap_err();
+        assert!(error.to_string().contains("being deleted"));
+        assert_eq!(
+            db.with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap(),
+            instance_count,
+            "a rejected static-Agent run must not leave a detached instance"
+        );
     }
 
     #[test]
@@ -3525,6 +3596,9 @@ flows:
     #[test]
     fn recovery_advances_an_event_committed_before_the_next_step() {
         let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
         let workflow_id = create_workflow(
             &db,
             r#"
@@ -3587,6 +3661,9 @@ flows:
     #[test]
     fn wait_timeout_takes_configured_flow() {
         let (db, engine) = setup();
+        AgentRegistry::new(db.clone())
+            .ensure("project-a", "codex")
+            .unwrap();
         let workflow_id = create_workflow(
             &db,
             r#"

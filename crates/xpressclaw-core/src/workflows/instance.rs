@@ -57,7 +57,7 @@ pub(super) struct WorkflowInstanceScope<'a> {
     pub project_id: Option<&'a str>,
     pub conversation_id: Option<&'a str>,
     pub creator_agent_id: Option<&'a str>,
-    pub workflow_agent_inputs: &'a [(String, String)],
+    pub workflow_agent_bindings: &'a [(String, String)],
 }
 
 impl InstanceManager {
@@ -188,7 +188,7 @@ impl InstanceManager {
                 }
             }
             let mut agent_bindings = Vec::new();
-            for (input_name, agent_id) in scope.workflow_agent_inputs {
+            for (source, agent_id) in scope.workflow_agent_bindings {
                 let agent_project = transaction
                     .query_row(
                         "SELECT project_id FROM agents WHERE id = ?1",
@@ -198,13 +198,13 @@ impl InstanceManager {
                     .optional()?
                     .ok_or_else(|| {
                         Error::Workflow(format!(
-                            "workflow agent input '{input_name}' references unknown agent '{agent_id}'"
+                            "workflow {source} references unknown agent '{agent_id}'"
                         ))
                     })?;
                 if let Some(project_id) = resolved_project {
                     if agent_project.as_deref() != Some(project_id) {
                         return Err(Error::Workflow(format!(
-                            "workflow agent input '{input_name}' references Agent '{agent_id}' outside project '{project_id}'"
+                            "workflow {source} references Agent '{agent_id}' outside project '{project_id}'"
                         )));
                     }
                 } else if let Some(project_id) = agent_project.as_deref() {
@@ -1111,7 +1111,7 @@ mod tests {
                 None,
                 None,
                 WorkflowInstanceScope {
-                    workflow_agent_inputs: &agent_inputs,
+                    workflow_agent_bindings: &agent_inputs,
                     ..WorkflowInstanceScope::default()
                 },
             )
@@ -1176,7 +1176,7 @@ mod tests {
                 None,
                 None,
                 WorkflowInstanceScope {
-                    workflow_agent_inputs: &agent_inputs,
+                    workflow_agent_bindings: &agent_inputs,
                     ..WorkflowInstanceScope::default()
                 },
             )

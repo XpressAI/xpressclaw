@@ -132,7 +132,11 @@ impl NativeRuntimeLifecycle {
             .clone()
     }
 
-    async fn enter(&self, agent_id: &str) -> OwnedRwLockReadGuard<()> {
+    /// Enter a runtime operation that may create, replace, or use resources
+    /// owned by an Agent. Reconcilers and dispatchers must acquire this before
+    /// acting on a durable desired-state snapshot so Project deletion can
+    /// quiesce every launch path with the write side of the same barrier.
+    pub(crate) async fn enter(&self, agent_id: &str) -> OwnedRwLockReadGuard<()> {
         self.slot(agent_id).read_owned().await
     }
 

@@ -7,6 +7,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use rusqlite::OptionalExtension;
 use tracing::{debug, error, info, warn};
 
 use crate::agents::registry::AgentRegistry;
@@ -16,6 +17,7 @@ use crate::docker::images::build_container_spec;
 use crate::docker::manager::{DockerManager, SelinuxRelabel, VolumeMount};
 use crate::tasks::board::TaskBoard;
 use crate::tasks::queue::TaskQueue;
+use crate::workers::native::NativeRuntimeLifecycle;
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 const STABLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
@@ -23,14 +25,20 @@ const STABLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
 /// Start the reconciliation loop as a background task.
 /// Takes the config behind a RwLock so it always sees the latest
 /// config after user changes (add/remove agents, update API keys, etc.)
-pub async fn start(db: Arc<Database>, config: Arc<RwLock<Arc<Config>>>, server_port: u16) {
+pub async fn start(
+    db: Arc<Database>,
+    config: Arc<RwLock<Arc<Config>>>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
+    server_port: u16,
+) {
     info!(
         "starting desired-state reconciler ({}s interval)",
         RECONCILE_INTERVAL.as_secs()
     );
     loop {
         let config_snapshot = config.read().unwrap().clone();
-        if let Err(e) = reconcile_once(&db, &config_snapshot, server_port).await {
+        if let Err(e) = reconcile_once(&db, &config_snapshot, &runtime_lifecycle, server_port).await
+        {
             warn!(error = %e, "reconciliation cycle failed");
         }
         tokio::time::sleep(RECONCILE_INTERVAL).await;
@@ -40,6 +48,7 @@ pub async fn start(db: Arc<Database>, config: Arc<RwLock<Arc<Config>>>, server_p
 async fn reconcile_once(
     db: &Arc<Database>,
     config: &Config,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
     server_port: u16,
 ) -> crate::error::Result<()> {
     // Connect to Docker — if unavailable, skip this cycle
@@ -53,8 +62,16 @@ async fn reconcile_once(
 
     reconcile_models(config).await;
     let available_images = reconcile_images(config, &docker).await;
-    reconcile_agents(db, config, &docker, server_port, &available_images).await;
-    reconcile_apps(db, &docker).await;
+    reconcile_agents(
+        db,
+        config,
+        &docker,
+        runtime_lifecycle,
+        server_port,
+        &available_images,
+    )
+    .await;
+    reconcile_apps(db, &docker, runtime_lifecycle).await;
     reconcile_tasks(db, &docker).await;
     reconcile_idle_tasks(db, config);
 
@@ -194,12 +211,18 @@ async fn reconcile_agents(
     db: &Arc<Database>,
     config: &Config,
     docker: &DockerManager,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
     server_port: u16,
     available_images: &std::collections::HashSet<String>,
 ) {
     let registry = AgentRegistry::new(db.clone());
 
     for agent_config in &config.agents {
+        // Acquire before reading durable desired state. A cascade that marked
+        // this Project first will make the re-read below stop/skip; a cascade
+        // that starts later waits for this complete Docker operation and then
+        // removes any container it produced.
+        let _runtime_guard = runtime_lifecycle.enter(&agent_config.name).await;
         let agent = match registry.get(&agent_config.name) {
             Ok(a) => a,
             Err(_) => continue, // Not in DB yet (setup hasn't run)
@@ -385,8 +408,48 @@ struct AppRow {
     last_attempt_at: Option<String>,
 }
 
+fn load_reconcilable_app(
+    db: &Arc<Database>,
+    app_id: &str,
+    expected_agent_id: &str,
+) -> crate::error::Result<Option<AppRow>> {
+    Ok(db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT app.id, app.agent_id, app.start_command, app.image, app.port,
+                    app.restart_count, app.last_attempt_at
+             FROM apps app
+             JOIN agents agent ON agent.id = app.agent_id
+             LEFT JOIN projects project ON project.id = agent.project_id
+             WHERE app.id = ?1 AND app.agent_id = ?2
+               AND app.status IN ('running', 'starting')
+               AND app.start_command IS NOT NULL
+               AND (
+                    agent.project_id IS NULL
+                    OR (project.id IS NOT NULL AND project.deletion_started_at IS NULL)
+               )",
+            rusqlite::params![app_id, expected_agent_id],
+            |row| {
+                Ok(AppRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    start_command: row.get(2)?,
+                    image: row.get(3)?,
+                    port: row.get(4)?,
+                    restart_count: row.get(5)?,
+                    last_attempt_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+    })?)
+}
+
 /// Reconcile published app containers — pull images and restart any that should be running.
-async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
+async fn reconcile_apps(
+    db: &Arc<Database>,
+    docker: &DockerManager,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
+) {
     let apps: Vec<AppRow> = {
         let conn = db.conn();
         let mut stmt = match conn.prepare(
@@ -413,7 +476,20 @@ async fn reconcile_apps(db: &Arc<Database>, docker: &DockerManager) {
         .collect()
     };
 
-    for app in apps {
+    for stale_app in apps {
+        // App containers are owned by their Agent for lifecycle purposes. The
+        // initial list is only a candidate set: after entering the barrier,
+        // re-read the row and its Project deletion marker before touching
+        // Docker so a stale cycle cannot relaunch an app after cleanup.
+        let _runtime_guard = runtime_lifecycle.enter(&stale_app.agent_id).await;
+        let app = match load_reconcilable_app(db, &stale_app.id, &stale_app.agent_id) {
+            Ok(Some(app)) => app,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(app_id = stale_app.id, %error, "failed to refresh app state");
+                continue;
+            }
+        };
         let app_id = &app.id;
         let agent_id = &app.agent_id;
         // Container name must match what docker.launch() produces: "xpressclaw-{name}"
@@ -980,5 +1056,73 @@ mod tests {
         // list_all should show both
         let all = board.list_all(None, None, 100).unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_app_candidate_rechecks_state_after_project_quiescence() {
+        let db = Arc::new(crate::db::Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents
+                    (id, name, backend, config, project_id, desired_status)
+                    VALUES
+                    ('project-agent', 'Project Agent', 'native', '{}',
+                     'project-one', 'running');
+                 INSERT INTO apps
+                    (id, title, agent_id, status, start_command, image)
+                    VALUES
+                    ('project-app', 'Project app', 'project-agent', 'running',
+                     'npm start', 'node:20-alpine');",
+            )
+        })
+        .unwrap();
+
+        assert!(load_reconcilable_app(&db, "project-app", "project-agent")
+            .unwrap()
+            .is_some());
+        crate::projects::ProjectManager::new(db.clone())
+            .begin_cascade("project-one")
+            .unwrap();
+        assert_eq!(
+            db.with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status FROM apps WHERE id = 'project-app'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap(),
+            "stopped",
+            "the deletion marker transaction must disable app desired state"
+        );
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE apps SET status = 'running' WHERE id = 'project-app'",
+                [],
+            )
+        })
+        .unwrap();
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        let guards = lifecycle
+            .quiesce_agents(&["project-agent".to_string()])
+            .await;
+        let candidate_db = db.clone();
+        let candidate_lifecycle = lifecycle.clone();
+        let mut candidate = tokio::spawn(async move {
+            let _guard = candidate_lifecycle.enter("project-agent").await;
+            load_reconcilable_app(&candidate_db, "project-app", "project-agent").unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut candidate)
+                .await
+                .is_err(),
+            "the desired-state candidate must wait for Project runtime cleanup"
+        );
+        drop(guards);
+        assert!(
+            candidate.await.unwrap().is_none(),
+            "the post-barrier re-read must also reject stale status by Project marker"
+        );
     }
 }

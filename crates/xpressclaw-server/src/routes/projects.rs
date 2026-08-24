@@ -124,16 +124,11 @@ async fn delete_project_cascade(
     let plan = manager.begin_cascade(id).map_err(project_error)?;
 
     interrupt_project_work(state, &plan).await;
-    let agent_ids = plan
-        .agents
-        .iter()
-        .map(|agent| agent.id.clone())
-        .collect::<Vec<_>>();
     let runtime_guards = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         state
             .native_runtime_lifecycle
-            .quiesce_agents(&agent_ids),
+            .quiesce_agents(&plan.runtime_agent_ids),
     )
     .await
     .map_err(|_| {
@@ -636,6 +631,7 @@ mod tests {
                 name: "atlas".into(),
                 container_id: None,
             }],
+            runtime_agent_ids: vec!["agent-id".into()],
             recorded_container_ids: vec![],
             conversation_ids: vec![],
             task_ids: vec![],
