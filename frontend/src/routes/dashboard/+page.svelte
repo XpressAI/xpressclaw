@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import {
+		ApiError,
 		dashboard,
 		type DashboardActiveWork,
 		type DashboardEvent,
@@ -111,6 +112,8 @@
 
 	async function loadDashboard() {
 		const generation = ++loadGeneration;
+		const requestedProjectId = projectId;
+		const requestedRange = range;
 		paginationGeneration += 1;
 		summaryRefreshGeneration += 1;
 		if (refreshTimer) clearTimeout(refreshTimer);
@@ -132,8 +135,11 @@
 		error = '';
 		liveState = navigator.onLine ? 'connecting' : 'offline';
 		try {
-			const loaded = await dashboard.snapshot(projectId, range);
-			if (!mounted || generation !== loadGeneration) return;
+			const loaded = await dashboard.snapshot(requestedProjectId, requestedRange);
+			if (
+				!mounted || generation !== loadGeneration
+				|| requestedProjectId !== projectId || requestedRange !== range
+			) return;
 			projectOptions = loaded.projects;
 			snapshot = loaded;
 			feed = uniqueEvents(loaded.feed.events).slice(0, 160);
@@ -143,6 +149,13 @@
 			connectStream(loaded.cursor);
 		} catch (caught) {
 			if (generation !== loadGeneration) return;
+			if (
+				requestedProjectId && requestedProjectId === projectId
+				&& caught instanceof ApiError && caught.status === 404
+			) {
+				recoverDeletedProject(requestedProjectId);
+				return;
+			}
 			loading = false;
 			error = caught instanceof Error ? caught.message : 'Control center could not be loaded.';
 			liveState = navigator.onLine ? 'reconnecting' : 'offline';
@@ -173,7 +186,10 @@
 			if (eventSource === source) void loadDashboard();
 		});
 		source.addEventListener('stream_error', () => {
-			if (eventSource === source) liveState = 'reconnecting';
+			if (eventSource === source) {
+				liveState = 'reconnecting';
+				scheduleSummaryRefresh(0);
+			}
 		});
 		source.onerror = () => {
 			if (eventSource === source) liveState = navigator.onLine ? 'reconnecting' : 'offline';
@@ -223,10 +239,32 @@
 				) return;
 				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: snapshot?.feed ?? refreshed.feed };
-			} catch {
-				// EventSource owns connection state; a later event or reconnect retries.
+			} catch (caught) {
+				if (
+					mounted && refreshGeneration === summaryRefreshGeneration
+					&& refreshProjectId === projectId && refreshRange === range
+					&& refreshProjectId && caught instanceof ApiError && caught.status === 404
+				) {
+					recoverDeletedProject(refreshProjectId);
+				}
+				// EventSource owns other connection failures; a later event or reconnect retries.
 			}
 		}, delay);
+	}
+
+	function recoverDeletedProject(deletedProjectId: string) {
+		if (projectId !== deletedProjectId) return;
+		summaryRefreshGeneration += 1;
+		paginationGeneration += 1;
+		eventSource?.close();
+		eventSource = null;
+		snapshot = null;
+		feed = [];
+		newEventIds = new Set();
+		projectOptions = projectOptions.filter((project) => project.id !== deletedProjectId);
+		loading = true;
+		liveState = navigator.onLine ? 'reconnecting' : 'offline';
+		projectId = '';
 	}
 
 	function refreshRollingWindow() {

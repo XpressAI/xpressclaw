@@ -774,7 +774,7 @@ impl DashboardManager {
                       AND t.status IN ('waiting_for_input', 'blocked')
                       AND (?1 IS NULL OR t.project_id = ?1)
                     UNION
-                    SELECT 'conversation:' || c.id
+                    SELECT 'conversation:' || c.id || ':' || cas.agent_id
                     FROM conversation_agent_sessions cas
                     JOIN conversations c ON c.id = cas.conversation_id
                     WHERE cas.status = 'failed'
@@ -2334,6 +2334,53 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(error, Error::ProjectNotFound { .. }));
+    }
+
+    #[test]
+    fn attention_counter_matches_each_failed_conversation_agent_item() {
+        let (db, project_id, agent_id, _) = fixture();
+        let reviewer_id = "reviewer-agent";
+        AgentRegistry::new(db.clone())
+            .create_in_project(reviewer_id, "native", &project_id)
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('conversation-failed', 'Failed responses', ?1)",
+                [&project_id],
+            )?;
+            for failed_agent in [agent_id.as_str(), reviewer_id] {
+                conn.execute(
+                    "INSERT INTO conversation_agent_sessions
+                         (conversation_id, agent_id, status)
+                     VALUES ('conversation-failed', ?1, 'failed')",
+                    [failed_agent],
+                )?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        let snapshot = DashboardManager::new(db)
+            .snapshot(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.counters.needs_attention, 2);
+        assert_eq!(snapshot.attention.len(), 2);
+        assert!(snapshot
+            .attention
+            .iter()
+            .any(|item| item.id == format!("conversation:conversation-failed:{agent_id}")));
+        assert!(snapshot
+            .attention
+            .iter()
+            .any(|item| item.id == "conversation:conversation-failed:reviewer-agent"));
     }
 
     #[test]
