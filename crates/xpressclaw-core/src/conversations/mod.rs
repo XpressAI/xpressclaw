@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
 use crate::tasks::queue::TaskQueue;
 
@@ -188,18 +189,12 @@ impl ConversationManager {
         let id = Uuid::new_v4().to_string();
 
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             if let Some(project_id) = project_id {
-                let exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                    [project_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !exists {
-                    return Err(Error::ProjectNotFound {
-                        id: project_id.to_string(),
-                    });
-                }
+                ensure_project_accepts_work(&transaction, project_id)?;
             }
             for agent_id in &req.participant_ids {
                 let agent_project = transaction
@@ -417,6 +412,9 @@ impl ConversationManager {
                 .map_err(|_| Error::ConversationNotFound {
                     id: conv_id.to_string(),
                 })?;
+            if let Some(project_id) = conversation_project.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
 
             if participant_type == "agent" {
                 let agent_project = transaction
@@ -433,6 +431,11 @@ impl ConversationManager {
                         "an Agent must belong to the conversation's project before it can join"
                             .into(),
                     ));
+                }
+                if agent_project.as_deref() != conversation_project.as_deref() {
+                    if let Some(project_id) = agent_project.as_deref() {
+                        ensure_project_accepts_work(&transaction, project_id)?;
+                    }
                 }
             }
 
@@ -565,7 +568,10 @@ impl ConversationManager {
     ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
         validate_new_attachments(attachments)?;
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let result = Self::insert_structured_message(
                 &transaction,
                 conv_id,
@@ -594,7 +600,10 @@ impl ConversationManager {
     )> {
         validate_new_attachments(attachments)?;
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let (message, attachments) = Self::insert_structured_message(
                 &transaction,
                 conv_id,
@@ -786,6 +795,19 @@ impl ConversationManager {
         metadata: Option<&serde_json::Value>,
         attachments: &[NewConversationAttachment],
     ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
+        let conversation_project = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conv_id.to_string(),
+            })?;
+        if let Some(project_id) = conversation_project.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
         let message_type = msg.message_type.as_deref().unwrap_or("message");
         let metadata = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
         transaction.execute(

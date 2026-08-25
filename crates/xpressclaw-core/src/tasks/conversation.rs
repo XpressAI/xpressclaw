@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::Database;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::tasks::attachments::DecodedImageAttachment;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,8 +68,22 @@ impl TaskConversation {
         content: &str,
         attachments: &[DecodedImageAttachment],
     ) -> Result<TaskMessage> {
-        let mut conn = self.db.conn();
-        let tx = conn.transaction()?;
+        let conn = self.db.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let project_id = tx
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::TaskNotFound {
+                id: task_id.to_string(),
+            })?;
+        if let Some(project_id) = project_id.as_deref() {
+            ensure_project_accepts_work(&tx, project_id)?;
+        }
         tx.execute(
             "INSERT INTO task_messages (task_id, role, content) VALUES (?1, ?2, ?3)",
             rusqlite::params![task_id, role, content],

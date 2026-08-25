@@ -97,6 +97,17 @@ export interface Project {
 	agent_ids: string[];
 	conversation_count: number;
 	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflow_runs: number;
+		schedules: number;
+	};
 }
 
 export interface ConversationParticipant {
@@ -170,6 +181,8 @@ export const projects = {
 		request<Project>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
 	delete: (id: string) =>
 		request<void>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+	deleteCascade: (id: string) =>
+		request<void>(`/api/projects/${encodeURIComponent(id)}?cascade=confirmed`, { method: 'DELETE' }),
 	assignAgent: (id: string, agentId: string) =>
 		request<Project>(`/api/projects/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: '{}' }),
 	tasks: (id: string) => request<Task[]>(`/api/projects/${encodeURIComponent(id)}/tasks`),

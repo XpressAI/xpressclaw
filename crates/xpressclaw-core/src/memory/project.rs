@@ -15,6 +15,7 @@ use zerocopy::IntoBytes;
 use crate::db::{task_search_key, Database};
 use crate::error::{Error, Result};
 use crate::memory::vector::{simple_embedding, EMBEDDING_DIM};
+use crate::projects::ensure_project_accepts_work;
 
 const NOTE_TYPES: &[&str] = &[
     "decision",
@@ -210,7 +211,11 @@ impl ProjectMemoryStore {
         let embedding = simple_embedding(&search_key);
 
         self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_project_accepts_work(&tx, project_id)?;
             tx.execute(
                 "INSERT INTO project_memory_notes
                  (id, project_id, title, body, summary, note_type, state,
@@ -293,7 +298,11 @@ impl ProjectMemoryStore {
         let embedding = simple_embedding(&search_key);
 
         self.db.with_conn(|conn| {
-            let tx = conn.unchecked_transaction()?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_project_accepts_work(&tx, project_id)?;
             tx.execute(
                 "UPDATE project_memory_notes
                  SET title = ?1, body = ?2, summary = ?3, note_type = ?4,
@@ -351,7 +360,12 @@ impl ProjectMemoryStore {
         self.get_without_access(project_id, &req.to_note_id)?;
 
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_project_accepts_work(&transaction, project_id)?;
+            transaction.execute(
                 "INSERT INTO project_memory_links
                  (from_note_id, to_note_id, link_type, strength)
                  VALUES (?1, ?2, ?3, ?4)
@@ -364,14 +378,17 @@ impl ProjectMemoryStore {
                     req.strength,
                 ],
             )?;
-            conn.query_row(
-                "SELECT from_note_id, to_note_id, link_type, strength, created_at
+            let link = transaction
+                .query_row(
+                    "SELECT from_note_id, to_note_id, link_type, strength, created_at
                  FROM project_memory_links
                  WHERE from_note_id = ?1 AND to_note_id = ?2 AND link_type = ?3",
-                rusqlite::params![req.from_note_id, req.to_note_id, req.link_type],
-                row_to_link,
-            )
-            .map_err(Error::from)
+                    rusqlite::params![req.from_note_id, req.to_note_id, req.link_type],
+                    row_to_link,
+                )
+                .map_err(Error::from)?;
+            transaction.commit()?;
+            Ok(link)
         })
     }
 

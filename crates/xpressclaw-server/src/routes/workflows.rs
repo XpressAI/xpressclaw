@@ -315,6 +315,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    use xpressclaw_core::agents::registry::AgentRegistry;
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
 
@@ -343,6 +344,9 @@ flows:
 
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,

@@ -92,6 +92,9 @@ async fn fetch_project(
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
     let _config_guard = state.config_write_lock.lock().await;
+    ProjectManager::new(state.db.clone())
+        .ensure_accepting_work(&project_id)
+        .map_err(core_error)?;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config_path = state.config_path.clone();
@@ -123,6 +126,9 @@ async fn publish_project(
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
     let _config_guard = state.config_write_lock.lock().await;
+    ProjectManager::new(state.db.clone())
+        .ensure_accepting_work(&project_id)
+        .map_err(core_error)?;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config = state.config();
