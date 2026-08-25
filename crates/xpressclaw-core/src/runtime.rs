@@ -347,6 +347,13 @@ mod tests {
     fn setup() -> (Arc<Config>, Arc<Database>, Runtime) {
         let config = Arc::new(Config::load_default().unwrap());
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'atlas', 'generic', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let runtime = Runtime::without_docker(config.clone(), db.clone());
         (config, db, runtime)
     }

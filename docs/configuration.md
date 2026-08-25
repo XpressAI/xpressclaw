@@ -40,6 +40,17 @@ system:
 agents: []
 ```
 
+## Project lifecycle and configuration
+
+One control-plane instance can contain many Projects. Deleting a Project from
+**Project settings** removes that Project's Agent entries from
+`xpressclaw.yaml` and removes those Agents from local collaboration-service
+access assignments. Reusable workflow definitions, connectors, source
+repositories, and host workspace folders are preserved. XpressClaw marks the
+Project as deleting before it rewrites configuration, so a write or runtime
+cleanup failure remains visible and can be retried safely. See [Projects and
+deletion](projects.md) for the complete cascade and API contract.
+
 ## Optional local collaboration services
 
 GitBucket and Jenkins remain disabled until a person explicitly enables,

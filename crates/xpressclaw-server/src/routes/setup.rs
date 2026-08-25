@@ -1069,6 +1069,10 @@ async fn add_session(
             .create_in_project(&agent_config.name, &agent_config.backend, project_id)
             .map_err(|error| match error {
                 xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+                xpressclaw_core::error::Error::Project(_) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": error.to_string() })),
+                ),
                 _ => internal_error(error),
             })?;
         if let Err(error) = new_config.save(&state.config_path) {

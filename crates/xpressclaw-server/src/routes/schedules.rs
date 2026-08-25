@@ -43,7 +43,7 @@ async fn create_schedule(
     Json(req): Json<CreateSchedule>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
-    let schedule = mgr.create(&req).map_err(internal_error)?;
+    let schedule = mgr.create(&req).map_err(schedule_write_error)?;
     Ok((StatusCode::CREATED, Json(json!(schedule))))
 }
 
@@ -52,10 +52,7 @@ async fn create_one_shot_schedule(
     Json(req): Json<CreateOneShotSchedule>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let mgr = ScheduleManager::new(state.db.clone());
-    let schedule = mgr.create_one_shot(&req).map_err(|error| match &error {
-        xpressclaw_core::error::Error::Schedule(_) => bad_request(&error),
-        _ => internal_error(error),
-    })?;
+    let schedule = mgr.create_one_shot(&req).map_err(schedule_write_error)?;
     Ok((StatusCode::CREATED, Json(json!(schedule))))
 }
 
@@ -143,6 +140,19 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     )
 }
 
+fn schedule_write_error(error: xpressclaw_core::error::Error) -> (StatusCode, Json<Value>) {
+    match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. }
+        | xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+        xpressclaw_core::error::Error::Project(_) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": error.to_string() })),
+        ),
+        xpressclaw_core::error::Error::Schedule(_) => bad_request(&error),
+        _ => internal_error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -159,6 +169,14 @@ mod tests {
 
     fn test_app() -> Router {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config)
+                 VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let config = Arc::new(Config::load_default().unwrap());
         let state = AppState::new(
             config,
@@ -289,6 +307,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_schedule_creation_rejects_missing_agent() {
+        let app = test_app();
+        for uri in ["/schedules", "/schedules/once"] {
+            let payload = if uri.ends_with("once") {
+                json!({
+                    "name": "Stale wake-up",
+                    "delay_seconds": 60,
+                    "agent_id": "deleted-agent",
+                    "title": "Resume"
+                })
+            } else {
+                json!({
+                    "name": "Stale schedule",
+                    "cron": "0 9 * * *",
+                    "agent_id": "deleted-agent",
+                    "title": "Run"
+                })
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
     }
 
     #[tokio::test]

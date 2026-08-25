@@ -221,7 +221,8 @@ Desktop limitations.
 
 See the guides for [workflows](docs/workflows.md),
 [scheduling](docs/scheduling.md), [local collaboration](docs/local-collaboration.md),
-and [remote access](docs/remote-access.md).
+[Project management and deletion](docs/projects.md), and
+[remote access](docs/remote-access.md).
 
 ## CLI Essentials
 

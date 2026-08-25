@@ -2977,6 +2977,14 @@ mod tests {
     }
 
     fn test_recorder(db: Arc<Database>) -> (AcpEventRecorder, String) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, backend, config)
+                 VALUES ('session-1', 'Session 1', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&crate::tasks::board::CreateTask {
                 title: "Parent task".to_string(),

@@ -173,6 +173,17 @@ interface MockProject {
 	agent_ids: string[];
 	conversation_count: number;
 	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflow_runs: number;
+		schedules: number;
+	};
 }
 
 interface SharedProjectState {
@@ -270,7 +281,11 @@ async function mockApi(
 		collaborationActions?: string[];
 		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
 		projectDeleteRequests?: string[];
+		projectDeleteAcknowledgements?: (string | null)[];
+		projectDeleteGate?: Promise<void>;
 		projectDeleteError?: string;
+		projectDeletionStartedAt?: string | null;
+		projectDeletionCounts?: MockProject['deletion_counts'];
 		projectGetRequests?: string[];
 		projectGetGate?: Promise<void>;
 		projectListRequests?: string[];
@@ -417,6 +432,17 @@ async function mockApi(
 		agent_ids: availableAgents.map((availableAgent) => availableAgent.id),
 		conversation_count: options.conversations?.length ?? 0,
 		task_count: listedTasks.length,
+		deletion_started_at: options.projectDeletionStartedAt ?? null,
+		deletion_counts: options.projectDeletionCounts ?? {
+			agents: availableAgents.length,
+			tasks: listedTasks.length,
+			task_messages: options.taskMessages?.length ?? 0,
+			conversations: options.conversations?.length ?? 0,
+			conversation_messages: options.conversationMessages?.length ?? 0,
+			memory_notes: 0,
+			workflow_runs: 0,
+			schedules: 0,
+		},
 	};
 	if (options.sharedProjectState?.project) {
 		project = { ...project, ...options.sharedProjectState.project };
@@ -572,6 +598,8 @@ async function mockApi(
 				response = project;
 			} else if (request.method() === 'DELETE') {
 				options.projectDeleteRequests?.push(projectId);
+				options.projectDeleteAcknowledgements?.push(url.searchParams.get('cascade'));
+				await options.projectDeleteGate;
 				if (options.projectDeleteError) {
 					await route.fulfill({
 						status: 409,
@@ -2005,7 +2033,22 @@ test('project pages expose a copyable canonical ID', async ({ page }) => {
 test('project settings rename and delete a project', async ({ page }) => {
 	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
 	const projectDeleteRequests: string[] = [];
-	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	const projectDeleteAcknowledgements: (string | null)[] = [];
+	await mockApi(page, {
+		projectUpdateRequests,
+		projectDeleteRequests,
+		projectDeleteAcknowledgements,
+		projectDeletionCounts: {
+			agents: 1,
+			tasks: 3,
+			task_messages: 7,
+			conversations: 2,
+			conversation_messages: 11,
+			memory_notes: 4,
+			workflow_runs: 5,
+			schedules: 2,
+		},
+	});
 	await page.goto(`/projects/${projectId}`);
 
 	await page.getByRole('button', { name: 'Project settings' }).click();
@@ -2031,13 +2074,60 @@ test('project settings rename and delete a project', async ({ page }) => {
 	dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
 	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByText('This permanently deletes “Renamed collaboration project” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('7 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('11 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('local collaboration access', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('including steps and waits', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('source repositories, workspace folders, and reusable workflow definitions', { exact: false })).toBeVisible();
+	const permanentDelete = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await expect(permanentDelete).toBeDisabled();
+	await dialog.getByLabel('Type Renamed collaboration project to confirm').fill('Renamed collaboration project');
+	await permanentDelete.click();
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect.poll(() => projectDeleteAcknowledgements).toEqual(['confirmed']);
 	await expect(page).toHaveURL(/\/projects$/);
 	await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
 	await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible();
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
+});
+
+test('project deletion refreshes the authoritative name and counts before confirmation', async ({ page }) => {
+	const projectGetRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectGetRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+	await expect.poll(() => projectGetRequests).toHaveLength(1);
+
+	sharedProjectState.project = {
+		...sharedProjectState.project!,
+		name: 'Current Project name',
+		updated_at: timestamp(120),
+		deletion_counts: {
+			agents: 2,
+			tasks: 9,
+			task_messages: 13,
+			conversations: 4,
+			conversation_messages: 17,
+			memory_notes: 3,
+			workflow_runs: 5,
+			schedules: 6,
+		},
+	};
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectGetRequests).toHaveLength(2);
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await expect(dialog.getByText('This permanently deletes “Current Project name” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
+	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
 });
 
 test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
@@ -2235,7 +2325,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Remote project rename to confirm').fill('Remote project rename');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
 	await expect(page).toHaveURL(/\/projects$/);
@@ -2285,19 +2376,56 @@ test('project mutations synchronize split panes and separate workspace windows',
 
 test('project settings keep deletion errors visible and actionable', async ({ page }) => {
 	const projectDeleteRequests: string[] = [];
-	const projectDeleteError = "move or remove this project's agents, conversations, and tasks first";
-	await mockApi(page, { projectDeleteRequests, projectDeleteError });
+	const projectDeleteError = 'Project work was cancelled, but Docker or Podman is unavailable. Start it and retry deletion.';
+	await mockApi(page, {
+		projectDeleteRequests,
+		projectDeleteError,
+		projectDeletionStartedAt: timestamp(60),
+	});
+	await page.goto(`/projects/${projectId}`);
+	await expect(page.getByText('Deletion was interrupted after this Project stopped accepting new work.', { exact: false })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByText('A previous deletion attempt was interrupted', { exact: false })).toBeVisible();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
+	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
+	await expect(dialog.getByRole('button', { name: 'Permanently delete project' })).toBeEnabled();
+});
+
+test('project deletion shows progress, ignores duplicate confirmation, and opens the next project', async ({ page }) => {
+	let releaseDelete!: () => void;
+	const projectDeleteGate = new Promise<void>((resolve) => (releaseDelete = resolve));
+	const projectDeleteRequests: string[] = [];
+	await mockApi(page, {
+		projectCount: 2,
+		secondaryProjectName: 'Next project',
+		projectDeleteRequests,
+		projectDeleteGate,
+	});
 	await page.goto(`/projects/${projectId}`);
 
 	await page.getByRole('button', { name: 'Project settings' }).click();
 	const dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	const deleteButton = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await deleteButton.evaluate((element) => {
+		(element as HTMLButtonElement).click();
+		(element as HTMLButtonElement).click();
+	});
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
-	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
-	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
-	await expect(dialog.getByRole('button', { name: 'Delete project' })).toBeEnabled();
+	await expect(dialog.getByRole('status')).toHaveText('Cancelling active work and removing Project data…');
+	await expect(dialog.getByRole('button', { name: 'Deleting…' })).toBeDisabled();
+
+	releaseDelete();
+	await expect(page).toHaveURL(/\/projects\/project-mobile-2$/);
 });
 
 test('opening a conversation reveals its newest messages after media loads', async ({ page }) => {

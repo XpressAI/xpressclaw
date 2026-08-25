@@ -101,7 +101,21 @@ fn inject_into_conversation(
             }) {
                 Ok(conv) => {
                     // Tag conversation with channel metadata so we can find it later
-                    tag_conversation_channel(db, &conv.id, &event.channel_id, agent_id);
+                    if let Err(e) = connector_mgr.bind_channel_conversation(
+                        &conv.id,
+                        &event.channel_id,
+                        agent_id,
+                    ) {
+                        error!(
+                            conv_id = conv.id.as_str(),
+                            agent_id,
+                            channel_id = event.channel_id.as_str(),
+                            error = %e,
+                            "failed to bind connector channel conversation"
+                        );
+                        let _ = conv_mgr.delete(&conv.id);
+                        return None;
+                    }
                     info!(
                         conv_id = conv.id.as_str(),
                         agent_id,
@@ -213,17 +227,4 @@ fn find_channel_conversation(
         )
         .ok()
     })
-}
-
-/// Tag a conversation with its channel binding for future lookup.
-fn tag_conversation_channel(db: &Arc<Database>, conv_id: &str, channel_id: &str, agent_id: &str) {
-    let _ = db.with_conn(|conn| {
-        conn.execute(
-            "INSERT OR REPLACE INTO conversation_channel_bindings
-             (conversation_id, channel_id, agent_id)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![conv_id, channel_id, agent_id],
-        )
-        .map_err(|e| crate::error::Error::Database(e.to_string()))
-    });
 }

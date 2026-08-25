@@ -1426,6 +1426,14 @@ mod tests {
 
     fn setup_task(context: Option<Value>) -> (Arc<Database>, String) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO agents (id, name, backend, config) VALUES
+                    ('project-codex', 'Project Codex', 'native', '{}'),
+                    ('reviewer-codex', 'Reviewer Codex', 'native', '{}');",
+            )
+        })
+        .unwrap();
         SessionManager::new(db.clone())
             .ensure("project-codex", Some("Project"))
             .unwrap();

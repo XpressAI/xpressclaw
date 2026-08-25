@@ -109,7 +109,17 @@ link directly to them in the editor.
 - **Automations → Workflows** coordinate Agents through implementation/review,
   goal, and custom loops; workflows started in a Conversation report there.
 
-## 6. Reconnect from another device
+## 6. Manage or delete a Project
+
+Use **Project settings** to rename a Project or permanently delete it. Deletion
+shows current counts and requires the exact Project name because it cancels
+active work and removes the Project's Agents, conversations, tasks, messages,
+memory, workflow runs, schedules, and runtime containers. Source repositories,
+host workspace folders, and shared workflow definitions are preserved. See
+[Projects and deletion](projects.md) for the complete boundary, retry behavior,
+and explicit API acknowledgement.
+
+## 7. Reconnect from another device
 
 The browser or Desktop window is only a client. Closing it does not stop the
 control plane or queued work. XpressClaw listens on loopback by default and has

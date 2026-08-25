@@ -905,7 +905,15 @@ mod tests {
     use crate::tasks::board::CreateTask;
 
     fn setup() -> Arc<Database> {
-        Arc::new(Database::open_memory().unwrap())
+        let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
+        db
     }
 
     #[test]
