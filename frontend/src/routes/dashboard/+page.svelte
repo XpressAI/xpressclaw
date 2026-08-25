@@ -47,7 +47,7 @@
 		generation: number;
 		projectId: string;
 		range: DashboardRange;
-		pending: boolean;
+		pendingDataRefresh: boolean;
 	} | null = null;
 	let loadGeneration = 0;
 	let paginationGeneration = 0;
@@ -196,13 +196,13 @@
 		source.addEventListener('stream_error', () => {
 			if (eventSource === source) {
 				liveState = 'reconnecting';
-				scheduleSummaryRefresh(0);
+				scheduleSummaryRefresh('probe');
 			}
 		});
 		source.onerror = () => {
 			if (eventSource === source) {
 				liveState = navigator.onLine ? 'reconnecting' : 'offline';
-				if (navigator.onLine) scheduleSummaryRefresh(0);
+				if (navigator.onLine) scheduleSummaryRefresh('probe');
 			}
 		};
 	}
@@ -232,10 +232,10 @@
 			if (follow) scroller.scrollTo({ top: 0, behavior: reducedMotion() ? 'auto' : 'smooth' });
 			else scroller.scrollTop = previousTop + scroller.scrollHeight - previousHeight;
 		}
-		scheduleSummaryRefresh();
+		scheduleSummaryRefresh('data');
 	}
 
-	function scheduleSummaryRefresh(delay = 900) {
+	function scheduleSummaryRefresh(trigger: 'data' | 'probe', delay = trigger === 'data' ? 900 : 0) {
 		if (
 			activeSummaryRefresh
 			&& activeSummaryRefresh.generation === summaryRefreshGeneration
@@ -243,9 +243,10 @@
 			&& activeSummaryRefresh.range === range
 		) {
 			// Preserve the in-flight request's generation so a burst of equivalent
-			// stream errors cannot repeatedly invalidate a slow 404 scope probe.
-			// One trailing refresh still captures live activity received meanwhile.
-			activeSummaryRefresh.pending = true;
+			// stream errors cannot repeatedly invalidate a slow 404 scope probe. Track
+			// data-driven work separately so it still receives one trailing refresh,
+			// even if this request fails transiently.
+			if (trigger === 'data') activeSummaryRefresh.pendingDataRefresh = true;
 			return;
 		}
 		if (refreshTimer) return;
@@ -258,10 +259,9 @@
 				generation: refreshGeneration,
 				projectId: refreshProjectId,
 				range: refreshRange,
-				pending: false,
+				pendingDataRefresh: false,
 			};
 			activeSummaryRefresh = request;
-			let accepted = false;
 			try {
 				const refreshed = await dashboard.snapshot(refreshProjectId, refreshRange, 20);
 				if (
@@ -273,7 +273,6 @@
 					: reconcileAllProjectsFeed(refreshed);
 				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: refreshedFeed };
-				accepted = true;
 			} catch (caught) {
 				if (
 					mounted && refreshGeneration === summaryRefreshGeneration
@@ -287,10 +286,10 @@
 				if (activeSummaryRefresh !== request) return;
 				activeSummaryRefresh = null;
 				if (
-					accepted && request.pending && mounted
+					request.pendingDataRefresh && mounted
 					&& refreshGeneration === summaryRefreshGeneration
 					&& refreshProjectId === projectId && refreshRange === range
-				) scheduleSummaryRefresh(0);
+				) scheduleSummaryRefresh('data', 0);
 			}
 		}, delay);
 	}
@@ -336,7 +335,7 @@
 		const referenceTime = Date.now();
 		now = referenceTime;
 		pruneExpiredFeed(referenceTime);
-		if (snapshot && navigator.onLine) scheduleSummaryRefresh(0);
+		if (snapshot && navigator.onLine) scheduleSummaryRefresh('data', 0);
 	}
 
 	function pruneExpiredFeed(referenceTime: number) {

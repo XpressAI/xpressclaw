@@ -106,6 +106,7 @@ async function mockDashboard(page: Page, options: {
 	delaySnapshot?: boolean;
 	delayFeed?: boolean;
 	failScopedSnapshot?: boolean;
+	failFirstRefresh?: boolean;
 	manyFeedEvents?: boolean;
 	outOfOrderRefresh?: boolean;
 	delayDeletedSnapshot?: boolean;
@@ -140,6 +141,9 @@ async function mockDashboard(page: Page, options: {
 				return route.fulfill({ status: 404, json: { error: `Project not found: ${projectId}` } });
 			}
 			if (options.outOfOrderRefresh && requestNumber === 2) await firstRefreshGate;
+			if (options.failFirstRefresh && requestNumber === 2) {
+				return route.fulfill({ status: 503, json: { error: 'Summary refresh unavailable' } });
+			}
 			const response = snapshot(
 				Boolean(options.empty || selectedProjectDeleted || (options.rollingWindow && requestNumber > 1)),
 				options.manyFeedEvents ? 1_000 : 40,
@@ -463,6 +467,23 @@ test('live activity during a slow summary refresh queues one trailing refresh', 
 	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-refresh-one' }));
 	await expect.poll(mocked.snapshotRequestCount).toBe(2);
 	await emitDashboardEvent(page, event({ cursor: 52, event_id: 'evt-refresh-two' }));
+	await page.waitForTimeout(100);
+	expect(mocked.snapshotRequestCount()).toBe(2);
+
+	mocked.releaseFirstRefresh();
+	await expect.poll(mocked.snapshotRequestCount).toBe(3);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('live activity coalesced into a failed summary refresh receives one retry', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { failFirstRefresh: true, outOfOrderRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-failed-refresh-one' }));
+	await expect.poll(mocked.snapshotRequestCount).toBe(2);
+	await emitDashboardEvent(page, event({ cursor: 52, event_id: 'evt-failed-refresh-two' }));
 	await page.waitForTimeout(100);
 	expect(mocked.snapshotRequestCount()).toBe(2);
 
