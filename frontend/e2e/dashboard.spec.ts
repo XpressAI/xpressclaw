@@ -108,6 +108,7 @@ async function mockDashboard(page: Page, options: {
 	failScopedSnapshot?: boolean;
 	manyFeedEvents?: boolean;
 	outOfOrderRefresh?: boolean;
+	delayDeletedSnapshot?: boolean;
 	refreshProjects?: boolean;
 	rollingWindow?: boolean;
 	stream?: boolean;
@@ -117,8 +118,12 @@ async function mockDashboard(page: Page, options: {
 	let feedRequests = 0;
 	let selectedProjectDeleted = false;
 	let releaseFirstRefresh = () => {};
+	let releaseDeletedSnapshot = () => {};
 	const firstRefreshGate = new Promise<void>((resolve) => {
 		releaseFirstRefresh = resolve;
+	});
+	const deletedSnapshotGate = new Promise<void>((resolve) => {
+		releaseDeletedSnapshot = resolve;
 	});
 	await page.route('**/api/**', async (route) => {
 		const url = new URL(route.request().url());
@@ -131,6 +136,7 @@ async function mockDashboard(page: Page, options: {
 				return route.fulfill({ status: 503, json: { error: 'Scoped dashboard unavailable' } });
 			}
 			if (selectedProjectDeleted && requestedProject === projectId) {
+				if (options.delayDeletedSnapshot) await deletedSnapshotGate;
 				return route.fulfill({ status: 404, json: { error: `Project not found: ${projectId}` } });
 			}
 			if (options.outOfOrderRefresh && requestNumber === 2) await firstRefreshGate;
@@ -218,6 +224,7 @@ async function mockDashboard(page: Page, options: {
 		scopes,
 		snapshotRequestCount: () => snapshotRequests,
 		releaseFirstRefresh,
+		releaseDeletedSnapshot,
 		deleteSelectedProject: () => (selectedProjectDeleted = true),
 	};
 }
@@ -447,7 +454,7 @@ test('a failed scope switch never relabels stale dashboard data', async ({ page 
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
 });
 
-test('an older summary refresh cannot overwrite a newer live result', async ({ page }) => {
+test('live activity during a slow summary refresh queues one trailing refresh', async ({ page }) => {
 	await installMockEventSource(page);
 	const mocked = await mockDashboard(page, { outOfOrderRefresh: true });
 	await page.goto('/dashboard');
@@ -456,11 +463,11 @@ test('an older summary refresh cannot overwrite a newer live result', async ({ p
 	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-refresh-one' }));
 	await expect.poll(mocked.snapshotRequestCount).toBe(2);
 	await emitDashboardEvent(page, event({ cursor: 52, event_id: 'evt-refresh-two' }));
-	await expect.poll(mocked.snapshotRequestCount).toBe(3);
-	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+	await page.waitForTimeout(100);
+	expect(mocked.snapshotRequestCount()).toBe(2);
 
 	mocked.releaseFirstRefresh();
-	await page.waitForTimeout(100);
+	await expect.poll(mocked.snapshotRequestCount).toBe(3);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
 });
 
@@ -526,6 +533,27 @@ test('a failed stream reconnect probes and recovers a deleted selected Project',
 	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
 	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
+});
+
+test('repeated stream errors cannot starve a slow deleted-Project recovery', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { delayDeletedSnapshot: true });
+	await page.goto('/dashboard');
+	await page.locator('#dashboard-project').selectOption(projectId);
+	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
+	await expect.poll(mocked.snapshotRequestCount).toBe(2);
+
+	mocked.deleteSelectedProject();
+	await emitDashboardStreamError(page);
+	await expect.poll(mocked.snapshotRequestCount).toBe(3);
+	await emitDashboardStreamError(page);
+	await emitDashboardTransportError(page);
+	await page.waitForTimeout(100);
+	expect(mocked.snapshotRequestCount()).toBe(3);
+
+	mocked.releaseDeletedSnapshot();
+	await expect(page.locator('#dashboard-project')).toHaveValue('');
 	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
 });
 

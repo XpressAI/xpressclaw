@@ -43,6 +43,12 @@
 	let newEventIds = $state<Set<string>>(new Set());
 	let eventSource: EventSource | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	let activeSummaryRefresh: {
+		generation: number;
+		projectId: string;
+		range: DashboardRange;
+		pending: boolean;
+	} | null = null;
 	let loadGeneration = 0;
 	let paginationGeneration = 0;
 	let summaryRefreshGeneration = 0;
@@ -99,6 +105,7 @@
 		return () => {
 			mounted = false;
 			summaryRefreshGeneration += 1;
+			activeSummaryRefresh = null;
 			eventSource?.close();
 			if (clockTimer) clearInterval(clockTimer);
 			if (rollingWindowTimer) clearInterval(rollingWindowTimer);
@@ -116,6 +123,7 @@
 		const requestedRange = range;
 		paginationGeneration += 1;
 		summaryRefreshGeneration += 1;
+		activeSummaryRefresh = null;
 		if (refreshTimer) clearTimeout(refreshTimer);
 		refreshTimer = null;
 		loadingOlder = false;
@@ -228,12 +236,32 @@
 	}
 
 	function scheduleSummaryRefresh(delay = 900) {
+		if (
+			activeSummaryRefresh
+			&& activeSummaryRefresh.generation === summaryRefreshGeneration
+			&& activeSummaryRefresh.projectId === projectId
+			&& activeSummaryRefresh.range === range
+		) {
+			// Preserve the in-flight request's generation so a burst of equivalent
+			// stream errors cannot repeatedly invalidate a slow 404 scope probe.
+			// One trailing refresh still captures live activity received meanwhile.
+			activeSummaryRefresh.pending = true;
+			return;
+		}
 		if (refreshTimer) return;
 		const refreshGeneration = ++summaryRefreshGeneration;
 		refreshTimer = setTimeout(async () => {
 			refreshTimer = null;
 			const refreshProjectId = projectId;
 			const refreshRange = range;
+			const request = {
+				generation: refreshGeneration,
+				projectId: refreshProjectId,
+				range: refreshRange,
+				pending: false,
+			};
+			activeSummaryRefresh = request;
+			let accepted = false;
 			try {
 				const refreshed = await dashboard.snapshot(refreshProjectId, refreshRange, 20);
 				if (
@@ -245,6 +273,7 @@
 					: reconcileAllProjectsFeed(refreshed);
 				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: refreshedFeed };
+				accepted = true;
 			} catch (caught) {
 				if (
 					mounted && refreshGeneration === summaryRefreshGeneration
@@ -254,6 +283,14 @@
 					recoverDeletedProject(refreshProjectId);
 				}
 				// EventSource owns other connection failures; a later event or reconnect retries.
+			} finally {
+				if (activeSummaryRefresh !== request) return;
+				activeSummaryRefresh = null;
+				if (
+					accepted && request.pending && mounted
+					&& refreshGeneration === summaryRefreshGeneration
+					&& refreshProjectId === projectId && refreshRange === range
+				) scheduleSummaryRefresh(0);
 			}
 		}, delay);
 	}
@@ -282,6 +319,7 @@
 	function recoverDeletedProject(deletedProjectId: string) {
 		if (projectId !== deletedProjectId) return;
 		summaryRefreshGeneration += 1;
+		activeSummaryRefresh = null;
 		paginationGeneration += 1;
 		eventSource?.close();
 		eventSource = null;
