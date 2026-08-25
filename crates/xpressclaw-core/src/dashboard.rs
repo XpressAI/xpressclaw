@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, NaiveDateTime, SecondsFormat, TimeZone, Utc};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -194,6 +194,18 @@ struct MetricRow {
     code_additions: Option<i64>,
     code_deletions: Option<i64>,
     git_state: String,
+}
+
+struct GitMetricSample<'a> {
+    work_kind: &'a str,
+    work_id: &'a str,
+    project_id: Option<&'a str>,
+    agent_id: Option<&'a str>,
+    observed_at: &'a DateTime<Utc>,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    state: &'a str,
+    detail: Option<&'a str>,
 }
 
 pub struct DashboardManager {
@@ -454,7 +466,6 @@ impl DashboardManager {
         let workspace =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
         let captured_at = Utc::now();
-        let bucket_at = timestamp_string(bucket_time(captured_at, 10));
         self.db.with_conn(|conn| {
             let concurrent = conn.query_row(
                 "SELECT EXISTS(
@@ -532,28 +543,19 @@ impl DashboardManager {
                     snapshot.detail
                 ],
             )?;
-            conn.execute(
-                "INSERT INTO dashboard_metric_points (
-                    work_kind, work_id, project_id, agent_id, bucket_at,
-                    code_additions, code_deletions, git_state, git_detail, recorded_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
-                    code_additions = excluded.code_additions,
-                    code_deletions = excluded.code_deletions,
-                    git_state = excluded.git_state,
-                    git_detail = excluded.git_detail,
-                    recorded_at = excluded.recorded_at",
-                params![
+            insert_git_metric_sample(
+                conn,
+                GitMetricSample {
                     work_kind,
                     work_id,
                     project_id,
-                    agent_id,
-                    bucket_at,
-                    available.then_some(0),
-                    snapshot.state,
-                    snapshot.detail,
-                    timestamp_string(captured_at)
-                ],
+                    agent_id: Some(agent_id),
+                    observed_at: &captured_at,
+                    additions: available.then_some(0),
+                    deletions: available.then_some(0),
+                    state: &snapshot.state,
+                    detail: snapshot.detail.as_deref(),
+                },
             )?;
             Ok::<_, Error>(())
         })?;
@@ -640,31 +642,20 @@ impl DashboardManager {
         };
         let detail = combine_details(baseline_detail.as_deref(), snapshot.detail.as_deref());
         let now = Utc::now();
-        let bucket_at = timestamp_string(bucket_time(now, 10));
         self.db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO dashboard_metric_points (
-                    work_kind, work_id, project_id, agent_id, bucket_at,
-                    code_additions, code_deletions, git_state, git_detail, recorded_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
-                    code_additions = excluded.code_additions,
-                    code_deletions = excluded.code_deletions,
-                    git_state = excluded.git_state,
-                    git_detail = excluded.git_detail,
-                    recorded_at = excluded.recorded_at",
-                params![
+            insert_git_metric_sample(
+                conn,
+                GitMetricSample {
                     work_kind,
                     work_id,
-                    project_id,
-                    agent_id,
-                    bucket_at,
-                    additions,
-                    deletions,
+                    project_id: project_id.as_deref(),
+                    agent_id: agent_id.as_deref(),
+                    observed_at: &now,
+                    additions: Some(additions),
+                    deletions: Some(deletions),
                     state,
-                    detail,
-                    timestamp_string(now)
-                ],
+                    detail: detail.as_deref(),
+                },
             )?;
             conn.execute(
                 "UPDATE dashboard_git_baselines
@@ -1318,6 +1309,47 @@ fn timestamp_string(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn insert_git_metric_sample(conn: &Connection, sample: GitMetricSample<'_>) -> Result<()> {
+    // Git values are cumulative snapshots. Keep each ordered sample so a quick
+    // add-and-revert cannot be collapsed by the 10-second rows used for
+    // coalesced context and tool metrics. Chart bucketing happens at read time.
+    let recorded_at = timestamp_string(sample.observed_at.to_owned());
+    let mut sample_at = sample.observed_at.to_owned();
+    loop {
+        let bucket_at = timestamp_string(sample_at);
+        let occupied = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM dashboard_metric_points
+                WHERE work_kind = ?1 AND work_id = ?2 AND bucket_at = ?3
+             )",
+            params![sample.work_kind, sample.work_id, bucket_at],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !occupied {
+            conn.execute(
+                "INSERT INTO dashboard_metric_points (
+                    work_kind, work_id, project_id, agent_id, bucket_at,
+                    code_additions, code_deletions, git_state, git_detail, recorded_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    sample.work_kind,
+                    sample.work_id,
+                    sample.project_id,
+                    sample.agent_id,
+                    bucket_at,
+                    sample.additions,
+                    sample.deletions,
+                    sample.state,
+                    sample.detail,
+                    recorded_at
+                ],
+            )?;
+            return Ok(());
+        }
+        sample_at += Duration::milliseconds(1);
+    }
+}
+
 fn now_string() -> String {
     timestamp_string(Utc::now())
 }
@@ -1326,6 +1358,7 @@ fn bucket_epoch(epoch: i64, bucket_seconds: i64) -> i64 {
     epoch.div_euclid(bucket_seconds) * bucket_seconds
 }
 
+#[cfg(test)]
 fn bucket_time(value: DateTime<Utc>, bucket_seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(bucket_epoch(value.timestamp(), bucket_seconds), 0)
         .single()
@@ -2007,6 +2040,75 @@ mod tests {
                 .sum::<i64>(),
             10,
             "reverting previously added lines is deletion activity"
+        );
+    }
+
+    #[test]
+    fn code_series_preserves_reversals_sampled_in_one_storage_bucket() {
+        let (db, project_id, agent_id, _task_id) = fixture();
+        let observed_at = bucket_time(Utc::now() - Duration::minutes(10), 10);
+        db.with_conn(|conn| {
+            for additions in [0_i64, 10, 0] {
+                insert_git_metric_sample(
+                    conn,
+                    GitMetricSample {
+                        work_kind: "attempt",
+                        work_id: "short-revert",
+                        project_id: Some(&project_id),
+                        agent_id: Some(&agent_id),
+                        observed_at: &observed_at,
+                        additions: Some(additions),
+                        deletions: Some(0),
+                        state: "available",
+                        detail: None,
+                    },
+                )
+                .unwrap();
+            }
+
+            let mut statement = conn
+                .prepare(
+                    "SELECT bucket_at FROM dashboard_metric_points
+                     WHERE work_kind = 'attempt' AND work_id = 'short-revert'
+                     ORDER BY bucket_at",
+                )
+                .unwrap();
+            let stored = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(stored.len(), 3);
+            assert!(stored.iter().all(|sample| {
+                parse_timestamp(sample)
+                    .is_some_and(|timestamp| bucket_time(timestamp, 10) == observed_at)
+            }));
+        });
+
+        let snapshot = DashboardManager::new(db)
+            .snapshot(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_additions)
+                .sum::<i64>(),
+            10
+        );
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_deletions)
+                .sum::<i64>(),
+            10
         );
     }
 
