@@ -22,6 +22,38 @@ const EVENT_RETENTION_DAYS: i64 = 8;
 const EVENT_RETENTION_ROWS: i64 = 20_000;
 const GIT_SNAPSHOT_DEBOUNCE_SECONDS: i64 = 20;
 
+/// Close Git attribution windows whose work is no longer executing. A worker
+/// restart moves interrupted work back to `queued`; leaving its old baseline
+/// open would make the next turn in the same workspace look concurrent.
+pub(crate) fn finalize_inactive_git_baselines(
+    conn: &Connection,
+    workspace: Option<&str>,
+) -> Result<usize> {
+    conn.execute(
+        "UPDATE dashboard_git_baselines
+         SET finalized_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE finalized_at IS NULL
+           AND (?1 IS NULL OR workspace = ?1)
+           AND (
+               (work_kind = 'attempt' AND NOT EXISTS (
+                   SELECT 1 FROM work_attempts attempt
+                   WHERE attempt.id = dashboard_git_baselines.work_id
+                     AND attempt.status IN (
+                         'preparing', 'running', 'waiting_for_input', 'review'
+                     )
+               ))
+               OR
+               (work_kind = 'conversation_turn' AND NOT EXISTS (
+                   SELECT 1 FROM conversation_turns turn
+                   WHERE turn.id = dashboard_git_baselines.work_id
+                     AND turn.status = 'running'
+               ))
+           )",
+        [workspace],
+    )
+    .map_err(Error::from)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardRange {
     Hour,
@@ -465,15 +497,20 @@ impl DashboardManager {
             .map_err(|error| Error::Backend(format!("failed to encode Git baseline: {error}")))?;
         let workspace =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let workspace = workspace.to_string_lossy().into_owned();
         let captured_at = Utc::now();
         self.db.with_conn(|conn| {
+            // Recovery normally closes interrupted baselines before workers
+            // restart. Reconcile here too so an earlier partial recovery or
+            // terminal worker failure can never poison later attribution.
+            finalize_inactive_git_baselines(conn, Some(&workspace))?;
             let concurrent = conn.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM dashboard_git_baselines
                     WHERE workspace = ?1 AND finalized_at IS NULL
                       AND NOT (work_kind = ?2 AND work_id = ?3)
                  )",
-                params![workspace.to_string_lossy(), work_kind, work_id],
+                params![workspace, work_kind, work_id],
                 |row| row.get::<_, bool>(0),
             )?;
             if concurrent && snapshot.state != "unavailable" {
@@ -492,7 +529,7 @@ impl DashboardManager {
                             ELSE git_detail || '; ' || ?1 END
                      WHERE workspace = ?2 AND finalized_at IS NULL
                        AND NOT (work_kind = ?3 AND work_id = ?4)",
-                    params![DETAIL, workspace.to_string_lossy(), work_kind, work_id],
+                    params![DETAIL, workspace, work_kind, work_id],
                 )?;
                 conn.execute(
                     "UPDATE dashboard_metric_points AS metrics
@@ -511,7 +548,7 @@ impl DashboardManager {
                           AND baseline.finalized_at IS NULL
                           AND NOT (baseline.work_kind = ?3 AND baseline.work_id = ?4)
                      )",
-                    params![DETAIL, workspace.to_string_lossy(), work_kind, work_id],
+                    params![DETAIL, workspace, work_kind, work_id],
                 )?;
             }
             let available = snapshot.state != "unavailable";
@@ -536,7 +573,7 @@ impl DashboardManager {
                     work_id,
                     project_id,
                     agent_id,
-                    workspace.to_string_lossy(),
+                    workspace,
                     snapshot.baseline_ref,
                     baseline_json,
                     snapshot.state,
@@ -2297,7 +2334,7 @@ mod tests {
     #[test]
     fn git_metrics_subtract_preexisting_dirty_lines_and_report_non_git() {
         let (db, project_id, agent_id, _task_id) = fixture();
-        let manager = DashboardManager::new(db);
+        let manager = DashboardManager::new(db.clone());
         let repository = tempfile::tempdir().unwrap();
         Command::new("git")
             .args(["init", "-q"])
@@ -2364,6 +2401,31 @@ mod tests {
         assert_eq!(metric.deletions, Some(0));
         assert_eq!(metric.state, "partial");
 
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO logical_sessions (id, agent_id, title)
+                 VALUES ('git-session', ?1, 'Git metrics')",
+                [&agent_id],
+            )?;
+            conn.execute(
+                "INSERT INTO work_attempts (id, session_id, runner, status)
+                 VALUES ('concurrent-a', 'git-session', 'codex', 'running')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('git-conversation', 'Concurrent Git metrics', ?1)",
+                [&project_id],
+            )?;
+            conn.execute(
+                "INSERT INTO conversation_turns
+                     (id, conversation_id, agent_id, status)
+                 VALUES ('concurrent-b', 'git-conversation', ?1, 'running')",
+                [&agent_id],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
         let first_concurrent = manager
             .capture_git_baseline(
                 "attempt",
@@ -2421,6 +2483,103 @@ mod tests {
             .unwrap();
         assert_eq!(unavailable.state, "unavailable");
         assert!(unavailable.detail.unwrap().contains("not a Git repository"));
+    }
+
+    #[test]
+    fn recovered_stale_git_baseline_does_not_mark_replacement_partial() {
+        let (db, project_id, agent_id, _task_id) = fixture();
+        let manager = DashboardManager::new(db.clone());
+        let repository = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        std::fs::write(repository.path().join("tracked.txt"), "baseline\n").unwrap();
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Dashboard test",
+                "-c",
+                "user.email=dashboard@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO logical_sessions (id, agent_id, title)
+                 VALUES ('recovery-session', ?1, 'Recovered Git metrics')",
+                [&agent_id],
+            )?;
+            for (id, status) in [("stale-attempt", "running"), ("replacement", "queued")] {
+                conn.execute(
+                    "INSERT INTO work_attempts (id, session_id, runner, status)
+                     VALUES (?1, 'recovery-session', 'codex', ?2)",
+                    params![id, status],
+                )?;
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .capture_git_baseline(
+                    "attempt",
+                    "stale-attempt",
+                    Some(&project_id),
+                    &agent_id,
+                    repository.path(),
+                )
+                .unwrap()
+                .state,
+            "available"
+        );
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE work_attempts SET status = 'queued'
+                 WHERE id = 'stale-attempt'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE work_attempts SET status = 'running'
+                 WHERE id = 'replacement'",
+                [],
+            )?;
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+
+        let replacement = manager
+            .capture_git_baseline(
+                "attempt",
+                "replacement",
+                Some(&project_id),
+                &agent_id,
+                repository.path(),
+            )
+            .unwrap();
+        assert_eq!(replacement.state, "available");
+        db.with_conn(|conn| {
+            assert!(conn
+                .query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'attempt' AND work_id = 'stale-attempt'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_some());
+        });
     }
 
     #[test]

@@ -140,6 +140,20 @@ async function mockDashboard(page: Page, options: {
 			);
 			if (selectedProjectDeleted) {
 				response.projects = response.projects.filter((project) => project.id !== projectId);
+				response.feed = {
+					events: [event({
+						cursor: 35,
+						event_id: 'evt-docs-survives',
+						project_id: 'project-docs',
+						project_name: 'Docs',
+						target_id: 'task-docs',
+						target_title: 'Refresh the documentation',
+						href: '/tasks/task-docs',
+						preview: 'Docs activity remains available',
+					})],
+					next_before: 35,
+					has_more: false,
+				};
 			}
 			if (options.rollingWindow && requestNumber === 1) {
 				response.feed.events = response.feed.events.map((item) => ({
@@ -479,6 +493,22 @@ test('deleting the selected Project returns the dashboard to All Projects', asyn
 	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
 	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
+});
+
+test('All Projects refresh removes retained activity for a deleted Project', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page);
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+
+	mocked.deleteSelectedProject();
+	await emitDashboardStreamError(page);
+
+	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-attention"]')).toHaveCount(0);
+	await expect(page.locator('[data-feed-event="evt-docs-survives"]')).toContainText('Docs activity remains available');
+	await expect(page.locator('[data-live-feed] a[href="/tasks/task-dashboard"]')).toHaveCount(0);
 });
 
 test('a failed stream reconnect probes and recovers a deleted selected Project', async ({ page }) => {

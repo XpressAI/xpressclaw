@@ -240,8 +240,11 @@
 					!mounted || refreshGeneration !== summaryRefreshGeneration
 					|| refreshProjectId !== projectId || refreshRange !== range
 				) return;
+				const refreshedFeed = refreshProjectId
+					? (snapshot?.feed ?? refreshed.feed)
+					: reconcileAllProjectsFeed(refreshed);
 				projectOptions = refreshed.projects;
-				snapshot = { ...refreshed, feed: snapshot?.feed ?? refreshed.feed };
+				snapshot = { ...refreshed, feed: refreshedFeed };
 			} catch (caught) {
 				if (
 					mounted && refreshGeneration === summaryRefreshGeneration
@@ -253,6 +256,27 @@
 				// EventSource owns other connection failures; a later event or reconnect retries.
 			}
 		}, delay);
+	}
+
+	function reconcileAllProjectsFeed(refreshed: DashboardSnapshot): DashboardSnapshot['feed'] {
+		const currentProjectIds = new Set(refreshed.projects.map((project) => project.id));
+		const retained = feed.filter((event) =>
+			event.project_id === null || currentProjectIds.has(event.project_id)
+		);
+		const reconciled = uniqueEvents([...refreshed.feed.events, ...retained])
+			.slice(0, MAX_FEED_EVENTS);
+		const retainedIds = new Set(reconciled.map((event) => event.event_id));
+		const mayHaveOlder = hasMoreOlder || refreshed.feed.has_more;
+		feed = reconciled;
+		newEventIds = new Set([...newEventIds].filter((id) => retainedIds.has(id)));
+		olderCursor = reconciled.at(-1)?.cursor ?? refreshed.feed.next_before ?? null;
+		historyLimitReached = historyLimitReached && reconciled.length >= MAX_FEED_EVENTS;
+		hasMoreOlder = reconciled.length > 0 && !historyLimitReached && mayHaveOlder;
+		return {
+			events: reconciled,
+			next_before: olderCursor,
+			has_more: hasMoreOlder,
+		};
 	}
 
 	function recoverDeletedProject(deletedProjectId: string) {
