@@ -61,7 +61,7 @@
 		? 'ACP context-window occupancy across active response turns. This is not billing-grade token usage.'
 		: chartMode === 'tools'
 			? 'Canonical tool-call starts. Progress updates are not counted twice.'
-			: 'Lines changed relative to each turn baseline. Pre-existing dirty changes are excluded.');
+			: 'Git line activity relative to each turn baseline. Reverts count in the opposite direction; pre-existing dirty changes are excluded.');
 
 	$effect(() => {
 		projectId;
@@ -221,6 +221,7 @@
 					!mounted || refreshGeneration !== summaryRefreshGeneration
 					|| refreshProjectId !== projectId || refreshRange !== range
 				) return;
+				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: snapshot?.feed ?? refreshed.feed };
 			} catch {
 				// EventSource owns connection state; a later event or reconnect retries.

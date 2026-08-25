@@ -1030,8 +1030,21 @@ impl DashboardManager {
                     .insert(row.work_key.clone(), (additions, deletions))
                     .unwrap_or_default();
                 if let Some(point) = points.get_mut(&bucket) {
-                    point.code_additions += (additions - previous_additions).max(0);
-                    point.code_deletions += (deletions - previous_deletions).max(0);
+                    // Git snapshots are cumulative relative to the turn baseline.
+                    // A falling addition count means added lines were reverted, while
+                    // a falling deletion count means deleted lines were restored.
+                    // Record those decreases as reverse activity so the chart does not
+                    // permanently retain changes that no longer exist.
+                    let added = additions
+                        .saturating_sub(previous_additions)
+                        .max(0)
+                        .saturating_add(previous_deletions.saturating_sub(deletions).max(0));
+                    let deleted = deletions
+                        .saturating_sub(previous_deletions)
+                        .max(0)
+                        .saturating_add(previous_additions.saturating_sub(additions).max(0));
+                    point.code_additions = point.code_additions.saturating_add(added);
+                    point.code_deletions = point.code_deletions.saturating_add(deleted);
                 }
             }
             let observed = git_observed.entry(bucket).or_default();
@@ -1929,6 +1942,71 @@ mod tests {
                 .map(|point| point.code_deletions)
                 .sum::<i64>(),
             2
+        );
+    }
+
+    #[test]
+    fn code_series_counts_reverts_as_reverse_activity() {
+        let (db, project_id, agent_id, _task_id) = fixture();
+        let outside = timestamp_string(Utc::now() - Duration::hours(2));
+        let inside = timestamp_string(Utc::now() - Duration::minutes(10));
+        db.with_conn(|conn| {
+            for (work_id, outside_additions, outside_deletions) in [
+                ("reverted-additions", 10_i64, 0_i64),
+                ("restored-deletions", 0, 6),
+            ] {
+                conn.execute(
+                    "INSERT INTO dashboard_metric_points (
+                        work_kind, work_id, project_id, agent_id, bucket_at,
+                        code_additions, code_deletions, git_state
+                     ) VALUES ('attempt', ?1, ?2, ?3, ?4, ?5, ?6, 'available')",
+                    params![
+                        work_id,
+                        project_id,
+                        agent_id,
+                        outside,
+                        outside_additions,
+                        outside_deletions
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO dashboard_metric_points (
+                        work_kind, work_id, project_id, agent_id, bucket_at,
+                        code_additions, code_deletions, git_state
+                     ) VALUES ('attempt', ?1, ?2, ?3, ?4, 0, 0, 'available')",
+                    params![work_id, project_id, agent_id, inside],
+                )
+                .unwrap();
+            }
+        });
+
+        let snapshot = DashboardManager::new(db)
+            .snapshot(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_additions)
+                .sum::<i64>(),
+            6,
+            "restoring previously deleted lines is addition activity"
+        );
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_deletions)
+                .sum::<i64>(),
+            10,
+            "reverting previously added lines is deletion activity"
         );
     }
 

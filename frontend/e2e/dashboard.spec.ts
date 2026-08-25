@@ -108,6 +108,7 @@ async function mockDashboard(page: Page, options: {
 	failScopedSnapshot?: boolean;
 	manyFeedEvents?: boolean;
 	outOfOrderRefresh?: boolean;
+	refreshProjects?: boolean;
 	rollingWindow?: boolean;
 	stream?: boolean;
 } = {}) {
@@ -141,6 +142,12 @@ async function mockDashboard(page: Page, options: {
 			}
 			if (options.outOfOrderRefresh && requestNumber > 1) {
 				response.counters.working_agents = requestNumber === 2 ? 4 : 9;
+			}
+			if (options.refreshProjects && requestNumber > 1) {
+				response.projects = [
+					{ id: projectId, name: 'Platform renamed' },
+					{ id: 'project-new', name: 'New Project' },
+				];
 			}
 			return route.fulfill({ json: response });
 		}
@@ -389,6 +396,19 @@ test('an older summary refresh cannot overwrite a newer live result', async ({ p
 	mocked.releaseFirstRefresh();
 	await page.waitForTimeout(100);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('summary refreshes keep the Project selector current', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { refreshProjects: true });
+	await page.goto('/dashboard');
+	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-project-refresh' }));
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.getByRole('option', { name: 'Platform renamed', exact: true })).toHaveCount(1);
+	await expect(page.getByRole('option', { name: 'New Project', exact: true })).toHaveCount(1);
+	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(0);
 });
 
 test('a quiet dashboard advances its rolling range and prunes expired activity', async ({ page }) => {

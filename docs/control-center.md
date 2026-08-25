@@ -27,7 +27,9 @@ For Git metrics, XpressClaw records the repository commit and
 `git diff --numstat` state at the start of the response, then samples at
 debounced tool boundaries and at the end. This preserves attribution when an
 Agent commits during its turn while subtracting dirty changes that existed
-before the turn. Binary or untracked files, and attribution that overlaps
+before the turn. If a later snapshot reverts added lines or restores deleted
+lines, the chart records that as reverse activity instead of retaining stale
+line counts. Binary or untracked files, and attribution that overlaps
 pre-existing dirty files, make the result **Partial**. A missing workspace,
 non-Git directory, or repository without a baseline commit is reported as
 unavailable rather than as zero.
