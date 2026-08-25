@@ -1739,6 +1739,445 @@ CREATE INDEX idx_work_attempts_trigger_message
     ON work_attempts(trigger_message_id);
 ";
 
+const MIGRATION_V39: &str = r#"
+-- Durable, bounded telemetry for the instance-wide Control center. Dashboard
+-- rows contain only short display-safe summaries and normalized counters;
+-- raw tool arguments, terminal output, prompts, and diffs never enter these
+-- tables.
+CREATE TABLE dashboard_events (
+    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    project_name TEXT,
+    agent_id TEXT,
+    agent_name TEXT,
+    source_kind TEXT NOT NULL DEFAULT 'system',
+    source_label TEXT NOT NULL DEFAULT 'XpressClaw',
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_title TEXT NOT NULL,
+    href TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info'
+        CHECK (severity IN ('info', 'success', 'warning', 'error')),
+    needs_attention INTEGER NOT NULL DEFAULT 0
+        CHECK (needs_attention IN (0, 1)),
+    preview TEXT NOT NULL DEFAULT '',
+    work_kind TEXT,
+    work_id TEXT
+);
+CREATE INDEX idx_dashboard_events_cursor_project
+    ON dashboard_events(project_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_time
+    ON dashboard_events(occurred_at DESC, cursor DESC);
+CREATE INDEX idx_dashboard_events_attention
+    ON dashboard_events(needs_attention, occurred_at DESC, cursor DESC);
+CREATE INDEX idx_dashboard_events_event_version
+    ON dashboard_events(event_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_work
+    ON dashboard_events(work_kind, work_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_kind_project_time
+    ON dashboard_events(event_kind, project_id, occurred_at DESC);
+
+CREATE TABLE dashboard_metric_points (
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('attempt', 'conversation_turn')),
+    work_id TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT,
+    bucket_at TEXT NOT NULL,
+    context_used INTEGER,
+    context_size INTEGER,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    code_additions INTEGER,
+    code_deletions INTEGER,
+    git_state TEXT NOT NULL DEFAULT 'unavailable'
+        CHECK (git_state IN ('available', 'partial', 'unavailable')),
+    git_detail TEXT,
+    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (work_kind, work_id, bucket_at)
+);
+CREATE INDEX idx_dashboard_metrics_project_time
+    ON dashboard_metric_points(project_id, bucket_at DESC);
+CREATE INDEX idx_dashboard_metrics_time
+    ON dashboard_metric_points(bucket_at DESC);
+
+CREATE TABLE dashboard_git_baselines (
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('attempt', 'conversation_turn')),
+    work_id TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT,
+    workspace TEXT NOT NULL,
+    baseline_ref TEXT,
+    baseline_json TEXT NOT NULL DEFAULT '{}',
+    git_state TEXT NOT NULL DEFAULT 'unavailable'
+        CHECK (git_state IN ('available', 'partial', 'unavailable')),
+    git_detail TEXT,
+    captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_snapshot_at TEXT,
+    finalized_at TEXT,
+    PRIMARY KEY (work_kind, work_id)
+);
+CREATE INDEX idx_dashboard_git_workspace_active
+    ON dashboard_git_baselines(workspace, finalized_at);
+
+-- Stable message event IDs let the browser replace an in-progress Agent
+-- message with its latest text when a reconnect overlaps streaming updates.
+CREATE TRIGGER dashboard_task_message_insert
+AFTER INSERT ON task_messages
+WHEN NEW.role != 'assistant' OR trim(NEW.content) != ''
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-message:' || NEW.id,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.timestamp),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        t.project_id, p.name, t.agent_id, a.name,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent' ELSE 'user' END,
+        CASE WHEN NEW.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+        'task', t.id, t.title, '/tasks/' || t.id,
+        'info', 0,
+        CASE WHEN trim(NEW.content) = '' THEN 'Image attachment'
+             ELSE substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+        END
+    FROM tasks t
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = t.agent_id
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+CREATE TRIGGER dashboard_task_message_update
+AFTER UPDATE OF content ON task_messages
+WHEN NEW.content != OLD.content AND trim(NEW.content) != ''
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-message:' || NEW.id,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        t.project_id, p.name, t.agent_id, a.name,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent' ELSE 'user' END,
+        CASE WHEN NEW.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+        'task', t.id, t.title, '/tasks/' || t.id,
+        'info', 0,
+        substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+    FROM tasks t
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = t.agent_id
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+CREATE TRIGGER dashboard_conversation_message_insert
+AFTER INSERT ON conversation_messages
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'conversation-message:' || NEW.id,
+        CASE WHEN NEW.sender_type = 'agent' THEN 'agent_response' ELSE 'conversation_message' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        c.project_id, p.name,
+        CASE WHEN NEW.sender_type = 'agent' THEN NEW.sender_id ELSE NULL END,
+        CASE WHEN NEW.sender_type = 'agent' THEN COALESCE(NEW.sender_name, a.name) ELSE NULL END,
+        NEW.sender_type,
+        COALESCE(NEW.sender_name,
+            CASE WHEN NEW.sender_type = 'user' THEN 'You' ELSE NEW.sender_id END),
+        'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+        '/conversations/' || c.id, 'info', 0,
+        CASE WHEN trim(NEW.content) = '' THEN 'File attachment'
+             ELSE substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+        END
+    FROM conversations c
+    LEFT JOIN projects p ON p.id = c.project_id
+    LEFT JOIN agents a ON a.id = NEW.sender_id AND NEW.sender_type = 'agent'
+    WHERE c.id = NEW.conversation_id;
+END;
+
+CREATE TRIGGER dashboard_task_status_update
+AFTER UPDATE OF status ON tasks
+WHEN NEW.status != OLD.status AND NEW.hidden = 0
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-status:' || lower(hex(randomblob(16))),
+        CASE NEW.status
+            WHEN 'waiting_for_input' THEN 'waiting_for_input'
+            WHEN 'blocked' THEN 'failure'
+            WHEN 'completed' THEN 'completion'
+            WHEN 'cancelled' THEN 'cancellation'
+            ELSE 'status_change'
+        END,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        NEW.project_id, p.name, NEW.agent_id, a.name, 'system', 'XpressClaw',
+        'task', NEW.id, NEW.title, '/tasks/' || NEW.id,
+        CASE NEW.status WHEN 'blocked' THEN 'error'
+             WHEN 'waiting_for_input' THEN 'warning'
+             WHEN 'completed' THEN 'success' ELSE 'info' END,
+        CASE WHEN NEW.status IN ('blocked', 'waiting_for_input') THEN 1 ELSE 0 END,
+        CASE NEW.status
+            WHEN 'waiting_for_input' THEN 'The Agent needs your input'
+            WHEN 'blocked' THEN 'Task is blocked'
+            WHEN 'completed' THEN 'Task completed'
+            WHEN 'cancelled' THEN 'Task cancelled'
+            WHEN 'in_progress' THEN 'Work started'
+            ELSE 'Task is pending'
+        END
+    FROM projects p
+    LEFT JOIN agents a ON a.id = NEW.agent_id
+    WHERE p.id = NEW.project_id;
+END;
+
+CREATE TRIGGER dashboard_session_event_insert
+AFTER INSERT ON session_events
+WHEN NEW.event_type IN ('runner_progress', 'elicitation_pending', 'attempt_failed')
+ AND (
+    NEW.event_type != 'runner_progress'
+    OR NOT EXISTS (
+        SELECT 1 FROM dashboard_events
+        WHERE event_kind = 'progress'
+          AND work_kind = 'attempt'
+          AND work_id = NEW.attempt_id
+          AND occurred_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 seconds')
+    )
+ )
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT
+        'session-event:' || NEW.id,
+        CASE WHEN NEW.event_type = 'elicitation_pending' THEN 'waiting_for_input'
+             WHEN NEW.event_type = 'attempt_failed' THEN 'failure'
+             ELSE 'progress' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        t.project_id, p.name, ls.agent_id, a.name, 'agent', COALESCE(a.name, ls.agent_id),
+        'task', t.id, t.title, '/tasks/' || t.id,
+        CASE WHEN NEW.event_type = 'attempt_failed' THEN 'error'
+             WHEN NEW.event_type = 'elicitation_pending' THEN 'warning' ELSE 'info' END,
+        CASE WHEN NEW.event_type IN ('elicitation_pending', 'attempt_failed') THEN 1 ELSE 0 END,
+        CASE WHEN NEW.event_type = 'attempt_failed' THEN 'Agent attempt failed'
+             WHEN NEW.event_type = 'elicitation_pending' THEN 'The Agent needs your input'
+             ELSE substr(trim(replace(replace(NEW.summary, char(10), ' '), char(13), ' ')), 1, 240)
+        END,
+        'attempt', NEW.attempt_id
+    FROM tasks t
+    JOIN logical_sessions ls ON ls.id = NEW.session_id
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = ls.agent_id
+    WHERE t.id = NEW.task_id;
+END;
+
+CREATE TRIGGER dashboard_conversation_turn_status
+AFTER UPDATE OF status ON conversation_turns
+WHEN NEW.status != OLD.status AND NEW.status IN ('completed', 'failed', 'cancelled')
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT
+        'conversation-turn:' || NEW.id || ':' || NEW.status,
+        CASE NEW.status WHEN 'completed' THEN 'completion'
+             WHEN 'failed' THEN 'failure' ELSE 'cancellation' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.completed_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        c.project_id, p.name, NEW.agent_id, a.name, 'agent', COALESCE(a.name, NEW.agent_id),
+        'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+        '/conversations/' || c.id,
+        CASE NEW.status WHEN 'failed' THEN 'error'
+             WHEN 'completed' THEN 'success' ELSE 'info' END,
+        CASE WHEN NEW.status = 'failed' THEN 1 ELSE 0 END,
+        CASE NEW.status WHEN 'completed' THEN 'Response completed'
+             WHEN 'failed' THEN 'Conversation response failed'
+             ELSE 'Response cancelled' END,
+        'conversation_turn', NEW.id
+    FROM conversations c
+    LEFT JOIN projects p ON p.id = c.project_id
+    LEFT JOIN agents a ON a.id = NEW.agent_id
+    WHERE c.id = NEW.conversation_id;
+END;
+
+CREATE TRIGGER dashboard_attempt_context_update
+AFTER UPDATE OF context_used, context_size ON work_attempts
+WHEN NEW.context_used IS NOT OLD.context_used OR NEW.context_size IS NOT OLD.context_size
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        context_used, context_size, recorded_at
+    )
+    SELECT 'attempt', NEW.id, t.project_id, ls.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', 'now') || printf('%02dZ', (CAST(strftime('%S', 'now') AS INTEGER) / 10) * 10),
+        NEW.context_used, NEW.context_size, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM logical_sessions ls
+    LEFT JOIN tasks t ON t.id = NEW.task_id
+    WHERE ls.id = NEW.session_id
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        context_used = excluded.context_used,
+        context_size = excluded.context_size,
+        recorded_at = excluded.recorded_at;
+END;
+
+CREATE TRIGGER dashboard_conversation_context_update
+AFTER UPDATE OF context_used, context_size ON conversation_turns
+WHEN NEW.context_used IS NOT OLD.context_used OR NEW.context_size IS NOT OLD.context_size
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        context_used, context_size, recorded_at
+    )
+    SELECT 'conversation_turn', NEW.id, c.project_id, NEW.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', 'now') || printf('%02dZ', (CAST(strftime('%S', 'now') AS INTEGER) / 10) * 10),
+        NEW.context_used, NEW.context_size, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM conversations c WHERE c.id = NEW.conversation_id
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        context_used = excluded.context_used,
+        context_size = excluded.context_size,
+        recorded_at = excluded.recorded_at;
+END;
+
+-- Tool starts remain exact for 1h/24h/7d charts even when the bounded feed
+-- rolls older display rows off its 20,000-row replay window.
+CREATE TRIGGER dashboard_tool_metric_insert
+AFTER INSERT ON dashboard_events
+WHEN NEW.event_kind = 'tool_call'
+ AND NEW.work_kind IN ('attempt', 'conversation_turn')
+ AND NEW.work_id IS NOT NULL
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        tool_calls, recorded_at
+    ) VALUES (
+        NEW.work_kind, NEW.work_id, NEW.project_id, NEW.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', NEW.occurred_at)
+            || printf('%02dZ', (CAST(strftime('%S', NEW.occurred_at) AS INTEGER) / 10) * 10),
+        1, strftime('%Y-%m-%dT%H:%M:%fZ', NEW.occurred_at)
+    )
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        tool_calls = dashboard_metric_points.tool_calls + 1,
+        recorded_at = excluded.recorded_at;
+END;
+
+-- Keep storage bounded even when nobody has the dashboard open. The snapshot
+-- path also prunes, while this amortized trigger limits write-side cleanup to
+-- once per 256 normalized feed rows.
+CREATE TRIGGER dashboard_telemetry_retention
+AFTER INSERT ON dashboard_events
+WHEN NEW.cursor % 256 = 0
+BEGIN
+    DELETE FROM dashboard_events
+    WHERE occurred_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days')
+       OR cursor <= COALESCE((SELECT MAX(cursor) FROM dashboard_events), 0) - 20000;
+    DELETE FROM dashboard_metric_points
+    WHERE bucket_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days');
+    DELETE FROM dashboard_git_baselines
+    WHERE COALESCE(finalized_at, captured_at)
+        < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days');
+END;
+
+-- Seed a useful bounded history for upgraded installations without copying
+-- unbounded message bodies or any sensitive tool payload.
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview
+)
+SELECT 'task-message:' || tm.id,
+       CASE WHEN tm.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', tm.timestamp),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       t.project_id, p.name, t.agent_id, a.name,
+       CASE WHEN tm.role = 'assistant' THEN 'agent' ELSE 'user' END,
+       CASE WHEN tm.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+       'task', t.id, t.title, '/tasks/' || t.id, 'info', 0,
+       CASE WHEN trim(tm.content) = '' THEN 'Image attachment'
+            ELSE substr(trim(replace(replace(tm.content, char(10), ' '), char(13), ' ')), 1, 240) END
+FROM task_messages tm
+JOIN tasks t ON t.id = tm.task_id AND t.hidden = 0
+LEFT JOIN projects p ON p.id = t.project_id
+LEFT JOIN agents a ON a.id = t.agent_id
+WHERE tm.id IN (SELECT id FROM task_messages ORDER BY id DESC LIMIT 500)
+  AND (tm.role != 'assistant' OR trim(tm.content) != '');
+
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview
+)
+SELECT 'conversation-message:' || cm.id,
+       CASE WHEN cm.sender_type = 'agent' THEN 'agent_response' ELSE 'conversation_message' END,
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', cm.created_at),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       c.project_id, p.name,
+       CASE WHEN cm.sender_type = 'agent' THEN cm.sender_id ELSE NULL END,
+       CASE WHEN cm.sender_type = 'agent' THEN COALESCE(cm.sender_name, a.name) ELSE NULL END,
+       cm.sender_type,
+       COALESCE(cm.sender_name, CASE WHEN cm.sender_type = 'user' THEN 'You' ELSE cm.sender_id END),
+       'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+       '/conversations/' || c.id, 'info', 0,
+       CASE WHEN trim(cm.content) = '' THEN 'File attachment'
+            ELSE substr(trim(replace(replace(cm.content, char(10), ' '), char(13), ' ')), 1, 240) END
+FROM conversation_messages cm
+JOIN conversations c ON c.id = cm.conversation_id
+LEFT JOIN projects p ON p.id = c.project_id
+LEFT JOIN agents a ON a.id = cm.sender_id AND cm.sender_type = 'agent'
+WHERE cm.id IN (SELECT id FROM conversation_messages ORDER BY id DESC LIMIT 500);
+
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview, work_kind, work_id
+)
+SELECT 'tool-call:legacy:' || se.id, 'tool_call',
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', se.created_at),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       t.project_id, p.name, ls.agent_id, a.name,
+       'agent', COALESCE(a.name, ls.agent_id),
+       'task', t.id, t.title, '/tasks/' || t.id, 'info', 0,
+       'Used an Agent tool',
+       'attempt', se.attempt_id
+FROM session_events se
+JOIN logical_sessions ls ON ls.id = se.session_id
+JOIN tasks t ON t.id = se.task_id AND t.hidden = 0
+LEFT JOIN projects p ON p.id = t.project_id
+LEFT JOIN agents a ON a.id = ls.agent_id
+WHERE se.event_type = 'tool_call'
+  AND se.id IN (
+      SELECT id FROM session_events
+      WHERE event_type = 'tool_call'
+      ORDER BY id DESC LIMIT 1000
+  );
+"#;
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1779,6 +2218,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (36, MIGRATION_V36),
         (37, MIGRATION_V37),
         (38, MIGRATION_V38),
+        (39, MIGRATION_V39),
     ]
 }
 
@@ -1799,7 +2239,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "38");
+        assert_eq!(version, "39");
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -2423,5 +2863,8 @@ mod tests {
         assert!(tables.contains(&"task_message_sync".to_string()));
         assert!(tables.contains(&"project_workflows".to_string()));
         assert!(tables.contains(&"project_sync_state".to_string()));
+        assert!(tables.contains(&"dashboard_events".to_string()));
+        assert!(tables.contains(&"dashboard_metric_points".to_string()));
+        assert!(tables.contains(&"dashboard_git_baselines".to_string()));
     }
 }

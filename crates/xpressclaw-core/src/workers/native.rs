@@ -28,6 +28,7 @@ use crate::config::{
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
 use crate::conversations::{ConversationManager, SendMessage};
+use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
@@ -747,6 +748,15 @@ async fn execute_conversation_turn(
         turn.id.clone(),
         kind.clone(),
     );
+    if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+        "conversation_turn",
+        &turn.id,
+        conversation.project_id.as_deref(),
+        &turn.agent_id,
+        &workspace,
+    ) {
+        warn!(%error, turn_id = turn.id, "failed to capture conversation Git baseline");
+    }
     let result = live
         .process
         .run_turn(
@@ -763,6 +773,11 @@ async fn execute_conversation_turn(
             },
         )
         .await;
+    if let Err(error) =
+        DashboardManager::new(db.clone()).record_git_snapshot("conversation_turn", &turn.id, true)
+    {
+        warn!(%error, turn_id = turn.id, "failed to finalize conversation Git metrics");
+    }
     turn_controls.finish_attempt(&turn.id);
     let result = match result {
         Ok(result) => result,
@@ -1071,6 +1086,15 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         item.task_id.clone(),
         kind.clone(),
     );
+    if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+        "attempt",
+        attempt_id,
+        task_project_id.as_deref(),
+        &item.agent_id,
+        &workspace,
+    ) {
+        warn!(%error, attempt_id, "failed to capture task Git baseline");
+    }
     let turn = live
         .process
         .run_turn(
@@ -1087,6 +1111,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             },
         )
         .await;
+    if let Err(error) =
+        DashboardManager::new(db.clone()).record_git_snapshot("attempt", attempt_id, true)
+    {
+        warn!(%error, attempt_id, "failed to finalize task Git metrics");
+    }
     if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
         docker.stop_preserving(workload_id).await?;
     }

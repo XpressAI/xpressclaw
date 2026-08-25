@@ -45,6 +45,14 @@ Codex, Claude Code, DeepSeek Harness, and OpenCode already supply excellent agen
 
 ## Features
 
+### Real-time Control Center
+
+Leave the Control center open to see working Agents, active Task and
+Conversation turns, items needing input, canonical tool calls, context usage,
+and attributed Git line changes across every Project. One durable live feed
+replays missed responses and status changes after reconnecting, with direct
+links back to the relevant work. See the [Control center guide](docs/control-center.md).
+
 ### Project Conversations
 
 Projects are the top-level collaboration boundary. Each Project can contain
@@ -221,7 +229,7 @@ Desktop limitations.
 
 See the guides for [workflows](docs/workflows.md),
 [scheduling](docs/scheduling.md), [local collaboration](docs/local-collaboration.md),
-and [remote access](docs/remote-access.md).
+[remote access](docs/remote-access.md), and the [Control center](docs/control-center.md).
 
 ## CLI Essentials
 
