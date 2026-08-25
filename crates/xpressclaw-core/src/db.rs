@@ -1883,6 +1883,7 @@ END;
 
 CREATE TRIGGER dashboard_conversation_message_insert
 AFTER INSERT ON conversation_messages
+WHEN NEW.sender_type IN ('user', 'agent')
 BEGIN
     INSERT INTO dashboard_events (
         event_id, event_kind, occurred_at, project_id, project_name,
@@ -2157,7 +2158,12 @@ FROM conversation_messages cm
 JOIN conversations c ON c.id = cm.conversation_id
 LEFT JOIN projects p ON p.id = c.project_id
 LEFT JOIN agents a ON a.id = cm.sender_id AND cm.sender_type = 'agent'
-WHERE cm.id IN (SELECT id FROM conversation_messages ORDER BY id DESC LIMIT 500);
+WHERE cm.id IN (
+    SELECT id FROM conversation_messages
+    WHERE sender_type IN ('user', 'agent')
+    ORDER BY id DESC LIMIT 500
+)
+  AND cm.sender_type IN ('user', 'agent');
 
 INSERT INTO dashboard_events (
     event_id, event_kind, occurred_at, project_id, project_name,
@@ -2435,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn v39_backfills_only_user_and_assistant_task_messages() {
+    fn v39_backfills_only_user_and_agent_authored_messages() {
         ensure_sqlite_vec();
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -2455,7 +2461,16 @@ mod tests {
              INSERT INTO task_messages (task_id, role, content)
              VALUES ('task', 'system', 'Private generated orchestration prompt'),
                     ('task', 'user', 'Please investigate'),
-                    ('task', 'assistant', 'I found the cause');",
+                    ('task', 'assistant', 'I found the cause');
+             INSERT INTO conversations (id, title, project_id)
+             VALUES ('conversation', 'Discuss', 'p');
+             INSERT INTO conversation_messages
+                 (conversation_id, sender_type, sender_id, sender_name, content)
+             VALUES
+                 ('conversation', 'system', 'scheduler', 'Scheduler',
+                  'Private scheduled wake-up instructions'),
+                 ('conversation', 'user', 'user', 'You', 'Can you check this?'),
+                 ('conversation', 'agent', 'atlas', 'Atlas', 'I am checking it now');",
         )
         .unwrap();
 
@@ -2468,7 +2483,15 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(previews, vec!["Please investigate", "I found the cause"]);
+        assert_eq!(
+            previews,
+            vec![
+                "Please investigate",
+                "I found the cause",
+                "Can you check this?",
+                "I am checking it now"
+            ]
+        );
     }
 
     #[test]

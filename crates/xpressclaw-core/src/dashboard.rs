@@ -1380,6 +1380,27 @@ mod tests {
         TaskConversation::new(db.clone())
             .add_message(&task_id, "user", &message)
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO conversations (id, title, project_id)
+                 VALUES ('conversation', 'Dashboard privacy', ?1)",
+                [&project_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO conversation_messages
+                     (conversation_id, sender_type, sender_id, sender_name, content)
+                 VALUES
+                     ('conversation', 'system', 'scheduler', 'Scheduler',
+                      'Private scheduled wake-up instructions'),
+                     ('conversation', 'user', 'user', 'You',
+                      'Visible conversation question'),
+                     ('conversation', 'agent', 'platform-agent', 'Platform Agent',
+                      'Visible conversation response')",
+                [],
+            )
+            .unwrap();
+        });
         let snapshot = DashboardManager::new(db)
             .snapshot(
                 &DashboardFilter {
@@ -1403,6 +1424,21 @@ mod tests {
             .events
             .iter()
             .all(|event| !event.preview.contains("Private orchestration context")));
+        assert!(snapshot
+            .feed
+            .events
+            .iter()
+            .all(|event| !event.preview.contains("Private scheduled wake-up")));
+        assert!(snapshot
+            .feed
+            .events
+            .iter()
+            .any(|event| event.preview == "Visible conversation question"));
+        assert!(snapshot
+            .feed
+            .events
+            .iter()
+            .any(|event| event.preview == "Visible conversation response"));
     }
 
     #[test]
