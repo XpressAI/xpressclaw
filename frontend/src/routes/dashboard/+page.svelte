@@ -16,6 +16,7 @@
 	const MAX_FEED_EVENTS = 400;
 
 	let snapshot = $state<DashboardSnapshot | null>(null);
+	let projectOptions = $state<DashboardSnapshot['projects']>([]);
 	let feed = $state<DashboardEvent[]>([]);
 	let projectId = $state('');
 	let range = $state<DashboardRange>('24h');
@@ -46,7 +47,7 @@
 		needs_attention: 0,
 		tool_calls: 0,
 	});
-	let projects = $derived(snapshot?.projects ?? []);
+	let projects = $derived(projectOptions);
 	let selectedProjectName = $derived(projects.find((project) => project.id === projectId)?.name ?? 'All Projects');
 	let metricDescription = $derived(chartMode === 'context'
 		? 'ACP context-window occupancy across active response turns. This is not billing-grade token usage.'
@@ -102,12 +103,20 @@
 		olderCursor = null;
 		eventSource?.close();
 		eventSource = null;
+		// The existing snapshot belongs to the previous Project/range. Clear it
+		// before starting the scoped request so a failure cannot relabel stale
+		// counters, charts, or feed rows as the newly selected scope.
+		snapshot = null;
+		feed = [];
+		newEventIds = new Set();
+		announcement = '';
 		loading = true;
 		error = '';
 		liveState = navigator.onLine ? 'connecting' : 'offline';
 		try {
 			const loaded = await dashboard.snapshot(projectId, range);
 			if (!mounted || generation !== loadGeneration) return;
+			projectOptions = loaded.projects;
 			snapshot = loaded;
 			feed = uniqueEvents(loaded.feed.events).slice(0, 160);
 			olderCursor = loaded.feed.next_before ?? feed.at(-1)?.cursor ?? null;

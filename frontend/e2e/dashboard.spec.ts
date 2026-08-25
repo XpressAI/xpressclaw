@@ -105,6 +105,7 @@ async function mockDashboard(page: Page, options: {
 	empty?: boolean;
 	delaySnapshot?: boolean;
 	delayFeed?: boolean;
+	failScopedSnapshot?: boolean;
 	manyFeedEvents?: boolean;
 	stream?: boolean;
 } = {}) {
@@ -115,8 +116,12 @@ async function mockDashboard(page: Page, options: {
 		const url = new URL(route.request().url());
 		if (url.pathname === '/api/dashboard/snapshot') {
 			snapshotRequests += 1;
-			scopes.push(url.searchParams.get('project_id') ?? 'all');
+			const requestedProject = url.searchParams.get('project_id');
+			scopes.push(requestedProject ?? 'all');
 			if (options.delaySnapshot && snapshotRequests === 1) await new Promise((resolve) => setTimeout(resolve, 800));
+			if (options.failScopedSnapshot && requestedProject) {
+				return route.fulfill({ status: 503, json: { error: 'Scoped dashboard unavailable' } });
+			}
 			return route.fulfill({ json: snapshot(Boolean(options.empty), options.manyFeedEvents ? 1_000 : 40) });
 		}
 		if (url.pathname === '/api/dashboard/feed') {
@@ -272,6 +277,19 @@ test('an older page from a previous Project scope is discarded', async ({ page }
 	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
 	await page.waitForTimeout(400);
 	await expect(page.locator('[data-feed-event="evt-older"]')).toHaveCount(0);
+});
+
+test('a failed scope switch never relabels stale dashboard data', async ({ page }) => {
+	await mockDashboard(page, { failScopedSnapshot: true, stream: false });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+
+	await page.locator('#dashboard-project').selectOption(projectId);
+	await expect(page.getByRole('alert')).toContainText('Scoped dashboard unavailable');
+	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
 });
 
 test('bounded history disables pagination cleanly at the client cap', async ({ page }) => {

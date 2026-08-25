@@ -2036,7 +2036,7 @@ BEGIN
         strftime('%Y-%m-%dT%H:%M:', 'now') || printf('%02dZ', (CAST(strftime('%S', 'now') AS INTEGER) / 10) * 10),
         NEW.context_used, NEW.context_size, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     FROM logical_sessions ls
-    LEFT JOIN tasks t ON t.id = NEW.task_id
+    JOIN tasks t ON t.id = NEW.task_id AND t.hidden = 0 AND t.task_type != 'IDLE'
     WHERE ls.id = NEW.session_id
     ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
         context_used = excluded.context_used,

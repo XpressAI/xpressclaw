@@ -1724,8 +1724,14 @@ mod tests {
                 [],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE work_attempts SET context_used = 258399, context_size = 258400
+                 WHERE id = 'attempt-idle'",
+                [],
+            )
+            .unwrap();
         });
-        let manager = DashboardManager::new(db);
+        let manager = DashboardManager::new(db.clone());
         manager
             .record_task_tool_call("attempt-platform", &task_id, "Read source")
             .unwrap();
@@ -1758,6 +1764,18 @@ mod tests {
             platform.series.iter().map(|point| point.context_used).max(),
             Some(42_000)
         );
+        db.with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dashboard_metric_points
+                     WHERE work_kind = 'attempt' AND work_id = 'attempt-idle'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        });
         assert!(!platform
             .feed
             .events
