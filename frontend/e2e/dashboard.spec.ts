@@ -108,6 +108,7 @@ async function mockDashboard(page: Page, options: {
 	failScopedSnapshot?: boolean;
 	manyFeedEvents?: boolean;
 	outOfOrderRefresh?: boolean;
+	rollingWindow?: boolean;
 	stream?: boolean;
 } = {}) {
 	const scopes: string[] = [];
@@ -128,7 +129,16 @@ async function mockDashboard(page: Page, options: {
 				return route.fulfill({ status: 503, json: { error: 'Scoped dashboard unavailable' } });
 			}
 			if (options.outOfOrderRefresh && requestNumber === 2) await firstRefreshGate;
-			const response = snapshot(Boolean(options.empty), options.manyFeedEvents ? 1_000 : 40);
+			const response = snapshot(
+				Boolean(options.empty || (options.rollingWindow && requestNumber > 1)),
+				options.manyFeedEvents ? 1_000 : 40,
+			);
+			if (options.rollingWindow && requestNumber === 1) {
+				response.feed.events = response.feed.events.map((item) => ({
+					...item,
+					occurred_at: iso(24 * 60 - 0.5),
+				}));
+			}
 			if (options.outOfOrderRefresh && requestNumber > 1) {
 				response.counters.working_agents = requestNumber === 2 ? 4 : 9;
 			}
@@ -379,6 +389,20 @@ test('an older summary refresh cannot overwrite a newer live result', async ({ p
 	mocked.releaseFirstRefresh();
 	await page.waitForTimeout(100);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('a quiet dashboard advances its rolling range and prunes expired activity', async ({ page }) => {
+	await page.clock.install({ time: new Date(now) });
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { rollingWindow: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+	await expect(page.locator('[data-feed-event="evt-existing"]')).toBeVisible();
+
+	await page.clock.runFor(60_100);
+	await expect.poll(mocked.snapshotRequestCount).toBeGreaterThan(1);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect(page.locator('[data-feed-event]')).toHaveCount(0);
 });
 
 test('bounded history disables pagination cleanly at the client cap', async ({ page }) => {

@@ -14,6 +14,12 @@
 	type ChartMode = 'context' | 'tools' | 'code';
 	type LiveState = 'connecting' | 'live' | 'reconnecting' | 'offline';
 	const MAX_FEED_EVENTS = 400;
+	const ROLLING_WINDOW_REFRESH_MS = 60_000;
+	const RANGE_WINDOW_MS: Record<DashboardRange, number> = {
+		'1h': 60 * 60_000,
+		'24h': 24 * 60 * 60_000,
+		'7d': 7 * 24 * 60 * 60_000,
+	};
 
 	let snapshot = $state<DashboardSnapshot | null>(null);
 	let projectOptions = $state<DashboardSnapshot['projects']>([]);
@@ -40,6 +46,7 @@
 	let paginationGeneration = 0;
 	let summaryRefreshGeneration = 0;
 	let clockTimer: ReturnType<typeof setInterval> | null = null;
+	let rollingWindowTimer: ReturnType<typeof setInterval> | null = null;
 	const animationTimers = new Set<ReturnType<typeof setTimeout>>();
 
 	let counters = $derived(snapshot?.counters ?? {
@@ -66,21 +73,26 @@
 	onMount(() => {
 		mounted = true;
 		const updateClock = () => (now = Date.now());
-		const updateClockState = () => {
+		const updateClockState = (refreshAfterResume = false) => {
 			if (clockTimer) clearInterval(clockTimer);
+			if (rollingWindowTimer) clearInterval(rollingWindowTimer);
 			clockTimer = null;
+			rollingWindowTimer = null;
 			if (!document.hidden) {
 				updateClock();
+				if (refreshAfterResume) refreshRollingWindow();
 				clockTimer = setInterval(updateClock, 1_000);
+				rollingWindowTimer = setInterval(refreshRollingWindow, ROLLING_WINDOW_REFRESH_MS);
 			}
 		};
+		const visibilityChanged = () => updateClockState(true);
 		const wentOffline = () => (liveState = 'offline');
 		const cameOnline = () => {
 			liveState = 'reconnecting';
 			if (!eventSource && snapshot) connectStream(snapshot.cursor);
 		};
 		updateClockState();
-		document.addEventListener('visibilitychange', updateClockState);
+		document.addEventListener('visibilitychange', visibilityChanged);
 		window.addEventListener('offline', wentOffline);
 		window.addEventListener('online', cameOnline);
 		return () => {
@@ -88,9 +100,10 @@
 			summaryRefreshGeneration += 1;
 			eventSource?.close();
 			if (clockTimer) clearInterval(clockTimer);
+			if (rollingWindowTimer) clearInterval(rollingWindowTimer);
 			if (refreshTimer) clearTimeout(refreshTimer);
 			for (const timer of animationTimers) clearTimeout(timer);
-			document.removeEventListener('visibilitychange', updateClockState);
+			document.removeEventListener('visibilitychange', visibilityChanged);
 			window.removeEventListener('offline', wentOffline);
 			window.removeEventListener('online', cameOnline);
 		};
@@ -195,7 +208,7 @@
 		scheduleSummaryRefresh();
 	}
 
-	function scheduleSummaryRefresh() {
+	function scheduleSummaryRefresh(delay = 900) {
 		if (refreshTimer) return;
 		const refreshGeneration = ++summaryRefreshGeneration;
 		refreshTimer = setTimeout(async () => {
@@ -212,7 +225,29 @@
 			} catch {
 				// EventSource owns connection state; a later event or reconnect retries.
 			}
-		}, 900);
+		}, delay);
+	}
+
+	function refreshRollingWindow() {
+		const referenceTime = Date.now();
+		now = referenceTime;
+		pruneExpiredFeed(referenceTime);
+		if (snapshot && navigator.onLine) scheduleSummaryRefresh(0);
+	}
+
+	function pruneExpiredFeed(referenceTime: number) {
+		const cutoff = referenceTime - RANGE_WINDOW_MS[range];
+		const retained = feed.filter((event) => {
+			const occurredAt = serverTimestampMs(event.occurred_at);
+			return occurredAt === null || occurredAt >= cutoff;
+		});
+		if (retained.length === feed.length) return;
+		feed = retained;
+		const retainedIds = new Set(retained.map((event) => event.event_id));
+		newEventIds = new Set([...newEventIds].filter((id) => retainedIds.has(id)));
+		olderCursor = retained.at(-1)?.cursor ?? null;
+		if (retained.length === 0) hasMoreOlder = false;
+		if (retained.length < MAX_FEED_EVENTS) historyLimitReached = false;
 	}
 
 	async function loadOlder() {
