@@ -641,6 +641,7 @@ impl DashboardManager {
             "available"
         };
         let detail = combine_details(baseline_detail.as_deref(), snapshot.detail.as_deref());
+        let available = state != "unavailable";
         let now = Utc::now();
         self.db.with_conn(|conn| {
             insert_git_metric_sample(
@@ -651,8 +652,8 @@ impl DashboardManager {
                     project_id: project_id.as_deref(),
                     agent_id: agent_id.as_deref(),
                     observed_at: &now,
-                    additions: Some(additions),
-                    deletions: Some(deletions),
+                    additions: available.then_some(additions),
+                    deletions: available.then_some(deletions),
                     state,
                     detail: detail.as_deref(),
                 },
@@ -674,7 +675,6 @@ impl DashboardManager {
             )?;
             Ok::<_, Error>(())
         })?;
-        let available = state != "unavailable";
         Ok(Some(GitMetricResult {
             state: state.to_string(),
             detail,
@@ -2421,6 +2421,108 @@ mod tests {
             .unwrap();
         assert_eq!(unavailable.state, "unavailable");
         assert!(unavailable.detail.unwrap().contains("not a Git repository"));
+    }
+
+    #[test]
+    fn unavailable_git_sample_does_not_imply_a_revert() {
+        let (db, project_id, agent_id, _task_id) = fixture();
+        let manager = DashboardManager::new(db.clone());
+        let repository = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        std::fs::write(repository.path().join("tracked.txt"), "one\n").unwrap();
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Dashboard test",
+                "-c",
+                "user.email=dashboard@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ])
+            .current_dir(repository.path())
+            .status()
+            .unwrap();
+
+        manager
+            .capture_git_baseline(
+                "attempt",
+                "capture-failure",
+                Some(&project_id),
+                &agent_id,
+                repository.path(),
+            )
+            .unwrap();
+        std::fs::write(repository.path().join("tracked.txt"), "one\nagent line\n").unwrap();
+        let observed = manager
+            .record_git_snapshot("attempt", "capture-failure", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.additions, Some(1));
+        assert_eq!(observed.deletions, Some(0));
+
+        repository.close().unwrap();
+        let unavailable = manager
+            .record_git_snapshot("attempt", "capture-failure", true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unavailable.state, "unavailable");
+        assert_eq!(unavailable.additions, None);
+        assert_eq!(unavailable.deletions, None);
+        db.with_conn(|conn| {
+            let stored = conn
+                .query_row(
+                    "SELECT code_additions, code_deletions, git_state
+                     FROM dashboard_metric_points
+                     WHERE work_kind = 'attempt' AND work_id = 'capture-failure'
+                     ORDER BY bucket_at DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(stored, (None, None, "unavailable".to_string()));
+        });
+
+        let snapshot = manager
+            .snapshot(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_additions)
+                .sum::<i64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .series
+                .iter()
+                .map(|point| point.code_deletions)
+                .sum::<i64>(),
+            0
+        );
     }
 
     #[test]
