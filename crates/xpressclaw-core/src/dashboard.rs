@@ -1369,6 +1369,13 @@ mod tests {
     #[test]
     fn source_triggers_create_bounded_literal_message_events() {
         let (db, project_id, _agent, task_id) = fixture();
+        TaskConversation::new(db.clone())
+            .add_message(
+                &task_id,
+                "system",
+                "Private orchestration context must never reach the dashboard",
+            )
+            .unwrap();
         let message = "<script>alert('never')</script>\n".repeat(30);
         TaskConversation::new(db.clone())
             .add_message(&task_id, "user", &message)
@@ -1391,6 +1398,11 @@ mod tests {
         assert!(event.preview.starts_with("<script>alert('never')</script>"));
         assert!(!event.preview.contains('\n'));
         assert!(event.preview.chars().count() <= 240);
+        assert!(snapshot
+            .feed
+            .events
+            .iter()
+            .all(|event| !event.preview.contains("Private orchestration context")));
     }
 
     #[test]

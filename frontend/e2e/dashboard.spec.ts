@@ -107,22 +107,32 @@ async function mockDashboard(page: Page, options: {
 	delayFeed?: boolean;
 	failScopedSnapshot?: boolean;
 	manyFeedEvents?: boolean;
+	outOfOrderRefresh?: boolean;
 	stream?: boolean;
 } = {}) {
 	const scopes: string[] = [];
 	let snapshotRequests = 0;
 	let feedRequests = 0;
+	let releaseFirstRefresh = () => {};
+	const firstRefreshGate = new Promise<void>((resolve) => {
+		releaseFirstRefresh = resolve;
+	});
 	await page.route('**/api/**', async (route) => {
 		const url = new URL(route.request().url());
 		if (url.pathname === '/api/dashboard/snapshot') {
-			snapshotRequests += 1;
+			const requestNumber = ++snapshotRequests;
 			const requestedProject = url.searchParams.get('project_id');
 			scopes.push(requestedProject ?? 'all');
-			if (options.delaySnapshot && snapshotRequests === 1) await new Promise((resolve) => setTimeout(resolve, 800));
+			if (options.delaySnapshot && requestNumber === 1) await new Promise((resolve) => setTimeout(resolve, 800));
 			if (options.failScopedSnapshot && requestedProject) {
 				return route.fulfill({ status: 503, json: { error: 'Scoped dashboard unavailable' } });
 			}
-			return route.fulfill({ json: snapshot(Boolean(options.empty), options.manyFeedEvents ? 1_000 : 40) });
+			if (options.outOfOrderRefresh && requestNumber === 2) await firstRefreshGate;
+			const response = snapshot(Boolean(options.empty), options.manyFeedEvents ? 1_000 : 40);
+			if (options.outOfOrderRefresh && requestNumber > 1) {
+				response.counters.working_agents = requestNumber === 2 ? 4 : 9;
+			}
+			return route.fulfill({ json: response });
 		}
 		if (url.pathname === '/api/dashboard/feed') {
 			feedRequests += 1;
@@ -166,7 +176,69 @@ async function mockDashboard(page: Page, options: {
 		if (url.pathname === '/api/workflows' || url.pathname === '/api/schedules') return route.fulfill({ json: [] });
 		return route.fulfill({ json: {} });
 	});
-	return scopes;
+	return {
+		scopes,
+		snapshotRequestCount: () => snapshotRequests,
+		releaseFirstRefresh,
+	};
+}
+
+async function installMockEventSource(page: Page) {
+	await page.addInitScript(() => {
+		type DashboardListener = (event: { data: string }) => void;
+		class MockEventSource {
+			onopen: (() => void) | null = null;
+			onerror: (() => void) | null = null;
+			closed = false;
+			listeners = new Map<string, Set<DashboardListener>>();
+
+			constructor(_url: string) {
+				(window as unknown as { __dashboardEventSources: MockEventSource[] })
+					.__dashboardEventSources.push(this);
+				queueMicrotask(() => this.onopen?.());
+			}
+
+			addEventListener(type: string, listener: DashboardListener) {
+				const listeners = this.listeners.get(type) ?? new Set<DashboardListener>();
+				listeners.add(listener);
+				this.listeners.set(type, listeners);
+			}
+
+			close() {
+				this.closed = true;
+			}
+		}
+
+		const dashboardWindow = window as unknown as {
+			EventSource: typeof EventSource;
+			__dashboardEventSources: MockEventSource[];
+			__emitDashboardEvent: (payload: unknown) => void;
+		};
+		dashboardWindow.__dashboardEventSources = [];
+		dashboardWindow.EventSource = MockEventSource as unknown as typeof EventSource;
+		dashboardWindow.__emitDashboardEvent = (payload) => {
+			const source = [...dashboardWindow.__dashboardEventSources]
+				.reverse()
+				.find((candidate) => !candidate.closed);
+			if (!source) throw new Error('Dashboard EventSource is not connected');
+			for (const listener of source.listeners.get('dashboard') ?? []) {
+				listener({ data: JSON.stringify(payload) });
+			}
+		};
+	});
+}
+
+async function emitDashboardEvent(page: Page, payload: unknown) {
+	await page.waitForFunction(() => {
+		const sources = (window as unknown as {
+			__dashboardEventSources?: Array<{ closed: boolean }>;
+		}).__dashboardEventSources;
+		return sources?.some((source) => !source.closed) ?? false;
+	});
+	await page.evaluate((next) => {
+		(window as unknown as { __emitDashboardEvent: (payload: unknown) => void })
+			.__emitDashboardEvent(next);
+	}, payload);
 }
 
 function rgb(value: string): [number, number, number] {
@@ -190,7 +262,7 @@ function contrast(foreground: string, background: string) {
 
 test('brand opens the real-time Control center with deduplicated live navigation', async ({ page }, testInfo) => {
 	await page.setViewportSize({ width: 1440, height: 1050 });
-	const scopes = await mockDashboard(page);
+	const { scopes } = await mockDashboard(page);
 	await page.goto('/projects');
 	await page.locator('a[aria-label="Open Control center"]').first().click();
 	await expect(page).toHaveURL(/\/dashboard$/);
@@ -290,6 +362,23 @@ test('a failed scope switch never relabels stale dashboard data', async ({ page 
 	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
 	await expect(page.locator('[data-feed-event="evt-existing"]')).toHaveCount(0);
+});
+
+test('an older summary refresh cannot overwrite a newer live result', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { outOfOrderRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('2');
+
+	await emitDashboardEvent(page, event({ cursor: 51, event_id: 'evt-refresh-one' }));
+	await expect.poll(mocked.snapshotRequestCount).toBe(2);
+	await emitDashboardEvent(page, event({ cursor: 52, event_id: 'evt-refresh-two' }));
+	await expect.poll(mocked.snapshotRequestCount).toBe(3);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+
+	mocked.releaseFirstRefresh();
+	await page.waitForTimeout(100);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
 });
 
 test('bounded history disables pagination cleanly at the client cap', async ({ page }) => {

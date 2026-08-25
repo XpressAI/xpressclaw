@@ -38,6 +38,7 @@
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let loadGeneration = 0;
 	let paginationGeneration = 0;
+	let summaryRefreshGeneration = 0;
 	let clockTimer: ReturnType<typeof setInterval> | null = null;
 	const animationTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -84,6 +85,7 @@
 		window.addEventListener('online', cameOnline);
 		return () => {
 			mounted = false;
+			summaryRefreshGeneration += 1;
 			eventSource?.close();
 			if (clockTimer) clearInterval(clockTimer);
 			if (refreshTimer) clearTimeout(refreshTimer);
@@ -97,6 +99,9 @@
 	async function loadDashboard() {
 		const generation = ++loadGeneration;
 		paginationGeneration += 1;
+		summaryRefreshGeneration += 1;
+		if (refreshTimer) clearTimeout(refreshTimer);
+		refreshTimer = null;
 		loadingOlder = false;
 		hasMoreOlder = false;
 		historyLimitReached = false;
@@ -192,13 +197,17 @@
 
 	function scheduleSummaryRefresh() {
 		if (refreshTimer) return;
+		const refreshGeneration = ++summaryRefreshGeneration;
 		refreshTimer = setTimeout(async () => {
 			refreshTimer = null;
 			const refreshProjectId = projectId;
 			const refreshRange = range;
 			try {
 				const refreshed = await dashboard.snapshot(refreshProjectId, refreshRange, 20);
-				if (!mounted || refreshProjectId !== projectId || refreshRange !== range) return;
+				if (
+					!mounted || refreshGeneration !== summaryRefreshGeneration
+					|| refreshProjectId !== projectId || refreshRange !== range
+				) return;
 				snapshot = { ...refreshed, feed: snapshot?.feed ?? refreshed.feed };
 			} catch {
 				// EventSource owns connection state; a later event or reconnect retries.

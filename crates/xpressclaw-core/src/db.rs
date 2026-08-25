@@ -1825,7 +1825,8 @@ CREATE INDEX idx_dashboard_git_workspace_active
 -- message with its latest text when a reconnect overlaps streaming updates.
 CREATE TRIGGER dashboard_task_message_insert
 AFTER INSERT ON task_messages
-WHEN NEW.role != 'assistant' OR trim(NEW.content) != ''
+WHEN NEW.role IN ('user', 'assistant')
+ AND (NEW.role != 'assistant' OR trim(NEW.content) != '')
 BEGIN
     INSERT INTO dashboard_events (
         event_id, event_kind, occurred_at, project_id, project_name,
@@ -1854,7 +1855,9 @@ END;
 
 CREATE TRIGGER dashboard_task_message_update
 AFTER UPDATE OF content ON task_messages
-WHEN NEW.content != OLD.content AND trim(NEW.content) != ''
+WHEN NEW.role IN ('user', 'assistant')
+ AND NEW.content != OLD.content
+ AND trim(NEW.content) != ''
 BEGIN
     INSERT INTO dashboard_events (
         event_id, event_kind, occurred_at, project_id, project_name,
@@ -2123,7 +2126,12 @@ FROM task_messages tm
 JOIN tasks t ON t.id = tm.task_id AND t.hidden = 0
 LEFT JOIN projects p ON p.id = t.project_id
 LEFT JOIN agents a ON a.id = t.agent_id
-WHERE tm.id IN (SELECT id FROM task_messages ORDER BY id DESC LIMIT 500)
+WHERE tm.id IN (
+    SELECT id FROM task_messages
+    WHERE role IN ('user', 'assistant')
+    ORDER BY id DESC LIMIT 500
+)
+  AND tm.role IN ('user', 'assistant')
   AND (tm.role != 'assistant' OR trim(tm.content) != '');
 
 INSERT INTO dashboard_events (
@@ -2424,6 +2432,43 @@ mod tests {
                 "2026-08-16 11:00:07".into(),
             )
         );
+    }
+
+    #[test]
+    fn v39_backfills_only_user_and_assistant_task_messages() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 38 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO projects (id, name) VALUES ('p', 'Project');
+             INSERT INTO agents (id, name, backend, config, project_id)
+             VALUES ('atlas', 'Atlas', 'native', '{}', 'p');
+             INSERT INTO tasks (id, title, agent_id, project_id)
+             VALUES ('task', 'Investigate', 'atlas', 'p');
+             INSERT INTO task_messages (task_id, role, content)
+             VALUES ('task', 'system', 'Private generated orchestration prompt'),
+                    ('task', 'user', 'Please investigate'),
+                    ('task', 'assistant', 'I found the cause');",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V39).unwrap();
+
+        let previews = conn
+            .prepare("SELECT preview FROM dashboard_events ORDER BY cursor")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(previews, vec!["Please investigate", "I found the cause"]);
     }
 
     #[test]
