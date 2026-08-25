@@ -35,7 +35,7 @@ function event(overrides: Record<string, unknown> = {}) {
 	};
 }
 
-function snapshot(empty = false) {
+function snapshot(empty = false, cursorBase = 40) {
 	const series = Array.from({ length: 13 }, (_, index) => ({
 		timestamp: new Date(now - (12 - index) * 5 * 60_000).toISOString(),
 		context_used: empty ? 0 : 20_000 + index * 1_100,
@@ -47,7 +47,7 @@ function snapshot(empty = false) {
 	}));
 	return {
 		generated_at: iso(),
-		cursor: 50,
+		cursor: cursorBase + 10,
 		projects: [{ id: projectId, name: 'Platform' }, { id: 'project-docs', name: 'Docs' }],
 		counters: empty
 			? { working_agents: 0, active_work: 0, needs_attention: 0, tool_calls: 0 }
@@ -84,8 +84,8 @@ function snapshot(empty = false) {
 			updated_at: iso(1),
 		}],
 		feed: {
-			events: empty ? [] : [event(), event({
-				cursor: 39,
+			events: empty ? [] : [event({ cursor: cursorBase }), event({
+				cursor: cursorBase - 1,
 				event_id: 'evt-attention',
 				event_kind: 'waiting_for_input',
 				target_id: 'task-attention',
@@ -95,24 +95,47 @@ function snapshot(empty = false) {
 				needs_attention: true,
 				preview: 'The Agent needs your input',
 			})],
-			next_before: empty ? null : 39,
+			next_before: empty ? null : cursorBase - 1,
 			has_more: !empty,
 		},
 	};
 }
 
-async function mockDashboard(page: Page, options: { empty?: boolean; delaySnapshot?: boolean; stream?: boolean } = {}) {
+async function mockDashboard(page: Page, options: {
+	empty?: boolean;
+	delaySnapshot?: boolean;
+	delayFeed?: boolean;
+	manyFeedEvents?: boolean;
+	stream?: boolean;
+} = {}) {
 	const scopes: string[] = [];
 	let snapshotRequests = 0;
+	let feedRequests = 0;
 	await page.route('**/api/**', async (route) => {
 		const url = new URL(route.request().url());
 		if (url.pathname === '/api/dashboard/snapshot') {
 			snapshotRequests += 1;
 			scopes.push(url.searchParams.get('project_id') ?? 'all');
-			if (options.delaySnapshot && snapshotRequests === 1) await new Promise((resolve) => setTimeout(resolve, 300));
-			return route.fulfill({ json: snapshot(Boolean(options.empty)) });
+			if (options.delaySnapshot && snapshotRequests === 1) await new Promise((resolve) => setTimeout(resolve, 800));
+			return route.fulfill({ json: snapshot(Boolean(options.empty), options.manyFeedEvents ? 1_000 : 40) });
 		}
 		if (url.pathname === '/api/dashboard/feed') {
+			feedRequests += 1;
+			if (options.delayFeed) await new Promise((resolve) => setTimeout(resolve, 300));
+			if (options.manyFeedEvents) {
+				const start = 998 - (feedRequests - 1) * 100;
+				const events = Array.from({ length: 100 }, (_, index) => event({
+					cursor: start - index,
+					event_id: `evt-page-${feedRequests}-${index}`,
+					preview: `Earlier activity ${feedRequests}-${index}`,
+					occurred_at: iso(45 + feedRequests),
+				}));
+				return route.fulfill({ json: {
+					events,
+					next_before: start - 99,
+					has_more: true,
+				} });
+			}
 			return route.fulfill({ json: {
 				events: [event({ cursor: 20, event_id: 'evt-older', preview: 'Earlier bounded activity', occurred_at: iso(45) })],
 				next_before: null,
@@ -238,4 +261,27 @@ test('loading, empty, reconnecting, themes, reduced motion, and mobile layout st
 	}
 	const orbitAnimation = await page.locator('.live-orbit').evaluate((element) => getComputedStyle(element, '::before').animationName);
 	expect(orbitAnimation).toBe('none');
+});
+
+test('an older page from a previous Project scope is discarded', async ({ page }) => {
+	await mockDashboard(page, { delayFeed: true, stream: false });
+	await page.goto('/dashboard');
+	await expect(page.getByRole('heading', { name: 'Control center' })).toBeVisible();
+	await page.getByRole('button', { name: 'Load earlier activity' }).click();
+	await page.locator('#dashboard-project').selectOption(projectId);
+	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
+	await page.waitForTimeout(400);
+	await expect(page.locator('[data-feed-event="evt-older"]')).toHaveCount(0);
+});
+
+test('bounded history disables pagination cleanly at the client cap', async ({ page }) => {
+	await mockDashboard(page, { manyFeedEvents: true, stream: false });
+	await page.goto('/dashboard');
+	const events = page.locator('[data-feed-event]');
+	for (const expected of [102, 202, 302, 400]) {
+		await page.getByRole('button', { name: 'Load earlier activity' }).click();
+		await expect(events).toHaveCount(expected);
+	}
+	await expect(page.getByRole('button', { name: 'Load earlier activity' })).toHaveCount(0);
+	await expect(page.locator('[data-feed-limit]')).toContainText('latest 400 events');
 });

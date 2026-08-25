@@ -13,6 +13,7 @@
 
 	type ChartMode = 'context' | 'tools' | 'code';
 	type LiveState = 'connecting' | 'live' | 'reconnecting' | 'offline';
+	const MAX_FEED_EVENTS = 400;
 
 	let snapshot = $state<DashboardSnapshot | null>(null);
 	let feed = $state<DashboardEvent[]>([]);
@@ -21,6 +22,9 @@
 	let chartMode = $state<ChartMode>('context');
 	let loading = $state(true);
 	let loadingOlder = $state(false);
+	let hasMoreOlder = $state(false);
+	let historyLimitReached = $state(false);
+	let olderCursor = $state<number | null>(null);
 	let error = $state('');
 	let liveState = $state<LiveState>('connecting');
 	let mounted = $state(false);
@@ -32,6 +36,7 @@
 	let eventSource: EventSource | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let loadGeneration = 0;
+	let paginationGeneration = 0;
 	let clockTimer: ReturnType<typeof setInterval> | null = null;
 	const animationTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -90,6 +95,11 @@
 
 	async function loadDashboard() {
 		const generation = ++loadGeneration;
+		paginationGeneration += 1;
+		loadingOlder = false;
+		hasMoreOlder = false;
+		historyLimitReached = false;
+		olderCursor = null;
 		eventSource?.close();
 		eventSource = null;
 		loading = true;
@@ -100,6 +110,8 @@
 			if (!mounted || generation !== loadGeneration) return;
 			snapshot = loaded;
 			feed = uniqueEvents(loaded.feed.events).slice(0, 160);
+			olderCursor = loaded.feed.next_before ?? feed.at(-1)?.cursor ?? null;
+			hasMoreOlder = loaded.feed.has_more;
 			loading = false;
 			connectStream(loaded.cursor);
 		} catch (caught) {
@@ -146,7 +158,12 @@
 		const follow = atLiveEdge;
 		const previousHeight = scroller?.scrollHeight ?? 0;
 		const previousTop = scroller?.scrollTop ?? 0;
-		feed = uniqueEvents([event, ...feed]).slice(0, 240);
+		const combined = uniqueEvents([event, ...feed]);
+		feed = combined.slice(0, MAX_FEED_EVENTS);
+		if (combined.length > MAX_FEED_EVENTS || (combined.length >= MAX_FEED_EVENTS && hasMoreOlder)) {
+			hasMoreOlder = false;
+			historyLimitReached = true;
+		}
 		newEventIds = new Set(newEventIds).add(event.event_id);
 		announcement = `${event.source_label} updated ${event.target_title}`;
 		const timer = setTimeout(() => {
@@ -181,17 +198,32 @@
 	}
 
 	async function loadOlder() {
-		const before = feed.at(-1)?.cursor;
-		if (!snapshot?.feed.has_more || before === undefined || loadingOlder) return;
+		const before = olderCursor;
+		if (!hasMoreOlder || before === null || loadingOlder) return;
+		const generation = loadGeneration;
+		const request = ++paginationGeneration;
+		const requestProjectId = projectId;
+		const requestRange = range;
 		loadingOlder = true;
 		try {
-			const page = await dashboard.feed(projectId, range, before);
-			feed = uniqueEvents([...feed, ...page.events]).slice(0, 400);
-			snapshot = { ...snapshot, feed: page };
+			const page = await dashboard.feed(requestProjectId, requestRange, before);
+			if (
+				!mounted || request !== paginationGeneration || generation !== loadGeneration
+				|| requestProjectId !== projectId || requestRange !== range
+			) return;
+			const combined = uniqueEvents([...feed, ...page.events]);
+			const reachedLimit = combined.length > MAX_FEED_EVENTS
+				|| (combined.length >= MAX_FEED_EVENTS && page.has_more);
+			feed = combined.slice(0, MAX_FEED_EVENTS);
+			olderCursor = page.next_before ?? page.events.at(-1)?.cursor ?? olderCursor;
+			historyLimitReached = reachedLimit;
+			hasMoreOlder = page.has_more && !reachedLimit;
+			if (snapshot) snapshot = { ...snapshot, feed: { ...page, has_more: hasMoreOlder } };
 		} catch (caught) {
+			if (request !== paginationGeneration || generation !== loadGeneration) return;
 			error = caught instanceof Error ? caught.message : 'Older activity could not be loaded.';
 		} finally {
-			loadingOlder = false;
+			if (request === paginationGeneration) loadingOlder = false;
 		}
 	}
 
@@ -408,8 +440,10 @@
 								</a>
 							{/each}
 						</div>
-						{#if snapshot?.feed.has_more}
+						{#if hasMoreOlder}
 							<div class="flex justify-center p-4"><button type="button" onclick={loadOlder} disabled={loadingOlder} class="rounded-lg border border-border bg-card px-4 py-2 text-xs font-semibold shadow-sm hover:bg-accent disabled:opacity-50">{loadingOlder ? 'Loading…' : 'Load earlier activity'}</button></div>
+						{:else if historyLimitReached}
+							<div class="border-t border-border/50 p-4 text-center text-[11px] text-muted-foreground" role="status" data-feed-limit>Showing the latest {MAX_FEED_EVENTS} events in this view. Narrow the Project or time range to explore a different slice.</div>
 						{/if}
 					{:else}
 						<div class="flex min-h-[26rem] flex-col items-center justify-center px-6 text-center">

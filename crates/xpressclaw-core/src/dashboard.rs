@@ -361,7 +361,7 @@ impl DashboardManager {
                  LEFT JOIN work_attempts wa ON wa.id = ?3 AND wa.task_id = t.id
                  LEFT JOIN logical_sessions ls ON ls.id = wa.session_id
                  LEFT JOIN agents a ON a.id = COALESCE(ls.agent_id, t.agent_id)
-                 WHERE t.id = ?4",
+                 WHERE t.id = ?4 AND t.hidden = 0",
                 params![
                     format!("tool-call:{}", uuid::Uuid::new_v4()),
                     preview,
@@ -370,6 +370,14 @@ impl DashboardManager {
                 ],
             )?;
             if inserted == 0 {
+                let hidden = conn
+                    .query_row("SELECT hidden FROM tasks WHERE id = ?1", [task_id], |row| {
+                        row.get::<_, bool>(0)
+                    })
+                    .optional()?;
+                if hidden == Some(true) {
+                    return Ok(());
+                }
                 return Err(Error::Task(format!("task {task_id} not found")));
             }
             Ok(())
@@ -1386,7 +1394,19 @@ mod tests {
         manager
             .record_task_tool_call("attempt-1", &task_id, "Run command with token=super-secret")
             .unwrap();
+        let hidden_task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "IDLE".into(),
+                agent_id: Some("platform-agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
         db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET hidden = 1 WHERE id = ?1",
+                [&hidden_task.id],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO dashboard_events (
                     event_id, event_kind, project_id, source_label,
@@ -1407,6 +1427,9 @@ mod tests {
             )
             .unwrap();
         });
+        manager
+            .record_task_tool_call("attempt-idle", &hidden_task.id, "Run hidden idle check")
+            .unwrap();
         let snapshot = manager
             .snapshot(
                 &DashboardFilter {
@@ -1417,6 +1440,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(snapshot.counters.tool_calls, 1);
+        assert!(snapshot
+            .feed
+            .events
+            .iter()
+            .all(|event| event.target_id != hidden_task.id));
+        db.with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dashboard_events WHERE work_id = 'attempt-idle'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        });
         let tool = snapshot
             .feed
             .events
