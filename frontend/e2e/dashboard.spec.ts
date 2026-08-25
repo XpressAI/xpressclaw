@@ -263,6 +263,7 @@ async function installMockEventSource(page: Page) {
 			EventSource: typeof EventSource;
 			__dashboardEventSources: MockEventSource[];
 			__emitDashboardEvent: (payload: unknown) => void;
+			__emitDashboardCursor: () => void;
 			__emitDashboardStreamError: () => void;
 			__emitDashboardTransportError: () => void;
 		};
@@ -275,6 +276,15 @@ async function installMockEventSource(page: Page) {
 			if (!source) throw new Error('Dashboard EventSource is not connected');
 			for (const listener of source.listeners.get('dashboard') ?? []) {
 				listener({ data: JSON.stringify(payload) });
+			}
+		};
+		dashboardWindow.__emitDashboardCursor = () => {
+			const source = [...dashboardWindow.__dashboardEventSources]
+				.reverse()
+				.find((candidate) => !candidate.closed);
+			if (!source) throw new Error('Dashboard EventSource is not connected');
+			for (const listener of source.listeners.get('cursor') ?? []) {
+				listener({ data: '{}' });
 			}
 		};
 		dashboardWindow.__emitDashboardStreamError = () => {
@@ -319,6 +329,19 @@ async function emitDashboardStreamError(page: Page) {
 	await page.evaluate(() => {
 		(window as unknown as { __emitDashboardStreamError: () => void })
 			.__emitDashboardStreamError();
+	});
+}
+
+async function emitDashboardCursor(page: Page) {
+	await page.waitForFunction(() => {
+		const sources = (window as unknown as {
+			__dashboardEventSources?: Array<{ closed: boolean }>;
+		}).__dashboardEventSources;
+		return sources?.some((source) => !source.closed) ?? false;
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __emitDashboardCursor: () => void })
+			.__emitDashboardCursor();
 	});
 }
 
@@ -490,6 +513,39 @@ test('live activity coalesced into a failed summary refresh receives one retry',
 	mocked.releaseFirstRefresh();
 	await expect.poll(mocked.snapshotRequestCount).toBe(3);
 	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('9');
+});
+
+test('an open stream returns to Live after an in-stream error recovers', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { outOfOrderRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Live');
+
+	await emitDashboardStreamError(page);
+	await expect.poll(mocked.snapshotRequestCount).toBe(2);
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
+
+	await emitDashboardCursor(page);
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Live');
+	await emitDashboardStreamError(page);
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
+
+	mocked.releaseFirstRefresh();
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Live');
+});
+
+test('a successful transport-error probe does not claim the stream reopened', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page, { outOfOrderRefresh: true });
+	await page.goto('/dashboard');
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Live');
+
+	await emitDashboardTransportError(page);
+	await expect.poll(mocked.snapshotRequestCount).toBe(2);
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
+	mocked.releaseFirstRefresh();
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('4');
+	await expect(page.locator('[data-dashboard-connection]')).toContainText('Reconnecting');
 });
 
 test('summary refreshes keep the Project selector current', async ({ page }) => {

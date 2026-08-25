@@ -42,6 +42,7 @@
 	let announcement = $state('');
 	let newEventIds = $state<Set<string>>(new Set());
 	let eventSource: EventSource | null = null;
+	let inStreamErrorSource: EventSource | null = null;
 	let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 	let activeSummaryRefresh: {
 		generation: number;
@@ -93,7 +94,10 @@
 			}
 		};
 		const visibilityChanged = () => updateClockState(true);
-		const wentOffline = () => (liveState = 'offline');
+		const wentOffline = () => {
+			inStreamErrorSource = null;
+			liveState = 'offline';
+		};
 		const cameOnline = () => {
 			liveState = 'reconnecting';
 			if (!eventSource && snapshot) connectStream(snapshot.cursor);
@@ -106,6 +110,7 @@
 			mounted = false;
 			summaryRefreshGeneration += 1;
 			activeSummaryRefresh = null;
+			inStreamErrorSource = null;
 			eventSource?.close();
 			if (clockTimer) clearInterval(clockTimer);
 			if (rollingWindowTimer) clearInterval(rollingWindowTimer);
@@ -130,6 +135,7 @@
 		hasMoreOlder = false;
 		historyLimitReached = false;
 		olderCursor = null;
+		inStreamErrorSource = null;
 		eventSource?.close();
 		eventSource = null;
 		// The existing snapshot belongs to the previous Project/range. Clear it
@@ -172,6 +178,7 @@
 
 	function connectStream(after: number) {
 		eventSource?.close();
+		inStreamErrorSource = null;
 		if (!mounted || !navigator.onLine) {
 			liveState = 'offline';
 			return;
@@ -180,27 +187,44 @@
 		const source = new EventSource(dashboard.streamUrl(projectId, range, after));
 		eventSource = source;
 		source.onopen = () => {
-			if (eventSource === source) liveState = 'live';
+			if (eventSource === source) {
+				inStreamErrorSource = null;
+				liveState = 'live';
+			}
 		};
 		source.addEventListener('dashboard', (event) => {
 			if (eventSource !== source) return;
 			try {
-				insertLiveEvent(JSON.parse((event as MessageEvent).data) as DashboardEvent);
+				const dashboardEvent = JSON.parse((event as MessageEvent).data) as DashboardEvent;
+				inStreamErrorSource = null;
+				liveState = 'live';
+				insertLiveEvent(dashboardEvent);
 			} catch {
 				liveState = 'reconnecting';
 			}
 		});
+		source.addEventListener('cursor', () => {
+			if (eventSource === source) {
+				inStreamErrorSource = null;
+				liveState = 'live';
+			}
+		});
 		source.addEventListener('reset', () => {
-			if (eventSource === source) void loadDashboard();
+			if (eventSource === source) {
+				inStreamErrorSource = null;
+				void loadDashboard();
+			}
 		});
 		source.addEventListener('stream_error', () => {
 			if (eventSource === source) {
+				inStreamErrorSource = source;
 				liveState = 'reconnecting';
 				scheduleSummaryRefresh('probe');
 			}
 		});
 		source.onerror = () => {
 			if (eventSource === source) {
+				inStreamErrorSource = null;
 				liveState = navigator.onLine ? 'reconnecting' : 'offline';
 				if (navigator.onLine) scheduleSummaryRefresh('probe');
 			}
@@ -273,6 +297,10 @@
 					: reconcileAllProjectsFeed(refreshed);
 				projectOptions = refreshed.projects;
 				snapshot = { ...refreshed, feed: refreshedFeed };
+				if (inStreamErrorSource === eventSource) {
+					inStreamErrorSource = null;
+					liveState = 'live';
+				}
 			} catch (caught) {
 				if (
 					mounted && refreshGeneration === summaryRefreshGeneration
@@ -319,6 +347,7 @@
 		if (projectId !== deletedProjectId) return;
 		summaryRefreshGeneration += 1;
 		activeSummaryRefresh = null;
+		inStreamErrorSource = null;
 		paginationGeneration += 1;
 		eventSource?.close();
 		eventSource = null;
