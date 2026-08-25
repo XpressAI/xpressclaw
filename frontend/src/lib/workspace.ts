@@ -1,5 +1,6 @@
 export type WorkspaceTabKind =
 	| 'home'
+	| 'dashboard'
 	| 'projects'
 	| 'project'
 	| 'agents'
@@ -79,6 +80,7 @@ export function projectSection(route: string): ProjectSection {
 export function workspacePath(route: string): boolean {
 	const pathname = pathnameFromRoute(route);
 	return pathname === '/'
+		|| pathname === '/dashboard'
 		|| pathname === '/projects'
 		|| pathname.startsWith('/projects/')
 		|| pathname === '/conversations'
@@ -98,6 +100,7 @@ export function workspacePath(route: string): boolean {
 export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status' | 'lastActiveAt'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
+	if (pathname === '/dashboard') return { path: route, kind: 'dashboard', title: 'Control center', resourceId: null };
 	if (pathname === '/projects') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
 	if (pathname.startsWith('/projects/')) return { path: route, kind: 'project', title: 'Project', resourceId: decodeURIComponent(pathname.slice('/projects/'.length)) };
 	if (pathname === '/conversations') return { path: route, kind: 'projects', title: 'Conversations', resourceId: null };

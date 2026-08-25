@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
@@ -715,6 +716,7 @@ impl TaskQueue {
                    AND status IN ('completed', 'failed', 'cancelled', 'interrupted')",
                 [],
             )?;
+            finalize_inactive_git_baselines(&tx, None)?;
             tx.commit()?;
             Ok::<_, Error>(finalized)
         })?;
@@ -771,6 +773,7 @@ impl TaskQueue {
                     [session_id],
                 )?;
             }
+            finalize_inactive_git_baselines(&tx, None)?;
             tx.commit()?;
             Ok::<_, Error>(())
         })?;
@@ -1007,16 +1010,36 @@ mod tests {
         board
             .update_status(&task.id, "in_progress", Some("atlas"))
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_git_baselines
+                     (work_kind, work_id, workspace, baseline_json, git_state)
+                 VALUES ('attempt', ?1, '/tmp/recovered-task', '{}', 'available')",
+                [attempt_id],
+            )
+        })
+        .unwrap();
 
         assert_eq!(queue.recover_in_progress().unwrap(), 1);
         assert_eq!(queue.get(queued.id).unwrap().status, "queued");
         assert_eq!(board.get(&task.id).unwrap().status.as_str(), "pending");
-        let overview = SessionManager::new(db).overview("atlas").unwrap();
+        let overview = SessionManager::new(db.clone()).overview("atlas").unwrap();
         assert_eq!(overview.session.status, "queued");
         assert!(overview
             .recent_events
             .iter()
             .any(|event| event.event_type == "attempt_requeued"));
+        assert!(db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'attempt' AND work_id = ?1",
+                    [attempt_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap()
+            .is_some());
     }
 
     #[test]

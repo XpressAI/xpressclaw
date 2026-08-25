@@ -224,6 +224,118 @@ export const conversations = {
 	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
 };
 
+// -- Control center dashboard --
+
+export type DashboardRange = '1h' | '24h' | '7d';
+
+export interface DashboardProject {
+	id: string;
+	name: string;
+}
+
+export interface DashboardCounters {
+	working_agents: number;
+	active_work: number;
+	needs_attention: number;
+	tool_calls: number;
+}
+
+export interface DashboardSeriesPoint {
+	timestamp: string;
+	context_used: number;
+	context_size: number;
+	tool_calls: number;
+	code_additions: number;
+	code_deletions: number;
+	git_state: 'none' | 'available' | 'partial' | 'unavailable';
+}
+
+export interface DashboardActiveWork {
+	work_kind: 'attempt' | 'conversation_turn';
+	work_id: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string;
+	agent_name: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	phase: 'queued' | 'working';
+	queued_at: string;
+	started_at: string | null;
+	activity: string;
+}
+
+export interface DashboardEvent {
+	cursor: number;
+	event_id: string;
+	event_kind: string;
+	occurred_at: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	source_kind: string;
+	source_label: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	severity: 'info' | 'success' | 'warning' | 'error';
+	needs_attention: boolean;
+	preview: string;
+	work_kind: string | null;
+	work_id: string | null;
+}
+
+export interface DashboardAttentionItem {
+	id: string;
+	kind: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	summary: string;
+	updated_at: string;
+}
+
+export interface DashboardFeedPage {
+	events: DashboardEvent[];
+	next_before: number | null;
+	has_more: boolean;
+}
+
+export interface DashboardSnapshot {
+	generated_at: string;
+	cursor: number;
+	projects: DashboardProject[];
+	counters: DashboardCounters;
+	series: DashboardSeriesPoint[];
+	active_work: DashboardActiveWork[];
+	attention: DashboardAttentionItem[];
+	feed: DashboardFeedPage;
+}
+
+function dashboardParams(projectId: string, range: DashboardRange, extras: Record<string, string> = {}) {
+	const params = new URLSearchParams({ range, ...extras });
+	if (projectId) params.set('project_id', projectId);
+	return params;
+}
+
+export const dashboard = {
+	snapshot: (projectId: string, range: DashboardRange, limit = 40) =>
+		request<DashboardSnapshot>(`/api/dashboard/snapshot?${dashboardParams(projectId, range, { limit: String(limit) })}`),
+	feed: (projectId: string, range: DashboardRange, before: number, limit = 40) =>
+		request<DashboardFeedPage>(`/api/dashboard/feed?${dashboardParams(projectId, range, { before: String(before), limit: String(limit) })}`),
+	streamUrl: (projectId: string, range: DashboardRange, after: number) =>
+		`/api/dashboard/stream?${dashboardParams(projectId, range, { after: String(after) })}`,
+};
+
 // -- Logical sessions and native work attempts --
 
 export interface NativeRunnerConfig {

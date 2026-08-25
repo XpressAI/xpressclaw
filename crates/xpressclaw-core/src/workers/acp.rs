@@ -16,7 +16,7 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, TextContent, ToolCallStatus,
+    SetSessionModeRequest, TextContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
@@ -31,6 +31,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::AttachedContainer;
 use crate::error::{Error, Result};
@@ -511,6 +512,35 @@ impl AcpEventRecorder {
                     .insert(call.tool_call_id.to_string(), call.title.clone());
                 let summary = tool_summary(&call.title, call.status);
                 self.append_event("tool_call", &summary, payload)?;
+                let dashboard_summary = dashboard_tool_summary(call.kind);
+                let dashboard = DashboardManager::new(self.db.clone());
+                let telemetry = if let Some(conversation_id) = self.conversation_id.as_deref() {
+                    dashboard.record_conversation_tool_call(
+                        &self.attempt_id,
+                        conversation_id,
+                        &self.logical_session_id,
+                        dashboard_summary,
+                    )
+                } else {
+                    dashboard.record_task_tool_call(
+                        &self.attempt_id,
+                        &self.task_id,
+                        dashboard_summary,
+                    )
+                };
+                if let Err(error) = telemetry {
+                    warn!(%error, "failed to record dashboard tool-call telemetry");
+                }
+                let work_kind = if self.conversation_id.is_some() {
+                    "conversation_turn"
+                } else {
+                    "attempt"
+                };
+                if let Err(error) =
+                    dashboard.record_git_snapshot(work_kind, &self.attempt_id, false)
+                {
+                    warn!(%error, "failed to record dashboard Git metric boundary");
+                }
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -1675,6 +1705,22 @@ fn tool_summary(title: &str, status: ToolCallStatus) -> String {
         ToolCallStatus::Completed => title.to_string(),
         ToolCallStatus::Failed => format!("Failed {title}"),
         _ => title.to_string(),
+    }
+}
+
+fn dashboard_tool_summary(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "Reading workspace data",
+        ToolKind::Edit => "Editing workspace files",
+        ToolKind::Delete => "Removing workspace content",
+        ToolKind::Move => "Moving workspace content",
+        ToolKind::Search => "Searching workspace data",
+        ToolKind::Execute => "Running a command",
+        ToolKind::Think => "Using an internal planning tool",
+        ToolKind::Fetch => "Fetching external data",
+        ToolKind::SwitchMode => "Switching Agent mode",
+        ToolKind::Other => "Using an Agent tool",
+        _ => "Using an Agent tool",
     }
 }
 

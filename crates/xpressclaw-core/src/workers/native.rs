@@ -31,6 +31,7 @@ use crate::config::{
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
 use crate::conversations::{ConversationManager, SendMessage};
+use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
@@ -814,6 +815,15 @@ async fn execute_conversation_turn(
         turn.id.clone(),
         kind.clone(),
     );
+    if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+        "conversation_turn",
+        &turn.id,
+        conversation.project_id.as_deref(),
+        &turn.agent_id,
+        &workspace,
+    ) {
+        warn!(%error, turn_id = turn.id, "failed to capture conversation Git baseline");
+    }
     let result = live
         .process
         .run_turn(
@@ -830,6 +840,11 @@ async fn execute_conversation_turn(
             },
         )
         .await;
+    if let Err(error) =
+        DashboardManager::new(db.clone()).record_git_snapshot("conversation_turn", &turn.id, true)
+    {
+        warn!(%error, turn_id = turn.id, "failed to finalize conversation Git metrics");
+    }
     turn_controls.finish_attempt(&turn.id);
     let result = match result {
         Ok(result) => result,
@@ -976,6 +991,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
     let task_project_id = board.project_id(&task.id)?;
+    let capture_task_dashboard_metrics = dashboard_task_metrics_enabled(&task);
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
         control_task_id.is_some() && github_review_lifecycle_enabled(&task);
@@ -1143,6 +1159,17 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         item.task_id.clone(),
         kind.clone(),
     );
+    if capture_task_dashboard_metrics {
+        if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+            "attempt",
+            attempt_id,
+            task_project_id.as_deref(),
+            &item.agent_id,
+            &workspace,
+        ) {
+            warn!(%error, attempt_id, "failed to capture task Git baseline");
+        }
+    }
     let turn = live
         .process
         .run_turn(
@@ -1159,6 +1186,13 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             },
         )
         .await;
+    if capture_task_dashboard_metrics {
+        if let Err(error) =
+            DashboardManager::new(db.clone()).record_git_snapshot("attempt", attempt_id, true)
+        {
+            warn!(%error, attempt_id, "failed to finalize task Git metrics");
+        }
+    }
     if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
         docker.stop_preserving(workload_id).await?;
     }
@@ -2081,7 +2115,11 @@ fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<Mc
 }
 
 fn continuation_task_id(task: &Task) -> Option<&str> {
-    (!task.hidden && task.task_type != "IDLE").then_some(task.id.as_str())
+    dashboard_task_metrics_enabled(task).then_some(task.id.as_str())
+}
+
+fn dashboard_task_metrics_enabled(task: &Task) -> bool {
+    !task.hidden && task.task_type != "IDLE"
 }
 
 fn github_review_lifecycle_enabled(task: &Task) -> bool {
@@ -4025,7 +4063,7 @@ mod tests {
         crate::agents::registry::AgentRegistry::new(db.clone())
             .ensure("atlas", "native")
             .unwrap();
-        let board = TaskBoard::new(db);
+        let board = TaskBoard::new(db.clone());
         let visible = board
             .create(&CreateTask {
                 title: "Visible work".into(),
@@ -4039,6 +4077,15 @@ mod tests {
 
         assert_eq!(continuation_task_id(&visible), Some(visible.id.as_str()));
         assert_eq!(continuation_task_id(&idle), None);
+        assert!(dashboard_task_metrics_enabled(&visible));
+        assert!(!dashboard_task_metrics_enabled(&idle));
+
+        db.with_conn(|conn| conn.execute("UPDATE tasks SET hidden = 0 WHERE id = ?1", [&idle.id]))
+            .unwrap();
+        let visible_idle = board.get(&idle.id).unwrap();
+        assert!(!visible_idle.hidden);
+        assert_eq!(visible_idle.task_type, "IDLE");
+        assert!(!dashboard_task_metrics_enabled(&visible_idle));
     }
 
     #[test]

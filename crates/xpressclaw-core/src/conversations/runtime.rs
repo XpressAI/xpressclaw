@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::conversations::{row_to_message, ConversationManager, ConversationMessage, SendMessage};
+use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
@@ -630,7 +631,8 @@ impl ConversationTurnQueue {
 
     pub fn recover(&self) -> Result<usize> {
         self.db.with_conn(|conn| {
-            let changed = conn.execute(
+            let transaction = conn.unchecked_transaction()?;
+            let changed = transaction.execute(
                 "UPDATE conversation_turns
                  SET status = 'queued', started_at = NULL,
                      response_queued_at = CURRENT_TIMESTAMP, response_started_at = NULL,
@@ -638,11 +640,13 @@ impl ConversationTurnQueue {
                  WHERE status = 'running'",
                 [],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE conversation_agent_sessions SET status = 'queued'
                  WHERE status = 'running'",
                 [],
             )?;
+            finalize_inactive_git_baselines(&transaction, None)?;
+            transaction.commit()?;
             Ok(changed)
         })
     }
@@ -769,6 +773,74 @@ mod tests {
                 && turn.response_queued_at.as_deref() == Some(second.created_at.as_str())
                 && turn.response_started_at.is_none()
         }));
+    }
+
+    #[test]
+    fn recovery_closes_interrupted_conversation_git_baseline() {
+        let (db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Recovery".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let message = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "Please continue after restart".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .enqueue_for_message(
+                &conversation.id,
+                message.id,
+                "user",
+                "local",
+                &message.content,
+            )
+            .unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_git_baselines
+                     (work_kind, work_id, workspace, baseline_json, git_state)
+                 VALUES (
+                     'conversation_turn', ?1, '/tmp/recovered-conversation', '{}', 'available'
+                 )",
+                [&running.id],
+            )
+        })
+        .unwrap();
+
+        assert_eq!(queue.recover().unwrap(), 1);
+        let recovered = queue
+            .list_for_conversation(&conversation.id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|turn| turn.id == running.id)
+            .unwrap();
+        assert_eq!(recovered.status, "queued");
+        assert!(db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'conversation_turn' AND work_id = ?1",
+                    [&running.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap()
+            .is_some());
     }
 
     #[test]

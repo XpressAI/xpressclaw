@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod config;
+pub mod dashboard;
 pub mod db;
 pub mod error;
 pub mod runtime;

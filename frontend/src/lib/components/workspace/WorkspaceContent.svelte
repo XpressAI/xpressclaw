@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { projectSection, type WorkspaceTab } from '$lib/workspace';
 	import HomePage from '../../../routes/+page.svelte';
+	import DashboardPage from '../../../routes/dashboard/+page.svelte';
 	import AgentsPage from '../../../routes/agents/+page.svelte';
 	import AgentView from '../../../routes/agents/[id]/ProjectView.svelte';
 	import ProjectsPage from '../../../routes/projects/ProjectsPage.svelte';
@@ -18,6 +19,8 @@
 
 {#if tab.kind === 'home'}
 	<HomePage />
+{:else if tab.kind === 'dashboard'}
+	<DashboardPage />
 {:else if tab.kind === 'projects'}
 	<ProjectsPage />
 {:else if tab.kind === 'project' && tab.resourceId}
