@@ -192,7 +192,10 @@
 			}
 		});
 		source.onerror = () => {
-			if (eventSource === source) liveState = navigator.onLine ? 'reconnecting' : 'offline';
+			if (eventSource === source) {
+				liveState = navigator.onLine ? 'reconnecting' : 'offline';
+				if (navigator.onLine) scheduleSummaryRefresh(0);
+			}
 		};
 	}
 

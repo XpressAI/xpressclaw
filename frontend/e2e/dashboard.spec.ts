@@ -239,6 +239,7 @@ async function installMockEventSource(page: Page) {
 			__dashboardEventSources: MockEventSource[];
 			__emitDashboardEvent: (payload: unknown) => void;
 			__emitDashboardStreamError: () => void;
+			__emitDashboardTransportError: () => void;
 		};
 		dashboardWindow.__dashboardEventSources = [];
 		dashboardWindow.EventSource = MockEventSource as unknown as typeof EventSource;
@@ -259,6 +260,13 @@ async function installMockEventSource(page: Page) {
 			for (const listener of source.listeners.get('stream_error') ?? []) {
 				listener({ data: '{"message":"Dashboard stream is unavailable"}' });
 			}
+		};
+		dashboardWindow.__emitDashboardTransportError = () => {
+			const source = [...dashboardWindow.__dashboardEventSources]
+				.reverse()
+				.find((candidate) => !candidate.closed);
+			if (!source) throw new Error('Dashboard EventSource is not connected');
+			source.onerror?.();
 		};
 	});
 }
@@ -286,6 +294,19 @@ async function emitDashboardStreamError(page: Page) {
 	await page.evaluate(() => {
 		(window as unknown as { __emitDashboardStreamError: () => void })
 			.__emitDashboardStreamError();
+	});
+}
+
+async function emitDashboardTransportError(page: Page) {
+	await page.waitForFunction(() => {
+		const sources = (window as unknown as {
+			__dashboardEventSources?: Array<{ closed: boolean }>;
+		}).__dashboardEventSources;
+		return sources?.some((source) => !source.closed) ?? false;
+	});
+	await page.evaluate(() => {
+		(window as unknown as { __emitDashboardTransportError: () => void })
+			.__emitDashboardTransportError();
 	});
 }
 
@@ -452,6 +473,24 @@ test('deleting the selected Project returns the dashboard to All Projects', asyn
 
 	mocked.deleteSelectedProject();
 	await emitDashboardStreamError(page);
+
+	await expect(page.locator('#dashboard-project')).toHaveValue('');
+	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
+	await expect(page.getByRole('option', { name: 'Docs', exact: true })).toHaveCount(1);
+	await expect(page.locator('[data-kpi="working-agents"]')).toContainText('0');
+	await expect.poll(() => mocked.scopes.at(-1)).toBe('all');
+});
+
+test('a failed stream reconnect probes and recovers a deleted selected Project', async ({ page }) => {
+	await installMockEventSource(page);
+	const mocked = await mockDashboard(page);
+	await page.goto('/dashboard');
+	await page.locator('#dashboard-project').selectOption(projectId);
+	await expect(page.locator('#dashboard-project')).toHaveValue(projectId);
+	await expect.poll(() => mocked.scopes.filter((scope) => scope === projectId).length).toBe(1);
+
+	mocked.deleteSelectedProject();
+	await emitDashboardTransportError(page);
 
 	await expect(page.locator('#dashboard-project')).toHaveValue('');
 	await expect(page.getByRole('option', { name: 'Platform', exact: true })).toHaveCount(0);
