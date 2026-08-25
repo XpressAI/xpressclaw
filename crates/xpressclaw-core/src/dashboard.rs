@@ -281,12 +281,13 @@ impl DashboardManager {
     /// every cursor and replaces matching stable event IDs.
     pub fn replay_after(
         &self,
-        project_id: Option<&str>,
+        filter: &DashboardFilter,
         after: i64,
         limit: i64,
     ) -> Result<DashboardReplay> {
-        self.validate_project(project_id)?;
+        self.validate_project(filter.project_id.as_deref())?;
         let limit = limit.clamp(1, 250);
+        let since = Utc::now() - Duration::seconds(filter.range.seconds());
         self.db.with_conn(|conn| {
             let (oldest_cursor, latest_cursor) = conn.query_row(
                 "SELECT COALESCE(MIN(cursor), 0), COALESCE(MAX(cursor), 0)
@@ -310,11 +311,16 @@ impl DashboardManager {
                         target_title, href, severity, needs_attention, preview,
                         work_kind, work_id
                  FROM dashboard_events
-                 WHERE cursor > ?1 AND (?2 IS NULL OR project_id = ?2)
-                 ORDER BY cursor ASC LIMIT ?3",
+                 WHERE cursor > ?1
+                   AND occurred_at >= ?2
+                   AND (?3 IS NULL OR project_id = ?3)
+                 ORDER BY cursor ASC LIMIT ?4",
             )?;
             let events = statement
-                .query_map(params![after, project_id, limit], row_to_event)?
+                .query_map(
+                    params![after, timestamp_string(since), filter.project_id, limit],
+                    row_to_event,
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(DashboardReplay {
                 events,
@@ -730,7 +736,7 @@ impl DashboardManager {
                     SELECT ls.agent_id AS agent_id
                     FROM work_attempts wa
                     JOIN logical_sessions ls ON ls.id = wa.session_id
-                    LEFT JOIN tasks t ON t.id = wa.task_id
+                    JOIN tasks t ON t.id = wa.task_id AND t.hidden = 0
                     WHERE wa.status IN ('preparing', 'running')
                       AND (?1 IS NULL OR t.project_id = ?1)
                     UNION ALL
@@ -747,7 +753,7 @@ impl DashboardManager {
                 "SELECT COUNT(*) FROM (
                     SELECT wa.id
                     FROM work_attempts wa
-                    LEFT JOIN tasks t ON t.id = wa.task_id
+                    JOIN tasks t ON t.id = wa.task_id AND t.hidden = 0
                     WHERE wa.status IN ('queued', 'preparing', 'running')
                       AND (?1 IS NULL OR t.project_id = ?1)
                     UNION ALL
@@ -1388,6 +1394,43 @@ mod tests {
     }
 
     #[test]
+    fn projectless_task_status_transitions_reach_the_all_projects_feed() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Projectless maintenance".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET status = 'completed' WHERE id = ?1",
+                [&task.id],
+            )
+            .unwrap();
+        });
+
+        let snapshot = DashboardManager::new(db)
+            .snapshot(
+                &DashboardFilter {
+                    project_id: None,
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+        let event = snapshot
+            .feed
+            .events
+            .iter()
+            .find(|event| event.event_kind == "completion" && event.target_id == task.id)
+            .expect("projectless status transition should be visible");
+        assert_eq!(event.project_id, None);
+        assert_eq!(event.project_name, None);
+        assert_eq!(event.preview, "Task completed");
+    }
+
+    #[test]
     fn canonical_tool_count_ignores_updates_and_enforces_project_scope() {
         let (db, project_id, _agent_id, task_id) = fixture();
         let manager = DashboardManager::new(db.clone());
@@ -1477,7 +1520,19 @@ mod tests {
     #[test]
     fn high_frequency_progress_is_coalesced_without_losing_attention_events() {
         let (db, _project_id, agent_id, task_id) = fixture();
+        let hidden_task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "IDLE".into(),
+                agent_id: Some(agent_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
         db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET hidden = 1 WHERE id = ?1",
+                [&hidden_task.id],
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO logical_sessions (id, agent_id, title)
                  VALUES (?1, ?1, ?1)",
@@ -1488,6 +1543,21 @@ mod tests {
                 "INSERT INTO work_attempts (id, session_id, task_id, runner, status)
                  VALUES ('attempt-progress', ?1, ?2, 'codex', 'running')",
                 params![agent_id, task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO work_attempts (id, session_id, task_id, runner, status)
+                 VALUES ('attempt-hidden-progress', ?1, ?2, 'codex', 'running')",
+                params![agent_id, hidden_task.id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_events (
+                    session_id, attempt_id, task_id, source_type,
+                    event_type, summary
+                 ) VALUES (?1, 'attempt-hidden-progress', ?2, 'acp',
+                           'runner_progress', 'Hidden idle progress')",
+                params![agent_id, hidden_task.id],
             )
             .unwrap();
             for summary in ["Reading files", "Still reading files"] {
@@ -1542,6 +1612,16 @@ mod tests {
             assert_eq!(
                 conn.query_row(
                     "SELECT COUNT(*) FROM dashboard_events
+                     WHERE work_id = 'attempt-hidden-progress'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM dashboard_events
                      WHERE work_id = 'attempt-progress'
                        AND event_kind = 'waiting_for_input' AND needs_attention = 1",
                     [],
@@ -1588,6 +1668,9 @@ mod tests {
         AgentRegistry::new(db.clone())
             .create_in_project("docs-agent", "native", &other_project.id)
             .unwrap();
+        AgentRegistry::new(db.clone())
+            .create_in_project("idle-agent", "native", &project_id)
+            .unwrap();
         let other_task = TaskBoard::new(db.clone())
             .create(&CreateTask {
                 title: "Write docs".into(),
@@ -1595,10 +1678,23 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        let hidden_task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "IDLE".into(),
+                agent_id: Some("idle-agent".into()),
+                ..Default::default()
+            })
+            .unwrap();
         db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE tasks SET hidden = 1 WHERE id = ?1",
+                [&hidden_task.id],
+            )
+            .unwrap();
             for (session, task, attempt) in [
                 (agent_id.as_str(), task_id.as_str(), "attempt-platform"),
                 ("docs-agent", other_task.id.as_str(), "attempt-docs"),
+                ("idle-agent", hidden_task.id.as_str(), "attempt-idle"),
             ] {
                 conn.execute(
                     "INSERT INTO logical_sessions (id, agent_id, title, status)
@@ -1667,6 +1763,60 @@ mod tests {
             .events
             .iter()
             .any(|event| event.project_id.as_deref() == Some(&other_project.id)));
+    }
+
+    #[test]
+    fn non_git_metric_buckets_do_not_report_git_capture_failures() {
+        let (db, project_id, agent_id, _task_id) = fixture();
+        let now = Utc::now();
+        let observed = timestamp_string(bucket_time(now - Duration::minutes(20), 10));
+        let context_only = timestamp_string(bucket_time(now - Duration::minutes(10), 10));
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_metric_points (
+                    work_kind, work_id, project_id, agent_id, bucket_at,
+                    code_additions, code_deletions, git_state
+                 ) VALUES ('attempt', 'git-work', ?1, ?2, ?3, 0, 0, 'available')",
+                params![project_id, agent_id, observed],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dashboard_metric_points (
+                    work_kind, work_id, project_id, agent_id, bucket_at,
+                    context_used, context_size
+                 ) VALUES ('attempt', 'git-work', ?1, ?2, ?3, 12000, 258400)",
+                params![project_id, agent_id, context_only],
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT git_state FROM dashboard_metric_points
+                     WHERE work_id = 'git-work' AND bucket_at = ?1",
+                    [&context_only],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                "unobserved"
+            );
+        });
+
+        let snapshot = DashboardManager::new(db)
+            .snapshot(
+                &DashboardFilter {
+                    project_id: Some(project_id),
+                    range: DashboardRange::Hour,
+                },
+                20,
+            )
+            .unwrap();
+        assert!(snapshot
+            .series
+            .iter()
+            .any(|point| point.git_state == "available"));
+        assert!(snapshot
+            .series
+            .iter()
+            .all(|point| !matches!(point.git_state.as_str(), "partial" | "unavailable")));
     }
 
     #[test]
@@ -1747,7 +1897,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].preview, "Final <strong>answer</strong>");
-        let overlap = manager.replay_after(None, first_cursor, 20).unwrap();
+        let overlap = manager
+            .replay_after(
+                &DashboardFilter {
+                    project_id: None,
+                    range: DashboardRange::Hour,
+                },
+                first_cursor,
+                20,
+            )
+            .unwrap();
         assert_eq!(overlap.events.len(), 1);
         assert_eq!(overlap.events[0].event_id, versions[0].event_id);
     }
@@ -1846,16 +2005,33 @@ mod tests {
             .record_task_tool_call("attempt-1", &task_id, "First")
             .unwrap();
         let first = manager.latest_cursor().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_events (
+                    event_id, event_kind, occurred_at, source_label,
+                    target_type, target_id, target_title, href, preview
+                 ) VALUES ('outside-replay-range', 'progress', ?1, 'Agent',
+                           'task', ?2, 'Ship dashboard', '/tasks/' || ?2,
+                           'Out-of-window progress')",
+                params![timestamp_string(Utc::now() - Duration::hours(2)), task_id],
+            )
+            .unwrap();
+        });
         manager
             .record_task_tool_call("attempt-1", &task_id, "Second")
             .unwrap();
-        let replay = manager.replay_after(None, first, 20).unwrap();
+        let filter = DashboardFilter {
+            project_id: None,
+            range: DashboardRange::Hour,
+        };
+        let replay = manager.replay_after(&filter, first, 20).unwrap();
         assert_eq!(replay.events.len(), 1);
         assert!(replay.events[0].cursor > first);
+        assert_ne!(replay.events[0].event_id, "outside-replay-range");
         assert!(!replay.reset_required);
         assert!(
             manager
-                .replay_after(None, replay.latest_cursor + 100, 20)
+                .replay_after(&filter, replay.latest_cursor + 100, 20)
                 .unwrap()
                 .reset_required
         );
@@ -1866,7 +2042,7 @@ mod tests {
         });
         assert!(
             manager
-                .replay_after(None, first - 1, 20)
+                .replay_after(&filter, first - 1, 20)
                 .unwrap()
                 .reset_required
         );

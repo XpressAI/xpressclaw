@@ -1791,8 +1791,8 @@ CREATE TABLE dashboard_metric_points (
     tool_calls INTEGER NOT NULL DEFAULT 0,
     code_additions INTEGER,
     code_deletions INTEGER,
-    git_state TEXT NOT NULL DEFAULT 'unavailable'
-        CHECK (git_state IN ('available', 'partial', 'unavailable')),
+    git_state TEXT NOT NULL DEFAULT 'unobserved'
+        CHECK (git_state IN ('unobserved', 'available', 'partial', 'unavailable')),
     git_detail TEXT,
     recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     PRIMARY KEY (work_kind, work_id, bucket_at)
@@ -1943,9 +1943,9 @@ BEGIN
             WHEN 'in_progress' THEN 'Work started'
             ELSE 'Task is pending'
         END
-    FROM projects p
-    LEFT JOIN agents a ON a.id = NEW.agent_id
-    WHERE p.id = NEW.project_id;
+    FROM (SELECT 1) singleton
+    LEFT JOIN projects p ON p.id = NEW.project_id
+    LEFT JOIN agents a ON a.id = NEW.agent_id;
 END;
 
 CREATE TRIGGER dashboard_session_event_insert
@@ -1989,7 +1989,7 @@ BEGIN
     JOIN logical_sessions ls ON ls.id = NEW.session_id
     LEFT JOIN projects p ON p.id = t.project_id
     LEFT JOIN agents a ON a.id = ls.agent_id
-    WHERE t.id = NEW.task_id;
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
 END;
 
 CREATE TRIGGER dashboard_conversation_turn_status

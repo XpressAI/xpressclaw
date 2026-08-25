@@ -85,14 +85,14 @@ async fn stream(
     // Validate both the range and Project before committing an SSE response.
     let requested_filter = filter(&params)?;
     DashboardManager::new(state.db.clone())
-        .replay_after(requested_filter.project_id.as_deref(), 0, 1)
+        .replay_after(&requested_filter, 0, 1)
         .map_err(api_error)?;
     let header_cursor = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok());
     let mut cursor = header_cursor.or(params.after).unwrap_or_default().max(0);
-    let project_id = requested_filter.project_id;
+    let replay_filter = requested_filter;
 
     let event_stream = async_stream::stream! {
         let mut interval = tokio::time::interval(Duration::from_millis(800));
@@ -100,7 +100,7 @@ async fn stream(
         loop {
             interval.tick().await;
             match DashboardManager::new(state.db.clone())
-                .replay_after(project_id.as_deref(), cursor, STREAM_BATCH)
+                .replay_after(&replay_filter, cursor, STREAM_BATCH)
             {
                 Ok(DashboardReplay { reset_required: true, latest_cursor, .. }) => {
                     cursor = latest_cursor;
@@ -273,13 +273,26 @@ mod tests {
             .add_message(&task.id, "user", "Already delivered")
             .unwrap();
         let cursor = DashboardManager::new(db.clone()).latest_cursor().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_events (
+                    event_id, event_kind, occurred_at, project_id, project_name,
+                    source_label, target_type, target_id, target_title, href, preview
+                 ) VALUES ('old-after-cursor', 'progress',
+                           '2000-01-01T00:00:00.000Z', ?1, 'Platform', 'Agent',
+                           'task', ?2, 'Stream the dashboard', '/tasks/' || ?2,
+                           'Out-of-window replay')",
+                [&project_id, &task.id],
+            )
+            .unwrap();
+        });
         conversation
             .add_message(&task.id, "assistant", "New response")
             .unwrap();
 
         let response = app
             .oneshot(
-                Request::get(format!("/stream?project_id={project_id}&range=24h&after=0"))
+                Request::get(format!("/stream?project_id={project_id}&range=1h&after=0"))
                     .header("last-event-id", cursor.to_string())
                     .body(Body::empty())
                     .unwrap(),
@@ -306,5 +319,6 @@ mod tests {
         assert!(event.contains("event: dashboard"));
         assert!(event.contains("New response"));
         assert!(!event.contains("Already delivered"));
+        assert!(!event.contains("Out-of-window replay"));
     }
 }
