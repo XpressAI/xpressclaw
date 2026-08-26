@@ -289,6 +289,62 @@ test('Instance settings requires the explicit no-auth remote warning and shows r
 	await expect(page.getByText('127.0.0.1:8935', { exact: true })).toBeVisible();
 });
 
+test('Desktop persists a newly configured password before authentication restarts', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__credentialCalls: unknown[];
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__credentialCalls = [];
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				if (command === 'list_instance_profiles') return [];
+				if (command === 'store_active_profile_credential') {
+					target.__credentialCalls.push(structuredClone(args));
+					return null;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	let saved = structuredClone(baseInstance.saved);
+	let passwordConfigured = false;
+	await page.route('**/api/**', async (route) => {
+		const request = route.request();
+		const path = new URL(request.url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: false, credential_kind: 'disabled', authenticated: true, csrf_token: null });
+			return;
+		}
+		if (path === '/api/settings/instance/') {
+			if (request.method() === 'PUT') {
+				const update = request.postDataJSON() as { authentication_enabled: boolean; password?: string };
+				saved = { ...saved, authentication_enabled: update.authentication_enabled };
+				passwordConfigured = Boolean(update.password);
+			}
+			await fulfill(route, {
+				...baseInstance,
+				saved,
+				password_configured: passwordConfigured,
+				restart_required: saved.authentication_enabled !== baseInstance.effective.authentication_enabled,
+			});
+			return;
+		}
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/settings/server');
+	await page.getByLabel('Require XpressClaw login').check();
+	await page.getByPlaceholder('Optional password (12+ characters)').fill('pending-password-123');
+	await page.getByRole('button', { name: 'Save instance settings' }).click();
+
+	await expect(page.getByText('Restart pending')).toBeVisible();
+	await expect(page.getByText(/Desktop could not update/)).toHaveCount(0);
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __credentialCalls: unknown[] }
+	).__credentialCalls)).toEqual([{ credential: 'pending-password-123' }]);
+});
+
 test('Desktop profiles can be edited without exposing their saved keychain credential', async ({ page }) => {
 	await page.addInitScript(() => {
 		type Profile = {

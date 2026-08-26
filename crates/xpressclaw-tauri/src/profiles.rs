@@ -84,6 +84,18 @@ struct Bootstrap {
     credential_kind: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct PendingInstanceSettings {
+    instance_id: String,
+    saved: PendingListenerSettings,
+    password_configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingListenerSettings {
+    authentication_enabled: bool,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DesktopTicket {
     ticket: String,
@@ -818,9 +830,12 @@ pub async fn store_active_profile_credential(
             profile = state.set_local_bootstrap(&bootstrap)?;
         }
         let authentication = effective_authentication(&bootstrap)?;
-        if authentication == "none" {
-            return Err("The selected instance does not require a credential".to_string());
-        }
+        let stored_authentication = if authentication == "none" {
+            require_pending_password_configuration(&profile.url, &bootstrap.instance_id).await?;
+            "password"
+        } else {
+            authentication
+        };
         if profile.local {
             *state
                 .local_ephemeral_credential
@@ -842,7 +857,7 @@ pub async fn store_active_profile_credential(
                 .find(|current| current.id == profile.id)
                 .ok_or_else(|| "The selected Desktop profile no longer exists".to_string())?;
             current.instance_id = Some(next_instance_id);
-            current.authentication = authentication.to_string();
+            current.authentication = stored_authentication.to_string();
             Ok(())
         }) {
             let rollback = if let Some(previous) = previous_credential {
@@ -1127,6 +1142,45 @@ async fn fetch_bootstrap(url: &str) -> Result<Bootstrap, String> {
     .await
 }
 
+async fn require_pending_password_configuration(
+    url: &str,
+    expected_instance_id: &str,
+) -> Result<(), String> {
+    let response = http_client()?
+        .get(format!("{url}/api/settings/instance/"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not verify pending instance authentication: {error}"))?;
+    if !response.status().is_success() {
+        return Err(
+            "The selected instance does not currently require a credential, and its pending authentication settings could not be verified"
+                .to_string(),
+        );
+    }
+    let settings: PendingInstanceSettings = read_bounded_json(
+        response,
+        "The selected instance returned invalid pending authentication settings",
+    )
+    .await?;
+    validate_pending_password_configuration(&settings, expected_instance_id)
+}
+
+fn validate_pending_password_configuration(
+    settings: &PendingInstanceSettings,
+    expected_instance_id: &str,
+) -> Result<(), String> {
+    if settings.instance_id != expected_instance_id {
+        return Err(
+            "The instance identity changed while Desktop verified pending authentication"
+                .to_string(),
+        );
+    }
+    if !settings.saved.authentication_enabled || !settings.password_configured {
+        return Err("The selected instance does not require a credential".to_string());
+    }
+    Ok(())
+}
+
 async fn request_ticket(
     url: &str,
     credential: &str,
@@ -1367,6 +1421,62 @@ mod tests {
         );
         assert!(effective_authentication(&bootstrap(true, "restart_required")).is_err());
         assert!(effective_authentication(&bootstrap(true, "future_mode")).is_err());
+    }
+
+    #[test]
+    fn pending_password_storage_requires_the_same_instance_and_complete_configuration() {
+        let settings = PendingInstanceSettings {
+            instance_id: "instance".into(),
+            saved: PendingListenerSettings {
+                authentication_enabled: true,
+            },
+            password_configured: true,
+        };
+        validate_pending_password_configuration(&settings, "instance").unwrap();
+        assert!(
+            validate_pending_password_configuration(&settings, "replacement")
+                .unwrap_err()
+                .contains("identity changed")
+        );
+
+        let without_password = PendingInstanceSettings {
+            password_configured: false,
+            ..settings
+        };
+        assert_eq!(
+            validate_pending_password_configuration(&without_password, "instance").unwrap_err(),
+            "The selected instance does not require a credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_password_storage_reads_the_authoritative_saved_settings() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .starts_with("GET /api/settings/instance/ HTTP/1.1"));
+            let body = r#"{"instance_id":"pending-instance","saved":{"authentication_enabled":true},"password_configured":true}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        require_pending_password_configuration(&format!("http://{address}"), "pending-instance")
+            .await
+            .unwrap();
+        server.join().unwrap();
     }
 
     #[test]

@@ -546,21 +546,34 @@ pub(crate) fn enable_profile_capabilities(
     .local(false)
     .window("main")
     .window("workspace-*")
-    .remote(format!("{origin}/*"))
-    .permission("clipboard-manager:allow-read-image")
-    .permission("core:image:allow-rgba")
-    .permission("core:image:allow-size")
-    .permission("core:resources:allow-close")
-    .permission("core:webview:allow-create-webview-window")
-    .permission("core:window:allow-create")
-    .permission("core:window:allow-set-focus");
-    capability = capability.permission(if local_profile {
-        "desktop-local-commands"
-    } else {
-        "desktop-profile-commands"
-    });
+    .remote(format!("{origin}/*"));
+    for permission in profile_capability_permissions(local_profile) {
+        capability = capability.permission(permission);
+    }
     app.add_capability(capability)
         .map_err(|error| error.to_string())
+}
+
+fn profile_capability_permissions(local_profile: bool) -> Vec<&'static str> {
+    if !local_profile {
+        // Runtime capabilities cannot be revoked after an origin is replaced
+        // or deselected. Remote pages therefore receive only custom commands,
+        // whose handlers revalidate the selected origin and pinned instance
+        // identity on every call. In particular, never grant a remote origin
+        // direct clipboard or window-plugin access.
+        return vec!["desktop-profile-commands"];
+    }
+
+    vec![
+        "clipboard-manager:allow-read-image",
+        "core:image:allow-rgba",
+        "core:image:allow-size",
+        "core:resources:allow-close",
+        "core:webview:allow-create-webview-window",
+        "core:window:allow-create",
+        "core:window:allow-set-focus",
+        "desktop-local-commands",
+    ]
 }
 
 fn is_xpressclaw_health(body: &serde_json::Value) -> bool {
@@ -608,6 +621,18 @@ mod tests {
         let origins = local_origins("http://127.0.0.1:19435");
         assert!(origins.contains(&"http://127.0.0.1:19435/*".to_string()));
         assert!(!origins.iter().any(|origin| origin.contains(":*")));
+    }
+
+    #[test]
+    fn remote_profile_capabilities_expose_only_identity_checked_commands() {
+        assert_eq!(
+            profile_capability_permissions(false),
+            vec!["desktop-profile-commands"]
+        );
+        let local = profile_capability_permissions(true);
+        assert!(local.contains(&"clipboard-manager:allow-read-image"));
+        assert!(local.contains(&"core:webview:allow-create-webview-window"));
+        assert!(local.contains(&"desktop-local-commands"));
     }
 
     #[test]
