@@ -321,10 +321,10 @@ fn main() {
                     for mut line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                         if let Some(token) = line.strip_prefix(STARTUP_TOKEN_PREFIX) {
                             let token = Zeroizing::new(token.to_string());
-                            token_handle
+                            if let Err(error) = token_handle
                                 .state::<profiles::ProfileState>()
-                                .remember_local_startup_token(token.clone());
-                            if let Err(error) = profiles::persist_local_startup_token(&token) {
+                                .remember_local_startup_token(token.clone())
+                            {
                                 warn!(%error, "could not store the local startup token in the OS keychain");
                             }
                         }

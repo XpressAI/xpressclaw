@@ -122,6 +122,83 @@ test('Desktop blocks credentials when a remote address changes instance identity
 	).__selectedProfile)).toBe('local');
 });
 
+test('Desktop routes a no-auth replacement through identity recovery', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__selectedProfile: string | null;
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__selectedProfile = null;
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					return { instance_id: 'expected-instance', local: false };
+				}
+				if (command === 'select_instance_profile') {
+					target.__selectedProfile = (args as { id: string }).id;
+					return null;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/auth/bootstrap', (route) => fulfill(route, {
+		instance_id: 'replacement-instance',
+		authentication_enabled: false,
+		credential_kind: 'disabled',
+		authenticated: true,
+		csrf_token: null,
+	}));
+
+	await page.goto('/dashboard');
+	await expect(page).toHaveURL(/\/login\?return_to=%2Fdashboard$/);
+	await expect(page.getByText(/address now identifies a different XpressClaw instance/i)).toBeVisible();
+	await page.getByRole('button', { name: 'Return to local instance' }).click();
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __selectedProfile: string | null }
+	).__selectedProfile)).toBe('local');
+});
+
+test('Desktop pins a first-use no-auth local instance before showing the workspace', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__tauriCalls: string[];
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__tauriCalls = [];
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				target.__tauriCalls.push(command);
+				if (command === 'get_active_instance_profile') {
+					return { instance_id: null, local: true };
+				}
+				if (command === 'login_active_profile') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/**', async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, {
+				instance_id: 'first-local-instance',
+				authentication_enabled: false,
+				credential_kind: 'disabled',
+				authenticated: true,
+				csrf_token: null,
+			});
+			return;
+		}
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/dashboard');
+	await expect(page).toHaveURL(/\/dashboard$/);
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __tauriCalls: string[] }
+	).__tauriCalls)).toEqual(['get_active_instance_profile', 'login_active_profile']);
+});
+
 test('Desktop requires explicit recovery before trusting a replacement local identity', async ({ page }) => {
 	await page.addInitScript(() => {
 		const target = window as unknown as {

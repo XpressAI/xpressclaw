@@ -177,7 +177,7 @@
 							<p>Saved identity: <code class="break-all">{pinnedInstanceId}</code></p>
 							<p>Current identity: <code class="break-all">{session?.instance_id}</code></p>
 						</div>
-						<p class="mt-3 text-xs text-foreground">Only trust the replacement if you intentionally reset or replaced this local instance. Desktop will remove the previous saved credential and ask for the new one.</p>
+						<p class="mt-3 text-xs text-foreground">Only trust the replacement if you intentionally reset or replaced this local instance. Desktop will discard the previous credential; if it launched this replacement, it can retain only a startup token the new instance verifies.</p>
 						<button type="button" onclick={trustLocalReplacement} disabled={trustingReplacement} class="mt-3 rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground disabled:opacity-50">
 							{trustingReplacement ? 'Waiting for confirmation…' : 'Trust replacement local instance'}
 						</button>

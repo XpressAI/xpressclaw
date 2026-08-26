@@ -20,7 +20,26 @@
 			authenticationReady = true;
 			return;
 		}
-		void auth.bootstrap().then((session) => {
+		void auth.bootstrap().then(async (session) => {
+			if ('__TAURI_INTERNALS__' in window) {
+				const { invoke } = await import('@tauri-apps/api/core');
+				const active = await invoke<{ instance_id: string | null; local: boolean }>('get_active_instance_profile');
+				if (active.instance_id && active.instance_id !== session.instance_id) {
+					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+					// Identity recovery belongs to the login page even when the
+					// replacement has authentication disabled. Native command guards
+					// also enforce this pin, so skipping /login cannot grant access.
+					authenticationReady = true;
+					void goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
+					return;
+				}
+				if (!active.instance_id && active.local && !session.authentication_enabled) {
+					// Establish the automatic local profile's first-use identity before
+					// exposing profile commands. Authenticated instances do this in the
+					// login flow, where the same command also obtains a ticket.
+					await invoke('login_active_profile');
+				}
+			}
 			if (session.authentication_enabled && !session.authenticated) {
 				const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 				// The root layout persists across client-side navigation. Mark its

@@ -229,12 +229,40 @@ impl ProfileState {
         })
     }
 
-    fn forget_local_credential(&self) -> Result<(), String> {
-        *self
+    fn clear_local_credential(&self) -> Result<(), String> {
+        let mut current = self
             .local_ephemeral_credential
             .lock()
-            .map_err(|_| "Local credential lock failed".to_string())? = None;
+            .map_err(|_| "Local credential lock failed".to_string())?;
+        *current = None;
         delete_credential(LOCAL_PROFILE_ID)
+    }
+
+    fn forget_local_credential_if_unchanged(&self, observed: Option<&str>) -> Result<(), String> {
+        let mut current = self
+            .local_ephemeral_credential
+            .lock()
+            .map_err(|_| "Local credential lock failed".to_string())?;
+        let unchanged = match (current.as_ref(), observed) {
+            (Some(current), Some(observed)) => current.as_str() == observed,
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            // A listener-bound token arrived after the caller's snapshot. It
+            // belongs to a newer managed sidecar start and must not be erased
+            // as though it were the previous instance's credential.
+            return Ok(());
+        }
+        *current = None;
+        delete_credential(LOCAL_PROFILE_ID)
+    }
+
+    fn local_startup_token(&self) -> Result<Option<Zeroizing<String>>, String> {
+        self.local_ephemeral_credential
+            .lock()
+            .map_err(|_| "Local credential lock failed".to_string())
+            .map(|credential| credential.clone())
     }
 
     fn select_local(&self) -> Result<String, String> {
@@ -258,8 +286,16 @@ impl ProfileState {
         self.active().map(|profile| profile.local)
     }
 
-    pub fn remember_local_startup_token(&self, token: Zeroizing<String>) {
-        *self.local_ephemeral_credential.lock().unwrap() = Some(token);
+    pub fn remember_local_startup_token(&self, token: Zeroizing<String>) -> Result<(), String> {
+        // Serialize process-memory and keychain updates with replacement
+        // recovery so the latter cannot erase a freshly rotated sidecar token
+        // between the two stores.
+        let mut current = self
+            .local_ephemeral_credential
+            .lock()
+            .map_err(|_| "Local credential lock failed".to_string())?;
+        *current = Some(token.clone());
+        set_credential(LOCAL_PROFILE_ID, &token)
     }
 }
 
@@ -268,7 +304,7 @@ pub async fn list_instance_profiles(
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
 ) -> Result<Vec<InstanceProfile>, String> {
-    require_active_profile_origin(&state, &webview)?;
+    require_active_profile_identity(&state, &webview).await?;
     let (profiles, active) = {
         let file = state.file.lock().map_err(|_| "Profile lock failed")?;
         (file.profiles.clone(), file.active_profile_id.clone())
@@ -331,8 +367,8 @@ pub async fn save_instance_profile(
     state: State<'_, ProfileState>,
     input: SaveProfileInput,
 ) -> Result<InstanceProfile, String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
+    require_active_profile_identity(&state, &webview).await?;
     let name = input.name.trim();
     if name.is_empty() || name.chars().count() > 80 {
         return Err("Profile name must be between 1 and 80 characters".to_string());
@@ -487,8 +523,16 @@ pub async fn select_instance_profile(
     state: State<'_, ProfileState>,
     id: String,
 ) -> Result<(), String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
+    let active_profile = require_active_profile_origin(&state, &webview)?;
+    // A page served by a replaced remote instance must retain one safe escape
+    // hatch back to the automatic local profile. Every other selection first
+    // proves that the currently loaded page still belongs to its pinned
+    // instance, so a same-origin replacement cannot pivot into another saved
+    // profile.
+    if id != LOCAL_PROFILE_ID || active_profile.local {
+        require_active_profile_identity_for(&state, &webview, active_profile, false).await?;
+    }
     let (mut profile, previous_active) = {
         let file = state.file.lock().map_err(|_| "Profile lock failed")?;
         let profile = file
@@ -583,8 +627,8 @@ pub async fn delete_instance_profile(
     state: State<'_, ProfileState>,
     id: String,
 ) -> Result<(), String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
+    require_active_profile_identity(&state, &webview).await?;
     if id == LOCAL_PROFILE_ID {
         return Err("The automatic local profile cannot be deleted".to_string());
     }
@@ -629,11 +673,10 @@ pub async fn login_active_profile(
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
 ) -> Result<Option<DesktopTicket>, String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
-    let mut profile = state.active()?;
-    let bootstrap = fetch_bootstrap(&profile.url).await?;
-    require_profile_identity(&profile, &bootstrap.instance_id)?;
+    let profile = require_active_profile_origin(&state, &webview)?;
+    let (mut profile, bootstrap) =
+        require_active_profile_identity_for(&state, &webview, profile, true).await?;
     let credential_profile = profile.clone();
     if profile.local {
         profile = state.set_local_bootstrap(&bootstrap)?;
@@ -657,8 +700,11 @@ pub fn get_active_instance_profile(
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
 ) -> Result<ActiveProfileIdentity, String> {
-    require_active_profile_origin(&state, &webview)?;
-    let profile = state.active()?;
+    // This intentionally remains origin-bound rather than identity-bound: it
+    // exposes no credential or mutable state, and the login page needs the
+    // saved pin in order to offer the explicit local-replacement recovery or
+    // safe return-to-local flow when the live identity does not match.
+    let profile = require_active_profile_origin(&state, &webview)?;
     Ok(ActiveProfileIdentity {
         instance_id: profile.instance_id,
         local: profile.local,
@@ -671,9 +717,11 @@ pub async fn trust_local_instance_replacement(
     state: State<'_, ProfileState>,
     instance_id: String,
 ) -> Result<(), String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
-    let profile = state.active()?;
+    // Identity mismatch is the condition this native-confirmation recovery
+    // command repairs. It is the sole mutating command allowed past the origin
+    // boundary without first matching the saved pin.
+    let profile = require_active_profile_origin(&state, &webview)?;
     if !profile.local {
         return Err("Only the automatic local profile can use this recovery action".to_string());
     }
@@ -697,7 +745,7 @@ pub async fn trust_local_instance_replacement(
         dialog
             .dialog()
             .message(
-                "Another XpressClaw instance is answering on the local address. Trusting it will forget the saved local credential. Continue only if you intentionally reset or replaced this local instance.",
+                "Another XpressClaw instance is answering on the local address. Trusting it will discard credentials for the previous instance. Desktop retains a new listener-bound startup token only if the replacement verifies it. Continue only if you intentionally reset or replaced this local instance.",
             )
             .title("Trust replacement local instance?")
             .buttons(MessageDialogButtons::OkCancelCustom(
@@ -723,11 +771,37 @@ pub async fn trust_local_instance_replacement(
     }
     effective_authentication(&confirmed_bootstrap)?;
 
-    // Fail closed: remove both process-memory and keychain credentials before
-    // changing the pin. A replacement must receive a freshly entered secret;
-    // it can never inherit the credential for the previous local instance.
-    state.forget_local_credential()?;
+    // Discard credentials belonging to the previous instance, but retain a
+    // listener-bound startup token only after the replacement accepts it. The
+    // Desktop sidecar may already have delivered that fresh token while the
+    // native confirmation dialog was open.
+    preserve_verified_replacement_token_or_forget(&state, &profile, &confirmed_bootstrap).await?;
     state.replace_local_bootstrap(previous_instance_id, &confirmed_bootstrap)
+}
+
+async fn preserve_verified_replacement_token_or_forget(
+    state: &ProfileState,
+    profile: &StoredProfile,
+    bootstrap: &Bootstrap,
+) -> Result<bool, String> {
+    let observed = state.local_startup_token()?;
+    let preserve = if effective_authentication(bootstrap)? == "startup_token" {
+        if let Some(credential) = observed.as_ref() {
+            request_ticket(&profile.url, credential, &bootstrap.instance_id)
+                .await
+                .is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !preserve {
+        state.forget_local_credential_if_unchanged(
+            observed.as_ref().map(|credential| credential.as_str()),
+        )?;
+    }
+    Ok(preserve)
 }
 
 #[tauri::command]
@@ -736,13 +810,10 @@ pub async fn store_active_profile_credential(
     state: State<'_, ProfileState>,
     credential: Option<String>,
 ) -> Result<(), String> {
-    require_active_profile_origin(&state, &webview)?;
     let _mutation_guard = state.mutation_lock.lock().await;
-    let mut profile = state.active()?;
+    let (mut profile, bootstrap) = require_active_profile_identity(&state, &webview).await?;
     if let Some(value) = credential {
         let value = Zeroizing::new(value);
-        let bootstrap = fetch_bootstrap(&profile.url).await?;
-        require_profile_identity(&profile, &bootstrap.instance_id)?;
         if profile.local {
             profile = state.set_local_bootstrap(&bootstrap)?;
         }
@@ -788,19 +859,13 @@ pub async fn store_active_profile_credential(
         }
         Ok(())
     } else {
-        delete_credential(&profile.id)?;
         if profile.local {
-            *state
-                .local_ephemeral_credential
-                .lock()
-                .map_err(|_| "Local credential lock failed".to_string())? = None;
+            state.clear_local_credential()?;
+        } else {
+            delete_credential(&profile.id)?;
         }
         Ok(())
     }
-}
-
-pub fn persist_local_startup_token(token: &str) -> Result<(), String> {
-    set_credential(LOCAL_PROFILE_ID, token)
 }
 
 pub async fn preferred_startup_url(state: &ProfileState) -> String {
@@ -845,24 +910,64 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
 }
 
 /// Dynamic Tauri capabilities cannot be revoked after a profile switch. Keep
-/// every profile command bound to the origin that is selected *now* so a
-/// previously selected (or subsequently compromised) instance cannot reuse a
-/// stale capability to request another profile's login ticket or mutate its
-/// Desktop configuration.
+/// even the two recovery-safe commands bound to the origin that is selected
+/// *now* so a previously selected instance cannot reuse a stale capability.
 fn require_active_profile_origin(
     state: &ProfileState,
     webview: &tauri::WebviewWindow,
-) -> Result<(), String> {
-    let expected = state.active()?.url;
+) -> Result<StoredProfile, String> {
+    let profile = state.active()?;
     let actual = webview
         .url()
         .map_err(|error| format!("Could not verify the Desktop page origin: {error}"))?;
-    if !urls_have_same_origin(&expected, &actual) {
+    if !urls_have_same_origin(&profile.url, &actual) {
         return Err(
             "This Desktop page no longer belongs to the selected instance profile".to_string(),
         );
     }
-    Ok(())
+    Ok(profile)
+}
+
+/// Protect profile metadata and all keychain/configuration mutations with the
+/// persisted instance pin as well as the web origin. This check is native so a
+/// replacement server at the same URL cannot bypass it by skipping the login
+/// page (notably when authentication is disabled).
+async fn require_active_profile_identity(
+    state: &ProfileState,
+    webview: &tauri::WebviewWindow,
+) -> Result<(StoredProfile, Bootstrap), String> {
+    let profile = require_active_profile_origin(state, webview)?;
+    require_active_profile_identity_for(state, webview, profile, false).await
+}
+
+async fn require_active_profile_identity_for(
+    state: &ProfileState,
+    webview: &tauri::WebviewWindow,
+    profile: StoredProfile,
+    allow_unpinned_local: bool,
+) -> Result<(StoredProfile, Bootstrap), String> {
+    if profile.instance_id.is_none() && !(allow_unpinned_local && profile.local) {
+        return Err(
+            "Desktop has not established this instance identity yet; reconnect before using profile commands"
+                .to_string(),
+        );
+    }
+    let bootstrap = fetch_matching_bootstrap(&profile).await?;
+
+    // The bootstrap request yields across the executor. Recheck both the
+    // selected profile and page origin afterward so a concurrent switch or
+    // navigation cannot turn a successful check into authority for stale
+    // state.
+    if require_active_profile_origin(state, webview)? != profile {
+        return Err("The selected Desktop profile changed while its identity was verified".into());
+    }
+    Ok((profile, bootstrap))
+}
+
+async fn fetch_matching_bootstrap(profile: &StoredProfile) -> Result<Bootstrap, String> {
+    let bootstrap = fetch_bootstrap(&profile.url).await?;
+    require_profile_identity(profile, &bootstrap.instance_id)?;
+    Ok(bootstrap)
 }
 
 fn urls_have_same_origin(expected: &str, actual: &reqwest::Url) -> bool {
@@ -1503,6 +1608,118 @@ mod tests {
         assert_eq!(
             requests.lock().unwrap().as_slice(),
             ["GET /api/auth/bootstrap HTTP/1.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_no_auth_profile_rejects_a_same_url_replacement() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read])
+                .starts_with("GET /api/auth/bootstrap HTTP/1.1"));
+            let body = r#"{"instance_id":"replacement-instance","authentication_enabled":false,"credential_kind":"disabled"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let profile = StoredProfile {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            url: format!("http://{address}"),
+            instance_id: Some("trusted-instance".to_string()),
+            authentication: "none".to_string(),
+            local: false,
+            confirmed_unauthenticated_remote: true,
+        };
+
+        let error = fetch_matching_bootstrap(&profile).await.unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("identity at this address changed"));
+    }
+
+    #[tokio::test]
+    async fn trusting_a_replacement_preserves_its_verified_sidecar_token() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
+            assert!(request.contains("fresh-sidecar-token"));
+            let body = r#"{"ticket":"single-use-ticket","instance_id":"replacement-instance"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let profile = StoredProfile {
+            id: LOCAL_PROFILE_ID.to_string(),
+            name: "Local XpressClaw".to_string(),
+            url: format!("http://{address}"),
+            instance_id: Some("previous-instance".to_string()),
+            authentication: "startup_token".to_string(),
+            local: true,
+            confirmed_unauthenticated_remote: true,
+        };
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: LOCAL_PROFILE_ID.to_string(),
+                profiles: vec![profile.clone()],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(Some(Zeroizing::new(
+                "fresh-sidecar-token".to_string(),
+            ))),
+        };
+        let bootstrap = Bootstrap {
+            instance_id: "replacement-instance".to_string(),
+            authentication_enabled: true,
+            credential_kind: "startup_token".to_string(),
+        };
+
+        assert!(
+            preserve_verified_replacement_token_or_forget(&state, &profile, &bootstrap)
+                .await
+                .unwrap()
+        );
+        state
+            .replace_local_bootstrap("previous-instance", &bootstrap)
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            profile_credential(&state, &state.active().unwrap())
+                .unwrap()
+                .as_str(),
+            "fresh-sidecar-token"
+        );
+        assert_eq!(
+            state.active().unwrap().instance_id.as_deref(),
+            Some("replacement-instance")
         );
     }
 
