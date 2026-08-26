@@ -99,6 +99,35 @@ fn detached_launcher_prints_token_without_writing_it_to_server_log() {
 }
 
 #[test]
+fn foreground_does_not_announce_a_token_when_the_listener_is_owned() {
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("occupied-instance");
+    std::fs::create_dir_all(&instance).unwrap();
+    let mut config = Config::default();
+    config.system.data_dir = instance.clone();
+    config.system.workspace_dir = instance.join("workspaces");
+    config.instance.authentication_enabled = true;
+    config.save(&instance.join("xpressclaw.yaml")).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let output = Command::new(env!("CARGO_BIN_EXE_xpressclaw"))
+        .args([
+            "up",
+            "--instance",
+            instance.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_STARTUP_TOKEN="));
+}
+
+#[test]
 fn confirmed_saved_wildcard_no_auth_starts_without_repeating_the_cli_warning() {
     let root = tempfile::tempdir().unwrap();
     let instance = root.path().join("tailnet-instance");

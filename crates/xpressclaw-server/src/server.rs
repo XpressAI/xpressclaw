@@ -115,6 +115,19 @@ pub async fn serve(state: AppState, port: u16) -> anyhow::Result<()> {
 
 /// Start the HTTP server on an explicitly selected client address.
 pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Result<()> {
+    serve_on_with_bound_callback(state, bind, port, || Ok(())).await
+}
+
+/// Start the HTTP server and invoke `on_bound` only after both public and
+/// runner-callback listeners are owned by this process. Launchers use this
+/// boundary to publish per-start credentials without announcing a token from
+/// a process that will subsequently lose a port race.
+pub async fn serve_on_with_bound_callback(
+    state: AppState,
+    bind: IpAddr,
+    port: u16,
+    on_bound: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     // Log frontend embed status (debug diagnostic)
     crate::frontend::log_frontend_status();
 
@@ -128,6 +141,7 @@ pub async fn serve_on(state: AppState, bind: IpAddr, port: u16) -> anyhow::Resul
     let internal_listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
     let internal_port = internal_listener.local_addr()?.port();
     let internal_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
+    on_bound()?;
 
     let config = state.config();
 

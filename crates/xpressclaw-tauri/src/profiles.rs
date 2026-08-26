@@ -873,10 +873,10 @@ async fn credential_for_authentication(
     authentication: &str,
 ) -> Result<Zeroizing<String>, String> {
     if profile.local && authentication == "startup_token" {
-        // The sidecar prints its per-start token immediately before binding
-        // the listener, but the stdout-drain thread can be scheduled a few
-        // milliseconds later. Prefer the current process-memory token over a
-        // stale keychain value and briefly wait for that handoff.
+        // The sidecar prints its per-start token after it owns the listeners,
+        // but the stdout-drain thread can be scheduled a few milliseconds
+        // later. Prefer the current process-memory token over a stale keychain
+        // value and briefly wait for that handoff.
         for _ in 0..40 {
             if let Some(credential) = state
                 .local_ephemeral_credential

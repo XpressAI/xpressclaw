@@ -87,11 +87,14 @@ async fn run_foreground(
         println!("Press Ctrl+C to stop.");
     }
 
-    if let Some(token) = state.auth.take_startup_token_announcement() {
-        print_startup_token(&token)?;
-    }
-
-    server::serve_on(state, effective.bind, effective.port).await?;
+    let startup_token = state.auth.take_startup_token_announcement();
+    server::serve_on_with_bound_callback(state, effective.bind, effective.port, move || {
+        if let Some(token) = startup_token {
+            print_startup_token(&token)?;
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }
