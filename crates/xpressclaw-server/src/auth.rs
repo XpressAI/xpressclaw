@@ -26,22 +26,21 @@ use xpressclaw_core::desktop_auth::{
     credential_aad as desktop_credential_aad,
     credential_proof_message as desktop_credential_proof_message,
     derive_credential_keys as derive_desktop_credential_keys, identity_proof_message,
+    DesktopCredentialPurpose, BROWSER_SESSION_COOKIE, BROWSER_SESSION_LIFETIME_SECONDS,
     CREDENTIAL_CHANNEL_NONCE, CREDENTIAL_REQUEST_DIRECTION, CREDENTIAL_RESPONSE_DIRECTION,
 };
 use zeroize::Zeroizing;
 
-pub const SESSION_COOKIE: &str = "xpressclaw_session";
+pub const SESSION_COOKIE: &str = BROWSER_SESSION_COOKIE;
 pub const CSRF_HEADER: &str = "x-xpressclaw-csrf";
 pub const STARTUP_TOKEN_PREFIX: &str = "XPRESSCLAW_STARTUP_TOKEN=";
 pub const INSTANCE_IDENTITY_PREFIX: &str = "XPRESSCLAW_INSTANCE_IDENTITY=";
 
-const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
-const DESKTOP_TICKET_LIFETIME: Duration = Duration::from_secs(30);
+const SESSION_LIFETIME: Duration = Duration::from_secs(BROWSER_SESSION_LIFETIME_SECONDS);
 const LOGIN_WINDOW: Duration = Duration::from_secs(60);
 const MAX_LOGIN_FAILURES: usize = 5;
 const MAX_TRACKED_LOGIN_PEERS: usize = 4096;
 const MAX_BROWSER_SESSIONS: usize = 256;
-const MAX_DESKTOP_TICKETS: usize = 128;
 const MAX_DESKTOP_CREDENTIAL_CHANNELS: usize = 128;
 const DESKTOP_CREDENTIAL_CHANNEL_LIFETIME: Duration = Duration::from_secs(30);
 
@@ -76,10 +75,6 @@ struct BrowserSession {
     expires_at: Instant,
 }
 
-struct DesktopTicket {
-    expires_at: Instant,
-}
-
 struct DesktopCredentialChannel {
     request_key: Zeroizing<[u8; 32]>,
     response_key: Zeroizing<[u8; 32]>,
@@ -94,6 +89,7 @@ pub struct DesktopCredentialProof {
 
 pub struct OpenedDesktopCredential {
     pub credential: Zeroizing<String>,
+    pub purpose: DesktopCredentialPurpose,
     exchange_id: [u8; 32],
     response_key: Zeroizing<[u8; 32]>,
 }
@@ -117,7 +113,6 @@ pub struct InstanceAuth {
     effective_enabled: bool,
     credential: Mutex<Credential>,
     sessions: Mutex<HashMap<[u8; 32], BrowserSession>>,
-    desktop_tickets: Mutex<HashMap<[u8; 32], DesktopTicket>>,
     desktop_credential_channels: Mutex<HashMap<[u8; 32], DesktopCredentialChannel>>,
     login_failures: Mutex<HashMap<IpAddr, LoginFailures>>,
     /// Serialize credential verification so a parallel burst cannot race
@@ -149,7 +144,6 @@ impl InstanceAuth {
             effective_enabled: false,
             credential: Mutex::new(Credential::Disabled),
             sessions: Mutex::new(HashMap::new()),
-            desktop_tickets: Mutex::new(HashMap::new()),
             desktop_credential_channels: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             login_gate: tokio::sync::Mutex::new(()),
@@ -191,7 +185,6 @@ impl InstanceAuth {
             effective_enabled,
             credential: Mutex::new(credential),
             sessions: Mutex::new(HashMap::new()),
-            desktop_tickets: Mutex::new(HashMap::new()),
             desktop_credential_channels: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             login_gate: tokio::sync::Mutex::new(()),
@@ -303,6 +296,7 @@ impl InstanceAuth {
         &self,
         exchange_id: &str,
         ciphertext: &str,
+        purpose: DesktopCredentialPurpose,
     ) -> Result<OpenedDesktopCredential, DesktopCredentialError> {
         let exchange_id: [u8; 32] = URL_SAFE_NO_PAD
             .decode(exchange_id)
@@ -333,6 +327,7 @@ impl InstanceAuth {
             &self.instance_id,
             &exchange_id,
             CREDENTIAL_REQUEST_DIRECTION,
+            purpose,
         );
         let plaintext = key
             .open_in_place(
@@ -349,6 +344,7 @@ impl InstanceAuth {
             .to_owned();
         Ok(OpenedDesktopCredential {
             credential: Zeroizing::new(credential),
+            purpose,
             exchange_id,
             response_key: channel.response_key,
         })
@@ -367,6 +363,7 @@ impl InstanceAuth {
             &self.instance_id,
             &channel.exchange_id,
             CREDENTIAL_RESPONSE_DIRECTION,
+            channel.purpose,
         );
         key.seal_in_place_append_tag(
             Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
@@ -463,7 +460,6 @@ impl InstanceAuth {
 
     pub fn revoke_all(&self) {
         self.sessions.lock().unwrap().clear();
-        self.desktop_tickets.lock().unwrap().clear();
         self.desktop_credential_channels.lock().unwrap().clear();
     }
 
@@ -482,48 +478,16 @@ impl InstanceAuth {
         *self.credential.lock().unwrap() = next;
     }
 
-    pub async fn create_desktop_ticket(
+    pub async fn validate_desktop_credential(
         &self,
         credential: Zeroizing<String>,
         peer: IpAddr,
-    ) -> Result<Zeroizing<String>, LoginError> {
+    ) -> Result<(), LoginError> {
         let (session, _) = self.login(credential, peer).await?;
-        // A desktop credential check must not also leave an unused browser
-        // session behind.
+        // Profile setup and health validation must not leave an unused browser
+        // session behind. Only the explicit browser-session purpose retains it.
         self.logout(&session);
-
-        let ticket = Zeroizing::new(generate_secret().map_err(|_| LoginError::Internal)?);
-        let mut tickets = self.desktop_tickets.lock().unwrap();
-        let now = Instant::now();
-        tickets.retain(|_, ticket| ticket.expires_at > now);
-        if tickets.len() >= MAX_DESKTOP_TICKETS {
-            if let Some(oldest) = tickets
-                .iter()
-                .min_by_key(|(_, ticket)| ticket.expires_at)
-                .map(|(key, _)| *key)
-            {
-                tickets.remove(&oldest);
-            }
-        }
-        tickets.insert(
-            secret_key(&ticket),
-            DesktopTicket {
-                expires_at: now + DESKTOP_TICKET_LIFETIME,
-            },
-        );
-        Ok(ticket)
-    }
-
-    pub fn exchange_desktop_ticket(
-        &self,
-        ticket: &str,
-    ) -> Option<(Zeroizing<String>, Zeroizing<String>)> {
-        let key = secret_key(ticket);
-        let mut tickets = self.desktop_tickets.lock().unwrap();
-        let now = Instant::now();
-        tickets.retain(|_, ticket| ticket.expires_at > now);
-        tickets.remove(&key)?;
-        self.new_session().ok()
+        Ok(())
     }
 
     fn new_session(&self) -> Result<(Zeroizing<String>, Zeroizing<String>), LoginError> {
@@ -915,8 +879,12 @@ mod tests {
         .unwrap();
 
         let mut ciphertext = b"saved-password".to_vec();
-        let request_aad =
-            desktop_credential_aad("instance", &exchange_id, CREDENTIAL_REQUEST_DIRECTION);
+        let request_aad = desktop_credential_aad(
+            "instance",
+            &exchange_id,
+            CREDENTIAL_REQUEST_DIRECTION,
+            DesktopCredentialPurpose::BrowserSession,
+        );
         LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, keys.request.as_ref()).unwrap())
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
@@ -928,20 +896,30 @@ mod tests {
             .windows("saved-password".len())
             .any(|window| window == b"saved-password"));
         let opened = auth
-            .open_desktop_credential(&proof.exchange_id, &URL_SAFE_NO_PAD.encode(&ciphertext))
+            .open_desktop_credential(
+                &proof.exchange_id,
+                &URL_SAFE_NO_PAD.encode(&ciphertext),
+                DesktopCredentialPurpose::BrowserSession,
+            )
             .unwrap();
         assert_eq!(opened.credential.as_str(), "saved-password");
+        assert_eq!(opened.purpose, DesktopCredentialPurpose::BrowserSession);
         assert!(matches!(
-            auth.open_desktop_credential(&proof.exchange_id, &URL_SAFE_NO_PAD.encode(&ciphertext)),
+            auth.open_desktop_credential(
+                &proof.exchange_id,
+                &URL_SAFE_NO_PAD.encode(&ciphertext),
+                DesktopCredentialPurpose::BrowserSession,
+            ),
             Err(DesktopCredentialError::Invalid)
         ));
 
-        let ticket = auth
-            .create_desktop_ticket(opened.credential.clone(), "127.0.0.1".parse().unwrap())
+        let (session, _csrf) = auth
+            .login(opened.credential.clone(), "127.0.0.1".parse().unwrap())
             .await
             .unwrap();
         let mut encrypted_response = serde_json::to_vec(&serde_json::json!({
-            "ticket": ticket.as_str(),
+            "kind": "browser_session",
+            "session": session.as_str(),
             "instance_id": "instance",
         }))
         .unwrap();
@@ -949,8 +927,12 @@ mod tests {
             .seal_desktop_credential_response(&opened, &mut encrypted_response)
             .unwrap();
         let mut encrypted_response = URL_SAFE_NO_PAD.decode(encoded).unwrap();
-        let response_aad =
-            desktop_credential_aad("instance", &exchange_id, CREDENTIAL_RESPONSE_DIRECTION);
+        let response_aad = desktop_credential_aad(
+            "instance",
+            &exchange_id,
+            CREDENTIAL_RESPONSE_DIRECTION,
+            DesktopCredentialPurpose::BrowserSession,
+        );
         let plaintext =
             LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, keys.response.as_ref()).unwrap())
                 .open_in_place(
@@ -961,7 +943,8 @@ mod tests {
                 .unwrap();
         let response: serde_json::Value = serde_json::from_slice(plaintext).unwrap();
         assert_eq!(response["instance_id"], "instance");
-        assert_eq!(response["ticket"], ticket.as_str());
+        assert_eq!(response["session"], session.as_str());
+        assert!(auth.authenticate(&session).is_some());
     }
 
     #[tokio::test]
@@ -1093,7 +1076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_sessions_and_replayed_desktop_tickets_are_rejected() {
+    async fn expired_sessions_and_validation_only_credentials_leave_no_session() {
         let root = tempfile::tempdir().unwrap();
         let auth = InstanceAuth::load(
             root.path(),
@@ -1117,15 +1100,13 @@ mod tests {
             .expires_at = Instant::now() - Duration::from_secs(1);
         assert!(auth.authenticate(&session).is_none());
 
-        let ticket = auth
-            .create_desktop_ticket(
-                Zeroizing::new("expected".into()),
-                "127.0.0.1".parse().unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(auth.exchange_desktop_ticket(&ticket).is_some());
-        assert!(auth.exchange_desktop_ticket(&ticket).is_none());
+        auth.validate_desktop_credential(
+            Zeroizing::new("expected".into()),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(auth.sessions.lock().unwrap().is_empty());
     }
 
     #[test]

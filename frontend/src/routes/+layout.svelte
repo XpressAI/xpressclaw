@@ -36,7 +36,7 @@
 				if (active.identity_status === 'unpinned' && active.local && !session.authentication_enabled) {
 					// Establish the automatic local profile's first-use identity before
 					// exposing profile commands. Authenticated instances do this in the
-					// login flow, where the same command also obtains a ticket.
+					// login flow, where native Desktop installs the browser session.
 					await invoke('login_active_profile');
 				}
 			}

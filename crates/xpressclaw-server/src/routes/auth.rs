@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use xpressclaw_core::desktop_auth::DesktopCredentialPurpose;
 use zeroize::Zeroizing;
 
 use crate::auth::{
@@ -23,8 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/identity-proof", post(identity_proof))
         .route("/login", post(login))
         .route("/logout", post(logout))
-        .route("/desktop-ticket", post(desktop_ticket))
-        .route("/exchange", post(exchange_ticket))
+        .route("/desktop-session", post(desktop_session))
         // Credential-bearing payloads are deliberately tiny. Keep this bound
         // independent of the larger attachment limit on the main API router.
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -158,75 +158,87 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 #[derive(Deserialize)]
-struct DesktopTicketRequest {
+struct DesktopSessionRequest {
     exchange_id: String,
     ciphertext: String,
+    purpose: DesktopCredentialPurpose,
 }
 
-async fn desktop_ticket(
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DesktopSessionResponse<'a> {
+    Validated {
+        instance_id: &'a str,
+    },
+    BrowserSession {
+        instance_id: &'a str,
+        session: &'a str,
+    },
+}
+
+async fn desktop_session(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<DesktopTicketRequest>,
+    Json(body): Json<DesktopSessionRequest>,
 ) -> Response {
-    let channel = match state
-        .auth
-        .open_desktop_credential(&body.exchange_id, &body.ciphertext)
-    {
-        Ok(channel) => channel,
-        Err(error) => return desktop_channel_error_response(error),
-    };
-    match state
-        .auth
-        .create_desktop_ticket(channel.credential.clone(), login_client_ip(&headers, peer))
-        .await
-    {
-        Ok(ticket) => {
-            let mut plaintext = Zeroizing::new(
-                serde_json::to_vec(&serde_json::json!({
-                    "ticket": ticket.as_str(),
-                    "instance_id": state.auth.instance_id(),
-                    "expires_in_seconds": 30,
-                }))
-                .expect("Desktop ticket response is serializable"),
-            );
-            let ciphertext = match state
+    let channel =
+        match state
+            .auth
+            .open_desktop_credential(&body.exchange_id, &body.ciphertext, body.purpose)
+        {
+            Ok(channel) => channel,
+            Err(error) => return desktop_channel_error_response(error),
+        };
+    let peer = login_client_ip(&headers, peer);
+    let (mut plaintext, issued_session) = match channel.purpose {
+        DesktopCredentialPurpose::Validate => {
+            match state
                 .auth
-                .seal_desktop_credential_response(&channel, &mut plaintext)
+                .validate_desktop_credential(channel.credential.clone(), peer)
+                .await
             {
-                Ok(ciphertext) => ciphertext,
-                Err(error) => return desktop_channel_error_response(error),
-            };
-            no_store(Json(serde_json::json!({ "ciphertext": ciphertext })))
+                Ok(()) => (
+                    Zeroizing::new(
+                        serde_json::to_vec(&DesktopSessionResponse::Validated {
+                            instance_id: state.auth.instance_id(),
+                        })
+                        .expect("Desktop validation response is serializable"),
+                    ),
+                    None,
+                ),
+                Err(error) => return login_error_response(error),
+            }
         }
-        Err(error) => login_error_response(error),
-    }
-}
-
-#[derive(Deserialize)]
-struct ExchangeRequest {
-    ticket: String,
-}
-
-async fn exchange_ticket(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<ExchangeRequest>,
-) -> Response {
-    if body.ticket.is_empty() || body.ticket.len() > 256 {
-        return error_response(StatusCode::BAD_REQUEST, "Desktop ticket length is invalid");
-    }
-    match state.auth.exchange_desktop_ticket(&body.ticket) {
-        Some((session, csrf)) => session_response(
-            &session,
-            &csrf,
-            request_uses_externally_terminated_https(&headers),
-        ),
-        None => error_response(
-            StatusCode::UNAUTHORIZED,
-            "Desktop login ticket is invalid or expired",
-        ),
-    }
+        DesktopCredentialPurpose::BrowserSession => {
+            match state.auth.login(channel.credential.clone(), peer).await {
+                Ok((session, _csrf)) => {
+                    let plaintext = Zeroizing::new(
+                        serde_json::to_vec(&DesktopSessionResponse::BrowserSession {
+                            instance_id: state.auth.instance_id(),
+                            session: session.as_str(),
+                        })
+                        .expect("Desktop browser-session response is serializable"),
+                    );
+                    (plaintext, Some(session))
+                }
+                Err(error) => return login_error_response(error),
+            }
+        }
+    };
+    let ciphertext = match state
+        .auth
+        .seal_desktop_credential_response(&channel, &mut plaintext)
+    {
+        Ok(ciphertext) => ciphertext,
+        Err(error) => {
+            if let Some(session) = issued_session {
+                state.auth.logout(&session);
+            }
+            return desktop_channel_error_response(error);
+        }
+    };
+    no_store(Json(serde_json::json!({ "ciphertext": ciphertext })))
 }
 
 fn session_response(session: &str, csrf: &str, secure: bool) -> Response {

@@ -89,9 +89,10 @@ the directly connected peer is loopback. It ignores this header from network
 peers and never uses it for authentication, cookie policy, or authorization.
 
 Because externally terminated HTTPS is common, XpressClaw does not infer
-cookie policy from `Forwarded` or `X-Forwarded-*` headers. Login and Desktop
-ticket exchange instead use the browser's actual HTTPS `Origin` to set the
-session cookie's `Secure` attribute. Restrict proxy-to-XpressClaw access at the
+cookie policy from `Forwarded` or `X-Forwarded-*` headers. Browser login uses
+the browser's actual HTTPS `Origin` to set the session cookie's `Secure`
+attribute; native Desktop uses the selected profile's HTTPS scheme when it
+installs the same HttpOnly cookie. Restrict proxy-to-XpressClaw access at the
 host/network layer, redirect HTTP to HTTPS, and enable HSTS at the proxy.
 
 ## Desktop profiles
@@ -115,9 +116,11 @@ state. The local sidecar remains running while a remote profile is selected.
 An expired browser session returns to the login screen. If a selected remote
 profile is unreachable or its saved credential is rejected during Desktop
 startup, Desktop falls back to the automatic local profile and marks the
-remote profile as needing credentials. Desktop exchanges a keychain credential
-for a short-lived, single-use ticket and never returns the stored credential to
-web content.
+remote profile as needing credentials. The server creates browser-session
+material only inside the signed one-use encrypted channel. Desktop installs
+the session as an HttpOnly cookie and returns only success/failure to web
+content; no password, startup token, session token, or redeemable bearer ticket
+crosses the native command boundary.
 
 This credential channel protects the saved secret during Desktop login; it
 does not add TLS or protect the browser session from an active network relay.

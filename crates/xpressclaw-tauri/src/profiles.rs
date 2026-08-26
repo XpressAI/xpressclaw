@@ -12,6 +12,8 @@ use ring::agreement::{
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
+use tauri::webview::cookie::{time::Duration as CookieDuration, SameSite};
+use tauri::webview::Cookie;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tempfile::NamedTempFile;
@@ -19,6 +21,7 @@ use xpressclaw_core::desktop_auth::{
     credential_aad as desktop_credential_aad,
     credential_proof_message as desktop_credential_proof_message,
     derive_credential_keys as derive_desktop_credential_keys, identity_proof_message,
+    DesktopCredentialPurpose, BROWSER_SESSION_COOKIE, BROWSER_SESSION_LIFETIME_SECONDS,
     CREDENTIAL_CHANNEL_NONCE, CREDENTIAL_REQUEST_DIRECTION, CREDENTIAL_RESPONSE_DIRECTION,
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -137,14 +140,24 @@ struct DesktopCredentialChannel {
 }
 
 #[derive(Debug, Deserialize)]
-struct EncryptedDesktopTicket {
+struct EncryptedDesktopSession {
     ciphertext: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct DesktopTicket {
-    ticket: String,
-    instance_id: String,
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum DesktopAuthResponse {
+    Validated {
+        instance_id: String,
+    },
+    BrowserSession {
+        instance_id: String,
+        session: String,
+    },
+}
+
+struct DesktopBrowserSession {
+    session: Zeroizing<String>,
 }
 
 pub struct ProfileState {
@@ -596,7 +609,7 @@ pub async fn save_instance_profile(
                     .to_string(),
             );
         };
-        request_ticket(&url, supplied, &bootstrap).await?;
+        validate_desktop_credential(&url, supplied, &bootstrap).await?;
         if credential.is_some() {
             set_credential(&id, supplied)?;
         }
@@ -738,7 +751,7 @@ pub async fn select_instance_profile(
         }
         let credential =
             credential_for_authentication(&state, &credential_profile, expected).await?;
-        request_ticket(&profile.url, &credential, &bootstrap).await?;
+        validate_desktop_credential(&profile.url, &credential, &bootstrap).await?;
     }
     state.update(|file| {
         let Some(current) = file.profiles.iter().find(|current| current.id == id) else {
@@ -858,7 +871,7 @@ pub async fn login_active_profile(
     app: AppHandle,
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
-) -> Result<Option<DesktopTicket>, String> {
+) -> Result<bool, String> {
     let _mutation_guard = state.mutation_lock.lock().await;
     let profile = require_active_profile_origin(&state, &webview)?;
     let (mut profile, bootstrap) =
@@ -869,7 +882,7 @@ pub async fn login_active_profile(
         crate::enable_verified_local_capabilities(&app, &profile.url)?;
     }
     if !bootstrap.authentication_enabled {
-        return Ok(None);
+        return Ok(false);
     }
     let expected = effective_authentication(&bootstrap)?;
     if profile.authentication != expected {
@@ -878,8 +891,12 @@ pub async fn login_active_profile(
         ));
     }
     let credential = credential_for_authentication(&state, &credential_profile, expected).await?;
-    let ticket = request_ticket(&profile.url, &credential, &bootstrap).await?;
-    Ok(Some(ticket))
+    let session = request_desktop_session(&profile.url, &credential, &bootstrap).await?;
+    if require_active_profile_origin(&state, &webview)? != profile {
+        return Err("The selected Desktop profile changed while authentication completed".into());
+    }
+    install_browser_session_cookie(&webview, &profile.url, &session)?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -994,7 +1011,7 @@ async fn preserve_verified_replacement_token_or_forget(
     let observed = state.local_startup_token()?;
     let preserve = if effective_authentication(bootstrap)? == "startup_token" {
         if let Some(credential) = observed.as_ref() {
-            request_ticket(&profile.url, credential, bootstrap)
+            validate_desktop_credential(&profile.url, credential, bootstrap)
                 .await
                 .is_ok()
         } else {
@@ -1097,7 +1114,7 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
                             (Ok(expected), Ok(credential))
                                 if expected == profile.authentication =>
                             {
-                                request_ticket(&profile.url, &credential, &bootstrap)
+                                validate_desktop_credential(&profile.url, &credential, &bootstrap)
                                     .await
                                     .is_ok()
                             }
@@ -1601,11 +1618,12 @@ fn validate_pending_password_configuration(
     Ok(())
 }
 
-async fn request_ticket(
+async fn request_desktop_auth(
     url: &str,
     credential: &str,
     bootstrap: &Bootstrap,
-) -> Result<DesktopTicket, String> {
+    purpose: DesktopCredentialPurpose,
+) -> Result<DesktopAuthResponse, String> {
     let channel = open_desktop_credential_channel(url, bootstrap).await?;
     let key = LessSafeKey::new(
         UnboundKey::new(&CHACHA20_POLY1305, channel.request_key.as_ref())
@@ -1616,6 +1634,7 @@ async fn request_ticket(
         &bootstrap.instance_id,
         &channel.exchange_id_bytes,
         CREDENTIAL_REQUEST_DIRECTION,
+        purpose,
     );
     key.seal_in_place_append_tag(
         Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
@@ -1624,10 +1643,11 @@ async fn request_ticket(
     )
     .map_err(|_| "Could not encrypt the Desktop credential".to_string())?;
     let response = http_client()?
-        .post(format!("{url}/api/auth/desktop-ticket"))
+        .post(format!("{url}/api/auth/desktop-session"))
         .json(&serde_json::json!({
             "exchange_id": channel.exchange_id,
             "ciphertext": URL_SAFE_NO_PAD.encode(encrypted_credential.as_slice()),
+            "purpose": purpose,
         }))
         .send()
         .await
@@ -1639,15 +1659,18 @@ async fn request_ticket(
             _ => format!("Remote login failed with {}", response.status()),
         });
     }
-    let encrypted_ticket: EncryptedDesktopTicket = read_bounded_json(
+    let encrypted_session: EncryptedDesktopSession = read_bounded_json(
         response,
-        "The remote instance returned an invalid login ticket",
+        "The remote instance returned an invalid Desktop authentication response",
     )
     .await?;
     let mut ciphertext = Zeroizing::new(
         URL_SAFE_NO_PAD
-            .decode(encrypted_ticket.ciphertext)
-            .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?,
+            .decode(encrypted_session.ciphertext)
+            .map_err(|_| {
+                "The remote instance returned an invalid Desktop authentication response"
+                    .to_string()
+            })?,
     );
     let response_key = LessSafeKey::new(
         UnboundKey::new(&CHACHA20_POLY1305, channel.response_key.as_ref())
@@ -1657,6 +1680,7 @@ async fn request_ticket(
         &bootstrap.instance_id,
         &channel.exchange_id_bytes,
         CREDENTIAL_RESPONSE_DIRECTION,
+        purpose,
     );
     let plaintext = response_key
         .open_in_place(
@@ -1664,16 +1688,100 @@ async fn request_ticket(
             Aad::from(aad),
             ciphertext.as_mut(),
         )
-        .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?;
-    let ticket: DesktopTicket = serde_json::from_slice(plaintext)
-        .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?;
-    if ticket.instance_id != bootstrap.instance_id {
+        .map_err(|_| {
+            "The remote instance returned an invalid Desktop authentication response".to_string()
+        })?;
+    let response: DesktopAuthResponse = serde_json::from_slice(plaintext).map_err(|_| {
+        "The remote instance returned an invalid Desktop authentication response".to_string()
+    })?;
+    let instance_id = match &response {
+        DesktopAuthResponse::Validated { instance_id }
+        | DesktopAuthResponse::BrowserSession { instance_id, .. } => instance_id,
+    };
+    if instance_id != &bootstrap.instance_id {
         return Err(
             "The instance identity changed while Desktop was authenticating; no profile change was saved"
                 .to_string(),
         );
     }
-    Ok(ticket)
+    Ok(response)
+}
+
+async fn validate_desktop_credential(
+    url: &str,
+    credential: &str,
+    bootstrap: &Bootstrap,
+) -> Result<(), String> {
+    match request_desktop_auth(
+        url,
+        credential,
+        bootstrap,
+        DesktopCredentialPurpose::Validate,
+    )
+    .await?
+    {
+        DesktopAuthResponse::Validated { .. } => Ok(()),
+        DesktopAuthResponse::BrowserSession { .. } => {
+            Err("The remote instance returned an unexpected browser session".to_string())
+        }
+    }
+}
+
+async fn request_desktop_session(
+    url: &str,
+    credential: &str,
+    bootstrap: &Bootstrap,
+) -> Result<DesktopBrowserSession, String> {
+    match request_desktop_auth(
+        url,
+        credential,
+        bootstrap,
+        DesktopCredentialPurpose::BrowserSession,
+    )
+    .await?
+    {
+        DesktopAuthResponse::BrowserSession {
+            instance_id: _,
+            session,
+        } => Ok(DesktopBrowserSession {
+            session: Zeroizing::new(session),
+        }),
+        DesktopAuthResponse::Validated { .. } => {
+            Err("The remote instance did not create a browser session".to_string())
+        }
+    }
+}
+
+fn desktop_session_cookie<'a>(
+    url: &'a reqwest::Url,
+    session: &'a str,
+) -> Result<Cookie<'a>, String> {
+    let domain = url
+        .host_str()
+        .ok_or_else(|| "The selected Desktop profile URL has no host".to_string())?;
+    Ok(Cookie::build((BROWSER_SESSION_COOKIE, session))
+        .domain(domain)
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .secure(url.scheme() == "https")
+        .max_age(CookieDuration::seconds(
+            BROWSER_SESSION_LIFETIME_SECONDS as i64,
+        ))
+        .build())
+}
+
+fn install_browser_session_cookie(
+    webview: &tauri::WebviewWindow,
+    profile_url: &str,
+    session: &DesktopBrowserSession,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(profile_url)
+        .map_err(|error| format!("The selected Desktop profile URL is invalid: {error}"))?;
+    let cookie = desktop_session_cookie(&url, &session.session)?;
+    webview
+        .set_cookie(cookie)
+        .map_err(|error| format!("Could not install the Desktop browser session: {error}"))
 }
 
 async fn read_bounded_json<T: serde::de::DeserializeOwned>(
@@ -1920,13 +2028,21 @@ mod tests {
     }
 
     impl TestCredentialChannel {
-        fn open_credential(&self, request: &str, instance_id: &str) -> Zeroizing<String> {
+        fn open_credential(
+            &self,
+            request: &str,
+            instance_id: &str,
+            expected_purpose: DesktopCredentialPurpose,
+        ) -> Zeroizing<String> {
             let (_, body) = request
                 .split_once("\r\n\r\n")
                 .expect("credential request has a body");
             let request: serde_json::Value = serde_json::from_str(body).unwrap();
             assert_eq!(request["exchange_id"], self.exchange_id);
             assert!(request.get("credential").is_none());
+            let purpose: DesktopCredentialPurpose =
+                serde_json::from_value(request["purpose"].clone()).unwrap();
+            assert_eq!(purpose, expected_purpose);
             let mut ciphertext = Zeroizing::new(
                 URL_SAFE_NO_PAD
                     .decode(request["ciphertext"].as_str().unwrap())
@@ -1939,6 +2055,7 @@ mod tests {
                 instance_id,
                 &self.exchange_id_bytes,
                 CREDENTIAL_REQUEST_DIRECTION,
+                purpose,
             );
             let plaintext = key
                 .open_in_place(
@@ -1950,12 +2067,13 @@ mod tests {
             Zeroizing::new(std::str::from_utf8(plaintext).unwrap().to_string())
         }
 
-        fn encrypted_ticket_json(&self, ticket: &str, instance_id: &str) -> String {
-            let mut plaintext = serde_json::to_vec(&serde_json::json!({
-                "ticket": ticket,
-                "instance_id": instance_id,
-            }))
-            .unwrap();
+        fn encrypted_response_json(
+            &self,
+            response: serde_json::Value,
+            instance_id: &str,
+            purpose: DesktopCredentialPurpose,
+        ) -> String {
+            let mut plaintext = serde_json::to_vec(&response).unwrap();
             let key = LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, self.response_key.as_ref()).unwrap(),
             );
@@ -1963,6 +2081,7 @@ mod tests {
                 instance_id,
                 &self.exchange_id_bytes,
                 CREDENTIAL_RESPONSE_DIRECTION,
+                purpose,
             );
             key.seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
@@ -2042,6 +2161,31 @@ mod tests {
         assert!(normalize_url("https://user:secret@host.example").is_err());
         assert!(normalize_url("https://host.example/path").is_err());
         assert!(normalize_url("file:///tmp/xpressclaw").is_err());
+    }
+
+    #[test]
+    fn native_browser_session_cookie_matches_the_server_policy() {
+        let http = reqwest::Url::parse("http://127.0.0.1:8935").unwrap();
+        let cookie = desktop_session_cookie(&http, "native-only-session").unwrap();
+        assert_eq!(cookie.name(), BROWSER_SESSION_COOKIE);
+        assert_eq!(cookie.value(), "native-only-session");
+        assert_eq!(cookie.domain(), Some("127.0.0.1"));
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(cookie.http_only(), Some(true));
+        assert_eq!(cookie.same_site(), Some(SameSite::Strict));
+        assert_eq!(cookie.secure(), Some(false));
+        assert_eq!(
+            cookie.max_age().unwrap().whole_seconds(),
+            BROWSER_SESSION_LIFETIME_SECONDS as i64
+        );
+
+        let https = reqwest::Url::parse("https://control.example.test").unwrap();
+        assert_eq!(
+            desktop_session_cookie(&https, "native-only-session")
+                .unwrap()
+                .secure(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2656,7 +2800,7 @@ mod tests {
         });
 
         let bootstrap = TestIdentity::new("expected-instance").bootstrap(true, "password");
-        let result = request_ticket(
+        let result = validate_desktop_credential(
             &format!("http://{redirect_address}"),
             "credential-that-must-not-be-forwarded",
             &bootstrap,
@@ -2668,7 +2812,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relayed_identity_proof_never_exposes_the_saved_credential() {
+    async fn relayed_identity_proof_keeps_credential_and_session_native() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let identity = TestIdentity::new("genuine-instance");
@@ -2682,30 +2826,42 @@ mod tests {
             let (proof, genuine_channel) = identity.credential_proof_json(&proof_request);
             respond_json(&mut proof_stream, &proof);
 
-            let (mut ticket_stream, _) = listener.accept().unwrap();
-            let ticket_request = read_http_request(&mut ticket_stream);
-            assert!(ticket_request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
-            assert!(!ticket_request.contains("saved-password-must-stay-secret"));
-            let (_, body) = ticket_request.split_once("\r\n\r\n").unwrap();
+            let (mut session_stream, _) = listener.accept().unwrap();
+            let session_request = read_http_request(&mut session_stream);
+            assert!(session_request.starts_with("POST /api/auth/desktop-session HTTP/1.1"));
+            assert!(!session_request.contains("saved-password-must-stay-secret"));
+            let (_, body) = session_request.split_once("\r\n\r\n").unwrap();
             let body: serde_json::Value = serde_json::from_str(body).unwrap();
             assert!(body.get("credential").is_none());
+            assert!(body.get("session").is_none());
             assert!(body["ciphertext"].as_str().is_some());
 
             // The genuine server behind the relay can decrypt and answer;
             // the relay itself only sees opaque request/response ciphertext.
             assert_eq!(
                 genuine_channel
-                    .open_credential(&ticket_request, "genuine-instance")
+                    .open_credential(
+                        &session_request,
+                        "genuine-instance",
+                        DesktopCredentialPurpose::BrowserSession,
+                    )
                     .as_str(),
                 "saved-password-must-stay-secret"
             );
-            respond_json(
-                &mut ticket_stream,
-                &genuine_channel.encrypted_ticket_json("opaque-ticket", "genuine-instance"),
+            let response = genuine_channel.encrypted_response_json(
+                serde_json::json!({
+                    "kind": "browser_session",
+                    "instance_id": "genuine-instance",
+                    "session": "native-only-session-must-stay-secret",
+                }),
+                "genuine-instance",
+                DesktopCredentialPurpose::BrowserSession,
             );
+            assert!(!response.contains("native-only-session-must-stay-secret"));
+            respond_json(&mut session_stream, &response);
         });
 
-        let ticket = request_ticket(
+        let session = request_desktop_session(
             &format!("http://{address}"),
             "saved-password-must-stay-secret",
             &bootstrap,
@@ -2713,8 +2869,10 @@ mod tests {
         .await
         .unwrap();
         server.join().unwrap();
-        assert_eq!(ticket.ticket, "opaque-ticket");
-        assert_eq!(ticket.instance_id, "genuine-instance");
+        assert_eq!(
+            session.session.as_str(),
+            "native-only-session-must-stay-secret"
+        );
     }
 
     #[tokio::test]
@@ -2837,19 +2995,30 @@ mod tests {
             let (proof, channel) = identity.credential_proof_json(&proof_request);
             respond_json(&mut proof_stream, &proof);
 
-            let (mut ticket_stream, _) = listener.accept().unwrap();
-            let ticket_request = read_http_request(&mut ticket_stream);
-            assert!(ticket_request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
-            assert!(!ticket_request.contains("fresh-sidecar-token"));
+            let (mut validation_stream, _) = listener.accept().unwrap();
+            let validation_request = read_http_request(&mut validation_stream);
+            assert!(validation_request.starts_with("POST /api/auth/desktop-session HTTP/1.1"));
+            assert!(!validation_request.contains("fresh-sidecar-token"));
             assert_eq!(
                 channel
-                    .open_credential(&ticket_request, "replacement-instance")
+                    .open_credential(
+                        &validation_request,
+                        "replacement-instance",
+                        DesktopCredentialPurpose::Validate,
+                    )
                     .as_str(),
                 "fresh-sidecar-token"
             );
             respond_json(
-                &mut ticket_stream,
-                &channel.encrypted_ticket_json("single-use-ticket", "replacement-instance"),
+                &mut validation_stream,
+                &channel.encrypted_response_json(
+                    serde_json::json!({
+                        "kind": "validated",
+                        "instance_id": "replacement-instance",
+                    }),
+                    "replacement-instance",
+                    DesktopCredentialPurpose::Validate,
+                ),
             );
         });
 

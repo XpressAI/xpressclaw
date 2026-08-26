@@ -70,15 +70,6 @@ export const auth = {
 		await request<void>('/api/auth/logout', { method: 'POST', body: '{}' }, false);
 		csrfToken = null;
 	},
-	exchangeDesktopTicket: async (ticket: string) => {
-		const result = await request<{ authenticated: boolean; csrf_token: string }>(
-			'/api/auth/exchange',
-			{ method: 'POST', body: JSON.stringify({ ticket }) },
-			false
-		);
-		csrfToken = result.csrf_token;
-		return result;
-	},
 };
 
 // -- Agents --

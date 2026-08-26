@@ -5,6 +5,7 @@
 //! cannot drift between crates.
 
 use ring::hkdf::{Salt, HKDF_SHA256};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 const IDENTITY_PROOF_DOMAIN: &[u8] = b"xpressclaw-desktop-identity-v1\0";
@@ -14,6 +15,24 @@ const CREDENTIAL_CHANNEL_AAD_DOMAIN: &[u8] = b"xpressclaw-desktop-credential-aad
 pub const CREDENTIAL_REQUEST_DIRECTION: &[u8] = b"request";
 pub const CREDENTIAL_RESPONSE_DIRECTION: &[u8] = b"response";
 pub const CREDENTIAL_CHANNEL_NONCE: [u8; 12] = [0; 12];
+pub const BROWSER_SESSION_COOKIE: &str = "xpressclaw_session";
+pub const BROWSER_SESSION_LIFETIME_SECONDS: u64 = 12 * 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopCredentialPurpose {
+    Validate,
+    BrowserSession,
+}
+
+impl DesktopCredentialPurpose {
+    pub const fn as_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Validate => b"validate",
+            Self::BrowserSession => b"browser_session",
+        }
+    }
+}
 
 pub struct DesktopCredentialKeys {
     pub request: Zeroizing<[u8; 32]>,
@@ -96,19 +115,26 @@ pub fn derive_credential_keys(
     Ok(DesktopCredentialKeys { request, response })
 }
 
-pub fn credential_aad(instance_id: &str, exchange_id: &[u8; 32], direction: &[u8]) -> Vec<u8> {
+pub fn credential_aad(
+    instance_id: &str,
+    exchange_id: &[u8; 32],
+    direction: &[u8],
+    purpose: DesktopCredentialPurpose,
+) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
         CREDENTIAL_CHANNEL_AAD_DOMAIN.len()
             + instance_id.len()
             + 1
             + exchange_id.len()
-            + direction.len(),
+            + direction.len()
+            + purpose.as_bytes().len(),
     );
     aad.extend_from_slice(CREDENTIAL_CHANNEL_AAD_DOMAIN);
     aad.extend_from_slice(instance_id.as_bytes());
     aad.push(0);
     aad.extend_from_slice(exchange_id);
     aad.extend_from_slice(direction);
+    aad.extend_from_slice(purpose.as_bytes());
     aad
 }
 
@@ -137,8 +163,32 @@ mod tests {
         assert_ne!(*first.request, *first.response);
         assert_ne!(*first.request, *second.request);
         assert_ne!(
-            credential_aad("instance", &exchange, CREDENTIAL_REQUEST_DIRECTION),
-            credential_aad("instance", &exchange, CREDENTIAL_RESPONSE_DIRECTION)
+            credential_aad(
+                "instance",
+                &exchange,
+                CREDENTIAL_REQUEST_DIRECTION,
+                DesktopCredentialPurpose::Validate,
+            ),
+            credential_aad(
+                "instance",
+                &exchange,
+                CREDENTIAL_RESPONSE_DIRECTION,
+                DesktopCredentialPurpose::Validate,
+            )
+        );
+        assert_ne!(
+            credential_aad(
+                "instance",
+                &exchange,
+                CREDENTIAL_REQUEST_DIRECTION,
+                DesktopCredentialPurpose::Validate,
+            ),
+            credential_aad(
+                "instance",
+                &exchange,
+                CREDENTIAL_REQUEST_DIRECTION,
+                DesktopCredentialPurpose::BrowserSession,
+            )
         );
     }
 }

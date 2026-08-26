@@ -85,6 +85,59 @@ test('protected-route login returns through the persistent layout without exposi
 	expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('not-persisted-password');
 });
 
+test('Desktop auto-login returns only status after native session installation', async ({ page }) => {
+	let bootstrapCalls = 0;
+	let bearerExchangeCalls = 0;
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__desktopLoginResults: unknown[];
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__desktopLoginResults = [];
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: false };
+				}
+				if (command === 'login_active_profile') {
+					const result = true;
+					target.__desktopLoginResults.push(result);
+					return result;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/**', async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			bootstrapCalls += 1;
+			await fulfill(route, {
+				instance_id: 'desktop-native-session',
+				authentication_enabled: true,
+				credential_kind: 'password',
+				authenticated: bootstrapCalls > 1,
+				csrf_token: bootstrapCalls > 1 ? 'csrf-from-native-session' : null,
+			});
+			return;
+		}
+		if (path === '/api/auth/exchange') {
+			bearerExchangeCalls += 1;
+			await fulfill(route, { error: 'legacy bearer exchange must not be used' }, 404);
+			return;
+		}
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/login?return_to=%2Fdashboard');
+	await expect(page).toHaveURL(/\/dashboard$/);
+	expect(bootstrapCalls).toBeGreaterThanOrEqual(2);
+	expect(bearerExchangeCalls).toBe(0);
+	expect(await page.evaluate(() => (
+		window as unknown as { __desktopLoginResults: unknown[] }
+	).__desktopLoginResults)).toEqual([true]);
+});
+
 test('Desktop blocks credentials when a remote address changes instance identity', async ({ page }) => {
 	await page.addInitScript(() => {
 		const target = window as unknown as {

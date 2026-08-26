@@ -29,12 +29,19 @@
 	async function finishDesktopLogin(): Promise<boolean> {
 		try {
 			const { invoke } = await import('@tauri-apps/api/core');
-			const result = await invoke<{ ticket: string; instance_id: string } | null>('login_active_profile');
-			if (!result) return false;
-			if (session && result.instance_id !== session.instance_id) {
+			const authenticated = await invoke<boolean>('login_active_profile');
+			if (!authenticated) return false;
+			// Native Desktop installs the HttpOnly session cookie itself. Refresh
+			// bootstrap state to obtain the matching CSRF token without ever
+			// exposing a redeemable bearer ticket to page content.
+			const refreshed = await auth.bootstrap();
+			if (!refreshed.authenticated) {
+				throw new Error('Desktop could not establish the browser session.');
+			}
+			if (session && refreshed.instance_id !== session.instance_id) {
 				throw new Error('The remote server identity changed. Review the saved profile before reconnecting.');
 			}
-			await auth.exchangeDesktopTicket(result.ticket);
+			session = refreshed;
 			await goto(safeReturnTo(), { replaceState: true });
 			return true;
 		} catch (cause) {

@@ -55,9 +55,11 @@ be coupled to browser sessions.
   HKDF-SHA256 and directional ChaCha20-Poly1305 request/response keys. A relay
   may forward the exchange but cannot decrypt the long-lived credential from
   it. On first local startup, the bundled child announces its public key over
-  inherited stdout only after it owns both listeners. Web content can receive
-  only a short-lived, single-use ticket for the currently selected profile,
-  never the keychain credential itself.
+  inherited stdout only after it owns both listeners. A requested browser
+  session is returned only inside that encrypted channel; native Desktop
+  installs its HttpOnly cookie and returns only success/failure to web content.
+  Passwords, startup tokens, session values, and redeemable bearer tickets do
+  not cross the native command boundary.
 - Tauri application commands have an explicit ACL. Bundled local content gets
   the existing local command set; only the exact selected remote origin gets
   the narrower profile/login command set. Other remote origins cannot invoke
