@@ -23,7 +23,7 @@ function visualizationDocument(artifactId: string, label: string, followUp?: { p
 			document.querySelector('#visual-follow-up').addEventListener('click', () => window.openai.sendFollowUpMessage(${JSON.stringify(followUp)}));
 		</script>`
 		: '';
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"></head><body><div id="visual-content">${label}</div>${action}<script>
+	const artifactDocument = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"></head><body><div id="visual-content">${label}</div>${action}<script>
 		addEventListener('message', (event) => {
 			if (event.source === parent && event.data?.source === 'xpressclaw-host' && event.data.artifactId === ${JSON.stringify(artifactId)} && event.data.type === 'theme') {
 				document.documentElement.dataset.theme = event.data.theme;
@@ -37,6 +37,48 @@ function visualizationDocument(artifactId: string, label: string, followUp?: { p
 		fetch('https://example.invalid/visualization-network').then(() => { document.documentElement.dataset.networkBlocked = 'false'; }).catch(() => { document.documentElement.dataset.networkBlocked = 'true'; });
 		const form = document.createElement('form'); form.action = 'https://example.invalid/visualization-form'; form.method = 'post'; document.body.append(form); const beforeSubmit = location.href; form.submit(); setTimeout(() => { document.documentElement.dataset.formBlocked = location.href === beforeSubmit ? 'true' : 'false'; }, 0);
 	</script></body></html>`;
+	const encodedDocument = Buffer.from(artifactDocument, 'utf8').toString('base64');
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src blob:; child-src blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><style>html,body,#root,iframe{width:100%;height:100%;margin:0;border:0}#blocked[hidden]{display:none}</style><script>
+		const artifactId = ${JSON.stringify(artifactId)};
+		let child;
+		let childUrl;
+		let initialLoadComplete = false;
+		let lastTheme = null;
+		addEventListener('message', (event) => {
+			const data = event.data;
+			if (!data || typeof data !== 'object') return;
+			if (event.source === parent) {
+				if (data.source !== 'xpressclaw-host' || data.artifactId !== artifactId) return;
+				if (data.type === 'theme') lastTheme = data.theme;
+				if (data.type === 'theme' || data.type === 'follow-up-result') child?.contentWindow?.postMessage(data, '*');
+				return;
+			}
+			if (event.source !== child?.contentWindow || data.source !== 'xpressclaw-visualization' || data.artifactId !== artifactId) return;
+			if (data.type === 'resize' || data.type === 'follow-up-request') parent.postMessage(data, '*');
+		});
+		addEventListener('DOMContentLoaded', () => {
+			const binary = atob(${JSON.stringify(encodedDocument)});
+			const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+			childUrl = URL.createObjectURL(new Blob([bytes], { type: 'text/html;charset=utf-8' }));
+			child = document.createElement('iframe');
+			child.dataset.artifactFrame = '';
+			child.title = ${JSON.stringify(label)};
+			child.setAttribute('sandbox', 'allow-scripts');
+			child.setAttribute('referrerpolicy', 'no-referrer');
+			child.addEventListener('load', () => {
+				if (initialLoadComplete) {
+					child.remove();
+					document.querySelector('#blocked').hidden = false;
+					parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 160 }, '*');
+					return;
+				}
+				initialLoadComplete = true;
+				if (lastTheme) child.contentWindow?.postMessage({ source: 'xpressclaw-host', type: 'theme', artifactId, theme: lastTheme }, '*');
+			});
+			child.src = childUrl;
+			document.querySelector('#root').append(child);
+		});
+	</script></head><body><div id="root"></div><div id="blocked" role="status" hidden>Navigation was blocked.</div></body></html>`;
 }
 
 async function expectVerticalScroll(scroller: Locator) {
@@ -2105,7 +2147,8 @@ test('task assistant visualizations render in order, stay isolated, and confirm 
 	const firstFrameElement = page.locator('iframe[title="Task dependency map"]');
 	await expect(firstFrameElement).toHaveAttribute('sandbox', 'allow-scripts');
 	await expect(firstFrameElement).toHaveAttribute('referrerpolicy', 'no-referrer');
-	const firstFrame = page.frameLocator('iframe[title="Task dependency map"]');
+	const firstOuterFrame = page.frameLocator('iframe[title="Task dependency map"]');
+	const firstFrame = firstOuterFrame.frameLocator('iframe[data-artifact-frame]');
 	await expect(firstFrame.getByText('Task visualization loaded')).toBeVisible();
 	await expect(firstFrame.locator('html')).toHaveAttribute('data-parent-blocked', 'true');
 	await expect(firstFrame.locator('html')).toHaveAttribute('data-storage-blocked', 'true');
@@ -2118,7 +2161,7 @@ test('task assistant visualizations render in order, stay isolated, and confirm 
 	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
 	await page.evaluate(() => document.documentElement.classList.remove('dark'));
 	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'light');
-	await expect(page.frameLocator('iframe[title="Timeline"]').getByText('Wide timeline loaded')).toBeVisible();
+	await expect(page.frameLocator('iframe[title="Timeline"]').frameLocator('iframe[data-artifact-frame]').getByText('Wide timeline loaded')).toBeVisible();
 	await expect.poll(() => visualizationRequests).toEqual(expect.arrayContaining([
 		{ path: firstPath, token: 'token-one' },
 		{ path: widePath, token: 'token-wide' },
@@ -2138,12 +2181,30 @@ test('task assistant visualizations render in order, stay isolated, and confirm 
 		delivery: 'after_tool',
 	})]);
 
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 260 }, '*');
+	}, 'viz-task-one');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
 	await page.setViewportSize({ width: 390, height: 844 });
 	const firstCard = page.locator('[data-inline-visualization]').first();
 	await firstCard.getByRole('button', { name: 'Expand visualization' }).click();
 	await expect(firstCard).toHaveCSS('position', 'fixed');
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 700 }, '*');
+	}, 'viz-task-one');
 	await firstCard.getByRole('button', { name: 'Exit expanded visualization' }).click();
 	await expect(firstCard).not.toHaveCSS('position', 'fixed');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
+
+	const selfNavigationRequests: string[] = [];
+	page.on('request', (request) => {
+		if (request.url().startsWith('https://example.invalid/visualization-self-navigation')) selfNavigationRequests.push(request.url());
+	});
+	await firstFrame.locator('html').evaluate(() => {
+		window.location.assign('https://example.invalid/visualization-self-navigation?artifact-data=secret');
+	});
+	await expect(firstOuterFrame.getByRole('status')).toHaveText('Navigation was blocked.');
+	expect(selfNavigationRequests).toEqual([]);
 });
 
 test('conversation visualizations persist on reload and route confirmed follow-ups to the conversation', async ({ page }) => {
@@ -2182,7 +2243,7 @@ test('conversation visualizations persist on reload and route confirmed follow-u
 	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
 	await expect(page.locator('[data-message-role="user"] .prose-chat')).toHaveText(reference);
 	await expect(page.locator('[data-message-role="system"] .prose-chat')).toHaveText(reference);
-	const frame = page.frameLocator('iframe[title="Conversation map"]');
+	const frame = page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]');
 	await expect(frame.getByText('Conversation visualization loaded')).toBeVisible();
 	await frame.getByRole('button', { name: 'Follow up' }).click();
 	const dialog = page.getByRole('dialog', { name: 'Send this follow-up?' });
@@ -2193,7 +2254,7 @@ test('conversation visualizations persist on reload and route confirmed follow-u
 
 	await page.reload();
 	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
-	await expect(page.frameLocator('iframe[title="Conversation map"]').getByText('Conversation visualization loaded')).toBeVisible();
+	await expect(page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]').getByText('Conversation visualization loaded')).toBeVisible();
 	await expect.poll(() => visualizationRequests.filter((request) => request.path === path).length).toBeGreaterThanOrEqual(2);
 });
 

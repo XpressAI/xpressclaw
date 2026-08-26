@@ -18,7 +18,11 @@ card with a useful reason.
 
 Visualization HTML is untrusted. It is never inserted into the XpressClaw DOM.
 The viewer loads a capability-protected copy in a sandboxed, opaque-origin
-iframe with a restrictive content security policy:
+iframe nested inside a trusted navigation-guard frame. The guard permits only
+the artifact's initial blob document, so script-driven document navigation
+cannot become an outbound request even in browsers that do not implement the
+experimental `navigate-to` CSP directive. A restrictive content security
+policy additionally ensures that:
 
 - scripts may run inside the iframe, but it receives no same-origin access;
 - host cookies, storage, XpressClaw APIs, forms, popups, objects, workers,

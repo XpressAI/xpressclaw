@@ -107,7 +107,9 @@
 		const data = event.data;
 		if (data.source !== 'xpressclaw-visualization' || data.artifactId !== artifact.id) return;
 		if (data.type === 'resize') {
-			if (typeof data.height === 'number' && Number.isFinite(data.height)) {
+			// The expanded viewport is intentionally much taller than the inline
+			// card. Keep it from replacing the remembered inline measurement.
+			if (!expanded && typeof data.height === 'number' && Number.isFinite(data.height)) {
 				frameHeight = Math.max(220, Math.min(720, Math.ceil(data.height)));
 			}
 			return;
@@ -200,7 +202,7 @@
 					title={title}
 					sandbox="allow-scripts"
 					referrerpolicy="no-referrer"
-					class="min-h-0 w-full flex-1 border-0 bg-transparent"
+					class="min-h-0 w-full border-0 bg-transparent {expanded ? 'flex-1' : 'shrink-0'}"
 					style:height={expanded ? undefined : `${frameHeight}px`}
 					onload={sendTheme}
 				></iframe>

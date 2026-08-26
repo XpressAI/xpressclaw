@@ -266,10 +266,6 @@ fn capture_fragment(
     let Some((_, root, relative)) = candidates.into_iter().next() else {
         return Err(CaptureError::OutsidePermittedRoots);
     };
-    if relative.as_os_str().is_empty() {
-        return Err(CaptureError::NonHtml);
-    }
-
     let canonical_root = root.host_root.canonicalize().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CaptureError::Missing
@@ -277,25 +273,43 @@ fn capture_fragment(
             CaptureError::Unreadable
         }
     })?;
-    let canonical_candidate = canonical_root
-        .join(&relative)
-        .canonicalize()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                CaptureError::Missing
-            } else {
-                CaptureError::Unreadable
-            }
-        })?;
-    if !canonical_candidate.starts_with(&canonical_root) {
-        return Err(CaptureError::OutsidePermittedRoots);
-    }
+    let (capability_root, capability_relative) = if relative.as_os_str().is_empty() {
+        // Docker also permits a writable bind whose source and target are
+        // individual files. The configured source itself is the complete
+        // capability in this case; open only its canonical basename through
+        // its parent rather than widening discovery to sibling files.
+        if !canonical_root.is_file() {
+            return Err(CaptureError::NonHtml);
+        }
+        let parent = canonical_root.parent().ok_or(CaptureError::Unreadable)?;
+        let name = canonical_root
+            .file_name()
+            .ok_or(CaptureError::Unreadable)?
+            .into();
+        (parent.to_path_buf(), name)
+    } else {
+        let canonical_candidate =
+            canonical_root
+                .join(&relative)
+                .canonicalize()
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        CaptureError::Missing
+                    } else {
+                        CaptureError::Unreadable
+                    }
+                })?;
+        if !canonical_candidate.starts_with(&canonical_root) {
+            return Err(CaptureError::OutsidePermittedRoots);
+        }
+        (canonical_root, relative)
+    };
 
     // Open relative to a capability directory as defense in depth against a
     // symlink swap between canonicalization and opening the file.
-    let directory = Dir::open_ambient_dir(&canonical_root, ambient_authority())
+    let directory = Dir::open_ambient_dir(&capability_root, ambient_authority())
         .map_err(|_| CaptureError::Unreadable)?;
-    let file = directory.open(&relative).map_err(|error| {
+    let file = directory.open(&capability_relative).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CaptureError::Missing
         } else if error.kind() == std::io::ErrorKind::PermissionDenied {
@@ -304,6 +318,10 @@ fn capture_fragment(
             CaptureError::Unreadable
         }
     })?;
+    read_fragment(file)
+}
+
+fn read_fragment(file: cap_std::fs::File) -> std::result::Result<String, CaptureError> {
     let metadata = file.metadata().map_err(|_| CaptureError::Unreadable)?;
     if !metadata.is_file() {
         return Err(CaptureError::NonHtml);
@@ -815,6 +833,26 @@ mod tests {
             &roots,
         );
         assert_eq!(prepared[0].content.as_deref(), Some("<div>mounted</div>"));
+    }
+
+    #[test]
+    fn captures_an_exact_writable_file_bind_mount() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("mounted-chart.html");
+        fs::write(&source, "<figure>file bind</figure>").unwrap();
+        let prepared = prepare_message_visualizations(
+            &marker(r#"{"path":"/workspace/chart.html"}"#),
+            &[VisualizationSourceRoot::new(
+                "/workspace/chart.html",
+                source,
+            )],
+        );
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].status, "ready");
+        assert_eq!(
+            prepared[0].content.as_deref(),
+            Some("<figure>file bind</figure>")
+        );
     }
 
     #[cfg(unix)]

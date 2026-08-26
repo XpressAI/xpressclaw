@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
+use base64::Engine;
 use xpressclaw_core::visualizations::VisualizationArtifact;
 
 pub(crate) const RETRIEVAL_TOKEN_HEADER: &str = "x-xpressclaw-artifact-token";
@@ -21,13 +22,29 @@ pub(crate) fn retrieval_token(headers: &HeaderMap) -> Option<&str> {
 pub(crate) fn artifact_response(
     artifact: VisualizationArtifact,
 ) -> Result<Response<Body>, axum::http::Error> {
-    let csp = content_security_policy();
-    let artifact_id = serde_json::to_string(&artifact.visualization.id)
-        .unwrap_or_else(|_| "\"invalid\"".to_string());
-    let prefix = VISUALIZATION_PREFIX
-        .replace("__XPRESSCLAW_CSP__", &html_attribute_escape(&csp))
+    let artifact_csp = artifact_content_security_policy();
+    let artifact_id = javascript_string(&artifact.visualization.id);
+    let artifact_prefix = VISUALIZATION_PREFIX
+        .replace("__XPRESSCLAW_CSP__", &html_attribute_escape(&artifact_csp))
         .replace("__XPRESSCLAW_ARTIFACT_ID__", &artifact_id);
-    let document = format!("{prefix}{}{VISUALIZATION_SUFFIX}", artifact.content);
+    let artifact_document = format!(
+        "{artifact_prefix}{}{VISUALIZATION_SUFFIX}",
+        artifact.content
+    );
+    let encoded_document =
+        base64::engine::general_purpose::STANDARD.encode(artifact_document.as_bytes());
+    let outer_csp = outer_content_security_policy();
+    let document = VISUALIZATION_OUTER_DOCUMENT
+        .replace(
+            "__XPRESSCLAW_OUTER_CSP__",
+            &html_attribute_escape(&outer_csp),
+        )
+        .replace("__XPRESSCLAW_ARTIFACT_ID__", &artifact_id)
+        .replace(
+            "__XPRESSCLAW_ARTIFACT_TITLE__",
+            &javascript_string(&artifact.visualization.title),
+        )
+        .replace("__XPRESSCLAW_ARTIFACT_DOCUMENT__", &encoded_document);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -36,7 +53,7 @@ pub(crate) fn artifact_response(
         .header(header::CONTENT_DISPOSITION, "inline")
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header("content-security-policy", csp)
+        .header("content-security-policy", outer_csp)
         .header(
             "permissions-policy",
             "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), geolocation=(), gyroscope=(), microphone=(), payment=(), usb=()",
@@ -44,10 +61,29 @@ pub(crate) fn artifact_response(
         .body(Body::from(document))
 }
 
-fn content_security_policy() -> String {
+fn artifact_content_security_policy() -> String {
     format!(
         "default-src 'none'; script-src 'unsafe-inline' {RESOURCE_ORIGINS}; style-src 'unsafe-inline' {STYLE_ORIGINS}; font-src {FONT_ORIGINS}; img-src data: blob: {RESOURCE_ORIGINS}; media-src data: blob: {RESOURCE_ORIGINS}; connect-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; manifest-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; navigate-to 'none'; sandbox allow-scripts"
     )
+}
+
+fn outer_content_security_policy() -> String {
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+     frame-src blob:; child-src blob:; connect-src 'none'; img-src 'none'; \
+     media-src 'none'; font-src 'none'; object-src 'none'; worker-src 'none'; \
+     manifest-src 'none'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'self'; navigate-to 'none'; sandbox allow-scripts"
+        .to_string()
+}
+
+fn javascript_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"invalid\"".to_string())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 fn html_attribute_escape(value: &str) -> String {
@@ -57,6 +93,98 @@ fn html_attribute_escape(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
+
+/// A trusted outer frame owns the untrusted artifact frame. Its `frame-src
+/// blob:` policy is enforced by current browsers for every navigation of the
+/// nested frame, including script-driven self-navigation. This closes the gap
+/// left by the still-experimental `navigate-to` directive: an artifact may
+/// destroy its own view, but it cannot turn a navigation into an outbound
+/// request. The outer frame also keeps the artifact's postMessage bridge
+/// narrow and observable by the first-party host component.
+const VISUALIZATION_OUTER_DOCUMENT: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="__XPRESSCLAW_OUTER_CSP__">
+<meta name="referrer" content="no-referrer">
+<style>
+* { box-sizing: border-box; }
+html, body, #frame-root, iframe { width: 100%; height: 100%; margin: 0; border: 0; }
+html, body { min-width: 0; overflow: hidden; background: transparent; }
+#navigation-blocked { display: grid; min-height: 160px; place-items: center; padding: 20px; color: #5f6676; font: 13px/1.5 ui-sans-serif, system-ui, sans-serif; text-align: center; }
+#navigation-blocked[hidden] { display: none; }
+</style>
+<script>
+(() => {
+  "use strict";
+  const artifactId = __XPRESSCLAW_ARTIFACT_ID__;
+  const artifactTitle = __XPRESSCLAW_ARTIFACT_TITLE__;
+  const encodedDocument = "__XPRESSCLAW_ARTIFACT_DOCUMENT__";
+  let child;
+  let childUrl;
+  let initialLoadComplete = false;
+  let lastTheme = null;
+
+  const relayToHost = (message) => parent.postMessage(message, "*");
+  const relayToArtifact = (message) => child?.contentWindow?.postMessage(message, "*");
+  const showNavigationBlocked = () => {
+    if (!child?.isConnected) return;
+    child.remove();
+    document.getElementById("navigation-blocked").hidden = false;
+    relayToHost({ source: "xpressclaw-visualization", type: "resize", artifactId, height: 160 });
+  };
+
+  addEventListener("message", (event) => {
+    const data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (event.source === parent) {
+      if (data.source !== "xpressclaw-host" || data.artifactId !== artifactId) return;
+      if (data.type === "theme" && (data.theme === "light" || data.theme === "dark")) {
+        lastTheme = data.theme;
+        relayToArtifact(data);
+      } else if (data.type === "follow-up-result") {
+        relayToArtifact(data);
+      }
+      return;
+    }
+    if (event.source !== child?.contentWindow || data.source !== "xpressclaw-visualization" || data.artifactId !== artifactId) return;
+    if (data.type === "resize" && typeof data.height === "number" && Number.isFinite(data.height)) {
+      relayToHost(data);
+    } else if (data.type === "follow-up-request") {
+      relayToHost(data);
+    }
+  });
+
+  addEventListener("DOMContentLoaded", () => {
+    const binary = atob(encodedDocument);
+    const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    childUrl = URL.createObjectURL(new Blob([bytes], { type: "text/html;charset=utf-8" }));
+    child = document.createElement("iframe");
+    child.dataset.artifactFrame = "";
+    child.title = artifactTitle;
+    child.setAttribute("sandbox", "allow-scripts");
+    child.setAttribute("referrerpolicy", "no-referrer");
+    child.addEventListener("load", () => {
+      if (initialLoadComplete) {
+        showNavigationBlocked();
+        return;
+      }
+      initialLoadComplete = true;
+      if (lastTheme) relayToArtifact({ source: "xpressclaw-host", type: "theme", artifactId, theme: lastTheme });
+    });
+    child.src = childUrl;
+    document.getElementById("frame-root").append(child);
+  });
+  addEventListener("pagehide", () => { if (childUrl) URL.revokeObjectURL(childUrl); }, { once: true });
+})();
+</script>
+</head>
+<body>
+<div id="frame-root"></div>
+<div id="navigation-blocked" role="status" hidden>This visualization attempted to leave its isolated viewer. The navigation was blocked.</div>
+</body>
+</html>"#;
 
 const VISUALIZATION_PREFIX: &str = r#"<!doctype html>
 <html lang="en">
@@ -179,7 +307,9 @@ a { color: var(--blue); }
     }
   });
   addEventListener("DOMContentLoaded", () => {
-    new ResizeObserver(reportHeight).observe(document.documentElement);
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(reportHeight).observe(document.documentElement);
+    }
     reportHeight();
   });
 })();
@@ -195,10 +325,22 @@ const VISUALIZATION_SUFFIX: &str = r#"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
     use xpressclaw_core::visualizations::MessageVisualization;
 
-    #[test]
-    fn wrapper_enforces_the_visualization_security_boundary() {
+    fn embedded_artifact_document(document: &str) -> String {
+        let prefix = "const encodedDocument = \"";
+        let start = document.find(prefix).unwrap() + prefix.len();
+        let end = start + document[start..].find("\";").unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&document[start..end])
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wrapper_enforces_the_visualization_security_boundary() {
+        let fragment = "<button onclick=\"openai.sendFollowUpMessage({prompt:'go'})\">Go</button>";
         let response = artifact_response(VisualizationArtifact {
             visualization: MessageVisualization {
                 id: "viz-test".into(),
@@ -210,24 +352,27 @@ mod tests {
                 size: Some(31),
                 retrieval_token: "token".into(),
             },
-            content: "<button onclick=\"openai.sendFollowUpMessage({prompt:'go'})\">Go</button>"
-                .into(),
+            content: fragment.into(),
         })
         .unwrap();
-        let csp = response
+        let outer_csp = response
             .headers()
             .get("content-security-policy")
             .unwrap()
             .to_str()
-            .unwrap();
-        assert!(csp.contains("connect-src 'none'"));
-        assert!(csp.contains("form-action 'none'"));
-        assert!(csp.contains("object-src 'none'"));
-        assert!(csp.contains("frame-src 'none'"));
-        assert!(csp.contains("worker-src 'none'"));
-        assert!(csp.contains("navigate-to 'none'"));
-        assert!(csp.contains("sandbox allow-scripts"));
-        assert!(csp.contains("frame-ancestors 'self'"));
+            .unwrap()
+            .to_string();
+        assert!(outer_csp.contains("connect-src 'none'"));
+        assert!(outer_csp.contains("form-action 'none'"));
+        assert!(outer_csp.contains("object-src 'none'"));
+        assert!(outer_csp.contains("frame-src blob:"));
+        assert!(outer_csp.contains("worker-src 'none'"));
+        assert!(outer_csp.contains("sandbox allow-scripts"));
+        assert!(!outer_csp.contains("https://"));
+
+        let artifact_csp = artifact_content_security_policy();
+        assert!(artifact_csp.contains("frame-src 'none'"));
+        assert!(artifact_csp.contains("connect-src 'none'"));
         for origin in [
             "https://cdnjs.cloudflare.com",
             "https://esm.sh",
@@ -237,9 +382,12 @@ mod tests {
             "https://fonts.gstatic.com",
             "https://fonts.bunny.net",
         ] {
-            assert!(csp.contains(origin), "missing allowed origin {origin}");
+            assert!(
+                artifact_csp.contains(origin),
+                "missing allowed origin {origin}"
+            );
         }
-        assert!(!csp
+        assert!(!artifact_csp
             .split(';')
             .find(|directive| directive.trim_start().starts_with("script-src"))
             .unwrap()
@@ -248,6 +396,14 @@ mod tests {
             response.headers().get(header::REFERRER_POLICY).unwrap(),
             "no-referrer"
         );
+        let document = response.into_body().collect().await.unwrap().to_bytes();
+        let document = String::from_utf8(document.to_vec()).unwrap();
+        assert!(document.contains("frame-src blob:"));
+        assert!(document.contains("child.setAttribute(\"sandbox\", \"allow-scripts\")"));
+        assert!(!document.contains(fragment));
+        let embedded = embedded_artifact_document(&document);
+        assert!(embedded.contains(fragment));
+        assert!(embedded.contains("Object.defineProperty(window, \"openai\""));
     }
 
     #[test]

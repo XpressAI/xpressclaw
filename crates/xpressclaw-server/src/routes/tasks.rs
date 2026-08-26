@@ -2181,8 +2181,9 @@ mod tests {
             .contains("connect-src 'none'"));
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body.contains("<div data-secret>safe</div>"));
-        assert!(body.contains("Object.defineProperty(window, \"openai\""));
+        assert!(!body.contains("<div data-secret>safe</div>"));
+        assert!(body.contains("const encodedDocument ="));
+        assert!(body.contains("child.setAttribute(\"sandbox\", \"allow-scripts\")"));
 
         for request in [
             Request::get(&path)
