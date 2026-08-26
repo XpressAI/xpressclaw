@@ -109,13 +109,13 @@ credential, during the native exchange. The profile JSON contains only the
 name, URL, public identity, and authentication mode. A remote profile with
 authentication off requires the same trusted-network confirmation.
 
-Automatic keychain login is available for HTTPS remote profiles and for the
-exact local HTTP sidecar whose listeners were started by the current Desktop
-process. Desktop deliberately does not submit a saved credential or install a
-browser session for an HTTP remote profile: an active HTTP replacement could
-relay identity proof and then steal any cookie installed for its origin. Direct
-HTTP over an operator-trusted LAN or tailnet remains supported through the
-normal browser login form.
+Automatic keychain login is available only for the exact local HTTP sidecar
+whose listeners were started by the current Desktop process. Remote profiles
+use the normal browser login, including over HTTPS: a replacement origin could
+relay the separately signed XpressClaw identity proof and receive any cookie
+installed for that origin, while native code cannot prove that the browser's
+connection terminates at the same instance. Direct HTTP over an
+operator-trusted LAN or tailnet remains supported through that login form.
 
 The current Desktop release intentionally selects one profile for the whole
 application. Switching closes secondary workspace windows before navigating

@@ -85,7 +85,7 @@ test('protected-route login returns through the persistent layout without exposi
 	expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('not-persisted-password');
 });
 
-test('Desktop auto-login returns only status after native session installation', async ({ page }) => {
+test('Desktop local auto-login returns only status after native session installation', async ({ page }) => {
 	let bootstrapCalls = 0;
 	let bearerExchangeCalls = 0;
 	await page.addInitScript(() => {
@@ -97,7 +97,7 @@ test('Desktop auto-login returns only status after native session installation',
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string) => {
 				if (command === 'get_active_instance_profile') {
-					return { identity_status: 'matched', local: false };
+					return { identity_status: 'matched', local: true };
 				}
 				if (command === 'login_active_profile') {
 					const result = true;
@@ -138,20 +138,21 @@ test('Desktop auto-login returns only status after native session installation',
 	).__desktopLoginResults)).toEqual([true]);
 });
 
-test('Desktop HTTP remote profiles fall back to an explicit browser login', async ({ page }) => {
+test('Desktop remote profiles use explicit browser login without a native session', async ({ page }) => {
 	await page.addInitScript(() => {
 		const target = window as unknown as {
+			__remoteLoginCalls: number;
 			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
 		};
+		target.__remoteLoginCalls = 0;
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string) => {
 				if (command === 'get_active_instance_profile') {
 					return { identity_status: 'matched', local: false };
 				}
 				if (command === 'login_active_profile') {
-					throw new Error(
-						'Desktop does not use saved credentials for automatic login to an HTTP remote profile. Enter the credential manually on this trusted network, or use HTTPS for automatic keychain login.'
-					);
+					target.__remoteLoginCalls += 1;
+					return false;
 				}
 				throw new Error(`Unexpected Tauri command: ${command}`);
 			},
@@ -174,8 +175,12 @@ test('Desktop HTTP remote profiles fall back to an explicit browser login', asyn
 
 	await page.goto('/login?return_to=%2Fdashboard');
 	await expect(page).toHaveURL(/\/login/);
-	await expect(page.getByRole('alert')).toContainText('does not use saved credentials');
+	await expect(page.getByRole('alert')).toHaveCount(0);
 	await expect(page.getByLabel('Password')).toBeVisible();
+	await expect(page.getByText(/Remote profiles use the browser login above/)).toBeVisible();
+	expect(await page.evaluate(() => (
+		window as unknown as { __remoteLoginCalls: number }
+	).__remoteLoginCalls)).toBe(1);
 });
 
 test('Desktop blocks credentials when a remote address changes instance identity', async ({ page }) => {

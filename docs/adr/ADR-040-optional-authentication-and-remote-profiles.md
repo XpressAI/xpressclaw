@@ -56,16 +56,15 @@ be coupled to browser sessions.
   may forward the exchange but cannot decrypt the long-lived credential from
   it. On first local startup, the bundled child announces its public key over
   inherited stdout only after it owns both listeners. Automatic keychain login
-  additionally requires an HTTPS remote origin or the exact local HTTP identity
-  announced by that listener-owning child. Desktop does not submit a saved
-  credential or install a session for an HTTP remote origin, because a relay
-  could receive and reuse a cookie scoped to that unproved endpoint; direct
-  trusted-tailnet HTTP remains available through the browser login form. For an
-  eligible origin, the requested browser session is returned only inside the
-  encrypted channel; native Desktop installs its HttpOnly cookie and returns
-  only success/failure to web content. Passwords, startup tokens, session
-  values, and redeemable bearer tickets do not cross the native command
-  boundary.
+  is limited to the exact local HTTP identity announced by that
+  listener-owning child. Remote profiles use the browser login form even over
+  HTTPS: a replacement HTTPS origin can relay the separately signed application
+  proof, and native code cannot bind the browser's cookie-bearing TLS connection
+  to that proof. For the eligible local origin, the requested browser session
+  is returned only inside the encrypted channel; native Desktop installs its
+  HttpOnly cookie and returns only success/failure to web content. Passwords,
+  startup tokens, session values, and redeemable bearer tickets do not cross the
+  native command boundary.
 - Tauri application commands have an explicit ACL. Bundled local content gets
   the existing local command set; only the exact selected remote origin gets
   the narrower profile/login command set. Other remote origins cannot invoke

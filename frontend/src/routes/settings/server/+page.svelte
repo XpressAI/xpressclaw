@@ -288,7 +288,7 @@
 	{#if desktop}
 		<section class="rounded-xl border border-border bg-card p-4 shadow-sm">
 			<div class="flex items-center gap-2"><Laptop size={17} /><h2 class="text-sm font-semibold">Desktop instance profiles</h2></div>
-			<p class="mt-1 text-xs text-muted-foreground">This Desktop window uses one selected profile at a time. The automatic local sidecar continues running when you connect remotely. Credentials stay in the operating-system keychain. Automatic keychain login requires HTTPS for remote profiles; trusted HTTP/tailnet profiles use the normal browser login.</p>
+			<p class="mt-1 text-xs text-muted-foreground">This Desktop window uses one selected profile at a time. The automatic local sidecar continues running when you connect remotely. Credentials stay in the operating-system keychain. Automatic keychain login is local-sidecar-only; remote profiles use the normal browser login.</p>
 			<div class="mt-4 grid gap-2">
 				{#each profiles as profile}
 					<div class="flex items-center gap-3 rounded-lg border {profile.active ? 'border-primary/50 bg-primary/5' : 'border-border'} p-3">

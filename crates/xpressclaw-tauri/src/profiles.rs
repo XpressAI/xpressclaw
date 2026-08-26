@@ -890,6 +890,14 @@ pub async fn login_active_profile(
             "This instance now requires {expected}; edit the profile before reconnecting"
         ));
     }
+    // A remote page must authenticate through its visible browser origin.
+    // Native code cannot bind the WebView's later cookie-bearing connection to
+    // the separately proved XpressClaw identity, even when that origin uses
+    // HTTPS, so silently attempting keychain login would reintroduce a relay.
+    if !profile.local {
+        return Ok(false);
+    }
+    require_listener_bound_local_session_origin(&state, &profile, &bootstrap)?;
     let credential = credential_for_authentication(&state, &credential_profile, expected).await?;
     let session = request_desktop_session(&state, &profile, &credential, &bootstrap).await?;
     if require_active_profile_origin(&state, &webview)? != profile {
@@ -1733,7 +1741,7 @@ async fn request_desktop_session(
     credential: &str,
     bootstrap: &Bootstrap,
 ) -> Result<DesktopBrowserSession, String> {
-    require_proved_native_session_origin(state, profile, bootstrap)?;
+    require_listener_bound_local_session_origin(state, profile, bootstrap)?;
     match request_desktop_auth(
         &profile.url,
         credential,
@@ -1754,17 +1762,13 @@ async fn request_desktop_session(
     }
 }
 
-fn require_proved_native_session_origin(
+fn require_listener_bound_local_session_origin(
     state: &ProfileState,
     profile: &StoredProfile,
     bootstrap: &Bootstrap,
 ) -> Result<(), String> {
-    let url = reqwest::Url::parse(&profile.url)
-        .map_err(|error| format!("The selected Desktop profile URL is invalid: {error}"))?;
-    if url.scheme() == "https" {
-        return Ok(());
-    }
     if profile.local
+        && profile.id == LOCAL_PROFILE_ID
         && state.local_bound_identity()?.as_deref() == Some(bootstrap.identity_public_key.as_str())
     {
         return Ok(());
@@ -1773,7 +1777,7 @@ fn require_proved_native_session_origin(
         "Desktop automatic login is unavailable because this HTTP local instance was not started by the current Desktop process. Enter the credential manually, or restart the local sidecar from Desktop."
             .to_string()
     } else {
-        "Desktop does not use saved credentials for automatic login to an HTTP remote profile. Enter the credential manually on this trusted network, or use HTTPS for automatic keychain login."
+        "Desktop automatic login is available only for its managed local instance. Enter the credential manually for this remote profile; use HTTPS or a trusted tailnet for transport security."
             .to_string()
     })
 }
@@ -2924,7 +2928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_http_relay_cannot_receive_a_native_browser_session() {
+    async fn remote_profiles_cannot_receive_a_native_browser_session() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -2961,26 +2965,47 @@ mod tests {
         )
         .await
         {
-            Ok(_) => panic!("an HTTP remote profile received a native browser session"),
+            Ok(_) => panic!("a remote profile received a native browser session"),
             Err(error) => error,
         };
-        assert!(error.contains("does not use saved credentials"));
+        assert!(error.contains("managed local instance"));
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
 
         let mut https_profile = profile.clone();
-        https_profile.url = "https://control.example.test".to_string();
-        assert!(require_proved_native_session_origin(&state, &https_profile, &bootstrap).is_ok());
+        https_profile.url = format!("https://{address}");
+        let error = match request_desktop_session(
+            &state,
+            &https_profile,
+            "saved-password-must-stay-secret",
+            &bootstrap,
+        )
+        .await
+        {
+            Ok(_) => panic!("an HTTPS remote profile received a native browser session"),
+            Err(error) => error,
+        };
+        assert!(error.contains("managed local instance"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
 
         let mut local_profile = profile;
         local_profile.local = true;
-        assert!(require_proved_native_session_origin(&state, &local_profile, &bootstrap).is_err());
+        local_profile.id = LOCAL_PROFILE_ID.to_string();
+        assert!(
+            require_listener_bound_local_session_origin(&state, &local_profile, &bootstrap)
+                .is_err()
+        );
         state
             .remember_local_bound_identity(&bootstrap.identity_public_key)
             .unwrap();
-        assert!(require_proved_native_session_origin(&state, &local_profile, &bootstrap).is_ok());
+        assert!(
+            require_listener_bound_local_session_origin(&state, &local_profile, &bootstrap).is_ok()
+        );
     }
 
     #[tokio::test]
