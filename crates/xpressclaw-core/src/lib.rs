@@ -20,5 +20,6 @@ pub mod projects;
 pub mod sessions;
 pub mod tasks;
 pub mod tools;
+pub mod visualizations;
 pub mod workers;
 pub mod workflows;

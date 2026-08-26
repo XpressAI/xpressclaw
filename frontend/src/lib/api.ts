@@ -126,6 +126,17 @@ export interface ConversationAttachment {
 	created_at: string;
 }
 
+export interface MessageVisualization {
+	id: string;
+	reference_index: number;
+	title: string;
+	mode: 'normal' | 'wide';
+	status: 'ready' | 'unavailable';
+	error_code: string | null;
+	size: number | null;
+	retrieval_token: string;
+}
+
 export interface ConversationMessage {
 	id: number;
 	conversation_id: string;
@@ -137,6 +148,7 @@ export interface ConversationMessage {
 	linked_task_id: string | null;
 	metadata: Record<string, unknown>;
 	attachments?: ConversationAttachment[];
+	visualizations?: MessageVisualization[];
 	created_at: string;
 }
 
@@ -222,6 +234,8 @@ export const conversations = {
 		}),
 	turns: (id: string) => request<ConversationTurn[]>(`/api/conversations/${encodeURIComponent(id)}/turns`),
 	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
+	visualizationUrl: (conversationId: string, messageId: number, artifactId: string) =>
+		`/api/conversations/${encodeURIComponent(conversationId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
 };
 
 // -- Control center dashboard --
@@ -688,6 +702,8 @@ export const tasks = {
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
 	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	visualizationUrl: (taskId: string, messageId: number, artifactId: string) =>
+		`/api/tasks/${encodeURIComponent(taskId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
 	activity: (id: string, options: { after?: number; before?: number; limit?: number } = {}) => {
 		const params = new URLSearchParams();
 		if (options.after !== undefined) params.set('after', String(options.after));
@@ -732,6 +748,7 @@ export interface TaskMessage {
 	content: string;
 	timestamp: string;
 	attachments: TaskMessageAttachment[];
+	visualizations?: MessageVisualization[];
 }
 
 export interface TaskMessageAttachment {
@@ -746,6 +763,21 @@ export interface TaskMessageResponse {
 	continuation_queued: boolean;
 	attempt_id: string | null;
 	delivery: 'stored' | 'queued' | 'after_tool' | 'immediate';
+}
+
+export async function fetchVisualizationDocument(path: string, retrievalToken: string): Promise<Blob> {
+	const response = await fetch(`${BASE}${path}`, {
+		headers: { 'X-XpressClaw-Artifact-Token': retrievalToken },
+		credentials: 'same-origin',
+	});
+	if (!response.ok) {
+		throw new ApiError(response.status === 404 ? 'Visualization is no longer available.' : 'Could not load visualization.', response.status);
+	}
+	const contentType = response.headers.get('content-type') ?? '';
+	if (!contentType.toLowerCase().startsWith('text/html')) {
+		throw new ApiError('Visualization response was not HTML.', response.status);
+	}
+	return response.blob();
 }
 
 // -- Schedules --

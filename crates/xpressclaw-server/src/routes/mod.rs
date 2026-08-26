@@ -17,6 +17,7 @@ mod settings_collaboration;
 mod settings_sync;
 mod setup;
 mod tasks;
+mod visualizations;
 mod workflows;
 mod workspace;
 

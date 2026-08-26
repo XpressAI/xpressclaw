@@ -283,6 +283,12 @@
 		}
 	}
 
+	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
+		await conversations.sendMessage(conversationId, prompt);
+		await refreshActivity();
+		await scrollToLatest();
+	}
+
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !composing && event.keyCode !== 229) {
 			event.preventDefault();
@@ -447,15 +453,20 @@
 						{#if messages.length === 0}<div class="rounded-xl border border-dashed border-border p-10 text-center"><h2 class="font-medium">Start the conversation</h2><p class="mt-2 text-sm text-muted-foreground">Every participating Agent can answer, even while its task lane is busy.</p></div>{/if}
 						{#each messages as message (message.id)}
 							{@const fromUser = message.sender_type === 'user'}
+							{@const messageRole = fromUser ? 'user' : message.sender_type === 'agent' ? 'assistant' : 'system'}
 							{@const linkedTask = taskList.find((task) => task.id === message.linked_task_id)}
 							<AiMessage
-								role={fromUser ? 'user' : 'assistant'}
+								role={messageRole}
 								sender={message.sender_name || message.sender_id}
 								timestampLabel={timeAgo(message.created_at)}
 								content={message.content}
 								avatar={fromUser ? 'Y' : message.sender_name?.slice(0, 1).toUpperCase() || 'A'}
 								selectionActions={!fromUser}
 								onselectionaction={handleSelectionAction}
+								visualizations={message.visualizations ?? []}
+								visualizationUrl={(artifact) => conversations.visualizationUrl(conversationId, message.id, artifact.id)}
+								visualizationFollowUpTarget="this Conversation"
+								onvisualizationfollowup={sendVisualizationFollowUp}
 							>
 								{#if linkedTask}
 									<a href="/tasks/{linkedTask.id}" class="mt-3 flex items-center gap-2 rounded-lg bg-background/40 px-3 py-2 text-xs shadow-[var(--shadow-hairline)]">

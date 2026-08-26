@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -12,12 +12,15 @@ use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachm
 use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::visualizations::VisualizationManager;
 use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
 use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
 
 use crate::state::AppState;
+
+use super::visualizations;
 
 #[derive(Deserialize)]
 pub struct ListParams {
@@ -120,6 +123,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/{id}/messages/{message_id}/attachments/{attachment_id}",
             get(get_message_attachment),
+        )
+        .route(
+            "/{id}/messages/{message_id}/visualizations/{artifact_id}",
+            get(get_message_visualization),
         )
         .route("/{id}/activity", get(get_activity))
         .route("/{id}/pull-requests", post(register_pull_request))
@@ -628,6 +635,29 @@ async fn get_message_attachment(
         )
         .body(Body::from(attachment.data))
         .map_err(internal_error)
+}
+
+async fn get_message_visualization(
+    State(state): State<AppState>,
+    Path((id, message_id, artifact_id)): Path<(String, i64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let token = visualizations::retrieval_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "visualization not found" })),
+        )
+    })?;
+    let artifact = VisualizationManager::new(state.db.clone())
+        .task_artifact(&id, message_id, &artifact_id, token)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "visualization not found" })),
+            )
+        })?;
+    visualizations::artifact_response(artifact).map_err(internal_error)
 }
 
 async fn get_activity(
@@ -2101,5 +2131,76 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["event_type"] == "attempt_queued"));
+    }
+
+    #[tokio::test]
+    async fn visualization_retrieval_requires_its_message_scoped_capability() {
+        let (app, db) = test_app_with_db();
+        let message_id = db
+            .with_conn(|connection| -> std::result::Result<i64, xpressclaw_core::error::Error> {
+                connection.execute(
+                    "INSERT INTO tasks (id, title) VALUES ('visual-task', 'Visual'), ('other-task', 'Other')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO task_messages (task_id, role, content)
+                     VALUES ('visual-task', 'assistant', 'visual')",
+                    [],
+                )?;
+                let message_id = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO message_visualizations
+                     (id, task_message_id, reference_index, title, display_mode,
+                      status, content, content_sha256, size, retrieval_token)
+                     VALUES ('viz-route', ?1, 0, 'Route test', 'normal',
+                             'ready', '<div data-secret>safe</div>',
+                             '0000000000000000000000000000000000000000000000000000000000000000',
+                             27, 'route-token')",
+                    [message_id],
+                )?;
+                Ok(message_id)
+            })
+            .unwrap();
+
+        let path = format!("/tasks/visual-task/messages/{message_id}/visualizations/viz-route");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(&path)
+                    .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert!(response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("connect-src 'none'"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("<div data-secret>safe</div>"));
+        assert!(body.contains("const encodedDocument ="));
+        assert!(body.contains("child.setAttribute(\"sandbox\", \"allow-scripts\")"));
+
+        for request in [
+            Request::get(&path)
+                .header(visualizations::RETRIEVAL_TOKEN_HEADER, "wrong")
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(format!(
+                "/tasks/other-task/messages/{message_id}/visualizations/viz-route"
+            ))
+            .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+            .body(Body::empty())
+            .unwrap(),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 }

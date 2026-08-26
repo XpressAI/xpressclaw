@@ -9,6 +9,7 @@ use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
+use crate::visualizations::{store_conversation_message_visualizations, PreparedVisualization};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -398,6 +399,23 @@ impl ConversationTurnQueue {
         message: &SendMessage,
         metadata: &serde_json::Value,
     ) -> Result<Option<ConversationMessage>> {
+        self.complete_with_message_and_visualizations(
+            turn,
+            native_session_id,
+            message,
+            metadata,
+            &[],
+        )
+    }
+
+    pub fn complete_with_message_and_visualizations(
+        &self,
+        turn: &ConversationTurn,
+        native_session_id: &str,
+        message: &SendMessage,
+        metadata: &serde_json::Value,
+        visualizations: &[PreparedVisualization],
+    ) -> Result<Option<ConversationMessage>> {
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
             let may_publish = transaction.query_row(
@@ -443,6 +461,13 @@ impl ConversationTurnQueue {
                 "SELECT * FROM conversation_messages WHERE id = ?1",
                 [message_id],
                 row_to_message,
+            )?;
+            store_conversation_message_visualizations(
+                &transaction,
+                message_id,
+                None,
+                Some(&turn.id),
+                visualizations,
             )?;
             Self::enqueue_for_message_in_transaction(
                 &transaction,

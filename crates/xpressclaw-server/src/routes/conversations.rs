@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -23,10 +23,13 @@ use xpressclaw_core::conversations::{
     ConversationManager, CreateConversation, NewConversationAttachment, SendMessage,
 };
 use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
+use xpressclaw_core::visualizations::VisualizationManager;
 use xpressclaw_core::workers::acp::AcpInterruptMode;
 use xpressclaw_core::workflows::engine::{WorkflowContext, WorkflowEngine};
 
 use crate::state::AppState;
+
+use super::visualizations;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -51,6 +54,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/turns", get(list_turns))
         .route("/{id}/attachments/{attachment_id}", get(get_attachment))
+        .route(
+            "/{id}/messages/{message_id}/visualizations/{artifact_id}",
+            get(get_visualization),
+        )
 }
 
 #[derive(Deserialize)]
@@ -201,8 +208,10 @@ async fn list_messages(
         .into_iter()
         .map(|message| {
             let attachments = manager.attachments(message.id).unwrap_or_default();
+            let visualizations = manager.visualizations(message.id).unwrap_or_default();
             let mut value = json!(message);
             value["attachments"] = json!(attachments);
+            value["visualizations"] = json!(visualizations);
             value
         })
         .collect::<Vec<_>>();
@@ -500,6 +509,29 @@ async fn get_attachment(
         .map_err(|error| api_error(error.to_string()))
 }
 
+async fn get_visualization(
+    State(state): State<AppState>,
+    Path((id, message_id, artifact_id)): Path<(String, i64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, ApiError> {
+    let token = visualizations::retrieval_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "visualization not found" })),
+        )
+    })?;
+    let artifact = VisualizationManager::new(state.db.clone())
+        .conversation_artifact(&id, message_id, &artifact_id, token)
+        .map_err(api_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "visualization not found" })),
+            )
+        })?;
+    visualizations::artifact_response(artifact).map_err(api_error)
+}
+
 async fn conversation_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -587,7 +619,7 @@ mod tests {
 
     use super::*;
 
-    fn app() -> Router {
+    fn app_with_db() -> (Router, Arc<Database>) {
         let db = Arc::new(Database::open_memory().unwrap());
         db.with_conn(|connection| {
             connection.execute(
@@ -605,12 +637,16 @@ mod tests {
         .unwrap();
         let state = AppState::new(
             Arc::new(Config::load_default().unwrap()),
-            db,
+            db.clone(),
             None,
             "test.yaml".into(),
             true,
         );
-        routes().with_state(state)
+        (routes().with_state(state), db)
+    }
+
+    fn app() -> Router {
+        app_with_db().0
     }
 
     async fn json_body(response: Response<Body>) -> Value {
@@ -707,5 +743,80 @@ mod tests {
             response.into_body().collect().await.unwrap().to_bytes(),
             "hello"
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_visualizations_are_listed_and_retrieved_only_in_scope() {
+        let (app, db) = app_with_db();
+        let message_id = db
+            .with_conn(
+                |connection| -> std::result::Result<i64, xpressclaw_core::error::Error> {
+                    connection.execute(
+                        "INSERT INTO conversations (id, project_id, title)
+                     VALUES ('visual-conversation', 'project', 'Visual'),
+                            ('other-conversation', 'project', 'Other')",
+                        [],
+                    )?;
+                    connection.execute(
+                        "INSERT INTO conversation_messages
+                     (conversation_id, sender_type, sender_id, content)
+                     VALUES ('visual-conversation', 'agent', 'atlas', 'visual')",
+                        [],
+                    )?;
+                    let message_id = connection.last_insert_rowid();
+                    connection.execute(
+                        "INSERT INTO message_visualizations
+                     (id, conversation_message_id, reference_index, title,
+                      display_mode, status, content, content_sha256, size, retrieval_token)
+                     VALUES ('conversation-viz', ?1, 0, 'Conversation visual',
+                             'wide', 'ready', '<div>conversation</div>',
+                             '0000000000000000000000000000000000000000000000000000000000000000',
+                             23, 'conversation-token')",
+                        [message_id],
+                    )?;
+                    Ok(message_id)
+                },
+            )
+            .unwrap();
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::get("/visual-conversation/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed = json_body(listed).await;
+        assert_eq!(listed[0]["visualizations"][0]["id"], "conversation-viz");
+        assert_eq!(listed[0]["visualizations"][0]["mode"], "wide");
+
+        let path =
+            format!("/visual-conversation/messages/{message_id}/visualizations/conversation-viz");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header(visualizations::RETRIEVAL_TOKEN_HEADER, "conversation-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::get(format!(
+                    "/other-conversation/messages/{message_id}/visualizations/conversation-viz"
+                ))
+                .header(visualizations::RETRIEVAL_TOKEN_HEADER, "conversation-token")
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
