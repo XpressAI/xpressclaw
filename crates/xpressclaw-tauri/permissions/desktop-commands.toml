@@ -12,6 +12,7 @@ commands.allow = [
   "delete_instance_profile",
   "get_active_instance_profile",
   "login_active_profile",
+  "trust_local_instance_replacement",
   "store_active_profile_credential",
 ]
 
@@ -25,5 +26,6 @@ commands.allow = [
   "delete_instance_profile",
   "get_active_instance_profile",
   "login_active_profile",
+  "trust_local_instance_replacement",
   "store_active_profile_credential",
 ]

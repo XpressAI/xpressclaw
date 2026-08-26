@@ -122,6 +122,52 @@ test('Desktop blocks credentials when a remote address changes instance identity
 	).__selectedProfile)).toBe('local');
 });
 
+test('Desktop requires explicit recovery before trusting a replacement local identity', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__tauriCalls: string[];
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__tauriCalls = [];
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				target.__tauriCalls.push(`${command}:${JSON.stringify(args ?? null)}`);
+				if (command === 'get_active_instance_profile') {
+					return { instance_id: 'trusted-local-instance', local: true };
+				}
+				if (command === 'trust_local_instance_replacement') return null;
+				if (command === 'login_active_profile') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/auth/bootstrap', (route) => fulfill(route, {
+		instance_id: 'replacement-local-instance',
+		authentication_enabled: true,
+		credential_kind: 'password',
+		authenticated: false,
+		csrf_token: null,
+	}));
+
+	await page.goto('/login');
+	await expect(page.getByText(/different XpressClaw instance is answering on the saved local address/i)).toBeVisible();
+	await expect(page.getByText('trusted-local-instance', { exact: true })).toBeVisible();
+	await expect(page.getByText('replacement-local-instance', { exact: true })).toBeVisible();
+	await expect(page.getByLabel('Password')).toHaveCount(0);
+	expect(await page.evaluate(() => (
+		window as unknown as { __tauriCalls: string[] }
+	).__tauriCalls.some((call) => call.startsWith('login_active_profile:')))).toBe(false);
+
+	await page.getByRole('button', { name: 'Trust replacement local instance' }).click();
+	await expect(page.getByLabel('Password')).toBeVisible();
+	const calls = await page.evaluate(() => (
+		window as unknown as { __tauriCalls: string[] }
+	).__tauriCalls);
+	expect(calls).toContain('trust_local_instance_replacement:{"instanceId":"replacement-local-instance"}');
+	expect(calls.filter((call) => call.startsWith('login_active_profile:'))).toHaveLength(1);
+	expect(calls.some((call) => call.includes('credential'))).toBe(false);
+});
+
 test('Instance settings requires the explicit no-auth remote warning and shows restart-pending values', async ({ page }) => {
 	let saved = structuredClone(baseInstance.saved);
 	let updatePayload: Record<string, unknown> | null = null;

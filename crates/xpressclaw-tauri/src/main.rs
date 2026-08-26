@@ -390,6 +390,7 @@ fn main() {
             profiles::delete_instance_profile,
             profiles::get_active_instance_profile,
             profiles::login_active_profile,
+            profiles::trust_local_instance_replacement,
             profiles::store_active_profile_credential,
         ])
         .build(tauri::generate_context!())

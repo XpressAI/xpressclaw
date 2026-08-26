@@ -11,7 +11,10 @@
 	let submitting = $state(false);
 	let desktopAttempted = $state(false);
 	let desktopIdentityBlocked = $state(false);
+	let blockedLocalProfile = $state(false);
+	let pinnedInstanceId = $state<string | null>(null);
 	let returningLocal = $state(false);
+	let trustingReplacement = $state(false);
 
 	function safeReturnTo(): string {
 		const candidate = $page.url.searchParams.get('return_to') ?? '/dashboard';
@@ -48,20 +51,23 @@
 	onMount(async () => {
 		try {
 			session = await auth.bootstrap();
-			if (!session.authentication_enabled || session.authenticated) {
-				await goto(safeReturnTo(), { replaceState: true });
-				return;
-			}
 			if ('__TAURI_INTERNALS__' in window) {
 				desktopAttempted = true;
 				const { invoke } = await import('@tauri-apps/api/core');
 				const active = await invoke<{ instance_id: string | null; local: boolean }>('get_active_instance_profile');
-				if (!active.local && active.instance_id && active.instance_id !== session.instance_id) {
+				if (active.instance_id && active.instance_id !== session.instance_id) {
 					desktopIdentityBlocked = true;
-					error = 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
+					blockedLocalProfile = active.local;
+					pinnedInstanceId = active.instance_id;
+					error = active.local
+						? 'A different XpressClaw instance is answering on the saved local address. Desktop will not send it a saved credential.'
+						: 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
 					return;
 				}
-				await finishDesktopLogin();
+				if (session.authentication_enabled && !session.authenticated && await finishDesktopLogin()) return;
+			}
+			if (!session.authentication_enabled || session.authenticated) {
+				await goto(safeReturnTo(), { replaceState: true });
 			}
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not reach this XpressClaw instance.';
@@ -77,6 +83,28 @@
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not return to the local instance.';
 			returningLocal = false;
+		}
+	}
+
+	async function trustLocalReplacement() {
+		if (!session || trustingReplacement) return;
+		trustingReplacement = true;
+		error = '';
+		try {
+			const { invoke } = await import('@tauri-apps/api/core');
+			await invoke('trust_local_instance_replacement', { instanceId: session.instance_id });
+			desktopIdentityBlocked = false;
+			blockedLocalProfile = false;
+			pinnedInstanceId = null;
+			if (session.authentication_enabled && !session.authenticated) {
+				await finishDesktopLogin();
+			} else {
+				await goto(safeReturnTo(), { replaceState: true });
+			}
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not trust the replacement local instance.';
+		} finally {
+			trustingReplacement = false;
 		}
 	}
 
@@ -130,9 +158,11 @@
 			<div class="mb-5 flex items-start gap-3">
 				<div class="grid size-9 shrink-0 place-items-center rounded-lg bg-muted"><LockKeyhole size={18} /></div>
 				<div>
-					<h1 class="text-xl font-semibold">Sign in to this instance</h1>
+					<h1 class="text-xl font-semibold">{desktopIdentityBlocked ? 'Verify this instance' : 'Sign in to this instance'}</h1>
 					<p class="mt-1 text-sm leading-relaxed text-muted-foreground">
-						{session?.credential_kind === 'startup_token'
+						{desktopIdentityBlocked
+							? 'Desktop detected that the instance identity changed before using a saved credential.'
+							: session?.credential_kind === 'startup_token'
 							? 'Enter the token printed when this instance started.'
 							: 'Enter the instance password set by its operator.'}
 					</p>
@@ -142,9 +172,20 @@
 			{#if desktopIdentityBlocked}
 				<div class="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">
 					<p>{error}</p>
-					<button type="button" onclick={returnToLocalInstance} disabled={returningLocal} class="mt-3 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium disabled:opacity-50">
-						{returningLocal ? 'Returning…' : 'Return to local instance'}
-					</button>
+					{#if blockedLocalProfile}
+						<div class="mt-3 space-y-1 text-xs text-muted-foreground">
+							<p>Saved identity: <code class="break-all">{pinnedInstanceId}</code></p>
+							<p>Current identity: <code class="break-all">{session?.instance_id}</code></p>
+						</div>
+						<p class="mt-3 text-xs text-foreground">Only trust the replacement if you intentionally reset or replaced this local instance. Desktop will remove the previous saved credential and ask for the new one.</p>
+						<button type="button" onclick={trustLocalReplacement} disabled={trustingReplacement} class="mt-3 rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground disabled:opacity-50">
+							{trustingReplacement ? 'Waiting for confirmation…' : 'Trust replacement local instance'}
+						</button>
+					{:else}
+						<button type="button" onclick={returnToLocalInstance} disabled={returningLocal} class="mt-3 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium disabled:opacity-50">
+							{returningLocal ? 'Returning…' : 'Return to local instance'}
+						</button>
+					{/if}
 				</div>
 			{:else if session?.credential_kind === 'restart_required'}
 				<div class="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
