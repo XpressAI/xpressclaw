@@ -11,6 +11,11 @@
 	let setupRoute = $derived($page.url.pathname.startsWith('/setup'));
 	let loginRoute = $derived($page.url.pathname === '/login');
 	let authenticationReady = $state(false);
+	type ActiveDesktopProfile = {
+		identity_status: 'unpinned' | 'matched' | 'changed';
+		navigation_status?: 'ready' | 'confirmation_required' | 'profile_review_required';
+		local: boolean;
+	};
 
 	onMount(() => {
 		initializeTheme();
@@ -23,14 +28,23 @@
 		void auth.bootstrap().then(async (session) => {
 			if ('__TAURI_INTERNALS__' in window) {
 				const { invoke } = await import('@tauri-apps/api/core');
-				const active = await invoke<{ identity_status: 'unpinned' | 'matched' | 'changed'; local: boolean }>('get_active_instance_profile');
+				const active = await invoke<ActiveDesktopProfile>('get_active_instance_profile');
 				if (active.identity_status === 'changed') {
 					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 					// Identity recovery belongs to the login page even when the
 					// replacement has authentication disabled. Native command guards
 					// also enforce this pin, so skipping /login cannot grant access.
+					await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
 					authenticationReady = true;
-					void goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
+					return;
+				}
+				if (!active.local && active.navigation_status !== 'ready') {
+					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+					// Revalidate the selected remote on every Desktop bootstrap. This
+					// catches an already-open remote that restarted with authentication
+					// disabled before any workspace content is made available.
+					await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
+					authenticationReady = true;
 					return;
 				}
 				if (active.identity_status === 'unpinned' && active.local && !session.authentication_enabled) {
@@ -42,11 +56,11 @@
 			}
 			if (session.authentication_enabled && !session.authenticated) {
 				const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-				// The root layout persists across client-side navigation. Mark its
-				// bootstrap complete before visiting /login so a successful login can
-				// return here without leaving the workspace behind this loading state.
+				// The root layout persists across client-side navigation. Complete its
+				// bootstrap after /login is active so no protected workspace can flash,
+				// while a successful login can still return through this layout.
+				await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
 				authenticationReady = true;
-				void goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
 				return;
 			}
 			authenticationReady = true;

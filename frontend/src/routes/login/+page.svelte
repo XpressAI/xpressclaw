@@ -11,6 +11,8 @@
 	let submitting = $state(false);
 	let desktopAttempted = $state(false);
 	let desktopIdentityBlocked = $state(false);
+	let desktopProfileBlocked = $state(false);
+	let unauthenticatedRemoteBlocked = $state(false);
 	let blockedLocalProfile = $state(false);
 	let returningLocal = $state(false);
 	let trustingReplacement = $state(false);
@@ -60,13 +62,25 @@
 			if ('__TAURI_INTERNALS__' in window) {
 				desktopAttempted = true;
 				const { invoke } = await import('@tauri-apps/api/core');
-				const active = await invoke<{ identity_status: 'unpinned' | 'matched' | 'changed'; local: boolean }>('get_active_instance_profile');
+				const active = await invoke<{
+					identity_status: 'unpinned' | 'matched' | 'changed';
+					navigation_status?: 'ready' | 'confirmation_required' | 'profile_review_required';
+					local: boolean;
+				}>('get_active_instance_profile');
 				if (active.identity_status === 'changed') {
 					desktopIdentityBlocked = true;
 					blockedLocalProfile = active.local;
 					error = active.local
 						? 'A different XpressClaw instance is answering on the saved local address. Desktop will not send it a saved credential.'
 						: 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
+					return;
+				}
+				if (!active.local && active.navigation_status !== 'ready') {
+					desktopProfileBlocked = true;
+					unauthenticatedRemoteBlocked = active.navigation_status === 'confirmation_required';
+					error = unauthenticatedRemoteBlocked
+						? 'This remote instance now has authentication disabled. Return to the local instance, edit this profile, and explicitly confirm that its network is trusted before reconnecting.'
+						: 'This remote profile must be reviewed from the local instance before Desktop can reconnect.';
 					return;
 				}
 				if (session.authentication_enabled && !session.authenticated && await finishDesktopLogin()) return;
@@ -162,9 +176,13 @@
 			<div class="mb-5 flex items-start gap-3">
 				<div class="grid size-9 shrink-0 place-items-center rounded-lg bg-muted"><LockKeyhole size={18} /></div>
 				<div>
-					<h1 class="text-xl font-semibold">{desktopIdentityBlocked ? 'Verify this instance' : 'Sign in to this instance'}</h1>
+					<h1 class="text-xl font-semibold">{desktopProfileBlocked ? 'Review remote access' : desktopIdentityBlocked ? 'Verify this instance' : 'Sign in to this instance'}</h1>
 					<p class="mt-1 text-sm leading-relaxed text-muted-foreground">
-						{desktopIdentityBlocked
+						{desktopProfileBlocked
+							? unauthenticatedRemoteBlocked
+								? 'Authentication changed while this remote profile was active.'
+								: 'Desktop cannot safely reconnect with the profile as currently saved.'
+							: desktopIdentityBlocked
 							? 'Desktop detected that the instance identity changed before using a saved credential.'
 							: session?.credential_kind === 'startup_token'
 							? 'Enter the token printed when this instance started.'
@@ -173,7 +191,14 @@
 				</div>
 			</div>
 
-			{#if desktopIdentityBlocked}
+			{#if desktopProfileBlocked}
+				<div class="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">
+					<p>{error}</p>
+					<button type="button" onclick={returnToLocalInstance} disabled={returningLocal} class="mt-3 rounded-md border border-destructive/40 px-3 py-1.5 text-xs font-medium disabled:opacity-50">
+						{returningLocal ? 'Returning…' : 'Return to local instance'}
+					</button>
+				</div>
+			{:else if desktopIdentityBlocked}
 				<div class="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">
 					<p>{error}</p>
 					{#if blockedLocalProfile}

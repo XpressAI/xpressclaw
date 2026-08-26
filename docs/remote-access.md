@@ -108,6 +108,9 @@ identity. A relaying endpoint therefore sees only ciphertext, not the saved
 credential, during the native exchange. The profile JSON contains only the
 name, URL, public identity, and authentication mode. A remote profile with
 authentication off requires the same trusted-network confirmation.
+Desktop rechecks this policy whenever an active remote page loads, so a remote
+that restarts with authentication disabled returns to a blocked review screen
+instead of inheriting access from an earlier authenticated session.
 
 Automatic keychain login is available only for the exact local HTTP sidecar
 whose listeners were started by the current Desktop process. Remote profiles

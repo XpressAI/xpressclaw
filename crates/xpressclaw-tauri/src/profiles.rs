@@ -80,6 +80,7 @@ pub struct InstanceProfile {
 #[derive(Debug, Serialize)]
 pub struct ActiveProfileIdentity {
     identity_status: &'static str,
+    navigation_status: &'static str,
     local: bool,
 }
 
@@ -916,11 +917,13 @@ pub async fn get_active_instance_profile(
         }
         Some(_) => "changed",
     };
+    let navigation_status = active_profile_navigation_status(&profile, &bootstrap, identity_status);
     if require_active_profile_origin(&state, &webview)? != profile {
         return Err("The selected Desktop profile changed while its identity was inspected".into());
     }
     Ok(ActiveProfileIdentity {
         identity_status,
+        navigation_status,
         local: profile.local,
     })
 }
@@ -1139,6 +1142,24 @@ fn validate_remote_profile_navigation(
         );
     }
     Ok(())
+}
+
+fn active_profile_navigation_status(
+    profile: &StoredProfile,
+    bootstrap: &Bootstrap,
+    identity_status: &str,
+) -> &'static str {
+    if profile.local || identity_status == "changed" {
+        return "ready";
+    }
+    if identity_status != "matched" {
+        return "profile_review_required";
+    }
+    match validate_remote_profile_navigation(profile, bootstrap) {
+        Ok(()) => "ready",
+        Err(_) if !bootstrap.authentication_enabled => "confirmation_required",
+        Err(_) => "profile_review_required",
+    }
 }
 
 /// Dynamic Tauri capabilities cannot be revoked after a profile switch. Keep
@@ -2383,9 +2404,25 @@ mod tests {
 
         let no_auth = identity.bootstrap(false, "disabled");
         assert!(validate_remote_profile_navigation(&profile, &no_auth).is_err());
+        assert_eq!(
+            active_profile_navigation_status(&profile, &no_auth, "matched"),
+            "confirmation_required"
+        );
         profile.authentication = "none".into();
+        assert_eq!(
+            active_profile_navigation_status(&profile, &no_auth, "matched"),
+            "confirmation_required"
+        );
         profile.confirmed_unauthenticated_remote = true;
         assert!(validate_remote_profile_navigation(&profile, &no_auth).is_ok());
+        assert_eq!(
+            active_profile_navigation_status(&profile, &no_auth, "matched"),
+            "ready"
+        );
+        assert_eq!(
+            active_profile_navigation_status(&profile, &no_auth, "unpinned"),
+            "profile_review_required"
+        );
     }
 
     #[tokio::test]
@@ -2772,10 +2809,14 @@ mod tests {
 
         let response = serde_json::to_string(&ActiveProfileIdentity {
             identity_status: "changed",
+            navigation_status: "ready",
             local: false,
         })
         .unwrap();
-        assert_eq!(response, r#"{"identity_status":"changed","local":false}"#);
+        assert_eq!(
+            response,
+            r#"{"identity_status":"changed","navigation_status":"ready","local":false}"#
+        );
         assert!(!response.contains("native-secret-pin"));
         assert!(!response.contains("instance_id"));
     }

@@ -62,7 +62,10 @@ be coupled to browser sessions.
   proof, and native code cannot bind the browser's cookie-bearing TLS connection
   to that proof. An identity-proved remote is therefore navigated without first
   validating keychain material, allowing its browser login to collect a rotated
-  startup token or current password. For the eligible local origin, the
+  startup token or current password. Native Desktop revalidates the selected
+  profile's navigation policy on every page bootstrap; an active remote that
+  restarts with authentication disabled is blocked until its trusted-network
+  confirmation is explicitly saved. For the eligible local origin, the
   requested browser session is returned only inside the encrypted channel;
   native Desktop installs its HttpOnly cookie and returns only success/failure
   to web content. Passwords, startup tokens, session values, and redeemable

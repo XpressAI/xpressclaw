@@ -148,7 +148,7 @@ test('Desktop remote profiles use explicit browser login without a native sessio
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string) => {
 				if (command === 'get_active_instance_profile') {
-					return { identity_status: 'matched', local: false };
+					return { identity_status: 'matched', navigation_status: 'ready', local: false };
 				}
 				if (command === 'login_active_profile') {
 					target.__remoteLoginCalls += 1;
@@ -251,6 +251,60 @@ test('Desktop routes a no-auth replacement through identity recovery', async ({ 
 	await page.goto('/dashboard');
 	await expect(page).toHaveURL(/\/login\?return_to=%2Fdashboard$/);
 	await expect(page.getByText(/address now identifies a different XpressClaw instance/i)).toBeVisible();
+	await page.getByRole('button', { name: 'Return to local instance' }).click();
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __selectedProfile: string | null }
+	).__selectedProfile)).toBe('local');
+});
+
+test('Desktop blocks an active remote that reloads with authentication disabled', async ({ page }) => {
+	let nonBootstrapRequests = 0;
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__selectedProfile: string | null;
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__selectedProfile = null;
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					return {
+						identity_status: 'matched',
+						navigation_status: 'confirmation_required',
+						local: false,
+					};
+				}
+				if (command === 'select_instance_profile') {
+					target.__selectedProfile = (args as { id: string }).id;
+					return null;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/**', async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, {
+				instance_id: 'same-remote-instance',
+				authentication_enabled: false,
+				credential_kind: 'disabled',
+				authenticated: true,
+				csrf_token: null,
+			});
+			return;
+		}
+		nonBootstrapRequests += 1;
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/dashboard');
+	await expect(page).toHaveURL(/\/login\?return_to=%2Fdashboard$/);
+	await expect(page.getByRole('heading', { name: 'Review remote access' })).toBeVisible();
+	await expect(page.getByText(/now has authentication disabled/i)).toBeVisible();
+	await expect(page.getByLabel('Password')).toHaveCount(0);
+	expect(nonBootstrapRequests).toBe(0);
+
 	await page.getByRole('button', { name: 'Return to local instance' }).click();
 	await expect.poll(() => page.evaluate(() => (
 		window as unknown as { __selectedProfile: string | null }
