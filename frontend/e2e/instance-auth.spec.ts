@@ -181,7 +181,7 @@ test('Desktop profiles can be edited without exposing their saved keychain crede
 		target.__desktopProfileCalls = [];
 		target.__desktopProfiles = [
 			{ id: 'local', name: 'Local XpressClaw', url: 'http://localhost:8935', instance_id: 'local-id', authentication: 'none', local: true, active: true, health: 'healthy', confirmed_unauthenticated_remote: true },
-			{ id: 'remote-id', name: 'Tailnet server', url: 'https://server.tailnet.example', instance_id: 'remote-instance', authentication: 'password', local: false, active: false, health: 'healthy', confirmed_unauthenticated_remote: false },
+			{ id: 'remote-id', name: 'Tailnet server', url: 'https://server.tailnet.example', instance_id: 'remote-instance', authentication: 'password', local: false, active: false, health: 'reachable', confirmed_unauthenticated_remote: false },
 		];
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
@@ -211,7 +211,7 @@ test('Desktop profiles can be edited without exposing their saved keychain crede
 
 	await page.goto('/settings/server');
 	await expect(page.getByText('Tailnet server', { exact: true })).toBeVisible();
-	await expect(page.getByText('Healthy · password')).toBeVisible();
+	await expect(page.getByText('Reachable · password')).toBeVisible();
 	await page.getByRole('button', { name: 'Edit Tailnet server' }).click();
 	await expect(page.getByText('Edit remote profile')).toBeVisible();
 	await expect(page.getByPlaceholder('Blank keeps it only when address and mode are unchanged')).toHaveValue('');

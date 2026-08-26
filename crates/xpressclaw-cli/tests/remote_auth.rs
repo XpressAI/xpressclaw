@@ -99,6 +99,59 @@ fn detached_launcher_prints_token_without_writing_it_to_server_log() {
 }
 
 #[test]
+fn detached_password_mode_does_not_print_an_unused_candidate_token() {
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("password-instance");
+    std::fs::create_dir_all(&instance).unwrap();
+    let mut config = Config::default();
+    config.system.data_dir = instance.clone();
+    config.system.workspace_dir = instance.join("workspaces");
+    config.instance.authentication_enabled = true;
+    config.save(&instance.join("xpressclaw.yaml")).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let hash = runtime
+        .block_on(xpressclaw_server::auth::hash_password(
+            zeroize::Zeroizing::new("configured password value".to_string()),
+        ))
+        .unwrap();
+    xpressclaw_server::auth::store_password_hash(&instance, Some(&hash)).unwrap();
+
+    let port = unused_port();
+    let binary = env!("CARGO_BIN_EXE_xpressclaw");
+    let output = Command::new(binary)
+        .args([
+            "up",
+            "--detach",
+            "--instance",
+            instance.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _guard = DetachedGuard(instance.clone());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    wait_for_listener(port);
+    let log = std::fs::read_to_string(instance.join("server.log")).unwrap_or_default();
+    assert!(!log.contains("XPRESSCLAW_STARTUP_TOKEN="));
+
+    let stopped = Command::new(binary)
+        .args(["down", "--instance", instance.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+}
+
+#[test]
 fn foreground_does_not_announce_a_token_when_the_listener_is_owned() {
     let root = tempfile::tempdir().unwrap();
     let instance = root.path().join("occupied-instance");
@@ -125,6 +178,39 @@ fn foreground_does_not_announce_a_token_when_the_listener_is_owned() {
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_STARTUP_TOKEN="));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_STARTUP_TOKEN="));
+}
+
+#[test]
+fn detached_does_not_announce_a_token_or_succeed_before_listener_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("occupied-detached-instance");
+    std::fs::create_dir_all(&instance).unwrap();
+    let mut config = Config::default();
+    config.system.data_dir = instance.clone();
+    config.system.workspace_dir = instance.join("workspaces");
+    config.instance.authentication_enabled = true;
+    config.save(&instance.join("xpressclaw.yaml")).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let output = Command::new(env!("CARGO_BIN_EXE_xpressclaw"))
+        .args([
+            "up",
+            "--detach",
+            "--instance",
+            instance.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    assert!(!instance.join("server.pid").exists());
+    let log = std::fs::read_to_string(instance.join("server.log")).unwrap_or_default();
+    assert!(!log.contains("XPRESSCLAW_STARTUP_TOKEN="));
 }
 
 #[test]

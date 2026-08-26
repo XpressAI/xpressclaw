@@ -785,19 +785,16 @@ async fn inspect_profile(
             } else if bootstrap.authentication_enabled {
                 match effective_authentication(&bootstrap) {
                     Ok(expected) if profile.local || expected == profile.authentication => {
-                        match credential_for_authentication(state, profile, expected).await {
-                            Ok(credential)
-                                if request_ticket(
-                                    &profile.url,
-                                    &credential,
-                                    &bootstrap.instance_id,
-                                )
-                                .await
-                                .is_ok() =>
-                            {
-                                "healthy"
-                            }
-                            _ => "authentication_required",
+                        // Profile listing is passive discovery. Validating a
+                        // stored credential here would spend the instance's
+                        // interactive brute-force budget every time Settings
+                        // refreshes, potentially locking out the operator when
+                        // a saved password or startup token is stale. The
+                        // explicit Save/Connect/Login paths still authenticate.
+                        if profile_credential(state, profile).is_ok() {
+                            "reachable"
+                        } else {
+                            "authentication_required"
                         }
                     }
                     _ => "authentication_required",
@@ -1251,5 +1248,75 @@ mod tests {
         assert!(result.is_err());
         redirect_thread.join().unwrap();
         assert!(!target_thread.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn profile_inspection_never_submits_a_saved_credential() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex as StdMutex};
+        use std::time::{Duration, Instant};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let observed = requests.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(400);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(250)))
+                            .unwrap();
+                        let mut request = [0_u8; 4096];
+                        let read = stream.read(&mut request).unwrap();
+                        let request = String::from_utf8_lossy(&request[..read]);
+                        observed
+                            .lock()
+                            .unwrap()
+                            .push(request.lines().next().unwrap_or_default().to_string());
+                        let body = r#"{"instance_id":"instance","authentication_enabled":true,"credential_kind":"startup_token"}"#;
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("profile test listener failed: {error}"),
+                }
+            }
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile::default()),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(Some(Zeroizing::new(
+                "saved-token-that-may-have-gone-stale".to_string(),
+            ))),
+        };
+        let profile = StoredProfile {
+            id: LOCAL_PROFILE_ID.to_string(),
+            name: "Local XpressClaw".to_string(),
+            url: format!("http://{address}"),
+            instance_id: Some("instance".to_string()),
+            authentication: "startup_token".to_string(),
+            local: true,
+            confirmed_unauthenticated_remote: true,
+        };
+
+        let (health, _) = inspect_profile(&state, &profile).await;
+        assert_eq!(health, "reachable");
+        server.join().unwrap();
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            ["GET /api/auth/bootstrap HTTP/1.1"]
+        );
     }
 }

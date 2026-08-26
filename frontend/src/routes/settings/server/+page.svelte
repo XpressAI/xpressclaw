@@ -11,7 +11,7 @@
 		authentication: 'password' | 'startup_token' | 'none';
 		local: boolean;
 		active: boolean;
-		health: 'healthy' | 'unreachable' | 'identity_changed' | 'authentication_required' | 'unknown';
+		health: 'healthy' | 'reachable' | 'unreachable' | 'identity_changed' | 'authentication_required' | 'unknown';
 		confirmed_unauthenticated_remote: boolean;
 	};
 
@@ -49,6 +49,7 @@
 	};
 	const profileHealthLabel = (value: DesktopProfile['health']) => ({
 		healthy: 'Healthy',
+		reachable: 'Reachable',
 		unreachable: 'Unreachable',
 		identity_changed: 'Identity changed',
 		authentication_required: 'Credentials needed',
@@ -291,7 +292,7 @@
 			<div class="mt-4 grid gap-2">
 				{#each profiles as profile}
 					<div class="flex items-center gap-3 rounded-lg border {profile.active ? 'border-primary/50 bg-primary/5' : 'border-border'} p-3">
-						<span aria-hidden="true" class="size-2.5 rounded-full {profile.health === 'healthy' ? 'bg-emerald-500' : profile.health === 'unreachable' ? 'bg-red-500' : 'bg-amber-500'}"></span>
+						<span aria-hidden="true" class="size-2.5 rounded-full {profile.health === 'healthy' || profile.health === 'reachable' ? 'bg-emerald-500' : profile.health === 'unreachable' ? 'bg-red-500' : 'bg-amber-500'}"></span>
 						<div class="min-w-0 flex-1"><p class="truncate text-sm font-medium">{profile.name}{profile.local ? ' · Local' : ''}</p><p class="truncate text-xs text-muted-foreground">{profile.url}</p><p class="mt-0.5 text-[11px] text-muted-foreground">{profileHealthLabel(profile.health)} · {profile.authentication.replace('_', ' ')}</p></div>
 						{#if !profile.active}<button type="button" onclick={() => selectProfile(profile.id)} class="rounded-md border border-border px-2.5 py-1.5 text-xs">Connect</button>{:else}<span class="text-xs font-medium text-primary">Connected</span>{/if}
 						{#if !profile.local}<button type="button" aria-label="Edit {profile.name}" onclick={() => editProfile(profile)} class="rounded-md p-1.5 text-muted-foreground hover:text-foreground"><Pencil size={15} /></button><button type="button" aria-label="Delete {profile.name}" onclick={() => deleteProfile(profile.id)} class="rounded-md p-1.5 text-muted-foreground hover:text-destructive"><Trash2 size={15} /></button>{/if}

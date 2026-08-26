@@ -1,7 +1,9 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::InstanceConfig;
@@ -41,26 +43,69 @@ pub async fn run(
     let configured = load_instance_config(&selected)?;
     let effective =
         resolve_instance_config(&configured.instance, bind, port, allow_insecure_remote)?;
-    let supplied_startup_token = if startup_token_stdin {
-        Some(read_startup_token()?)
+    let launcher_input = if startup_token_stdin {
+        Some(read_detached_launcher_input()?)
     } else {
         None
     };
 
     if detach {
-        return run_detached(&effective, &configured, &selected);
+        return run_detached(&effective, &selected);
     }
 
-    run_foreground(effective, &selected, supplied_startup_token).await
+    run_foreground(effective, &selected, launcher_input).await
+}
+
+struct DetachedLauncherInput {
+    startup_token: Zeroizing<String>,
+    ready_port: u16,
+    ready_nonce: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+struct RawDetachedLauncherInput {
+    startup_token: String,
+    ready_port: u16,
+    ready_nonce: String,
+}
+
+#[derive(Serialize)]
+struct DetachedLauncherPayload<'a> {
+    startup_token: &'a str,
+    ready_port: u16,
+    ready_nonce: &'a str,
+}
+
+#[derive(Serialize)]
+struct DetachedReadyAnnouncement<'a> {
+    nonce: &'a str,
+    startup_token_in_use: bool,
+}
+
+#[derive(Deserialize)]
+struct RawDetachedReadyAnnouncement {
+    nonce: String,
+    startup_token_in_use: bool,
 }
 
 /// Run the server in the foreground (default).
 async fn run_foreground(
     effective: InstanceConfig,
     instance: &Instance,
-    supplied_startup_token: Option<Zeroizing<String>>,
+    launcher_input: Option<DetachedLauncherInput>,
 ) -> anyhow::Result<()> {
+    let (supplied_startup_token, readiness) = match launcher_input {
+        Some(input) => (
+            Some(input.startup_token),
+            Some((input.ready_port, input.ready_nonce)),
+        ),
+        None => (None, None),
+    };
     let state = build_state(instance, effective.clone(), supplied_startup_token).await?;
+    let startup_token_in_use = matches!(
+        state.auth.credential_kind(),
+        xpressclaw_server::auth::CredentialKind::StartupToken
+    );
     let ui_url = ui_url(effective.bind, effective.port);
 
     if !state.is_setup_complete() {
@@ -89,6 +134,9 @@ async fn run_foreground(
 
     let startup_token = state.auth.take_startup_token_announcement();
     server::serve_on_with_bound_callback(state, effective.bind, effective.port, move || {
+        if let Some((ready_port, ready_nonce)) = readiness {
+            announce_detached_ready(ready_port, &ready_nonce, startup_token_in_use)?;
+        }
         if let Some(token) = startup_token {
             print_startup_token(&token)?;
         }
@@ -103,11 +151,7 @@ async fn run_foreground(
 ///
 /// Re-executes `xpressclaw up` (without --detach) in a new process,
 /// redirecting stdout/stderr to a log file.
-fn run_detached(
-    effective: &InstanceConfig,
-    config: &Config,
-    instance: &Instance,
-) -> anyhow::Result<()> {
+fn run_detached(effective: &InstanceConfig, instance: &Instance) -> anyhow::Result<()> {
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
@@ -140,55 +184,71 @@ fn run_detached(
     let log_file = File::create(&log_path)?;
     let err_file = log_file.try_clone()?;
 
+    let ready_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    ready_listener.set_nonblocking(true)?;
+    let ready_port = ready_listener.local_addr()?.port();
+    let ready_nonce = xpressclaw_server::auth::generate_startup_token()?;
+
     let mut command = Command::new(exe);
     command
         .arg("up")
         .args(["--port", &effective.port.to_string()])
         .args(["--bind", &effective.bind.to_string()])
         .arg("--instance")
-        .arg(&instance.root);
+        .arg(&instance.root)
+        .arg("--startup-token-stdin")
+        .stdin(std::process::Stdio::piped());
     if !effective.bind.is_loopback() && !effective.authentication_enabled {
         command.arg("--allow-insecure-remote");
     }
-    let startup_token = if effective.authentication_enabled
-        && !xpressclaw_server::auth::password_configured(&config.system.data_dir)?
-    {
-        command.arg("--startup-token-stdin");
-        command.stdin(std::process::Stdio::piped());
-        Some(xpressclaw_server::auth::generate_startup_token()?)
-    } else {
-        command.stdin(std::process::Stdio::null());
-        None
-    };
+    // Always supply a candidate token. The child ignores it when auth is off
+    // or a password verifier exists, and reports the effective credential mode
+    // in its authenticated readiness response. This keeps a concurrent config
+    // change from generating a token in the child log or exposing an unused
+    // token from the parent.
+    let startup_token = xpressclaw_server::auth::generate_startup_token()?;
     let mut child = command.stdout(log_file).stderr(err_file).spawn()?;
 
-    if let Some(token) = startup_token.as_ref() {
-        let write_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("detached child did not expose its startup-token pipe"))
-            .and_then(|mut stdin| {
-                writeln!(stdin, "{}", token.as_str())?;
-                Ok(())
-            });
-        if let Err(error) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("detached child did not expose its launcher pipe"))
+        .and_then(|mut stdin| {
+            serde_json::to_writer(
+                &mut stdin,
+                &DetachedLauncherPayload {
+                    startup_token: startup_token.as_str(),
+                    ready_port,
+                    ready_nonce: &ready_nonce,
+                },
+            )?;
+            writeln!(stdin)?;
+            Ok(())
+        });
+    if let Err(error) = write_result {
+        terminate_child(&mut child);
+        return Err(error);
     }
 
     let pid = child.id();
+    let startup_token_in_use =
+        match wait_for_detached_ready(&mut child, &ready_listener, &ready_nonce, &log_path) {
+            Ok(startup_token_in_use) => startup_token_in_use,
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = std::fs::remove_file(&pid_path);
+                return Err(error);
+            }
+        };
     if let Err(error) = std::fs::write(&pid_path, pid.to_string()) {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_child(&mut child);
         return Err(error.into());
     }
 
-    if let Some(token) = startup_token {
+    if startup_token_in_use {
+        let token = startup_token;
         if let Err(error) = print_startup_token(&token) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_child(&mut child);
             let _ = std::fs::remove_file(&pid_path);
             return Err(error);
         }
@@ -208,6 +268,84 @@ fn run_detached(
         );
     }
 
+    Ok(())
+}
+
+fn wait_for_detached_ready(
+    child: &mut std::process::Child,
+    listener: &std::net::TcpListener,
+    expected_nonce: &str,
+    log_path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    use std::io::Read;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "detached XpressClaw exited with {status} before owning its listeners; see {}",
+                log_path.display()
+            );
+        }
+
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                let mut announcement = String::new();
+                if stream.take(1025).read_to_string(&mut announcement).is_ok() {
+                    let parsed =
+                        serde_json::from_str::<RawDetachedReadyAnnouncement>(announcement.trim());
+                    announcement.zeroize();
+                    if let Ok(mut parsed) = parsed {
+                        let nonce_matches = parsed.nonce == expected_nonce;
+                        parsed.nonce.zeroize();
+                        if nonce_matches {
+                            return Ok(parsed.startup_token_in_use);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "detached XpressClaw did not own its listeners within 10 seconds; see {}",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn announce_detached_ready(
+    port: u16,
+    nonce: &str,
+    startup_token_in_use: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let address = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    serde_json::to_writer(
+        &mut stream,
+        &DetachedReadyAnnouncement {
+            nonce,
+            startup_token_in_use,
+        },
+    )?;
+    writeln!(stream)?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -358,16 +496,29 @@ fn resolve_instance_config(
     )
 }
 
-fn read_startup_token() -> anyhow::Result<Zeroizing<String>> {
+fn read_detached_launcher_input() -> anyhow::Result<DetachedLauncherInput> {
     use std::io::Read;
-    let mut token = String::new();
-    std::io::stdin().take(4097).read_to_string(&mut token)?;
-    let trimmed = token.trim().to_string();
-    token.zeroize();
-    if !(20..=256).contains(&trimmed.len()) {
+    let mut payload = String::new();
+    std::io::stdin().take(8193).read_to_string(&mut payload)?;
+    let parsed = serde_json::from_str::<RawDetachedLauncherInput>(&payload);
+    payload.zeroize();
+    let mut parsed = parsed
+        .map_err(|_| anyhow::anyhow!("the detached launcher supplied invalid startup data"))?;
+    if parsed.ready_port == 0 || !(20..=256).contains(&parsed.ready_nonce.len()) {
+        parsed.ready_nonce.zeroize();
+        parsed.startup_token.zeroize();
+        anyhow::bail!("the detached launcher supplied invalid readiness data");
+    }
+    if !(20..=256).contains(&parsed.startup_token.len()) {
+        parsed.ready_nonce.zeroize();
+        parsed.startup_token.zeroize();
         anyhow::bail!("the detached launcher supplied an invalid startup token");
     }
-    Ok(Zeroizing::new(trimmed))
+    Ok(DetachedLauncherInput {
+        startup_token: Zeroizing::new(std::mem::take(&mut parsed.startup_token)),
+        ready_port: parsed.ready_port,
+        ready_nonce: Zeroizing::new(std::mem::take(&mut parsed.ready_nonce)),
+    })
 }
 
 fn print_startup_token(token: &str) -> anyhow::Result<()> {

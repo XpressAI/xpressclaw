@@ -46,7 +46,7 @@ pub enum Command {
         #[arg(long)]
         allow_insecure_remote: bool,
 
-        /// Read a pre-generated startup token from stdin (launcher protocol)
+        /// Read the detached-launcher startup handshake from stdin
         #[arg(long, hide = true)]
         startup_token_stdin: bool,
     },
