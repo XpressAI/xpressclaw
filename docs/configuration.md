@@ -70,12 +70,16 @@ startup tokens are process-local and disappear on restart. These secret files,
 Desktop profile data, and sessions are outside Project synchronization. Desktop
 stores remote profile credentials in the operating-system keychain; its JSON
 profile file contains only non-secret connection metadata. Before Desktop
-submits a saved credential, it opens a one-use encrypted channel authenticated
-by the pinned instance identity. Browser-session material returns through that
-same channel and is installed as an HttpOnly cookie by native Desktop, so web
-content receives no credential, session value, or redeemable bearer ticket.
-This protects native secrets from a relaying endpoint but does not replace TLS
-for the subsequent browser session.
+submits a saved credential, it requires either an HTTPS remote profile or the
+exact local HTTP identity announced by the sidecar whose listeners Desktop
+started. It then opens a one-use encrypted channel authenticated by the pinned
+instance identity. Browser-session material returns through that same channel
+and is installed as an HttpOnly cookie by native Desktop, so web content
+receives no credential, session value, or redeemable bearer ticket. Desktop
+does not automatically submit a keychain credential or install a session for
+an HTTP remote profile; users may still sign in through the browser on an
+operator-trusted LAN or tailnet. The channel protects native secrets but does
+not replace TLS for the subsequent browser session.
 
 Application authentication does not provide TLS. See [Remote
 access](remote-access.md) before selecting a non-loopback address.

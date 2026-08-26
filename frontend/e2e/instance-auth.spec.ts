@@ -138,6 +138,46 @@ test('Desktop auto-login returns only status after native session installation',
 	).__desktopLoginResults)).toEqual([true]);
 });
 
+test('Desktop HTTP remote profiles fall back to an explicit browser login', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: false };
+				}
+				if (command === 'login_active_profile') {
+					throw new Error(
+						'Desktop does not use saved credentials for automatic login to an HTTP remote profile. Enter the credential manually on this trusted network, or use HTTPS for automatic keychain login.'
+					);
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/**', async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, {
+				instance_id: 'desktop-http-remote',
+				authentication_enabled: true,
+				credential_kind: 'password',
+				authenticated: false,
+				csrf_token: null,
+			});
+			return;
+		}
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/login?return_to=%2Fdashboard');
+	await expect(page).toHaveURL(/\/login/);
+	await expect(page.getByRole('alert')).toContainText('does not use saved credentials');
+	await expect(page.getByLabel('Password')).toBeVisible();
+});
+
 test('Desktop blocks credentials when a remote address changes instance identity', async ({ page }) => {
 	await page.addInitScript(() => {
 		const target = window as unknown as {

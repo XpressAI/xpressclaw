@@ -222,7 +222,7 @@
 			</div>
 		</section>
 		{#if desktopAttempted}
-			<p class="mt-3 text-center text-[11px] text-muted-foreground">Desktop credentials are read from your operating-system keychain and are never copied into this page.</p>
+			<p class="mt-3 text-center text-[11px] text-muted-foreground">When automatic login is available, Desktop reads credentials from your operating-system keychain without copying them into this page. HTTP remote profiles use the browser login above.</p>
 		{/if}
 	</div>
 </main>

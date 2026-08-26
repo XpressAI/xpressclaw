@@ -109,6 +109,14 @@ credential, during the native exchange. The profile JSON contains only the
 name, URL, public identity, and authentication mode. A remote profile with
 authentication off requires the same trusted-network confirmation.
 
+Automatic keychain login is available for HTTPS remote profiles and for the
+exact local HTTP sidecar whose listeners were started by the current Desktop
+process. Desktop deliberately does not submit a saved credential or install a
+browser session for an HTTP remote profile: an active HTTP replacement could
+relay identity proof and then steal any cookie installed for its origin. Direct
+HTTP over an operator-trusted LAN or tailnet remains supported through the
+normal browser login form.
+
 The current Desktop release intentionally selects one profile for the whole
 application. Switching closes secondary workspace windows before navigating
 the main window, so no window silently remains connected to stale instance
@@ -116,11 +124,12 @@ state. The local sidecar remains running while a remote profile is selected.
 An expired browser session returns to the login screen. If a selected remote
 profile is unreachable or its saved credential is rejected during Desktop
 startup, Desktop falls back to the automatic local profile and marks the
-remote profile as needing credentials. The server creates browser-session
-material only inside the signed one-use encrypted channel. Desktop installs
-the session as an HttpOnly cookie and returns only success/failure to web
-content; no password, startup token, session token, or redeemable bearer ticket
-crosses the native command boundary.
+remote profile as needing credentials. For an origin eligible for automatic
+login, the server creates browser-session material only inside the signed
+one-use encrypted channel. Desktop installs the session as an HttpOnly cookie
+and returns only success/failure to web content; no password, startup token,
+session token, or redeemable bearer ticket crosses the native command
+boundary.
 
 This credential channel protects the saved secret during Desktop login; it
 does not add TLS or protect the browser session from an active network relay.

@@ -891,7 +891,7 @@ pub async fn login_active_profile(
         ));
     }
     let credential = credential_for_authentication(&state, &credential_profile, expected).await?;
-    let session = request_desktop_session(&profile.url, &credential, &bootstrap).await?;
+    let session = request_desktop_session(&state, &profile, &credential, &bootstrap).await?;
     if require_active_profile_origin(&state, &webview)? != profile {
         return Err("The selected Desktop profile changed while authentication completed".into());
     }
@@ -1728,12 +1728,14 @@ async fn validate_desktop_credential(
 }
 
 async fn request_desktop_session(
-    url: &str,
+    state: &ProfileState,
+    profile: &StoredProfile,
     credential: &str,
     bootstrap: &Bootstrap,
 ) -> Result<DesktopBrowserSession, String> {
+    require_proved_native_session_origin(state, profile, bootstrap)?;
     match request_desktop_auth(
-        url,
+        &profile.url,
         credential,
         bootstrap,
         DesktopCredentialPurpose::BrowserSession,
@@ -1750,6 +1752,30 @@ async fn request_desktop_session(
             Err("The remote instance did not create a browser session".to_string())
         }
     }
+}
+
+fn require_proved_native_session_origin(
+    state: &ProfileState,
+    profile: &StoredProfile,
+    bootstrap: &Bootstrap,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(&profile.url)
+        .map_err(|error| format!("The selected Desktop profile URL is invalid: {error}"))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    if profile.local
+        && state.local_bound_identity()?.as_deref() == Some(bootstrap.identity_public_key.as_str())
+    {
+        return Ok(());
+    }
+    Err(if profile.local {
+        "Desktop automatic login is unavailable because this HTTP local instance was not started by the current Desktop process. Enter the credential manually, or restart the local sidecar from Desktop."
+            .to_string()
+    } else {
+        "Desktop does not use saved credentials for automatic login to an HTTP remote profile. Enter the credential manually on this trusted network, or use HTTPS for automatic keychain login."
+            .to_string()
+    })
 }
 
 fn desktop_session_cookie<'a>(
@@ -2812,15 +2838,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relayed_identity_proof_keeps_credential_and_session_native() {
+    async fn listener_bound_login_keeps_credential_and_session_native() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let identity = TestIdentity::new("genuine-instance");
         let bootstrap = identity.bootstrap(true, "password");
+        let root = tempfile::tempdir().unwrap();
+        let profile = StoredProfile {
+            id: LOCAL_PROFILE_ID.to_string(),
+            name: "Local XpressClaw".to_string(),
+            url: format!("http://{address}"),
+            instance_id: Some(bootstrap.instance_id.clone()),
+            identity_public_key: Some(bootstrap.identity_public_key.clone()),
+            authentication: "password".to_string(),
+            local: true,
+            confirmed_unauthenticated_remote: true,
+        };
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: LOCAL_PROFILE_ID.to_string(),
+                profiles: vec![profile.clone()],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(Some(bootstrap.identity_public_key.clone())),
+        };
         let server = std::thread::spawn(move || {
-            // This endpoint represents a replacement origin relaying the
-            // proof to the genuine instance. It can observe both HTTP bodies,
-            // but only the genuine side of the relay owns the ephemeral key.
+            // A listener-bound local endpoint can observe both HTTP bodies,
+            // but only native Desktop and the server own the ephemeral keys.
             let (mut proof_stream, _) = listener.accept().unwrap();
             let proof_request = read_http_request(&mut proof_stream);
             let (proof, genuine_channel) = identity.credential_proof_json(&proof_request);
@@ -2862,7 +2909,8 @@ mod tests {
         });
 
         let session = request_desktop_session(
-            &format!("http://{address}"),
+            &state,
+            &profile,
             "saved-password-must-stay-secret",
             &bootstrap,
         )
@@ -2873,6 +2921,66 @@ mod tests {
             session.session.as_str(),
             "native-only-session-must-stay-secret"
         );
+    }
+
+    #[tokio::test]
+    async fn remote_http_relay_cannot_receive_a_native_browser_session() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("remote-instance");
+        let bootstrap = identity.bootstrap(true, "password");
+        let profile = StoredProfile {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            url: format!("http://{address}"),
+            instance_id: Some(bootstrap.instance_id.clone()),
+            identity_public_key: Some(bootstrap.identity_public_key.clone()),
+            authentication: "password".to_string(),
+            local: false,
+            confirmed_unauthenticated_remote: false,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: profile.id.clone(),
+                profiles: vec![profile.clone()],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+
+        let error = match request_desktop_session(
+            &state,
+            &profile,
+            "saved-password-must-stay-secret",
+            &bootstrap,
+        )
+        .await
+        {
+            Ok(_) => panic!("an HTTP remote profile received a native browser session"),
+            Err(error) => error,
+        };
+        assert!(error.contains("does not use saved credentials"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let mut https_profile = profile.clone();
+        https_profile.url = "https://control.example.test".to_string();
+        assert!(require_proved_native_session_origin(&state, &https_profile, &bootstrap).is_ok());
+
+        let mut local_profile = profile;
+        local_profile.local = true;
+        assert!(require_proved_native_session_origin(&state, &local_profile, &bootstrap).is_err());
+        state
+            .remember_local_bound_identity(&bootstrap.identity_public_key)
+            .unwrap();
+        assert!(require_proved_native_session_origin(&state, &local_profile, &bootstrap).is_ok());
     }
 
     #[tokio::test]
