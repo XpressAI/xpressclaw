@@ -109,6 +109,21 @@ fn main() {
     let local_url = local_connection.url.clone();
 
     let mut builder = tauri::Builder::default()
+        .manage(profiles::BrowserNavigationState::default())
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("instance-profile-navigation-guard")
+                .on_navigation(|webview, requested| {
+                    let allowed = webview
+                        .app_handle()
+                        .try_state::<profiles::BrowserNavigationState>()
+                        .is_some_and(|state| state.allows(requested));
+                    if !allowed {
+                        warn!(url = %requested, "blocked navigation outside the selected Desktop profile");
+                    }
+                    allowed
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())

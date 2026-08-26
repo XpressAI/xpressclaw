@@ -176,6 +176,31 @@ pub struct ProfileState {
     local_bound_identity: Mutex<Option<String>>,
 }
 
+/// The origin the Desktop WebView may contact right now. This is separate
+/// from the persisted profile selection so a switch can block all network
+/// navigation while host-scoped session cookies are being removed.
+#[derive(Default)]
+pub struct BrowserNavigationState {
+    active_profile_url: Mutex<Option<String>>,
+}
+
+impl BrowserNavigationState {
+    fn replace(&self, next: Option<String>) -> Result<Option<String>, String> {
+        let mut current = self
+            .active_profile_url
+            .lock()
+            .map_err(|_| "Desktop navigation lock failed".to_string())?;
+        Ok(std::mem::replace(&mut *current, next))
+    }
+
+    pub(crate) fn allows(&self, requested: &reqwest::Url) -> bool {
+        let Ok(active) = self.active_profile_url.lock() else {
+            return false;
+        };
+        browser_navigation_allowed(active.as_deref(), requested)
+    }
+}
+
 impl ProfileState {
     pub fn load(app: &AppHandle, local_url: &str) -> Result<Self, String> {
         let directory = app
@@ -797,18 +822,42 @@ pub(crate) fn navigate_to_profile(app: &AppHandle, url: &str) -> Result<(), Stri
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main Desktop window is unavailable".to_string())?;
+    let requested = url
+        .parse()
+        .map_err(|error| format!("Invalid profile URL: {error}"))?;
+    let navigation = app.state::<BrowserNavigationState>();
+    // Close the network boundary before clearing cookies. The currently
+    // loaded page remains alive during a native command and must not be able
+    // to race the profile switch by navigating to the newly selected origin.
+    let previous = navigation.replace(None)?;
     // Cookies are host-scoped, not origin-scoped: a session for
     // localhost:8935 would otherwise be sent to localhost:9000 before that
     // target can be identity-checked. Keep exactly one active browser session
     // by deleting every XpressClaw session cookie before crossing a profile
     // boundary. This intentionally signs the previous browser profile out.
-    clear_browser_session_cookies(&window)?;
-    window
-        .navigate(
-            url.parse()
-                .map_err(|error| format!("Invalid profile URL: {error}"))?,
-        )
-        .map_err(|error| error.to_string())
+    if let Err(error) = clear_browser_session_cookies(&window) {
+        navigation.replace(previous)?;
+        return Err(error);
+    }
+    navigation.replace(Some(url.to_string()))?;
+    if let Err(error) = window.navigate(requested) {
+        navigation.replace(previous)?;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Keep browser history and other top-level navigation inside the selected
+/// instance origin. A Back/Forward traversal to a deselected origin is
+/// rejected before the WebView can send its host-scoped cookie.
+pub(crate) fn browser_navigation_allowed(
+    active_profile_url: Option<&str>,
+    requested: &reqwest::Url,
+) -> bool {
+    if requested.as_str() == "about:blank" {
+        return true;
+    }
+    active_profile_url.is_some_and(|active| urls_have_same_origin(active, requested))
 }
 
 pub(crate) fn clear_browser_session_cookies(webview: &tauri::WebviewWindow) -> Result<(), String> {
@@ -3005,6 +3054,31 @@ mod tests {
         assert!(!urls_have_same_origin(
             selected,
             &reqwest::Url::parse("http://selected.example:9443/settings/server").unwrap()
+        ));
+    }
+
+    #[test]
+    fn browser_history_cannot_return_to_a_deselected_profile_origin() {
+        let active = "http://localhost:9000";
+        assert!(browser_navigation_allowed(
+            None,
+            &reqwest::Url::parse("about:blank").unwrap()
+        ));
+        assert!(!browser_navigation_allowed(
+            None,
+            &reqwest::Url::parse("http://localhost:9000/").unwrap()
+        ));
+        assert!(browser_navigation_allowed(
+            Some(active),
+            &reqwest::Url::parse("http://localhost:9000/tasks/active").unwrap()
+        ));
+        assert!(!browser_navigation_allowed(
+            Some(active),
+            &reqwest::Url::parse("http://localhost:8935/tasks/previous").unwrap()
+        ));
+        assert!(!browser_navigation_allowed(
+            Some(active),
+            &reqwest::Url::parse("https://localhost:9000/tasks/previous").unwrap()
         ));
     }
 

@@ -126,10 +126,13 @@ the main window and clears every XpressClaw browser-session cookie before the
 new instance receives a browser request. Browser cookies are scoped by hostname
 rather than port, so this serial session boundary prevents instances such as
 `localhost:8935` and `localhost:9000` from receiving or overwriting each
-other's sessions. It also means changing profiles signs the browser out of the
-previous instance. Desktop starts on a non-network bootstrap page and applies
-the same cleanup before its first instance navigation. The local sidecar
-remains running while a remote profile is selected.
+other's sessions. A native navigation guard also rejects browser Back/Forward
+history or any other top-level navigation to a deselected origin before it can
+make a request with the current session. It also means changing profiles signs
+the browser out of the previous instance. Desktop starts on a non-network
+bootstrap page and applies the same cleanup before its first instance
+navigation. The local sidecar remains running while a remote profile is
+selected.
 An expired browser session returns to the login screen. Desktop falls back to
 the automatic local profile only when a selected remote is unreachable or
 cannot prove its pinned identity. A proved remote opens its browser login
