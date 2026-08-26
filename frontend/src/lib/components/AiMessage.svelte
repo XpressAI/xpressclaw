@@ -1,6 +1,9 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import type { MessageVisualization } from '$lib/api';
 	import { renderContent } from '$lib/formatMessage';
+	import { splitMessageVisualizations } from '$lib/messageVisualizations';
+	import VisualizationArtifact from '$lib/components/VisualizationArtifact.svelte';
 
 	type MessageRole = 'user' | 'assistant' | 'system' | string;
 	type SelectionAction = 'Explain' | 'Improve' | 'Shorten' | 'Tone' | 'Grammar';
@@ -16,6 +19,10 @@
 		openLinksInNewWindow = role === 'assistant',
 		selectionActions = role === 'assistant',
 		onselectionaction,
+		visualizations = [],
+		visualizationUrl,
+		visualizationFollowUpTarget = 'this thread',
+		onvisualizationfollowup,
 		children,
 	}: {
 		role: MessageRole;
@@ -28,6 +35,10 @@
 		openLinksInNewWindow?: boolean;
 		selectionActions?: boolean;
 		onselectionaction?: (action: SelectionAction, text: string) => void;
+		visualizations?: MessageVisualization[];
+		visualizationUrl?: (artifact: MessageVisualization) => string;
+		visualizationFollowUpTarget?: string;
+		onvisualizationfollowup?: (prompt: string, title?: string) => Promise<void>;
 		children?: Snippet;
 	} = $props();
 
@@ -39,6 +50,8 @@
 	const actions: SelectionAction[] = ['Explain', 'Improve', 'Shorten', 'Tone', 'Grammar'];
 	let fromUser = $derived(role === 'user');
 	let isSystem = $derived(role === 'system');
+	let contentBlocks = $derived(splitMessageVisualizations(content, role, visualizations));
+	let hasWideVisualization = $derived(contentBlocks.some((block) => block.kind === 'visualization' && block.mode === 'wide'));
 
 	function watchSelection(node: HTMLElement) {
 		const handleSelection = () => requestAnimationFrame(captureSelection);
@@ -103,7 +116,7 @@
 		{isSystem ? 'bg-muted text-muted-foreground' : fromUser ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'}">
 		{avatar}
 	</div>
-	<div class="min-w-0 max-w-[min(48rem,86%)] {fromUser ? 'items-end' : ''}">
+	<div class="min-w-0 {hasWideVisualization ? 'w-full max-w-[min(64rem,96%)]' : 'max-w-[min(48rem,86%)]'} {fromUser ? 'items-end' : ''}">
 		<div class="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground {fromUser ? 'justify-end' : ''}">
 			<span class="font-medium {isSystem ? 'text-muted-foreground' : 'text-foreground'}">{sender}</span>
 			{#if badge}<span class="ai-status-pill h-5 bg-accent px-1.5 text-[9px] font-semibold uppercase tracking-wide text-accent-foreground">{badge}</span>{/if}
@@ -117,9 +130,22 @@
 				fromUser ? 'rounded-tr-[4px] bg-primary text-primary-foreground shadow-sm' :
 				'rounded-tl-[4px] bg-card pr-10 text-card-foreground shadow-[var(--shadow-card)]'}"
 		>
-			<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
-				{@html renderContent(content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant' })}
-			</div>
+			{#each contentBlocks as block, index (`${block.kind}:${index}`)}
+				{#if block.kind === 'text'}
+					<div class="prose-chat max-w-none break-words {fromUser ? 'prose-chat-user' : ''}">
+						{@html renderContent(block.content, { openLinksInNewWindow, renderStructuredAgentMarkup: role === 'assistant' })}
+					</div>
+				{:else}
+					<VisualizationArtifact
+						artifact={block.artifact}
+						title={block.title}
+						mode={block.mode}
+						href={block.artifact && visualizationUrl ? visualizationUrl(block.artifact) : undefined}
+						followUpTarget={visualizationFollowUpTarget}
+						onfollowup={onvisualizationfollowup}
+					/>
+				{/if}
+			{/each}
 			{#if children}{@render children()}{/if}
 
 			{#if !isSystem && !fromUser}

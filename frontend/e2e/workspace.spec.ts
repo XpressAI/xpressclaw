@@ -14,6 +14,31 @@ function recentSqliteTimestamp(millisecondsAgo: number): string {
 	return new Date(Date.now() - millisecondsAgo).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+function visualizationDocument(artifactId: string, label: string, followUp?: { prompt: string; title?: string }): string {
+	const action = followUp
+		? `<button id="visual-follow-up" type="button">Follow up</button><script>
+			window.openai = Object.freeze({ sendFollowUpMessage(value) {
+				parent.postMessage({ source: 'xpressclaw-visualization', type: 'follow-up-request', artifactId: ${JSON.stringify(artifactId)}, requestId: 'request-browser-test', prompt: value.prompt, title: value.title || null }, '*');
+			} });
+			document.querySelector('#visual-follow-up').addEventListener('click', () => window.openai.sendFollowUpMessage(${JSON.stringify(followUp)}));
+		</script>`
+		: '';
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"></head><body><div id="visual-content">${label}</div>${action}<script>
+		addEventListener('message', (event) => {
+			if (event.source === parent && event.data?.source === 'xpressclaw-host' && event.data.artifactId === ${JSON.stringify(artifactId)} && event.data.type === 'theme') {
+				document.documentElement.dataset.theme = event.data.theme;
+			}
+		});
+		try { void parent.document.body; document.documentElement.dataset.parentBlocked = 'false'; } catch { document.documentElement.dataset.parentBlocked = 'true'; }
+		try { localStorage.setItem('artifact-test', 'bad'); document.documentElement.dataset.storageBlocked = 'false'; } catch { document.documentElement.dataset.storageBlocked = 'true'; }
+		try { document.cookie = 'artifact-test=bad'; document.documentElement.dataset.cookieBlocked = document.cookie ? 'false' : 'true'; } catch { document.documentElement.dataset.cookieBlocked = 'true'; }
+		try { const popup = window.open('about:blank'); document.documentElement.dataset.popupBlocked = popup === null ? 'true' : 'false'; popup?.close(); } catch { document.documentElement.dataset.popupBlocked = 'true'; }
+		try { top.location.href = 'https://example.invalid/visualization-top-navigation'; document.documentElement.dataset.navigationBlocked = 'false'; } catch { document.documentElement.dataset.navigationBlocked = 'true'; }
+		fetch('https://example.invalid/visualization-network').then(() => { document.documentElement.dataset.networkBlocked = 'false'; }).catch(() => { document.documentElement.dataset.networkBlocked = 'true'; });
+		const form = document.createElement('form'); form.action = 'https://example.invalid/visualization-form'; form.method = 'post'; document.body.append(form); const beforeSubmit = location.href; form.submit(); setTimeout(() => { document.documentElement.dataset.formBlocked = location.href === beforeSubmit ? 'true' : 'false'; }, 0);
+	</script></body></html>`;
+}
+
 async function expectVerticalScroll(scroller: Locator) {
 	await expect(scroller).toBeVisible();
 	await expect(scroller).toHaveCSS('overflow-y', 'auto');
@@ -296,6 +321,8 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		visualizationDocuments?: Record<string, string>;
+		visualizationRequests?: { path: string; token: string | undefined }[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -476,7 +503,21 @@ async function mockApi(
 		const path = url.pathname;
 		let response: unknown;
 
-		if (path === '/api/health') {
+		if (path.includes('/visualizations/')) {
+			options.visualizationRequests?.push({ path, token: request.headers()['x-xpressclaw-artifact-token'] });
+			const document = options.visualizationDocuments?.[path];
+			if (!document) {
+				await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Visualization not found' }) });
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: 'text/html; charset=utf-8',
+				headers: { 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' },
+				body: document,
+			});
+			return;
+		} else if (path === '/api/health') {
 			if (options.connection?.online === false) {
 				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ status: 'unavailable' }) });
 				return;
@@ -2006,6 +2047,154 @@ test('raw HTML stays literal across task messages, activity, results, and previe
 	const preview = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
 	await expect(preview).toContainText(taskPrompt);
 	await expect(preview.locator('custom-prompt')).toHaveCount(0);
+});
+
+test('task assistant visualizations render in order, stay isolated, and confirm follow-ups', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const firstReference = 'visualize{"path":"/workspace/dependencies.html","title":"Task dependency map"}';
+	const wideReference = 'visualize{"path":"/workspace/timeline.html","mode":"wide"}';
+	const missingReference = 'visualize{"path":"/workspace/large.html"}';
+	const userReference = 'visualize{"path":"/workspace/user.html"}';
+	const firstPath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-one`;
+	const widePath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-wide`;
+	await mockApi(page, {
+		postedMessages,
+		visualizationRequests,
+		visualizationDocuments: {
+			[firstPath]: visualizationDocument('viz-task-one', 'Task visualization loaded', { prompt: 'Inspect dependency node A', title: 'Inspect dependency' }),
+			[widePath]: visualizationDocument('viz-task-wide', 'Wide timeline loaded'),
+		},
+		taskMessages: [
+			{ id: 1, task_id: taskId, role: 'user', content: userReference, attachments: [], visualizations: [], timestamp: timestamp(20) },
+			{
+				id: 2,
+				task_id: taskId,
+				role: 'assistant',
+				content: [
+					'**Dependency analysis**',
+					firstReference,
+					'Markdown between views.',
+					wideReference,
+					missingReference,
+					'\\visualize{"path":"/workspace/escaped.html"}',
+					'visualize{"path":"/workspace/bad.html","mode":"fullscreen"}',
+				].join('\n\n'),
+				attachments: [],
+				visualizations: [
+					{ id: 'viz-task-one', reference_index: 0, title: 'Task dependency map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'token-one' },
+					{ id: 'viz-task-wide', reference_index: 1, title: 'Timeline', mode: 'wide', status: 'ready', error_code: null, size: 130, retrieval_token: 'token-wide' },
+					{ id: 'viz-task-missing', reference_index: 2, title: 'Large view', mode: 'normal', status: 'unavailable', error_code: 'oversize', size: null, retrieval_token: 'token-missing' },
+				],
+				timestamp: timestamp(25),
+			},
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const assistant = page.locator('[data-message-role="assistant"]');
+	await expect(assistant.locator('strong', { hasText: 'Dependency analysis' })).toBeVisible();
+	await expect(assistant).toContainText('Markdown between views.');
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(3);
+	await expect(page.locator('[data-inline-visualization][data-visualization-mode="wide"]')).toHaveCount(1);
+	await expect(page.getByText('The generated visualization exceeded the 1 MiB limit.')).toBeVisible();
+	await expect(page.locator('[data-message-role="user"] .prose-chat').filter({ hasText: userReference })).toHaveText(userReference);
+	await expect(assistant).toContainText('visualize{"path":"/workspace/escaped.html"}');
+	await expect(assistant).toContainText('visualize{"path":"/workspace/bad.html","mode":"fullscreen"}');
+
+	const firstFrameElement = page.locator('iframe[title="Task dependency map"]');
+	await expect(firstFrameElement).toHaveAttribute('sandbox', 'allow-scripts');
+	await expect(firstFrameElement).toHaveAttribute('referrerpolicy', 'no-referrer');
+	const firstFrame = page.frameLocator('iframe[title="Task dependency map"]');
+	await expect(firstFrame.getByText('Task visualization loaded')).toBeVisible();
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-parent-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-storage-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-cookie-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-popup-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-navigation-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-network-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-form-blocked', 'true');
+	await page.evaluate(() => document.documentElement.classList.add('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
+	await page.evaluate(() => document.documentElement.classList.remove('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'light');
+	await expect(page.frameLocator('iframe[title="Timeline"]').getByText('Wide timeline loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests).toEqual(expect.arrayContaining([
+		{ path: firstPath, token: 'token-one' },
+		{ path: widePath, token: 'token-wide' },
+	]));
+
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Inspect dependency' });
+	await expect(dialog).toContainText('Inspect dependency node A');
+	expect(postedMessages).toEqual([]);
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	expect(postedMessages).toEqual([]);
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	await page.getByRole('dialog', { name: 'Inspect dependency' }).getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => postedMessages).toEqual([expect.objectContaining({
+		role: 'user',
+		content: 'Inspect dependency node A',
+		delivery: 'after_tool',
+	})]);
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	const firstCard = page.locator('[data-inline-visualization]').first();
+	await firstCard.getByRole('button', { name: 'Expand visualization' }).click();
+	await expect(firstCard).toHaveCSS('position', 'fixed');
+	await firstCard.getByRole('button', { name: 'Exit expanded visualization' }).click();
+	await expect(firstCard).not.toHaveCSS('position', 'fixed');
+});
+
+test('conversation visualizations persist on reload and route confirmed follow-ups to the conversation', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const reference = 'visualize{"path":"/workspace/conversation-map.html","title":"Conversation map"}';
+	const path = `/api/conversations/${conversationId}/messages/3/visualizations/viz-conversation`;
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Visualization review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessageRequests,
+		visualizationRequests,
+		visualizationDocuments: {
+			[path]: visualizationDocument('viz-conversation', 'Conversation visualization loaded', { prompt: 'Compare the highlighted paths' }),
+		},
+		conversationMessages: [
+			{ id: 1, conversation_id: conversationId, sender_type: 'user', sender_id: 'local', sender_name: 'You', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(10) },
+			{ id: 2, conversation_id: conversationId, sender_type: 'system', sender_id: 'system', sender_name: 'System', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(15) },
+			{ id: 3, conversation_id: conversationId, sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace', content: `Here is the map.\n\n${reference}`, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [{ id: 'viz-conversation', reference_index: 0, title: 'Conversation map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'conversation-token' }], created_at: timestamp(20) },
+		],
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.locator('[data-message-role="user"] .prose-chat')).toHaveText(reference);
+	await expect(page.locator('[data-message-role="system"] .prose-chat')).toHaveText(reference);
+	const frame = page.frameLocator('iframe[title="Conversation map"]');
+	await expect(frame.getByText('Conversation visualization loaded')).toBeVisible();
+	await frame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Send this follow-up?' });
+	await expect(dialog).toContainText('Compare the highlighted paths');
+	expect(conversationMessageRequests).toEqual([]);
+	await dialog.getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => conversationMessageRequests).toEqual([{ content: 'Compare the highlighted paths', attachments: [] }]);
+
+	await page.reload();
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.frameLocator('iframe[title="Conversation map"]').getByText('Conversation visualization loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests.filter((request) => request.path === path).length).toBeGreaterThanOrEqual(2);
 });
 
 test('project pages expose a copyable canonical ID', async ({ page }) => {

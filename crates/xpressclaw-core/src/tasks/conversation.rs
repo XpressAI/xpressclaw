@@ -8,6 +8,10 @@ use crate::db::Database;
 use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
 use crate::tasks::attachments::DecodedImageAttachment;
+use crate::visualizations::{
+    store_task_message_visualizations, MessageVisualization, PreparedVisualization,
+    VisualizationManager,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskMessageAttachment {
@@ -25,6 +29,8 @@ pub struct TaskMessage {
     pub content: String,
     pub timestamp: String,
     pub attachments: Vec<TaskMessageAttachment>,
+    #[serde(default)]
+    pub visualizations: Vec<MessageVisualization>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +73,45 @@ impl TaskConversation {
         role: &str,
         content: &str,
         attachments: &[DecodedImageAttachment],
+    ) -> Result<TaskMessage> {
+        self.add_message_with_attachments_and_visualizations(
+            task_id,
+            role,
+            content,
+            attachments,
+            None,
+            &[],
+        )
+    }
+
+    /// Persist a final assistant response and its copied visualization
+    /// fragments in one transaction. A process crash can therefore expose
+    /// neither a dangling content reference nor an ownerless artifact.
+    pub fn add_final_assistant_message(
+        &self,
+        task_id: &str,
+        content: &str,
+        attempt_id: &str,
+        visualizations: &[PreparedVisualization],
+    ) -> Result<TaskMessage> {
+        self.add_message_with_attachments_and_visualizations(
+            task_id,
+            "assistant",
+            content,
+            &[],
+            Some(attempt_id),
+            visualizations,
+        )
+    }
+
+    fn add_message_with_attachments_and_visualizations(
+        &self,
+        task_id: &str,
+        role: &str,
+        content: &str,
+        attachments: &[DecodedImageAttachment],
+        attempt_id: Option<&str>,
+        visualizations: &[PreparedVisualization],
     ) -> Result<TaskMessage> {
         let conn = self.db.conn();
         let tx =
@@ -118,6 +163,8 @@ impl TaskConversation {
             [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
+        let stored_visualizations =
+            store_task_message_visualizations(&tx, id, attempt_id, visualizations)?;
         tx.commit()?;
 
         Ok(TaskMessage {
@@ -127,6 +174,7 @@ impl TaskConversation {
             content,
             timestamp,
             attachments: stored_attachments,
+            visualizations: stored_visualizations,
         })
     }
 
@@ -153,6 +201,7 @@ impl TaskConversation {
                     content: row.get("content")?,
                     timestamp: row.get("timestamp")?,
                     attachments: Vec::new(),
+                    visualizations: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
@@ -173,6 +222,12 @@ impl TaskConversation {
                     })
                 })?
                 .collect::<std::result::Result<_, _>>()?;
+        }
+        drop(attachment_stmt);
+        drop(conn);
+        let visualization_manager = VisualizationManager::new(self.db.clone());
+        for message in &mut messages {
+            message.visualizations = visualization_manager.list_for_task_message(message.id)?;
         }
 
         Ok(messages)

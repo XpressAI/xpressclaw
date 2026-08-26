@@ -66,6 +66,11 @@ start a reusable workflow with typed inputs. Agents can create linked Tasks for
 themselves, publish task results back to the Conversation, and share files that
 people or other Agents can download into their workspaces.
 
+Codex can also publish interactive Visualize results directly inside Task and
+Conversation replies. XpressClaw preserves the generated fragment with the
+message, runs it in an isolated viewer, and asks before an interactive visual
+can send a follow-up. See [Inline visualizations](docs/inline-visualizations.md).
+
 ### Persistent Agents
 
 Each Agent is a durable execution identity inside a Project. It has a name,

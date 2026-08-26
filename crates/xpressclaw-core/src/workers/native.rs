@@ -41,6 +41,10 @@ use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
 use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
+use crate::visualizations::{
+    is_absolute_runner_root, prepare_message_visualizations, PreparedVisualization,
+    VisualizationSourceRoot,
+};
 use crate::workers::acp::{
     AcpElicitationBroker, AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnControlBroker,
     AcpTurnOptions, AcpTurnRuntime,
@@ -678,6 +682,7 @@ async fn execute_conversation_turn(
         .working_dir
         .clone()
         .unwrap_or_else(|| "/workspace".to_string());
+    let visualization_roots = visualization_source_roots(&workspace, &container_workspace, agent);
     let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
         == Some(spec.image.as_str());
     if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
@@ -858,7 +863,8 @@ async fn execute_conversation_turn(
             return Err(error);
         }
     };
-    let Some(message) = queue.complete_with_message(
+    let visualizations = prepare_message_visualizations(&result.summary, &visualization_roots);
+    let Some(message) = queue.complete_with_message_and_visualizations(
         &turn,
         &result.session_id,
         &SendMessage {
@@ -869,15 +875,18 @@ async fn execute_conversation_turn(
             message_type: None,
         },
         &json!({ "conversation_turn_id": turn.id, "runner": kind }),
+        &visualizations,
     )?
     else {
         event_bus.send(&turn.conversation_id, ConversationEvent::Done);
         return Ok(());
     };
+    let mut message_value = json!(message);
+    message_value["visualizations"] = json!(manager.visualizations(message.id).unwrap_or_default());
     event_bus.send(
         &turn.conversation_id,
         ConversationEvent::Message {
-            message: json!(message),
+            message: message_value,
         },
     );
     event_bus.send(&turn.conversation_id, ConversationEvent::Done);
@@ -1009,6 +1018,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         .working_dir
         .clone()
         .unwrap_or_else(|| "/workspace".to_string());
+    let visualization_roots = visualization_source_roots(&workspace, &container_workspace, agent);
     let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
         == Some(spec.image.as_str());
     let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
@@ -1233,6 +1243,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         sessions.refresh_status(&item.agent_id)?;
         return Ok(());
     }
+    let visualizations = prepare_message_visualizations(&turn.summary, &visualization_roots);
     sessions.add_artifact(
         attempt_id,
         "runner_output",
@@ -1263,9 +1274,12 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     }
     let queue = TaskQueue::new(db.clone());
     queue.complete(item.id, &turn.summary)?;
-    if let Err(error) =
-        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &turn.summary)
-    {
+    if let Err(error) = TaskConversation::new(db.clone()).add_final_assistant_message(
+        &item.task_id,
+        &turn.summary,
+        attempt_id,
+        &visualizations,
+    ) {
         warn!(%error, task_id = item.task_id, "failed to persist ACP task reply");
     }
 
@@ -1301,6 +1315,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &item,
         &agent.context_label(),
         &turn.summary,
+        attempt_id,
+        &visualizations,
     );
     for completed in completed_tasks {
         advance_workflow(&db, &completed.id, "completed", &turn.summary);
@@ -1388,12 +1404,14 @@ fn publish_conversation_result(
     item: &QueueItem,
     sender_name: &str,
     content: &str,
+    attempt_id: &str,
+    visualizations: &[PreparedVisualization],
 ) {
     let Some(conversation_id) = conversation_id(db, &item.task_id) else {
         return;
     };
     let manager = ConversationManager::new(db.clone());
-    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_attachments(
+    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_visualizations(
         &conversation_id,
         &SendMessage {
             sender_type: "agent".to_string(),
@@ -1404,11 +1422,16 @@ fn publish_conversation_result(
         },
         Some(&item.task_id),
         &[],
+        Some(attempt_id),
+        visualizations,
     ) {
+        let mut message_value = json!(message);
+        message_value["visualizations"] =
+            json!(manager.visualizations(message.id).unwrap_or_default());
         event_bus.send(
             &conversation_id,
             ConversationEvent::Message {
-                message: json!(message),
+                message: message_value,
             },
         );
     }
@@ -2600,6 +2623,33 @@ pub fn resolved_workspace(config: &Config, agent: &AgentConfig) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| config.system.workspace_dir.clone());
     canonical_or_original(&workspace)
+}
+
+/// Resolve only runner paths that the Agent can write and that map back to a
+/// known host directory. XpressClaw-injected credential/config mounts are not
+/// part of `agent.volumes`, so they cannot become visualization sources.
+fn visualization_source_roots(
+    workspace: &Path,
+    container_workspace: &str,
+    agent: &AgentConfig,
+) -> Vec<VisualizationSourceRoot> {
+    let mut roots = vec![VisualizationSourceRoot::new(container_workspace, workspace)];
+    for raw in &agent.volumes {
+        let Some(mount) = parse_volume(raw) else {
+            continue;
+        };
+        if mount.read_only
+            || !is_absolute_runner_root(&mount.target)
+            || !Path::new(&mount.source).is_absolute()
+        {
+            continue;
+        }
+        let root = VisualizationSourceRoot::new(mount.target, mount.source);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
@@ -5202,6 +5252,26 @@ mod tests {
     }
 
     #[test]
+    fn visualization_roots_include_only_explicit_writable_agent_mounts() {
+        let agent = AgentConfig {
+            volumes: vec![
+                "/host/reference:/workspace/reference:ro".into(),
+                "/host/output:/workspace/output:rw".into(),
+                "/host/relative:relative-target:rw".into(),
+                "relative-host:/workspace/relative-host:rw".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            visualization_source_roots(Path::new("/host/project"), "/workspace", &agent),
+            vec![
+                VisualizationSourceRoot::new("/workspace", "/host/project"),
+                VisualizationSourceRoot::new("/workspace/output", "/host/output"),
+            ]
+        );
+    }
+
+    #[test]
     fn published_images_keep_the_prototype_local_aliases() {
         assert_eq!(
             local_runner_image_alias("ghcr.io/xpressai/xpressclaw-runner-codex:latest"),
@@ -5310,6 +5380,8 @@ mod tests {
             &item,
             "Atlas",
             "@[AGENT:reviewer:Reviewer] Native result",
+            "attempt",
+            &[],
         );
 
         let messages = conversations
