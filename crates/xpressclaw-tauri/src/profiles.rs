@@ -5,12 +5,22 @@ use std::time::Duration;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures_util::StreamExt;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use ring::agreement::{
+    agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey as AgreementPublicKey, X25519,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tempfile::NamedTempFile;
+use xpressclaw_core::desktop_auth::{
+    credential_aad as desktop_credential_aad,
+    credential_proof_message as desktop_credential_proof_message,
+    derive_credential_keys as derive_desktop_credential_keys, identity_proof_message,
+    CREDENTIAL_CHANNEL_NONCE, CREDENTIAL_REQUEST_DIRECTION, CREDENTIAL_RESPONSE_DIRECTION,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 const PROFILE_VERSION: u8 = 1;
@@ -18,7 +28,6 @@ const LOCAL_PROFILE_ID: &str = "local";
 const KEYCHAIN_SERVICE: &str = "ai.xpress.xpressclaw.instance";
 const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
 const PROFILE_INSPECTION_CONCURRENCY: usize = 4;
-const IDENTITY_PROOF_DOMAIN: &[u8] = b"xpressclaw-desktop-identity-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredProfile {
@@ -109,6 +118,27 @@ struct IdentityProof {
     instance_id: String,
     identity_public_key: String,
     signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesktopCredentialProof {
+    instance_id: String,
+    identity_public_key: String,
+    exchange_id: String,
+    server_public_key: String,
+    signature: String,
+}
+
+struct DesktopCredentialChannel {
+    exchange_id: String,
+    exchange_id_bytes: [u8; 32],
+    request_key: Zeroizing<[u8; 32]>,
+    response_key: Zeroizing<[u8; 32]>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EncryptedDesktopTicket {
+    ciphertext: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -566,7 +596,7 @@ pub async fn save_instance_profile(
                     .to_string(),
             );
         };
-        request_ticket(&url, supplied, &bootstrap.instance_id).await?;
+        request_ticket(&url, supplied, &bootstrap).await?;
         if credential.is_some() {
             set_credential(&id, supplied)?;
         }
@@ -708,7 +738,7 @@ pub async fn select_instance_profile(
         }
         let credential =
             credential_for_authentication(&state, &credential_profile, expected).await?;
-        request_ticket(&profile.url, &credential, &bootstrap.instance_id).await?;
+        request_ticket(&profile.url, &credential, &bootstrap).await?;
     }
     state.update(|file| {
         let Some(current) = file.profiles.iter().find(|current| current.id == id) else {
@@ -848,7 +878,7 @@ pub async fn login_active_profile(
         ));
     }
     let credential = credential_for_authentication(&state, &credential_profile, expected).await?;
-    let ticket = request_ticket(&profile.url, &credential, &bootstrap.instance_id).await?;
+    let ticket = request_ticket(&profile.url, &credential, &bootstrap).await?;
     Ok(Some(ticket))
 }
 
@@ -964,7 +994,7 @@ async fn preserve_verified_replacement_token_or_forget(
     let observed = state.local_startup_token()?;
     let preserve = if effective_authentication(bootstrap)? == "startup_token" {
         if let Some(credential) = observed.as_ref() {
-            request_ticket(&profile.url, credential, &bootstrap.instance_id)
+            request_ticket(&profile.url, credential, bootstrap)
                 .await
                 .is_ok()
         } else {
@@ -1067,7 +1097,7 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
                             (Ok(expected), Ok(credential))
                                 if expected == profile.authentication =>
                             {
-                                request_ticket(&profile.url, &credential, &bootstrap.instance_id)
+                                request_ticket(&profile.url, &credential, &bootstrap)
                                     .await
                                     .is_ok()
                             }
@@ -1365,16 +1395,6 @@ async fn fetch_bootstrap(url: &str) -> Result<Bootstrap, String> {
     .await
 }
 
-fn identity_proof_message(instance_id: &str, challenge: &[u8]) -> Vec<u8> {
-    let mut message =
-        Vec::with_capacity(IDENTITY_PROOF_DOMAIN.len() + instance_id.len() + 1 + challenge.len());
-    message.extend_from_slice(IDENTITY_PROOF_DOMAIN);
-    message.extend_from_slice(instance_id.as_bytes());
-    message.push(0);
-    message.extend_from_slice(challenge);
-    message
-}
-
 fn validate_identity_public_key(value: &str) -> Result<Vec<u8>, String> {
     let key = URL_SAFE_NO_PAD
         .decode(value)
@@ -1383,6 +1403,107 @@ fn validate_identity_public_key(value: &str) -> Result<Vec<u8>, String> {
         return Err("The XpressClaw instance returned an invalid identity key".to_string());
     }
     Ok(key)
+}
+
+fn decode_fixed_32(value: &str, invalid_message: &str) -> Result<[u8; 32], String> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| invalid_message.to_string())?
+        .try_into()
+        .map_err(|_| invalid_message.to_string())
+}
+
+async fn open_desktop_credential_channel(
+    url: &str,
+    bootstrap: &Bootstrap,
+) -> Result<DesktopCredentialChannel, String> {
+    let identity_public_key = validate_identity_public_key(&bootstrap.identity_public_key)?;
+    let mut challenge = [0u8; 32];
+    let rng = SystemRandom::new();
+    rng.fill(&mut challenge)
+        .map_err(|_| "Could not create a secure Desktop credential challenge".to_string())?;
+    let client_private = EphemeralPrivateKey::generate(&X25519, &rng)
+        .map_err(|_| "Could not create a secure Desktop credential channel".to_string())?;
+    let client_public = client_private
+        .compute_public_key()
+        .map_err(|_| "Could not create a secure Desktop credential channel".to_string())?;
+    let client_public_key: [u8; 32] = client_public
+        .as_ref()
+        .try_into()
+        .map_err(|_| "Could not create a secure Desktop credential channel".to_string())?;
+
+    let response = http_client()?
+        .post(format!("{url}/api/auth/identity-proof"))
+        .json(&serde_json::json!({
+            "challenge": URL_SAFE_NO_PAD.encode(challenge),
+            "client_public_key": URL_SAFE_NO_PAD.encode(client_public_key),
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Could not establish the Desktop credential channel: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The Desktop credential channel failed with {}",
+            response.status()
+        ));
+    }
+    let proof: DesktopCredentialProof = read_bounded_json(
+        response,
+        "The XpressClaw instance returned an invalid Desktop credential proof",
+    )
+    .await?;
+    if proof.instance_id != bootstrap.instance_id
+        || proof.identity_public_key != bootstrap.identity_public_key
+    {
+        return Err(
+            "The XpressClaw instance identity changed while opening the credential channel"
+                .to_string(),
+        );
+    }
+    let exchange_id = decode_fixed_32(
+        &proof.exchange_id,
+        "The XpressClaw instance returned an invalid credential exchange ID",
+    )?;
+    let server_public_key = decode_fixed_32(
+        &proof.server_public_key,
+        "The XpressClaw instance returned an invalid credential channel key",
+    )?;
+    let signature = URL_SAFE_NO_PAD.decode(proof.signature).map_err(|_| {
+        "The XpressClaw instance returned an invalid Desktop credential proof".to_string()
+    })?;
+    UnparsedPublicKey::new(&ED25519, identity_public_key)
+        .verify(
+            &desktop_credential_proof_message(
+                &bootstrap.instance_id,
+                &challenge,
+                &exchange_id,
+                &client_public_key,
+                &server_public_key,
+            ),
+            &signature,
+        )
+        .map_err(|_| {
+            "The XpressClaw instance could not authenticate its credential channel".to_string()
+        })?;
+    let peer = AgreementPublicKey::new(&X25519, server_public_key);
+    let keys = agree_ephemeral(client_private, &peer, |shared| {
+        derive_desktop_credential_keys(
+            shared,
+            &bootstrap.instance_id,
+            &challenge,
+            &exchange_id,
+            &client_public_key,
+            &server_public_key,
+        )
+    })
+    .map_err(|_| "The XpressClaw instance returned an invalid credential channel key".to_string())?
+    .map_err(|_| "Could not derive the Desktop credential channel".to_string())?;
+    Ok(DesktopCredentialChannel {
+        exchange_id: proof.exchange_id,
+        exchange_id_bytes: exchange_id,
+        request_key: keys.request,
+        response_key: keys.response,
+    })
 }
 
 async fn verify_bootstrap_identity(
@@ -1483,11 +1604,31 @@ fn validate_pending_password_configuration(
 async fn request_ticket(
     url: &str,
     credential: &str,
-    expected_instance_id: &str,
+    bootstrap: &Bootstrap,
 ) -> Result<DesktopTicket, String> {
+    let channel = open_desktop_credential_channel(url, bootstrap).await?;
+    let key = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, channel.request_key.as_ref())
+            .map_err(|_| "Could not open the Desktop credential channel".to_string())?,
+    );
+    let mut encrypted_credential = Zeroizing::new(credential.as_bytes().to_vec());
+    let aad = desktop_credential_aad(
+        &bootstrap.instance_id,
+        &channel.exchange_id_bytes,
+        CREDENTIAL_REQUEST_DIRECTION,
+    );
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+        Aad::from(aad),
+        &mut *encrypted_credential,
+    )
+    .map_err(|_| "Could not encrypt the Desktop credential".to_string())?;
     let response = http_client()?
         .post(format!("{url}/api/auth/desktop-ticket"))
-        .json(&serde_json::json!({ "credential": credential }))
+        .json(&serde_json::json!({
+            "exchange_id": channel.exchange_id,
+            "ciphertext": URL_SAFE_NO_PAD.encode(encrypted_credential.as_slice()),
+        }))
         .send()
         .await
         .map_err(|error| format!("Could not authenticate to the remote instance: {error}"))?;
@@ -1498,12 +1639,35 @@ async fn request_ticket(
             _ => format!("Remote login failed with {}", response.status()),
         });
     }
-    let ticket: DesktopTicket = read_bounded_json(
+    let encrypted_ticket: EncryptedDesktopTicket = read_bounded_json(
         response,
         "The remote instance returned an invalid login ticket",
     )
     .await?;
-    if ticket.instance_id != expected_instance_id {
+    let mut ciphertext = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encrypted_ticket.ciphertext)
+            .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?,
+    );
+    let response_key = LessSafeKey::new(
+        UnboundKey::new(&CHACHA20_POLY1305, channel.response_key.as_ref())
+            .map_err(|_| "Could not open the Desktop credential channel".to_string())?,
+    );
+    let aad = desktop_credential_aad(
+        &bootstrap.instance_id,
+        &channel.exchange_id_bytes,
+        CREDENTIAL_RESPONSE_DIRECTION,
+    );
+    let plaintext = response_key
+        .open_in_place(
+            Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+            Aad::from(aad),
+            ciphertext.as_mut(),
+        )
+        .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?;
+    let ticket: DesktopTicket = serde_json::from_slice(plaintext)
+        .map_err(|_| "The remote instance returned an invalid login ticket".to_string())?;
+    if ticket.instance_id != bootstrap.instance_id {
         return Err(
             "The instance identity changed while Desktop was authenticating; no profile change was saved"
                 .to_string(),
@@ -1631,6 +1795,13 @@ mod tests {
         key_pair: Ed25519KeyPair,
     }
 
+    struct TestCredentialChannel {
+        exchange_id: String,
+        exchange_id_bytes: [u8; 32],
+        request_key: Zeroizing<[u8; 32]>,
+        response_key: Zeroizing<[u8; 32]>,
+    }
+
     impl TestIdentity {
         fn new(instance_id: impl Into<String>) -> Self {
             let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
@@ -1681,6 +1852,125 @@ mod tests {
                 ),
             })
             .to_string()
+        }
+
+        fn credential_proof_json(&self, request: &str) -> (String, TestCredentialChannel) {
+            let (_, body) = request
+                .split_once("\r\n\r\n")
+                .expect("credential proof request has a body");
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let challenge: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(request["challenge"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let client_public_key: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(request["client_public_key"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let rng = SystemRandom::new();
+            let server_private = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+            let server_public_key: [u8; 32] = server_private
+                .compute_public_key()
+                .unwrap()
+                .as_ref()
+                .try_into()
+                .unwrap();
+            let mut exchange_id_bytes = [0u8; 32];
+            rng.fill(&mut exchange_id_bytes).unwrap();
+            let peer = AgreementPublicKey::new(&X25519, client_public_key);
+            let keys = agree_ephemeral(server_private, &peer, |shared| {
+                derive_desktop_credential_keys(
+                    shared,
+                    &self.instance_id,
+                    &challenge,
+                    &exchange_id_bytes,
+                    &client_public_key,
+                    &server_public_key,
+                )
+            })
+            .unwrap()
+            .unwrap();
+            let signature = self.key_pair.sign(&desktop_credential_proof_message(
+                &self.instance_id,
+                &challenge,
+                &exchange_id_bytes,
+                &client_public_key,
+                &server_public_key,
+            ));
+            let exchange_id = URL_SAFE_NO_PAD.encode(exchange_id_bytes);
+            (
+                serde_json::json!({
+                    "instance_id": self.instance_id,
+                    "identity_public_key": self.public_key(),
+                    "exchange_id": exchange_id,
+                    "server_public_key": URL_SAFE_NO_PAD.encode(server_public_key),
+                    "signature": URL_SAFE_NO_PAD.encode(signature.as_ref()),
+                })
+                .to_string(),
+                TestCredentialChannel {
+                    exchange_id,
+                    exchange_id_bytes,
+                    request_key: keys.request,
+                    response_key: keys.response,
+                },
+            )
+        }
+    }
+
+    impl TestCredentialChannel {
+        fn open_credential(&self, request: &str, instance_id: &str) -> Zeroizing<String> {
+            let (_, body) = request
+                .split_once("\r\n\r\n")
+                .expect("credential request has a body");
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(request["exchange_id"], self.exchange_id);
+            assert!(request.get("credential").is_none());
+            let mut ciphertext = Zeroizing::new(
+                URL_SAFE_NO_PAD
+                    .decode(request["ciphertext"].as_str().unwrap())
+                    .unwrap(),
+            );
+            let key = LessSafeKey::new(
+                UnboundKey::new(&CHACHA20_POLY1305, self.request_key.as_ref()).unwrap(),
+            );
+            let aad = desktop_credential_aad(
+                instance_id,
+                &self.exchange_id_bytes,
+                CREDENTIAL_REQUEST_DIRECTION,
+            );
+            let plaintext = key
+                .open_in_place(
+                    Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+                    Aad::from(aad),
+                    ciphertext.as_mut(),
+                )
+                .unwrap();
+            Zeroizing::new(std::str::from_utf8(plaintext).unwrap().to_string())
+        }
+
+        fn encrypted_ticket_json(&self, ticket: &str, instance_id: &str) -> String {
+            let mut plaintext = serde_json::to_vec(&serde_json::json!({
+                "ticket": ticket,
+                "instance_id": instance_id,
+            }))
+            .unwrap();
+            let key = LessSafeKey::new(
+                UnboundKey::new(&CHACHA20_POLY1305, self.response_key.as_ref()).unwrap(),
+            );
+            let aad = desktop_credential_aad(
+                instance_id,
+                &self.exchange_id_bytes,
+                CREDENTIAL_RESPONSE_DIRECTION,
+            );
+            key.seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+                Aad::from(aad),
+                &mut plaintext,
+            )
+            .unwrap();
+            serde_json::json!({ "ciphertext": URL_SAFE_NO_PAD.encode(plaintext) }).to_string()
         }
     }
 
@@ -2365,15 +2655,66 @@ mod tests {
             .unwrap();
         });
 
+        let bootstrap = TestIdentity::new("expected-instance").bootstrap(true, "password");
         let result = request_ticket(
             &format!("http://{redirect_address}"),
             "credential-that-must-not-be-forwarded",
-            "expected-instance",
+            &bootstrap,
         )
         .await;
         assert!(result.is_err());
         redirect_thread.join().unwrap();
         assert!(!target_thread.join().unwrap());
+    }
+
+    #[tokio::test]
+    async fn relayed_identity_proof_never_exposes_the_saved_credential() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("genuine-instance");
+        let bootstrap = identity.bootstrap(true, "password");
+        let server = std::thread::spawn(move || {
+            // This endpoint represents a replacement origin relaying the
+            // proof to the genuine instance. It can observe both HTTP bodies,
+            // but only the genuine side of the relay owns the ephemeral key.
+            let (mut proof_stream, _) = listener.accept().unwrap();
+            let proof_request = read_http_request(&mut proof_stream);
+            let (proof, genuine_channel) = identity.credential_proof_json(&proof_request);
+            respond_json(&mut proof_stream, &proof);
+
+            let (mut ticket_stream, _) = listener.accept().unwrap();
+            let ticket_request = read_http_request(&mut ticket_stream);
+            assert!(ticket_request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
+            assert!(!ticket_request.contains("saved-password-must-stay-secret"));
+            let (_, body) = ticket_request.split_once("\r\n\r\n").unwrap();
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert!(body.get("credential").is_none());
+            assert!(body["ciphertext"].as_str().is_some());
+
+            // The genuine server behind the relay can decrypt and answer;
+            // the relay itself only sees opaque request/response ciphertext.
+            assert_eq!(
+                genuine_channel
+                    .open_credential(&ticket_request, "genuine-instance")
+                    .as_str(),
+                "saved-password-must-stay-secret"
+            );
+            respond_json(
+                &mut ticket_stream,
+                &genuine_channel.encrypted_ticket_json("opaque-ticket", "genuine-instance"),
+            );
+        });
+
+        let ticket = request_ticket(
+            &format!("http://{address}"),
+            "saved-password-must-stay-secret",
+            &bootstrap,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(ticket.ticket, "opaque-ticket");
+        assert_eq!(ticket.instance_id, "genuine-instance");
     }
 
     #[tokio::test]
@@ -2487,23 +2828,29 @@ mod tests {
     async fn trusting_a_replacement_preserves_its_verified_sidecar_token() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("replacement-instance");
+        let bootstrap = identity.bootstrap(true, "startup_token");
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            let mut request = [0_u8; 4096];
-            let read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..read]);
-            assert!(request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
-            assert!(request.contains("fresh-sidecar-token"));
-            let body = r#"{"ticket":"single-use-ticket","instance_id":"replacement-instance"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            let (mut proof_stream, _) = listener.accept().unwrap();
+            let proof_request = read_http_request(&mut proof_stream);
+            assert!(proof_request.starts_with("POST /api/auth/identity-proof HTTP/1.1"));
+            let (proof, channel) = identity.credential_proof_json(&proof_request);
+            respond_json(&mut proof_stream, &proof);
+
+            let (mut ticket_stream, _) = listener.accept().unwrap();
+            let ticket_request = read_http_request(&mut ticket_stream);
+            assert!(ticket_request.starts_with("POST /api/auth/desktop-ticket HTTP/1.1"));
+            assert!(!ticket_request.contains("fresh-sidecar-token"));
+            assert_eq!(
+                channel
+                    .open_credential(&ticket_request, "replacement-instance")
+                    .as_str(),
+                "fresh-sidecar-token"
+            );
+            respond_json(
+                &mut ticket_stream,
+                &channel.encrypted_ticket_json("single-use-ticket", "replacement-instance"),
+            );
         });
 
         let root = tempfile::tempdir().unwrap();
@@ -2530,8 +2877,6 @@ mod tests {
             ))),
             local_bound_identity: Mutex::new(None),
         };
-        let bootstrap = TestIdentity::new("replacement-instance").bootstrap(true, "startup_token");
-
         assert!(
             preserve_verified_replacement_token_or_forget(&state, &profile, &bootstrap)
                 .await

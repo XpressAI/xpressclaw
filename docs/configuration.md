@@ -69,7 +69,10 @@ Desktop profiles retain only its public key. Browser sessions and no-password
 startup tokens are process-local and disappear on restart. These secret files,
 Desktop profile data, and sessions are outside Project synchronization. Desktop
 stores remote profile credentials in the operating-system keychain; its JSON
-profile file contains only non-secret connection metadata.
+profile file contains only non-secret connection metadata. Before Desktop
+submits a saved credential, it opens a one-use encrypted channel authenticated
+by the pinned instance identity; this protects the keychain secret from a
+relaying endpoint but does not replace TLS for the browser session.
 
 Application authentication does not provide TLS. See [Remote
 access](remote-access.md) before selecting a non-loopback address.

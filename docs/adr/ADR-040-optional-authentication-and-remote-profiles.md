@@ -48,12 +48,16 @@ be coupled to browser sessions.
 - Desktop keeps one automatic local profile and any number of explicit remote
   profiles. Non-secret profile metadata is local to Desktop; credentials use
   the OS keychain. Desktop pins a long-lived Ed25519 instance public key and
-  verifies a fresh signed challenge before releasing a credential or granting
-  local plugin permissions; the private key remains in restricted instance
-  secret storage. On first local startup, the bundled child announces its
-  public key over inherited stdout only after it owns both listeners. Web
-  content can receive only a short-lived, single-use ticket for the currently
-  selected profile, never the keychain credential itself.
+  verifies a fresh signed challenge before granting local plugin permissions;
+  the private key remains in restricted instance secret storage. Desktop
+  releases a saved password or startup token only through a one-use channel
+  authenticated by that Ed25519 key: signed ephemeral X25519 keys feed
+  HKDF-SHA256 and directional ChaCha20-Poly1305 request/response keys. A relay
+  may forward the exchange but cannot decrypt the long-lived credential from
+  it. On first local startup, the bundled child announces its public key over
+  inherited stdout only after it owns both listeners. Web content can receive
+  only a short-lived, single-use ticket for the currently selected profile,
+  never the keychain credential itself.
 - Tauri application commands have an explicit ACL. Bundled local content gets
   the existing local command set; only the exact selected remote origin gets
   the narrower profile/login command set. Other remote origins cannot invoke
@@ -71,3 +75,9 @@ changes are distinguished from effective process values until restart, while
 password changes revoke sessions immediately. Existing `--bind` and
 `--allow-insecure-remote` scripts remain valid, and explicit CLI listener
 values continue to override saved configuration.
+
+The Desktop credential channel protects the keychain secret from a relaying
+or replacement HTTP endpoint; it is not a substitute for TLS and does not
+authenticate or encrypt the subsequent browser session. Operators who need
+transport integrity or protection against an active relay for all application
+traffic must use HTTPS, an SSH tunnel, or a trusted tailnet path.

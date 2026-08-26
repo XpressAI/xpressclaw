@@ -101,9 +101,12 @@ Desktop always starts the automatic local instance at `~/.xpressclaw`. In
 to a cryptographic instance identity, selected, edited, or removed. Desktop
 verifies a fresh signed challenge before using a saved credential; a recorded
 bootstrap response or instance ID is not sufficient. Passwords and startup
-tokens are stored in the operating-system keychain; the profile JSON contains
-only the name, URL, public identity, and authentication mode. A remote profile
-with authentication off requires the same trusted-network confirmation.
+tokens are stored in the operating-system keychain and sent only through a
+one-use encrypted channel whose ephemeral key is signed by the pinned instance
+identity. A relaying endpoint therefore sees only ciphertext, not the saved
+credential, during the native exchange. The profile JSON contains only the
+name, URL, public identity, and authentication mode. A remote profile with
+authentication off requires the same trusted-network confirmation.
 
 The current Desktop release intentionally selects one profile for the whole
 application. Switching closes secondary workspace windows before navigating
@@ -115,6 +118,11 @@ startup, Desktop falls back to the automatic local profile and marks the
 remote profile as needing credentials. Desktop exchanges a keychain credential
 for a short-lived, single-use ticket and never returns the stored credential to
 web content.
+
+This credential channel protects the saved secret during Desktop login; it
+does not add TLS or protect the browser session from an active network relay.
+Use HTTPS, an SSH tunnel, or a trusted tailnet path when the network itself is
+not trusted.
 
 ## Reconnection and runner callbacks
 

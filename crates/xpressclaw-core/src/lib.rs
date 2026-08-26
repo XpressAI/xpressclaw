@@ -2,6 +2,7 @@ pub mod acp;
 pub mod config;
 pub mod dashboard;
 pub mod db;
+pub mod desktop_auth;
 pub mod error;
 pub mod runtime;
 pub mod sync;

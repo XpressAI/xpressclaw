@@ -11,7 +11,10 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::auth::{cookie_value, expired_session_cookie, session_cookie, LoginError, CSRF_HEADER};
+use crate::auth::{
+    cookie_value, expired_session_cookie, session_cookie, DesktopCredentialError, LoginError,
+    CSRF_HEADER,
+};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -57,6 +60,8 @@ async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> Respons
 #[derive(Deserialize)]
 struct IdentityProofRequest {
     challenge: String,
+    #[serde(default)]
+    client_public_key: Option<String>,
 }
 
 async fn identity_proof(
@@ -68,6 +73,28 @@ async fn identity_proof(
     };
     if challenge.len() != 32 {
         return error_response(StatusCode::BAD_REQUEST, "Identity challenge is invalid");
+    }
+    if let Some(client_public_key) = body.client_public_key {
+        let Ok(client_public_key) = URL_SAFE_NO_PAD.decode(client_public_key) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "Desktop credential channel key is invalid",
+            );
+        };
+        let proof = match state
+            .auth
+            .begin_desktop_credential_exchange(&challenge, &client_public_key)
+        {
+            Ok(proof) => proof,
+            Err(error) => return desktop_channel_error_response(error),
+        };
+        return no_store(Json(serde_json::json!({
+            "instance_id": state.auth.instance_id(),
+            "identity_public_key": state.auth.identity_public_key(),
+            "exchange_id": proof.exchange_id,
+            "server_public_key": proof.server_public_key,
+            "signature": proof.signature,
+        })));
     }
     no_store(Json(serde_json::json!({
         "instance_id": state.auth.instance_id(),
@@ -130,28 +157,48 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     cleared_cookie(StatusCode::NO_CONTENT.into_response())
 }
 
+#[derive(Deserialize)]
+struct DesktopTicketRequest {
+    exchange_id: String,
+    ciphertext: String,
+}
+
 async fn desktop_ticket(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(body): Json<LoginRequest>,
+    Json(body): Json<DesktopTicketRequest>,
 ) -> Response {
-    if body.credential.is_empty() || body.credential.len() > 4096 {
-        return error_response(StatusCode::BAD_REQUEST, "Credential length is invalid");
-    }
+    let channel = match state
+        .auth
+        .open_desktop_credential(&body.exchange_id, &body.ciphertext)
+    {
+        Ok(channel) => channel,
+        Err(error) => return desktop_channel_error_response(error),
+    };
     match state
         .auth
-        .create_desktop_ticket(
-            Zeroizing::new(body.credential),
-            login_client_ip(&headers, peer),
-        )
+        .create_desktop_ticket(channel.credential.clone(), login_client_ip(&headers, peer))
         .await
     {
-        Ok(ticket) => no_store(Json(serde_json::json!({
-            "ticket": ticket.as_str(),
-            "instance_id": state.auth.instance_id(),
-            "expires_in_seconds": 30,
-        }))),
+        Ok(ticket) => {
+            let mut plaintext = Zeroizing::new(
+                serde_json::to_vec(&serde_json::json!({
+                    "ticket": ticket.as_str(),
+                    "instance_id": state.auth.instance_id(),
+                    "expires_in_seconds": 30,
+                }))
+                .expect("Desktop ticket response is serializable"),
+            );
+            let ciphertext = match state
+                .auth
+                .seal_desktop_credential_response(&channel, &mut plaintext)
+            {
+                Ok(ciphertext) => ciphertext,
+                Err(error) => return desktop_channel_error_response(error),
+            };
+            no_store(Json(serde_json::json!({ "ciphertext": ciphertext })))
+        }
         Err(error) => login_error_response(error),
     }
 }
@@ -255,6 +302,19 @@ fn login_error_response(error: LoginError) -> Response {
         LoginError::Disabled => error_response(
             StatusCode::CONFLICT,
             "Authentication is disabled for this running instance",
+        ),
+    }
+}
+
+fn desktop_channel_error_response(error: DesktopCredentialError) -> Response {
+    match error {
+        DesktopCredentialError::Invalid => error_response(
+            StatusCode::BAD_REQUEST,
+            "Desktop credential channel is invalid or expired",
+        ),
+        DesktopCredentialError::Internal => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not create a secure Desktop credential channel",
         ),
     }
 }

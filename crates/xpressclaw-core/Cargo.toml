@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 ring = { workspace = true }
+zeroize = { workspace = true }
 bollard = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
 tracing = { workspace = true }

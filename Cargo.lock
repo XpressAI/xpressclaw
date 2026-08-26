@@ -8266,6 +8266,7 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
@@ -8332,6 +8333,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xpressclaw-core",
  "zeroize",
 ]
 

@@ -10,6 +10,7 @@ description = "Tauri native desktop app for xpressclaw"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+xpressclaw-core = { path = "../xpressclaw-core" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

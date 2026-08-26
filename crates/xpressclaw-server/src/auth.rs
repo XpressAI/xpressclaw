@@ -14,19 +14,26 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tempfile::NamedTempFile;
+use xpressclaw_core::desktop_auth::{
+    credential_aad as desktop_credential_aad,
+    credential_proof_message as desktop_credential_proof_message,
+    derive_credential_keys as derive_desktop_credential_keys, identity_proof_message,
+    CREDENTIAL_CHANNEL_NONCE, CREDENTIAL_REQUEST_DIRECTION, CREDENTIAL_RESPONSE_DIRECTION,
+};
 use zeroize::Zeroizing;
 
 pub const SESSION_COOKIE: &str = "xpressclaw_session";
 pub const CSRF_HEADER: &str = "x-xpressclaw-csrf";
 pub const STARTUP_TOKEN_PREFIX: &str = "XPRESSCLAW_STARTUP_TOKEN=";
 pub const INSTANCE_IDENTITY_PREFIX: &str = "XPRESSCLAW_INSTANCE_IDENTITY=";
-const IDENTITY_PROOF_DOMAIN: &[u8] = b"xpressclaw-desktop-identity-v1\0";
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 const DESKTOP_TICKET_LIFETIME: Duration = Duration::from_secs(30);
@@ -35,6 +42,8 @@ const MAX_LOGIN_FAILURES: usize = 5;
 const MAX_TRACKED_LOGIN_PEERS: usize = 4096;
 const MAX_BROWSER_SESSIONS: usize = 256;
 const MAX_DESKTOP_TICKETS: usize = 128;
+const MAX_DESKTOP_CREDENTIAL_CHANNELS: usize = 128;
+const DESKTOP_CREDENTIAL_CHANNEL_LIFETIME: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
@@ -71,6 +80,30 @@ struct DesktopTicket {
     expires_at: Instant,
 }
 
+struct DesktopCredentialChannel {
+    request_key: Zeroizing<[u8; 32]>,
+    response_key: Zeroizing<[u8; 32]>,
+    expires_at: Instant,
+}
+
+pub struct DesktopCredentialProof {
+    pub exchange_id: String,
+    pub server_public_key: String,
+    pub signature: String,
+}
+
+pub struct OpenedDesktopCredential {
+    pub credential: Zeroizing<String>,
+    exchange_id: [u8; 32],
+    response_key: Zeroizing<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopCredentialError {
+    Invalid,
+    Internal,
+}
+
 #[derive(Default)]
 struct LoginFailures {
     failures: VecDeque<Instant>,
@@ -85,6 +118,7 @@ pub struct InstanceAuth {
     credential: Mutex<Credential>,
     sessions: Mutex<HashMap<[u8; 32], BrowserSession>>,
     desktop_tickets: Mutex<HashMap<[u8; 32], DesktopTicket>>,
+    desktop_credential_channels: Mutex<HashMap<[u8; 32], DesktopCredentialChannel>>,
     login_failures: Mutex<HashMap<IpAddr, LoginFailures>>,
     /// Serialize credential verification so a parallel burst cannot race
     /// through the failure threshold and fan out memory-hard Argon2 work.
@@ -116,6 +150,7 @@ impl InstanceAuth {
             credential: Mutex::new(Credential::Disabled),
             sessions: Mutex::new(HashMap::new()),
             desktop_tickets: Mutex::new(HashMap::new()),
+            desktop_credential_channels: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             login_gate: tokio::sync::Mutex::new(()),
             announcement: Mutex::new(None),
@@ -157,6 +192,7 @@ impl InstanceAuth {
             credential: Mutex::new(credential),
             sessions: Mutex::new(HashMap::new()),
             desktop_tickets: Mutex::new(HashMap::new()),
+            desktop_credential_channels: Mutex::new(HashMap::new()),
             login_failures: Mutex::new(HashMap::new()),
             login_gate: tokio::sync::Mutex::new(()),
             announcement: Mutex::new(announcement),
@@ -182,6 +218,163 @@ impl InstanceAuth {
                 .sign(&identity_proof_message(&self.instance_id, challenge))
                 .as_ref(),
         )
+    }
+
+    /// Establish a one-use encrypted channel for a Desktop credential. The
+    /// instance identity signs both ephemeral X25519 keys and the caller's
+    /// fresh challenge, so a relay can forward the exchange but cannot read
+    /// the password or startup token that follows.
+    pub fn begin_desktop_credential_exchange(
+        &self,
+        challenge: &[u8],
+        client_public_key: &[u8],
+    ) -> Result<DesktopCredentialProof, DesktopCredentialError> {
+        if challenge.len() != 32 || client_public_key.len() != 32 {
+            return Err(DesktopCredentialError::Invalid);
+        }
+        let rng = SystemRandom::new();
+        let server_private = EphemeralPrivateKey::generate(&X25519, &rng)
+            .map_err(|_| DesktopCredentialError::Internal)?;
+        let server_public = server_private
+            .compute_public_key()
+            .map_err(|_| DesktopCredentialError::Internal)?;
+        let server_public_key: [u8; 32] = server_public
+            .as_ref()
+            .try_into()
+            .map_err(|_| DesktopCredentialError::Internal)?;
+        let client_public_key: [u8; 32] = client_public_key
+            .try_into()
+            .map_err(|_| DesktopCredentialError::Invalid)?;
+        let mut exchange_id = [0u8; 32];
+        rng.fill(&mut exchange_id)
+            .map_err(|_| DesktopCredentialError::Internal)?;
+        let peer = UnparsedPublicKey::new(&X25519, client_public_key);
+        let keys = agree_ephemeral(server_private, &peer, |shared| {
+            derive_desktop_credential_keys(
+                shared,
+                &self.instance_id,
+                challenge,
+                &exchange_id,
+                &client_public_key,
+                &server_public_key,
+            )
+        })
+        .map_err(|_| DesktopCredentialError::Invalid)?
+        .map_err(|_| DesktopCredentialError::Internal)?;
+
+        let proof_message = desktop_credential_proof_message(
+            &self.instance_id,
+            challenge,
+            &exchange_id,
+            &client_public_key,
+            &server_public_key,
+        );
+        let signature = URL_SAFE_NO_PAD.encode(self.identity_key.sign(&proof_message).as_ref());
+        let now = Instant::now();
+        let mut channels = self.desktop_credential_channels.lock().unwrap();
+        channels.retain(|_, channel| channel.expires_at > now);
+        if channels.len() >= MAX_DESKTOP_CREDENTIAL_CHANNELS {
+            if let Some(oldest) = channels
+                .iter()
+                .min_by_key(|(_, channel)| channel.expires_at)
+                .map(|(id, _)| *id)
+            {
+                channels.remove(&oldest);
+            }
+        }
+        channels.insert(
+            exchange_id,
+            DesktopCredentialChannel {
+                request_key: keys.request,
+                response_key: keys.response,
+                expires_at: now + DESKTOP_CREDENTIAL_CHANNEL_LIFETIME,
+            },
+        );
+        Ok(DesktopCredentialProof {
+            exchange_id: URL_SAFE_NO_PAD.encode(exchange_id),
+            server_public_key: URL_SAFE_NO_PAD.encode(server_public_key),
+            signature,
+        })
+    }
+
+    /// Consume a credential exchange before attempting decryption so an
+    /// invalid or replayed ciphertext cannot be tried against the same key.
+    pub fn open_desktop_credential(
+        &self,
+        exchange_id: &str,
+        ciphertext: &str,
+    ) -> Result<OpenedDesktopCredential, DesktopCredentialError> {
+        let exchange_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(exchange_id)
+            .map_err(|_| DesktopCredentialError::Invalid)?
+            .try_into()
+            .map_err(|_| DesktopCredentialError::Invalid)?;
+        let mut channels = self.desktop_credential_channels.lock().unwrap();
+        let now = Instant::now();
+        channels.retain(|_, channel| channel.expires_at > now);
+        let channel = channels
+            .remove(&exchange_id)
+            .ok_or(DesktopCredentialError::Invalid)?;
+        drop(channels);
+
+        let mut encrypted = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(ciphertext)
+                .map_err(|_| DesktopCredentialError::Invalid)?,
+        );
+        if encrypted.len() > 4096 + CHACHA20_POLY1305.tag_len() {
+            return Err(DesktopCredentialError::Invalid);
+        }
+        let key = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, channel.request_key.as_ref())
+                .map_err(|_| DesktopCredentialError::Internal)?,
+        );
+        let aad = desktop_credential_aad(
+            &self.instance_id,
+            &exchange_id,
+            CREDENTIAL_REQUEST_DIRECTION,
+        );
+        let plaintext = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+                Aad::from(aad),
+                encrypted.as_mut(),
+            )
+            .map_err(|_| DesktopCredentialError::Invalid)?;
+        if plaintext.is_empty() || plaintext.len() > 4096 {
+            return Err(DesktopCredentialError::Invalid);
+        }
+        let credential = std::str::from_utf8(plaintext)
+            .map_err(|_| DesktopCredentialError::Invalid)?
+            .to_owned();
+        Ok(OpenedDesktopCredential {
+            credential: Zeroizing::new(credential),
+            exchange_id,
+            response_key: channel.response_key,
+        })
+    }
+
+    pub fn seal_desktop_credential_response(
+        &self,
+        channel: &OpenedDesktopCredential,
+        plaintext: &mut Vec<u8>,
+    ) -> Result<String, DesktopCredentialError> {
+        let key = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, channel.response_key.as_ref())
+                .map_err(|_| DesktopCredentialError::Internal)?,
+        );
+        let aad = desktop_credential_aad(
+            &self.instance_id,
+            &channel.exchange_id,
+            CREDENTIAL_RESPONSE_DIRECTION,
+        );
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+            Aad::from(aad),
+            plaintext,
+        )
+        .map_err(|_| DesktopCredentialError::Internal)?;
+        Ok(URL_SAFE_NO_PAD.encode(plaintext))
     }
 
     pub fn enabled(&self) -> bool {
@@ -271,6 +464,7 @@ impl InstanceAuth {
     pub fn revoke_all(&self) {
         self.sessions.lock().unwrap().clear();
         self.desktop_tickets.lock().unwrap().clear();
+        self.desktop_credential_channels.lock().unwrap().clear();
     }
 
     /// Apply a password change to the running process and revoke every
@@ -441,16 +635,6 @@ fn secret_key(value: &str) -> [u8; 32] {
         .as_ref()
         .try_into()
         .expect("SHA-256 has a fixed length")
-}
-
-pub fn identity_proof_message(instance_id: &str, challenge: &[u8]) -> Vec<u8> {
-    let mut message =
-        Vec::with_capacity(IDENTITY_PROOF_DOMAIN.len() + instance_id.len() + 1 + challenge.len());
-    message.extend_from_slice(IDENTITY_PROOF_DOMAIN);
-    message.extend_from_slice(instance_id.as_bytes());
-    message.push(0);
-    message.extend_from_slice(challenge);
-    message
 }
 
 #[derive(Serialize, Deserialize)]
@@ -668,6 +852,116 @@ mod tests {
                 &replayed_for_another_challenge,
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn desktop_credentials_use_a_signed_one_time_encrypted_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let auth = InstanceAuth::load(
+            root.path(),
+            "instance".into(),
+            true,
+            Some(Zeroizing::new("saved-password".into())),
+        )
+        .unwrap();
+        let rng = SystemRandom::new();
+        let challenge = [7u8; 32];
+        let client_private = EphemeralPrivateKey::generate(&X25519, &rng).unwrap();
+        let client_public_key: [u8; 32] = client_private
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let proof = auth
+            .begin_desktop_credential_exchange(&challenge, &client_public_key)
+            .unwrap();
+        let exchange_id: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&proof.exchange_id)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let server_public_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&proof.server_public_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let identity_public_key = URL_SAFE_NO_PAD.decode(auth.identity_public_key()).unwrap();
+        let signature = URL_SAFE_NO_PAD.decode(proof.signature).unwrap();
+        UnparsedPublicKey::new(&ED25519, identity_public_key)
+            .verify(
+                &desktop_credential_proof_message(
+                    "instance",
+                    &challenge,
+                    &exchange_id,
+                    &client_public_key,
+                    &server_public_key,
+                ),
+                &signature,
+            )
+            .unwrap();
+        let peer = ring::agreement::UnparsedPublicKey::new(&X25519, server_public_key);
+        let keys = agree_ephemeral(client_private, &peer, |shared| {
+            derive_desktop_credential_keys(
+                shared,
+                "instance",
+                &challenge,
+                &exchange_id,
+                &client_public_key,
+                &server_public_key,
+            )
+        })
+        .unwrap()
+        .unwrap();
+
+        let mut ciphertext = b"saved-password".to_vec();
+        let request_aad =
+            desktop_credential_aad("instance", &exchange_id, CREDENTIAL_REQUEST_DIRECTION);
+        LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, keys.request.as_ref()).unwrap())
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+                Aad::from(request_aad),
+                &mut ciphertext,
+            )
+            .unwrap();
+        assert!(!ciphertext
+            .windows("saved-password".len())
+            .any(|window| window == b"saved-password"));
+        let opened = auth
+            .open_desktop_credential(&proof.exchange_id, &URL_SAFE_NO_PAD.encode(&ciphertext))
+            .unwrap();
+        assert_eq!(opened.credential.as_str(), "saved-password");
+        assert!(matches!(
+            auth.open_desktop_credential(&proof.exchange_id, &URL_SAFE_NO_PAD.encode(&ciphertext)),
+            Err(DesktopCredentialError::Invalid)
+        ));
+
+        let ticket = auth
+            .create_desktop_ticket(opened.credential.clone(), "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        let mut encrypted_response = serde_json::to_vec(&serde_json::json!({
+            "ticket": ticket.as_str(),
+            "instance_id": "instance",
+        }))
+        .unwrap();
+        let encoded = auth
+            .seal_desktop_credential_response(&opened, &mut encrypted_response)
+            .unwrap();
+        let mut encrypted_response = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        let response_aad =
+            desktop_credential_aad("instance", &exchange_id, CREDENTIAL_RESPONSE_DIRECTION);
+        let plaintext =
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, keys.response.as_ref()).unwrap())
+                .open_in_place(
+                    Nonce::assume_unique_for_key(CREDENTIAL_CHANNEL_NONCE),
+                    Aad::from(response_aad),
+                    &mut encrypted_response,
+                )
+                .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(plaintext).unwrap();
+        assert_eq!(response["instance_id"], "instance");
+        assert_eq!(response["ticket"], ticket.as_str());
     }
 
     #[tokio::test]
