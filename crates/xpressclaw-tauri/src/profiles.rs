@@ -729,26 +729,11 @@ pub async fn select_instance_profile(
     let credential_profile = profile.clone();
     if profile.local {
         profile = state.set_local_bootstrap(&bootstrap)?;
+    } else {
+        validate_remote_profile_navigation(&profile, &bootstrap)?;
     }
-    if !profile.local
-        && !bootstrap.authentication_enabled
-        && !profile.confirmed_unauthenticated_remote
-    {
-        return Err("Confirm unauthenticated remote access before connecting".to_string());
-    }
-    if !profile.local && !bootstrap.authentication_enabled && profile.authentication != "none" {
-        return Err(
-            "This instance now has authentication disabled; edit the profile and confirm its trusted network before connecting"
-                .to_string(),
-        );
-    }
-    if bootstrap.authentication_enabled {
+    if profile.local && bootstrap.authentication_enabled {
         let expected = effective_authentication(&bootstrap)?;
-        if !profile.local && profile.authentication != expected {
-            return Err(format!(
-                "This instance now requires {expected}; edit the profile before reconnecting"
-            ));
-        }
         let credential =
             credential_for_authentication(&state, &credential_profile, expected).await?;
         validate_desktop_credential(&profile.url, &credential, &bootstrap).await?;
@@ -885,17 +870,17 @@ pub async fn login_active_profile(
         return Ok(false);
     }
     let expected = effective_authentication(&bootstrap)?;
-    if profile.authentication != expected {
-        return Err(format!(
-            "This instance now requires {expected}; edit the profile before reconnecting"
-        ));
-    }
     // A remote page must authenticate through its visible browser origin.
     // Native code cannot bind the WebView's later cookie-bearing connection to
     // the separately proved XpressClaw identity, even when that origin uses
     // HTTPS, so silently attempting keychain login would reintroduce a relay.
     if !profile.local {
         return Ok(false);
+    }
+    if profile.authentication != expected {
+        return Err(format!(
+            "This instance now requires {expected}; edit the profile before reconnecting"
+        ));
     }
     require_listener_bound_local_session_origin(&state, &profile, &bootstrap)?;
     let credential = credential_for_authentication(&state, &credential_profile, expected).await?;
@@ -1114,23 +1099,7 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
         Some(expected_identity) => {
             match fetch_verified_bootstrap(&profile.url, Some(expected_identity)).await {
                 Ok(bootstrap) if profile_identity_matches(&profile, &bootstrap) => {
-                    if bootstrap.authentication_enabled {
-                        match (
-                            effective_authentication(&bootstrap),
-                            profile_credential(state, &profile),
-                        ) {
-                            (Ok(expected), Ok(credential))
-                                if expected == profile.authentication =>
-                            {
-                                validate_desktop_credential(&profile.url, &credential, &bootstrap)
-                                    .await
-                                    .is_ok()
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        profile.authentication == "none" && profile.confirmed_unauthenticated_remote
-                    }
+                    validate_remote_profile_navigation(&profile, &bootstrap).is_ok()
                 }
                 _ => false,
             }
@@ -1144,6 +1113,32 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
             .select_local()
             .unwrap_or_else(|_| "http://localhost:8935".to_string())
     }
+}
+
+fn validate_remote_profile_navigation(
+    profile: &StoredProfile,
+    bootstrap: &Bootstrap,
+) -> Result<(), String> {
+    if bootstrap.authentication_enabled {
+        // Remote profiles authenticate in their visible browser origin. Once
+        // the target has proved its pinned instance identity, navigate to its
+        // login page even when a saved password or rotating startup token is
+        // stale. Native code must not read or validate keychain material before
+        // that navigation; a successful browser login updates the saved mode
+        // and credential afterward.
+        effective_authentication(bootstrap)?;
+        return Ok(());
+    }
+    if !profile.confirmed_unauthenticated_remote {
+        return Err("Confirm unauthenticated remote access before connecting".to_string());
+    }
+    if profile.authentication != "none" {
+        return Err(
+            "This instance now has authentication disabled; edit the profile and confirm its trusted network before connecting"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Dynamic Tauri capabilities cannot be revoked after a profile switch. Keep
@@ -2363,6 +2358,36 @@ mod tests {
         assert!(effective_authentication(&bootstrap(true, "future_mode")).is_err());
     }
 
+    #[test]
+    fn authenticated_remote_navigation_defers_credentials_to_browser_login() {
+        let identity = TestIdentity::new("remote-instance");
+        let mut profile = StoredProfile {
+            id: "remote".into(),
+            name: "Remote".into(),
+            url: "https://remote.example".into(),
+            instance_id: Some("remote-instance".into()),
+            identity_public_key: Some(identity.public_key()),
+            authentication: "password".into(),
+            local: false,
+            confirmed_unauthenticated_remote: false,
+        };
+
+        // A restart can rotate a startup token or change the authenticated
+        // mode. Neither condition should prevent the proved origin from
+        // showing the browser form that collects the current credential.
+        assert!(validate_remote_profile_navigation(
+            &profile,
+            &identity.bootstrap(true, "startup_token")
+        )
+        .is_ok());
+
+        let no_auth = identity.bootstrap(false, "disabled");
+        assert!(validate_remote_profile_navigation(&profile, &no_auth).is_err());
+        profile.authentication = "none".into();
+        profile.confirmed_unauthenticated_remote = true;
+        assert!(validate_remote_profile_navigation(&profile, &no_auth).is_ok());
+    }
+
     #[tokio::test]
     async fn signed_instance_identity_accepts_a_fresh_challenge() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2494,6 +2519,58 @@ mod tests {
         assert_eq!(preferred_startup_url(&state).await, "http://localhost:8935");
         server.join().unwrap();
         assert!(state.active().unwrap().local);
+    }
+
+    #[tokio::test]
+    async fn startup_opens_a_proved_remote_before_validating_its_rotating_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let remote_url = format!("http://{address}");
+        let identity = TestIdentity::new("rotating-token-remote");
+        let expected_public_key = identity.public_key();
+        let server = std::thread::spawn(move || {
+            // Only bootstrap and identity proof are served. A native
+            // credential-validation request would fail this regression.
+            serve_bootstrap_and_proof(listener, identity, true, "startup_token")
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: "remote".into(),
+                profiles: vec![
+                    StoredProfile {
+                        id: LOCAL_PROFILE_ID.into(),
+                        name: "Local XpressClaw".into(),
+                        url: "http://localhost:8935".into(),
+                        instance_id: None,
+                        identity_public_key: None,
+                        authentication: "none".into(),
+                        local: true,
+                        confirmed_unauthenticated_remote: true,
+                    },
+                    StoredProfile {
+                        id: "remote".into(),
+                        name: "Remote".into(),
+                        url: remote_url.clone(),
+                        instance_id: Some("rotating-token-remote".into()),
+                        identity_public_key: Some(expected_public_key),
+                        authentication: "startup_token".into(),
+                        local: false,
+                        confirmed_unauthenticated_remote: false,
+                    },
+                ],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+
+        assert_eq!(preferred_startup_url(&state).await, remote_url);
+        server.join().unwrap();
+        assert_eq!(state.active().unwrap().id, "remote");
     }
 
     #[tokio::test]

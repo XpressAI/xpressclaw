@@ -121,10 +121,12 @@ The current Desktop release intentionally selects one profile for the whole
 application. Switching closes secondary workspace windows before navigating
 the main window, so no window silently remains connected to stale instance
 state. The local sidecar remains running while a remote profile is selected.
-An expired browser session returns to the login screen. If a selected remote
-profile is unreachable or its saved credential is rejected during Desktop
-startup, Desktop falls back to the automatic local profile and marks the
-remote profile as needing credentials. For an origin eligible for automatic
+An expired browser session returns to the login screen. Desktop falls back to
+the automatic local profile only when a selected remote is unreachable or
+cannot prove its pinned identity. A proved remote opens its browser login
+without first validating saved keychain material, so a rotated startup token
+can be entered directly; a successful login refreshes the saved credential and
+authentication mode. For the managed local origin eligible for automatic
 login, the server creates browser-session material only inside the signed
 one-use encrypted channel. Desktop installs the session as an HttpOnly cookie
 and returns only success/failure to web content; no password, startup token,
