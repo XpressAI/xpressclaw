@@ -308,6 +308,11 @@ fn main() {
                         path = %sidecar_path.display(),
                         "failed to spawn sidecar — the app will start but the server won't be running"
                     );
+                    tauri::async_runtime::spawn(show_preferred_startup(
+                        app.handle().clone(),
+                        local_url.clone(),
+                        false,
+                    ));
                     tray::setup_tray(app, &local_url)?;
                     return Ok(());
                 }
@@ -340,40 +345,14 @@ fn main() {
             let state = app.state::<SidecarState>();
             *state.0.lock().unwrap() = Some(child);
 
-            // Wait for server to be ready, then show the window
-            let handle = app.handle().clone();
-            let startup_local_url = local_url.clone();
-            tauri::async_runtime::spawn(async move {
-                let server_ready = wait_for_server(&startup_local_url).await;
-                if let Some(window) = handle.get_webview_window("main") {
-                    if server_ready {
-                        info!("server is ready");
-                        if let Err(error) =
-                            enable_image_paste_capability(&handle, &startup_local_url)
-                        {
-                            warn!(%error, "failed to enable image paste capability");
-                        }
-                        if let Err(error) =
-                            enable_workspace_window_capability(&handle, &startup_local_url)
-                        {
-                            warn!(%error, "failed to enable workspace window capability");
-                        }
-                        let profile_state = handle.state::<profiles::ProfileState>();
-                        let url = profiles::preferred_startup_url(&profile_state).await;
-                        let local_profile = profile_state.active_is_local().unwrap_or(true);
-                        if let Err(error) =
-                            enable_profile_capabilities(&handle, &url, local_profile)
-                        {
-                            warn!(%error, "failed to enable selected profile capabilities");
-                        }
-                        if let Ok(url) = url.parse() {
-                            let _ = window.navigate(url);
-                        }
-                    }
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            });
+            // Resolve a selected remote profile before waiting on the local
+            // sidecar. Remote operation must remain usable when the optional
+            // automatic local instance cannot bind or start.
+            tauri::async_runtime::spawn(show_preferred_startup(
+                app.handle().clone(),
+                local_url.clone(),
+                true,
+            ));
 
             tray::setup_tray(app, &local_url)?;
             info!(port, "xpressclaw desktop app started");
@@ -402,6 +381,49 @@ fn main() {
                 shutdown_sidecar(app);
             }
         });
+}
+
+async fn show_preferred_startup(
+    handle: tauri::AppHandle,
+    local_url: String,
+    sidecar_spawned: bool,
+) {
+    let profile_state = handle.state::<profiles::ProfileState>();
+    let url = profiles::preferred_startup_url(&profile_state).await;
+    let local_profile = profile_state.active_is_local().unwrap_or(true);
+    let server_ready = if should_wait_for_local_sidecar(local_profile, sidecar_spawned) {
+        wait_for_server(&local_url).await
+    } else {
+        false
+    };
+
+    if server_ready {
+        info!("server is ready");
+        if let Err(error) = enable_image_paste_capability(&handle, &local_url) {
+            warn!(%error, "failed to enable image paste capability");
+        }
+        if let Err(error) = enable_workspace_window_capability(&handle, &local_url) {
+            warn!(%error, "failed to enable workspace window capability");
+        }
+    }
+    // A remote profile is independent of local listener health. For the local
+    // profile, do not grant native capabilities to an unverified listener.
+    if !local_profile || server_ready {
+        if let Err(error) = enable_profile_capabilities(&handle, &url, local_profile) {
+            warn!(%error, "failed to enable selected profile capabilities");
+        }
+    }
+    if let Some(window) = handle.get_webview_window("main") {
+        if let Ok(url) = url.parse() {
+            let _ = window.navigate(url);
+        }
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn should_wait_for_local_sidecar(local_profile: bool, sidecar_spawned: bool) -> bool {
+    local_profile && sidecar_spawned
 }
 
 /// Show a confirmation dialog, then shut down if confirmed.
@@ -633,6 +655,14 @@ mod tests {
         assert!(local.contains(&"clipboard-manager:allow-read-image"));
         assert!(local.contains(&"core:webview:allow-create-webview-window"));
         assert!(local.contains(&"desktop-local-commands"));
+    }
+
+    #[test]
+    fn remote_startup_never_waits_for_the_local_sidecar() {
+        assert!(!should_wait_for_local_sidecar(false, true));
+        assert!(!should_wait_for_local_sidecar(false, false));
+        assert!(should_wait_for_local_sidecar(true, true));
+        assert!(!should_wait_for_local_sidecar(true, false));
     }
 
     #[test]

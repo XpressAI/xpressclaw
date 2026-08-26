@@ -12,7 +12,6 @@
 	let desktopAttempted = $state(false);
 	let desktopIdentityBlocked = $state(false);
 	let blockedLocalProfile = $state(false);
-	let pinnedInstanceId = $state<string | null>(null);
 	let returningLocal = $state(false);
 	let trustingReplacement = $state(false);
 
@@ -54,11 +53,10 @@
 			if ('__TAURI_INTERNALS__' in window) {
 				desktopAttempted = true;
 				const { invoke } = await import('@tauri-apps/api/core');
-				const active = await invoke<{ instance_id: string | null; local: boolean }>('get_active_instance_profile');
-				if (active.instance_id && active.instance_id !== session.instance_id) {
+				const active = await invoke<{ identity_status: 'unpinned' | 'matched' | 'changed'; local: boolean }>('get_active_instance_profile');
+				if (active.identity_status === 'changed') {
 					desktopIdentityBlocked = true;
 					blockedLocalProfile = active.local;
-					pinnedInstanceId = active.instance_id;
 					error = active.local
 						? 'A different XpressClaw instance is answering on the saved local address. Desktop will not send it a saved credential.'
 						: 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
@@ -95,7 +93,6 @@
 			await invoke('trust_local_instance_replacement', { instanceId: session.instance_id });
 			desktopIdentityBlocked = false;
 			blockedLocalProfile = false;
-			pinnedInstanceId = null;
 			if (session.authentication_enabled && !session.authenticated) {
 				await finishDesktopLogin();
 			} else {
@@ -173,10 +170,7 @@
 				<div class="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">
 					<p>{error}</p>
 					{#if blockedLocalProfile}
-						<div class="mt-3 space-y-1 text-xs text-muted-foreground">
-							<p>Saved identity: <code class="break-all">{pinnedInstanceId}</code></p>
-							<p>Current identity: <code class="break-all">{session?.instance_id}</code></p>
-						</div>
+						<p class="mt-3 text-xs text-muted-foreground">Desktop keeps the previous instance identity in native storage and does not reveal it to page content.</p>
 						<p class="mt-3 text-xs text-foreground">Only trust the replacement if you intentionally reset or replaced this local instance. Desktop will discard the previous credential; if it launched this replacement, it can retain only a startup token the new instance verifies.</p>
 						<button type="button" onclick={trustLocalReplacement} disabled={trustingReplacement} class="mt-3 rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground disabled:opacity-50">
 							{trustingReplacement ? 'Waiting for confirmation…' : 'Trust replacement local instance'}

@@ -116,10 +116,10 @@
 				await auth.login(submittedPassword);
 			}
 			let keychainWarning = '';
-			if (desktop && (submittedPassword || submittedRemoval || !authenticationEnabled)) {
+			if (desktop && (submittedPassword || submittedRemoval)) {
 				const { invoke } = await import('@tauri-apps/api/core');
 				await invoke('store_active_profile_credential', {
-					credential: submittedRemoval || !authenticationEnabled ? null : submittedPassword,
+					credential: submittedRemoval ? null : submittedPassword,
 				}).catch((cause) => {
 					keychainWarning = cause instanceof Error ? cause.message : String(cause);
 				});

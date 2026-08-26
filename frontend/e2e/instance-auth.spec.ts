@@ -95,7 +95,7 @@ test('Desktop blocks credentials when a remote address changes instance identity
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
 				if (command === 'get_active_instance_profile') {
-					return { instance_id: 'expected-instance', local: false };
+					return { identity_status: 'changed', local: false };
 				}
 				if (command === 'select_instance_profile') {
 					target.__selectedProfile = (args as { id: string }).id;
@@ -132,7 +132,7 @@ test('Desktop routes a no-auth replacement through identity recovery', async ({ 
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
 				if (command === 'get_active_instance_profile') {
-					return { instance_id: 'expected-instance', local: false };
+					return { identity_status: 'changed', local: false };
 				}
 				if (command === 'select_instance_profile') {
 					target.__selectedProfile = (args as { id: string }).id;
@@ -170,7 +170,7 @@ test('Desktop pins a first-use no-auth local instance before showing the workspa
 			invoke: async (command: string) => {
 				target.__tauriCalls.push(command);
 				if (command === 'get_active_instance_profile') {
-					return { instance_id: null, local: true };
+					return { identity_status: 'unpinned', local: true };
 				}
 				if (command === 'login_active_profile') return null;
 				throw new Error(`Unexpected Tauri command: ${command}`);
@@ -210,7 +210,7 @@ test('Desktop requires explicit recovery before trusting a replacement local ide
 			invoke: async (command: string, args: unknown) => {
 				target.__tauriCalls.push(`${command}:${JSON.stringify(args ?? null)}`);
 				if (command === 'get_active_instance_profile') {
-					return { instance_id: 'trusted-local-instance', local: true };
+					return { identity_status: 'changed', local: true };
 				}
 				if (command === 'trust_local_instance_replacement') return null;
 				if (command === 'login_active_profile') return null;
@@ -228,8 +228,8 @@ test('Desktop requires explicit recovery before trusting a replacement local ide
 
 	await page.goto('/login');
 	await expect(page.getByText(/different XpressClaw instance is answering on the saved local address/i)).toBeVisible();
-	await expect(page.getByText('trusted-local-instance', { exact: true })).toBeVisible();
-	await expect(page.getByText('replacement-local-instance', { exact: true })).toBeVisible();
+	await expect(page.getByText(/keeps the previous instance identity in native storage/i)).toBeVisible();
+	await expect(page.getByText('trusted-local-instance', { exact: true })).toHaveCount(0);
 	await expect(page.getByLabel('Password')).toHaveCount(0);
 	expect(await page.evaluate(() => (
 		window as unknown as { __tauriCalls: string[] }
@@ -343,6 +343,63 @@ test('Desktop persists a newly configured password before authentication restart
 	await expect.poll(() => page.evaluate(() => (
 		window as unknown as { __credentialCalls: unknown[] }
 	).__credentialCalls)).toEqual([{ credential: 'pending-password-123' }]);
+});
+
+test('Desktop retains its keychain password while authentication is temporarily disabled', async ({ page }) => {
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__credentialCalls: unknown[];
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__credentialCalls = [];
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
+				if (command === 'list_instance_profiles') return [];
+				if (command === 'store_active_profile_credential') {
+					target.__credentialCalls.push(structuredClone(args));
+					return null;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	const effective = { ...baseInstance.effective, authentication_enabled: true };
+	let saved = { ...baseInstance.saved, authentication_enabled: true };
+	let updateCompleted = false;
+	await page.route('**/api/**', async (route) => {
+		const request = route.request();
+		const path = new URL(request.url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: true, credential_kind: 'password', authenticated: true, csrf_token: 'csrf-test' });
+			return;
+		}
+		if (path === '/api/settings/instance/') {
+			if (request.method() === 'PUT') {
+				const update = request.postDataJSON() as { authentication_enabled: boolean };
+				saved = { ...saved, authentication_enabled: update.authentication_enabled };
+				updateCompleted = true;
+			}
+			await fulfill(route, {
+				...baseInstance,
+				effective,
+				saved,
+				credential_kind: 'password',
+				password_configured: true,
+				restart_required: saved.authentication_enabled !== effective.authentication_enabled,
+			});
+			return;
+		}
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/settings/server');
+	await page.getByLabel('Require XpressClaw login').uncheck();
+	await page.getByRole('button', { name: 'Save instance settings' }).click();
+	await expect.poll(() => updateCompleted).toBe(true);
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __credentialCalls: unknown[] }
+	).__credentialCalls)).toEqual([]);
 });
 
 test('Desktop profiles can be edited without exposing their saved keychain credential', async ({ page }) => {

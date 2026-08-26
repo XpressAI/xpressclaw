@@ -60,7 +60,7 @@ pub struct InstanceProfile {
 
 #[derive(Debug, Serialize)]
 pub struct ActiveProfileIdentity {
-    instance_id: Option<String>,
+    identity_status: &'static str,
     local: bool,
 }
 
@@ -708,17 +708,23 @@ pub async fn login_active_profile(
 }
 
 #[tauri::command]
-pub fn get_active_instance_profile(
+pub async fn get_active_instance_profile(
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
 ) -> Result<ActiveProfileIdentity, String> {
-    // This intentionally remains origin-bound rather than identity-bound: it
-    // exposes no credential or mutable state, and the login page needs the
-    // saved pin in order to offer the explicit local-replacement recovery or
-    // safe return-to-local flow when the live identity does not match.
+    let _mutation_guard = state.mutation_lock.lock().await;
+    // The saved instance ID is a native-only pin. Returning it to content from
+    // the selected origin would let a same-origin replacement replay it from
+    // its own bootstrap endpoint and trick a later credential-bearing command.
+    // Report only the result of the native comparison.
     let profile = require_active_profile_origin(&state, &webview)?;
+    let bootstrap = fetch_bootstrap(&profile.url).await?;
+    let identity_status = profile_identity_status(&profile, &bootstrap.instance_id);
+    if require_active_profile_origin(&state, &webview)? != profile {
+        return Err("The selected Desktop profile changed while its identity was inspected".into());
+    }
     Ok(ActiveProfileIdentity {
-        instance_id: profile.instance_id,
+        identity_status,
         local: profile.local,
     })
 }
@@ -1046,6 +1052,14 @@ fn profile_identity_matches(profile: &StoredProfile, instance_id: &str) -> bool 
         .instance_id
         .as_deref()
         .is_none_or(|expected| expected == instance_id)
+}
+
+fn profile_identity_status(profile: &StoredProfile, instance_id: &str) -> &'static str {
+    match profile.instance_id.as_deref() {
+        None => "unpinned",
+        Some(expected) if expected == instance_id => "matched",
+        Some(_) => "changed",
+    }
 }
 
 fn require_profile_identity(profile: &StoredProfile, instance_id: &str) -> Result<(), String> {
@@ -1514,6 +1528,33 @@ mod tests {
             "password",
             "instance-b"
         ));
+    }
+
+    #[test]
+    fn active_profile_identity_reports_only_native_comparison_status() {
+        let profile = StoredProfile {
+            id: "remote".into(),
+            name: "Remote".into(),
+            url: "https://remote.example".into(),
+            instance_id: Some("native-secret-pin".into()),
+            authentication: "password".into(),
+            local: false,
+            confirmed_unauthenticated_remote: false,
+        };
+        assert_eq!(
+            profile_identity_status(&profile, "native-secret-pin"),
+            "matched"
+        );
+        assert_eq!(profile_identity_status(&profile, "replacement"), "changed");
+
+        let response = serde_json::to_string(&ActiveProfileIdentity {
+            identity_status: "changed",
+            local: false,
+        })
+        .unwrap();
+        assert_eq!(response, r#"{"identity_status":"changed","local":false}"#);
+        assert!(!response.contains("native-secret-pin"));
+        assert!(!response.contains("instance_id"));
     }
 
     #[test]

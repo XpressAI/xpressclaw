@@ -23,8 +23,8 @@
 		void auth.bootstrap().then(async (session) => {
 			if ('__TAURI_INTERNALS__' in window) {
 				const { invoke } = await import('@tauri-apps/api/core');
-				const active = await invoke<{ instance_id: string | null; local: boolean }>('get_active_instance_profile');
-				if (active.instance_id && active.instance_id !== session.instance_id) {
+				const active = await invoke<{ identity_status: 'unpinned' | 'matched' | 'changed'; local: boolean }>('get_active_instance_profile');
+				if (active.identity_status === 'changed') {
 					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 					// Identity recovery belongs to the login page even when the
 					// replacement has authentication disabled. Native command guards
@@ -33,7 +33,7 @@
 					void goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
 					return;
 				}
-				if (!active.instance_id && active.local && !session.authentication_enabled) {
+				if (active.identity_status === 'unpinned' && active.local && !session.authentication_enabled) {
 					// Establish the automatic local profile's first-use identity before
 					// exposing profile commands. Authenticated instances do this in the
 					// login flow, where the same command also obtains a ticket.
