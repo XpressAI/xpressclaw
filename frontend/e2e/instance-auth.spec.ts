@@ -399,18 +399,21 @@ test('Desktop persists a newly configured password before authentication restart
 });
 
 test('Desktop retains its keychain password while authentication is temporarily disabled', async ({ page }) => {
+	const credentialCalls: unknown[] = [];
+	await page.exposeFunction('__recordCredentialCall', (args: unknown) => {
+		credentialCalls.push(args);
+	});
 	await page.addInitScript(() => {
 		const target = window as unknown as {
-			__credentialCalls: unknown[];
+			__recordCredentialCall: (args: unknown) => Promise<void>;
 			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
 		};
-		target.__credentialCalls = [];
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
 				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
 				if (command === 'list_instance_profiles') return [];
 				if (command === 'store_active_profile_credential') {
-					target.__credentialCalls.push(structuredClone(args));
+					await target.__recordCredentialCall(structuredClone(args));
 					return null;
 				}
 				throw new Error(`Unexpected Tauri command: ${command}`);
@@ -424,7 +427,13 @@ test('Desktop retains its keychain password while authentication is temporarily 
 		const request = route.request();
 		const path = new URL(request.url()).pathname;
 		if (path === '/api/auth/bootstrap') {
-			await fulfill(route, { instance_id: baseInstance.instance_id, authentication_enabled: true, credential_kind: 'password', authenticated: true, csrf_token: 'csrf-test' });
+			await fulfill(route, {
+				instance_id: baseInstance.instance_id,
+				authentication_enabled: true,
+				credential_kind: 'password',
+				authenticated: !updateCompleted,
+				csrf_token: updateCompleted ? null : 'csrf-test',
+			});
 			return;
 		}
 		if (path === '/api/settings/instance/') {
@@ -448,11 +457,12 @@ test('Desktop retains its keychain password while authentication is temporarily 
 
 	await page.goto('/settings/server');
 	await page.getByLabel('Require XpressClaw login').uncheck();
-	await page.getByRole('button', { name: 'Save instance settings' }).click();
+	await Promise.all([
+		page.waitForURL(/\/login\?return_to=%2Fsettings%2Fserver$/),
+		page.getByRole('button', { name: 'Save instance settings' }).click(),
+	]);
 	await expect.poll(() => updateCompleted).toBe(true);
-	await expect.poll(() => page.evaluate(() => (
-		window as unknown as { __credentialCalls: unknown[] }
-	).__credentialCalls)).toEqual([]);
+	expect(credentialCalls).toEqual([]);
 });
 
 test('Desktop profiles can be edited without exposing their saved keychain credential', async ({ page }) => {
