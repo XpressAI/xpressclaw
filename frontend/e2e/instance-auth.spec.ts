@@ -666,6 +666,7 @@ test('Desktop profiles can be edited without exposing their saved keychain crede
 	});
 
 	await page.goto('/settings/server');
+	await expect(page.getByText(/Switching profiles clears the current browser session/)).toBeVisible();
 	await expect(page.getByText('Tailnet server', { exact: true })).toBeVisible();
 	await expect(page.getByText('Reachable · password')).toBeVisible();
 	await page.getByRole('button', { name: 'Edit Tailnet server' }).click();

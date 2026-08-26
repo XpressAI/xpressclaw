@@ -786,7 +786,7 @@ fn enter_local_recovery(
     navigate_to_profile(app, &profile.url)
 }
 
-fn navigate_to_profile(app: &AppHandle, url: &str) -> Result<(), String> {
+pub(crate) fn navigate_to_profile(app: &AppHandle, url: &str) -> Result<(), String> {
     // The first slice deliberately enforces one profile for all Desktop
     // windows. Close secondary windows so none remain bound to stale state.
     for (label, window) in app.webview_windows() {
@@ -797,12 +797,56 @@ fn navigate_to_profile(app: &AppHandle, url: &str) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main Desktop window is unavailable".to_string())?;
+    // Cookies are host-scoped, not origin-scoped: a session for
+    // localhost:8935 would otherwise be sent to localhost:9000 before that
+    // target can be identity-checked. Keep exactly one active browser session
+    // by deleting every XpressClaw session cookie before crossing a profile
+    // boundary. This intentionally signs the previous browser profile out.
+    clear_browser_session_cookies(&window)?;
     window
         .navigate(
             url.parse()
                 .map_err(|error| format!("Invalid profile URL: {error}"))?,
         )
         .map_err(|error| error.to_string())
+}
+
+pub(crate) fn clear_browser_session_cookies(webview: &tauri::WebviewWindow) -> Result<(), String> {
+    let cookies = webview
+        .cookies()
+        .map_err(|error| format!("Could not inspect Desktop browser sessions: {error}"))?;
+    delete_browser_session_cookies(cookies, |cookie| {
+        webview.delete_cookie(cookie).map_err(|error| {
+            format!("Could not remove the previous Desktop browser session: {error}")
+        })
+    })?;
+    // Tauri dispatches cookie deletion to the platform WebView and some
+    // backends cannot return the platform error through delete_cookie. Read
+    // the store again and fail closed instead of navigating with a session
+    // that the platform did not actually remove.
+    if webview
+        .cookies()
+        .map_err(|error| format!("Could not verify Desktop browser-session cleanup: {error}"))?
+        .iter()
+        .any(|cookie| cookie.name() == BROWSER_SESSION_COOKIE)
+    {
+        return Err("Desktop could not isolate the previous browser session".to_string());
+    }
+    Ok(())
+}
+
+fn delete_browser_session_cookies<E>(
+    cookies: Vec<Cookie<'static>>,
+    mut delete: impl FnMut(Cookie<'static>) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut deleted = 0;
+    for cookie in cookies {
+        if cookie.name() == BROWSER_SESSION_COOKIE {
+            delete(cookie)?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -2231,6 +2275,58 @@ mod tests {
                 .unwrap()
                 .secure(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn profile_boundary_deletes_every_browser_session_cookie() {
+        let cookies = vec![
+            Cookie::build((
+                BROWSER_SESSION_COOKIE.to_string(),
+                "local-session".to_string(),
+            ))
+            .domain("localhost")
+            .path("/")
+            .build(),
+            Cookie::build((
+                BROWSER_SESSION_COOKIE.to_string(),
+                "remote-session".to_string(),
+            ))
+            .domain("control.example.test")
+            .path("/nested")
+            .build(),
+            Cookie::build(("unrelated".to_string(), "preserved".to_string()))
+                .domain("localhost")
+                .path("/")
+                .build(),
+        ];
+        let mut deleted = Vec::new();
+
+        let count = delete_browser_session_cookies(cookies, |cookie| {
+            deleted.push((
+                cookie.name().to_string(),
+                cookie.domain().map(str::to_string),
+                cookie.path().map(str::to_string),
+            ));
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            deleted,
+            vec![
+                (
+                    BROWSER_SESSION_COOKIE.to_string(),
+                    Some("localhost".to_string()),
+                    Some("/".to_string()),
+                ),
+                (
+                    BROWSER_SESSION_COOKIE.to_string(),
+                    Some("control.example.test".to_string()),
+                    Some("/nested".to_string()),
+                ),
+            ]
         );
     }
 

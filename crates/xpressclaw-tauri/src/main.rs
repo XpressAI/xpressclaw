@@ -165,6 +165,16 @@ fn main() {
                 .map_err(anyhow::Error::msg)?;
             app.manage(profile_state);
 
+            // The configured window starts on about:blank so no host can
+            // receive a persisted cookie before native code establishes the
+            // selected profile boundary. Purge legacy/current XpressClaw
+            // sessions before the first instance navigation as well as on
+            // every later profile switch.
+            let main_window = app
+                .get_webview_window("main")
+                .ok_or_else(|| anyhow::anyhow!("Main Desktop window is unavailable"))?;
+            profiles::clear_browser_session_cookies(&main_window).map_err(anyhow::Error::msg)?;
+
             // Build the custom macOS app menu with our own Quit item
             #[cfg(target_os = "macos")]
             {
@@ -436,10 +446,11 @@ async fn show_preferred_startup(
             warn!(%error, "failed to enable selected profile capabilities");
         }
     }
+    if let Err(error) = profiles::navigate_to_profile(&handle, &url) {
+        warn!(%error, "refusing to navigate before Desktop browser sessions are isolated");
+        return;
+    }
     if let Some(window) = handle.get_webview_window("main") {
-        if let Ok(url) = url.parse() {
-            let _ = window.navigate(url);
-        }
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -685,6 +696,18 @@ mod tests {
         let origins = local_origins("http://127.0.0.1:19435");
         assert!(origins.contains(&"http://127.0.0.1:19435/*".to_string()));
         assert!(!origins.iter().any(|origin| origin.contains(":*")));
+    }
+
+    #[test]
+    fn desktop_starts_without_contacting_an_instance_origin() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            config
+                .pointer("/app/windows/0/url")
+                .and_then(serde_json::Value::as_str),
+            Some("about:blank")
+        );
     }
 
     #[test]
