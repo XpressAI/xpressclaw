@@ -1,0 +1,29 @@
+[[permission]]
+identifier = "desktop-local-commands"
+description = "Allows the bundled local XpressClaw frontend to use all Desktop commands."
+commands.allow = [
+  "get_health",
+  "get_server_port",
+  "get_status",
+  "open_browser",
+  "list_instance_profiles",
+  "save_instance_profile",
+  "select_instance_profile",
+  "delete_instance_profile",
+  "get_active_instance_profile",
+  "login_active_profile",
+  "store_active_profile_credential",
+]
+
+[[permission]]
+identifier = "desktop-profile-commands"
+description = "Allows one explicitly selected remote XpressClaw origin to manage Desktop instance profiles and authenticate through the OS keychain."
+commands.allow = [
+  "list_instance_profiles",
+  "save_instance_profile",
+  "select_instance_profile",
+  "delete_instance_profile",
+  "get_active_instance_profile",
+  "login_active_profile",
+  "store_active_profile_credential",
+]

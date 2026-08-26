@@ -4,7 +4,7 @@ use super::client;
 use super::instance;
 
 pub async fn run(
-    port: u16,
+    port: Option<u16>,
     instance_dir: Option<PathBuf>,
     workdir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -12,10 +12,14 @@ pub async fn run(
         eprintln!("warning: --workdir is deprecated; use --instance instead");
     }
     let instance = instance::resolve(instance_dir.or(workdir))?;
+    let saved = xpressclaw_core::config::Config::load(&instance.config_path())
+        .map(|config| config.instance)
+        .unwrap_or_default();
+    let port = port.unwrap_or(saved.port);
 
     // Sessions have no persistent processes to stop. A graceful server
     // shutdown cancels and removes any active short-lived worker containers.
-    if client::connect(port).await.is_ok() {
+    if client::connect_to(saved.bind, port).await.is_ok() {
         println!("Stopping the control plane and active ACP workers...");
     }
 

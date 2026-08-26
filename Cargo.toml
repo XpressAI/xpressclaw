@@ -43,6 +43,9 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 base64 = "0.22"
 ring = "0.17"
+argon2 = { version = "0.5.3", features = ["std", "zeroize"] }
+zeroize = "1"
+subtle = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

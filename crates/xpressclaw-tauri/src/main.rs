@@ -2,10 +2,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod profiles;
 mod tray;
 
 use std::sync::Mutex;
+use std::{net::IpAddr, path::PathBuf};
 
+use serde::Deserialize;
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tracing::{info, warn};
@@ -13,6 +16,82 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PORT: u16 = 8935;
 const DEV_FRONTEND_PORT: u16 = 5173;
+// Anonymous stdout protocol emitted by the CLI when the local sidecar needs
+// a per-start login token. The matched line is consumed and never logged.
+const STARTUP_TOKEN_PREFIX: &str = "XPRESSCLAW_STARTUP_TOKEN=";
+
+#[derive(Debug, Clone)]
+struct LocalInstanceConnection {
+    port: u16,
+    url: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct DesktopYaml {
+    instance: DesktopListener,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct DesktopListener {
+    bind: IpAddr,
+    port: u16,
+}
+
+impl Default for DesktopListener {
+    fn default() -> Self {
+        Self {
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: DEFAULT_PORT,
+        }
+    }
+}
+
+fn local_instance_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+        .join(".xpressclaw")
+}
+
+fn local_instance_connection() -> LocalInstanceConnection {
+    let config_path = local_instance_root().join("xpressclaw.yaml");
+    let saved = match std::fs::read_to_string(&config_path) {
+        Ok(yaml) => serde_yaml::from_str::<DesktopYaml>(&yaml).unwrap_or_else(|error| {
+            warn!(path = %config_path.display(), %error, "could not read the saved Desktop listener; using safe defaults");
+            DesktopYaml::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopYaml::default(),
+        Err(error) => {
+            warn!(path = %config_path.display(), %error, "could not read the saved Desktop listener; using safe defaults");
+            DesktopYaml::default()
+        }
+    };
+    let port = std::env::var("XPRESSCLAW_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(saved.instance.port);
+    LocalInstanceConnection {
+        port,
+        url: listener_client_url(saved.instance.bind, port),
+    }
+}
+
+pub(crate) fn local_server_port() -> u16 {
+    local_instance_connection().port
+}
+
+fn listener_client_url(bind: IpAddr, port: u16) -> String {
+    match bind {
+        IpAddr::V4(address) if address.is_unspecified() => format!("http://localhost:{port}"),
+        IpAddr::V4(address) if address == std::net::Ipv4Addr::LOCALHOST => {
+            format!("http://localhost:{port}")
+        }
+        IpAddr::V4(address) => format!("http://{address}:{port}"),
+        IpAddr::V6(address) if address.is_unspecified() => format!("http://[::1]:{port}"),
+        IpAddr::V6(address) => format!("http://[{address}]:{port}"),
+    }
+}
 
 /// Holds the sidecar child process for cleanup on exit.
 struct SidecarState(Mutex<Option<std::process::Child>>);
@@ -24,10 +103,9 @@ fn main() {
         )
         .init();
 
-    let port = std::env::var("XPRESSCLAW_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    let local_connection = local_instance_connection();
+    let port = local_connection.port;
+    let local_url = local_connection.url.clone();
 
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -82,6 +160,10 @@ fn main() {
             }
         })
         .setup(move |app| {
+            let profile_state = profiles::ProfileState::load(app.handle(), &local_url)
+                .map_err(anyhow::Error::msg)?;
+            app.manage(profile_state);
+
             // Build the custom macOS app menu with our own Quit item
             #[cfg(target_os = "macos")]
             {
@@ -121,9 +203,7 @@ fn main() {
             }
 
             // Desktop owns the default local control-plane instance.
-            let data_dir = dirs::home_dir()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-                .join(".xpressclaw");
+            let data_dir = local_instance_root();
             std::fs::create_dir_all(&data_dir).ok();
             let instance = data_dir.to_string_lossy().to_string();
 
@@ -187,9 +267,12 @@ fn main() {
 
             // Spawn the sidecar process
             let mut cmd = std::process::Command::new(&sidecar_path);
-            cmd.args(["up", "--port", &port.to_string(), "--instance", &instance])
-                .stdout(std::process::Stdio::null())
+            cmd.args(["up", "--instance", &instance])
+                .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null());
+            if std::env::var_os("XPRESSCLAW_PORT").is_some() {
+                cmd.args(["--port", &port.to_string()]);
+            }
 
             #[cfg(target_os = "windows")]
             {
@@ -217,7 +300,7 @@ fn main() {
                 );
             }
 
-            let child = match cmd.spawn() {
+            let mut child = match cmd.spawn() {
                 Ok(child) => child,
                 Err(e) => {
                     warn!(
@@ -225,10 +308,32 @@ fn main() {
                         path = %sidecar_path.display(),
                         "failed to spawn sidecar — the app will start but the server won't be running"
                     );
-                    tray::setup_tray(app, port)?;
+                    tray::setup_tray(app, &local_url)?;
                     return Ok(());
                 }
             };
+
+            if let Some(stdout) = child.stdout.take() {
+                let token_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    use zeroize::{Zeroize, Zeroizing};
+                    for mut line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if let Some(token) = line.strip_prefix(STARTUP_TOKEN_PREFIX) {
+                            let token = Zeroizing::new(token.to_string());
+                            token_handle
+                                .state::<profiles::ProfileState>()
+                                .remember_local_startup_token(token.clone());
+                            if let Err(error) = profiles::persist_local_startup_token(&token) {
+                                warn!(%error, "could not store the local startup token in the OS keychain");
+                            }
+                        }
+                        line.zeroize();
+                        // Drain every line without forwarding it: the token
+                        // must never enter Desktop logs or diagnostics.
+                    }
+                });
+            }
 
             info!(pid = child.id(), "sidecar spawned");
 
@@ -237,26 +342,40 @@ fn main() {
 
             // Wait for server to be ready, then show the window
             let handle = app.handle().clone();
+            let startup_local_url = local_url.clone();
             tauri::async_runtime::spawn(async move {
-                let server_ready = wait_for_server(port).await;
+                let server_ready = wait_for_server(&startup_local_url).await;
                 if let Some(window) = handle.get_webview_window("main") {
                     if server_ready {
                         info!("server is ready");
-                        if let Err(error) = enable_image_paste_capability(&handle, port) {
+                        if let Err(error) =
+                            enable_image_paste_capability(&handle, &startup_local_url)
+                        {
                             warn!(%error, "failed to enable image paste capability");
                         }
-                        if let Err(error) = enable_workspace_window_capability(&handle, port) {
+                        if let Err(error) =
+                            enable_workspace_window_capability(&handle, &startup_local_url)
+                        {
                             warn!(%error, "failed to enable workspace window capability");
                         }
-                        let url = format!("http://localhost:{port}");
-                        let _ = window.navigate(url.parse().unwrap());
+                        let profile_state = handle.state::<profiles::ProfileState>();
+                        let url = profiles::preferred_startup_url(&profile_state).await;
+                        let local_profile = profile_state.active_is_local().unwrap_or(true);
+                        if let Err(error) =
+                            enable_profile_capabilities(&handle, &url, local_profile)
+                        {
+                            warn!(%error, "failed to enable selected profile capabilities");
+                        }
+                        if let Ok(url) = url.parse() {
+                            let _ = window.navigate(url);
+                        }
                     }
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
             });
 
-            tray::setup_tray(app, port)?;
+            tray::setup_tray(app, &local_url)?;
             info!(port, "xpressclaw desktop app started");
             Ok(())
         })
@@ -265,6 +384,13 @@ fn main() {
             commands::get_server_port,
             commands::get_status,
             commands::open_browser,
+            profiles::list_instance_profiles,
+            profiles::save_instance_profile,
+            profiles::select_instance_profile,
+            profiles::delete_instance_profile,
+            profiles::get_active_instance_profile,
+            profiles::login_active_profile,
+            profiles::store_active_profile_credential,
         ])
         .build(tauri::generate_context!())
         .expect("error building xpressclaw desktop app")
@@ -360,15 +486,16 @@ fn sidecar_binary_name() -> String {
     }
 }
 
-fn localhost_origins(port: u16) -> Vec<String> {
-    let mut origins = vec![format!("http://localhost:{port}/*")];
-    if cfg!(debug_assertions) && port != DEV_FRONTEND_PORT {
+fn local_origins(url: &str) -> Vec<String> {
+    let mut origins = vec![format!("{url}/*")];
+    let port = reqwest::Url::parse(url).ok().and_then(|url| url.port());
+    if cfg!(debug_assertions) && port != Some(DEV_FRONTEND_PORT) {
         origins.push(format!("http://localhost:{DEV_FRONTEND_PORT}/*"));
     }
     origins
 }
 
-fn enable_image_paste_capability(app: &tauri::AppHandle, port: u16) -> tauri::Result<()> {
+fn enable_image_paste_capability(app: &tauri::AppHandle, url: &str) -> tauri::Result<()> {
     let mut capability = tauri::ipc::CapabilityBuilder::new("localhost-image-paste")
         .local(false)
         .window("main")
@@ -377,13 +504,13 @@ fn enable_image_paste_capability(app: &tauri::AppHandle, port: u16) -> tauri::Re
         .permission("core:image:allow-rgba")
         .permission("core:image:allow-size")
         .permission("core:resources:allow-close");
-    for origin in localhost_origins(port) {
+    for origin in local_origins(url) {
         capability = capability.remote(origin);
     }
     app.add_capability(capability)
 }
 
-fn enable_workspace_window_capability(app: &tauri::AppHandle, port: u16) -> tauri::Result<()> {
+fn enable_workspace_window_capability(app: &tauri::AppHandle, url: &str) -> tauri::Result<()> {
     let mut capability = tauri::ipc::CapabilityBuilder::new("localhost-workspace-windows")
         .local(false)
         .window("main")
@@ -391,10 +518,48 @@ fn enable_workspace_window_capability(app: &tauri::AppHandle, port: u16) -> taur
         .permission("core:webview:allow-create-webview-window")
         .permission("core:window:allow-create")
         .permission("core:window:allow-set-focus");
-    for origin in localhost_origins(port) {
+    for origin in local_origins(url) {
         capability = capability.remote(origin);
     }
     app.add_capability(capability)
+}
+
+/// Grant the selected profile's exact origin only its required Desktop
+/// capabilities. Local content retains the legacy status/browser commands;
+/// remote content receives only profile/login commands. No capability uses a
+/// wildcard host or port.
+pub(crate) fn enable_profile_capabilities(
+    app: &tauri::AppHandle,
+    url: &str,
+    local_profile: bool,
+) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Selected profile is not an HTTP(S) origin".to_string());
+    }
+    let origin = parsed.origin().ascii_serialization();
+    let mut capability = tauri::ipc::CapabilityBuilder::new(format!(
+        "instance-profile-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+    .local(false)
+    .window("main")
+    .window("workspace-*")
+    .remote(format!("{origin}/*"))
+    .permission("clipboard-manager:allow-read-image")
+    .permission("core:image:allow-rgba")
+    .permission("core:image:allow-size")
+    .permission("core:resources:allow-close")
+    .permission("core:webview:allow-create-webview-window")
+    .permission("core:window:allow-create")
+    .permission("core:window:allow-set-focus");
+    capability = capability.permission(if local_profile {
+        "desktop-local-commands"
+    } else {
+        "desktop-profile-commands"
+    });
+    app.add_capability(capability)
+        .map_err(|error| error.to_string())
 }
 
 fn is_xpressclaw_health(body: &serde_json::Value) -> bool {
@@ -402,9 +567,13 @@ fn is_xpressclaw_health(body: &serde_json::Value) -> bool {
         && body.get("name").and_then(serde_json::Value::as_str) == Some("xpressclaw")
 }
 
-async fn wait_for_server(port: u16) -> bool {
-    let url = format!("http://localhost:{port}/api/health");
-    let client = reqwest::Client::new();
+async fn wait_for_server(base_url: &str) -> bool {
+    let url = format!("{base_url}/api/health");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build local sidecar health client");
 
     for i in 0..120 {
         match client.get(&url).send().await {
@@ -434,10 +603,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn localhost_origins_are_port_scoped() {
-        let origins = localhost_origins(19_435);
-        assert!(origins.contains(&"http://localhost:19435/*".to_string()));
+    fn local_origins_are_exact_and_port_scoped() {
+        let origins = local_origins("http://127.0.0.1:19435");
+        assert!(origins.contains(&"http://127.0.0.1:19435/*".to_string()));
         assert!(!origins.iter().any(|origin| origin.contains(":*")));
+    }
+
+    #[test]
+    fn listener_urls_turn_wildcards_into_reachable_local_addresses() {
+        assert_eq!(
+            listener_client_url("0.0.0.0".parse().unwrap(), 8935),
+            "http://localhost:8935"
+        );
+        assert_eq!(
+            listener_client_url("::".parse().unwrap(), 9443),
+            "http://[::1]:9443"
+        );
+        assert_eq!(
+            listener_client_url("100.64.0.8".parse().unwrap(), 9000),
+            "http://100.64.0.8:9000"
+        );
     }
 
     #[test]

@@ -11,14 +11,21 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
 reqwest = { workspace = true }
 open = "5"
 dirs = "6"
+uuid = { workspace = true }
+zeroize = { workspace = true }
+tempfile = "3"
+futures-util = { workspace = true }
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
@@ -26,6 +33,15 @@ tauri-plugin-opener = "2.5.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"

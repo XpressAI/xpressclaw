@@ -759,21 +759,23 @@ fn require_same_origin(headers: &HeaderMap) -> ApiResult<()> {
     else {
         return Ok(());
     };
+    // Reverse proxies must preserve the public Host header. Do not trust an
+    // arbitrary X-Forwarded-Host value from a direct client when authorizing
+    // terminal or file access.
     let host = headers
-        .get("x-forwarded-host")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-        });
-    let authority = origin
-        .split_once("://")
-        .map(|(_, rest)| rest.trim_end_matches('/'));
-    if host.is_some() && authority == host {
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let origin = origin.parse::<axum::http::Uri>().ok();
+    let is_http_origin = origin
+        .as_ref()
+        .and_then(axum::http::Uri::scheme_str)
+        .is_some_and(|scheme| matches!(scheme, "http" | "https"));
+    let authority = origin.as_ref().and_then(axum::http::Uri::authority);
+    if is_http_origin
+        && host.is_some_and(|host| {
+            authority.is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
+        })
+    {
         Ok(())
     } else {
         Err(api_error(
@@ -908,6 +910,12 @@ mod tests {
         assert!(require_same_origin(&headers).is_ok());
 
         headers.insert(header::ORIGIN, "https://malicious.example".parse().unwrap());
+        assert_eq!(
+            require_same_origin(&headers).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert("x-forwarded-host", "malicious.example".parse().unwrap());
         assert_eq!(
             require_same_origin(&headers).unwrap_err().0,
             StatusCode::FORBIDDEN

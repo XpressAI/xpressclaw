@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
+use xpressclaw_core::config::InstanceConfig;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
@@ -10,6 +11,9 @@ use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
 use xpressclaw_core::workers::native::{ConversationAcpProcesses, NativeRuntimeLifecycle};
+use zeroize::Zeroizing;
+
+use crate::auth::InstanceAuth;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -50,6 +54,11 @@ pub struct AppState {
     /// stack. Every clone shares this lock, so fixed container, network, and
     /// volume names cannot be concurrently recreated or removed.
     pub collaboration_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Listener/authentication values effective for this running process.
+    /// Saved configuration may differ until the next restart.
+    pub effective_instance: Arc<InstanceConfig>,
+    /// Process-local browser sessions and credential verifier/token.
+    pub auth: Arc<InstanceAuth>,
 }
 
 impl AppState {
@@ -60,6 +69,60 @@ impl AppState {
         llm_router: Option<Arc<LlmRouter>>,
         config_path: PathBuf,
         setup_complete: bool,
+    ) -> Self {
+        let effective_instance = config.instance.clone();
+        let instance_id = db
+            .installation_id()
+            .unwrap_or_else(|_| "unknown-instance".to_string());
+        let auth = Arc::new(InstanceAuth::disabled(instance_id));
+        Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        )
+    }
+
+    /// Production constructor with the listener/auth settings selected by the
+    /// CLI and an optional token supplied by the detached launcher.
+    pub fn new_with_instance(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        supplied_startup_token: Option<Zeroizing<String>>,
+    ) -> anyhow::Result<Self> {
+        let instance_id = db.installation_id()?;
+        let auth = Arc::new(InstanceAuth::load(
+            &config.system.data_dir,
+            instance_id,
+            effective_instance.authentication_enabled,
+            supplied_startup_token,
+        )?);
+        Ok(Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        ))
+    }
+
+    fn new_inner(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        auth: Arc<InstanceAuth>,
     ) -> Self {
         let rate_limiter = Arc::new(RateLimiter::new(config.clone()));
         Self {
@@ -79,6 +142,8 @@ impl AppState {
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
             collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            effective_instance: Arc::new(effective_instance),
+            auth,
         }
     }
 

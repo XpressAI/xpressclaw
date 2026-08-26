@@ -23,11 +23,28 @@ when it has no configuration. If that default has not been configured, an
 existing current-directory `xpressclaw.yaml` is still honored for backward
 compatibility.
 
-The server binds to `127.0.0.1` by default. Use an SSH tunnel or authenticated
-HTTPS proxy for remote access. Because XpressClaw does not yet provide native
-remote authentication, a non-loopback `--bind` is rejected unless the caller
-also passes `--allow-insecure-remote` to acknowledge that an external security
-layer is responsible for access control.
+The server binds to `127.0.0.1` by default. Saved **Settings → Instance** values
+provide the normal bind, port, and authentication mode; explicit `--bind` and
+`--port` flags override them for that start. A non-loopback/no-auth CLI override
+still requires `--allow-insecure-remote`. A non-loopback/no-auth value saved
+through the Settings warning carries its acknowledgement on later ordinary
+starts.
+
+Authentication is configured in Settings. With a password, only an Argon2id
+verifier is persisted. Without a password, startup prints a new login token.
+Detached startup prints that token to the invoking terminal and never writes it
+to `server.log`:
+
+```bash
+xpressclaw up --detach
+# XPRESSCLAW_STARTUP_TOKEN=...
+```
+
+At the login screen, enter the value after `XPRESSCLAW_STARTUP_TOKEN=`.
+
+App authentication does not encrypt HTTP. Use direct no-auth access only on an
+operator-trusted LAN/tailnet, or use SSH/TLS as described in
+[Remote access](remote-access.md).
 
 ## `xpressclaw init` (optional/advanced)
 
@@ -58,21 +75,26 @@ environment, or remote-host boundary:
 
 ```bash
 xpressclaw up --instance /path/to/alternate-instance --port 9001
-xpressclaw status --port 9001
-xpressclaw down --instance /path/to/alternate-instance --port 9001
+xpressclaw status --instance /path/to/alternate-instance
+xpressclaw down --instance /path/to/alternate-instance
 ```
 
-`--instance` always means the directory containing `xpressclaw.yaml`; it never
+The saved instance port is used when `--port` is omitted. `--instance` always
+means the directory containing `xpressclaw.yaml`; it never
 means an Agent's source workspace. `--workdir` remains a deprecated alias for
 existing `up` and `down` scripts.
 
 ## `xpressclaw status`
 
 Check the server and list durable Agents with their current queue state.
+For an authenticated instance, `status` reports the running authentication
+mode without reading or persisting a credential; sign in to the web UI for
+the protected Agent details.
 
 ```bash
 xpressclaw status
 xpressclaw status --port 9000
+xpressclaw status --instance /path/to/alternate-instance
 ```
 
 ## `xpressclaw down`

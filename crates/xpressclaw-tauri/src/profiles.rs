@@ -1,0 +1,1255 @@
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, State};
+use tempfile::NamedTempFile;
+use zeroize::{Zeroize, Zeroizing};
+
+const PROFILE_VERSION: u8 = 1;
+const LOCAL_PROFILE_ID: &str = "local";
+const KEYCHAIN_SERVICE: &str = "ai.xpress.xpressclaw.instance";
+const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredProfile {
+    id: String,
+    name: String,
+    url: String,
+    instance_id: Option<String>,
+    authentication: String,
+    local: bool,
+    #[serde(default)]
+    confirmed_unauthenticated_remote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct ProfileFile {
+    version: u8,
+    active_profile_id: String,
+    profiles: Vec<StoredProfile>,
+}
+
+impl Default for ProfileFile {
+    fn default() -> Self {
+        Self {
+            version: PROFILE_VERSION,
+            active_profile_id: LOCAL_PROFILE_ID.to_string(),
+            profiles: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceProfile {
+    id: String,
+    name: String,
+    url: String,
+    instance_id: Option<String>,
+    authentication: String,
+    local: bool,
+    active: bool,
+    health: String,
+    confirmed_unauthenticated_remote: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActiveProfileIdentity {
+    instance_id: Option<String>,
+    local: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SaveProfileInput {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    url: String,
+    authentication: String,
+    #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
+    confirm_unauthenticated_remote: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct Bootstrap {
+    instance_id: String,
+    authentication_enabled: bool,
+    credential_kind: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DesktopTicket {
+    ticket: String,
+    instance_id: String,
+}
+
+pub struct ProfileState {
+    path: PathBuf,
+    file: Mutex<ProfileFile>,
+    /// Serialize profile/keychain mutations so their compensating writes are
+    /// atomic from the Desktop command surface.
+    mutation_lock: tokio::sync::Mutex<()>,
+    /// Secure process-memory fallback when an OS keychain is temporarily
+    /// unavailable. It rotates with the local server and is never serialized.
+    local_ephemeral_credential: Mutex<Option<Zeroizing<String>>>,
+}
+
+impl ProfileState {
+    pub fn load(app: &AppHandle, local_url: &str) -> Result<Self, String> {
+        let directory = app
+            .path()
+            .app_config_dir()
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        let path = directory.join("instance-profiles.json");
+        let mut file = if path.exists() {
+            serde_json::from_slice::<ProfileFile>(
+                &std::fs::read(&path).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("Could not read Desktop instance profiles: {error}"))?
+        } else {
+            ProfileFile::default()
+        };
+        if file.version != PROFILE_VERSION {
+            return Err(format!(
+                "Unsupported Desktop instance profile version {}",
+                file.version
+            ));
+        }
+        if let Some(local) = file.profiles.iter_mut().find(|profile| profile.local) {
+            local.id = LOCAL_PROFILE_ID.to_string();
+            local.name = "Local XpressClaw".to_string();
+            local.url = local_url.to_string();
+        } else {
+            file.profiles.insert(
+                0,
+                StoredProfile {
+                    id: LOCAL_PROFILE_ID.to_string(),
+                    name: "Local XpressClaw".to_string(),
+                    url: local_url.to_string(),
+                    instance_id: None,
+                    authentication: "none".to_string(),
+                    local: true,
+                    confirmed_unauthenticated_remote: true,
+                },
+            );
+        }
+        if !file
+            .profiles
+            .iter()
+            .any(|profile| profile.id == file.active_profile_id)
+        {
+            file.active_profile_id = LOCAL_PROFILE_ID.to_string();
+        }
+        let state = Self {
+            path,
+            file: Mutex::new(file),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+        };
+        state.persist()?;
+        Ok(state)
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        let file = self.file.lock().map_err(|_| "Profile lock failed")?;
+        persist_file(&self.path, &file)
+    }
+
+    fn update<T>(
+        &self,
+        change: impl FnOnce(&mut ProfileFile) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut current = self.file.lock().map_err(|_| "Profile lock failed")?;
+        let mut next = current.clone();
+        let result = change(&mut next)?;
+        persist_file(&self.path, &next)?;
+        *current = next;
+        Ok(result)
+    }
+
+    fn active(&self) -> Result<StoredProfile, String> {
+        let file = self.file.lock().map_err(|_| "Profile lock failed")?;
+        file.profiles
+            .iter()
+            .find(|profile| profile.id == file.active_profile_id)
+            .cloned()
+            .ok_or_else(|| "The selected Desktop profile no longer exists".to_string())
+    }
+
+    fn set_local_bootstrap(&self, bootstrap: &Bootstrap) -> Result<(), String> {
+        self.update(|file| {
+            let local = file
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.local)
+                .ok_or_else(|| "Local profile is missing".to_string())?;
+            local.instance_id = Some(bootstrap.instance_id.clone());
+            local.authentication = if bootstrap.authentication_enabled {
+                bootstrap.credential_kind.clone()
+            } else {
+                "none".to_string()
+            };
+            Ok(())
+        })
+    }
+
+    fn select_local(&self) -> Result<String, String> {
+        self.update(|file| {
+            let local = file
+                .profiles
+                .iter()
+                .find(|profile| profile.local)
+                .ok_or_else(|| "Local profile is missing".to_string())?;
+            let url = local.url.clone();
+            file.active_profile_id = LOCAL_PROFILE_ID.to_string();
+            Ok(url)
+        })
+    }
+
+    pub fn active_url(&self) -> Result<String, String> {
+        self.active().map(|profile| profile.url)
+    }
+
+    pub fn active_is_local(&self) -> Result<bool, String> {
+        self.active().map(|profile| profile.local)
+    }
+
+    pub fn remember_local_startup_token(&self, token: Zeroizing<String>) {
+        *self.local_ephemeral_credential.lock().unwrap() = Some(token);
+    }
+}
+
+#[tauri::command]
+pub async fn list_instance_profiles(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+) -> Result<Vec<InstanceProfile>, String> {
+    require_active_profile_origin(&state, &webview)?;
+    let (profiles, active) = {
+        let file = state.file.lock().map_err(|_| "Profile lock failed")?;
+        (file.profiles.clone(), file.active_profile_id.clone())
+    };
+    let mut result = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let (health, bootstrap) = inspect_profile(&state, &profile).await;
+        let mut authentication = profile.authentication.clone();
+        let mut instance_id = profile.instance_id.clone();
+        if profile.local {
+            if let Some(bootstrap) = bootstrap.as_ref() {
+                state.set_local_bootstrap(bootstrap)?;
+                authentication = effective_authentication(bootstrap)?.to_string();
+                instance_id = Some(bootstrap.instance_id.clone());
+            }
+        }
+        result.push(InstanceProfile {
+            id: profile.id.clone(),
+            name: profile.name,
+            url: profile.url,
+            instance_id,
+            authentication,
+            local: profile.local,
+            active: profile.id == active,
+            health,
+            confirmed_unauthenticated_remote: profile.confirmed_unauthenticated_remote,
+        });
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn save_instance_profile(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+    input: SaveProfileInput,
+) -> Result<InstanceProfile, String> {
+    require_active_profile_origin(&state, &webview)?;
+    let _mutation_guard = state.mutation_lock.lock().await;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err("Profile name must be between 1 and 80 characters".to_string());
+    }
+    let url = normalize_url(&input.url)?;
+    if !matches!(
+        input.authentication.as_str(),
+        "password" | "startup_token" | "none"
+    ) {
+        return Err("Choose password, startup token, or no authentication".to_string());
+    }
+    if input.authentication == "none" && !input.confirm_unauthenticated_remote {
+        return Err(
+            "Confirm that this unauthenticated profile uses an operator-trusted LAN or tailnet"
+                .to_string(),
+        );
+    }
+    // Move the IPC string into a zeroizing owner before any network I/O.
+    let mut credential = input.credential.map(Zeroizing::new);
+    if credential
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > 4096)
+    {
+        return Err("Profile credential length is invalid".to_string());
+    }
+
+    let editing = input.id.is_some();
+    let (id, existing) = if let Some(id) = input.id {
+        let file = state.file.lock().map_err(|_| "Profile lock failed")?;
+        let existing = file
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| "Desktop profile not found".to_string())?;
+        if existing.local {
+            return Err("The automatic local profile cannot be replaced".to_string());
+        }
+        (id, Some(existing.clone()))
+    } else {
+        (uuid::Uuid::new_v4().simple().to_string(), None)
+    };
+    if id == LOCAL_PROFILE_ID {
+        return Err("The automatic local profile cannot be replaced".to_string());
+    }
+
+    let bootstrap = fetch_bootstrap(&url).await?;
+    let expected_authentication = effective_authentication(&bootstrap)?;
+    if input.authentication != expected_authentication {
+        return Err(match expected_authentication {
+            "none" => "This instance currently has authentication disabled".to_string(),
+            "password" => "This instance currently requires its password".to_string(),
+            "startup_token" => {
+                "This instance currently requires the startup token from its latest launch"
+                    .to_string()
+            }
+            _ => unreachable!(),
+        });
+    }
+    if existing
+        .as_ref()
+        .is_some_and(|profile| !profile_identity_matches(profile, &bootstrap.instance_id))
+    {
+        return Err("The instance identity at this address changed. Delete and re-add the profile only if you trust the replacement.".to_string());
+    }
+
+    let previous_credential = if editing {
+        get_optional_credential(&id)?
+    } else {
+        None
+    };
+    if bootstrap.authentication_enabled {
+        let retained;
+        let supplied = if let Some(supplied) = credential.as_ref() {
+            supplied
+        } else if existing.as_ref().is_some_and(|profile| {
+            may_reuse_stored_credential(
+                profile,
+                &url,
+                &input.authentication,
+                &bootstrap.instance_id,
+            )
+        }) {
+            retained = get_credential(&id)?;
+            &retained
+        } else {
+            return Err(
+                "Enter the credential again when changing a profile address or authentication mode"
+                    .to_string(),
+            );
+        };
+        request_ticket(&url, supplied, &bootstrap.instance_id).await?;
+        if credential.is_some() {
+            set_credential(&id, supplied)?;
+        }
+    } else if editing {
+        delete_credential(&id)?;
+    }
+    if let Some(value) = credential.as_mut() {
+        value.zeroize();
+    }
+
+    let confirmed_unauthenticated_remote =
+        input.authentication == "none" && input.confirm_unauthenticated_remote;
+    let stored = StoredProfile {
+        id: id.clone(),
+        name: name.to_string(),
+        url: url.clone(),
+        instance_id: Some(bootstrap.instance_id),
+        authentication: input.authentication,
+        local: false,
+        confirmed_unauthenticated_remote,
+    };
+    if let Err(error) = state.update(|file| {
+        if let Some(existing) = file.profiles.iter_mut().find(|profile| profile.id == id) {
+            *existing = stored.clone();
+        } else if editing {
+            return Err("Desktop profile was deleted while it was being edited".to_string());
+        } else {
+            file.profiles.push(stored.clone());
+        }
+        Ok(())
+    }) {
+        let rollback = if let Some(previous) = previous_credential.as_ref() {
+            set_credential(&id, previous)
+        } else {
+            delete_credential(&id)
+        };
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback) => {
+                format!("{error}; the profile credential also could not be restored: {rollback}")
+            }
+        });
+    }
+    Ok(InstanceProfile {
+        id: stored.id,
+        name: stored.name,
+        url: stored.url,
+        instance_id: stored.instance_id,
+        authentication: stored.authentication,
+        local: false,
+        active: false,
+        health: "healthy".to_string(),
+        confirmed_unauthenticated_remote: stored.confirmed_unauthenticated_remote,
+    })
+}
+
+#[tauri::command]
+pub async fn select_instance_profile(
+    app: AppHandle,
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+    id: String,
+) -> Result<(), String> {
+    require_active_profile_origin(&state, &webview)?;
+    let _mutation_guard = state.mutation_lock.lock().await;
+    let (mut profile, previous_active) = {
+        let file = state.file.lock().map_err(|_| "Profile lock failed")?;
+        let profile = file
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .cloned()
+            .ok_or_else(|| "Desktop profile not found".to_string())?;
+        (profile, file.active_profile_id.clone())
+    };
+    let bootstrap = fetch_bootstrap(&profile.url).await?;
+    if !profile.local
+        && profile
+            .instance_id
+            .as_deref()
+            .is_some_and(|expected| expected != bootstrap.instance_id)
+    {
+        return Err("The instance identity at this address changed. Delete and re-add the profile only if you trust the replacement.".to_string());
+    }
+    if profile.local {
+        state.set_local_bootstrap(&bootstrap)?;
+        profile.instance_id = Some(bootstrap.instance_id.clone());
+        profile.authentication = effective_authentication(&bootstrap)?.to_string();
+    }
+    if !profile.local
+        && !bootstrap.authentication_enabled
+        && !profile.confirmed_unauthenticated_remote
+    {
+        return Err("Confirm unauthenticated remote access before connecting".to_string());
+    }
+    if !profile.local && !bootstrap.authentication_enabled && profile.authentication != "none" {
+        return Err(
+            "This instance now has authentication disabled; edit the profile and confirm its trusted network before connecting"
+                .to_string(),
+        );
+    }
+    if bootstrap.authentication_enabled {
+        let expected = effective_authentication(&bootstrap)?;
+        if !profile.local && profile.authentication != expected {
+            return Err(format!(
+                "This instance now requires {expected}; edit the profile before reconnecting"
+            ));
+        }
+        let credential = credential_for_authentication(&state, &profile, expected).await?;
+        request_ticket(&profile.url, &credential, &bootstrap.instance_id).await?;
+    }
+    state.update(|file| {
+        let Some(current) = file.profiles.iter().find(|current| current.id == id) else {
+            return Err("Desktop profile was deleted while connecting".to_string());
+        };
+        if current != &profile {
+            return Err("Desktop profile changed while connecting; try again".to_string());
+        }
+        file.active_profile_id = id.clone();
+        Ok(())
+    })?;
+    let rollback_selection = || {
+        state.update(|file| {
+            if file.active_profile_id == id
+                && file
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == previous_active)
+            {
+                file.active_profile_id = previous_active.clone();
+            }
+            Ok(())
+        })
+    };
+    if let Err(error) = crate::enable_profile_capabilities(&app, &profile.url, profile.local) {
+        let _ = rollback_selection();
+        return Err(error);
+    }
+    // The first slice deliberately enforces one profile for all Desktop
+    // windows. Close secondary windows so none remain bound to stale state.
+    for (label, window) in app.webview_windows() {
+        if label != "main" {
+            let _ = window.close();
+        }
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Main Desktop window is unavailable".to_string())?;
+    if let Err(error) = window.navigate(
+        profile
+            .url
+            .parse()
+            .map_err(|error| format!("Invalid profile URL: {error}"))?,
+    ) {
+        let _ = rollback_selection();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_instance_profile(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+    id: String,
+) -> Result<(), String> {
+    require_active_profile_origin(&state, &webview)?;
+    let _mutation_guard = state.mutation_lock.lock().await;
+    if id == LOCAL_PROFILE_ID {
+        return Err("The automatic local profile cannot be deleted".to_string());
+    }
+    {
+        let file = state.file.lock().map_err(|_| "Profile lock failed")?;
+        if !file.profiles.iter().any(|profile| profile.id == id) {
+            return Err("Desktop profile not found".to_string());
+        }
+        if file.active_profile_id == id {
+            return Err("Connect to another profile before deleting this one".to_string());
+        }
+    }
+    // Remove any credential even for a nominally no-auth profile so stale
+    // entries from older profile modes cannot survive profile deletion.
+    let previous_credential = get_optional_credential(&id)?;
+    delete_credential(&id)?;
+    if let Err(error) = state.update(|file| {
+        if file.active_profile_id == id {
+            return Err("Connect to another profile before deleting this one".to_string());
+        }
+        let before = file.profiles.len();
+        file.profiles.retain(|profile| profile.id != id);
+        if before == file.profiles.len() {
+            return Err("Desktop profile not found".to_string());
+        }
+        Ok(())
+    }) {
+        if let Some(previous) = previous_credential {
+            if let Err(rollback) = set_credential(&id, &previous) {
+                return Err(format!(
+                    "{error}; the profile credential also could not be restored: {rollback}"
+                ));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn login_active_profile(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+) -> Result<Option<DesktopTicket>, String> {
+    require_active_profile_origin(&state, &webview)?;
+    let profile = state.active()?;
+    let bootstrap = fetch_bootstrap(&profile.url).await?;
+    if !profile.local
+        && profile
+            .instance_id
+            .as_deref()
+            .is_some_and(|expected| expected != bootstrap.instance_id)
+    {
+        return Err("The server identity does not match the selected Desktop profile".to_string());
+    }
+    if profile.local {
+        state.set_local_bootstrap(&bootstrap)?;
+    }
+    if !bootstrap.authentication_enabled {
+        return Ok(None);
+    }
+    let expected = effective_authentication(&bootstrap)?;
+    if !profile.local && profile.authentication != expected {
+        return Err(format!(
+            "This instance now requires {expected}; edit the profile before reconnecting"
+        ));
+    }
+    let credential = credential_for_authentication(&state, &profile, expected).await?;
+    let ticket = request_ticket(&profile.url, &credential, &bootstrap.instance_id).await?;
+    Ok(Some(ticket))
+}
+
+#[tauri::command]
+pub fn get_active_instance_profile(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+) -> Result<ActiveProfileIdentity, String> {
+    require_active_profile_origin(&state, &webview)?;
+    let profile = state.active()?;
+    Ok(ActiveProfileIdentity {
+        instance_id: profile.instance_id,
+        local: profile.local,
+    })
+}
+
+#[tauri::command]
+pub async fn store_active_profile_credential(
+    webview: tauri::WebviewWindow,
+    state: State<'_, ProfileState>,
+    credential: Option<String>,
+) -> Result<(), String> {
+    require_active_profile_origin(&state, &webview)?;
+    let _mutation_guard = state.mutation_lock.lock().await;
+    let profile = state.active()?;
+    if let Some(value) = credential {
+        let value = Zeroizing::new(value);
+        let bootstrap = fetch_bootstrap(&profile.url).await?;
+        if !profile.local
+            && profile
+                .instance_id
+                .as_deref()
+                .is_some_and(|expected| expected != bootstrap.instance_id)
+        {
+            return Err(
+                "The server identity does not match the selected Desktop profile".to_string(),
+            );
+        }
+        let authentication = effective_authentication(&bootstrap)?;
+        if authentication == "none" {
+            return Err("The selected instance does not require a credential".to_string());
+        }
+        let next_instance_id = bootstrap.instance_id;
+        if profile.local {
+            state.update(|file| {
+                let current = file
+                    .profiles
+                    .iter_mut()
+                    .find(|current| current.id == profile.id)
+                    .ok_or_else(|| "The selected Desktop profile no longer exists".to_string())?;
+                current.instance_id = Some(next_instance_id);
+                current.authentication = authentication.to_string();
+                Ok(())
+            })?;
+            *state
+                .local_ephemeral_credential
+                .lock()
+                .map_err(|_| "Local credential lock failed".to_string())? = Some(value.clone());
+            // If the OS keychain is unavailable, the fresh credential remains
+            // usable in process memory for this sidecar lifetime. The caller
+            // still receives the keychain error so persistence is explicit.
+            return set_credential(&profile.id, &value);
+        }
+
+        let previous_credential = get_optional_credential(&profile.id)?;
+        set_credential(&profile.id, &value)?;
+        if let Err(error) = state.update(|file| {
+            let current = file
+                .profiles
+                .iter_mut()
+                .find(|current| current.id == profile.id)
+                .ok_or_else(|| "The selected Desktop profile no longer exists".to_string())?;
+            current.instance_id = Some(next_instance_id);
+            current.authentication = authentication.to_string();
+            Ok(())
+        }) {
+            let rollback = if let Some(previous) = previous_credential {
+                set_credential(&profile.id, &previous)
+            } else {
+                delete_credential(&profile.id)
+            };
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => {
+                    format!("{error}; the previous keychain credential also could not be restored: {rollback}")
+                }
+            });
+        }
+        Ok(())
+    } else {
+        delete_credential(&profile.id)?;
+        if profile.local {
+            *state
+                .local_ephemeral_credential
+                .lock()
+                .map_err(|_| "Local credential lock failed".to_string())? = None;
+        }
+        Ok(())
+    }
+}
+
+pub fn persist_local_startup_token(token: &str) -> Result<(), String> {
+    set_credential(LOCAL_PROFILE_ID, token)
+}
+
+pub async fn preferred_startup_url(state: &ProfileState) -> String {
+    let Ok(profile) = state.active() else {
+        return "http://localhost:8935".to_string();
+    };
+    if profile.local {
+        return profile.url;
+    }
+    let remote_is_usable = match fetch_bootstrap(&profile.url).await {
+        Ok(bootstrap)
+            if profile
+                .instance_id
+                .as_deref()
+                .is_none_or(|expected| expected == bootstrap.instance_id) =>
+        {
+            if bootstrap.authentication_enabled {
+                match (
+                    effective_authentication(&bootstrap),
+                    profile_credential(state, &profile),
+                ) {
+                    (Ok(expected), Ok(credential)) if expected == profile.authentication => {
+                        request_ticket(&profile.url, &credential, &bootstrap.instance_id)
+                            .await
+                            .is_ok()
+                    }
+                    _ => false,
+                }
+            } else {
+                profile.authentication == "none" && profile.confirmed_unauthenticated_remote
+            }
+        }
+        _ => false,
+    };
+    if remote_is_usable {
+        profile.url
+    } else {
+        state
+            .select_local()
+            .unwrap_or_else(|_| "http://localhost:8935".to_string())
+    }
+}
+
+/// Dynamic Tauri capabilities cannot be revoked after a profile switch. Keep
+/// every profile command bound to the origin that is selected *now* so a
+/// previously selected (or subsequently compromised) instance cannot reuse a
+/// stale capability to request another profile's login ticket or mutate its
+/// Desktop configuration.
+fn require_active_profile_origin(
+    state: &ProfileState,
+    webview: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let expected = state.active()?.url;
+    let actual = webview
+        .url()
+        .map_err(|error| format!("Could not verify the Desktop page origin: {error}"))?;
+    if !urls_have_same_origin(&expected, &actual) {
+        return Err(
+            "This Desktop page no longer belongs to the selected instance profile".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn urls_have_same_origin(expected: &str, actual: &reqwest::Url) -> bool {
+    reqwest::Url::parse(expected).is_ok_and(|expected| expected.origin() == actual.origin())
+}
+
+async fn inspect_profile(
+    state: &ProfileState,
+    profile: &StoredProfile,
+) -> (String, Option<Bootstrap>) {
+    match fetch_bootstrap(&profile.url).await {
+        Ok(bootstrap) => {
+            let status = if !profile.local
+                && profile
+                    .instance_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != bootstrap.instance_id)
+            {
+                "identity_changed"
+            } else if bootstrap.authentication_enabled {
+                match effective_authentication(&bootstrap) {
+                    Ok(expected) if profile.local || expected == profile.authentication => {
+                        match credential_for_authentication(state, profile, expected).await {
+                            Ok(credential)
+                                if request_ticket(
+                                    &profile.url,
+                                    &credential,
+                                    &bootstrap.instance_id,
+                                )
+                                .await
+                                .is_ok() =>
+                            {
+                                "healthy"
+                            }
+                            _ => "authentication_required",
+                        }
+                    }
+                    _ => "authentication_required",
+                }
+            } else if !profile.local
+                && (profile.authentication != "none" || !profile.confirmed_unauthenticated_remote)
+            {
+                "authentication_required"
+            } else {
+                "healthy"
+            };
+            (status.to_string(), Some(bootstrap))
+        }
+        Err(_) => ("unreachable".to_string(), None),
+    }
+}
+
+fn effective_authentication(bootstrap: &Bootstrap) -> Result<&'static str, String> {
+    if !bootstrap.authentication_enabled {
+        return Ok("none");
+    }
+    match bootstrap.credential_kind.as_str() {
+        "password" => Ok("password"),
+        "startup_token" => Ok("startup_token"),
+        "restart_required" => {
+            Err("Authentication changed on this instance; restart it before connecting".to_string())
+        }
+        _ => Err("The remote instance reported an unsupported authentication mode".to_string()),
+    }
+}
+
+fn profile_identity_matches(profile: &StoredProfile, instance_id: &str) -> bool {
+    profile
+        .instance_id
+        .as_deref()
+        .is_none_or(|expected| expected == instance_id)
+}
+
+fn may_reuse_stored_credential(
+    profile: &StoredProfile,
+    url: &str,
+    authentication: &str,
+    instance_id: &str,
+) -> bool {
+    profile_identity_matches(profile, instance_id)
+        && profile.url == url
+        && profile.authentication == authentication
+}
+
+fn profile_credential(
+    state: &ProfileState,
+    profile: &StoredProfile,
+) -> Result<Zeroizing<String>, String> {
+    if profile.local {
+        if let Some(credential) = state
+            .local_ephemeral_credential
+            .lock()
+            .map_err(|_| "Local credential lock failed".to_string())?
+            .clone()
+        {
+            // The process-memory value belongs to this exact sidecar start.
+            // Prefer it over a stale keychain entry when a keychain write was
+            // denied or temporarily unavailable during token rotation.
+            return Ok(credential);
+        }
+    }
+    get_credential(&profile.id)
+}
+
+async fn credential_for_authentication(
+    state: &ProfileState,
+    profile: &StoredProfile,
+    authentication: &str,
+) -> Result<Zeroizing<String>, String> {
+    if profile.local && authentication == "startup_token" {
+        // The sidecar prints its per-start token immediately before binding
+        // the listener, but the stdout-drain thread can be scheduled a few
+        // milliseconds later. Prefer the current process-memory token over a
+        // stale keychain value and briefly wait for that handoff.
+        for _ in 0..40 {
+            if let Some(credential) = state
+                .local_ephemeral_credential
+                .lock()
+                .map_err(|_| "Local credential lock failed".to_string())?
+                .clone()
+            {
+                return Ok(credential);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    profile_credential(state, profile)
+}
+
+async fn fetch_bootstrap(url: &str) -> Result<Bootstrap, String> {
+    let response = http_client()?
+        .get(format!("{url}/api/auth/bootstrap"))
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach the XpressClaw instance: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The remote server returned {} instead of XpressClaw bootstrap data",
+            response.status()
+        ));
+    }
+    read_bounded_json(
+        response,
+        "The remote address is not a compatible XpressClaw instance",
+    )
+    .await
+}
+
+async fn request_ticket(
+    url: &str,
+    credential: &str,
+    expected_instance_id: &str,
+) -> Result<DesktopTicket, String> {
+    let response = http_client()?
+        .post(format!("{url}/api/auth/desktop-ticket"))
+        .json(&serde_json::json!({ "credential": credential }))
+        .send()
+        .await
+        .map_err(|error| format!("Could not authenticate to the remote instance: {error}"))?;
+    if !response.status().is_success() {
+        return Err(match response.status().as_u16() {
+            401 => "The saved instance credential was rejected".to_string(),
+            429 => "Too many login attempts; wait before reconnecting".to_string(),
+            _ => format!("Remote login failed with {}", response.status()),
+        });
+    }
+    let ticket: DesktopTicket = read_bounded_json(
+        response,
+        "The remote instance returned an invalid login ticket",
+    )
+    .await?;
+    if ticket.instance_id != expected_instance_id {
+        return Err(
+            "The instance identity changed while Desktop was authenticating; no profile change was saved"
+                .to_string(),
+        );
+    }
+    Ok(ticket)
+}
+
+async fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    invalid_message: &str,
+) -> Result<T, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_AUTH_RESPONSE_BYTES as u64)
+    {
+        return Err(format!("{invalid_message}: response is too large"));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| invalid_message.to_string())?;
+        if body.len().saturating_add(chunk.len()) > MAX_AUTH_RESPONSE_BYTES {
+            return Err(format!("{invalid_message}: response is too large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| invalid_message.to_string())
+}
+
+pub(crate) fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        // A malicious or misconfigured profile endpoint must not redirect a
+        // credential-bearing ticket request to another origin.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn normalize_url(raw: &str) -> Result<String, String> {
+    if raw.trim().len() > 2048 {
+        return Err("Instance URL is too long".to_string());
+    }
+    let mut url = reqwest::Url::parse(raw.trim()).map_err(|_| "Enter a valid instance URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Instance profiles support only http:// and https:// URLs".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Do not put credentials in an instance URL".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("Instance URL must include a host".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("Instance URL cannot include a query or fragment".to_string());
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        return Err("Instance URL must be an origin without a path".to_string());
+    }
+    url.set_path("");
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn credential_entry(profile_id: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, profile_id)
+        .map_err(|error| format!("Could not access the operating-system keychain: {error}"))
+}
+
+fn set_credential(profile_id: &str, credential: &str) -> Result<(), String> {
+    credential_entry(profile_id)?
+        .set_password(credential)
+        .map_err(|error| format!("Could not save the profile credential in the keychain: {error}"))
+}
+
+fn get_credential(profile_id: &str) -> Result<Zeroizing<String>, String> {
+    get_optional_credential(profile_id)?
+        .ok_or_else(|| "No credential is saved for this Desktop profile".to_string())
+}
+
+fn get_optional_credential(profile_id: &str) -> Result<Option<Zeroizing<String>>, String> {
+    match credential_entry(profile_id)?.get_password() {
+        Ok(credential) => Ok(Some(Zeroizing::new(credential))),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read the profile credential from the keychain: {error}"
+        )),
+    }
+}
+
+fn delete_credential(profile_id: &str) -> Result<(), String> {
+    let entry = credential_entry(profile_id)?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Could not remove the profile credential: {error}")),
+    }
+}
+
+fn persist_file(path: &Path, file: &ProfileFile) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Profile file has no parent directory".to_string())?;
+    let mut temporary = NamedTempFile::new_in(directory).map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut temporary, file).map_err(|error| error.to_string())?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("Could not replace Desktop profile file: {}", error.error))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_urls_are_origin_only_and_never_contain_credentials() {
+        assert_eq!(
+            normalize_url("https://host.example:9443/").unwrap(),
+            "https://host.example:9443"
+        );
+        assert!(normalize_url("https://user:secret@host.example").is_err());
+        assert!(normalize_url("https://host.example/path").is_err());
+        assert!(normalize_url("file:///tmp/xpressclaw").is_err());
+    }
+
+    #[test]
+    fn persisted_profiles_contain_no_credential_field() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("profiles.json");
+        let file = ProfileFile {
+            profiles: vec![StoredProfile {
+                id: "remote".into(),
+                name: "Remote".into(),
+                url: "http://host:8935".into(),
+                instance_id: Some("identity".into()),
+                authentication: "password".into(),
+                local: false,
+                confirmed_unauthenticated_remote: false,
+            }],
+            ..ProfileFile::default()
+        };
+        persist_file(&path, &file).unwrap();
+        let stored = std::fs::read_to_string(path).unwrap();
+        assert!(!stored.contains("credential"));
+        assert!(!stored.contains("password_hash"));
+    }
+
+    #[test]
+    fn profile_selection_is_persisted_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("profiles.json");
+        let file = ProfileFile {
+            active_profile_id: "remote".into(),
+            profiles: vec![
+                StoredProfile {
+                    id: LOCAL_PROFILE_ID.into(),
+                    name: "Local XpressClaw".into(),
+                    url: "http://localhost:8935".into(),
+                    instance_id: Some("local-instance".into()),
+                    authentication: "none".into(),
+                    local: true,
+                    confirmed_unauthenticated_remote: true,
+                },
+                StoredProfile {
+                    id: "remote".into(),
+                    name: "Remote".into(),
+                    url: "https://remote.example".into(),
+                    instance_id: Some("remote-instance".into()),
+                    authentication: "password".into(),
+                    local: false,
+                    confirmed_unauthenticated_remote: false,
+                },
+            ],
+            ..ProfileFile::default()
+        };
+        persist_file(&path, &file).unwrap();
+        let state = ProfileState {
+            path: path.clone(),
+            file: Mutex::new(file),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+        };
+
+        assert_eq!(state.select_local().unwrap(), "http://localhost:8935");
+        assert_eq!(state.active().unwrap().id, LOCAL_PROFILE_ID);
+        let persisted: ProfileFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.active_profile_id, LOCAL_PROFILE_ID);
+    }
+
+    #[test]
+    fn bootstrap_mode_must_be_supported_and_exact() {
+        let bootstrap = |enabled, kind: &str| Bootstrap {
+            instance_id: "instance".into(),
+            authentication_enabled: enabled,
+            credential_kind: kind.into(),
+        };
+        assert_eq!(
+            effective_authentication(&bootstrap(false, "disabled")).unwrap(),
+            "none"
+        );
+        assert_eq!(
+            effective_authentication(&bootstrap(true, "password")).unwrap(),
+            "password"
+        );
+        assert_eq!(
+            effective_authentication(&bootstrap(true, "startup_token")).unwrap(),
+            "startup_token"
+        );
+        assert!(effective_authentication(&bootstrap(true, "restart_required")).is_err());
+        assert!(effective_authentication(&bootstrap(true, "future_mode")).is_err());
+    }
+
+    #[test]
+    fn saved_credentials_are_reused_only_for_the_exact_pinned_profile() {
+        let profile = StoredProfile {
+            id: "remote".into(),
+            name: "Remote".into(),
+            url: "https://remote.example".into(),
+            instance_id: Some("instance-a".into()),
+            authentication: "password".into(),
+            local: false,
+            confirmed_unauthenticated_remote: false,
+        };
+        assert!(may_reuse_stored_credential(
+            &profile,
+            "https://remote.example",
+            "password",
+            "instance-a"
+        ));
+        assert!(!may_reuse_stored_credential(
+            &profile,
+            "https://attacker.example",
+            "password",
+            "instance-a"
+        ));
+        assert!(!may_reuse_stored_credential(
+            &profile,
+            "https://remote.example",
+            "startup_token",
+            "instance-a"
+        ));
+        assert!(!may_reuse_stored_credential(
+            &profile,
+            "https://remote.example",
+            "password",
+            "instance-b"
+        ));
+    }
+
+    #[test]
+    fn stale_profile_origins_cannot_reuse_desktop_commands() {
+        let selected = "https://selected.example:9443";
+        assert!(urls_have_same_origin(
+            selected,
+            &reqwest::Url::parse("https://selected.example:9443/settings/server").unwrap()
+        ));
+        assert!(!urls_have_same_origin(
+            selected,
+            &reqwest::Url::parse("https://previous.example:9443/settings/server").unwrap()
+        ));
+        assert!(!urls_have_same_origin(
+            selected,
+            &reqwest::Url::parse("http://selected.example:9443/settings/server").unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn credential_requests_never_follow_cross_origin_redirects() {
+        use std::io::{Read, Write};
+        use std::time::{Duration, Instant};
+
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_address = target.local_addr().unwrap();
+        let target_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while Instant::now() < deadline {
+                match target.accept() {
+                    Ok(_) => return true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("target listener failed: {error}"),
+                }
+            }
+            false
+        });
+
+        let redirect = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_address = redirect.local_addr().unwrap();
+        let redirect_thread = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target_address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+
+        let result = request_ticket(
+            &format!("http://{redirect_address}"),
+            "credential-that-must-not-be-forwarded",
+            "expected-instance",
+        )
+        .await;
+        assert!(result.is_err());
+        redirect_thread.join().unwrap();
+        assert!(!target_thread.join().unwrap());
+    }
+}

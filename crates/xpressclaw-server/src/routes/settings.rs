@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-use super::{settings_collaboration, settings_sync};
+use super::{settings_collaboration, settings_instance, settings_sync};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/profile", get(get_profile).put(put_profile))
+        .nest("/instance", settings_instance::routes())
         .nest("/collaboration", settings_collaboration::routes())
         .nest("/sync", settings_sync::routes())
 }

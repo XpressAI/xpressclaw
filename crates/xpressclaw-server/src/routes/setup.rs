@@ -1282,6 +1282,7 @@ async fn upsert_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents: old_config.agents.clone(),
+        instance: old_config.instance.clone(),
         collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
@@ -2065,6 +2066,7 @@ async fn delete_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents,
+        instance: old_config.instance.clone(),
         collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),

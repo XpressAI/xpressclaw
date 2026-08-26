@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use clap::Subcommand;
@@ -10,9 +10,6 @@ mod instance;
 mod status;
 mod sync;
 mod up;
-
-/// Default port for the xpressclaw server.
-const DEFAULT_PORT: u16 = 8935;
 
 #[derive(Subcommand)]
 pub enum Command {
@@ -30,8 +27,8 @@ pub enum Command {
         detach: bool,
 
         /// Port for the web UI and API
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Advanced: instance directory containing xpressclaw.yaml
         #[arg(long, value_name = "DIR", conflicts_with = "workdir")]
@@ -42,19 +39,23 @@ pub enum Command {
         workdir: Option<PathBuf>,
 
         /// Address on which the control plane listens
-        #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-        bind: IpAddr,
+        #[arg(long)]
+        bind: Option<IpAddr>,
 
-        /// Acknowledge that non-loopback access has no built-in authentication
-        #[arg(long, requires = "bind")]
+        /// Acknowledge direct non-loopback access without app authentication
+        #[arg(long)]
         allow_insecure_remote: bool,
+
+        /// Read a pre-generated startup token from stdin (launcher protocol)
+        #[arg(long, hide = true)]
+        startup_token_stdin: bool,
     },
 
     /// Stop the control plane and active workers
     Down {
         /// Server port
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Advanced: instance directory containing the detached process PID
         #[arg(long, value_name = "DIR", conflicts_with = "workdir")]
@@ -67,9 +68,13 @@ pub enum Command {
 
     /// Show control-plane and Agent status
     Status {
-        /// Server port
-        #[arg(short, long, default_value_t = DEFAULT_PORT)]
-        port: u16,
+        /// Server port (default: saved instance port or 8935)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Advanced: instance directory containing xpressclaw.yaml
+        #[arg(long, value_name = "DIR")]
+        instance: Option<PathBuf>,
     },
 
     /// Explicitly synchronize portable Project state through Git
@@ -89,13 +94,25 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             workdir,
             bind,
             allow_insecure_remote,
-        } => up::run(detach, port, instance, workdir, bind, allow_insecure_remote).await,
+            startup_token_stdin,
+        } => {
+            up::run(
+                detach,
+                port,
+                instance,
+                workdir,
+                bind,
+                allow_insecure_remote,
+                startup_token_stdin,
+            )
+            .await
+        }
         Command::Down {
             port,
             instance,
             workdir,
         } => down::run(port, instance, workdir).await,
-        Command::Status { port } => status::run(port).await,
+        Command::Status { port, instance } => status::run(port, instance).await,
         Command::Sync { command } => sync::run(command).await,
     }
 }
@@ -128,7 +145,7 @@ mod tests {
 
         assert!(instance.is_none());
         assert!(workdir.is_none());
-        assert!(bind.is_loopback());
+        assert!(bind.is_none());
         assert!(!allow_insecure_remote);
     }
 
@@ -179,7 +196,7 @@ mod tests {
         assert!(help.contains("--instance <DIR>"));
         assert!(help.contains("Deprecated alias for --instance"));
         assert!(help.contains("--bind <BIND>"));
-        assert!(help.contains("no built-in authentication"));
+        assert!(help.contains("without app authentication"));
     }
 
     #[test]

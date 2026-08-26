@@ -1,4 +1,15 @@
 const BASE = '';
+let csrfToken: string | null = null;
+
+function mutation(method: string | undefined): boolean {
+	return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase());
+}
+
+function sendToLogin(): void {
+	if (typeof window === 'undefined' || window.location.pathname === '/login') return;
+	const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+	window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
+}
 
 export class ApiError extends Error {
 	constructor(message: string, readonly status: number) {
@@ -7,13 +18,22 @@ export class ApiError extends Error {
 	}
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit, retryCsrf = true): Promise<T> {
+	const headers = new Headers(init?.headers);
+	if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	if (mutation(init?.method) && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
-		...init
+		credentials: 'same-origin',
+		...init,
+		headers
 	});
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
+		if (res.status === 403 && retryCsrf && mutation(init?.method) && String(body.error).includes('CSRF')) {
+			const session = await auth.bootstrap();
+			if (session.authenticated) return request<T>(path, init, false);
+		}
+		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
 		throw new ApiError(body.error || res.statusText, res.status);
 	}
 	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
@@ -21,6 +41,44 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	if (!text) return undefined as T;
 	return JSON.parse(text);
 }
+
+export interface AuthBootstrap {
+	instance_id: string;
+	authentication_enabled: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	authenticated: boolean;
+	csrf_token: string | null;
+}
+
+export const auth = {
+	bootstrap: async () => {
+		const result = await request<AuthBootstrap>('/api/auth/bootstrap', undefined, false);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	login: async (credential: string) => {
+		const result = await request<{ authenticated: boolean; csrf_token: string }>(
+			'/api/auth/login',
+			{ method: 'POST', body: JSON.stringify({ credential }) },
+			false
+		);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	logout: async () => {
+		await request<void>('/api/auth/logout', { method: 'POST', body: '{}' }, false);
+		csrfToken = null;
+	},
+	exchangeDesktopTicket: async (ticket: string) => {
+		const result = await request<{ authenticated: boolean; csrf_token: string }>(
+			'/api/auth/exchange',
+			{ method: 'POST', body: JSON.stringify({ ticket }) },
+			false
+		);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+};
 
 // -- Agents --
 
@@ -944,6 +1002,41 @@ export interface LiveConfig {
 	system: { budget: { daily: string; monthly: string | null; on_exceeded: string } };
 	mcp_servers: McpServerDefinition[];
 }
+
+export interface InstanceListenerSettings {
+	bind: string;
+	port: number;
+	authentication_enabled: boolean;
+	allow_unauthenticated_remote: boolean;
+}
+
+export interface InstanceSettings {
+	instance_id: string;
+	effective: InstanceListenerSettings;
+	saved: InstanceListenerSettings;
+	restart_required: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	password_configured: boolean;
+	config_path: string;
+	data_dir: string;
+	workspace_dir: string;
+	transport_encryption: 'operator_managed';
+}
+
+export const instanceSettings = {
+	get: () => request<InstanceSettings>('/api/settings/instance/'),
+	update: (value: {
+		bind: string;
+		port: number;
+		authentication_enabled: boolean;
+		acknowledge_unauthenticated_remote: boolean;
+		password?: string;
+		remove_password?: boolean;
+	}) => request<InstanceSettings>('/api/settings/instance/', {
+		method: 'PUT',
+		body: JSON.stringify(value),
+	}),
+};
 
 export interface McpServerDefinition {
 	name: string;

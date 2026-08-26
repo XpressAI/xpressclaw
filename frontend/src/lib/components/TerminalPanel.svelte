@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import '@xterm/xterm/css/xterm.css';
+	import { request } from '$lib/api';
 
 	let { agentId }: { agentId: string } = $props();
 	let host = $state<HTMLDivElement>();
@@ -81,11 +82,15 @@
 						});
 					}
 				};
-				websocket.onerror = () => {
-					connected = false;
-					connecting = false;
-					error = 'Could not connect to the retained project environment.';
-				};
+			websocket.onerror = () => {
+				connected = false;
+				connecting = false;
+				error = 'Could not connect to the retained project environment.';
+				// WebSocket does not expose an HTTP 401 handshake to JavaScript.
+				// Probe a protected endpoint so expired sessions recover through
+				// the normal login redirect instead of looking like a terminal fault.
+				void request(`/api/agents/${encodeURIComponent(agentId)}`).catch(() => undefined);
+			};
 				websocket.onclose = () => {
 					connected = false;
 					connecting = false;

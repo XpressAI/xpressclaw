@@ -1,0 +1,262 @@
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::header::{CACHE_CONTROL, RETRY_AFTER, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use crate::auth::{cookie_value, expired_session_cookie, session_cookie, LoginError, CSRF_HEADER};
+use crate::state::AppState;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/bootstrap", get(bootstrap))
+        .route("/login", post(login))
+        .route("/logout", post(logout))
+        .route("/desktop-ticket", post(desktop_ticket))
+        .route("/exchange", post(exchange_ticket))
+        // Credential-bearing payloads are deliberately tiny. Keep this bound
+        // independent of the larger attachment limit on the main API router.
+        .layer(DefaultBodyLimit::max(8 * 1024))
+}
+
+#[derive(Serialize)]
+struct BootstrapResponse {
+    instance_id: String,
+    authentication_enabled: bool,
+    credential_kind: &'static str,
+    authenticated: bool,
+    csrf_token: Option<String>,
+}
+
+async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (authenticated, csrf_token) = if !state.auth.enabled() {
+        (true, None)
+    } else {
+        let csrf = cookie_value(&headers).and_then(|cookie| state.auth.authenticate(cookie));
+        (csrf.is_some(), csrf.map(|value| value.to_string()))
+    };
+    no_store(Json(BootstrapResponse {
+        instance_id: state.auth.instance_id().to_string(),
+        authentication_enabled: state.auth.enabled(),
+        credential_kind: state.auth.credential_kind().as_str(),
+        authenticated,
+        csrf_token,
+    }))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    credential: String,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    if body.credential.is_empty() || body.credential.len() > 4096 {
+        return error_response(StatusCode::BAD_REQUEST, "Credential length is invalid");
+    }
+    if let Some(existing) = cookie_value(&headers) {
+        state.auth.logout(existing);
+    }
+    match state
+        .auth
+        .login(Zeroizing::new(body.credential), peer.ip())
+        .await
+    {
+        Ok((session, csrf)) => session_response(
+            &session,
+            &csrf,
+            request_uses_externally_terminated_https(&headers),
+        ),
+        Err(error) => login_error_response(error),
+    }
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.auth.enabled() {
+        return cleared_cookie(StatusCode::NO_CONTENT.into_response());
+    }
+    let Some(cookie) = cookie_value(&headers) else {
+        return unauthorized();
+    };
+    let Some(csrf) = headers
+        .get(CSRF_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return error_response(StatusCode::FORBIDDEN, "CSRF token required");
+    };
+    if !state.auth.verify_csrf(cookie, csrf) {
+        return error_response(StatusCode::FORBIDDEN, "CSRF token is invalid or expired");
+    }
+    state.auth.logout(cookie);
+    cleared_cookie(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn desktop_ticket(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    if body.credential.is_empty() || body.credential.len() > 4096 {
+        return error_response(StatusCode::BAD_REQUEST, "Credential length is invalid");
+    }
+    match state
+        .auth
+        .create_desktop_ticket(Zeroizing::new(body.credential), peer.ip())
+        .await
+    {
+        Ok(ticket) => no_store(Json(serde_json::json!({
+            "ticket": ticket.as_str(),
+            "instance_id": state.auth.instance_id(),
+            "expires_in_seconds": 30,
+        }))),
+        Err(error) => login_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExchangeRequest {
+    ticket: String,
+}
+
+async fn exchange_ticket(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ExchangeRequest>,
+) -> Response {
+    if body.ticket.is_empty() || body.ticket.len() > 256 {
+        return error_response(StatusCode::BAD_REQUEST, "Desktop ticket length is invalid");
+    }
+    match state.auth.exchange_desktop_ticket(&body.ticket) {
+        Some((session, csrf)) => session_response(
+            &session,
+            &csrf,
+            request_uses_externally_terminated_https(&headers),
+        ),
+        None => error_response(
+            StatusCode::UNAUTHORIZED,
+            "Desktop login ticket is invalid or expired",
+        ),
+    }
+}
+
+fn session_response(session: &str, csrf: &str, secure: bool) -> Response {
+    let mut response = Json(serde_json::json!({
+        "authenticated": true,
+        "csrf_token": csrf,
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&session_cookie(session, secure)).expect("valid session cookie"),
+    );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Browser fetch supplies an Origin derived from the actual page. This lets a
+/// TLS-terminating proxy receive Secure cookies without trusting forwarded
+/// transport headers. A non-browser client can only influence its own cookie.
+fn request_uses_externally_terminated_https(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::Uri>().ok())
+        .and_then(|origin| origin.scheme_str().map(str::to_owned))
+        .as_deref()
+        == Some("https")
+}
+
+fn login_error_response(error: LoginError) -> Response {
+    match error {
+        LoginError::Invalid => error_response(StatusCode::UNAUTHORIZED, "Invalid credential"),
+        LoginError::Internal => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not create a secure login session",
+        ),
+        LoginError::RateLimited {
+            retry_after_seconds,
+        } => {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many login attempts; try again shortly",
+            );
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                HeaderValue::from_str(&retry_after_seconds.to_string()).unwrap(),
+            );
+            response
+        }
+        LoginError::RestartRequired => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authentication was changed; restart XpressClaw to generate a new login token",
+        ),
+        LoginError::Disabled => error_response(
+            StatusCode::CONFLICT,
+            "Authentication is disabled for this running instance",
+        ),
+    }
+}
+
+pub(crate) fn unauthorized() -> Response {
+    cleared_cookie(error_response(
+        StatusCode::UNAUTHORIZED,
+        "Authentication required",
+    ))
+}
+
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
+    let mut response = (status, Json(serde_json::json!({ "error": message }))).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn cleared_cookie(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::from_str(&expired_session_cookie()).expect("valid expired cookie"),
+    );
+    response
+}
+
+fn no_store<T: IntoResponse>(value: T) -> Response {
+    let mut response = value.into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+pub(crate) fn is_safe_method(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_cookie_detection_uses_browser_origin_not_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(!request_uses_externally_terminated_https(&headers));
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            HeaderValue::from_static("https://xpressclaw.example"),
+        );
+        assert!(request_uses_externally_terminated_https(&headers));
+    }
+}

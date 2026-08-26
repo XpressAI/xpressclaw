@@ -40,6 +40,38 @@ system:
 agents: []
 ```
 
+## Listener and optional authentication
+
+The migration-safe defaults are loopback port 8935 with application
+authentication off. **Settings → Instance** edits this instance-local block:
+
+```yaml
+instance:
+  bind: 127.0.0.1
+  port: 8935
+  authentication_enabled: false
+  allow_unauthenticated_remote: false
+```
+
+`allow_unauthenticated_remote` is an explicit acknowledgement, not an access
+control or encryption setting. The UI sets it only after warning about a
+non-loopback listener with authentication off. `xpressclaw up --bind` and
+`--port` override saved values for one start; the existing
+`--allow-insecure-remote` flag acknowledges an explicit CLI no-auth remote
+bind. Saved bind/port/authentication-mode edits take effect on restart, and the
+UI shows saved and effective values separately.
+
+Passwords are never represented in YAML. XpressClaw writes only a memory-hard
+Argon2id verifier to `instance-auth.json` under `system.data_dir`, with
+restricted file permissions. Browser sessions and no-password startup tokens
+are process-local and disappear on restart. This secret file, Desktop profile
+data, and sessions are outside Project synchronization. Desktop stores remote
+profile credentials in the operating-system keychain; its JSON profile file
+contains only non-secret connection metadata.
+
+Application authentication does not provide TLS. See [Remote
+access](remote-access.md) before selecting a non-loopback address.
+
 ## Project lifecycle and configuration
 
 One control-plane instance can contain many Projects. Deleting a Project from
