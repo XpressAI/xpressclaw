@@ -39,7 +39,7 @@ async function fulfill(route: Route, body: unknown, status = 200) {
 	await route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
 }
 
-test('password login uses a cookie session without putting credentials in URLs or browser storage', async ({ page }) => {
+test('protected-route login returns through the persistent layout without exposing credentials', async ({ page }) => {
 	let authenticated = false;
 	let submittedCredential = '';
 	await page.route('**/api/**', async (route) => {
@@ -73,11 +73,13 @@ test('password login uses a cookie session without putting credentials in URLs o
 		await fulfill(route, genericResponse(path));
 	});
 
-	await page.goto('/login?return_to=%2Fsettings%2Fserver');
+	await page.goto('/settings/server');
+	await expect(page).toHaveURL(/\/login\?return_to=%2Fsettings%2Fserver$/);
 	await expect(page.getByRole('heading', { name: 'Sign in to this instance' })).toBeVisible();
 	await page.getByLabel('Password').fill('not-persisted-password');
 	await page.getByRole('button', { name: 'Sign in' }).click();
 	await expect(page).toHaveURL(/\/settings\/server$/);
+	await expect(page.getByRole('heading', { name: 'Instance', exact: true })).toBeVisible();
 	expect(submittedCredential).toBe('not-persisted-password');
 	expect(page.url()).not.toContain('not-persisted-password');
 	expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain('not-persisted-password');

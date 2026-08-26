@@ -75,10 +75,11 @@ different first port, such as `9893`, if the client port is occupied.
 
 A reverse proxy may terminate TLS in front of XpressClaw. It must preserve
 same-origin UI/API access, cookies, SSE, WebSockets, response streaming, and
-attachment sizes, including the browser's `Origin` header. Bind XpressClaw to
-loopback when the proxy runs on the same host. XpressClaw authentication may be
-used alone or in addition to proxy authentication, but it never substitutes
-for TLS on an untrusted network.
+attachment sizes, including the browser's `Origin` and `Sec-Fetch-Site`
+headers. It may preserve the public `Host` or rewrite it to the upstream
+listener. Bind XpressClaw to loopback when the proxy runs on the same host.
+XpressClaw authentication may be used alone or in addition to proxy
+authentication, but it never substitutes for TLS on an untrusted network.
 
 Because externally terminated HTTPS is common, XpressClaw does not infer
 cookie policy from untrusted `Forwarded` or `X-Forwarded-*` headers. Login and

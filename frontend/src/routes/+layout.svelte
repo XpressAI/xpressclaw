@@ -23,6 +23,10 @@
 		void auth.bootstrap().then((session) => {
 			if (session.authentication_enabled && !session.authenticated) {
 				const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+				// The root layout persists across client-side navigation. Mark its
+				// bootstrap complete before visiting /login so a successful login can
+				// return here without leaving the workspace behind this loading state.
+				authenticationReady = true;
 				void goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
 				return;
 			}
