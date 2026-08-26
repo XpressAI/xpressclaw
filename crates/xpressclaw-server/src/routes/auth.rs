@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::header::{CACHE_CONTROL, RETRY_AFTER, SET_COOKIE};
@@ -68,7 +68,10 @@ async fn login(
     }
     match state
         .auth
-        .login(Zeroizing::new(body.credential), peer.ip())
+        .login(
+            Zeroizing::new(body.credential),
+            login_client_ip(&headers, peer),
+        )
         .await
     {
         Ok((session, csrf)) => session_response(
@@ -103,6 +106,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 async fn desktop_ticket(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     if body.credential.is_empty() || body.credential.len() > 4096 {
@@ -110,7 +114,10 @@ async fn desktop_ticket(
     }
     match state
         .auth
-        .create_desktop_ticket(Zeroizing::new(body.credential), peer.ip())
+        .create_desktop_ticket(
+            Zeroizing::new(body.credential),
+            login_client_ip(&headers, peer),
+        )
         .await
     {
         Ok(ticket) => no_store(Json(serde_json::json!({
@@ -175,6 +182,23 @@ fn request_uses_externally_terminated_https(headers: &HeaderMap) -> bool {
         .and_then(|origin| origin.scheme_str().map(str::to_owned))
         .as_deref()
         == Some("https")
+}
+
+/// Use the directly connected peer for throttling unless it is a loopback
+/// reverse proxy. A same-host proxy is inside the instance's host boundary and
+/// may append or replace X-Forwarded-For; its final hop is the address it
+/// actually observed. Forwarded identity from every non-loopback peer remains
+/// untrusted and cannot be used to evade throttling.
+fn login_client_ip(headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+    if !peer.ip().is_loopback() {
+        return peer.ip();
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| peer.ip())
 }
 
 fn login_error_response(error: LoginError) -> Response {
@@ -247,6 +271,10 @@ pub(crate) fn is_safe_method(method: &Method) -> bool {
 mod tests {
     use super::*;
 
+    fn socket(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 43123)
+    }
+
     #[test]
     fn secure_cookie_detection_uses_browser_origin_not_forwarded_headers() {
         let mut headers = HeaderMap::new();
@@ -258,5 +286,64 @@ mod tests {
             HeaderValue::from_static("https://xpressclaw.example"),
         );
         assert!(request_uses_externally_terminated_https(&headers));
+    }
+
+    #[test]
+    fn login_throttling_uses_only_a_loopback_proxys_observed_client() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.7, 198.51.100.22"),
+        );
+
+        assert_eq!(
+            login_client_ip(&headers, socket("127.0.0.1")),
+            "198.51.100.22".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            login_client_ip(&headers, socket("192.0.2.44")),
+            "192.0.2.44".parse::<IpAddr>().unwrap()
+        );
+
+        headers.insert("x-forwarded-for", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(
+            login_client_ip(&headers, socket("::1")),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn proxied_login_failures_do_not_lock_out_another_client() {
+        let root = tempfile::tempdir().unwrap();
+        let auth = crate::auth::InstanceAuth::load(
+            root.path(),
+            "instance".into(),
+            true,
+            Some(Zeroizing::new("expected".into())),
+        )
+        .unwrap();
+        let proxy = socket("127.0.0.1");
+        let mut attacker = HeaderMap::new();
+        attacker.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.31"));
+        let mut operator = HeaderMap::new();
+        operator.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.32"));
+
+        for _ in 0..5 {
+            assert_eq!(
+                auth.login(
+                    Zeroizing::new("wrong".into()),
+                    login_client_ip(&attacker, proxy),
+                )
+                .await,
+                Err(crate::auth::LoginError::Invalid)
+            );
+        }
+        assert!(auth
+            .login(
+                Zeroizing::new("expected".into()),
+                login_client_ip(&operator, proxy),
+            )
+            .await
+            .is_ok());
     }
 }

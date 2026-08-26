@@ -56,8 +56,9 @@ a newly printed token. Bind, port, and authentication-mode edits likewise show
 as restart-pending in Settings; effective running values remain visible.
 
 Browser sessions use HttpOnly SameSite cookies and CSRF protection. Login
-attempts are throttled by the directly connected peer address. XpressClaw does
-not trust arbitrary forwarded client-address or protocol headers.
+attempts are throttled by the directly connected peer address. A reverse proxy
+running on the same host may provide the client address for throttling as
+described below; XpressClaw ignores forwarded identity from non-loopback peers.
 
 ## SSH tunnel
 
@@ -81,11 +82,17 @@ listener. Bind XpressClaw to loopback when the proxy runs on the same host.
 XpressClaw authentication may be used alone or in addition to proxy
 authentication, but it never substitutes for TLS on an untrusted network.
 
+For per-client login throttling, have the same-host proxy replace
+`X-Forwarded-For` with its observed client address or append that address as
+the final value. XpressClaw accepts only the final valid address and only when
+the directly connected peer is loopback. It ignores this header from network
+peers and never uses it for authentication, cookie policy, or authorization.
+
 Because externally terminated HTTPS is common, XpressClaw does not infer
-cookie policy from untrusted `Forwarded` or `X-Forwarded-*` headers. Login and
-Desktop ticket exchange instead use the browser's actual HTTPS `Origin` to set
-the session cookie's `Secure` attribute. Restrict proxy-to-XpressClaw access at
-the host/network layer, redirect HTTP to HTTPS, and enable HSTS at the proxy.
+cookie policy from `Forwarded` or `X-Forwarded-*` headers. Login and Desktop
+ticket exchange instead use the browser's actual HTTPS `Origin` to set the
+session cookie's `Secure` attribute. Restrict proxy-to-XpressClaw access at the
+host/network layer, redirect HTTP to HTTPS, and enable HSTS at the proxy.
 
 ## Desktop profiles
 

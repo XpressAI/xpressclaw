@@ -37,9 +37,11 @@ be coupled to browser sessions.
 - Browser sessions are opaque, process-local, expiring HttpOnly SameSite
   cookies. State-changing requests require a per-session CSRF header. Login
   creates a new session, is rate-limited by the direct peer address, and uses
-  constant-time secret comparison. Restart or credential/mode change revokes
-  sessions.
-- Proxy headers are not trusted to decide peer identity or cookie security.
+  constant-time secret comparison. A loopback reverse proxy may supply the
+  final observed `X-Forwarded-For` address for per-client throttling; forwarded
+  identity from non-loopback peers is ignored. Restart or credential/mode
+  change revokes sessions.
+- Proxy headers are not trusted to decide cookie security or authorization.
   An HTTPS browser Origin adds the Secure cookie attribute for externally
   terminated TLS, while direct trusted HTTP remains usable. TLS, HTTP
   redirection, and HSTS remain the operator's responsibility.
