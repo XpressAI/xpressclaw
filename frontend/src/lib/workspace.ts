@@ -36,6 +36,12 @@ export interface WorkspacePaneState {
 	width: number;
 }
 
+export const WORKSPACE_OPEN_SPLIT_EVENT = 'xpressclaw:workspace-open-split';
+
+export interface WorkspaceOpenSplitDetail {
+	path: string;
+}
+
 export const projectSections = ['session', 'tasks', 'schedules', 'files', 'runner', 'workspace'] as const;
 export type ProjectSection = typeof projectSections[number];
 

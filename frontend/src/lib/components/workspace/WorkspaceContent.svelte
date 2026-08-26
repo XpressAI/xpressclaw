@@ -28,7 +28,7 @@
 {:else if tab.kind === 'agents'}
 	<AgentsPage />
 {:else if tab.kind === 'agent' && tab.resourceId}
-	<AgentView agentId={tab.resourceId} section={projectSection(tab.path)} />
+	<AgentView agentId={tab.resourceId} section={projectSection(tab.path)} route={tab.path} />
 {:else if tab.kind === 'conversation' && tab.resourceId}
 	<ConversationView conversationId={tab.resourceId} />
 {:else if tab.kind === 'tasks'}

@@ -3008,7 +3008,7 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
-test('task details deep-link current Git changes into the workspace editor', async ({ page }) => {
+test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
 
@@ -3019,8 +3019,80 @@ test('task details deep-link current Git changes into the workspace editor', asy
 		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
 	);
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
-	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+	await expect(page.locator('[data-workspace-tree]')).toHaveCount(0);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await page.getByRole('button', { name: 'Show files' }).click();
+	await expect(page.locator('[data-workspace-tree]')).toBeVisible();
+});
+
+test('task changed files use normal navigation when the workspace is too narrow to split', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await expect(changedFile).toBeVisible();
+	await changedFile.click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByRole('button', { name: 'Show files' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	const preserved = await changedFile.evaluate((element) => [
+		{ ctrlKey: true },
+		{ metaKey: true },
+		{ shiftKey: true },
+		{ altKey: true },
+	].every((modifiers) => {
+		let defaultPreventedByHandler = true;
+		const observeThenSuppressNavigation = (event: MouseEvent) => {
+			defaultPreventedByHandler = event.defaultPrevented;
+			event.preventDefault();
+		};
+		document.addEventListener('click', observeThenSuppressNavigation, { once: true });
+		element.dispatchEvent(new MouseEvent('click', {
+			bubbles: true,
+			cancelable: true,
+			...modifiers,
+		}));
+		return !defaultPreventedByHandler;
+	}));
+
+	expect(preserved).toBe(true);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});
+
+test('task changed files use normal navigation at the workspace pane limit', async ({ page }) => {
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
+
+	const focusedPane = page.locator('[data-workspace-pane]').last();
+	await focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' }).click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
 });
 
 test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) => {

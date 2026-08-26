@@ -13,7 +13,7 @@
 	import SchedulesTab from './SchedulesTab.svelte';
 	import FilesTab from './FilesTab.svelte';
 
-	let { agentId, section = 'session' }: { agentId: string; section?: ProjectSection } = $props();
+	let { agentId, section = 'session', route = '' }: { agentId: string; section?: ProjectSection; route?: string } = $props();
 
 	let agent = $state<Agent | null>(null);
 	let error = $state<string | null>(null);
@@ -194,7 +194,7 @@
 			{:else if activeTab === 'schedules'}
 				<SchedulesTab agentId={agent.id} />
 			{:else if activeTab === 'files'}
-				<FilesTab agentId={agent.id} />
+				<FilesTab agentId={agent.id} {route} />
 			{/if}
 		</div>
 

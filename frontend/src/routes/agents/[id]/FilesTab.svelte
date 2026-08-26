@@ -6,7 +6,7 @@
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
 
-	let { agentId }: { agentId: string } = $props();
+	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
 	let git = $state<WorkspaceGitStatus | null>(null);
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
@@ -20,6 +20,7 @@
 	let loadingFile = $state(false);
 	let saving = $state(false);
 	let showTerminal = $state(false);
+	let showTree = $state(true);
 	let error = $state('');
 	let saveMessage = $state('');
 
@@ -28,6 +29,8 @@
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
+		const initialSearch = route.includes('?') ? route.slice(route.indexOf('?')) : window.location.search;
+		showTree = new URLSearchParams(initialSearch).get('tree') !== 'collapsed';
 		void initialize();
 	});
 
@@ -43,7 +46,8 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initialPath = new URLSearchParams(window.location.search).get('path');
+			const initialSearch = route.includes('?') ? route.slice(route.indexOf('?')) : window.location.search;
+			const initialPath = new URLSearchParams(initialSearch).get('path');
 			if (initialPath) await openFile(initialPath, true, false);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
@@ -168,6 +172,9 @@
 			</div>
 		</div>
 		<div class="flex items-center gap-2">
+			<button type="button" onclick={() => (showTree = !showTree)} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
+				{showTree ? 'Hide files' : 'Show files'}
+			</button>
 			<button type="button" onclick={refreshGit} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>
 			<button
 				type="button"
@@ -190,6 +197,7 @@
 		<div class="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Loading workspace…</div>
 	{:else}
 		<div class="flex min-h-0 flex-1 flex-col md:flex-row">
+			{#if showTree}
 			<div class="flex max-h-60 w-full shrink-0 flex-col border-b border-border md:max-h-none md:w-64 md:border-b-0 md:border-r">
 				{#if git?.files.length}
 					<div class="shrink-0 border-b border-border">
@@ -228,6 +236,7 @@
 					{/each}
 				</div>
 			</div>
+			{/if}
 
 			<div class="flex min-h-[20rem] min-w-0 flex-1 flex-col">
 				{#if selectedPath}

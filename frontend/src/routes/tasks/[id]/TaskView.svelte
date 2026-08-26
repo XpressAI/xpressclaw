@@ -12,6 +12,7 @@
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	const messageDraftScope = () => `task.${taskId}`;
@@ -1156,6 +1157,15 @@
 		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
+	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
+		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		event.preventDefault();
+		const route = `${workspaceFileUrl(agentId, path)}&tree=collapsed`;
+		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
+			detail: { path: route },
+		}));
+	}
+
 	function startsFreshConversation(): boolean {
 		if (!task?.context || typeof task.context !== 'object') return false;
 		return (task.context as Record<string, unknown>).session_mode === 'new';
@@ -1374,7 +1384,7 @@
 					{/if}
 
 					{#if subtaskList.length > 0}
-					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {compact ? '' : 'lg:hidden'}">
+					<section class="rounded-lg border border-border/60 bg-card/30 p-3 lg:hidden">
 							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 							</div>
@@ -1806,7 +1816,7 @@
 			</div>
 
 			<!-- Right: details sidebar -->
-			<div class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 {compact ? 'hidden' : 'hidden lg:block'}">
+			<div data-task-details-sidebar class="hidden w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 lg:block">
 				<!-- Details -->
 				<div class="space-y-2">
 					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
@@ -1869,6 +1879,7 @@
 								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
 									<a
 										href={workspaceFileUrl(task.agent_id, change.path)}
+										onclick={(event) => openChangedFile(event, task?.agent_id ?? '', change.path)}
 										title={change.path}
 										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
 									>
