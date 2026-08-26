@@ -311,6 +311,62 @@ test('Desktop blocks an active remote that reloads with authentication disabled'
 	).__selectedProfile)).toBe('local');
 });
 
+test('Desktop fails closed when active profile validation rejects', async ({ page }) => {
+	let nonBootstrapRequests = 0;
+	await page.addInitScript(() => {
+		const target = window as unknown as {
+			__profileValidationCalls: number;
+			__selectedProfile: string | null;
+			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
+		};
+		target.__profileValidationCalls = 0;
+		target.__selectedProfile = null;
+		target.__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					target.__profileValidationCalls += 1;
+					throw new Error('transient profile validation failure');
+				}
+				if (command === 'select_instance_profile') {
+					target.__selectedProfile = (args as { id: string }).id;
+					return null;
+				}
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
+	await page.route('**/api/**', async (route) => {
+		const path = new URL(route.request().url()).pathname;
+		if (path === '/api/auth/bootstrap') {
+			await fulfill(route, {
+				instance_id: 'temporarily-unvalidated-remote',
+				authentication_enabled: false,
+				credential_kind: 'disabled',
+				authenticated: true,
+				csrf_token: null,
+			});
+			return;
+		}
+		nonBootstrapRequests += 1;
+		await fulfill(route, genericResponse(path));
+	});
+
+	await page.goto('/dashboard');
+	await expect(page).toHaveURL(/\/login\?return_to=%2Fdashboard$/);
+	await expect(page.getByRole('heading', { name: 'Review remote access' })).toBeVisible();
+	await expect(page.getByText(/could not validate this instance profile/i)).toBeVisible();
+	await expect(page.getByLabel('Password')).toHaveCount(0);
+	expect(nonBootstrapRequests).toBe(0);
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __profileValidationCalls: number }
+	).__profileValidationCalls)).toBeGreaterThanOrEqual(2);
+
+	await page.getByRole('button', { name: 'Return to local instance' }).click();
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __selectedProfile: string | null }
+	).__selectedProfile)).toBe('local');
+});
+
 test('Desktop pins a first-use no-auth local instance before showing the workspace', async ({ page }) => {
 	await page.addInitScript(() => {
 		const target = window as unknown as {
@@ -450,6 +506,7 @@ test('Desktop persists a newly configured password before authentication restart
 		target.__credentialCalls = [];
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
 				if (command === 'list_instance_profiles') return [];
 				if (command === 'store_active_profile_credential') {
 					target.__credentialCalls.push(structuredClone(args));
@@ -584,6 +641,7 @@ test('Desktop profiles can be edited without exposing their saved keychain crede
 		target.__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
 				target.__desktopProfileCalls.push({ command, args });
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
 				if (command === 'list_instance_profiles') return structuredClone(target.__desktopProfiles);
 				if (command === 'save_instance_profile') {
 					const input = (args as { input: { id: string; name: string; url: string; authentication: string; confirm_unauthenticated_remote: boolean } }).input;

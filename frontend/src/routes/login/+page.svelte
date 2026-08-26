@@ -61,29 +61,39 @@
 			session = await auth.bootstrap();
 			if ('__TAURI_INTERNALS__' in window) {
 				desktopAttempted = true;
-				const { invoke } = await import('@tauri-apps/api/core');
-				const active = await invoke<{
-					identity_status: 'unpinned' | 'matched' | 'changed';
-					navigation_status?: 'ready' | 'confirmation_required' | 'profile_review_required';
-					local: boolean;
-				}>('get_active_instance_profile');
-				if (active.identity_status === 'changed') {
-					desktopIdentityBlocked = true;
-					blockedLocalProfile = active.local;
-					error = active.local
-						? 'A different XpressClaw instance is answering on the saved local address. Desktop will not send it a saved credential.'
-						: 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
-					return;
-				}
-				if (!active.local && active.navigation_status !== 'ready') {
+				try {
+					const { invoke } = await import('@tauri-apps/api/core');
+					const active = await invoke<{
+						identity_status: 'unpinned' | 'matched' | 'changed';
+						navigation_status?: 'ready' | 'confirmation_required' | 'profile_review_required';
+						local: boolean;
+					}>('get_active_instance_profile');
+					if (active.identity_status === 'changed') {
+						desktopIdentityBlocked = true;
+						blockedLocalProfile = active.local;
+						error = active.local
+							? 'A different XpressClaw instance is answering on the saved local address. Desktop will not send it a saved credential.'
+							: 'This address now identifies a different XpressClaw instance. Return to the local instance, then review or replace the remote profile only if you trust it.';
+						return;
+					}
+					if (!active.local && active.navigation_status !== 'ready') {
+						desktopProfileBlocked = true;
+						unauthenticatedRemoteBlocked = active.navigation_status === 'confirmation_required';
+						error = unauthenticatedRemoteBlocked
+							? 'This remote instance now has authentication disabled. Return to the local instance, edit this profile, and explicitly confirm that its network is trusted before reconnecting.'
+							: 'This remote profile must be reviewed from the local instance before Desktop can reconnect.';
+						return;
+					}
+					if (active.identity_status === 'unpinned' && active.local && !session.authentication_enabled) {
+						await invoke('login_active_profile');
+					}
+					if (session.authentication_enabled && !session.authenticated && await finishDesktopLogin()) return;
+				} catch {
 					desktopProfileBlocked = true;
-					unauthenticatedRemoteBlocked = active.navigation_status === 'confirmation_required';
-					error = unauthenticatedRemoteBlocked
-						? 'This remote instance now has authentication disabled. Return to the local instance, edit this profile, and explicitly confirm that its network is trusted before reconnecting.'
-						: 'This remote profile must be reviewed from the local instance before Desktop can reconnect.';
+					unauthenticatedRemoteBlocked = false;
+					error = 'Desktop could not validate this instance profile. Return to the local instance and review it before reconnecting.';
 					return;
 				}
-				if (session.authentication_enabled && !session.authenticated && await finishDesktopLogin()) return;
 			}
 			if (!session.authentication_enabled || session.authenticated) {
 				await goto(safeReturnTo(), { replaceState: true });

@@ -95,6 +95,7 @@ async function installTauriClipboardImage(page: Page) {
 		(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands = [];
 		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
 			invoke: async (command: string) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
 				(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands.push(command);
 				if (command === 'plugin:clipboard-manager|read_image') return 42;
 				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
@@ -3349,6 +3350,9 @@ test('tab context menus create native webview windows in the desktop app', async
 			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
 		}).__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: true };
+				}
 				(window as unknown as { __workspaceWindowCalls: unknown[] }).__workspaceWindowCalls.push({ command, args });
 				return null;
 			},

@@ -4,7 +4,7 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import WorkspaceShell from '$lib/components/workspace/WorkspaceShell.svelte';
-	import { auth } from '$lib/api';
+	import { auth, type AuthBootstrap } from '$lib/api';
 	import { initializeTheme } from '$lib/theme';
 
 	let { children } = $props();
@@ -17,34 +17,46 @@
 		local: boolean;
 	};
 
-	onMount(() => {
-		initializeTheme();
-		// The login page owns its bootstrap request so it can render the
-		// credential mode and attempt Desktop keychain login exactly once.
-		if (loginRoute) {
+	async function redirectToLogin(): Promise<void> {
+		const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+		try {
+			// Keep the workspace gated until /login is active. If navigation itself
+			// fails, the connecting screen is safer than unlocking the current page.
+			await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
+			authenticationReady = true;
+		} catch {
+			// Leave authenticationReady false and fail closed.
+		}
+	}
+
+	async function bootstrapAuthentication(): Promise<void> {
+		let session: AuthBootstrap;
+		try {
+			session = await auth.bootstrap();
+		} catch {
+			// Preserve the existing offline/reconnecting workspace experience when
+			// the server itself cannot answer. Desktop policy failures are handled
+			// separately below and never enter this fallback.
 			authenticationReady = true;
 			return;
 		}
-		void auth.bootstrap().then(async (session) => {
-			if ('__TAURI_INTERNALS__' in window) {
+
+		if ('__TAURI_INTERNALS__' in window) {
+			try {
 				const { invoke } = await import('@tauri-apps/api/core');
 				const active = await invoke<ActiveDesktopProfile>('get_active_instance_profile');
 				if (active.identity_status === 'changed') {
-					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 					// Identity recovery belongs to the login page even when the
 					// replacement has authentication disabled. Native command guards
 					// also enforce this pin, so skipping /login cannot grant access.
-					await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
-					authenticationReady = true;
+					await redirectToLogin();
 					return;
 				}
 				if (!active.local && active.navigation_status !== 'ready') {
-					const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 					// Revalidate the selected remote on every Desktop bootstrap. This
 					// catches an already-open remote that restarted with authentication
 					// disabled before any workspace content is made available.
-					await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
-					authenticationReady = true;
+					await redirectToLogin();
 					return;
 				}
 				if (active.identity_status === 'unpinned' && active.local && !session.authentication_enabled) {
@@ -53,21 +65,30 @@
 					// login flow, where native Desktop installs the browser session.
 					await invoke('login_active_profile');
 				}
-			}
-			if (session.authentication_enabled && !session.authenticated) {
-				const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-				// The root layout persists across client-side navigation. Complete its
-				// bootstrap after /login is active so no protected workspace can flash,
-				// while a successful login can still return through this layout.
-				await goto(`/login?return_to=${encodeURIComponent(returnTo)}`, { replaceState: true });
-				authenticationReady = true;
+			} catch {
+				// A rejected native profile/identity check is not an offline server
+				// state. Route it to the recovery UI and never unlock the workspace.
+				await redirectToLogin();
 				return;
 			}
+		}
+
+		if (session.authentication_enabled && !session.authenticated) {
+			await redirectToLogin();
+			return;
+		}
+		authenticationReady = true;
+	}
+
+	onMount(() => {
+		initializeTheme();
+		// The login page owns its bootstrap request so it can render the
+		// credential mode and attempt Desktop keychain login exactly once.
+		if (loginRoute) {
 			authenticationReady = true;
-		}).catch(() => {
-			// Preserve the existing offline/reconnecting workspace experience.
-			authenticationReady = true;
-		});
+			return;
+		}
+		void bootstrapAuthentication();
 	});
 </script>
 
