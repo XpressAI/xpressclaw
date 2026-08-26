@@ -13,6 +13,7 @@ const PROFILE_VERSION: u8 = 1;
 const LOCAL_PROFILE_ID: &str = "local";
 const KEYCHAIN_SERVICE: &str = "ai.xpress.xpressclaw.instance";
 const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
+const PROFILE_INSPECTION_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredProfile {
@@ -272,36 +273,56 @@ pub async fn list_instance_profiles(
         let file = state.file.lock().map_err(|_| "Profile lock failed")?;
         (file.profiles.clone(), file.active_profile_id.clone())
     };
-    let mut result = Vec::with_capacity(profiles.len());
-    for profile in profiles {
-        let (health, bootstrap) = inspect_profile(&state, &profile).await;
-        let mut authentication = profile.authentication.clone();
-        let mut instance_id = profile.instance_id.clone();
-        if profile.local {
-            if let Some(bootstrap) = bootstrap.as_ref() {
-                if profile_identity_matches(&profile, &bootstrap.instance_id) {
-                    // Listing is passive discovery. Report the live values,
-                    // but establish the local identity pin only on an explicit
-                    // connect/login path so a stale keychain entry cannot be
-                    // reused merely because Settings observed a listener.
-                    authentication = effective_authentication(bootstrap)?.to_string();
-                    instance_id = Some(bootstrap.instance_id.clone());
-                }
+    inspect_instance_profiles(&state, profiles, &active).await
+}
+
+async fn inspect_instance_profiles(
+    state: &ProfileState,
+    profiles: Vec<StoredProfile>,
+    active: &str,
+) -> Result<Vec<InstanceProfile>, String> {
+    let inspected = futures_util::stream::iter(profiles)
+        .map(|profile| summarize_profile(state, profile, active))
+        // Unreachable profiles can consume the full request timeout. Inspect
+        // independent endpoints concurrently, but cap fan-out so a large
+        // profile file cannot create an unbounded connection burst.
+        .buffered(PROFILE_INSPECTION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    inspected.into_iter().collect()
+}
+
+async fn summarize_profile(
+    state: &ProfileState,
+    profile: StoredProfile,
+    active: &str,
+) -> Result<InstanceProfile, String> {
+    let (health, bootstrap) = inspect_profile(state, &profile).await;
+    let mut authentication = profile.authentication.clone();
+    let mut instance_id = profile.instance_id.clone();
+    if profile.local {
+        if let Some(bootstrap) = bootstrap.as_ref() {
+            if profile_identity_matches(&profile, &bootstrap.instance_id) {
+                // Listing is passive discovery. Report the live values, but
+                // establish the local identity pin only on an explicit
+                // connect/login path so a stale keychain entry cannot be
+                // reused merely because Settings observed a listener.
+                authentication = effective_authentication(bootstrap)?.to_string();
+                instance_id = Some(bootstrap.instance_id.clone());
             }
         }
-        result.push(InstanceProfile {
-            id: profile.id.clone(),
-            name: profile.name,
-            url: profile.url,
-            instance_id,
-            authentication,
-            local: profile.local,
-            active: profile.id == active,
-            health,
-            confirmed_unauthenticated_remote: profile.confirmed_unauthenticated_remote,
-        });
     }
-    Ok(result)
+    Ok(InstanceProfile {
+        id: profile.id.clone(),
+        name: profile.name,
+        url: profile.url,
+        instance_id,
+        authentication,
+        local: profile.local,
+        active: profile.id == active,
+        health,
+        confirmed_unauthenticated_remote: profile.confirmed_unauthenticated_remote,
+    })
 }
 
 #[tauri::command]
@@ -1483,5 +1504,104 @@ mod tests {
             requests.lock().unwrap().as_slice(),
             ["GET /api/auth/bootstrap HTTP/1.1"]
         );
+    }
+
+    #[tokio::test]
+    async fn profile_inspections_are_concurrent_but_bounded_and_keep_order() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let maximum_requests = Arc::new(AtomicUsize::new(0));
+        let mut profiles = Vec::new();
+        let mut servers = Vec::new();
+
+        for index in 0..(PROFILE_INSPECTION_CONCURRENCY + 2) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let active_requests = active_requests.clone();
+            let maximum_requests = maximum_requests.clone();
+            servers.push(std::thread::spawn(move || {
+                let accept_deadline = Instant::now() + Duration::from_secs(3);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < accept_deadline,
+                                "profile inspection never reached test endpoint {index}"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("profile listener failed: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).unwrap();
+
+                let current = active_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum_requests.fetch_max(current, Ordering::SeqCst);
+                let overlap_deadline = Instant::now() + Duration::from_millis(500);
+                while maximum_requests.load(Ordering::SeqCst) < 2
+                    && Instant::now() < overlap_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+
+                let body = format!(
+                    r#"{{"instance_id":"instance-{index}","authentication_enabled":false,"credential_kind":"disabled"}}"#
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                active_requests.fetch_sub(1, Ordering::SeqCst);
+            }));
+            profiles.push(StoredProfile {
+                id: format!("profile-{index}"),
+                name: format!("Profile {index}"),
+                url: format!("http://{address}"),
+                instance_id: Some(format!("instance-{index}")),
+                authentication: "none".to_string(),
+                local: false,
+                confirmed_unauthenticated_remote: true,
+            });
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile::default()),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+        };
+        let inspected = inspect_instance_profiles(&state, profiles, "profile-3")
+            .await
+            .unwrap();
+        for server in servers {
+            server.join().unwrap();
+        }
+
+        assert!(maximum_requests.load(Ordering::SeqCst) >= 2);
+        assert!(maximum_requests.load(Ordering::SeqCst) <= PROFILE_INSPECTION_CONCURRENCY);
+        assert_eq!(
+            inspected
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>(),
+            (0..(PROFILE_INSPECTION_CONCURRENCY + 2))
+                .map(|index| format!("profile-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(inspected[3].active);
+        assert!(inspected.iter().all(|profile| profile.health == "healthy"));
     }
 }
