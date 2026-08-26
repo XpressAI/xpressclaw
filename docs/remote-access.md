@@ -98,10 +98,12 @@ host/network layer, redirect HTTP to HTTPS, and enable HSTS at the proxy.
 
 Desktop always starts the automatic local instance at `~/.xpressclaw`. In
 **Settings → Instance**, remote profiles can be added, health-checked, pinned
-to an instance identity, selected, edited, or removed. Passwords and startup
+to a cryptographic instance identity, selected, edited, or removed. Desktop
+verifies a fresh signed challenge before using a saved credential; a recorded
+bootstrap response or instance ID is not sufficient. Passwords and startup
 tokens are stored in the operating-system keychain; the profile JSON contains
-only the name, URL, identity, and authentication mode. A remote profile with
-authentication off requires the same trusted-network confirmation.
+only the name, URL, public identity, and authentication mode. A remote profile
+with authentication off requires the same trusted-network confirmation.
 
 The current Desktop release intentionally selects one profile for the whole
 application. Switching closes secondary workspace windows before navigating

@@ -16,6 +16,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tempfile::NamedTempFile;
@@ -24,6 +25,8 @@ use zeroize::Zeroizing;
 pub const SESSION_COOKIE: &str = "xpressclaw_session";
 pub const CSRF_HEADER: &str = "x-xpressclaw-csrf";
 pub const STARTUP_TOKEN_PREFIX: &str = "XPRESSCLAW_STARTUP_TOKEN=";
+pub const INSTANCE_IDENTITY_PREFIX: &str = "XPRESSCLAW_INSTANCE_IDENTITY=";
+const IDENTITY_PROOF_DOMAIN: &[u8] = b"xpressclaw-desktop-identity-v1\0";
 
 const SESSION_LIFETIME: Duration = Duration::from_secs(12 * 60 * 60);
 const DESKTOP_TICKET_LIFETIME: Duration = Duration::from_secs(30);
@@ -77,6 +80,7 @@ struct LoginFailures {
 /// intentionally lost on restart.
 pub struct InstanceAuth {
     instance_id: String,
+    identity_key: Ed25519KeyPair,
     effective_enabled: bool,
     credential: Mutex<Credential>,
     sessions: Mutex<HashMap<[u8; 32], BrowserSession>>,
@@ -99,8 +103,15 @@ pub enum LoginError {
 
 impl InstanceAuth {
     pub fn disabled(instance_id: String) -> Self {
+        let identity_key = generate_identity_key()
+            .expect("operating-system random number generator failed for test identity");
+        Self::disabled_with_identity(instance_id, identity_key)
+    }
+
+    fn disabled_with_identity(instance_id: String, identity_key: Ed25519KeyPair) -> Self {
         Self {
             instance_id,
+            identity_key,
             effective_enabled: false,
             credential: Mutex::new(Credential::Disabled),
             sessions: Mutex::new(HashMap::new()),
@@ -120,8 +131,9 @@ impl InstanceAuth {
         effective_enabled: bool,
         supplied_startup_token: Option<Zeroizing<String>>,
     ) -> anyhow::Result<Self> {
+        let identity_key = load_or_create_identity_key(data_dir)?;
         if !effective_enabled {
-            return Ok(Self::disabled(instance_id));
+            return Ok(Self::disabled_with_identity(instance_id, identity_key));
         }
 
         let password_hash = load_password_hash(data_dir)?;
@@ -140,6 +152,7 @@ impl InstanceAuth {
 
         Ok(Self {
             instance_id,
+            identity_key,
             effective_enabled,
             credential: Mutex::new(credential),
             sessions: Mutex::new(HashMap::new()),
@@ -152,6 +165,23 @@ impl InstanceAuth {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Stable public identity pinned by Desktop profiles. The matching private
+    /// key lives only in the restricted instance secret directory.
+    pub fn identity_public_key(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.identity_key.public_key().as_ref())
+    }
+
+    /// Sign a caller nonce with domain separation and the installation ID so
+    /// a recorded public bootstrap response cannot be replayed by a process
+    /// that later takes over the same address.
+    pub fn sign_identity_challenge(&self, challenge: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(
+            self.identity_key
+                .sign(&identity_proof_message(&self.instance_id, challenge))
+                .as_ref(),
+        )
     }
 
     pub fn enabled(&self) -> bool {
@@ -413,6 +443,89 @@ fn secret_key(value: &str) -> [u8; 32] {
         .expect("SHA-256 has a fixed length")
 }
 
+pub fn identity_proof_message(instance_id: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(IDENTITY_PROOF_DOMAIN.len() + instance_id.len() + 1 + challenge.len());
+    message.extend_from_slice(IDENTITY_PROOF_DOMAIN);
+    message.extend_from_slice(instance_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(challenge);
+    message
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstanceIdentitySecret {
+    version: u8,
+    private_key: String,
+}
+
+fn identity_secret_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("instance-identity.json")
+}
+
+fn generate_identity_key() -> anyhow::Result<Ed25519KeyPair> {
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| anyhow::anyhow!("operating-system random number generator failed"))?;
+    Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|_| anyhow::anyhow!("generated instance identity key was invalid"))
+}
+
+fn decode_identity_key(path: &Path, bytes: &[u8]) -> anyhow::Result<Ed25519KeyPair> {
+    let secret: InstanceIdentitySecret = serde_json::from_slice(bytes)
+        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))?;
+    if secret.version != 1 {
+        anyhow::bail!(
+            "unsupported instance identity secret version {}",
+            secret.version
+        );
+    }
+    let private_key = URL_SAFE_NO_PAD
+        .decode(secret.private_key)
+        .map_err(|_| anyhow::anyhow!("instance identity secret contains invalid base64"))?;
+    Ed25519KeyPair::from_pkcs8(&private_key)
+        .map_err(|_| anyhow::anyhow!("instance identity secret contains an invalid key"))
+}
+
+fn load_identity_key(path: &Path) -> anyhow::Result<Ed25519KeyPair> {
+    restrict_existing_file(path)?;
+    decode_identity_key(path, &std::fs::read(path)?)
+}
+
+fn load_or_create_identity_key(data_dir: &Path) -> anyhow::Result<Ed25519KeyPair> {
+    std::fs::create_dir_all(data_dir)?;
+    let path = identity_secret_path(data_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => return load_identity_key(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+        .map_err(|_| anyhow::anyhow!("operating-system random number generator failed"))?;
+    let secret = InstanceIdentitySecret {
+        version: 1,
+        private_key: URL_SAFE_NO_PAD.encode(pkcs8.as_ref()),
+    };
+    let bytes = serde_json::to_vec_pretty(&secret)?;
+    let mut temporary = NamedTempFile::new_in(data_dir)?;
+    use std::io::Write;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    set_restricted_permissions(temporary.path())?;
+    match temporary.persist_noclobber(&path) {
+        Ok(_) => load_identity_key(&path),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_identity_key(&path)
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to create {}: {}",
+            path.display(),
+            error.error
+        )),
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstanceAuthSecret {
@@ -526,6 +639,36 @@ pub fn cookie_value(headers: &axum::http::HeaderMap) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{UnparsedPublicKey, ED25519};
+
+    #[test]
+    fn identity_key_persists_and_proves_fresh_challenges() {
+        let root = tempfile::tempdir().unwrap();
+        let first = InstanceAuth::load(root.path(), "instance".into(), false, None).unwrap();
+        let public_key = URL_SAFE_NO_PAD.decode(first.identity_public_key()).unwrap();
+        let first_challenge = [7u8; 32];
+        let first_signature = URL_SAFE_NO_PAD
+            .decode(first.sign_identity_challenge(&first_challenge))
+            .unwrap();
+        UnparsedPublicKey::new(&ED25519, &public_key)
+            .verify(
+                &identity_proof_message("instance", &first_challenge),
+                &first_signature,
+            )
+            .unwrap();
+
+        let second = InstanceAuth::load(root.path(), "instance".into(), false, None).unwrap();
+        assert_eq!(second.identity_public_key(), first.identity_public_key());
+        let replayed_for_another_challenge = URL_SAFE_NO_PAD
+            .decode(first.sign_identity_challenge(&first_challenge))
+            .unwrap();
+        assert!(UnparsedPublicKey::new(&ED25519, &public_key)
+            .verify(
+                &identity_proof_message("instance", &[8u8; 32]),
+                &replayed_for_another_challenge,
+            )
+            .is_err());
+    }
 
     #[tokio::test]
     async fn password_verifier_and_sessions_never_store_plaintext() {
@@ -695,17 +838,16 @@ mod tests {
     fn secret_files_are_restricted_on_unix() {
         let root = tempfile::tempdir().unwrap();
         store_password_hash(root.path(), Some("hash")).unwrap();
+        InstanceAuth::load(root.path(), "instance".into(), false, None).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(secret_path(root.path()))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
+            for path in [secret_path(root.path()), identity_secret_path(root.path())] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
         }
     }
 
@@ -721,6 +863,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a regular file"));
+
+        let identity_root = tempfile::tempdir().unwrap();
+        symlink(outside.path(), identity_secret_path(identity_root.path())).unwrap();
+        assert!(
+            InstanceAuth::load(identity_root.path(), "instance".into(), false, None)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not a regular file")
+        );
     }
 
     #[test]

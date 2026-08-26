@@ -44,6 +44,7 @@ export async function request<T>(path: string, init?: RequestInit, retryCsrf = t
 
 export interface AuthBootstrap {
 	instance_id: string;
+	identity_public_key: string;
 	authentication_enabled: boolean;
 	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
 	authenticated: boolean;

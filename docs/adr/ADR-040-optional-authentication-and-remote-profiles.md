@@ -47,9 +47,13 @@ be coupled to browser sessions.
   redirection, and HSTS remain the operator's responsibility.
 - Desktop keeps one automatic local profile and any number of explicit remote
   profiles. Non-secret profile metadata is local to Desktop; credentials use
-  the OS keychain. A pinned instance ID detects address reuse. Web content can
-  receive only a short-lived, single-use ticket for the currently selected
-  profile, never the keychain credential itself.
+  the OS keychain. Desktop pins a long-lived Ed25519 instance public key and
+  verifies a fresh signed challenge before releasing a credential or granting
+  local plugin permissions; the private key remains in restricted instance
+  secret storage. On first local startup, the bundled child announces its
+  public key over inherited stdout only after it owns both listeners. Web
+  content can receive only a short-lived, single-use ticket for the currently
+  selected profile, never the keychain credential itself.
 - Tauri application commands have an explicit ACL. Bundled local content gets
   the existing local command set; only the exact selected remote origin gets
   the narrower profile/login command set. Other remote origins cannot invoke

@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::io::{Read, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use xpressclaw_core::config::Config;
@@ -45,6 +45,38 @@ fn http_status(port: u16, path: &str) -> u16 {
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse().ok())
         .expect("HTTP response status")
+}
+
+fn http_json(port: u16, path: &str) -> serde_json::Value {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
+}
+
+fn http_post_json(port: u16, path: &str, body: &str) -> serde_json::Value {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    serde_json::from_str(body).unwrap()
 }
 
 #[test]
@@ -165,6 +197,7 @@ fn foreground_does_not_announce_a_token_when_the_listener_is_owned() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let output = Command::new(env!("CARGO_BIN_EXE_xpressclaw"))
+        .env("XPRESSCLAW_DESKTOP_HANDSHAKE", "1")
         .args([
             "up",
             "--instance",
@@ -178,6 +211,76 @@ fn foreground_does_not_announce_a_token_when_the_listener_is_owned() {
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_STARTUP_TOKEN="));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_STARTUP_TOKEN="));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("XPRESSCLAW_INSTANCE_IDENTITY="));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("XPRESSCLAW_INSTANCE_IDENTITY="));
+}
+
+#[test]
+fn foreground_announces_desktop_identity_only_after_listener_ownership() {
+    use std::io::BufRead;
+    use std::sync::mpsc;
+
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("desktop-handshake-instance");
+    std::fs::create_dir_all(&instance).unwrap();
+    let mut config = Config::default();
+    config.system.data_dir = instance.clone();
+    config.system.workspace_dir = instance.join("workspaces");
+    config.save(&instance.join("xpressclaw.yaml")).unwrap();
+
+    let port = unused_port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xpressclaw"))
+        .env("XPRESSCLAW_DESKTOP_HANDSHAKE", "1")
+        .args([
+            "up",
+            "--instance",
+            instance.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(identity) = line.strip_prefix("XPRESSCLAW_INSTANCE_IDENTITY=") {
+                let _ = sender.send(identity.to_string());
+                return;
+            }
+        }
+    });
+
+    let identity = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the owned foreground listeners should announce their identity");
+    assert!(identity.len() >= 40);
+    assert!(identity
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+    assert_eq!(http_status(port, "/api/health"), 200);
+    let bootstrap = http_json(port, "/api/auth/bootstrap");
+    assert_eq!(bootstrap["identity_public_key"], identity);
+    let proof = http_post_json(
+        port,
+        "/api/auth/identity-proof",
+        r#"{"challenge":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+    );
+    assert_eq!(proof["instance_id"], bootstrap["instance_id"]);
+    assert_eq!(
+        proof["identity_public_key"],
+        bootstrap["identity_public_key"]
+    );
+    assert!(proof["signature"].as_str().unwrap().len() >= 80);
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+    reader.join().unwrap();
 }
 
 #[test]

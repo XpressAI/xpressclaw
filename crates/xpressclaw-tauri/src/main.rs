@@ -19,6 +19,7 @@ const DEV_FRONTEND_PORT: u16 = 5173;
 // Anonymous stdout protocol emitted by the CLI when the local sidecar needs
 // a per-start login token. The matched line is consumed and never logged.
 const STARTUP_TOKEN_PREFIX: &str = "XPRESSCLAW_STARTUP_TOKEN=";
+const INSTANCE_IDENTITY_PREFIX: &str = "XPRESSCLAW_INSTANCE_IDENTITY=";
 
 #[derive(Debug, Clone)]
 struct LocalInstanceConnection {
@@ -299,6 +300,10 @@ fn main() {
                     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
                 );
             }
+            // Ask the bundled CLI to announce its public identity only after
+            // it owns both listeners. The value is not secret; its position on
+            // this inherited stdout pipe binds it to the child we launched.
+            cmd.env("XPRESSCLAW_DESKTOP_HANDSHAKE", "1");
 
             let mut child = match cmd.spawn() {
                 Ok(child) => child,
@@ -324,6 +329,14 @@ fn main() {
                     use std::io::BufRead;
                     use zeroize::{Zeroize, Zeroizing};
                     for mut line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                        if let Some(identity) = line.strip_prefix(INSTANCE_IDENTITY_PREFIX) {
+                            if let Err(error) = token_handle
+                                .state::<profiles::ProfileState>()
+                                .remember_local_bound_identity(identity)
+                            {
+                                warn!(%error, "could not retain the bound local instance identity");
+                            }
+                        }
                         if let Some(token) = line.strip_prefix(STARTUP_TOKEN_PREFIX) {
                             let token = Zeroizing::new(token.to_string());
                             if let Err(error) = token_handle
@@ -393,22 +406,32 @@ async fn show_preferred_startup(
     let local_profile = profile_state.active_is_local().unwrap_or(true);
     let server_ready = if should_wait_for_local_sidecar(local_profile, sidecar_spawned) {
         wait_for_server(&local_url).await
+    } else if local_profile {
+        // A separately started local control plane can be reused, but receives
+        // native capabilities only after its saved signing key proves identity.
+        server_is_ready(&local_url).await
     } else {
         false
     };
 
-    if server_ready {
+    if local_profile && server_ready {
         info!("server is ready");
-        if let Err(error) = enable_image_paste_capability(&handle, &local_url) {
-            warn!(%error, "failed to enable image paste capability");
+        match profiles::verify_managed_local_instance(&profile_state).await {
+            Ok(_) => {
+                if let Err(error) = enable_verified_local_capabilities(&handle, &local_url) {
+                    warn!(%error, "failed to enable verified local Desktop capabilities");
+                }
+            }
+            Err(error) => {
+                warn!(%error, "local listener identity was not verified; withholding plugin permissions");
+                if let Err(error) = enable_profile_capabilities(&handle, &local_url, false) {
+                    warn!(%error, "failed to enable local identity recovery commands");
+                }
+            }
         }
-        if let Err(error) = enable_workspace_window_capability(&handle, &local_url) {
-            warn!(%error, "failed to enable workspace window capability");
-        }
-    }
-    // A remote profile is independent of local listener health. For the local
-    // profile, do not grant native capabilities to an unverified listener.
-    if !local_profile || server_ready {
+    } else if !local_profile {
+        // A remote profile is independent of local listener health and gets
+        // only identity-checked custom commands, never direct plugin access.
         if let Err(error) = enable_profile_capabilities(&handle, &url, local_profile) {
             warn!(%error, "failed to enable selected profile capabilities");
         }
@@ -424,6 +447,15 @@ async fn show_preferred_startup(
 
 fn should_wait_for_local_sidecar(local_profile: bool, sidecar_spawned: bool) -> bool {
     local_profile && sidecar_spawned
+}
+
+pub(crate) fn enable_verified_local_capabilities(
+    app: &tauri::AppHandle,
+    url: &str,
+) -> Result<(), String> {
+    enable_image_paste_capability(app, url).map_err(|error| error.to_string())?;
+    enable_workspace_window_capability(app, url).map_err(|error| error.to_string())?;
+    enable_profile_capabilities(app, url, true)
 }
 
 /// Show a confirmation dialog, then shut down if confirmed.
@@ -604,25 +636,10 @@ fn is_xpressclaw_health(body: &serde_json::Value) -> bool {
 }
 
 async fn wait_for_server(base_url: &str) -> bool {
-    let url = format!("{base_url}/api/health");
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build local sidecar health client");
-
+    let client = local_health_client();
     for i in 0..120 {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                if resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .is_ok_and(|body| is_xpressclaw_health(&body))
-                {
-                    return true;
-                }
-            }
-            _ => {}
+        if server_is_ready_with(&client, base_url).await {
+            return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if i % 20 == 19 {
@@ -631,6 +648,31 @@ async fn wait_for_server(base_url: &str) -> bool {
     }
     warn!("xpressclaw server did not become ready within 60 seconds");
     false
+}
+
+async fn server_is_ready(base_url: &str) -> bool {
+    server_is_ready_with(&local_health_client(), base_url).await
+}
+
+fn local_health_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_millis(250))
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .expect("failed to build local sidecar health client")
+}
+
+async fn server_is_ready_with(client: &reqwest::Client, base_url: &str) -> bool {
+    let url = format!("{base_url}/api/health");
+    match client.get(&url).send().await {
+        Ok(response) if response.status().is_success() => response
+            .json::<serde_json::Value>()
+            .await
+            .is_ok_and(|body| is_xpressclaw_health(&body)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

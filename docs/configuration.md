@@ -63,11 +63,13 @@ UI shows saved and effective values separately.
 
 Passwords are never represented in YAML. XpressClaw writes only a memory-hard
 Argon2id verifier to `instance-auth.json` under `system.data_dir`, with
-restricted file permissions. Browser sessions and no-password startup tokens
-are process-local and disappear on restart. This secret file, Desktop profile
-data, and sessions are outside Project synchronization. Desktop stores remote
-profile credentials in the operating-system keychain; its JSON profile file
-contains only non-secret connection metadata.
+restricted file permissions. The long-lived Ed25519 private key used to prove
+instance identity is stored separately in restricted `instance-identity.json`;
+Desktop profiles retain only its public key. Browser sessions and no-password
+startup tokens are process-local and disappear on restart. These secret files,
+Desktop profile data, and sessions are outside Project synchronization. Desktop
+stores remote profile credentials in the operating-system keychain; its JSON
+profile file contains only non-secret connection metadata.
 
 Application authentication does not provide TLS. See [Remote
 access](remote-access.md) before selecting a non-loopback address.

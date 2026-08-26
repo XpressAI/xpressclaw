@@ -6,6 +6,8 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -15,6 +17,7 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/bootstrap", get(bootstrap))
+        .route("/identity-proof", post(identity_proof))
         .route("/login", post(login))
         .route("/logout", post(logout))
         .route("/desktop-ticket", post(desktop_ticket))
@@ -27,6 +30,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(Serialize)]
 struct BootstrapResponse {
     instance_id: String,
+    identity_public_key: String,
     authentication_enabled: bool,
     credential_kind: &'static str,
     authenticated: bool,
@@ -42,11 +46,34 @@ async fn bootstrap(State(state): State<AppState>, headers: HeaderMap) -> Respons
     };
     no_store(Json(BootstrapResponse {
         instance_id: state.auth.instance_id().to_string(),
+        identity_public_key: state.auth.identity_public_key(),
         authentication_enabled: state.auth.enabled(),
         credential_kind: state.auth.credential_kind().as_str(),
         authenticated,
         csrf_token,
     }))
+}
+
+#[derive(Deserialize)]
+struct IdentityProofRequest {
+    challenge: String,
+}
+
+async fn identity_proof(
+    State(state): State<AppState>,
+    Json(body): Json<IdentityProofRequest>,
+) -> Response {
+    let Ok(challenge) = URL_SAFE_NO_PAD.decode(&body.challenge) else {
+        return error_response(StatusCode::BAD_REQUEST, "Identity challenge is invalid");
+    };
+    if challenge.len() != 32 {
+        return error_response(StatusCode::BAD_REQUEST, "Identity challenge is invalid");
+    }
+    no_store(Json(serde_json::json!({
+        "instance_id": state.auth.instance_id(),
+        "identity_public_key": state.auth.identity_public_key(),
+        "signature": state.auth.sign_identity_challenge(&challenge),
+    })))
 }
 
 #[derive(Deserialize)]

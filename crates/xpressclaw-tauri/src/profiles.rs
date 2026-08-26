@@ -2,7 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use futures_util::StreamExt;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -14,6 +18,7 @@ const LOCAL_PROFILE_ID: &str = "local";
 const KEYCHAIN_SERVICE: &str = "ai.xpress.xpressclaw.instance";
 const MAX_AUTH_RESPONSE_BYTES: usize = 16 * 1024;
 const PROFILE_INSPECTION_CONCURRENCY: usize = 4;
+const IDENTITY_PROOF_DOMAIN: &[u8] = b"xpressclaw-desktop-identity-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredProfile {
@@ -21,6 +26,8 @@ struct StoredProfile {
     name: String,
     url: String,
     instance_id: Option<String>,
+    #[serde(default)]
+    identity_public_key: Option<String>,
     authentication: String,
     local: bool,
     #[serde(default)]
@@ -80,6 +87,7 @@ pub struct SaveProfileInput {
 #[derive(Debug, Deserialize)]
 struct Bootstrap {
     instance_id: String,
+    identity_public_key: String,
     authentication_enabled: bool,
     credential_kind: String,
 }
@@ -94,6 +102,13 @@ struct PendingInstanceSettings {
 #[derive(Debug, Deserialize)]
 struct PendingListenerSettings {
     authentication_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdentityProof {
+    instance_id: String,
+    identity_public_key: String,
+    signature: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -111,6 +126,10 @@ pub struct ProfileState {
     /// Secure process-memory fallback when an OS keychain is temporarily
     /// unavailable. It rotates with the local server and is never serialized.
     local_ephemeral_credential: Mutex<Option<Zeroizing<String>>>,
+    /// Public key announced by the exact bundled child after it owns both
+    /// listeners. This is process-local and lets first-use local pairing avoid
+    /// trusting an unrelated process that happened to win the port.
+    local_bound_identity: Mutex<Option<String>>,
 }
 
 impl ProfileState {
@@ -147,6 +166,7 @@ impl ProfileState {
                     name: "Local XpressClaw".to_string(),
                     url: local_url.to_string(),
                     instance_id: None,
+                    identity_public_key: None,
                     authentication: "none".to_string(),
                     local: true,
                     confirmed_unauthenticated_remote: true,
@@ -165,6 +185,7 @@ impl ProfileState {
             file: Mutex::new(file),
             mutation_lock: tokio::sync::Mutex::new(()),
             local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
         };
         state.persist()?;
         Ok(state)
@@ -204,8 +225,20 @@ impl ProfileState {
                 .iter_mut()
                 .find(|profile| profile.local)
                 .ok_or_else(|| "Local profile is missing".to_string())?;
-            require_profile_identity(local, &bootstrap.instance_id)?;
+            if local.identity_public_key.is_some() {
+                require_profile_identity(local, bootstrap)?;
+            } else if local
+                .instance_id
+                .as_deref()
+                .is_some_and(|expected| expected != bootstrap.instance_id)
+            {
+                return Err(
+                    "The local XpressClaw instance identity changed. Explicitly trust the replacement before Desktop can use credentials."
+                        .to_string(),
+                );
+            }
             local.instance_id = Some(bootstrap.instance_id.clone());
+            local.identity_public_key = Some(bootstrap.identity_public_key.clone());
             local.authentication = authentication;
             Ok(local.clone())
         })
@@ -236,6 +269,7 @@ impl ProfileState {
                 return Err("This local instance identity is already trusted".to_string());
             }
             local.instance_id = Some(bootstrap.instance_id.clone());
+            local.identity_public_key = Some(bootstrap.identity_public_key.clone());
             local.authentication = authentication;
             Ok(())
         })
@@ -309,6 +343,61 @@ impl ProfileState {
         *current = Some(token.clone());
         set_credential(LOCAL_PROFILE_ID, &token)
     }
+
+    pub fn remember_local_bound_identity(&self, identity: &str) -> Result<(), String> {
+        validate_identity_public_key(identity)?;
+        let mut current = self
+            .local_bound_identity
+            .lock()
+            .map_err(|_| "Local identity lock failed".to_string())?;
+        *current = Some(identity.to_string());
+        Ok(())
+    }
+
+    fn local_bound_identity(&self) -> Result<Option<String>, String> {
+        self.local_bound_identity
+            .lock()
+            .map_err(|_| "Local identity lock failed".to_string())
+            .map(|identity| identity.clone())
+    }
+}
+
+pub(crate) async fn verify_managed_local_instance(state: &ProfileState) -> Result<String, String> {
+    let profile = {
+        let file = state.file.lock().map_err(|_| "Profile lock failed")?;
+        file.profiles
+            .iter()
+            .find(|profile| profile.local)
+            .cloned()
+            .ok_or_else(|| "Local profile is missing".to_string())?
+    };
+    // A saved cryptographic pin can authenticate an already-running managed
+    // sidecar. First use has no such pin, so require the public key announced
+    // by the exact child process after it acquired both listeners.
+    let expected_identity = if let Some(identity) = profile.identity_public_key.clone() {
+        identity
+    } else {
+        let mut identity = None;
+        for _ in 0..40 {
+            identity = state.local_bound_identity()?;
+            if identity.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        identity.ok_or_else(|| {
+            "The bundled sidecar did not confirm ownership of the local listeners".to_string()
+        })?
+    };
+    let bootstrap = fetch_verified_bootstrap(&profile.url, Some(&expected_identity)).await?;
+    if profile.identity_public_key.is_some() && !profile_identity_matches(&profile, &bootstrap) {
+        return Err(
+            "The bound local sidecar does not match the saved Desktop instance identity"
+                .to_string(),
+        );
+    }
+    state.set_local_bootstrap(&bootstrap)?;
+    Ok(profile.url)
 }
 
 #[tauri::command]
@@ -350,7 +439,7 @@ async fn summarize_profile(
     let mut instance_id = profile.instance_id.clone();
     if profile.local {
         if let Some(bootstrap) = bootstrap.as_ref() {
-            if profile_identity_matches(&profile, &bootstrap.instance_id) {
+            if profile_identity_matches(&profile, bootstrap) {
                 // Listing is passive discovery. Report the live values, but
                 // establish the local identity pin only on an explicit
                 // connect/login path so a stale keychain entry cannot be
@@ -427,6 +516,14 @@ pub async fn save_instance_profile(
     }
 
     let bootstrap = fetch_bootstrap(&url).await?;
+    verify_bootstrap_identity(
+        &url,
+        &bootstrap,
+        existing
+            .as_ref()
+            .and_then(|profile| profile.identity_public_key.as_deref()),
+    )
+    .await?;
     let expected_authentication = effective_authentication(&bootstrap)?;
     if input.authentication != expected_authentication {
         return Err(match expected_authentication {
@@ -439,10 +536,13 @@ pub async fn save_instance_profile(
             _ => unreachable!(),
         });
     }
-    if existing
-        .as_ref()
-        .is_some_and(|profile| !profile_identity_matches(profile, &bootstrap.instance_id))
-    {
+    if existing.as_ref().is_some_and(|profile| {
+        profile.instance_id.as_deref() != Some(bootstrap.instance_id.as_str())
+            || profile
+                .identity_public_key
+                .as_deref()
+                .is_some_and(|expected| expected != bootstrap.identity_public_key)
+    }) {
         return Err("The instance identity at this address changed. Delete and re-add the profile only if you trust the replacement.".to_string());
     }
 
@@ -456,12 +556,7 @@ pub async fn save_instance_profile(
         let supplied = if let Some(supplied) = credential.as_ref() {
             supplied
         } else if existing.as_ref().is_some_and(|profile| {
-            may_reuse_stored_credential(
-                profile,
-                &url,
-                &input.authentication,
-                &bootstrap.instance_id,
-            )
+            may_reuse_stored_credential(profile, &url, &input.authentication, &bootstrap)
         }) {
             retained = get_credential(&id)?;
             &retained
@@ -489,6 +584,7 @@ pub async fn save_instance_profile(
         name: name.to_string(),
         url: url.clone(),
         instance_id: Some(bootstrap.instance_id),
+        identity_public_key: Some(bootstrap.identity_public_key),
         authentication: input.authentication,
         local: false,
         confirmed_unauthenticated_remote,
@@ -537,6 +633,7 @@ pub async fn select_instance_profile(
 ) -> Result<(), String> {
     let _mutation_guard = state.mutation_lock.lock().await;
     let active_profile = require_active_profile_origin(&state, &webview)?;
+    let returning_from_remote = id == LOCAL_PROFILE_ID && !active_profile.local;
     // A page served by a replaced remote instance must retain one safe escape
     // hatch back to the automatic local profile. Every other selection first
     // proves that the currently loaded page still belongs to its pinned
@@ -555,8 +652,37 @@ pub async fn select_instance_profile(
             .ok_or_else(|| "Desktop profile not found".to_string())?;
         (profile, file.active_profile_id.clone())
     };
-    let bootstrap = fetch_bootstrap(&profile.url).await?;
-    require_profile_identity(&profile, &bootstrap.instance_id)?;
+    let bootstrap = match fetch_bootstrap(&profile.url).await {
+        Ok(bootstrap) => bootstrap,
+        Err(_) if profile.local && returning_from_remote => {
+            return enter_local_recovery(&app, &state, &profile)
+        }
+        Err(error) => return Err(error),
+    };
+    let local_bound_identity = profile
+        .local
+        .then(|| state.local_bound_identity())
+        .transpose()?
+        .flatten();
+    let expected_identity = profile
+        .identity_public_key
+        .as_deref()
+        .or(local_bound_identity.as_deref());
+    let identity_result = if let Some(expected_identity) = expected_identity {
+        verify_bootstrap_identity(&profile.url, &bootstrap, Some(expected_identity)).await
+    } else {
+        Err("Desktop has no trusted identity proof for this instance".to_string())
+    };
+    if local_profile_requires_recovery(&profile, &bootstrap, identity_result.is_ok()) {
+        // Enter a credential-free recovery state even when the caller is a
+        // healthy remote profile. The local page receives only guarded profile
+        // commands until the operator explicitly trusts the replacement.
+        return enter_local_recovery(&app, &state, &profile);
+    }
+    identity_result?;
+    if profile.identity_public_key.is_some() {
+        require_profile_identity(&profile, &bootstrap)?;
+    }
     let credential_profile = profile.clone();
     if profile.local {
         profile = state.set_local_bootstrap(&bootstrap)?;
@@ -611,6 +737,27 @@ pub async fn select_instance_profile(
         let _ = rollback_selection();
         return Err(error);
     }
+    if let Err(error) = navigate_to_profile(&app, &profile.url) {
+        let _ = rollback_selection();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn enter_local_recovery(
+    app: &AppHandle,
+    state: &ProfileState,
+    profile: &StoredProfile,
+) -> Result<(), String> {
+    if !profile.local {
+        return Err("Only the automatic local profile can enter recovery".to_string());
+    }
+    state.select_local()?;
+    crate::enable_profile_capabilities(app, &profile.url, false)?;
+    navigate_to_profile(app, &profile.url)
+}
+
+fn navigate_to_profile(app: &AppHandle, url: &str) -> Result<(), String> {
     // The first slice deliberately enforces one profile for all Desktop
     // windows. Close secondary windows so none remain bound to stale state.
     for (label, window) in app.webview_windows() {
@@ -621,16 +768,12 @@ pub async fn select_instance_profile(
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Main Desktop window is unavailable".to_string())?;
-    if let Err(error) = window.navigate(
-        profile
-            .url
-            .parse()
-            .map_err(|error| format!("Invalid profile URL: {error}"))?,
-    ) {
-        let _ = rollback_selection();
-        return Err(error.to_string());
-    }
-    Ok(())
+    window
+        .navigate(
+            url.parse()
+                .map_err(|error| format!("Invalid profile URL: {error}"))?,
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -682,6 +825,7 @@ pub async fn delete_instance_profile(
 
 #[tauri::command]
 pub async fn login_active_profile(
+    app: AppHandle,
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
 ) -> Result<Option<DesktopTicket>, String> {
@@ -692,6 +836,7 @@ pub async fn login_active_profile(
     let credential_profile = profile.clone();
     if profile.local {
         profile = state.set_local_bootstrap(&bootstrap)?;
+        crate::enable_verified_local_capabilities(&app, &profile.url)?;
     }
     if !bootstrap.authentication_enabled {
         return Ok(None);
@@ -719,7 +864,18 @@ pub async fn get_active_instance_profile(
     // Report only the result of the native comparison.
     let profile = require_active_profile_origin(&state, &webview)?;
     let bootstrap = fetch_bootstrap(&profile.url).await?;
-    let identity_status = profile_identity_status(&profile, &bootstrap.instance_id);
+    let identity_status = match profile.identity_public_key.as_deref() {
+        None => "unpinned",
+        Some(expected)
+            if require_profile_identity(&profile, &bootstrap).is_ok()
+                && verify_bootstrap_identity(&profile.url, &bootstrap, Some(expected))
+                    .await
+                    .is_ok() =>
+        {
+            "matched"
+        }
+        Some(_) => "changed",
+    };
     if require_active_profile_origin(&state, &webview)? != profile {
         return Err("The selected Desktop profile changed while its identity was inspected".into());
     }
@@ -731,6 +887,7 @@ pub async fn get_active_instance_profile(
 
 #[tauri::command]
 pub async fn trust_local_instance_replacement(
+    app: AppHandle,
     webview: tauri::WebviewWindow,
     state: State<'_, ProfileState>,
     instance_id: String,
@@ -746,7 +903,7 @@ pub async fn trust_local_instance_replacement(
     let previous_instance_id = profile.instance_id.as_deref().ok_or_else(|| {
         "The local profile does not have a pinned identity to replace".to_string()
     })?;
-    let bootstrap = fetch_bootstrap(&profile.url).await?;
+    let bootstrap = fetch_verified_bootstrap(&profile.url, None).await?;
     if bootstrap.instance_id != instance_id {
         return Err(
             "The local instance identity changed again before confirmation; reload and try again"
@@ -780,7 +937,8 @@ pub async fn trust_local_instance_replacement(
 
     // Re-read the identity after the operator responds so a process cannot
     // swap the listener while the native confirmation is open.
-    let confirmed_bootstrap = fetch_bootstrap(&profile.url).await?;
+    let confirmed_bootstrap =
+        fetch_verified_bootstrap(&profile.url, Some(&bootstrap.identity_public_key)).await?;
     if confirmed_bootstrap.instance_id != instance_id {
         return Err(
             "The local instance identity changed while confirmation was open; reload and try again"
@@ -794,7 +952,8 @@ pub async fn trust_local_instance_replacement(
     // Desktop sidecar may already have delivered that fresh token while the
     // native confirmation dialog was open.
     preserve_verified_replacement_token_or_forget(&state, &profile, &confirmed_bootstrap).await?;
-    state.replace_local_bootstrap(previous_instance_id, &confirmed_bootstrap)
+    state.replace_local_bootstrap(previous_instance_id, &confirmed_bootstrap)?;
+    crate::enable_verified_local_capabilities(&app, &profile.url)
 }
 
 async fn preserve_verified_replacement_token_or_forget(
@@ -896,30 +1055,32 @@ pub async fn preferred_startup_url(state: &ProfileState) -> String {
     if profile.local {
         return profile.url;
     }
-    let remote_is_usable = match fetch_bootstrap(&profile.url).await {
-        Ok(bootstrap)
-            if profile
-                .instance_id
-                .as_deref()
-                .is_none_or(|expected| expected == bootstrap.instance_id) =>
-        {
-            if bootstrap.authentication_enabled {
-                match (
-                    effective_authentication(&bootstrap),
-                    profile_credential(state, &profile),
-                ) {
-                    (Ok(expected), Ok(credential)) if expected == profile.authentication => {
-                        request_ticket(&profile.url, &credential, &bootstrap.instance_id)
-                            .await
-                            .is_ok()
+    let remote_is_usable = match profile.identity_public_key.as_deref() {
+        Some(expected_identity) => {
+            match fetch_verified_bootstrap(&profile.url, Some(expected_identity)).await {
+                Ok(bootstrap) if profile_identity_matches(&profile, &bootstrap) => {
+                    if bootstrap.authentication_enabled {
+                        match (
+                            effective_authentication(&bootstrap),
+                            profile_credential(state, &profile),
+                        ) {
+                            (Ok(expected), Ok(credential))
+                                if expected == profile.authentication =>
+                            {
+                                request_ticket(&profile.url, &credential, &bootstrap.instance_id)
+                                    .await
+                                    .is_ok()
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        profile.authentication == "none" && profile.confirmed_unauthenticated_remote
                     }
-                    _ => false,
                 }
-            } else {
-                profile.authentication == "none" && profile.confirmed_unauthenticated_remote
+                _ => false,
             }
         }
-        _ => false,
+        None => false,
     };
     if remote_is_usable {
         profile.url
@@ -967,13 +1128,27 @@ async fn require_active_profile_identity_for(
     profile: StoredProfile,
     allow_unpinned_local: bool,
 ) -> Result<(StoredProfile, Bootstrap), String> {
-    if profile.instance_id.is_none() && !(allow_unpinned_local && profile.local) {
+    if (profile.instance_id.is_none() || profile.identity_public_key.is_none())
+        && !(allow_unpinned_local && profile.local)
+    {
         return Err(
             "Desktop has not established this instance identity yet; reconnect before using profile commands"
                 .to_string(),
         );
     }
-    let bootstrap = fetch_matching_bootstrap(&profile).await?;
+    let local_bound_identity = if allow_unpinned_local && profile.local {
+        state.local_bound_identity()?
+    } else {
+        None
+    };
+    let expected_identity = profile
+        .identity_public_key
+        .as_deref()
+        .or(local_bound_identity.as_deref())
+        .ok_or_else(|| {
+            "Desktop has not received a listener-bound identity for this local instance".to_string()
+        })?;
+    let bootstrap = fetch_matching_bootstrap(&profile, expected_identity).await?;
 
     // The bootstrap request yields across the executor. Recheck both the
     // selected profile and page origin afterward so a concurrent switch or
@@ -985,9 +1160,18 @@ async fn require_active_profile_identity_for(
     Ok((profile, bootstrap))
 }
 
-async fn fetch_matching_bootstrap(profile: &StoredProfile) -> Result<Bootstrap, String> {
-    let bootstrap = fetch_bootstrap(&profile.url).await?;
-    require_profile_identity(profile, &bootstrap.instance_id)?;
+async fn fetch_matching_bootstrap(
+    profile: &StoredProfile,
+    expected_identity: &str,
+) -> Result<Bootstrap, String> {
+    let bootstrap = fetch_verified_bootstrap(&profile.url, Some(expected_identity)).await?;
+    if profile.identity_public_key.is_some() {
+        require_profile_identity(profile, &bootstrap)?;
+    } else if profile.instance_id.is_some()
+        && profile.instance_id.as_deref() != Some(bootstrap.instance_id.as_str())
+    {
+        return Err("The local XpressClaw instance identity changed".to_string());
+    }
     Ok(bootstrap)
 }
 
@@ -1001,7 +1185,31 @@ async fn inspect_profile(
 ) -> (String, Option<Bootstrap>) {
     match fetch_bootstrap(&profile.url).await {
         Ok(bootstrap) => {
-            let status = if !profile_identity_matches(profile, &bootstrap.instance_id) {
+            let local_bound_identity = profile
+                .local
+                .then(|| state.local_bound_identity().ok().flatten())
+                .flatten();
+            let expected_identity = profile
+                .identity_public_key
+                .as_deref()
+                .or(local_bound_identity.as_deref());
+            let proof_valid = if let Some(expected) = expected_identity {
+                verify_bootstrap_identity(&profile.url, &bootstrap, Some(expected))
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
+            let metadata_matches = if profile.identity_public_key.is_some() {
+                profile_identity_matches(profile, &bootstrap)
+            } else {
+                profile.local
+                    && profile
+                        .instance_id
+                        .as_deref()
+                        .is_none_or(|expected| expected == bootstrap.instance_id)
+            };
+            let status = if !proof_valid || !metadata_matches {
                 "identity_changed"
             } else if bootstrap.authentication_enabled {
                 match effective_authentication(&bootstrap) {
@@ -1047,23 +1255,24 @@ fn effective_authentication(bootstrap: &Bootstrap) -> Result<&'static str, Strin
     }
 }
 
-fn profile_identity_matches(profile: &StoredProfile, instance_id: &str) -> bool {
-    profile
-        .instance_id
-        .as_deref()
-        .is_none_or(|expected| expected == instance_id)
+fn profile_identity_matches(profile: &StoredProfile, bootstrap: &Bootstrap) -> bool {
+    profile.instance_id.as_deref() == Some(bootstrap.instance_id.as_str())
+        && profile.identity_public_key.as_deref() == Some(bootstrap.identity_public_key.as_str())
 }
 
-fn profile_identity_status(profile: &StoredProfile, instance_id: &str) -> &'static str {
-    match profile.instance_id.as_deref() {
-        None => "unpinned",
-        Some(expected) if expected == instance_id => "matched",
-        Some(_) => "changed",
-    }
+fn local_profile_requires_recovery(
+    profile: &StoredProfile,
+    bootstrap: &Bootstrap,
+    identity_proof_valid: bool,
+) -> bool {
+    profile.local
+        && profile.identity_public_key.is_some()
+        && (!identity_proof_valid
+            || profile.instance_id.as_deref() != Some(bootstrap.instance_id.as_str()))
 }
 
-fn require_profile_identity(profile: &StoredProfile, instance_id: &str) -> Result<(), String> {
-    if profile_identity_matches(profile, instance_id) {
+fn require_profile_identity(profile: &StoredProfile, bootstrap: &Bootstrap) -> Result<(), String> {
+    if profile_identity_matches(profile, bootstrap) {
         return Ok(());
     }
     Err(if profile.local {
@@ -1079,9 +1288,9 @@ fn may_reuse_stored_credential(
     profile: &StoredProfile,
     url: &str,
     authentication: &str,
-    instance_id: &str,
+    bootstrap: &Bootstrap,
 ) -> bool {
-    profile_identity_matches(profile, instance_id)
+    profile_identity_matches(profile, bootstrap)
         && profile.url == url
         && profile.authentication == authentication
 }
@@ -1154,6 +1363,82 @@ async fn fetch_bootstrap(url: &str) -> Result<Bootstrap, String> {
         "The remote address is not a compatible XpressClaw instance",
     )
     .await
+}
+
+fn identity_proof_message(instance_id: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(IDENTITY_PROOF_DOMAIN.len() + instance_id.len() + 1 + challenge.len());
+    message.extend_from_slice(IDENTITY_PROOF_DOMAIN);
+    message.extend_from_slice(instance_id.as_bytes());
+    message.push(0);
+    message.extend_from_slice(challenge);
+    message
+}
+
+fn validate_identity_public_key(value: &str) -> Result<Vec<u8>, String> {
+    let key = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| "The XpressClaw instance returned an invalid identity key".to_string())?;
+    if key.len() != 32 {
+        return Err("The XpressClaw instance returned an invalid identity key".to_string());
+    }
+    Ok(key)
+}
+
+async fn verify_bootstrap_identity(
+    url: &str,
+    bootstrap: &Bootstrap,
+    expected_public_key: Option<&str>,
+) -> Result<(), String> {
+    if expected_public_key.is_some_and(|expected| expected != bootstrap.identity_public_key) {
+        return Err("The XpressClaw instance identity key changed".to_string());
+    }
+    let public_key = validate_identity_public_key(&bootstrap.identity_public_key)?;
+    let mut challenge = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut challenge)
+        .map_err(|_| "Could not create a secure instance identity challenge".to_string())?;
+    let encoded_challenge = URL_SAFE_NO_PAD.encode(challenge);
+    let response = http_client()?
+        .post(format!("{url}/api/auth/identity-proof"))
+        .json(&serde_json::json!({ "challenge": encoded_challenge }))
+        .send()
+        .await
+        .map_err(|error| format!("Could not verify the XpressClaw instance identity: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "The XpressClaw instance identity proof failed with {}",
+            response.status()
+        ));
+    }
+    let proof: IdentityProof = read_bounded_json(
+        response,
+        "The XpressClaw instance returned an invalid identity proof",
+    )
+    .await?;
+    if proof.instance_id != bootstrap.instance_id
+        || proof.identity_public_key != bootstrap.identity_public_key
+    {
+        return Err("The XpressClaw instance identity changed during verification".to_string());
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(proof.signature)
+        .map_err(|_| "The XpressClaw instance returned an invalid identity proof".to_string())?;
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(
+            &identity_proof_message(&bootstrap.instance_id, &challenge),
+            &signature,
+        )
+        .map_err(|_| "The XpressClaw instance could not prove its saved identity".to_string())
+}
+
+async fn fetch_verified_bootstrap(
+    url: &str,
+    expected_public_key: Option<&str>,
+) -> Result<Bootstrap, String> {
+    let bootstrap = fetch_bootstrap(url).await?;
+    verify_bootstrap_identity(url, &bootstrap, expected_public_key).await?;
+    Ok(bootstrap)
 }
 
 async fn require_pending_password_configuration(
@@ -1338,6 +1623,125 @@ fn persist_file(path: &Path, file: &ProfileFile) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::io::{Read, Write};
+
+    struct TestIdentity {
+        instance_id: String,
+        key_pair: Ed25519KeyPair,
+    }
+
+    impl TestIdentity {
+        fn new(instance_id: impl Into<String>) -> Self {
+            let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+            Self {
+                instance_id: instance_id.into(),
+                key_pair: Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
+            }
+        }
+
+        fn public_key(&self) -> String {
+            URL_SAFE_NO_PAD.encode(self.key_pair.public_key().as_ref())
+        }
+
+        fn bootstrap(&self, authentication_enabled: bool, credential_kind: &str) -> Bootstrap {
+            Bootstrap {
+                instance_id: self.instance_id.clone(),
+                identity_public_key: self.public_key(),
+                authentication_enabled,
+                credential_kind: credential_kind.to_string(),
+            }
+        }
+
+        fn bootstrap_json(&self, authentication_enabled: bool, credential_kind: &str) -> String {
+            serde_json::json!({
+                "instance_id": self.instance_id,
+                "identity_public_key": self.public_key(),
+                "authentication_enabled": authentication_enabled,
+                "credential_kind": credential_kind,
+            })
+            .to_string()
+        }
+
+        fn proof_json(&self, request: &str) -> String {
+            let (_, body) = request
+                .split_once("\r\n\r\n")
+                .expect("identity proof request has a body");
+            let request: serde_json::Value = serde_json::from_str(body).unwrap();
+            let challenge = URL_SAFE_NO_PAD
+                .decode(request["challenge"].as_str().unwrap())
+                .unwrap();
+            serde_json::json!({
+                "instance_id": self.instance_id,
+                "identity_public_key": self.public_key(),
+                "signature": URL_SAFE_NO_PAD.encode(
+                    self.key_pair
+                        .sign(&identity_proof_message(&self.instance_id, &challenge))
+                        .as_ref(),
+                ),
+            })
+            .to_string()
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(750)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "HTTP client closed an incomplete request");
+            request.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                request.truncate(header_end + content_length);
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn respond_json(stream: &mut std::net::TcpStream, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
+
+    fn serve_bootstrap_and_proof(
+        listener: std::net::TcpListener,
+        identity: TestIdentity,
+        authentication_enabled: bool,
+        credential_kind: &str,
+    ) {
+        let (mut bootstrap_stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut bootstrap_stream);
+        assert!(request.starts_with("GET /api/auth/bootstrap HTTP/1.1"));
+        respond_json(
+            &mut bootstrap_stream,
+            &identity.bootstrap_json(authentication_enabled, credential_kind),
+        );
+
+        let (mut proof_stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut proof_stream);
+        assert!(request.starts_with("POST /api/auth/identity-proof HTTP/1.1"));
+        respond_json(&mut proof_stream, &identity.proof_json(&request));
+    }
 
     #[test]
     fn profile_urls_are_origin_only_and_never_contain_credentials() {
@@ -1354,12 +1758,14 @@ mod tests {
     fn persisted_profiles_contain_no_credential_field() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("profiles.json");
+        let public_identity = TestIdentity::new("identity").public_key();
         let file = ProfileFile {
             profiles: vec![StoredProfile {
                 id: "remote".into(),
                 name: "Remote".into(),
                 url: "http://host:8935".into(),
                 instance_id: Some("identity".into()),
+                identity_public_key: Some(public_identity.clone()),
                 authentication: "password".into(),
                 local: false,
                 confirmed_unauthenticated_remote: false,
@@ -1370,6 +1776,8 @@ mod tests {
         let stored = std::fs::read_to_string(path).unwrap();
         assert!(!stored.contains("credential"));
         assert!(!stored.contains("password_hash"));
+        assert!(!stored.contains("private_key"));
+        assert!(stored.contains(&public_identity));
     }
 
     #[test]
@@ -1384,6 +1792,7 @@ mod tests {
                     name: "Local XpressClaw".into(),
                     url: "http://localhost:8935".into(),
                     instance_id: Some("local-instance".into()),
+                    identity_public_key: None,
                     authentication: "none".into(),
                     local: true,
                     confirmed_unauthenticated_remote: true,
@@ -1393,6 +1802,7 @@ mod tests {
                     name: "Remote".into(),
                     url: "https://remote.example".into(),
                     instance_id: Some("remote-instance".into()),
+                    identity_public_key: None,
                     authentication: "password".into(),
                     local: false,
                     confirmed_unauthenticated_remote: false,
@@ -1406,6 +1816,57 @@ mod tests {
             file: Mutex::new(file),
             mutation_lock: tokio::sync::Mutex::new(()),
             local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+
+        assert_eq!(state.select_local().unwrap(), "http://localhost:8935");
+        assert_eq!(state.active().unwrap().id, LOCAL_PROFILE_ID);
+        let persisted: ProfileFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(persisted.active_profile_id, LOCAL_PROFILE_ID);
+    }
+
+    #[test]
+    fn remote_selection_can_enter_credential_free_local_recovery() {
+        let local_identity = TestIdentity::new("trusted-local");
+        let replacement = TestIdentity::new("replacement-local").bootstrap(false, "disabled");
+        let local = StoredProfile {
+            id: LOCAL_PROFILE_ID.into(),
+            name: "Local XpressClaw".into(),
+            url: "http://localhost:8935".into(),
+            instance_id: Some("trusted-local".into()),
+            identity_public_key: Some(local_identity.public_key()),
+            authentication: "password".into(),
+            local: true,
+            confirmed_unauthenticated_remote: true,
+        };
+        assert!(local_profile_requires_recovery(&local, &replacement, false));
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("profiles.json");
+        let state = ProfileState {
+            path: path.clone(),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: "remote".into(),
+                profiles: vec![
+                    local,
+                    StoredProfile {
+                        id: "remote".into(),
+                        name: "Remote".into(),
+                        url: "https://remote.example".into(),
+                        instance_id: Some("remote-instance".into()),
+                        identity_public_key: Some(
+                            TestIdentity::new("remote-instance").public_key(),
+                        ),
+                        authentication: "password".into(),
+                        local: false,
+                        confirmed_unauthenticated_remote: false,
+                    },
+                ],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
         };
 
         assert_eq!(state.select_local().unwrap(), "http://localhost:8935");
@@ -1418,6 +1879,7 @@ mod tests {
     fn bootstrap_mode_must_be_supported_and_exact() {
         let bootstrap = |enabled, kind: &str| Bootstrap {
             instance_id: "instance".into(),
+            identity_public_key: TestIdentity::new("instance").public_key(),
             authentication_enabled: enabled,
             credential_kind: kind.into(),
         };
@@ -1435,6 +1897,219 @@ mod tests {
         );
         assert!(effective_authentication(&bootstrap(true, "restart_required")).is_err());
         assert!(effective_authentication(&bootstrap(true, "future_mode")).is_err());
+    }
+
+    #[tokio::test]
+    async fn signed_instance_identity_accepts_a_fresh_challenge() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("signed-instance");
+        let expected_public_key = identity.public_key();
+        let server = std::thread::spawn(move || {
+            serve_bootstrap_and_proof(listener, identity, false, "disabled")
+        });
+
+        let bootstrap =
+            fetch_verified_bootstrap(&format!("http://{address}"), Some(&expected_public_key))
+                .await
+                .unwrap();
+        server.join().unwrap();
+        assert_eq!(bootstrap.instance_id, "signed-instance");
+    }
+
+    #[tokio::test]
+    async fn recorded_identity_proof_cannot_be_replayed_for_a_new_challenge() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("signed-instance");
+        let expected_public_key = identity.public_key();
+        let proof_public_key = expected_public_key.clone();
+        let bootstrap = identity.bootstrap_json(false, "disabled");
+        let recorded_signature = URL_SAFE_NO_PAD.encode(
+            identity
+                .key_pair
+                .sign(&identity_proof_message("signed-instance", &[7_u8; 32]))
+                .as_ref(),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut bootstrap_stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut bootstrap_stream);
+            assert!(request.starts_with("GET /api/auth/bootstrap HTTP/1.1"));
+            respond_json(&mut bootstrap_stream, &bootstrap);
+
+            let (mut proof_stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut proof_stream);
+            assert!(request.starts_with("POST /api/auth/identity-proof HTTP/1.1"));
+            respond_json(
+                &mut proof_stream,
+                &serde_json::json!({
+                    "instance_id": "signed-instance",
+                    "identity_public_key": proof_public_key,
+                    "signature": recorded_signature,
+                })
+                .to_string(),
+            );
+        });
+
+        let error =
+            fetch_verified_bootstrap(&format!("http://{address}"), Some(&expected_public_key))
+                .await
+                .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("could not prove its saved identity"));
+    }
+
+    #[tokio::test]
+    async fn startup_falls_back_before_using_a_replayed_remote_identity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("recorded-remote");
+        let expected_public_key = identity.public_key();
+        let proof_public_key = expected_public_key.clone();
+        let bootstrap = identity.bootstrap_json(false, "disabled");
+        let recorded_signature = URL_SAFE_NO_PAD.encode(
+            identity
+                .key_pair
+                .sign(&identity_proof_message("recorded-remote", &[9_u8; 32]))
+                .as_ref(),
+        );
+        let server = std::thread::spawn(move || {
+            let (mut bootstrap_stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut bootstrap_stream);
+            assert!(request.starts_with("GET /api/auth/bootstrap HTTP/1.1"));
+            respond_json(&mut bootstrap_stream, &bootstrap);
+
+            let (mut proof_stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut proof_stream);
+            assert!(request.starts_with("POST /api/auth/identity-proof HTTP/1.1"));
+            respond_json(
+                &mut proof_stream,
+                &serde_json::json!({
+                    "instance_id": "recorded-remote",
+                    "identity_public_key": proof_public_key,
+                    "signature": recorded_signature,
+                })
+                .to_string(),
+            );
+        });
+
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                active_profile_id: "remote".into(),
+                profiles: vec![
+                    StoredProfile {
+                        id: LOCAL_PROFILE_ID.into(),
+                        name: "Local XpressClaw".into(),
+                        url: "http://localhost:8935".into(),
+                        instance_id: None,
+                        identity_public_key: None,
+                        authentication: "none".into(),
+                        local: true,
+                        confirmed_unauthenticated_remote: true,
+                    },
+                    StoredProfile {
+                        id: "remote".into(),
+                        name: "Remote".into(),
+                        url: format!("http://{address}"),
+                        instance_id: Some("recorded-remote".into()),
+                        identity_public_key: Some(expected_public_key),
+                        authentication: "none".into(),
+                        local: false,
+                        confirmed_unauthenticated_remote: true,
+                    },
+                ],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+
+        assert_eq!(preferred_startup_url(&state).await, "http://localhost:8935");
+        server.join().unwrap();
+        assert!(state.active().unwrap().local);
+    }
+
+    #[tokio::test]
+    async fn saved_local_pin_authenticates_an_already_running_sidecar() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("managed-local");
+        let expected_public_key = identity.public_key();
+        let server = std::thread::spawn(move || {
+            serve_bootstrap_and_proof(listener, identity, false, "disabled")
+        });
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                profiles: vec![StoredProfile {
+                    id: LOCAL_PROFILE_ID.into(),
+                    name: "Local XpressClaw".into(),
+                    url: format!("http://{address}"),
+                    instance_id: Some("managed-local".into()),
+                    identity_public_key: Some(expected_public_key),
+                    authentication: "none".into(),
+                    local: true,
+                    confirmed_unauthenticated_remote: true,
+                }],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+
+        assert_eq!(
+            verify_managed_local_instance(&state).await.unwrap(),
+            format!("http://{address}")
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_local_pairing_requires_the_listener_bound_child_identity() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let identity = TestIdentity::new("first-managed-local");
+        let expected_public_key = identity.public_key();
+        let server = std::thread::spawn(move || {
+            serve_bootstrap_and_proof(listener, identity, false, "disabled")
+        });
+        let root = tempfile::tempdir().unwrap();
+        let state = ProfileState {
+            path: root.path().join("profiles.json"),
+            file: Mutex::new(ProfileFile {
+                profiles: vec![StoredProfile {
+                    id: LOCAL_PROFILE_ID.into(),
+                    name: "Local XpressClaw".into(),
+                    url: format!("http://{address}"),
+                    instance_id: None,
+                    identity_public_key: None,
+                    authentication: "none".into(),
+                    local: true,
+                    confirmed_unauthenticated_remote: true,
+                }],
+                ..ProfileFile::default()
+            }),
+            mutation_lock: tokio::sync::Mutex::new(()),
+            local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
+        };
+        state
+            .remember_local_bound_identity(&expected_public_key)
+            .unwrap();
+
+        verify_managed_local_instance(&state).await.unwrap();
+        server.join().unwrap();
+        let local = state.active().unwrap();
+        assert_eq!(local.instance_id.as_deref(), Some("first-managed-local"));
+        assert_eq!(
+            local.identity_public_key.as_deref(),
+            Some(expected_public_key.as_str())
+        );
     }
 
     #[test]
@@ -1495,11 +2170,14 @@ mod tests {
 
     #[test]
     fn saved_credentials_are_reused_only_for_the_exact_pinned_profile() {
+        let identity = TestIdentity::new("instance-a");
+        let bootstrap = identity.bootstrap(true, "password");
         let profile = StoredProfile {
             id: "remote".into(),
             name: "Remote".into(),
             url: "https://remote.example".into(),
             instance_id: Some("instance-a".into()),
+            identity_public_key: Some(identity.public_key()),
             authentication: "password".into(),
             local: false,
             confirmed_unauthenticated_remote: false,
@@ -1508,44 +2186,48 @@ mod tests {
             &profile,
             "https://remote.example",
             "password",
-            "instance-a"
+            &bootstrap
         ));
         assert!(!may_reuse_stored_credential(
             &profile,
             "https://attacker.example",
             "password",
-            "instance-a"
+            &bootstrap
         ));
         assert!(!may_reuse_stored_credential(
             &profile,
             "https://remote.example",
             "startup_token",
-            "instance-a"
+            &bootstrap
         ));
+        let replacement = TestIdentity::new("instance-b").bootstrap(true, "password");
         assert!(!may_reuse_stored_credential(
             &profile,
             "https://remote.example",
             "password",
-            "instance-b"
+            &replacement
         ));
     }
 
     #[test]
     fn active_profile_identity_reports_only_native_comparison_status() {
+        let identity = TestIdentity::new("native-secret-pin");
+        let bootstrap = identity.bootstrap(true, "password");
         let profile = StoredProfile {
             id: "remote".into(),
             name: "Remote".into(),
             url: "https://remote.example".into(),
             instance_id: Some("native-secret-pin".into()),
+            identity_public_key: Some(identity.public_key()),
             authentication: "password".into(),
             local: false,
             confirmed_unauthenticated_remote: false,
         };
-        assert_eq!(
-            profile_identity_status(&profile, "native-secret-pin"),
-            "matched"
-        );
-        assert_eq!(profile_identity_status(&profile, "replacement"), "changed");
+        assert!(profile_identity_matches(&profile, &bootstrap));
+        assert!(!profile_identity_matches(
+            &profile,
+            &TestIdentity::new("replacement").bootstrap(true, "password")
+        ));
 
         let response = serde_json::to_string(&ActiveProfileIdentity {
             identity_status: "changed",
@@ -1559,6 +2241,7 @@ mod tests {
 
     #[test]
     fn local_identity_pin_cannot_be_replaced_by_passive_discovery() {
+        let trusted = TestIdentity::new("trusted-local-instance");
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("profiles.json");
         let file = ProfileFile {
@@ -1568,6 +2251,7 @@ mod tests {
                 name: "Local XpressClaw".into(),
                 url: "http://localhost:8935".into(),
                 instance_id: Some("trusted-local-instance".into()),
+                identity_public_key: Some(trusted.public_key()),
                 authentication: "password".into(),
                 local: true,
                 confirmed_unauthenticated_remote: true,
@@ -1580,12 +2264,10 @@ mod tests {
             file: Mutex::new(file),
             mutation_lock: tokio::sync::Mutex::new(()),
             local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
         };
-        let replacement = Bootstrap {
-            instance_id: "replacement-local-instance".into(),
-            authentication_enabled: true,
-            credential_kind: "startup_token".into(),
-        };
+        let replacement =
+            TestIdentity::new("replacement-local-instance").bootstrap(true, "startup_token");
 
         let error = state.set_local_bootstrap(&replacement).unwrap_err();
         assert!(error.contains("Explicitly trust the replacement"));
@@ -1612,12 +2294,14 @@ mod tests {
             file: Mutex::new(ProfileFile::default()),
             mutation_lock: tokio::sync::Mutex::new(()),
             local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
         };
         let profile = StoredProfile {
             id: LOCAL_PROFILE_ID.into(),
             name: "Local XpressClaw".into(),
             url: "http://localhost:8935".into(),
             instance_id: None,
+            identity_public_key: None,
             authentication: "password".into(),
             local: true,
             confirmed_unauthenticated_remote: true,
@@ -1701,6 +2385,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let trusted_identity = TestIdentity::new("instance");
+        let replacement_identity = TestIdentity::new("replacement-instance");
+        let replacement_bootstrap = replacement_identity.bootstrap_json(true, "startup_token");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let observed = requests.clone();
         let server = std::thread::spawn(move || {
@@ -1718,7 +2405,7 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push(request.lines().next().unwrap_or_default().to_string());
-                        let body = r#"{"instance_id":"replacement-instance","authentication_enabled":true,"credential_kind":"startup_token"}"#;
+                        let body = &replacement_bootstrap;
                         write!(
                             stream,
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1742,12 +2429,14 @@ mod tests {
             local_ephemeral_credential: Mutex::new(Some(Zeroizing::new(
                 "saved-token-that-may-have-gone-stale".to_string(),
             ))),
+            local_bound_identity: Mutex::new(None),
         };
         let profile = StoredProfile {
             id: LOCAL_PROFILE_ID.to_string(),
             name: "Local XpressClaw".to_string(),
             url: format!("http://{address}"),
             instance_id: Some("instance".to_string()),
+            identity_public_key: Some(trusted_identity.public_key()),
             authentication: "startup_token".to_string(),
             local: true,
             confirmed_unauthenticated_remote: true,
@@ -1764,46 +2453,38 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_no_auth_profile_rejects_a_same_url_replacement() {
-        use std::io::{Read, Write};
-
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let trusted_identity = TestIdentity::new("trusted-instance");
+        let replacement_identity = TestIdentity::new("replacement-instance");
+        let replacement_bootstrap = replacement_identity.bootstrap_json(false, "disabled");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_millis(500)))
-                .unwrap();
-            let mut request = [0_u8; 2048];
-            let read = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..read])
-                .starts_with("GET /api/auth/bootstrap HTTP/1.1"));
-            let body = r#"{"instance_id":"replacement-instance","authentication_enabled":false,"credential_kind":"disabled"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("GET /api/auth/bootstrap HTTP/1.1"));
+            respond_json(&mut stream, &replacement_bootstrap);
         });
         let profile = StoredProfile {
             id: "remote".to_string(),
             name: "Remote".to_string(),
             url: format!("http://{address}"),
             instance_id: Some("trusted-instance".to_string()),
+            identity_public_key: Some(trusted_identity.public_key()),
             authentication: "none".to_string(),
             local: false,
             confirmed_unauthenticated_remote: true,
         };
 
-        let error = fetch_matching_bootstrap(&profile).await.unwrap_err();
+        let error =
+            fetch_matching_bootstrap(&profile, profile.identity_public_key.as_deref().unwrap())
+                .await
+                .unwrap_err();
         server.join().unwrap();
-        assert!(error.contains("identity at this address changed"));
+        assert!(error.contains("identity key changed"));
     }
 
     #[tokio::test]
     async fn trusting_a_replacement_preserves_its_verified_sidecar_token() {
-        use std::io::{Read, Write};
-
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1831,6 +2512,7 @@ mod tests {
             name: "Local XpressClaw".to_string(),
             url: format!("http://{address}"),
             instance_id: Some("previous-instance".to_string()),
+            identity_public_key: Some(TestIdentity::new("previous-instance").public_key()),
             authentication: "startup_token".to_string(),
             local: true,
             confirmed_unauthenticated_remote: true,
@@ -1846,12 +2528,9 @@ mod tests {
             local_ephemeral_credential: Mutex::new(Some(Zeroizing::new(
                 "fresh-sidecar-token".to_string(),
             ))),
+            local_bound_identity: Mutex::new(None),
         };
-        let bootstrap = Bootstrap {
-            instance_id: "replacement-instance".to_string(),
-            authentication_enabled: true,
-            credential_kind: "startup_token".to_string(),
-        };
+        let bootstrap = TestIdentity::new("replacement-instance").bootstrap(true, "startup_token");
 
         assert!(
             preserve_verified_replacement_token_or_forget(&state, &profile, &bootstrap)
@@ -1876,7 +2555,6 @@ mod tests {
 
     #[tokio::test]
     async fn profile_inspections_are_concurrent_but_bounded_and_keep_order() {
-        use std::io::{Read, Write};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::time::{Duration, Instant};
@@ -1890,6 +2568,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
+            let identity = TestIdentity::new(format!("instance-{index}"));
+            let identity_public_key = identity.public_key();
             let active_requests = active_requests.clone();
             let maximum_requests = maximum_requests.clone();
             servers.push(std::thread::spawn(move || {
@@ -1907,11 +2587,8 @@ mod tests {
                         Err(error) => panic!("profile listener failed: {error}"),
                     }
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .unwrap();
-                let mut request = [0_u8; 2048];
-                let _ = stream.read(&mut request).unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(request.starts_with("GET /api/auth/bootstrap HTTP/1.1"));
 
                 let current = active_requests.fetch_add(1, Ordering::SeqCst) + 1;
                 maximum_requests.fetch_max(current, Ordering::SeqCst);
@@ -1922,22 +2599,21 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(5));
                 }
 
-                let body = format!(
-                    r#"{{"instance_id":"instance-{index}","authentication_enabled":false,"credential_kind":"disabled"}}"#
-                );
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
+                respond_json(&mut stream, &identity.bootstrap_json(false, "disabled"));
                 active_requests.fetch_sub(1, Ordering::SeqCst);
+
+                listener.set_nonblocking(false).unwrap();
+                let (mut proof_stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut proof_stream);
+                assert!(request.starts_with("POST /api/auth/identity-proof HTTP/1.1"));
+                respond_json(&mut proof_stream, &identity.proof_json(&request));
             }));
             profiles.push(StoredProfile {
                 id: format!("profile-{index}"),
                 name: format!("Profile {index}"),
                 url: format!("http://{address}"),
                 instance_id: Some(format!("instance-{index}")),
+                identity_public_key: Some(identity_public_key),
                 authentication: "none".to_string(),
                 local: false,
                 confirmed_unauthenticated_remote: true,
@@ -1950,6 +2626,7 @@ mod tests {
             file: Mutex::new(ProfileFile::default()),
             mutation_lock: tokio::sync::Mutex::new(()),
             local_ephemeral_credential: Mutex::new(None),
+            local_bound_identity: Mutex::new(None),
         };
         let inspected = inspect_instance_profiles(&state, profiles, "profile-3")
             .await

@@ -26,6 +26,8 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 tempfile = "3"
 futures-util = { workspace = true }
+base64 = { workspace = true }
+ring = { workspace = true }
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"

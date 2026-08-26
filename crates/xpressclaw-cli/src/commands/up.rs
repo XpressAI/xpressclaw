@@ -102,6 +102,9 @@ async fn run_foreground(
         None => (None, None),
     };
     let state = build_state(instance, effective.clone(), supplied_startup_token).await?;
+    let desktop_identity = (std::env::var_os("XPRESSCLAW_DESKTOP_HANDSHAKE").as_deref()
+        == Some(std::ffi::OsStr::new("1")))
+    .then(|| state.auth.identity_public_key());
     let startup_token_in_use = matches!(
         state.auth.credential_kind(),
         xpressclaw_server::auth::CredentialKind::StartupToken
@@ -136,6 +139,9 @@ async fn run_foreground(
     server::serve_on_with_bound_callback(state, effective.bind, effective.port, move || {
         if let Some((ready_port, ready_nonce)) = readiness {
             announce_detached_ready(ready_port, &ready_nonce, startup_token_in_use)?;
+        }
+        if let Some(identity) = desktop_identity {
+            print_desktop_identity(&identity)?;
         }
         if let Some(token) = startup_token {
             print_startup_token(&token)?;
@@ -519,6 +525,19 @@ fn read_detached_launcher_input() -> anyhow::Result<DetachedLauncherInput> {
         ready_port: parsed.ready_port,
         ready_nonce: Zeroizing::new(std::mem::take(&mut parsed.ready_nonce)),
     })
+}
+
+fn print_desktop_identity(identity: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(
+        output,
+        "{}{identity}",
+        xpressclaw_server::auth::INSTANCE_IDENTITY_PREFIX
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
 fn print_startup_token(token: &str) -> anyhow::Result<()> {
