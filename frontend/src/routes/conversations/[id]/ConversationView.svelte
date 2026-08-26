@@ -209,6 +209,11 @@
 	function connectEvents() {
 		eventSource = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/events`);
 		eventSource.onmessage = () => void refreshActivity().then(() => scrollToLatest());
+		eventSource.onerror = () => {
+			// EventSource hides the handshake status. Probe one protected route so
+			// the shared API client can route an expired session to login.
+			void conversations.get(conversationId).catch(() => undefined);
+		};
 	}
 
 	async function scrollToLatest(behavior: ScrollBehavior = 'smooth') {

@@ -1,27 +1,34 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use xpressclaw_core::agents::registry::AgentRegistry;
+use xpressclaw_core::config::InstanceConfig;
 use xpressclaw_core::config::{self, Config};
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::sessions::SessionManager;
 use xpressclaw_server::server;
 use xpressclaw_server::state::AppState;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::instance::{self, Instance, InstanceSource};
 
 pub async fn run(
     detach: bool,
-    port: u16,
+    port: Option<u16>,
     instance_dir: Option<PathBuf>,
     workdir: Option<PathBuf>,
-    bind: IpAddr,
+    bind: Option<IpAddr>,
     allow_insecure_remote: bool,
+    startup_token_stdin: bool,
 ) -> anyhow::Result<()> {
-    validate_bind(bind, allow_insecure_remote)?;
+    if detach && startup_token_stdin {
+        anyhow::bail!("--startup-token-stdin is an internal launcher option and cannot be combined with --detach");
+    }
     if workdir.is_some() {
         eprintln!("warning: --workdir is deprecated; use --instance instead");
     }
@@ -33,17 +40,76 @@ pub async fn run(
         );
     }
 
+    let configured = load_instance_config(&selected)?;
+    let effective =
+        resolve_instance_config(&configured.instance, bind, port, allow_insecure_remote)?;
+    let launcher_input = if startup_token_stdin {
+        Some(read_detached_launcher_input()?)
+    } else {
+        None
+    };
+
     if detach {
-        return run_detached(port, bind, allow_insecure_remote, &selected);
+        return run_detached(&effective, &selected);
     }
 
-    run_foreground(port, bind, &selected).await
+    run_foreground(effective, &selected, launcher_input).await
+}
+
+struct DetachedLauncherInput {
+    startup_token: Zeroizing<String>,
+    ready_port: u16,
+    ready_nonce: Zeroizing<String>,
+}
+
+#[derive(Deserialize)]
+struct RawDetachedLauncherInput {
+    startup_token: String,
+    ready_port: u16,
+    ready_nonce: String,
+}
+
+#[derive(Serialize)]
+struct DetachedLauncherPayload<'a> {
+    startup_token: &'a str,
+    ready_port: u16,
+    ready_nonce: &'a str,
+}
+
+#[derive(Serialize)]
+struct DetachedReadyAnnouncement<'a> {
+    nonce: &'a str,
+    startup_token_in_use: bool,
+}
+
+#[derive(Deserialize)]
+struct RawDetachedReadyAnnouncement {
+    nonce: String,
+    startup_token_in_use: bool,
 }
 
 /// Run the server in the foreground (default).
-async fn run_foreground(port: u16, bind: IpAddr, instance: &Instance) -> anyhow::Result<()> {
-    let state = build_state(instance).await?;
-    let ui_url = ui_url(bind, port);
+async fn run_foreground(
+    effective: InstanceConfig,
+    instance: &Instance,
+    launcher_input: Option<DetachedLauncherInput>,
+) -> anyhow::Result<()> {
+    let (supplied_startup_token, readiness) = match launcher_input {
+        Some(input) => (
+            Some(input.startup_token),
+            Some((input.ready_port, input.ready_nonce)),
+        ),
+        None => (None, None),
+    };
+    let state = build_state(instance, effective.clone(), supplied_startup_token).await?;
+    let desktop_identity = (std::env::var_os("XPRESSCLAW_DESKTOP_HANDSHAKE").as_deref()
+        == Some(std::ffi::OsStr::new("1")))
+    .then(|| state.auth.identity_public_key());
+    let startup_token_in_use = matches!(
+        state.auth.credential_kind(),
+        xpressclaw_server::auth::CredentialKind::StartupToken
+    );
+    let ui_url = ui_url(effective.bind, effective.port);
 
     if !state.is_setup_complete() {
         println!("XpressClaw is starting its control plane...");
@@ -69,7 +135,20 @@ async fn run_foreground(port: u16, bind: IpAddr, instance: &Instance) -> anyhow:
         println!("Press Ctrl+C to stop.");
     }
 
-    server::serve_on(state, bind, port).await?;
+    let startup_token = state.auth.take_startup_token_announcement();
+    server::serve_on_with_bound_callback(state, effective.bind, effective.port, move || {
+        if let Some((ready_port, ready_nonce)) = readiness {
+            announce_detached_ready(ready_port, &ready_nonce, startup_token_in_use)?;
+        }
+        if let Some(identity) = desktop_identity {
+            print_desktop_identity(&identity)?;
+        }
+        if let Some(token) = startup_token {
+            print_startup_token(&token)?;
+        }
+        Ok(())
+    })
+    .await?;
 
     Ok(())
 }
@@ -78,19 +157,15 @@ async fn run_foreground(port: u16, bind: IpAddr, instance: &Instance) -> anyhow:
 ///
 /// Re-executes `xpressclaw up` (without --detach) in a new process,
 /// redirecting stdout/stderr to a log file.
-fn run_detached(
-    port: u16,
-    bind: IpAddr,
-    allow_insecure_remote: bool,
-    instance: &Instance,
-) -> anyhow::Result<()> {
+fn run_detached(effective: &InstanceConfig, instance: &Instance) -> anyhow::Result<()> {
     use std::fs::File;
+    use std::io::Write;
     use std::process::Command;
 
     std::fs::create_dir_all(&instance.root)?;
     let log_path = instance.root.join("server.log");
     let pid_path = instance.root.join("server.pid");
-    let ui_url = ui_url(bind, port);
+    let ui_url = ui_url(effective.bind, effective.port);
 
     // Check if already running
     if pid_path.exists() {
@@ -115,25 +190,75 @@ fn run_detached(
     let log_file = File::create(&log_path)?;
     let err_file = log_file.try_clone()?;
 
+    let ready_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    ready_listener.set_nonblocking(true)?;
+    let ready_port = ready_listener.local_addr()?.port();
+    let ready_nonce = xpressclaw_server::auth::generate_startup_token()?;
+
     let mut command = Command::new(exe);
     command
         .arg("up")
-        .args(["--port", &port.to_string()])
-        .args(["--bind", &bind.to_string()])
+        .args(["--port", &effective.port.to_string()])
+        .args(["--bind", &effective.bind.to_string()])
         .arg("--instance")
-        .arg(&instance.root);
-    if allow_insecure_remote {
+        .arg(&instance.root)
+        .arg("--startup-token-stdin")
+        .stdin(std::process::Stdio::piped());
+    if !effective.bind.is_loopback() && !effective.authentication_enabled {
         command.arg("--allow-insecure-remote");
     }
-    let child = command
-        .stdout(log_file)
-        .stderr(err_file)
-        .stdin(std::process::Stdio::null())
-        .spawn()?;
+    // Always supply a candidate token. The child ignores it when auth is off
+    // or a password verifier exists, and reports the effective credential mode
+    // in its authenticated readiness response. This keeps a concurrent config
+    // change from generating a token in the child log or exposing an unused
+    // token from the parent.
+    let startup_token = xpressclaw_server::auth::generate_startup_token()?;
+    let mut child = command.stdout(log_file).stderr(err_file).spawn()?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("detached child did not expose its launcher pipe"))
+        .and_then(|mut stdin| {
+            serde_json::to_writer(
+                &mut stdin,
+                &DetachedLauncherPayload {
+                    startup_token: startup_token.as_str(),
+                    ready_port,
+                    ready_nonce: &ready_nonce,
+                },
+            )?;
+            writeln!(stdin)?;
+            Ok(())
+        });
+    if let Err(error) = write_result {
+        terminate_child(&mut child);
+        return Err(error);
+    }
 
     let pid = child.id();
-    std::fs::write(&pid_path, pid.to_string())?;
+    let startup_token_in_use =
+        match wait_for_detached_ready(&mut child, &ready_listener, &ready_nonce, &log_path) {
+            Ok(startup_token_in_use) => startup_token_in_use,
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = std::fs::remove_file(&pid_path);
+                return Err(error);
+            }
+        };
+    if let Err(error) = std::fs::write(&pid_path, pid.to_string()) {
+        terminate_child(&mut child);
+        return Err(error.into());
+    }
 
+    if startup_token_in_use {
+        let token = startup_token;
+        if let Err(error) = print_startup_token(&token) {
+            terminate_child(&mut child);
+            let _ = std::fs::remove_file(&pid_path);
+            return Err(error);
+        }
+    }
     println!("xpressclaw started in background (pid {pid}).");
     println!("  Instance: {}", instance.root.display());
     println!("  Web UI:   {ui_url}");
@@ -152,8 +277,90 @@ fn run_detached(
     Ok(())
 }
 
+fn wait_for_detached_ready(
+    child: &mut std::process::Child,
+    listener: &std::net::TcpListener,
+    expected_nonce: &str,
+    log_path: &std::path::Path,
+) -> anyhow::Result<bool> {
+    use std::io::Read;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "detached XpressClaw exited with {status} before owning its listeners; see {}",
+                log_path.display()
+            );
+        }
+
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+                let mut announcement = String::new();
+                if stream.take(1025).read_to_string(&mut announcement).is_ok() {
+                    let parsed =
+                        serde_json::from_str::<RawDetachedReadyAnnouncement>(announcement.trim());
+                    announcement.zeroize();
+                    if let Ok(mut parsed) = parsed {
+                        let nonce_matches = parsed.nonce == expected_nonce;
+                        parsed.nonce.zeroize();
+                        if nonce_matches {
+                            return Ok(parsed.startup_token_in_use);
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "detached XpressClaw did not own its listeners within 10 seconds; see {}",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn announce_detached_ready(
+    port: u16,
+    nonce: &str,
+    startup_token_in_use: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let address = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+    let mut stream = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    serde_json::to_writer(
+        &mut stream,
+        &DetachedReadyAnnouncement {
+            nonce,
+            startup_token_in_use,
+        },
+    )?;
+    writeln!(stream)?;
+    stream.flush()?;
+    Ok(())
+}
+
 /// Build the AppState (shared between foreground and detached modes).
-async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
+async fn build_state(
+    instance: &Instance,
+    effective: InstanceConfig,
+    supplied_startup_token: Option<Zeroizing<String>>,
+) -> anyhow::Result<AppState> {
     std::fs::create_dir_all(&instance.root)?;
     let config_path = instance.config_path();
 
@@ -168,13 +375,15 @@ async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
         std::fs::create_dir_all(&config.system.workspace_dir)?;
         let db = Arc::new(Database::open(&db_path)?);
 
-        return Ok(AppState::new(
+        return AppState::new_with_instance(
             Arc::new(config),
             db,
             None,
             config_path,
             false,
-        ));
+            effective,
+            supplied_startup_token,
+        );
     }
 
     // Load config from the resolved path
@@ -232,13 +441,15 @@ async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
         LlmRouter::build_from_config(&config)
     };
 
-    let state = AppState::new(
+    let state = AppState::new_with_instance(
         config,
         db,
         Some(Arc::new(llm_router)),
         config_path,
         setup_complete,
-    );
+        effective,
+        supplied_startup_token,
+    )?;
 
     // No worker startup here. The server dispatches queued work into isolated,
     // short-lived ACP server containers (ADR-026).
@@ -246,14 +457,104 @@ async fn build_state(instance: &Instance) -> anyhow::Result<AppState> {
     Ok(state)
 }
 
-fn validate_bind(bind: IpAddr, allow_insecure_remote: bool) -> anyhow::Result<()> {
-    if bind.is_loopback() || allow_insecure_remote {
-        return Ok(());
+fn load_instance_config(instance: &Instance) -> anyhow::Result<Config> {
+    if instance.config_path().exists() {
+        return Ok(Config::load(&instance.config_path())?);
+    }
+    let mut config = Config::default();
+    config.system.data_dir = instance.root.clone();
+    config.system.workspace_dir = instance.root.join("workspaces");
+    Ok(config)
+}
+
+fn resolve_instance_config(
+    saved: &InstanceConfig,
+    cli_bind: Option<IpAddr>,
+    cli_port: Option<u16>,
+    allow_insecure_remote: bool,
+) -> anyhow::Result<InstanceConfig> {
+    let mut effective = saved.clone();
+    if let Some(bind) = cli_bind {
+        effective.bind = bind;
+    }
+    if let Some(port) = cli_port {
+        if port == 0 {
+            anyhow::bail!("--port must be between 1 and 65535");
+        }
+        effective.port = port;
+    }
+
+    if effective.bind.is_loopback() || effective.authentication_enabled {
+        effective.allow_unauthenticated_remote = false;
+        return Ok(effective);
+    }
+
+    let saved_acknowledgement_applies =
+        cli_bind.is_none() && saved.bind == effective.bind && saved.allow_unauthenticated_remote;
+    if allow_insecure_remote || saved_acknowledgement_applies {
+        effective.allow_unauthenticated_remote = true;
+        return Ok(effective);
     }
 
     anyhow::bail!(
-        "refusing to expose an unauthenticated XpressClaw control plane on {bind}. Keep the default loopback bind and use an SSH tunnel or authenticated TLS proxy. If another security layer already protects this address, rerun with --allow-insecure-remote to acknowledge the risk"
+        "refusing to expose an unauthenticated XpressClaw control plane on {}. Direct access is supported on an operator-trusted LAN or tailnet, but it is not encrypted. Rerun with --allow-insecure-remote, or save and confirm this address in Settings → Instance",
+        effective.bind
     )
+}
+
+fn read_detached_launcher_input() -> anyhow::Result<DetachedLauncherInput> {
+    use std::io::Read;
+    let mut payload = String::new();
+    std::io::stdin().take(8193).read_to_string(&mut payload)?;
+    let parsed = serde_json::from_str::<RawDetachedLauncherInput>(&payload);
+    payload.zeroize();
+    let mut parsed = parsed
+        .map_err(|_| anyhow::anyhow!("the detached launcher supplied invalid startup data"))?;
+    if parsed.ready_port == 0 || !(20..=256).contains(&parsed.ready_nonce.len()) {
+        parsed.ready_nonce.zeroize();
+        parsed.startup_token.zeroize();
+        anyhow::bail!("the detached launcher supplied invalid readiness data");
+    }
+    if !(20..=256).contains(&parsed.startup_token.len()) {
+        parsed.ready_nonce.zeroize();
+        parsed.startup_token.zeroize();
+        anyhow::bail!("the detached launcher supplied an invalid startup token");
+    }
+    Ok(DetachedLauncherInput {
+        startup_token: Zeroizing::new(std::mem::take(&mut parsed.startup_token)),
+        ready_port: parsed.ready_port,
+        ready_nonce: Zeroizing::new(std::mem::take(&mut parsed.ready_nonce)),
+    })
+}
+
+fn print_desktop_identity(identity: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(
+        output,
+        "{}{identity}",
+        xpressclaw_server::auth::INSTANCE_IDENTITY_PREFIX
+    )?;
+    output.flush()?;
+    Ok(())
+}
+
+fn print_startup_token(token: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output)?;
+    writeln!(output, "Authentication is enabled without a password.")?;
+    writeln!(output, "Use this login token until XpressClaw restarts:")?;
+    writeln!(
+        output,
+        "{}{token}",
+        xpressclaw_server::auth::STARTUP_TOKEN_PREFIX
+    )?;
+    writeln!(output)?;
+    output.flush()?;
+    Ok(())
 }
 
 fn ui_url(bind: IpAddr, port: u16) -> String {
@@ -272,16 +573,51 @@ mod tests {
 
     #[test]
     fn loopback_bind_is_safe_by_default() {
-        assert!(validate_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), false).is_ok());
+        let saved = InstanceConfig::default();
+        let effective = resolve_instance_config(&saved, None, None, false).unwrap();
+        assert_eq!(effective.bind, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(effective.port, 8935);
     }
 
     #[test]
     fn non_loopback_bind_requires_explicit_acknowledgement() {
         let bind = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-        let error = validate_bind(bind, false).unwrap_err().to_string();
+        let saved = InstanceConfig::default();
+        let error = resolve_instance_config(&saved, Some(bind), None, false)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("unauthenticated"));
-        assert!(error.contains("SSH tunnel"));
-        assert!(validate_bind(bind, true).is_ok());
+        assert!(error.contains("tailnet"));
+        assert!(resolve_instance_config(&saved, Some(bind), None, true).is_ok());
+    }
+
+    #[test]
+    fn saved_remote_acknowledgement_is_reusable_but_does_not_cover_cli_override() {
+        let saved = InstanceConfig {
+            bind: "0.0.0.0".parse().unwrap(),
+            allow_unauthenticated_remote: true,
+            ..InstanceConfig::default()
+        };
+        assert!(resolve_instance_config(&saved, None, None, false).is_ok());
+        assert!(
+            resolve_instance_config(&saved, Some("192.0.2.10".parse().unwrap()), None, false,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_cli_values_override_saved_instance_values() {
+        let saved = InstanceConfig {
+            port: 9000,
+            authentication_enabled: true,
+            ..InstanceConfig::default()
+        };
+        let effective =
+            resolve_instance_config(&saved, Some("::".parse().unwrap()), Some(9443), false)
+                .unwrap();
+        assert_eq!(effective.bind, "::".parse::<IpAddr>().unwrap());
+        assert_eq!(effective.port, 9443);
+        assert!(effective.authentication_enabled);
     }
 
     #[test]
@@ -302,7 +638,9 @@ mod tests {
         config.system.workspace_dir = instance.root.join("workspaces");
         config.save(&instance.config_path()).unwrap();
 
-        let state = build_state(&instance).await.unwrap();
+        let state = build_state(&instance, config.instance.clone(), None)
+            .await
+            .unwrap();
 
         assert!(!state.is_setup_complete());
     }

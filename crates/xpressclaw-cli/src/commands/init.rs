@@ -68,6 +68,12 @@ system:
   data_dir: {data_dir}
   workspace_dir: {workspace_dir}
 
+instance:
+  bind: 127.0.0.1
+  port: 8935
+  authentication_enabled: false
+  allow_unauthenticated_remote: false
+
 agents: []
 "#
     ))

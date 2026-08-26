@@ -43,8 +43,9 @@ uncommitted edit.
 Workspace and terminal endpoints are intentionally equivalent to local project
 access. They therefore:
 
-- accept browser requests only when `Origin` matches `Host` (or the first
-  forwarded host); origin-less calls remain available to the desktop shell and
+- accept browser requests only when `Origin` matches `Host`, or when the
+  browser reports `Sec-Fetch-Site: same-origin` through a reverse proxy that
+  rewrites `Host`; origin-less calls remain available to the desktop shell and
   trusted API clients;
 - resolve only normalized relative paths through a capability directory handle
   rooted at the workspace. Reads, listings, temporary saves, and atomic renames

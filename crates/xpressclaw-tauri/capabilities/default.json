@@ -3,6 +3,7 @@
   "description": "Default permissions for xpressclaw desktop app",
   "windows": ["main"],
   "permissions": [
+    "desktop-local-commands",
     "core:default",
     "shell:allow-open",
     {

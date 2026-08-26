@@ -760,20 +760,27 @@ fn require_same_origin(headers: &HeaderMap) -> ApiResult<()> {
         return Ok(());
     };
     let host = headers
-        .get("x-forwarded-host")
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
+    let origin = origin.parse::<axum::http::Uri>().ok();
+    let is_http_origin = origin
+        .as_ref()
+        .and_then(axum::http::Uri::scheme_str)
+        .is_some_and(|scheme| matches!(scheme, "http" | "https"));
+    let authority = origin.as_ref().and_then(axum::http::Uri::authority);
+    let host_matches = host.is_some_and(|host| {
+        authority.is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))
+    });
+    // A TLS-terminating proxy may legitimately rewrite Host to the upstream
+    // listener. In that topology the browser's unforgeable Fetch Metadata
+    // header still describes the request relative to the public origin. Raw
+    // non-browser clients gain nothing by forging it because they may already
+    // omit Origin; this check protects browser sessions from another origin.
+    let browser_reports_same_origin = headers
+        .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-        });
-    let authority = origin
-        .split_once("://")
-        .map(|(_, rest)| rest.trim_end_matches('/'));
-    if host.is_some() && authority == host {
+        .is_some_and(|value| value.eq_ignore_ascii_case("same-origin"));
+    if is_http_origin && (host_matches || browser_reports_same_origin) {
         Ok(())
     } else {
         Err(api_error(
@@ -908,6 +915,26 @@ mod tests {
         assert!(require_same_origin(&headers).is_ok());
 
         headers.insert(header::ORIGIN, "https://malicious.example".parse().unwrap());
+        assert_eq!(
+            require_same_origin(&headers).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert("x-forwarded-host", "malicious.example".parse().unwrap());
+        assert_eq!(
+            require_same_origin(&headers).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert(header::HOST, "127.0.0.1:8935".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://xpressclaw.example".parse().unwrap(),
+        );
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert!(require_same_origin(&headers).is_ok());
+
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
         assert_eq!(
             require_same_origin(&headers).unwrap_err().0,
             StatusCode::FORBIDDEN

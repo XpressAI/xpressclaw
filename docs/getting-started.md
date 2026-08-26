@@ -122,17 +122,20 @@ and explicit API acknowledgement.
 ## 7. Reconnect from another device
 
 The browser or Desktop window is only a client. Closing it does not stop the
-control plane or queued work. XpressClaw listens on loopback by default and has
-no built-in remote authentication yet, so connect through SSH rather than
-opening its port directly:
+control plane or queued work. XpressClaw listens on loopback by default. An SSH
+tunnel works without changing the listener:
 
 ```bash
 ssh -N -L 8935:127.0.0.1:8935 user@control-plane-host
 ```
 
-Open `http://localhost:8935` on the client device. See
-[Remote access](remote-access.md) for authenticated reverse-proxy guidance,
-reconnection behavior, and current Desktop limitations.
+Open `http://localhost:8935` on the client device. For direct Tailscale or a
+fully trusted LAN, **Settings → Instance** can save `0.0.0.0` or `::` after an
+explicit no-auth warning. You can instead enable a password or per-start token
+there. Desktop users can save the resulting remote URL as an instance profile;
+its credential stays in the OS keychain. XpressClaw authentication does not
+provide TLS. See [Remote access](remote-access.md) for all supported topologies,
+reconnection, and profile behavior.
 
 ## Lifecycle commands
 

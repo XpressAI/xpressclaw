@@ -197,8 +197,7 @@ task** for durable work, or send private work directly to one Agent from
 
 The control plane is the durable machine running Agents; Desktop and the web
 UI are clients. To leave work running on a desktop or server and reconnect
-from a laptop or phone, keep XpressClaw bound to its default loopback address
-and put an authenticated transport in front of it.
+from a laptop or phone, choose the connection boundary that fits your network.
 
 For example, from a laptop with SSH access to the control-plane host:
 
@@ -206,17 +205,22 @@ For example, from a laptop with SSH access to the control-plane host:
 ssh -N -L 8935:127.0.0.1:8935 user@control-plane-host
 ```
 
-Then open `http://localhost:8935` on that laptop. An authenticated HTTPS
-reverse proxy is another option. XpressClaw does not yet provide native remote
-authentication, so it refuses non-loopback binds unless
-`--allow-insecure-remote` explicitly acknowledges that another security layer
-protects the address. Never expose the port directly to a LAN or the internet.
+Then open `http://localhost:8935` on that laptop. An HTTPS reverse proxy is
+another option. For a direct Tailscale or operator-trusted LAN connection,
+choose `0.0.0.0` or `::` in **Settings → Instance** and explicitly confirm
+unauthenticated access, or enable XpressClaw password/token authentication.
+Authentication protects the app but does not supply TLS. Never expose the raw
+port to the public internet.
+
+Desktop can save local and remote instance profiles. Profile credentials stay
+in the operating-system keychain, and the automatic local sidecar keeps
+running while the app is connected to a remote instance.
 
 Browser disconnection does not cancel work. Reopening the same instance loads
 durable state and live streams reconnect; after a control-plane process
 restart, interrupted work is recovered into the queue. See
-[Remote access](docs/remote-access.md) for the current security boundary and
-Desktop limitations.
+[Remote access](docs/remote-access.md) for direct-tailnet, password/token,
+SSH, HTTPS proxy, and Desktop-profile guidance.
 
 ## Common Workflows
 

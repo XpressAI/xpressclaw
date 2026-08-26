@@ -18,7 +18,7 @@
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
-        "url": "http://localhost:8935",
+        "url": "about:blank",
         "visible": false,
         "dragDropEnabled": false,
         "hiddenTitle": true

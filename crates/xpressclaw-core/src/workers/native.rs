@@ -2013,8 +2013,12 @@ impl Drop for WindowsLocalAllocation {
     }
 }
 
+/// Apply a protected owner-only DACL to a private file or directory.
+///
+/// This is public so other XpressClaw crates can use the same audited Windows
+/// secret-storage primitive instead of inheriting a permissive parent ACL.
 #[cfg(windows)]
-fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
+pub fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
 
@@ -2034,7 +2038,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if wide_path.contains(&0) {
         return Err(Error::Backend(format!(
-            "failed to protect Pi MCP path {}: path contains a NUL character",
+            "failed to protect private path {}: path contains a NUL character",
             path.display()
         )));
     }
@@ -2063,7 +2067,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     let _security_descriptor = WindowsLocalAllocation(security_descriptor);
     if owner.is_null() {
         return Err(Error::Backend(format!(
-            "failed to protect Pi MCP path {}: Windows returned no owner",
+            "failed to protect private path {}: Windows returned no owner",
             path.display()
         )));
     }
@@ -2115,7 +2119,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
 #[cfg(windows)]
 fn windows_acl_error(action: &str, path: &Path, status: u32) -> Error {
     Error::Backend(format!(
-        "failed to {action} Pi MCP path {}: {}",
+        "failed to {action} private path {}: {}",
         path.display(),
         std::io::Error::from_raw_os_error(status as i32)
     ))
