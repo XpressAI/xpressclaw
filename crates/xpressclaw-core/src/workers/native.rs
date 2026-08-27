@@ -5257,20 +5257,25 @@ mod tests {
 
     #[test]
     fn visualization_roots_include_only_explicit_writable_agent_mounts() {
+        let host = tempfile::tempdir().unwrap();
+        let project = host.path().join("project");
+        let reference = host.path().join("reference");
+        let output = host.path().join("output");
+        let relative_target = host.path().join("relative-target");
         let agent = AgentConfig {
             volumes: vec![
-                "/host/reference:/workspace/reference:ro".into(),
-                "/host/output:/workspace/output:rw".into(),
-                "/host/relative:relative-target:rw".into(),
+                format!("{}:/workspace/reference:ro", reference.display()),
+                format!("{}:/workspace/output:rw", output.display()),
+                format!("{}:relative-target:rw", relative_target.display()),
                 "relative-host:/workspace/relative-host:rw".into(),
             ],
             ..Default::default()
         };
         assert_eq!(
-            visualization_source_roots(Path::new("/host/project"), "/workspace", &agent),
+            visualization_source_roots(&project, "/workspace", &agent),
             vec![
-                VisualizationSourceRoot::new("/workspace", "/host/project"),
-                VisualizationSourceRoot::new("/workspace/output", "/host/output"),
+                VisualizationSourceRoot::new("/workspace", project),
+                VisualizationSourceRoot::new("/workspace/output", output),
             ]
         );
     }
