@@ -12,6 +12,7 @@
 	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
+	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	const messageDraftScope = () => `task.${taskId}`;
@@ -154,7 +155,7 @@
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
-	let collapsedActivityEvents = $derived(collapseToolActivity(activityEvents));
+	let collapsedActivityEvents = $derived(coalesceAgentMessageFragments(collapseToolActivity(activityEvents)));
 	let primaryActivityEvents = $derived(
 		collapsedActivityEvents.filter(event => {
 			const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>

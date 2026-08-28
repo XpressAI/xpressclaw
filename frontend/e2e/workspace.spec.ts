@@ -1261,6 +1261,61 @@ test('agent updates stay beside their tools while the final reply is shown once'
 	expect(testIndex).toBeLessThan(finalIndexes[0]);
 });
 
+test('near-simultaneous sentence fragments render as one agent update', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'The audit', { item_type: 'agent_message', message_id: 'fragment-1' }),
+			timelineEvent(2, 10, 'runner_progress', '-retention regression is now exercising the actual migration DDL', { item_type: 'agent_message', message_id: 'fragment-2' }),
+			timelineEvent(3, 11, 'runner_progress', 'against H2: it inserts an audit row', { item_type: 'agent_message', message_id: 'fragment-3' }),
+			timelineEvent(4, 11, 'runner_progress', ',', { item_type: 'agent_message', message_id: 'fragment-4' }),
+			timelineEvent(5, 12, 'runner_progress', 'deletes', { item_type: 'agent_message', message_id: 'fragment-5' }),
+			timelineEvent(6, 12, 'runner_progress', 'the parent conversation, and creates a tombstone.', { item_type: 'agent_message', message_id: 'fragment-6' }),
+			timelineEvent(7, 12, 'runner_progress', 'Tests passed.', { item_type: 'agent_message', message_id: 'status-1' }),
+			timelineEvent(8, 12, 'runner_progress', 'Ready to review.', { item_type: 'agent_message', message_id: 'status-2' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(3);
+	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
+		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
+	);
+	await expect(updates.nth(1).locator('[data-agent-update-content]')).toHaveText('Tests passed.');
+	await expect(updates.nth(2).locator('[data-agent-update-content]')).toHaveText('Ready to review.');
+});
+
+test('agent update coalescing does not cross attempt, time, or tool boundaries', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
+			timelineEvent(2, 10, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'completed' }),
+			timelineEvent(3, 10, 'runner_progress', 'the migration', { item_type: 'agent_message', message_id: 'after-tool' }),
+			timelineEvent(4, 20, 'runner_progress', 'Checking', { item_type: 'agent_message', message_id: 'attempt-a' }),
+			{
+				...timelineEvent(5, 20, 'runner_progress', 'the workspace', { item_type: 'agent_message', message_id: 'attempt-b' }),
+				attempt_id: 'attempt-browser-test-2',
+			},
+			timelineEvent(6, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
+			timelineEvent(7, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(6);
+	await expect(updates).toHaveText([
+		/Reading/,
+		/the migration/,
+		/Checking/,
+		/the workspace/,
+		/Inspecting/,
+		/the repository/,
+	]);
+});
+
 test('links in agent responses open in new windows without changing user links', async ({ page }) => {
 	await mockApi(page, { agentTimeline: true, agentResponseLinks: true });
 	await page.goto(`/tasks/${taskId}`);
