@@ -22,6 +22,7 @@ use xpressclaw_core::llm::anthropic::AnthropicProvider;
 use xpressclaw_core::llm::local::detect_ollama;
 use xpressclaw_core::llm::openai::OpenAiProvider;
 use xpressclaw_core::llm::router::LlmRouter;
+use xpressclaw_core::paths::strip_verbatim;
 use xpressclaw_core::system;
 use xpressclaw_core::workers::native::{
     host_ssh_agent_socket, local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
@@ -408,10 +409,13 @@ async fn list_directories(
             requested.display()
         ))
     })?;
+    // Filesystem calls keep the verbatim path, which is what lifts MAX_PATH;
+    // only what leaves this handler is stripped.
+    let display_path = strip_verbatim(current.clone());
     if !current.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            current.display()
+            display_path.display()
         )));
     }
 
@@ -429,20 +433,20 @@ async fn list_directories(
             }
             Some((
                 entry.file_name().to_string_lossy().into_owned(),
-                path.display().to_string(),
+                strip_verbatim(path).display().to_string(),
             ))
         })
         .collect::<Vec<_>>();
     directories.sort_by_key(|(name, _)| name.to_lowercase());
-    let root = current
+    let root = display_path
         .ancestors()
         .last()
-        .unwrap_or(current.as_path())
+        .unwrap_or(display_path.as_path())
         .display()
         .to_string();
     Ok(Json(json!({
-        "path": current.display().to_string(),
-        "parent": current.parent().map(|path| path.display().to_string()),
+        "path": display_path.display().to_string(),
+        "parent": display_path.parent().map(|path| path.display().to_string()),
         "home": home.map(|path| path.display().to_string()),
         "roots": [root],
         "directories": directories.into_iter().map(|(name, path)| json!({
@@ -470,10 +474,12 @@ async fn project_environment(
             requested.display()
         ))
     })?;
+    // Probes below join onto the verbatim path; only the response is stripped.
+    let display_workspace = strip_verbatim(workspace.clone());
     if !workspace.is_dir() {
         return Err(bad_request(format!(
             "{} is not a directory",
-            workspace.display()
+            display_workspace.display()
         )));
     }
 
@@ -605,7 +611,7 @@ async fn project_environment(
     let git_uses_ssh = git_repository && repository_uses_ssh_remote(&workspace);
 
     Ok(Json(json!({
-        "workspace": workspace.display().to_string(),
+        "workspace": display_workspace.display().to_string(),
         "detected_files": detected_files,
         "suggestions": suggestions,
         "git_repository": git_repository,
