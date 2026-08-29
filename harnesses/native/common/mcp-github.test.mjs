@@ -9,6 +9,7 @@ import {
   managedCommandArguments,
   pullRequestRegistrationKey,
   pullRequestUrl,
+  resolveRepositoryContext,
   TOOL_DESCRIPTION,
   toolDescription,
   updatePullRequestRegistration,
@@ -139,7 +140,165 @@ test('advertises the GitHub MCP tool as the configured replacement for shell gh'
   assert.match(TOOL_DESCRIPTION, /authenticated, project-scoped replacement/);
   assert.match(TOOL_DESCRIPTION, /shell `gh` binary is intentionally unavailable/);
   assert.match(TOOL_DESCRIPTION, /Whenever instructions or skills require `gh`, call this tool/);
-  assert.match(TOOL_DESCRIPTION, /repository is fixed by XpressClaw/i);
+  assert.match(TOOL_DESCRIPTION, /pass its absolute container directory as `cwd`/i);
+  assert.match(TOOL_DESCRIPTION, /returns safe relative candidates instead of guessing/i);
+});
+
+test('resolves a nested cwd through the Agent-bound control plane', async () => {
+  const requests = [];
+  const environment = {
+    XPRESSCLAW_WORKSPACE: '/workspace',
+    XPRESSCLAW_URL: 'http://host.docker.internal:43123',
+    XPRESSCLAW_CONTROL_TOKEN: 'agent-capability',
+    XPRESSCLAW_AGENT_ID: 'opencode-agent',
+  };
+  const context = await resolveRepositoryContext('/workspace/product/src', {
+    environment,
+    realpath: async (path) => path,
+    gitRoot: async (directory) => {
+      assert.equal(directory, '/workspace/product/src');
+      return { exit_code: 0, stdout: '/workspace/product\n', stderr: '' };
+    },
+    fetch: async (url, request) => {
+      requests.push([url, request]);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          path: 'product',
+          repository: 'XpressAI/product',
+          token: 'scoped-secret',
+        }),
+      };
+    },
+  });
+
+  assert.equal(context.cwd, '/workspace/product');
+  assert.equal(context.environment.GH_REPO, 'XpressAI/product');
+  assert.equal(context.environment.GH_TOKEN, 'scoped-secret');
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0][0],
+    'http://host.docker.internal:43123/api/workspaces/opencode-agent/repository/resolve-github',
+  );
+  assert.deepEqual(JSON.parse(requests[0][1].body), { path: 'product' });
+  assert.equal(requests[0][1].headers['x-xpressclaw-agent-id'], 'opencode-agent');
+  assert.equal(
+    requests[0][1].headers['x-xpressclaw-internal-token'],
+    'agent-capability',
+  );
+});
+
+test('OpenCode bootstrap resolution preserves managed pull-request registration', async () => {
+  const environment = {
+    XPRESSCLAW_WORKSPACE: '/workspace',
+    XPRESSCLAW_URL: 'http://control',
+    XPRESSCLAW_CONTROL_TOKEN: 'agent-capability',
+    XPRESSCLAW_AGENT_ID: 'opencode-agent',
+    XPRESSCLAW_TASK_ID: 'task-199',
+    XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE: '1',
+  };
+  const context = await resolveRepositoryContext('/workspace/product', {
+    environment,
+    realpath: async (path) => path,
+    gitRoot: async () => ({ exit_code: 0, stdout: '/workspace/product\n', stderr: '' }),
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        path: 'product',
+        repository: 'XpressAI/product',
+        token: 'scoped-secret',
+      }),
+    }),
+  });
+  const registrations = [];
+  const output = await executeCommandWithReviewLifecycle(
+    ['pr', 'create', '--head', 'feature/adopt', '--base', 'main', '--title', 'Adopt clone'],
+    {
+      environment: context.environment,
+      registrationId: 'registration-opencode',
+      registrationKeyForCommand: async () => 'b'.repeat(64),
+      execute: async () => ({
+        exit_code: 0,
+        stdout: 'https://github.com/XpressAI/product/pull/7\n',
+        stderr: '',
+      }),
+      updateRegistration: async (phase, url, registrationId, registrationKey) => {
+        registrations.push({ phase, url, registrationId, registrationKey });
+        return { status: phase === 'begin' ? 'registration_pending' : 'waiting' };
+      },
+    },
+  );
+
+  assert.equal(context.cwd, '/workspace/product');
+  assert.equal(context.environment.GH_REPO, 'XpressAI/product');
+  assert.equal(output.review_lifecycle.registered, true);
+  assert.deepEqual(registrations, [
+    {
+      phase: 'begin',
+      url: undefined,
+      registrationId: 'registration-opencode',
+      registrationKey: 'b'.repeat(64),
+    },
+    {
+      phase: 'register',
+      url: 'https://github.com/XpressAI/product/pull/7',
+      registrationId: 'registration-opencode',
+      registrationKey: 'b'.repeat(64),
+    },
+  ]);
+});
+
+test('returns safe ambiguous repository candidates without invoking gh', async () => {
+  await assert.rejects(
+    resolveRepositoryContext(undefined, {
+      environment: {
+        XPRESSCLAW_WORKSPACE: '/workspace',
+        XPRESSCLAW_URL: 'http://control',
+        XPRESSCLAW_CONTROL_TOKEN: 'agent-capability',
+        XPRESSCLAW_AGENT_ID: 'agent',
+      },
+      realpath: async (path) => path,
+      fetch: async () => ({
+        ok: false,
+        status: 409,
+        text: async () => JSON.stringify({
+          error: 'multiple repositories were found',
+          state: 'ambiguous',
+          candidates: ['alpha', 'product'],
+          discovery_truncated: false,
+        }),
+      }),
+    }),
+    (error) => {
+      assert.equal(error.output.state, 'ambiguous');
+      assert.deepEqual(error.output.candidates, ['alpha', 'product']);
+      assert.equal(error.output.discovery_truncated, false);
+      return true;
+    },
+  );
+});
+
+test('rejects cwd traversal and symlink escape before contacting the control plane', async () => {
+  let fetched = false;
+  await assert.rejects(
+    resolveRepositoryContext('/workspace/escape', {
+      environment: {
+        XPRESSCLAW_WORKSPACE: '/workspace',
+        XPRESSCLAW_URL: 'http://control',
+        XPRESSCLAW_CONTROL_TOKEN: 'agent-capability',
+        XPRESSCLAW_AGENT_ID: 'agent',
+      },
+      realpath: async (path) => path === '/workspace/escape' ? '/outside/repository' : path,
+      fetch: async () => {
+        fetched = true;
+        throw new Error('must not fetch');
+      },
+    }),
+    /leaves the Agent's approved workspace/,
+  );
+  assert.equal(fetched, false);
 });
 
 test('ordinary task lifecycle overrides generic draft defaults', () => {

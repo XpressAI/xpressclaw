@@ -41,7 +41,8 @@ from source should use the [Developer Guide](development.md).
 ## 2. Add a repository and Agent
 
 Complete first-run setup. An existing repository is an Agent workspace, not an
-XpressClaw instance directory. The Agent creator asks for:
+XpressClaw instance directory. Leaving the folder empty creates a durable,
+isolated managed workspace for that Agent. The Agent creator asks for:
 
 - an Agent name;
 - Codex, Claude Code, DeepSeek Harness, OpenCode, or another ACP-compatible harness;
@@ -101,6 +102,36 @@ Monaco, inspect current Git changes and diffs, or open a terminal in its
 retained container. The terminal becomes available after the Agent has run its
 first task. Task details also show the workspace's current changed files and
 link directly to them in the editor.
+
+### Clone first, attach GitHub later
+
+A blank Agent can clone a repository during a Task or Conversation. The
+configured workspace remains its writable security boundary, while the cloned
+checkout becomes its narrower **active repository**:
+
+1. Ask the Agent to clone into its workspace. It can immediately call the
+   bundled GitHub tool with that checkout's absolute container directory as
+   `cwd`; XpressClaw validates the Git root and origin, obtains only that
+   repository's credential, and persists the selection before running `gh`.
+   Without that call, exactly one eligible checkout is adopted automatically
+   at the next safe turn boundary.
+2. If more than one checkout exists and `cwd` is omitted, the GitHub tool
+   returns safe relative candidates rather than guessing. Choose one under
+   **Agent → Environment → Active repository**, or let the Agent propose the
+   checkout with its XpressClaw control tool. Those choices apply next turn.
+3. After live `cwd` resolution or a queued choice, XpressClaw recreates the
+   retained ACP session on the next turn with the repository as its working
+   directory. The same Task, messages, and managed review state remain.
+4. For a GitHub origin, compatible built-in runner, and available GitHub
+   credential, the constrained GitHub MCP works immediately through `cwd` and
+   defaults to the active repository on later calls and turns.
+
+The status card distinguishes no repository, multiple candidates, non-GitHub
+origins, missing credentials, incompatible/custom images, an explicit GitHub
+MCP override, and an attached bundled MCP. Clearing a selection disables
+automatic re-adoption until another repository is selected. If a checkout is
+deleted or its origin changes, XpressClaw invalidates its runtime identity and
+shows the resulting diagnostic instead of switching to an unrelated clone.
 
 ## 5. Automate work
 

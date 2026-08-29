@@ -1906,7 +1906,7 @@
 						{:else if workspaceGit.repository}
 							<p class="text-xs text-muted-foreground">Working tree clean</p>
 						{:else}
-							<p class="text-xs text-muted-foreground">Not a Git repository</p>
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
 						{/if}
 					</div>
 				{/if}

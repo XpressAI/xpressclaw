@@ -583,6 +583,63 @@ test('serves project memory discovery and writes over the stdio MCP protocol', {
   }
 });
 
+test('repository adoption maps a nested clone to the assigned workspace boundary', { timeout: 5000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-adopt-'));
+  const repository = path.join(workspace, 'nested', 'repo');
+  await mkdir(repository, { recursive: true });
+  await execFile('git', ['-C', repository, 'init', '--quiet']);
+  let proposal = null;
+  let agentHeader = null;
+  const server = createServer(async (request, response) => {
+    if (request.url === '/api/workspaces/atlas/repository/propose' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      proposal = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      agentHeader = request.headers['x-xpressclaw-agent-id'];
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'pending', path: proposal.path }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+      XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
+      XPRESSCLAW_AGENT_ID: 'atlas',
+      XPRESSCLAW_WORKSPACE: workspace,
+      XPRESSCLAW_REPOSITORY: workspace,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  try {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: 'nested/repo' } } })}\n`);
+    const reply = JSON.parse((await output.next()).value);
+    assert.equal(reply.result.structuredContent.status, 'pending');
+    assert.deepEqual(proposal, { path: 'nested/repo' });
+    assert.equal(agentHeader, 'atlas');
+
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: '..' } } })}\n`);
+    const rejected = JSON.parse((await output.next()).value);
+    assert.equal(rejected.result.isError, true);
+    assert.match(rejected.result.content[0].text, /inside the Agent's assigned workspace/);
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test('conversation tools publish files, download attachments, and create linked work', { timeout: 5000 }, async () => {
   const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-conversation-'));
   await writeFile(path.join(workspace, 'report.md'), '# Report\nUseful evidence.\n');

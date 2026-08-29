@@ -598,9 +598,34 @@ export const sessions = {
 export interface WorkspaceStatus {
 	agent_id: string;
 	root: string;
+	repository: WorkspaceRepositoryStatus;
 	container_exists: boolean;
 	container_running: boolean;
 	terminal_available: boolean;
+}
+
+export interface WorkspaceRepositoryCandidate {
+	relative_path: string;
+	root: string;
+	github_repository: string | null;
+}
+
+export type WorkspaceRepositoryState = 'attached' | 'pending' | 'no_repository' | 'ambiguous' | 'missing' | 'cleared';
+export type WorkspaceGithubStatus = 'attached' | 'unavailable' | 'non_github_origin' | 'missing_credential' | 'incompatible_image' | 'explicit_override';
+
+export interface WorkspaceRepositoryStatus {
+	state: WorkspaceRepositoryState;
+	message: string;
+	bootstrap_root: string;
+	active: WorkspaceRepositoryCandidate | null;
+	candidates: WorkspaceRepositoryCandidate[];
+	discovery_truncated: boolean;
+	selected_relative_path: string | null;
+	pending_relative_path: string | null;
+	pending_action: 'manual' | 'cleared' | null;
+	github_status: WorkspaceGithubStatus;
+	github_repository: string | null;
+	restart_required: boolean;
 }
 
 export interface WorkspaceEntry {
@@ -637,6 +662,7 @@ export interface WorkspaceGitStatus {
 	repository: boolean;
 	branch: string | null;
 	files: GitChange[];
+	repository_status: WorkspaceRepositoryStatus;
 }
 
 export interface WorkspaceGitDiff {
@@ -668,6 +694,17 @@ export const workspaces = {
 		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`),
 	gitDiff: (agentId: string, path: string) =>
 		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
+	repository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`),
+	selectRepository: (agentId: string, path: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'PUT',
+			body: JSON.stringify({ path }),
+		}),
+	clearRepository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'DELETE',
+		}),
 };
 
 // -- Tasks --

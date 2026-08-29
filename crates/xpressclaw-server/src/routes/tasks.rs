@@ -140,8 +140,19 @@ pub fn routes() -> Router<AppState> {
 async fn register_pull_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<PullRequestInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|agent_id| agent_id != request.agent_id)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "pull-request registration must target the calling Agent" })),
+        ));
+    }
     let config = state.config();
     let agent = config
         .agents
@@ -154,12 +165,18 @@ async fn register_pull_request(
             )
         })?;
     let workspace = native::resolved_workspace(&config, agent);
-    let access = github::discover(&state.db, &workspace).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
-        )
-    })?;
+    let repository =
+        xpressclaw_core::repositories::active_repository_root(&state.db, &agent.name, &workspace)
+            .map_err(internal_error)?;
+    let access = repository
+        .as_deref()
+        .and_then(|repository| github::discover(&state.db, repository))
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+            )
+        })?;
     let manager = GithubReviewManager::new(state.db.clone());
     match request.phase {
         PullRequestRegistrationPhase::Begin => {
@@ -593,7 +610,10 @@ fn github_access_for_agent(
     let config = state.config();
     let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
     let workspace = native::resolved_workspace(&config, agent);
-    github::discover(&state.db, &workspace)
+    let repository =
+        xpressclaw_core::repositories::active_repository_root(&state.db, &agent.name, &workspace)
+            .ok()??;
+    github::discover(&state.db, &repository)
 }
 
 async fn task_counts(

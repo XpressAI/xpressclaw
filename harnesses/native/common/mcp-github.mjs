@@ -5,6 +5,8 @@
 
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
@@ -32,19 +34,29 @@ Supported commands:
 - gh pr thread resolve THREAD_ID
 - gh pr thread reopen THREAD_ID
 
-The repository is fixed by XpressClaw. Arbitrary gh api, authentication, configuration, extensions, repository selection, merging, and checkout are unavailable. Use the shell's full git CLI for branches, fetches, pushes, rebases, cherry-picks, and other Git operations.`;
+The repository is constrained by XpressClaw. When this Agent has just cloned a repository, pass its absolute container directory as \`cwd\`; XpressClaw validates and persists that checkout before running the command. If no repository is active and several checkouts exist, the tool returns safe relative candidates instead of guessing. Arbitrary gh api, authentication, configuration, extensions, owner/repository overrides, merging, and checkout are unavailable. Use the shell's full git CLI for branches, fetches, pushes, rebases, cherry-picks, and other Git operations.`;
 
 const REVIEW_LIFECYCLE_DESCRIPTION = `
 
 This ordinary task uses XpressClaw's managed pull-request review lifecycle. A pull request that is ready for a person to review must be published ready for review, never left as a draft. Generic instructions that default to draft are overridden here. After creation, XpressClaw keeps the task active, checks for review feedback, resumes this conversation to address every comment, and completes the task only after approval or merge.`;
 
-export function toolDescription(environment = process.env) {
+let invocationContext;
+
+function currentEnvironment() {
+  return invocationContext?.environment ?? process.env;
+}
+
+function currentWorkingDirectory() {
+  return invocationContext?.cwd ?? process.cwd();
+}
+
+export function toolDescription(environment = currentEnvironment()) {
   return reviewLifecycleEnabled(environment)
     ? `${TOOL_DESCRIPTION}${REVIEW_LIFECYCLE_DESCRIPTION}`
     : TOOL_DESCRIPTION;
 }
 
-export function reviewLifecycleEnabled(environment = process.env) {
+export function reviewLifecycleEnabled(environment = currentEnvironment()) {
   return environment.XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE === '1';
 }
 
@@ -177,7 +189,7 @@ function withoutDraftArguments(args) {
   return normalized;
 }
 
-export function managedCommandArguments(args, environment = process.env) {
+export function managedCommandArguments(args, environment = currentEnvironment()) {
   if (!reviewLifecycleEnabled(environment)) {
     return [...args];
   }
@@ -213,11 +225,12 @@ export function commandResultIsError(output) {
 }
 
 function commandOutput(args) {
+  const environment = currentEnvironment();
   return new Promise((resolve) => {
     const child = spawn(GH, args, {
-      cwd: process.cwd(),
+      cwd: currentWorkingDirectory(),
       env: {
-        ...process.env,
+        ...environment,
         GH_PROMPT_DISABLED: '1',
         PAGER: 'cat',
       },
@@ -241,8 +254,8 @@ function commandOutput(args) {
 function gitCommandOutput(args) {
   return new Promise((resolve) => {
     const child = spawn('git', args, {
-      cwd: process.cwd(),
-      env: process.env,
+      cwd: currentWorkingDirectory(),
+      env: currentEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -270,7 +283,7 @@ async function successfulCommand(args) {
   return output;
 }
 
-function repositoryParts(environment = process.env) {
+function repositoryParts(environment = currentEnvironment()) {
   const repository = environment.GH_REPO ?? '';
   const parts = repository.split('/');
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
@@ -315,7 +328,7 @@ function commandOptionValue(args, longName, shortName) {
   return undefined;
 }
 
-function registrationKey(owner, head, base, environment = process.env) {
+function registrationKey(owner, head, base, environment = currentEnvironment()) {
   const repository = environment.GH_REPO ?? '';
   if (!owner || !head || !base || !repository) {
     throw new Error('could not identify the pull-request head and base branches');
@@ -365,7 +378,7 @@ async function currentPullRequestIdentity(target) {
 }
 
 export async function pullRequestRegistrationKey(args, dependencies = {}) {
-  const environment = dependencies.environment ?? process.env;
+  const environment = dependencies.environment ?? currentEnvironment();
   const { owner: repositoryOwner } = repositoryParts(environment);
   if (args[0] === 'pr' && args[1] === 'create') {
     const commandArgs = args.slice(2);
@@ -434,7 +447,7 @@ export async function updatePullRequestRegistration(
   url,
   registrationId,
   registrationKeyValue,
-  environment = process.env,
+  environment = currentEnvironment(),
   fetchImplementation = globalThis.fetch,
 ) {
   const controlPlane = environment.XPRESSCLAW_URL?.replace(/\/$/, '');
@@ -455,6 +468,7 @@ export async function updatePullRequestRegistration(
       headers: {
         'content-type': 'application/json',
         ...(controlToken ? { 'x-xpressclaw-internal-token': controlToken } : {}),
+        'x-xpressclaw-agent-id': agentId,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(15_000),
@@ -474,7 +488,7 @@ export async function updatePullRequestRegistration(
 }
 
 export async function executeCommandWithReviewLifecycle(args, dependencies = {}) {
-  const environment = dependencies.environment ?? process.env;
+  const environment = dependencies.environment ?? currentEnvironment();
   const execute = dependencies.execute ?? commandOutput;
   const currentUrl = dependencies.currentPullRequestUrl ?? currentPullRequestUrl;
   const registrationId = dependencies.registrationId ?? randomUUID();
@@ -705,12 +719,139 @@ async function reviewThreads(args) {
   return { exit_code: 0, thread: response.data?.[mutation]?.thread };
 }
 
-async function callTool(argumentsValue) {
+function pathInside(root, candidate) {
+  const path = relative(root, candidate);
+  return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path));
+}
+
+function gitRoot(directory) {
+  return new Promise((resolveResult) => {
+    const child = spawn('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
+      cwd: directory,
+      env: currentEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      if (stdout.length < MAX_OUTPUT) stdout += chunk.slice(0, MAX_OUTPUT - stdout.length);
+    });
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < MAX_OUTPUT) stderr += chunk.slice(0, MAX_OUTPUT - stderr.length);
+    });
+    child.on('error', (cause) => resolveResult({ exit_code: 127, stdout, stderr: cause.message }));
+    child.on('close', (code) => resolveResult({ exit_code: code ?? 1, stdout, stderr }));
+  });
+}
+
+export async function resolveRepositoryContext(cwd, dependencies = {}) {
+  const environment = dependencies.environment ?? currentEnvironment();
+  const realpathImplementation = dependencies.realpath ?? realpath;
+  const executeGitRoot = dependencies.gitRoot ?? gitRoot;
+  const fetchImplementation = dependencies.fetch ?? globalThis.fetch;
+  const workspaceValue = environment.XPRESSCLAW_WORKSPACE;
+  const controlPlane = environment.XPRESSCLAW_URL?.replace(/\/$/, '');
+  const controlToken = environment.XPRESSCLAW_CONTROL_TOKEN;
+  const agentId = environment.XPRESSCLAW_AGENT_ID;
+  if (!workspaceValue || !controlPlane || !controlToken || !agentId) {
+    throw new Error('XpressClaw did not provide GitHub repository-resolution context');
+  }
+  if (cwd !== undefined && (typeof cwd !== 'string' || cwd.includes('\0'))) {
+    throw new Error('cwd must be a directory path without NUL characters');
+  }
+
+  const workspace = await realpathImplementation(workspaceValue);
+  let requestedRoot;
+  let requestedPath;
+  if (cwd?.trim()) {
+    const requested = await realpathImplementation(
+      isAbsolute(cwd) ? cwd : resolve(currentWorkingDirectory(), cwd),
+    );
+    if (!pathInside(workspace, requested)) {
+      throw new Error('cwd leaves the Agent\'s approved workspace');
+    }
+    const output = await executeGitRoot(requested);
+    if (output.exit_code !== 0 || !output.stdout.trim()) {
+      throw new Error(output.stderr.trim() || 'cwd is not inside a Git repository');
+    }
+    requestedRoot = await realpathImplementation(output.stdout.trim());
+    if (!pathInside(workspace, requestedRoot)) {
+      throw new Error('the Git repository containing cwd leaves the Agent\'s approved workspace');
+    }
+    requestedPath = relative(workspace, requestedRoot).split(sep).join('/') || '.';
+  }
+
+  const response = await fetchImplementation(
+    `${controlPlane}/api/workspaces/${encodeURIComponent(agentId)}/repository/resolve-github`,
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-xpressclaw-internal-token': controlToken,
+        'x-xpressclaw-agent-id': agentId,
+      },
+      body: JSON.stringify(requestedPath ? { path: requestedPath } : {}),
+      signal: AbortSignal.timeout(15_000),
+    },
+  );
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { error: text || `XpressClaw returned HTTP ${response.status}` };
+  }
+  if (!response.ok) {
+    const failure = new Error(payload.error ?? `XpressClaw returned HTTP ${response.status}`);
+    failure.output = {
+      error: failure.message,
+      state: payload.state,
+      candidates: payload.candidates,
+      discovery_truncated: payload.discovery_truncated,
+    };
+    throw failure;
+  }
+  if (typeof payload.repository !== 'string' ||
+      !/^[^/\s]+\/[^/\s]+$/.test(payload.repository) ||
+      typeof payload.token !== 'string' || !payload.token) {
+    throw new Error('XpressClaw returned invalid GitHub repository credentials');
+  }
+  if (typeof payload.path !== 'string') {
+    throw new Error('XpressClaw returned an invalid repository path');
+  }
+  const repositoryRoot = await realpathImplementation(resolve(workspace, payload.path));
+  if (!pathInside(workspace, repositoryRoot) ||
+      (requestedRoot !== undefined && requestedRoot !== repositoryRoot)) {
+    throw new Error('XpressClaw returned a repository outside the validated workspace or cwd');
+  }
+  return {
+    cwd: repositoryRoot,
+    environment: {
+      ...environment,
+      GH_HOST: 'github.com',
+      GH_REPO: payload.repository,
+      GH_TOKEN: payload.token,
+    },
+  };
+}
+
+export async function callTool(argumentsValue, dependencies = {}) {
   const requestedArgs = argumentsValue?.args;
   validateArguments(requestedArgs);
-  const args = managedCommandArguments(requestedArgs);
-  if (args[0] === 'pr' && args[1] === 'thread') return reviewThreads(args);
-  return executeCommandWithReviewLifecycle(args);
+  const context = await resolveRepositoryContext(argumentsValue?.cwd, dependencies);
+  if (invocationContext) {
+    throw new Error('concurrent GitHub tool calls are not supported by this stdio server');
+  }
+  invocationContext = context;
+  try {
+    const args = managedCommandArguments(requestedArgs);
+    if (args[0] === 'pr' && args[1] === 'thread') return await reviewThreads(args);
+    return await executeCommandWithReviewLifecycle(args);
+  } finally {
+    invocationContext = undefined;
+  }
 }
 
 async function handle(message) {
@@ -742,6 +883,10 @@ async function handle(message) {
               minItems: 2,
               items: { type: 'string' },
               description: 'Arguments after gh, for example ["pr", "view", "--json", "state,reviewDecision"]',
+            },
+            cwd: {
+              type: 'string',
+              description: 'Optional absolute container directory inside the intended repository. Use this after cloning when no active repository is selected.',
             },
           },
           required: ['args'],

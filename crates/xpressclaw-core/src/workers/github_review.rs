@@ -677,7 +677,25 @@ pub async fn poll_reviews_once(db: &Arc<Database>, config: &Config) -> Result<u3
             continue;
         };
         let workspace = native::resolved_workspace(config, agent);
-        let Some(access) = github::discover(db, &workspace) else {
+        let repository = match crate::repositories::active_repository_root(
+            db,
+            &agent.name,
+            &workspace,
+        ) {
+            Ok(repository) => repository,
+            Err(error) => {
+                warn!(task_id = item.task_id, agent_id = item.agent_id, workspace = %workspace.display(), %error, "review repository is unavailable");
+                manager.defer(
+                    &item,
+                    Some("the assigned Agent workspace or repository is unavailable"),
+                )?;
+                continue;
+            }
+        };
+        let Some(access) = repository
+            .as_deref()
+            .and_then(|repository| github::discover(db, repository))
+        else {
             manager.defer(&item, Some("project-scoped GitHub access is unavailable"))?;
             continue;
         };

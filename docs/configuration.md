@@ -140,7 +140,7 @@ agents:
 |---|---|
 | `kind` | Built-in catalog ID such as `codex`, `claude`, `deepseek-harness`, or `opencode`; otherwise `custom` |
 | `image` | Product-specific ACP server image or compatible derivative |
-| `workspace` | Host project mounted read-write at `/workspace`, or at the same absolute path in host-engine mode |
+| `workspace` | Host writable bootstrap boundary mounted at `/workspace`, or at the same absolute path in host-engine mode. The active Git repository may be this folder or one selected checkout beneath it. |
 | `project_name` | User-facing Agent name; falls back to the workspace folder when omitted |
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
@@ -219,6 +219,25 @@ authoritative for that session.
 ## Existing repositories and SSH remotes
 
 An existing workspace is mounted read-write, including its `.git` directory.
+For an Agent created without a path, XpressClaw creates
+`<data-dir>/workspaces/<agent-id>` and never reuses the instance root. A local
+SQLite selection records an active repository relative to that workspace; it
+is runtime state, not portable `xpressclaw.yaml` configuration. Existing
+explicit workspaces and legacy files are not moved during migration.
+
+Repository discovery occurs at safe turn boundaries and through explicit
+GitHub-tool `cwd` resolution. It is bounded, does not follow symlinks, and stays
+inside the configured writable workspace. A root
+repository wins; exactly one nested repository is adopted; multiple nested
+repositories require an explicit choice in **Agent → Environment**. If the
+bounded scan reaches its safety limit, XpressClaw also requires an explicit
+selection rather than assuming the partial candidate list is complete. Changing
+or clearing the active repository recreates the Agent's retained ACP session
+on the next turn while preserving Tasks, Conversations, and managed review
+state. Files, Git status, the ACP working directory, and the bundled GitHub MCP
+then use the active repository. The workspace remains the outer mount and
+authorization boundary.
+
 For GitHub repositories, XpressClaw prefers its project-scoped HTTPS credential
 helper and rewrites the standard `git@github.com:` remote forms when a GitHub
 connector is available. No SSH key is needed for that path.

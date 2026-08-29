@@ -126,8 +126,10 @@ Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know
 - A **Project** is the collaboration and memory boundary containing Agents,
   Conversations, Tasks, and workflows.
 - An **Agent** is an execution identity with one ACP harness, retained
-  environment, and workspace. Its workspace may be an existing repository or
-  an XpressClaw-managed folder.
+  environment, and writable workspace boundary. Its active repository may be
+  that folder or one Git checkout nested inside it. An Agent created without a
+  path receives an isolated XpressClaw-managed workspace, so it can clone and
+  adopt a repository later without sharing a broad instance directory.
 
 `xpressclaw.yaml` configures an instance; it does not add a repository and
 does not belong in every repository. Repository-local harness instructions
@@ -180,6 +182,13 @@ Choose an existing repository folder or start with an empty managed workspace,
 name the Agent, and select Codex, Claude Code, DeepSeek Harness, OpenCode, or a custom ACP
 harness. XpressClaw creates the first Project around that Agent. Add more
 Projects and Agents from the UI; you do not run `init` for each repository.
+If an Agent clones one repository into its blank workspace, XpressClaw adopts
+it at the next turn boundary and restarts the retained ACP session with that
+checkout as its working directory. If several repositories exist, choose one
+under **Agent → Environment → Active repository**. The bundled GitHub tool can
+also use a just-cloned checkout immediately when the Agent passes its container
+directory as `cwd`; the validated choice is persisted and the session switches
+its default cwd on the following turn.
 
 ### 3. Start work
 

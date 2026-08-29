@@ -18,6 +18,7 @@ const AGENT_ID = process.env.XPRESSCLAW_AGENT_ID ?? process.env.AGENT_ID ?? '';
 const TASK_ID = process.env.XPRESSCLAW_TASK_ID ?? '';
 const CONVERSATION_ID = process.env.XPRESSCLAW_CONVERSATION_ID ?? '';
 const PROJECT_ID = process.env.XPRESSCLAW_PROJECT_ID ?? '';
+const REPOSITORY_ROOT = process.env.XPRESSCLAW_REPOSITORY ?? '';
 const LOCAL_COLLABORATION = process.env.XPRESSCLAW_LOCAL_COLLABORATION === '1';
 const COLLABORATION_TOKEN = process.env.XPRESSCLAW_COLLABORATION_TOKEN ?? '';
 const execFile = promisify(execFileCallback);
@@ -86,6 +87,29 @@ export const TOOLS = [
       },
       required: ['schedule_id'],
       additionalProperties: false,
+    },
+  },
+  {
+    name: 'adopt_repository',
+    description: 'Propose a Git repository that was just created or cloned inside this Agent\'s assigned workspace as the durable active repository. The path is validated by both the runner and control plane. Adoption takes effect at the next safe turn boundary, which restarts the ACP session so the bundled GitHub MCP can be attached when the origin and credentials are eligible.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          minLength: 1,
+          description: 'Repository path, absolute inside the assigned workspace or relative to the current active repository.',
+        },
+      },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: 'Adopt cloned repository',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
     },
   },
   {
@@ -487,6 +511,7 @@ async function api(path, options = {}) {
     headers: {
       ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
       ...(CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {}),
+      ...(AGENT_ID ? { 'x-xpressclaw-agent-id': AGENT_ID } : {}),
       ...(options.headers ?? {}),
     },
   });
@@ -716,6 +741,27 @@ async function cancelWakeup(argumentsValue) {
   return { status: 'cancelled', schedule_id: scheduleId };
 }
 
+async function adoptRepository(argumentsValue) {
+  const requestedPath = argumentsValue?.path;
+  if (typeof requestedPath !== 'string' || !requestedPath.trim()) {
+    throw new Error('path must be a non-empty string');
+  }
+  const workspace = await realpath(process.env.XPRESSCLAW_WORKSPACE ?? '/workspace');
+  const base = REPOSITORY_ROOT ? await realpath(REPOSITORY_ROOT) : workspace;
+  const requested = path.isAbsolute(requestedPath)
+    ? requestedPath
+    : path.resolve(base, requestedPath);
+  const repository = await realpath(requested);
+  if (repository !== workspace && !repository.startsWith(`${workspace}${path.sep}`)) {
+    throw new Error('repository must be inside the Agent\'s assigned workspace');
+  }
+  const relative = path.relative(workspace, repository) || '.';
+  return api(`/api/workspaces/${encodeURIComponent(AGENT_ID)}/repository/propose`, {
+    method: 'POST',
+    body: JSON.stringify({ path: relative }),
+  });
+}
+
 async function searchProjectMemory(argumentsValue) {
   const query = argumentsValue?.query;
   if (typeof query !== 'string') throw new Error('query must be a string');
@@ -828,7 +874,10 @@ async function downloadConversationAttachment(argumentsValue) {
   if (!attachmentId) throw new Error('attachment_id must be a non-empty string');
   requireConfiguration();
   const response = await fetch(`${BASE_URL}${conversationPath(`/attachments/${encodeURIComponent(attachmentId)}`)}`, {
-    headers: CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {},
+    headers: {
+      ...(CONTROL_TOKEN ? { 'x-xpressclaw-internal-token': CONTROL_TOKEN } : {}),
+      ...(AGENT_ID ? { 'x-xpressclaw-agent-id': AGENT_ID } : {}),
+    },
   });
   if (!response.ok) {
 	const detail = await response.text();
@@ -1055,6 +1104,7 @@ async function callTool(name, argumentsValue) {
   if (name === 'schedule_wakeup') return scheduleWakeup(argumentsValue);
   if (name === 'list_wakeups') return { wakeups: await wakeups() };
   if (name === 'cancel_wakeup') return cancelWakeup(argumentsValue);
+  if (name === 'adopt_repository') return adoptRepository(argumentsValue);
   if (name === 'get_project_memory_index') return projectMemoryIndex();
   if (name === 'search_project_memory') return searchProjectMemory(argumentsValue);
   if (name === 'get_project_memory') return getProjectMemory(argumentsValue);

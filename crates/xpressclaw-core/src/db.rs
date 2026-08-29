@@ -2398,6 +2398,33 @@ CREATE INDEX idx_message_visualizations_turn
     ON message_visualizations(conversation_turn_id);
 "#;
 
+const MIGRATION_V43: &str = r#"
+-- An Agent's bootstrap workspace remains the writable security boundary while
+-- this local-only selection records the narrower repository used as ACP cwd.
+-- Portable Project sync intentionally excludes this machine-specific path.
+CREATE TABLE agent_repository_selections (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    relative_path TEXT,
+    repository_identity TEXT,
+    selection_mode TEXT NOT NULL DEFAULT 'automatic'
+        CHECK (selection_mode IN ('automatic', 'manual', 'cleared')),
+    pending_relative_path TEXT,
+    pending_selection_mode TEXT
+        CHECK (pending_selection_mode IN ('manual', 'cleared')),
+    generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (relative_path IS NOT NULL OR repository_identity IS NULL),
+    CHECK (selection_mode != 'cleared' OR relative_path IS NULL),
+    CHECK (
+        (pending_selection_mode IS NULL AND pending_relative_path IS NULL) OR
+        (pending_selection_mode = 'manual' AND pending_relative_path IS NOT NULL) OR
+        (pending_selection_mode = 'cleared' AND pending_relative_path IS NULL)
+    )
+);
+CREATE INDEX idx_agent_repository_updated
+    ON agent_repository_selections(updated_at);
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2493,6 +2520,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (40, MIGRATION_V40),
         (41, MIGRATION_V41),
         (42, MIGRATION_V42),
+        (43, MIGRATION_V43),
     ]
 }
 
@@ -2513,7 +2541,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "42");
+        assert_eq!(version, "43");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

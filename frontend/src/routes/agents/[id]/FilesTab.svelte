@@ -164,8 +164,9 @@
 		<div class="min-w-0">
 			<div class="truncate text-xs font-medium">{status?.root ?? 'Workspace'}</div>
 			<div class="text-[11px] text-muted-foreground">
-				{#if git?.repository}{git.branch || 'detached HEAD'} · {git.files.length} changed{:else}Not a Git repository{/if}
+				{#if git?.repository}{git.branch || 'detached HEAD'} · {git.files.length} changed{:else}{status?.repository.message ?? 'No active Git repository'}{/if}
 			</div>
+			{#if status?.repository.github_status === 'attached'}<div class="mt-0.5 text-[10px] text-emerald-600 dark:text-emerald-400">GitHub MCP · {status.repository.github_repository}</div>{/if}
 		</div>
 		<div class="flex items-center gap-2">
 			<button type="button" onclick={refreshGit} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>
@@ -263,7 +264,7 @@
 					<div class="flex h-full flex-col items-center justify-center px-6 text-center text-sm text-muted-foreground">
 						<div class="text-3xl opacity-40">⌘</div>
 						<p class="mt-2">Choose a file to browse or edit it with Monaco.</p>
-						<p class="mt-1 text-xs">Changed files are collected from the workspace's current Git status.</p>
+						<p class="mt-1 text-xs">Changed files are collected from the active repository's current Git status.</p>
 					</div>
 				{/if}
 			</div>
