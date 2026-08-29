@@ -39,8 +39,8 @@ use crate::docker::manager::{
 };
 use crate::error::{Error, Result};
 use crate::repositories::{
-    agent_callback_capability, run_repository_blocking, AgentRepositoryManager,
-    RepositoryBoundaryResult, RepositoryInspection,
+    agent_callback_capability, discover_github_access, run_repository_blocking,
+    AgentRepositoryManager, RepositoryBoundaryResult, RepositoryInspection,
 };
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
@@ -708,10 +708,11 @@ async fn execute_conversation_turn(
     if !queue.is_running(&turn.id)? {
         return Ok(());
     }
-    let github = repository
-        .active
-        .then(|| github::discover(&db, &repository.active_root))
-        .flatten();
+    let github = if repository.active {
+        discover_github_access(&db, &repository.active_root).await?
+    } else {
+        None
+    };
     let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
     let collaboration_token =
         configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
@@ -1192,10 +1193,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     if let AcpSessionStart::Resume(native_session_id) = &session_start {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
-    let github = repository
-        .active
-        .then(|| github::discover(&db, &repository.active_root))
-        .flatten();
+    let github = if repository.active {
+        discover_github_access(&db, &repository.active_root).await?
+    } else {
+        None
+    };
     let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
     let collaboration_token =
         configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;

@@ -4,7 +4,7 @@
 //! active repository is a narrower, local-only runtime choice beneath that
 //! boundary; it is deliberately not part of portable Project configuration.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -25,6 +25,9 @@ const MAX_SCANNED_DIRECTORIES: usize = 512;
 const MAX_REPOSITORIES: usize = 32;
 const MAX_GIT_METADATA_DEPTH: usize = 32;
 const MAX_GIT_METADATA_ENTRIES: usize = 100_000;
+const MAX_GIT_CONFIG_DEPTH: usize = 16;
+const MAX_GIT_CONFIG_FILES: usize = 64;
+const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
 const CALLBACK_CAPABILITY_CONTEXT: &[u8] = b"xpressclaw-runner-callback-v1\0";
 
 /// Derive the narrow callback capability exposed to one Agent's bundled
@@ -662,6 +665,17 @@ pub async fn discover_active_github_access(
     .await
 }
 
+/// Resolve GitHub access for an already-authorized repository without running
+/// Git or credential helpers on the caller's async worker.
+pub async fn discover_github_access(
+    db: &Arc<Database>,
+    repository: &Path,
+) -> Result<Option<github::GithubSessionAccess>> {
+    let db = db.clone();
+    let repository = repository.to_path_buf();
+    run_repository_blocking(move || Ok(github::discover(&db, &repository))).await
+}
+
 fn build_inspection(
     bootstrap_root: PathBuf,
     candidates: Vec<RepositoryCandidate>,
@@ -992,6 +1006,7 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         || (!dot_git_type.is_file() && !dot_git_type.is_dir())
         || !commondir_is_regular
         || !has_regular_git_metadata_tree(bootstrap_root, &git_dir, &git_common_dir)
+        || !has_self_contained_git_config(bootstrap_root, &git_dir, &git_common_dir)
         || !has_self_contained_object_store(bootstrap_root, &git_common_dir)
         || (top_level != bootstrap_root && !top_level.starts_with(bootstrap_root))
     {
@@ -1132,6 +1147,124 @@ fn has_regular_git_metadata_tree(
         }
     }
     true
+}
+
+fn has_self_contained_git_config(
+    bootstrap_root: &Path,
+    git_dir: &Path,
+    git_common_dir: &Path,
+) -> bool {
+    let mut queue = VecDeque::from([(git_common_dir.join("config"), 0usize)]);
+    let worktree_config = git_dir.join("config.worktree");
+    match std::fs::symlink_metadata(&worktree_config) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            queue.push_back((worktree_config, 0));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) | Err(_) => return false,
+    }
+
+    let mut visited = HashSet::new();
+    let mut total_bytes = 0u64;
+    while let Some((config, depth)) = queue.pop_front() {
+        if depth > MAX_GIT_CONFIG_DEPTH {
+            return false;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&config) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() || metadata.len() > MAX_GIT_CONFIG_BYTES {
+            return false;
+        }
+        let Ok(config) = config.canonicalize() else {
+            return false;
+        };
+        if !config.starts_with(bootstrap_root) {
+            return false;
+        }
+        if !visited.insert(config.clone()) {
+            continue;
+        }
+        if visited.len() > MAX_GIT_CONFIG_FILES {
+            return false;
+        }
+        let Some(next_total_bytes) = total_bytes.checked_add(metadata.len()) else {
+            return false;
+        };
+        if next_total_bytes > MAX_GIT_CONFIG_BYTES {
+            return false;
+        }
+        total_bytes = next_total_bytes;
+
+        // Parse one already-authorized file with includes disabled, then walk
+        // every declared include ourselves. This avoids asking Git to read an
+        // external include merely to discover that it crosses the boundary.
+        let Ok(output) = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&config)
+            .args(["--no-includes", "--null", "--list"])
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        for record in output.stdout.split(|byte| *byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let Some(separator) = record.iter().position(|byte| *byte == b'\n') else {
+                return false;
+            };
+            let Ok(key) = std::str::from_utf8(&record[..separator]) else {
+                return false;
+            };
+            if !is_git_config_include_key(key) {
+                continue;
+            }
+            let Ok(value) = std::str::from_utf8(&record[separator + 1..]) else {
+                return false;
+            };
+            let include = Path::new(value);
+            // Absolute includes remain tied to host topology after the Agent
+            // workspace is relocated into a runner, even when they currently
+            // happen to point inside the bootstrap root. Relative includes
+            // preserve their meaning and are accepted only after containment.
+            if value.starts_with('~')
+                || include.is_absolute()
+                || matches!(
+                    include.components().next(),
+                    Some(Component::Prefix(_) | Component::RootDir)
+                )
+            {
+                return false;
+            }
+            let Some(parent) = config.parent() else {
+                return false;
+            };
+            let include = parent.join(include);
+            let Ok(metadata) = std::fs::symlink_metadata(&include) else {
+                return false;
+            };
+            if !metadata.file_type().is_file() {
+                return false;
+            }
+            let Ok(include) = include.canonicalize() else {
+                return false;
+            };
+            if !include.starts_with(bootstrap_root) {
+                return false;
+            }
+            queue.push_back((include, depth + 1));
+        }
+    }
+    true
+}
+
+fn is_git_config_include_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
 }
 
 fn relative_path_string(path: &Path) -> Option<String> {
@@ -1481,6 +1614,131 @@ mod tests {
         assert!(manager
             .select("agent", workspace.path(), "checkout")
             .is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_git_config_includes_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        let external_config = outside.path().join("external.config");
+        std::fs::write(&external_config, "[xpressclaw]\n\texternal = true\n").unwrap();
+        git(
+            &checkout,
+            &[
+                "config",
+                "--local",
+                "include.path",
+                external_config.to_str().unwrap(),
+            ],
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args([
+                "config",
+                "--local",
+                "--includes",
+                "--get",
+                "xpressclaw.external",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "true");
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_matching_git_config_include_if_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        let external_config = outside.path().join("external.config");
+        std::fs::write(&external_config, "[xpressclaw]\n\texternal = true\n").unwrap();
+        let git_dir = checkout
+            .join(".git")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let include_if = format!("includeIf.gitdir:{git_dir}.path");
+        git(
+            &checkout,
+            &[
+                "config",
+                "--local",
+                &include_if,
+                external_config.to_str().unwrap(),
+            ],
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args([
+                "config",
+                "--local",
+                "--includes",
+                "--get",
+                "xpressclaw.external",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "true");
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_accepts_relative_git_config_includes_inside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        std::fs::write(
+            checkout.join(".git/xpressclaw.config"),
+            "[xpressclaw]\n\tinternal = true\n",
+        )
+        .unwrap();
+        git(
+            &checkout,
+            &["config", "--local", "include.path", "xpressclaw.config"],
+        );
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args([
+                "config",
+                "--local",
+                "--includes",
+                "--get",
+                "xpressclaw.internal",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "true");
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::Pending);
+        assert_eq!(inspection.candidates.len(), 1);
+        assert_eq!(inspection.candidates[0].relative_path, "checkout");
     }
 
     #[test]
