@@ -5,9 +5,11 @@
 //! boundary; it is deliberately not part of portable Project configuration.
 
 use std::collections::{HashSet, VecDeque};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -28,6 +30,9 @@ const MAX_GIT_METADATA_ENTRIES: usize = 100_000;
 const MAX_GIT_CONFIG_DEPTH: usize = 16;
 const MAX_GIT_CONFIG_FILES: usize = 64;
 const MAX_GIT_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_GIT_COMMAND_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+const GIT_INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const GIT_INSPECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CALLBACK_CAPABILITY_CONTEXT: &[u8] = b"xpressclaw-runner-callback-v1\0";
 
 /// Derive the narrow callback capability exposed to one Agent's bundled
@@ -968,18 +973,28 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
     if directory != bootstrap_root && !directory.starts_with(bootstrap_root) {
         return None;
     }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&directory)
-        .args([
-            "rev-parse",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
-        .output()
-        .ok()?;
+    let dot_git = directory.join(".git");
+    let dot_git_type = std::fs::symlink_metadata(&dot_git).ok()?.file_type();
+    if dot_git_type.is_dir() {
+        let direct_git_dir = dot_git.canonicalize().ok()?;
+        if !direct_git_dir.starts_with(bootstrap_root)
+            || !has_regular_git_metadata_tree(bootstrap_root, &direct_git_dir, &direct_git_dir)
+            || !has_self_contained_git_config(bootstrap_root, &direct_git_dir, &direct_git_dir)
+        {
+            return None;
+        }
+    } else if !dot_git_type.is_file() {
+        return None;
+    }
+    let mut command = Command::new("git");
+    command.arg("-C").arg(&directory).args([
+        "rev-parse",
+        "--show-toplevel",
+        "--absolute-git-dir",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ]);
+    let output = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT)?;
     if !output.status.success() {
         return None;
     }
@@ -988,9 +1003,6 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
     let top_level = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
     let git_dir = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
     let git_common_dir = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
-    let dot_git_type = std::fs::symlink_metadata(top_level.join(".git"))
-        .ok()?
-        .file_type();
     let commondir_is_regular = git_common_dir == git_dir
         || std::fs::symlink_metadata(git_dir.join("commondir"))
             .ok()
@@ -1048,12 +1060,12 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
 }
 
 fn git_origin(repository: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repository)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+        .args(["remote", "get-url", "origin"]);
+    let output = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT)?;
     output
         .status
         .success()
@@ -1199,12 +1211,12 @@ fn has_self_contained_git_config(
         // Parse one already-authorized file with includes disabled, then walk
         // every declared include ourselves. This avoids asking Git to read an
         // external include merely to discover that it crosses the boundary.
-        let Ok(output) = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .args(["config", "--file"])
             .arg(&config)
-            .args(["--no-includes", "--null", "--list"])
-            .output()
-        else {
+            .args(["--no-includes", "--null", "--list"]);
+        let Some(output) = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT) else {
             return false;
         };
         if !output.status.success() {
@@ -1267,6 +1279,58 @@ fn is_git_config_include_key(key: &str) -> bool {
     key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
 }
 
+fn bounded_command_output(command: &mut Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let stdout_reader = std::thread::spawn(move || read_bounded_output(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded_output(stderr));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(GIT_INSPECTION_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let stdout = stdout_reader.join().ok().flatten();
+    let stderr = stderr_reader.join().ok().flatten();
+    Some(Output {
+        status: status?,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+fn read_bounded_output(mut reader: impl Read) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    reader
+        .by_ref()
+        .take(MAX_GIT_COMMAND_OUTPUT_BYTES + 1)
+        .read_to_end(&mut output)
+        .ok()?;
+    (output.len() as u64 <= MAX_GIT_COMMAND_OUTPUT_BYTES).then_some(output)
+}
+
 fn relative_path_string(path: &Path) -> Option<String> {
     path.components()
         .map(|component| match component {
@@ -1317,6 +1381,17 @@ mod tests {
             .unwrap();
 
         assert_ne!(repository_worker, async_worker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_output_terminates_a_stalled_process() {
+        let started = Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("5");
+
+        assert!(bounded_command_output(&mut command, Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1703,6 +1778,32 @@ mod tests {
         assert!(manager
             .select("agent", workspace.path(), "checkout")
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_git_config_fifo_without_launching_git() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        git(
+            &checkout,
+            &["config", "--local", "include.path", "blocked.config"],
+        );
+        let fifo = checkout.join(".git/blocked.config");
+        let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (_db, manager) = manager();
+        let started = Instant::now();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
     }
 
     #[test]
