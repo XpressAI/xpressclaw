@@ -23,8 +23,8 @@ use crate::workers::github;
 const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_SCANNED_DIRECTORIES: usize = 512;
 const MAX_REPOSITORIES: usize = 32;
-const MAX_OBJECT_STORE_DEPTH: usize = 4;
-const MAX_OBJECT_STORE_ENTRIES: usize = 100_000;
+const MAX_GIT_METADATA_DEPTH: usize = 32;
+const MAX_GIT_METADATA_ENTRIES: usize = 100_000;
 const CALLBACK_CAPABILITY_CONTEXT: &[u8] = b"xpressclaw-runner-callback-v1\0";
 
 /// Derive the narrow callback capability exposed to one Agent's bundled
@@ -634,6 +634,34 @@ pub fn active_repository_root(
         .map(|candidate| candidate.root))
 }
 
+pub(crate) async fn run_repository_blocking<T>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| Error::Backend(format!("repository worker failed: {error}")))?
+}
+
+/// Resolve repository-scoped GitHub access without running Git discovery or
+/// credential lookup on the caller's async worker.
+pub async fn discover_active_github_access(
+    db: &Arc<Database>,
+    agent_id: &str,
+    bootstrap_root: &Path,
+) -> Result<Option<github::GithubSessionAccess>> {
+    let db = db.clone();
+    let agent_id = agent_id.to_string();
+    let bootstrap_root = bootstrap_root.to_path_buf();
+    run_repository_blocking(move || {
+        let repository = active_repository_root(&db, &agent_id, &bootstrap_root)?;
+        Ok(repository.and_then(|repository| github::discover(&db, &repository)))
+    })
+    .await
+}
+
 fn build_inspection(
     bootstrap_root: PathBuf,
     candidates: Vec<RepositoryCandidate>,
@@ -963,6 +991,7 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         || !git_common_dir.starts_with(bootstrap_root)
         || (!dot_git_type.is_file() && !dot_git_type.is_dir())
         || !commondir_is_regular
+        || !has_regular_git_metadata_tree(bootstrap_root, &git_dir, &git_common_dir)
         || !has_self_contained_object_store(bootstrap_root, &git_common_dir)
         || (top_level != bootstrap_root && !top_level.starts_with(bootstrap_root))
     {
@@ -1031,9 +1060,6 @@ fn has_self_contained_object_store(bootstrap_root: &Path, git_common_dir: &Path)
     if !objects.starts_with(bootstrap_root) {
         return false;
     }
-    if !has_regular_object_store_tree(&objects) {
-        return false;
-    }
 
     let info = objects.join("info");
     match std::fs::symlink_metadata(&info) {
@@ -1054,10 +1080,24 @@ fn has_self_contained_object_store(bootstrap_root: &Path, git_common_dir: &Path)
     }
 }
 
-fn has_regular_object_store_tree(objects: &Path) -> bool {
-    let mut queue = VecDeque::from([(objects.to_path_buf(), 0usize)]);
+fn has_regular_git_metadata_tree(
+    bootstrap_root: &Path,
+    git_dir: &Path,
+    git_common_dir: &Path,
+) -> bool {
+    let roots = if git_dir.starts_with(git_common_dir) {
+        vec![git_common_dir.to_path_buf()]
+    } else if git_common_dir.starts_with(git_dir) {
+        vec![git_dir.to_path_buf()]
+    } else {
+        vec![git_dir.to_path_buf(), git_common_dir.to_path_buf()]
+    };
+    let mut queue = roots
+        .into_iter()
+        .map(|root| (root.clone(), root, 0usize))
+        .collect::<VecDeque<_>>();
     let mut inspected_entries = 0usize;
-    while let Some((directory, depth)) = queue.pop_front() {
+    while let Some((root, directory, depth)) = queue.pop_front() {
         let Ok(entries) = std::fs::read_dir(directory) else {
             return false;
         };
@@ -1066,7 +1106,7 @@ fn has_regular_object_store_tree(objects: &Path) -> bool {
                 return false;
             };
             inspected_entries += 1;
-            if inspected_entries > MAX_OBJECT_STORE_ENTRIES {
+            if inspected_entries > MAX_GIT_METADATA_ENTRIES {
                 return false;
             }
             let Ok(file_type) = entry.file_type() else {
@@ -1076,16 +1116,16 @@ fn has_regular_object_store_tree(objects: &Path) -> bool {
                 return false;
             }
             if file_type.is_dir() {
-                if depth >= MAX_OBJECT_STORE_DEPTH {
+                if depth >= MAX_GIT_METADATA_DEPTH {
                     return false;
                 }
                 let Ok(directory) = entry.path().canonicalize() else {
                     return false;
                 };
-                if !directory.starts_with(objects) {
+                if !directory.starts_with(bootstrap_root) || !directory.starts_with(&root) {
                     return false;
                 }
-                queue.push_back((directory, depth + 1));
+                queue.push_back((root.clone(), directory, depth + 1));
             } else if !file_type.is_file() {
                 return false;
             }
@@ -1134,6 +1174,16 @@ mod tests {
             .unwrap();
         let manager = AgentRepositoryManager::new(db.clone());
         (db, manager)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repository_blocking_work_leaves_the_async_worker() {
+        let async_worker = std::thread::current().id();
+        let repository_worker = run_repository_blocking(move || Ok(std::thread::current().id()))
+            .await
+            .unwrap();
+
+        assert_ne!(repository_worker, async_worker);
     }
 
     #[test]
@@ -1374,6 +1424,55 @@ mod tests {
         std::fs::rename(&pack, &outside_pack).unwrap();
         symlink(&outside_pack, &pack).unwrap();
         git(&checkout, &["cat-file", "-e", "HEAD^{commit}"]);
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_nested_git_metadata_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        std::fs::write(checkout.join("tracked.txt"), "initial\n").unwrap();
+        git(&checkout, &["add", "tracked.txt"]);
+        git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        let index = checkout.join(".git/index");
+        let outside_index = outside.path().join("index");
+        std::fs::rename(&index, &outside_index).unwrap();
+        symlink(&outside_index, &index).unwrap();
+        std::fs::write(checkout.join("tracked.txt"), "changed\n").unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["status", "--porcelain=v1"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert_eq!(
+            String::from_utf8(status.stdout).unwrap(),
+            " M tracked.txt\n"
+        );
         let (_db, manager) = manager();
 
         let inspection = manager.inspect("agent", workspace.path()).unwrap();

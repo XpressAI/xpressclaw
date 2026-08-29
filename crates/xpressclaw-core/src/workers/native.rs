@@ -39,7 +39,8 @@ use crate::docker::manager::{
 };
 use crate::error::{Error, Result};
 use crate::repositories::{
-    agent_callback_capability, AgentRepositoryManager, RepositoryInspection,
+    agent_callback_capability, run_repository_blocking, AgentRepositoryManager,
+    RepositoryBoundaryResult, RepositoryInspection,
 };
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
@@ -1044,12 +1045,11 @@ async fn prepare_repository_for_turn(
     runtime_lifecycle: &NativeRuntimeLifecycle,
 ) -> Result<(OwnedRwLockReadGuard<()>, RuntimeRepository)> {
     let bootstrap_root = resolved_workspace(config, agent);
-    let manager = AgentRepositoryManager::new(db.clone());
     let lifecycle = runtime_lifecycle.slot(&agent.name);
     // Stable repositories retain the ordinary shared runtime path, so Task
     // and Conversation lanes for one Agent can continue concurrently.
     let read_guard = lifecycle.clone().read_owned().await;
-    let inspection = manager.inspect(&agent.name, &bootstrap_root)?;
+    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
     if !inspection.requires_boundary_change() {
         return Ok((
             read_guard,
@@ -1065,9 +1065,9 @@ async fn prepare_repository_for_turn(
     drop(read_guard);
     let write_guard = lifecycle.write_owned().await;
     AgentRegistry::new(db.clone()).get(&agent.name)?;
-    let inspection = manager.inspect(&agent.name, &bootstrap_root)?;
+    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
     let inspection = if inspection.requires_boundary_change() {
-        let boundary = manager.apply_boundary(&agent.name, &bootstrap_root)?;
+        let boundary = apply_repository_boundary_for_turn(db, &agent.name, &bootstrap_root).await?;
         if boundary.changed {
             conversation_processes
                 .retire_agent_everywhere(&agent.name)
@@ -1081,6 +1081,34 @@ async fn prepare_repository_for_turn(
     };
     let guard = OwnedRwLockWriteGuard::downgrade(write_guard);
     Ok((guard, RuntimeRepository::from_inspection(inspection, agent)))
+}
+
+async fn inspect_repository_for_turn(
+    db: &Arc<Database>,
+    agent_id: &str,
+    bootstrap_root: &Path,
+) -> Result<RepositoryInspection> {
+    let db = db.clone();
+    let agent_id = agent_id.to_string();
+    let bootstrap_root = bootstrap_root.to_path_buf();
+    run_repository_blocking(move || {
+        AgentRepositoryManager::new(db).inspect(&agent_id, &bootstrap_root)
+    })
+    .await
+}
+
+async fn apply_repository_boundary_for_turn(
+    db: &Arc<Database>,
+    agent_id: &str,
+    bootstrap_root: &Path,
+) -> Result<RepositoryBoundaryResult> {
+    let db = db.clone();
+    let agent_id = agent_id.to_string();
+    let bootstrap_root = bootstrap_root.to_path_buf();
+    run_repository_blocking(move || {
+        AgentRepositoryManager::new(db).apply_boundary(&agent_id, &bootstrap_root)
+    })
+    .await
 }
 
 async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {

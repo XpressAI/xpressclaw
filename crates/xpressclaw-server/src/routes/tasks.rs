@@ -622,17 +622,9 @@ async fn github_access_for_workspace(
     agent_id: String,
     workspace: std::path::PathBuf,
 ) -> Result<Option<github::GithubSessionAccess>, (StatusCode, Json<Value>)> {
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        let repository =
-            xpressclaw_core::repositories::active_repository_root(&db, &agent_id, &workspace)?;
-        Ok::<_, xpressclaw_core::error::Error>(
-            repository.and_then(|repository| github::discover(&db, &repository)),
-        )
-    })
-    .await
-    .map_err(internal_error)?
-    .map_err(internal_error)
+    xpressclaw_core::repositories::discover_active_github_access(&state.db, &agent_id, &workspace)
+        .await
+        .map_err(internal_error)
 }
 
 async fn task_counts(

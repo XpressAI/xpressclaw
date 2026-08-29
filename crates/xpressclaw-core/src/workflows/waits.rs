@@ -140,12 +140,24 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
             continue;
         };
         let workspace = native::resolved_workspace(config, agent);
-        let repository = match crate::repositories::active_repository_root(
+        let access = match crate::repositories::discover_active_github_access(
             db,
             &agent.name,
             &workspace,
-        ) {
-            Ok(repository) => repository,
+        )
+        .await
+        {
+            Ok(Some(access)) => access,
+            Ok(None) => {
+                warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), "workflow wait cannot discover project-scoped GitHub access");
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some("project-scoped GitHub access is unavailable"),
+                )?;
+                continue;
+            }
             Err(error) => {
                 warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), %error, "workflow wait repository is unavailable");
                 defer_wait(
@@ -156,19 +168,6 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
                 )?;
                 continue;
             }
-        };
-        let Some(access) = repository
-            .as_deref()
-            .and_then(|repository| github::discover(db, repository))
-        else {
-            warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), "workflow wait cannot discover project-scoped GitHub access");
-            defer_wait(
-                &instances,
-                &execution.id,
-                &mut state,
-                Some("project-scoped GitHub access is unavailable"),
-            )?;
-            continue;
         };
         let pull_request = match parse_pull_request(&state.resource) {
             Ok(pull_request) => pull_request,
