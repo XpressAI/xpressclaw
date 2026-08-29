@@ -924,7 +924,12 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
     let top_level = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
     let git_dir = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
     if top_level != directory
-        || (git_dir != top_level && !git_dir.starts_with(&top_level))
+        // A linked worktree keeps its administrative directory beneath the
+        // primary checkout (for example, `.git/worktrees/feature`) rather
+        // than beneath the linked worktree itself. Both locations must stay
+        // inside the Agent's approved workspace, but they need not be nested
+        // within one another.
+        || !git_dir.starts_with(bootstrap_root)
         || (top_level != bootstrap_root && !top_level.starts_with(bootstrap_root))
     {
         return None;
@@ -1066,6 +1071,77 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
             assert!(manager.select("agent", workspace.path(), "escape").is_err());
         }
+    }
+
+    #[test]
+    fn discovery_accepts_linked_worktrees_inside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let primary = workspace.path().join("primary");
+        repository(&primary, None);
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let linked = workspace.path().join("feature");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::Ambiguous);
+        assert_eq!(
+            inspection
+                .candidates
+                .iter()
+                .map(|candidate| candidate.relative_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feature", "primary"]
+        );
+
+        let selected = manager
+            .select("agent", workspace.path(), "feature")
+            .unwrap();
+        assert_eq!(selected.inspection.active_relative_path(), Some("feature"));
+    }
+
+    #[test]
+    fn discovery_rejects_git_metadata_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let repository = workspace.path().join("checkout");
+        let git_dir = outside.path().join("git-dir");
+        let status = Command::new("git")
+            .args(["init", "-q", "--separate-git-dir"])
+            .arg(&git_dir)
+            .arg(&repository)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
     }
 
     #[test]
