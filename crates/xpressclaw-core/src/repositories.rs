@@ -59,6 +59,20 @@ pub struct RepositoryCandidate {
     pub github_repository: Option<String>,
     #[serde(skip)]
     identity: String,
+    #[serde(skip)]
+    git_dir: PathBuf,
+    #[serde(skip)]
+    git_common_dir: PathBuf,
+}
+
+impl RepositoryCandidate {
+    pub(crate) fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    pub(crate) fn git_common_dir(&self) -> &Path {
+        &self.git_common_dir
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -913,7 +927,13 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
     let output = Command::new("git")
         .arg("-C")
         .arg(&directory)
-        .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -923,6 +943,14 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
     let mut lines = stdout.lines();
     let top_level = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
     let git_dir = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
+    let git_common_dir = PathBuf::from(lines.next()?.trim()).canonicalize().ok()?;
+    let dot_git_type = std::fs::symlink_metadata(top_level.join(".git"))
+        .ok()?
+        .file_type();
+    let commondir_is_regular = git_common_dir == git_dir
+        || std::fs::symlink_metadata(git_dir.join("commondir"))
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file());
     if top_level != directory
         // A linked worktree keeps its administrative directory beneath the
         // primary checkout (for example, `.git/worktrees/feature`) rather
@@ -930,6 +958,9 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         // inside the Agent's approved workspace, but they need not be nested
         // within one another.
         || !git_dir.starts_with(bootstrap_root)
+        || !git_common_dir.starts_with(bootstrap_root)
+        || (!dot_git_type.is_file() && !dot_git_type.is_dir())
+        || !commondir_is_regular
         || (top_level != bootstrap_root && !top_level.starts_with(bootstrap_root))
     {
         return None;
@@ -945,9 +976,18 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         .as_deref()
         .and_then(github::parse_repository_remote)
         .map(|(owner, repo)| format!("{owner}/{repo}"));
+    let git_dir_relative = relative_path_string(git_dir.strip_prefix(bootstrap_root).ok()?)?;
+    let git_common_dir_relative =
+        relative_path_string(git_common_dir.strip_prefix(bootstrap_root).ok()?)?;
     let identity = format!(
         "{:x}",
-        Sha256::digest(format!("{relative_path}\0{}", origin.as_deref().unwrap_or("")).as_bytes())
+        Sha256::digest(
+            format!(
+                "{relative_path}\0{}\0{git_dir_relative}\0{git_common_dir_relative}",
+                origin.as_deref().unwrap_or("")
+            )
+            .as_bytes()
+        )
     );
     Some(RepositoryCandidate {
         relative_path,
@@ -955,6 +995,8 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         origin,
         github_repository,
         identity,
+        git_dir,
+        git_common_dir,
     })
 }
 
@@ -1134,6 +1176,42 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_a_common_git_directory_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        repository(outside.path(), None);
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        let outside_common_dir = outside.path().join(".git").canonicalize().unwrap();
+        std::fs::write(
+            checkout.join(".git/commondir"),
+            format!("{}\n", outside_common_dir.display()),
+        )
+        .unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+                .canonicalize()
+                .unwrap(),
+            outside_common_dir
+        );
         let (_db, manager) = manager();
 
         let inspection = manager.inspect("agent", workspace.path()).unwrap();

@@ -61,6 +61,7 @@ const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
 const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
 const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 static PI_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
+static GIT_WORKTREE_REDIRECT_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
@@ -991,6 +992,8 @@ struct RuntimeRepository {
     bootstrap_root: PathBuf,
     active_root: PathBuf,
     active: bool,
+    git_dir: Option<PathBuf>,
+    git_common_dir: Option<PathBuf>,
     container_bootstrap: String,
     container_root: String,
 }
@@ -999,6 +1002,14 @@ impl RuntimeRepository {
     fn from_inspection(inspection: RepositoryInspection, agent: &AgentConfig) -> Self {
         let bootstrap_root = inspection.bootstrap_root.clone();
         let active_root = inspection.active_root().to_path_buf();
+        let git_dir = inspection
+            .active
+            .as_ref()
+            .map(|candidate| candidate.git_dir().to_path_buf());
+        let git_common_dir = inspection
+            .active
+            .as_ref()
+            .map(|candidate| candidate.git_common_dir().to_path_buf());
         let container_bootstrap =
             container_workspace_path(&bootstrap_root, agent.runner.container_engine);
         let container_root =
@@ -1015,6 +1026,8 @@ impl RuntimeRepository {
             bootstrap_root,
             active_root,
             active: inspection.active.is_some(),
+            git_dir,
+            git_common_dir,
             container_bootstrap,
             container_root,
         }
@@ -1960,7 +1973,7 @@ fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
 /// intentionally outside these hashed runtime roots and are never touched.
 pub fn remove_agent_runtime_state(data_dir: &Path, agent_id: &str) -> Result<()> {
     let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
-    for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+    for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
         let path = data_dir
             .join("runtime")
             .join(runtime_kind)
@@ -2564,6 +2577,148 @@ fn requested_session_config(
     Ok(requested)
 }
 
+fn repository_volume_mounts(
+    data_dir: &Path,
+    agent_id: &str,
+    repository: &RuntimeRepository,
+) -> Result<Vec<VolumeMount>> {
+    let mut mounts = vec![VolumeMount {
+        source: repository.bootstrap_root.display().to_string(),
+        target: repository.container_bootstrap.clone(),
+        read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
+    }];
+    let dot_git = repository.active_root.join(".git");
+    let linked_worktree = std::fs::symlink_metadata(&dot_git)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file());
+    if !repository.active || !linked_worktree {
+        return Ok(mounts);
+    }
+
+    let git_dir = repository.git_dir.as_deref().ok_or_else(|| {
+        Error::Backend("active linked worktree has no authorized Git directory".to_string())
+    })?;
+    let git_common_dir = repository.git_common_dir.as_deref().ok_or_else(|| {
+        Error::Backend("active linked worktree has no authorized common Git directory".to_string())
+    })?;
+    let container_git_dir = container_descendant_path(repository, git_dir)?;
+    let container_git_common_dir = container_descendant_path(repository, git_common_dir)?;
+    let topology = format!(
+        "{}\0{container_git_dir}\0{container_git_common_dir}",
+        repository.container_root
+    );
+    let topology_hash = format!("{:x}", Sha256::digest(topology.as_bytes()));
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    let runtime_dir = data_dir
+        .join("runtime")
+        .join("git-worktrees")
+        .join(agent_hash)
+        .join(topology_hash);
+    let _redirect_guard = GIT_WORKTREE_REDIRECT_LOCK.lock().unwrap();
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create linked-worktree runtime directory {}: {error}",
+            runtime_dir.display()
+        ))
+    })?;
+    if let Some(agent_dir) = runtime_dir.parent() {
+        set_private_directory_permissions(agent_dir)?;
+    }
+    set_private_directory_permissions(&runtime_dir)?;
+
+    let dot_git_redirect = runtime_dir.join("dot-git");
+    write_private_atomic(
+        &dot_git_redirect,
+        format!("gitdir: {container_git_dir}\n").as_bytes(),
+    )?;
+    mounts.push(VolumeMount {
+        source: dot_git_redirect.display().to_string(),
+        target: format!("{}/.git", repository.container_root),
+        read_only: true,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+
+    if git_common_dir != git_dir {
+        let host_commondir = git_dir.join("commondir");
+        if !std::fs::symlink_metadata(&host_commondir)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(Error::Backend(format!(
+                "linked worktree Git directory {} has no regular commondir file",
+                git_dir.display()
+            )));
+        }
+        let common_redirect = runtime_dir.join("commondir");
+        write_private_atomic(
+            &common_redirect,
+            format!("{container_git_common_dir}\n").as_bytes(),
+        )?;
+        mounts.push(VolumeMount {
+            source: common_redirect.display().to_string(),
+            target: format!("{container_git_dir}/commondir"),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+    }
+
+    let host_gitdir_backlink = git_dir.join("gitdir");
+    if std::fs::symlink_metadata(&host_gitdir_backlink)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        let gitdir_backlink = runtime_dir.join("gitdir");
+        write_private_atomic(
+            &gitdir_backlink,
+            format!("{}/.git\n", repository.container_root).as_bytes(),
+        )?;
+        mounts.push(VolumeMount {
+            source: gitdir_backlink.display().to_string(),
+            target: format!("{container_git_dir}/gitdir"),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+    }
+    Ok(mounts)
+}
+
+fn container_descendant_path(repository: &RuntimeRepository, host_path: &Path) -> Result<String> {
+    let relative = host_path
+        .strip_prefix(&repository.bootstrap_root)
+        .map_err(|_| {
+            Error::Backend(format!(
+                "Git metadata path {} leaves the Agent workspace {}",
+                host_path.display(),
+                repository.bootstrap_root.display()
+            ))
+        })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().ok_or_else(|| {
+                Error::Backend(format!(
+                    "Git metadata path {} is not valid UTF-8",
+                    host_path.display()
+                ))
+            }),
+            _ => Err(Error::Backend(format!(
+                "Git metadata path {} is not a normalized workspace descendant",
+                host_path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        Ok(repository.container_bootstrap.clone())
+    } else {
+        Ok(format!(
+            "{}/{}",
+            repository.container_bootstrap.trim_end_matches('/'),
+            components.join("/")
+        ))
+    }
+}
+
 fn build_spec(
     config: &Config,
     agent: &AgentConfig,
@@ -2575,12 +2730,7 @@ fn build_spec(
     let image = resolved_runner_image(&agent.runner, kind)?;
     let command = acp_command_for(&agent.runner, kind, &repository.container_root)?;
     let command = with_startup_commands(command, &agent.runner.startup_commands);
-    let mut volumes = vec![VolumeMount {
-        source: repository.bootstrap_root.display().to_string(),
-        target: repository.container_bootstrap.clone(),
-        read_only: false,
-        selinux_relabel: SelinuxRelabel::Shared,
-    }];
+    let mut volumes = repository_volume_mounts(&config.system.data_dir, &agent.name, repository)?;
     for volume in &agent.volumes {
         let mount = parse_volume(volume).ok_or_else(|| {
             Error::Backend(format!(
@@ -3648,6 +3798,16 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn run_git(repository: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
     fn add_test_agent(db: &Arc<Database>, agent_id: &str) {
         db.with_conn(|conn| {
             conn.execute(
@@ -3743,12 +3903,102 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktree_mounts_translate_git_metadata_into_the_container() {
+        let workspace = tempfile::tempdir().unwrap();
+        let primary = workspace.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        run_git(&primary, &["init", "-q"]);
+        run_git(
+            &primary,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let linked = workspace.path().join("feature");
+        run_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let original_dot_git = std::fs::read_to_string(linked.join(".git")).unwrap();
+        assert!(original_dot_git.starts_with("gitdir: "));
+        assert!(!original_dot_git.contains("/workspace/primary"));
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "opencode-agent");
+        let manager = AgentRepositoryManager::new(db);
+        let inspection = manager
+            .select("opencode-agent", workspace.path(), "feature")
+            .unwrap()
+            .inspection;
+        let mut agent = AgentConfig {
+            name: "opencode-agent".into(),
+            backend: "opencode".into(),
+            ..AgentConfig::default()
+        };
+        agent.runner.kind = "opencode".into();
+        agent.runner.workspace = Some(workspace.path().display().to_string());
+        let runtime = RuntimeRepository::from_inspection(inspection, &agent);
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let mounts = repository_volume_mounts(data_dir.path(), &agent.name, &runtime).unwrap();
+        assert_eq!(mounts.len(), 4);
+        assert!(mounts.iter().any(|mount| {
+            mount.source
+                == workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string()
+                && mount.target == "/workspace"
+                && !mount.read_only
+        }));
+        let expected = [
+            (
+                "/workspace/feature/.git",
+                "gitdir: /workspace/primary/.git/worktrees/feature\n",
+            ),
+            (
+                "/workspace/primary/.git/worktrees/feature/commondir",
+                "/workspace/primary/.git\n",
+            ),
+            (
+                "/workspace/primary/.git/worktrees/feature/gitdir",
+                "/workspace/feature/.git\n",
+            ),
+        ];
+        for (target, contents) in expected {
+            let mount = mounts.iter().find(|mount| mount.target == target).unwrap();
+            assert!(mount.read_only);
+            assert_eq!(mount.selinux_relabel, SelinuxRelabel::Shared);
+            assert_eq!(std::fs::read_to_string(&mount.source).unwrap(), contents);
+        }
+        assert_eq!(
+            std::fs::read_to_string(linked.join(".git")).unwrap(),
+            original_dot_git
+        );
+    }
+
+    #[test]
     fn agent_runtime_cleanup_is_idempotent_and_preserves_workspaces() {
         let root = tempfile::tempdir().unwrap();
         let data_dir = root.path().join("data");
         let agent_id = "atlas";
         let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
-        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
             let runtime_dir = data_dir
                 .join("runtime")
                 .join(runtime_kind)
@@ -3763,7 +4013,7 @@ mod tests {
         remove_agent_runtime_state(&data_dir, agent_id).unwrap();
         remove_agent_runtime_state(&data_dir, agent_id).unwrap();
 
-        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config"] {
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
             assert!(!data_dir
                 .join("runtime")
                 .join(runtime_kind)
