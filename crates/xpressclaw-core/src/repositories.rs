@@ -23,6 +23,8 @@ use crate::workers::github;
 const MAX_DISCOVERY_DEPTH: usize = 4;
 const MAX_SCANNED_DIRECTORIES: usize = 512;
 const MAX_REPOSITORIES: usize = 32;
+const MAX_OBJECT_STORE_DEPTH: usize = 4;
+const MAX_OBJECT_STORE_ENTRIES: usize = 100_000;
 const CALLBACK_CAPABILITY_CONTEXT: &[u8] = b"xpressclaw-runner-callback-v1\0";
 
 /// Derive the narrow callback capability exposed to one Agent's bundled
@@ -1029,6 +1031,9 @@ fn has_self_contained_object_store(bootstrap_root: &Path, git_common_dir: &Path)
     if !objects.starts_with(bootstrap_root) {
         return false;
     }
+    if !has_regular_object_store_tree(&objects) {
+        return false;
+    }
 
     let info = objects.join("info");
     match std::fs::symlink_metadata(&info) {
@@ -1047,6 +1052,46 @@ fn has_self_contained_object_store(bootstrap_root: &Path, git_common_dir: &Path)
         Ok(metadata) => metadata.file_type().is_file() && metadata.len() == 0,
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+fn has_regular_object_store_tree(objects: &Path) -> bool {
+    let mut queue = VecDeque::from([(objects.to_path_buf(), 0usize)]);
+    let mut inspected_entries = 0usize;
+    while let Some((directory, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            inspected_entries += 1;
+            if inspected_entries > MAX_OBJECT_STORE_ENTRIES {
+                return false;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                return false;
+            };
+            if file_type.is_symlink() {
+                return false;
+            }
+            if file_type.is_dir() {
+                if depth >= MAX_OBJECT_STORE_DEPTH {
+                    return false;
+                }
+                let Ok(directory) = entry.path().canonicalize() else {
+                    return false;
+                };
+                if !directory.starts_with(objects) {
+                    return false;
+                }
+                queue.push_back((directory, depth + 1));
+            } else if !file_type.is_file() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn relative_path_string(path: &Path) -> Option<String> {
@@ -1290,6 +1335,44 @@ mod tests {
             PathBuf::from(alternates.trim()).canonicalize().unwrap(),
             source.join(".git/objects").canonicalize().unwrap()
         );
+        git(&checkout, &["cat-file", "-e", "HEAD^{commit}"]);
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_nested_object_store_symlink_escapes() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("checkout");
+        repository(&checkout, None);
+        git(
+            &checkout,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        git(&checkout, &["repack", "-ad"]);
+        let pack = checkout.join(".git/objects/pack");
+        let outside_pack = outside.path().join("pack");
+        std::fs::rename(&pack, &outside_pack).unwrap();
+        symlink(&outside_pack, &pack).unwrap();
         git(&checkout, &["cat-file", "-e", "HEAD^{commit}"]);
         let (_db, manager) = manager();
 
