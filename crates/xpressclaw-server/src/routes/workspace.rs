@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::process::Output;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::repositories::{
     AgentRepositoryManager, RepositoryInspection, RepositorySelectionState,
@@ -124,7 +126,7 @@ async fn workspace_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let repository = repository_status_json(&state, &agent_id).await?;
     let docker = state.docker().await;
     let container_exists = match docker.as_ref() {
@@ -162,9 +164,12 @@ async fn select_repository(
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
     let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    AgentRepositoryManager::new(state.db.clone())
-        .propose(&agent_id, &bootstrap, &input.path)
-        .map_err(core_error)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose(&operation_agent_id, &bootstrap, &input.path)
+    })
+    .await?;
     Ok(Json(repository_status_json(&state, &agent_id).await?))
 }
 
@@ -175,9 +180,12 @@ async fn clear_repository(
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
     let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    AgentRepositoryManager::new(state.db.clone())
-        .propose_clear(&agent_id, &bootstrap)
-        .map_err(core_error)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose_clear(&operation_agent_id, &bootstrap)
+    })
+    .await?;
     Ok(Json(repository_status_json(&state, &agent_id).await?))
 }
 
@@ -197,9 +205,12 @@ async fn propose_repository(
         ));
     }
     let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let inspection = AgentRepositoryManager::new(state.db.clone())
-        .propose(&agent_id, &bootstrap, &input.path)
-        .map_err(core_error)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    let inspection = run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose(&operation_agent_id, &bootstrap, &input.path)
+    })
+    .await?;
     Ok(Json(json!({
         "status": "pending",
         "path": inspection.pending_relative_path,
@@ -228,7 +239,20 @@ async fn resolve_github_repository(
     }
 
     let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let manager = AgentRepositoryManager::new(state.db.clone());
+    let db = state.db.clone();
+    let response =
+        run_blocking(move || resolve_github_repository_blocking(db, agent_id, bootstrap, input))
+            .await?;
+    Ok(Json(response))
+}
+
+fn resolve_github_repository_blocking(
+    db: Arc<Database>,
+    agent_id: String,
+    bootstrap: PathBuf,
+    input: GithubRepositoryResolutionInput,
+) -> ApiResult<Value> {
+    let manager = AgentRepositoryManager::new(db.clone());
     let inspection = manager.inspect(&agent_id, &bootstrap).map_err(core_error)?;
     let requested = input
         .path
@@ -300,7 +324,7 @@ async fn resolve_github_repository(
             "the selected Git repository does not have a supported GitHub origin",
         )
     })?;
-    let access = github::discover(&state.db, &candidate.root).ok_or_else(|| {
+    let access = github::discover(&db, &candidate.root).ok_or_else(|| {
         repository_resolution_conflict(
             &inspection,
             "no matching GitHub connector, GH_TOKEN, or host gh credential is available",
@@ -331,11 +355,11 @@ async fn resolve_github_repository(
         ));
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "path": candidate.relative_path,
         "repository": github_repository,
         "token": access.mcp_token(),
-    })))
+    }))
 }
 
 fn repository_resolution_message(inspection: &RepositoryInspection) -> &'static str {
@@ -381,10 +405,9 @@ fn repository_resolution_conflict(
 
 async fn repository_status_json(state: &AppState, agent_id: &str) -> ApiResult<Value> {
     let (agent, bootstrap) = agent_workspace(state, agent_id)?;
-    let inspection = AgentRepositoryManager::new(state.db.clone())
-        .inspect(agent_id, &bootstrap)
-        .map_err(core_error)?;
-    let (github_status, github_repository) = github_availability(state, &agent, &inspection).await;
+    let inspection = inspect_repository(state, agent_id, bootstrap).await?;
+    let (github_status, github_repository) =
+        github_availability(state, &agent, &inspection).await?;
     let message = repository_message(&inspection, github_status);
     let restart_required = inspection.requires_runtime_restart();
     Ok(json!({
@@ -407,9 +430,9 @@ async fn github_availability(
     state: &AppState,
     agent: &xpressclaw_core::config::AgentConfig,
     inspection: &RepositoryInspection,
-) -> (&'static str, Option<String>) {
+) -> ApiResult<(&'static str, Option<String>)> {
     let Some(repository) = inspection.active.as_ref() else {
-        return ("unavailable", None);
+        return Ok(("unavailable", None));
     };
     if agent
         .runner
@@ -417,21 +440,25 @@ async fn github_availability(
         .iter()
         .any(|server| server == "github")
     {
-        return ("explicit_override", repository.github_repository.clone());
+        return Ok(("explicit_override", repository.github_repository.clone()));
     }
     let Some(repository_name) = repository.github_repository.clone() else {
-        return ("non_github_origin", None);
+        return Ok(("non_github_origin", None));
     };
-    if github::discover(&state.db, &repository.root).is_none() {
-        return ("missing_credential", Some(repository_name));
+    let db = state.db.clone();
+    let repository_root = repository.root.clone();
+    let credential_available =
+        run_blocking(move || Ok(github::discover(&db, &repository_root).is_some())).await?;
+    if !credential_available {
+        return Ok(("missing_credential", Some(repository_name)));
     }
     let kind = match native::resolve_runner_kind(agent) {
         Ok(kind) => kind,
-        Err(_) => return ("incompatible_image", Some(repository_name)),
+        Err(_) => return Ok(("incompatible_image", Some(repository_name))),
     };
     let image = match native::resolved_runner_image(&agent.runner, &kind) {
         Ok(image) => image,
-        Err(_) => return ("incompatible_image", Some(repository_name)),
+        Err(_) => return Ok(("incompatible_image", Some(repository_name))),
     };
     let built_in =
         xpressclaw_core::config::default_native_runner_image(&kind, agent.runner.container_engine)
@@ -446,9 +473,9 @@ async fn github_availability(
         false
     };
     if compatible {
-        ("attached", Some(repository_name))
+        Ok(("attached", Some(repository_name)))
     } else {
-        ("incompatible_image", Some(repository_name))
+        Ok(("incompatible_image", Some(repository_name)))
     }
 }
 
@@ -502,7 +529,7 @@ async fn list_directory(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&query.path)?;
     let workspace = open_workspace_dir(&root)?;
 
@@ -575,7 +602,7 @@ async fn read_file(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&query.path)?;
     let workspace = open_workspace_dir(&root)?;
     let mut file = workspace
@@ -640,7 +667,7 @@ async fn write_file(
             ),
         ));
     }
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&input.path)?;
     let workspace = open_workspace_dir(&root)?;
     let (parent, file_name) = open_parent_dir(&workspace, &relative)?;
@@ -701,7 +728,7 @@ async fn git_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let repository_status = repository_status_json(&state, &agent_id).await?;
     if repository_status
         .get("active")
@@ -771,9 +798,8 @@ async fn git_diff(
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
     let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
-    let root = AgentRepositoryManager::new(state.db.clone())
-        .inspect(&agent_id, &bootstrap)
-        .map_err(core_error)?
+    let root = inspect_repository(&state, &agent_id, bootstrap)
+        .await?
         .active
         .map(|candidate| candidate.root)
         .ok_or_else(|| api_error(StatusCode::CONFLICT, "no active Git repository is selected"))?;
@@ -846,7 +872,7 @@ async fn open_terminal(
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_same_origin(&headers)?;
-    let _ = workspace_root(&state, &agent_id)?;
+    let _ = workspace_root(&state, &agent_id).await?;
     let docker = state.docker().await.ok_or_else(|| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -951,6 +977,35 @@ async fn terminal_socket(
     let _ = input.shutdown().await;
 }
 
+async fn run_blocking<T>(operation: impl FnOnce() -> ApiResult<T> + Send + 'static) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| internal_error(format!("repository worker failed: {error}")))?
+}
+
+async fn run_repository_operation<T>(
+    operation: impl FnOnce() -> xpressclaw_core::error::Result<T> + Send + 'static,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    run_blocking(move || operation().map_err(core_error)).await
+}
+
+async fn inspect_repository(
+    state: &AppState,
+    agent_id: &str,
+    bootstrap: PathBuf,
+) -> ApiResult<RepositoryInspection> {
+    let db = state.db.clone();
+    let agent_id = agent_id.to_string();
+    run_repository_operation(move || AgentRepositoryManager::new(db).inspect(&agent_id, &bootstrap))
+        .await
+}
+
 fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     match output {
         bollard::container::LogOutput::StdIn { message }
@@ -960,11 +1015,9 @@ fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     }
 }
 
-fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
+async fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
     let (_, bootstrap) = agent_workspace(state, agent_id)?;
-    let inspection = AgentRepositoryManager::new(state.db.clone())
-        .inspect(agent_id, &bootstrap)
-        .map_err(core_error)?;
+    let inspection = inspect_repository(state, agent_id, bootstrap).await?;
     Ok(inspection.active_root().to_path_buf())
 }
 
@@ -1276,6 +1329,17 @@ mod tests {
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repository_work_runs_outside_the_async_worker() {
+        let async_worker = std::thread::current().id();
+        let repository_worker =
+            run_blocking(move || Ok::<_, ApiError>(std::thread::current().id()))
+                .await
+                .unwrap();
+
+        assert_ne!(repository_worker, async_worker);
     }
 
     #[tokio::test]

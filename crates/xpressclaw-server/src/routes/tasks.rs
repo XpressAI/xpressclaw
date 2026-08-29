@@ -165,12 +165,8 @@ async fn register_pull_request(
             )
         })?;
     let workspace = native::resolved_workspace(&config, agent);
-    let repository =
-        xpressclaw_core::repositories::active_repository_root(&state.db, &agent.name, &workspace)
-            .map_err(internal_error)?;
-    let access = repository
-        .as_deref()
-        .and_then(|repository| github::discover(&state.db, repository))
+    let access = github_access_for_workspace(&state, agent.name.clone(), workspace)
+        .await?
         .ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -440,9 +436,11 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
-    let agent_repository = new_agent
-        .as_deref()
-        .and_then(|agent_id| github_access_for_agent(&state, agent_id));
+    let agent_repository = if let Some(agent_id) = new_agent.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
 
     let task = board
         .update_with_agent_repository(
@@ -565,6 +563,13 @@ async fn update_task_status(
             .map_err(internal_error)?;
         return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
     }
+    let agent_repository = if req.status == "completed" {
+        None
+    } else if let Some(agent_id) = req.agent_id.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
     let updated = if req.status == "completed" {
         board
             .complete_and_roll_up(&id, req.agent_id.as_deref())
@@ -575,10 +580,6 @@ async fn update_task_status(
                     .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
             })
     } else {
-        let agent_repository = req
-            .agent_id
-            .as_deref()
-            .and_then(|agent_id| github_access_for_agent(&state, agent_id));
         board.update_status_with_agent_repository(
             &id,
             &req.status,
@@ -603,17 +604,35 @@ async fn update_task_status(
     Ok(Json(json!(task)))
 }
 
-fn github_access_for_agent(
+async fn github_access_for_agent(
     state: &AppState,
     agent_id: &str,
 ) -> Option<github::GithubSessionAccess> {
     let config = state.config();
     let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
     let workspace = native::resolved_workspace(&config, agent);
-    let repository =
-        xpressclaw_core::repositories::active_repository_root(&state.db, &agent.name, &workspace)
-            .ok()??;
-    github::discover(&state.db, &repository)
+    github_access_for_workspace(state, agent.name.clone(), workspace)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn github_access_for_workspace(
+    state: &AppState,
+    agent_id: String,
+    workspace: std::path::PathBuf,
+) -> Result<Option<github::GithubSessionAccess>, (StatusCode, Json<Value>)> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let repository =
+            xpressclaw_core::repositories::active_repository_root(&db, &agent_id, &workspace)?;
+        Ok::<_, xpressclaw_core::error::Error>(
+            repository.and_then(|repository| github::discover(&db, &repository)),
+        )
+    })
+    .await
+    .map_err(internal_error)?
+    .map_err(internal_error)
 }
 
 async fn task_counts(
