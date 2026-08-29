@@ -961,6 +961,7 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         || !git_common_dir.starts_with(bootstrap_root)
         || (!dot_git_type.is_file() && !dot_git_type.is_dir())
         || !commondir_is_regular
+        || !has_self_contained_object_store(bootstrap_root, &git_common_dir)
         || (top_level != bootstrap_root && !top_level.starts_with(bootstrap_root))
     {
         return None;
@@ -1012,6 +1013,40 @@ fn git_origin(repository: &Path) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|origin| !origin.is_empty())
+}
+
+fn has_self_contained_object_store(bootstrap_root: &Path, git_common_dir: &Path) -> bool {
+    let objects = git_common_dir.join("objects");
+    let Ok(objects_metadata) = std::fs::symlink_metadata(&objects) else {
+        return false;
+    };
+    if !objects_metadata.file_type().is_dir() {
+        return false;
+    }
+    let Ok(objects) = objects.canonicalize() else {
+        return false;
+    };
+    if !objects.starts_with(bootstrap_root) {
+        return false;
+    }
+
+    let info = objects.join("info");
+    match std::fs::symlink_metadata(&info) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Ok(_) | Err(_) => return false,
+    }
+
+    // Git object alternates can recursively borrow objects from arbitrary
+    // stores. Even an alternate currently inside the approved workspace may
+    // embed an absolute host path that is invalid after the runner relocates
+    // the workspace. Fail closed instead of allowing host Git to cross the
+    // boundary or starting an unusable ACP session.
+    let alternates = info.join("alternates");
+    match std::fs::symlink_metadata(alternates) {
+        Ok(metadata) => metadata.file_type().is_file() && metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn relative_path_string(path: &Path) -> Option<String> {
@@ -1212,6 +1247,50 @@ mod tests {
                 .unwrap(),
             outside_common_dir
         );
+        let (_db, manager) = manager();
+
+        let inspection = manager.inspect("agent", workspace.path()).unwrap();
+        assert_eq!(inspection.state, RepositorySelectionState::NoRepository);
+        assert!(inspection.candidates.is_empty());
+        assert!(manager
+            .select("agent", workspace.path(), "checkout")
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_rejects_object_alternates_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = outside.path().join("source");
+        repository(&source, None);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let checkout = workspace.path().join("checkout");
+        let status = Command::new("git")
+            .args(["clone", "-q", "--shared"])
+            .arg(&source)
+            .arg(&checkout)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let alternates =
+            std::fs::read_to_string(checkout.join(".git/objects/info/alternates")).unwrap();
+        assert_eq!(
+            PathBuf::from(alternates.trim()).canonicalize().unwrap(),
+            source.join(".git/objects").canonicalize().unwrap()
+        );
+        git(&checkout, &["cat-file", "-e", "HEAD^{commit}"]);
         let (_db, manager) = manager();
 
         let inspection = manager.inspect("agent", workspace.path()).unwrap();
