@@ -1,0 +1,151 @@
+#!/usr/bin/env node
+
+import { open } from 'node:fs/promises';
+
+const MAX_ARCHIVE_BYTES = 20 * 1024 * 1024;
+const MAX_ENTRIES = 4096;
+const MAX_ENTRY_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
+const MAX_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024;
+const EOCD_SIGNATURE = 0x06054b50;
+const CENTRAL_SIGNATURE = 0x02014b50;
+const LOCAL_SIGNATURE = 0x04034b50;
+
+function fail(message) {
+  console.error(`invalid presentation package: ${message}`);
+  process.exit(65);
+}
+
+if (process.argv.length !== 3) {
+  console.error('usage: xpressclaw-check-presentation-package INPUT.pptx');
+  process.exit(64);
+}
+
+async function readBounded(path) {
+  const file = await open(path, 'r');
+  try {
+    const metadata = await file.stat();
+    if (!metadata.isFile()) fail('input is not a regular file');
+    if (metadata.size < 22 || metadata.size > MAX_ARCHIVE_BYTES) {
+      fail('compressed package must be between 22 bytes and 20 MiB');
+    }
+    const data = Buffer.alloc(metadata.size);
+    let offset = 0;
+    while (offset < data.length) {
+      const { bytesRead } = await file.read(data, offset, data.length - offset, offset);
+      if (bytesRead === 0) fail('package changed while it was being read');
+      offset += bytesRead;
+    }
+    const trailing = Buffer.alloc(1);
+    if ((await file.read(trailing, 0, 1, data.length)).bytesRead !== 0) {
+      fail('package grew while it was being read');
+    }
+    return data;
+  } finally {
+    await file.close();
+  }
+}
+
+function checkedEnd(start, length, boundary, label) {
+  const end = start + length;
+  if (!Number.isSafeInteger(end) || start < 0 || length < 0 || end > boundary) {
+    fail(`${label} leaves the bounded archive region`);
+  }
+  return end;
+}
+
+function entryNameIsSafe(name) {
+  if (!name || name.includes('\0') || name.includes('\\') || name.startsWith('/')) return false;
+  return !name.split('/').some((component) => component === '..');
+}
+
+const data = await readBounded(process.argv[2]);
+const searchStart = Math.max(0, data.length - 22 - 0xffff);
+let eocd = -1;
+for (let offset = data.length - 22; offset >= searchStart; offset -= 1) {
+  if (data.readUInt32LE(offset) !== EOCD_SIGNATURE) continue;
+  const commentLength = data.readUInt16LE(offset + 20);
+  if (offset + 22 + commentLength === data.length) {
+    eocd = offset;
+    break;
+  }
+}
+if (eocd < 0) fail('missing a bounded end-of-central-directory record');
+
+const disk = data.readUInt16LE(eocd + 4);
+const centralDisk = data.readUInt16LE(eocd + 6);
+const entriesOnDisk = data.readUInt16LE(eocd + 8);
+const entryCount = data.readUInt16LE(eocd + 10);
+const centralSize = data.readUInt32LE(eocd + 12);
+const centralOffset = data.readUInt32LE(eocd + 16);
+if (disk !== 0 || centralDisk !== 0 || entriesOnDisk !== entryCount) {
+  fail('multi-disk ZIP packages are not supported');
+}
+if (entryCount === 0 || entryCount > MAX_ENTRIES) {
+  fail(`package entry count must be between 1 and ${MAX_ENTRIES}`);
+}
+if (centralSize === 0xffffffff || centralOffset === 0xffffffff) {
+  fail('ZIP64 packages are not supported');
+}
+const centralEnd = checkedEnd(centralOffset, centralSize, eocd, 'central directory');
+if (centralEnd !== eocd) fail('central directory has an unexpected trailing region');
+
+let cursor = centralOffset;
+let totalUncompressed = 0;
+let hasContentTypes = false;
+let hasPresentation = false;
+for (let index = 0; index < entryCount; index += 1) {
+  checkedEnd(cursor, 46, centralEnd, 'central-directory header');
+  if (data.readUInt32LE(cursor) !== CENTRAL_SIGNATURE) {
+    fail(`entry ${index + 1} has an invalid central-directory header`);
+  }
+  const flags = data.readUInt16LE(cursor + 8);
+  const method = data.readUInt16LE(cursor + 10);
+  const compressedSize = data.readUInt32LE(cursor + 20);
+  const uncompressedSize = data.readUInt32LE(cursor + 24);
+  const nameLength = data.readUInt16LE(cursor + 28);
+  const extraLength = data.readUInt16LE(cursor + 30);
+  const commentLength = data.readUInt16LE(cursor + 32);
+  const startDisk = data.readUInt16LE(cursor + 34);
+  const localOffset = data.readUInt32LE(cursor + 42);
+  if ((flags & 1) !== 0) fail('encrypted entries are not supported');
+  if (method !== 0 && method !== 8) fail(`entry ${index + 1} uses an unsupported compression method`);
+  if (
+    compressedSize === 0xffffffff || uncompressedSize === 0xffffffff ||
+    localOffset === 0xffffffff || startDisk !== 0
+  ) {
+    fail('ZIP64 or multi-disk entries are not supported');
+  }
+  if (uncompressedSize > MAX_ENTRY_UNCOMPRESSED_BYTES) {
+    fail(`entry ${index + 1} exceeds the 64 MiB uncompressed limit`);
+  }
+  totalUncompressed += uncompressedSize;
+  if (totalUncompressed > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+    fail('package exceeds the 128 MiB total uncompressed limit');
+  }
+
+  const variableLength = nameLength + extraLength + commentLength;
+  const next = checkedEnd(cursor + 46, variableLength, centralEnd, 'central-directory entry');
+  const name = data.toString('utf8', cursor + 46, cursor + 46 + nameLength);
+  if (!entryNameIsSafe(name)) fail(`entry ${index + 1} has an unsafe name`);
+  hasContentTypes ||= name === '[Content_Types].xml';
+  hasPresentation ||= name === 'ppt/presentation.xml';
+
+  checkedEnd(localOffset, 30, centralOffset, 'local-file header');
+  if (data.readUInt32LE(localOffset) !== LOCAL_SIGNATURE) {
+    fail(`entry ${index + 1} has an invalid local-file header`);
+  }
+  const localNameLength = data.readUInt16LE(localOffset + 26);
+  const localExtraLength = data.readUInt16LE(localOffset + 28);
+  const dataStart = checkedEnd(
+    localOffset + 30,
+    localNameLength + localExtraLength,
+    centralOffset,
+    'local-file metadata',
+  );
+  checkedEnd(dataStart, compressedSize, centralOffset, 'compressed entry data');
+  cursor = next;
+}
+if (cursor !== centralEnd) fail('central-directory entry count does not match its size');
+if (!hasContentTypes || !hasPresentation) {
+  fail('required PowerPoint package parts are missing');
+}

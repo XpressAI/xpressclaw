@@ -17,6 +17,7 @@ pub mod conversations;
 pub mod docker;
 pub mod llm;
 pub mod memory;
+pub mod message_artifacts;
 pub mod projects;
 pub mod repositories;
 pub mod sessions;

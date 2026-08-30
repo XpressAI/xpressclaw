@@ -505,6 +505,11 @@ async fn get_attachment(
                 safe_filename(&attachment.name)
             ),
         )
+        .header("x-content-type-options", "nosniff")
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
         .body(Body::from(data))
         .map_err(|error| api_error(error.to_string()))
 }
@@ -572,7 +577,8 @@ fn safe_filename(name: &str) -> String {
     name.chars()
         .map(|character| match character {
             '\r' | '\n' | '"' | '\\' => '_',
-            other => other,
+            other if other == ' ' || other.is_ascii_graphic() => other,
+            _ => '_',
         })
         .collect()
 }
@@ -739,6 +745,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"brief.txt\""
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
             "hello"

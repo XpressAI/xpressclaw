@@ -546,6 +546,13 @@ export interface RunnerReadiness {
 	command_present: boolean;
 	subscription_auth: boolean;
 	auth_present: boolean;
+	presentation_artifacts?: {
+		supported: boolean;
+		available: boolean;
+		capability: string | null;
+		runtime: string | null;
+		reason: string | null;
+	};
 	issues: string[];
 }
 

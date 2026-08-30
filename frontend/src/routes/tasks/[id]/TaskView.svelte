@@ -79,7 +79,7 @@
 			role: string;
 			content: string;
 			messageId?: number;
-			attachments: { id?: string; name: string; src: string }[];
+			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
 			visualizations: MessageVisualization[];
 			sequence: number;
 		}
@@ -206,6 +206,8 @@
 				id: attachment.id,
 				name: attachment.name,
 				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+				mimeType: attachment.mime_type,
+				size: attachment.size,
 			})),
 			visualizations: message.visualizations ?? [],
 			sequence: message.id,

@@ -44,6 +44,7 @@ async-imap = "0.10"
 async-native-tls = "0.5"
 async-std = { version = "1", features = ["default"] }
 base64 = "0.22"
+zip = { workspace = true }
 libc = "0.2"
 glob = "0.3"
 tempfile = "3"

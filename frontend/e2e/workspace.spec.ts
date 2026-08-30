@@ -366,6 +366,7 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		runnerReadiness?: Record<string, unknown>;
 		visualizationDocuments?: Record<string, string>;
 		visualizationRequests?: { path: string; token: string | undefined }[];
 	} = {},
@@ -1140,7 +1141,7 @@ async function mockApi(
 				artifacts: [],
 			};
 		} else if (path === `/api/sessions/${agentId}/readiness`) {
-			response = { ready: true };
+			response = options.runnerReadiness ?? { ready: true };
 		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
 			const targetAgentId = path.split('/')[3];
 			const payload = request.postDataJSON() as Record<string, unknown>;
@@ -2135,6 +2136,35 @@ test('raw HTML stays literal across task messages, activity, results, and previe
 	const preview = page.locator(`[data-task-row][href="/tasks/${taskId}"]`);
 	await expect(preview).toContainText(taskPrompt);
 	await expect(preview.locator('custom-prompt')).toHaveCount(0);
+});
+
+test('task presentation attachments render as durable download cards', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 7,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'The rendered and validated deck is attached.',
+			attachments: [{
+				id: 'presentation-browser-test',
+				name: 'Review deck.pptx',
+				mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+				size: 2_621_440,
+			}],
+			timestamp: timestamp(25),
+		}],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const message = page.locator('[data-message-role="assistant"]');
+	await expect(message).toContainText('The rendered and validated deck is attached.');
+	const attachment = message.getByRole('link', { name: 'Download Review deck.pptx' });
+	await expect(attachment).toHaveAttribute(
+		'href',
+		`/api/tasks/${taskId}/messages/7/attachments/presentation-browser-test`,
+	);
+	await expect(attachment).toContainText('PowerPoint presentation · 2.5 MB');
+	await expect(message.locator('[data-message-attachments] img')).toHaveCount(0);
 });
 
 test('task assistant visualizations render in order, stay isolated, and confirm follow-ups', async ({ page }) => {
@@ -3218,6 +3248,27 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 		'/tasks/project-task-2',
 	]);
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
+});
+
+test('agent Work reports the pinned Codex presentation capability', async ({ page }) => {
+	await mockApi(page, {
+		runnerReadiness: {
+			ready: true,
+			kind: 'codex',
+			presentation_artifacts: {
+				supported: true,
+				available: true,
+				capability: 'xpressclaw-pptx-v1',
+				runtime: 'PptxGenJS 4.0.1',
+				reason: null,
+			},
+		},
+	});
+	await page.goto(`/agents/${agentId}`);
+
+	const readiness = page.locator('[data-presentation-readiness]');
+	await expect(readiness).toContainText('PowerPoint artifacts ready');
+	await expect(readiness).toContainText('PptxGenJS 4.0.1 is pinned in this runner');
 });
 
 test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {

@@ -72,6 +72,18 @@ bidirectional stdio. Tasks are sent with `session/prompt`, while fresh and
 continued work use ACP session lifecycle methods. Agent commands and versions
 follow the official ACP Registry.
 
+## Codex presentation artifacts
+
+The Codex images include the separate `xpressclaw-presentations` skill and a
+read-only PptxGenJS 4.0.1, LibreOffice, and Poppler runtime. The Dockerfile
+authors and renders a smoke deck during the image build. Exact image labels
+gate discovery through ACP `additionalDirectories`, so an older or custom
+image without the runtime remains usable but cannot advertise presentation
+delivery. OpenAI's primary-runtime Presentations and Spreadsheets skills are
+disabled in Codex ACP sessions because their host-provided
+`load_workspace_dependencies`/`@oai/artifact-tool` contract is not available
+there. See [`docs/presentations.md`](../../docs/presentations.md).
+
 ## Publishing
 
 `Build & Push Runner Images` publishes all multi-architecture tags on a

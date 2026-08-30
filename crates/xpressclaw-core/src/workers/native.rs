@@ -31,20 +31,21 @@ use crate::config::{
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
-use crate::conversations::{ConversationManager, SendMessage};
+use crate::conversations::{ConversationManager, NewConversationAttachment, SendMessage};
 use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::error::{Error, Result};
+use crate::message_artifacts::{bound_published_file_name, prepare_message_artifacts};
 use crate::repositories::{
     agent_callback_capability, discover_github_access, run_repository_blocking,
     AgentRepositoryManager, RepositoryBoundaryResult, RepositoryInspection,
 };
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
-use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
+use crate::tasks::conversation::{FinalAssistantAttempt, PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::visualizations::{
     is_absolute_runner_root, prepare_message_visualizations, PreparedVisualization,
@@ -55,6 +56,10 @@ use crate::workers::acp::{
     AcpTurnOptions, AcpTurnRuntime,
 };
 use crate::workers::github;
+use crate::workers::presentations::{
+    configure_codex_presentations, PRESENTATION_CAPABILITY, PRESENTATION_CAPABILITY_LABEL,
+    PRESENTATION_RUNTIME_VERSION, PRESENTATION_RUNTIME_VERSION_LABEL,
+};
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
 const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
@@ -755,6 +760,9 @@ async fn execute_conversation_turn(
         bundled_control_tools,
         &mut spec.environment,
     )?;
+    let presentation_runtime = presentation_runtime_available(&docker, &spec.image).await;
+    let presentation_support =
+        configure_codex_presentations(&kind, presentation_runtime, &mut spec.environment)?;
     if bundled_control_tools
         && !agent
             .runner
@@ -892,6 +900,7 @@ async fn execute_conversation_turn(
                 session_config: agent.runner.session_config.clone(),
                 mcp_servers,
                 mcp_signature,
+                additional_directories: presentation_support.additional_directories,
                 image_attachments: vec![],
             },
         )
@@ -915,6 +924,7 @@ async fn execute_conversation_turn(
         }
     };
     let visualizations = prepare_message_visualizations(&result.summary, &visualization_roots);
+    let published = prepare_message_artifacts(&result.summary, &visualization_roots);
     let Some(message) = queue.complete_with_message_and_visualizations(
         &turn,
         &result.session_id,
@@ -922,17 +932,19 @@ async fn execute_conversation_turn(
             sender_type: "agent".into(),
             sender_id: turn.agent_id.clone(),
             sender_name: Some(agent.context_label()),
-            content: result.summary,
+            content: published.content,
             message_type: None,
         },
         &json!({ "conversation_turn_id": turn.id, "runner": kind }),
         &visualizations,
+        &published.attachments,
     )?
     else {
         event_bus.send(&turn.conversation_id, ConversationEvent::Done);
         return Ok(());
     };
     let mut message_value = json!(message);
+    message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
     message_value["visualizations"] = json!(manager.visualizations(message.id).unwrap_or_default());
     event_bus.send(
         &turn.conversation_id,
@@ -1259,6 +1271,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         bundled_control_tools,
         &mut spec.environment,
     )?;
+    let presentation_runtime = presentation_runtime_available(&docker, &spec.image).await;
+    let presentation_support =
+        configure_codex_presentations(&kind, presentation_runtime, &mut spec.environment)?;
     if bundled_control_tools
         && !agent
             .runner
@@ -1383,6 +1398,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 session_config: requested_session_config,
                 mcp_servers,
                 mcp_signature,
+                additional_directories: presentation_support.additional_directories,
                 image_attachments: prompt.attachments,
             },
         )
@@ -1398,7 +1414,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
-    let turn = turn?;
+    let mut turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
     if matches!(current.status.as_str(), "cancelled" | "interrupted") {
         return Ok(());
@@ -1435,6 +1451,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         return Ok(());
     }
     let visualizations = prepare_message_visualizations(&turn.summary, &visualization_roots);
+    let published = prepare_message_artifacts(&turn.summary, &visualization_roots);
+    turn.summary = published.content;
     sessions.add_artifact(
         attempt_id,
         "runner_output",
@@ -1453,26 +1471,21 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
     let completion_summary = truncate(&turn.summary, 2_000);
-    let completed = sessions.transition_attempt(
-        attempt_id,
-        "completed",
-        &completion_summary,
-        Some(&turn.summary),
-        None,
-    )?;
-    if completed.status != "completed" {
-        return Ok(());
-    }
     let queue = TaskQueue::new(db.clone());
-    queue.complete(item.id, &turn.summary)?;
-    if let Err(error) = TaskConversation::new(db.clone()).add_final_assistant_message(
-        &item.task_id,
-        &turn.summary,
-        attempt_id,
-        &visualizations,
-    ) {
-        warn!(%error, task_id = item.task_id, "failed to persist ACP task reply");
-    }
+    let Some(_) = TaskConversation::new(db.clone()).complete_final_assistant_attempt(
+        FinalAssistantAttempt {
+            task_id: &item.task_id,
+            queue_id: item.id,
+            attempt_id,
+            completion_summary: &completion_summary,
+            content: &turn.summary,
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
+    )?
+    else {
+        return Ok(());
+    };
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
@@ -1507,7 +1520,10 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &agent.context_label(),
         &turn.summary,
         attempt_id,
-        &visualizations,
+        ConversationResultArtifacts {
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
     );
     for completed in completed_tasks {
         advance_workflow(&db, &completed.id, "completed", &turn.summary);
@@ -1589,6 +1605,11 @@ fn conversation_id(db: &Arc<Database>, task_id: &str) -> Option<String> {
         .and_then(|task| task.conversation_id)
 }
 
+struct ConversationResultArtifacts<'a> {
+    visualizations: &'a [PreparedVisualization],
+    published_files: &'a [crate::message_artifacts::PublishedFileAttachment],
+}
+
 fn publish_conversation_result(
     db: &Arc<Database>,
     event_bus: &Arc<ConversationEventBus>,
@@ -1596,12 +1617,22 @@ fn publish_conversation_result(
     sender_name: &str,
     content: &str,
     attempt_id: &str,
-    visualizations: &[PreparedVisualization],
+    artifacts: ConversationResultArtifacts<'_>,
 ) {
     let Some(conversation_id) = conversation_id(db, &item.task_id) else {
         return;
     };
     let manager = ConversationManager::new(db.clone());
+    let attachments = artifacts
+        .published_files
+        .iter()
+        .map(|attachment| NewConversationAttachment {
+            name: bound_published_file_name(&attachment.name),
+            mime_type: attachment.mime_type.clone(),
+            data: attachment.data.clone(),
+            source_task_id: Some(item.task_id.clone()),
+        })
+        .collect::<Vec<_>>();
     if let Ok((message, _, _)) = manager.send_agent_routed_message_with_visualizations(
         &conversation_id,
         &SendMessage {
@@ -1612,11 +1643,12 @@ fn publish_conversation_result(
             message_type: Some("task_result".to_string()),
         },
         Some(&item.task_id),
-        &[],
+        &attachments,
         Some(attempt_id),
-        visualizations,
+        artifacts.visualizations,
     ) {
         let mut message_value = json!(message);
+        message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
         message_value["visualizations"] =
             json!(manager.visualizations(message.id).unwrap_or_default());
         event_bus.send(
@@ -1896,6 +1928,25 @@ pub async fn runner_image_compatible(
             || docker
                 .image_has_label(image, "io.xpressclaw.pi-mcp", PI_MCP_BRIDGE_LABEL)
                 .await)
+}
+
+/// Exact image contract for the XpressClaw-owned Codex presentation workflow.
+/// Custom images may opt in only by packaging the same paths and labels.
+pub async fn presentation_runtime_available(docker: &DockerManager, image: &str) -> bool {
+    docker
+        .image_has_label(
+            image,
+            PRESENTATION_CAPABILITY_LABEL,
+            PRESENTATION_CAPABILITY,
+        )
+        .await
+        && docker
+            .image_has_label(
+                image,
+                PRESENTATION_RUNTIME_VERSION_LABEL,
+                PRESENTATION_RUNTIME_VERSION,
+            )
+            .await
 }
 
 fn configure_pi_mcp_bridge(
@@ -5886,6 +5937,12 @@ mod tests {
         let item = TaskQueue::new(db.clone())
             .enqueue(&task.id, "atlas")
             .unwrap();
+        let published_file = crate::message_artifacts::PublishedFileAttachment {
+            name: format!("{}.pptx", "📊".repeat(64)),
+            mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .into(),
+            data: b"pptx bytes".to_vec(),
+        };
 
         publish_conversation_result(
             &db,
@@ -5894,7 +5951,10 @@ mod tests {
             "Atlas",
             "@[AGENT:reviewer:Reviewer] Native result",
             "attempt",
-            &[],
+            ConversationResultArtifacts {
+                visualizations: &[],
+                published_files: &[published_file],
+            },
         );
 
         let messages = conversations
@@ -5911,6 +5971,18 @@ mod tests {
             messages[0].content,
             "@[AGENT:reviewer:Reviewer] Native result"
         );
+        let attachments = conversations.attachments(messages[0].id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].name.len() <= 255);
+        assert!(attachments[0].name.ends_with(".pptx"));
+        assert_eq!(
+            attachments[0].source_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        let (_, data) = conversations
+            .attachment_data(&conversation.id, &attachments[0].id)
+            .unwrap();
+        assert_eq!(data, b"pptx bytes");
         let turns = ConversationTurnQueue::new(db)
             .list_for_conversation(&conversation.id, 10)
             .unwrap();
