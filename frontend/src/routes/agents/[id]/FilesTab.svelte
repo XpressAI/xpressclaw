@@ -67,19 +67,35 @@
 		const previousShowTree = showTree;
 		const requested = routeState(requestedRoute);
 		showTree = requested.showTree;
-		if (!requested.path || requested.path === selectedPath) {
+		if (requested.path === selectedPath) {
 			fileOpenSequence += 1;
 			loadingFile = false;
 			return;
 		}
 
-		const result = await openFile(requested.path, false, false);
+		const result = requested.path
+			? await openFile(requested.path, false, false)
+			: clearFileSelection();
 		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
 
 		showTree = previousShowTree;
 		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
 		syncedRoute = restoredRoute;
 		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
+	function clearFileSelection(): FileOpenResult {
+		fileOpenSequence += 1;
+		loadingFile = false;
+		if (dirty && !window.confirm('Discard the unsaved changes in the current file?')) return 'cancelled';
+		selectedPath = '';
+		selectedFile = null;
+		editorValue = '';
+		fileDiff = null;
+		viewMode = 'code';
+		error = '';
+		saveMessage = '';
+		return 'opened';
 	}
 
 	async function initialize() {

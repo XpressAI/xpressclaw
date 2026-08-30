@@ -3456,9 +3456,11 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await page.keyboard.insertText('export const unsaved = true;');
 	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
 
-	const requestFile = (path: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
+	const requestFile = (path?: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
 		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
-			detail: { path: `/agents/${requestedAgentId}?tab=files&path=${encodeURIComponent(requestedPath)}&tree=collapsed` },
+			detail: {
+				path: `/agents/${requestedAgentId}?tab=files${requestedPath ? `&path=${encodeURIComponent(requestedPath)}` : ''}&tree=collapsed`,
+			},
 		}));
 	}, { requestedAgentId: agentId, requestedPath: path });
 
@@ -3486,6 +3488,11 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
 	await page.waitForTimeout(600);
 	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+
+	await requestFile();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&tree=collapsed`);
+	await expect(focusedPane.getByText('Choose a file to browse or edit it with Monaco.')).toBeVisible();
+	await expect(focusedPane.locator('[data-monaco-editor]')).toHaveCount(0);
 });
 
 test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
