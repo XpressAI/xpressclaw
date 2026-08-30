@@ -67,9 +67,11 @@ function hasMessageBoundary(previous: SessionEvent, next: SessionEvent, messages
 function joinFragments(previous: string, next: string): string {
 	const previousText = previous.trimEnd();
 	const nextText = next.trimStart();
+	const previousEndsAttachedDelimiter = /\S[\/\-\u2010-\u2014]$/u.test(previousText);
 	const joinsWithoutSpace = /^[,.;:!?%)}\]]/u.test(nextText)
 		|| (/^(?:-(?!-)|[\u2010-\u2014])\p{Ll}{2,}/u.test(nextText) && /\p{L}$/u.test(previousText))
-		|| /[([{\/\-\u2010-\u2014]$/u.test(previousText);
+		|| /[([{]$/u.test(previousText)
+		|| previousEndsAttachedDelimiter;
 	return `${previousText}${joinsWithoutSpace ? '' : ' '}${nextText}`;
 }
 

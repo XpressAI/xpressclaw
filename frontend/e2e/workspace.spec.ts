@@ -1359,12 +1359,16 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 			timelineEvent(20, 18, 'runner_progress', 'or syntax.', { item_type: 'agent_message', message_id: 'fragment-10' }),
 			timelineEvent(21, 19, 'runner_progress', 'Call (', { item_type: 'agent_message', message_id: 'fragment-11' }),
 			timelineEvent(22, 19, 'runner_progress', 'child) first.', { item_type: 'agent_message', message_id: 'fragment-12' }),
+			timelineEvent(23, 20, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-13' }),
+			timelineEvent(24, 20, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'fragment-14' }),
+			timelineEvent(25, 21, 'runner_progress', 'Use input /', { item_type: 'agent_message', message_id: 'fragment-15' }),
+			timelineEvent(26, 21, 'runner_progress', 'output channels.', { item_type: 'agent_message', message_id: 'fragment-16' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(14);
+	await expect(updates).toHaveCount(16);
 	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
 		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
 	);
@@ -1381,6 +1385,8 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 	await expect(updates.nth(11).locator('[data-agent-update-content]')).toHaveText('The audit-retention policy passed.');
 	await expect(updates.nth(12).locator('[data-agent-update-content]')).toHaveText('Choose and/or syntax.');
 	await expect(updates.nth(13).locator('[data-agent-update-content]')).toHaveText('Call (child) first.');
+	await expect(updates.nth(14).locator('[data-agent-update-content]')).toHaveText('Tests passed - ready for review.');
+	await expect(updates.nth(15).locator('[data-agent-update-content]')).toHaveText('Use input / output channels.');
 });
 
 test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
