@@ -1389,6 +1389,31 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 	await expect(updates.nth(15).locator('[data-agent-update-content]')).toHaveText('Use input / output channels.');
 });
 
+test('mirrored final fragments are removed before adjacent updates coalesce', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'ready for review.',
+			attachments: [],
+			timestamp: timestamp(11),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-before-reply' }),
+			timelineEvent(2, 11, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'mirrored-reply' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(1);
+	await expect(updates.locator('[data-agent-update-content]')).toHaveText('Tests passed -');
+	await expect(transcript.locator('[data-message-role="assistant"]')).toHaveCount(1);
+	await expect(transcript.getByText('ready for review.', { exact: true })).toHaveCount(1);
+});
+
 test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
 	await mockApi(page, {
 		taskMessages: [{
