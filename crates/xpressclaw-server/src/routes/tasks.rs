@@ -140,8 +140,19 @@ pub fn routes() -> Router<AppState> {
 async fn register_pull_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<PullRequestInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|agent_id| agent_id != request.agent_id)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "pull-request registration must target the calling Agent" })),
+        ));
+    }
     let config = state.config();
     let agent = config
         .agents
@@ -154,12 +165,14 @@ async fn register_pull_request(
             )
         })?;
     let workspace = native::resolved_workspace(&config, agent);
-    let access = github::discover(&state.db, &workspace).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
-        )
-    })?;
+    let access = github_access_for_workspace(&state, agent.name.clone(), workspace)
+        .await?
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+            )
+        })?;
     let manager = GithubReviewManager::new(state.db.clone());
     match request.phase {
         PullRequestRegistrationPhase::Begin => {
@@ -423,9 +436,11 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
-    let agent_repository = new_agent
-        .as_deref()
-        .and_then(|agent_id| github_access_for_agent(&state, agent_id));
+    let agent_repository = if let Some(agent_id) = new_agent.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
 
     let task = board
         .update_with_agent_repository(
@@ -548,6 +563,13 @@ async fn update_task_status(
             .map_err(internal_error)?;
         return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
     }
+    let agent_repository = if req.status == "completed" {
+        None
+    } else if let Some(agent_id) = req.agent_id.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
     let updated = if req.status == "completed" {
         board
             .complete_and_roll_up(&id, req.agent_id.as_deref())
@@ -558,10 +580,6 @@ async fn update_task_status(
                     .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
             })
     } else {
-        let agent_repository = req
-            .agent_id
-            .as_deref()
-            .and_then(|agent_id| github_access_for_agent(&state, agent_id));
         board.update_status_with_agent_repository(
             &id,
             &req.status,
@@ -586,14 +604,27 @@ async fn update_task_status(
     Ok(Json(json!(task)))
 }
 
-fn github_access_for_agent(
+async fn github_access_for_agent(
     state: &AppState,
     agent_id: &str,
 ) -> Option<github::GithubSessionAccess> {
     let config = state.config();
     let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
     let workspace = native::resolved_workspace(&config, agent);
-    github::discover(&state.db, &workspace)
+    github_access_for_workspace(state, agent.name.clone(), workspace)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn github_access_for_workspace(
+    state: &AppState,
+    agent_id: String,
+    workspace: std::path::PathBuf,
+) -> Result<Option<github::GithubSessionAccess>, (StatusCode, Json<Value>)> {
+    xpressclaw_core::repositories::discover_active_github_access(&state.db, &agent_id, &workspace)
+        .await
+        .map_err(internal_error)
 }
 
 async fn task_counts(

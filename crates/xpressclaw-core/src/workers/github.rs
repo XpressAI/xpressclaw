@@ -32,7 +32,9 @@ that prerequisite and call the tool directly with the arguments that would \
 follow `gh`. Use shell `git` for branches, commits, fetches, pushes, rebases, \
 and other local Git operations. Use the MCP tool for pull requests, checks, \
 Actions, issues, and review threads. Repository selection and authentication \
-are already fixed by XpressClaw.";
+are constrained by XpressClaw. When a blank Agent has just cloned a repository, \
+pass its absolute container path as the tool's `cwd`; XpressClaw validates and \
+persists that checkout before the command runs.";
 const GITHUB_REVIEW_LIFECYCLE_INSTRUCTIONS: &str = "\
 For ordinary XpressClaw tasks where the attached GitHub tool advertises its \
 managed review lifecycle, a pull request that is ready for a person to review \
@@ -47,11 +49,13 @@ managed lifecycle does not apply to Conversation chat lanes or workflow tasks \
 whose GitHub tool does not advertise it.";
 
 #[derive(Debug, Clone)]
-pub struct GithubTaskContext {
+pub struct GithubMcpContext {
     pub control_plane_url: String,
     pub control_plane_token: String,
-    pub task_id: String,
     pub agent_id: String,
+    pub workspace: String,
+    pub active_repository: Option<String>,
+    pub task_id: Option<String>,
     pub review_lifecycle: bool,
 }
 
@@ -81,36 +85,10 @@ impl GithubSessionAccess {
         format!("{}/{}", self.owner, self.repo)
     }
 
-    /// ACP requires every agent to support stdio MCP servers. The real `gh`
-    /// binary is kept out of the worker PATH and is only reachable through
-    /// this argument-validating MCP process.
-    pub fn mcp_server(&self, task: Option<&GithubTaskContext>) -> McpServer {
-        let mut env = vec![
-            EnvVariable::new("GH_TOKEN", self.token.clone()),
-            EnvVariable::new("GH_HOST", GITHUB_HOST),
-            EnvVariable::new("GH_REPO", self.repository()),
-            EnvVariable::new("NO_COLOR", "1"),
-        ];
-        if let Some(task) = task {
-            env.extend([
-                EnvVariable::new("XPRESSCLAW_URL", &task.control_plane_url),
-                EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", &task.control_plane_token),
-                EnvVariable::new("XPRESSCLAW_TASK_ID", &task.task_id),
-                EnvVariable::new("XPRESSCLAW_AGENT_ID", &task.agent_id),
-            ]);
-            if task.review_lifecycle {
-                env.push(EnvVariable::new("XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE", "1"));
-            }
-        }
-        McpServer::Stdio(
-            McpServerStdio::new("github", GITHUB_MCP_COMMAND)
-                .args(vec![
-                    "--input-type=module".to_string(),
-                    "--eval".to_string(),
-                    BUNDLED_GITHUB_MCP_SOURCE.to_string(),
-                ])
-                .env(env),
-        )
+    /// Exposed only through the authenticated runner callback endpoint. It is
+    /// never serialized into user-facing state or long-lived MCP environment.
+    pub fn mcp_token(&self) -> &str {
+        &self.token
     }
 
     /// Read one repository-relative GitHub REST resource.
@@ -197,6 +175,38 @@ impl GithubSessionAccess {
             self.owner, self.repo
         ))
     }
+}
+
+/// Build the credential-free bootstrap GitHub MCP. Each tool call resolves a
+/// repository-scoped capability through the internal callback listener, which
+/// lets a live session use a just-cloned checkout without restarting first.
+pub fn mcp_server(context: &GithubMcpContext) -> McpServer {
+    let mut env = vec![
+        EnvVariable::new("GH_HOST", GITHUB_HOST),
+        EnvVariable::new("NO_COLOR", "1"),
+        EnvVariable::new("XPRESSCLAW_URL", &context.control_plane_url),
+        EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", &context.control_plane_token),
+        EnvVariable::new("XPRESSCLAW_AGENT_ID", &context.agent_id),
+        EnvVariable::new("XPRESSCLAW_WORKSPACE", &context.workspace),
+    ];
+    if let Some(repository) = &context.active_repository {
+        env.push(EnvVariable::new("XPRESSCLAW_REPOSITORY", repository));
+    }
+    if let Some(task_id) = &context.task_id {
+        env.push(EnvVariable::new("XPRESSCLAW_TASK_ID", task_id));
+        if context.review_lifecycle {
+            env.push(EnvVariable::new("XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE", "1"));
+        }
+    }
+    McpServer::Stdio(
+        McpServerStdio::new("github", GITHUB_MCP_COMMAND)
+            .args(vec![
+                "--input-type=module".to_string(),
+                "--eval".to_string(),
+                BUNDLED_GITHUB_MCP_SOURCE.to_string(),
+            ])
+            .env(env),
+    )
 }
 
 /// Discover GitHub access for the repository mounted into a worker.
@@ -332,10 +342,10 @@ fn origin_repository(workspace: &Path) -> Option<(String, String)> {
     if !output.status.success() {
         return None;
     }
-    parse_github_remote(String::from_utf8_lossy(&output.stdout).trim())
+    parse_repository_remote(String::from_utf8_lossy(&output.stdout).trim())
 }
 
-fn parse_github_remote(remote: &str) -> Option<(String, String)> {
+pub fn parse_repository_remote(remote: &str) -> Option<(String, String)> {
     let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
         path
     } else if let Some(path) = remote.strip_prefix("ssh://git@github.com/") {
@@ -428,33 +438,43 @@ mod tests {
             "http://github.com/XpressAI/xpressclaw/",
         ] {
             assert_eq!(
-                parse_github_remote(remote),
+                parse_repository_remote(remote),
                 Some(("XpressAI".into(), "xpressclaw".into()))
             );
         }
-        assert_eq!(parse_github_remote("git@gitlab.com:group/repo.git"), None);
         assert_eq!(
-            parse_github_remote("https://github.com/too/many/parts"),
+            parse_repository_remote("git@gitlab.com:group/repo.git"),
+            None
+        );
+        assert_eq!(
+            parse_repository_remote("https://github.com/too/many/parts"),
             None
         );
     }
 
     #[test]
-    fn mcp_configuration_contains_only_the_scoped_repository_context() {
-        let access = GithubSessionAccess {
-            owner: "XpressAI".into(),
-            repo: "xpressclaw".into(),
-            token: "secret".into(),
-        };
-        let value = serde_json::to_value(access.mcp_server(None)).unwrap();
+    fn mcp_configuration_bootstraps_without_a_long_lived_repository_token() {
+        let value = serde_json::to_value(mcp_server(&GithubMcpContext {
+            control_plane_url: "http://host.docker.internal:8935".into(),
+            control_plane_token: "agent-capability".into(),
+            agent_id: "xpressclaw-codex".into(),
+            workspace: "/workspace".into(),
+            active_repository: Some("/workspace/product".into()),
+            task_id: None,
+            review_lifecycle: false,
+        }))
+        .unwrap();
         assert!(value.get("type").is_none());
         assert_eq!(value["name"], "github");
         assert_eq!(value["command"], GITHUB_MCP_COMMAND);
-        assert!(value["env"]
-            .as_array()
-            .unwrap()
+        let env = value["env"].as_array().unwrap();
+        assert!(env
             .iter()
-            .any(|entry| entry["name"] == "GH_REPO" && entry["value"] == "XpressAI/xpressclaw"));
+            .all(|entry| !["GH_REPO", "GH_TOKEN"]
+                .contains(&entry["name"].as_str().unwrap_or_default())));
+        assert!(env.iter().any(|entry| {
+            entry["name"] == "XPRESSCLAW_REPOSITORY" && entry["value"] == "/workspace/product"
+        }));
         assert_eq!(value["args"][0], "--input-type=module");
         assert_eq!(value["args"][1], "--eval");
         assert!(value["args"][2].as_str().unwrap().contains("await main();"));
@@ -462,18 +482,15 @@ mod tests {
 
     #[test]
     fn ordinary_task_context_enables_review_registration_without_exposing_other_tasks() {
-        let access = GithubSessionAccess {
-            owner: "XpressAI".into(),
-            repo: "xpressclaw".into(),
-            token: "secret".into(),
-        };
-        let value = serde_json::to_value(access.mcp_server(Some(&GithubTaskContext {
+        let value = serde_json::to_value(mcp_server(&GithubMcpContext {
             control_plane_url: "http://host.docker.internal:8935".into(),
             control_plane_token: "internal-secret".into(),
-            task_id: "task-123".into(),
             agent_id: "xpressclaw-codex".into(),
+            workspace: "/workspace".into(),
+            active_repository: None,
+            task_id: Some("task-123".into()),
             review_lifecycle: true,
-        })))
+        }))
         .unwrap();
         let env = value["env"].as_array().unwrap();
         for (name, expected) in [

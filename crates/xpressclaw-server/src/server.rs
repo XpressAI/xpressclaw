@@ -38,10 +38,16 @@ fn create_unprotected_router(state: AppState) -> Router {
 }
 
 fn create_internal_router(state: AppState, token: Arc<str>) -> Router {
-    create_unprotected_router(state).layer(middleware::from_fn_with_state(
-        token,
-        require_internal_token,
-    ))
+    create_unprotected_router(state.clone())
+        .merge(
+            Router::new()
+                .nest("/api", routes::internal_api_routes())
+                .with_state(state),
+        )
+        .layer(middleware::from_fn_with_state(
+            token,
+            require_internal_token,
+        ))
 }
 
 /// Authenticate the complete public user-facing API boundary, including SSE
@@ -94,6 +100,10 @@ async fn require_internal_token(
         .headers()
         .get("x-xpressclaw-internal-token")
         .and_then(|value| value.to_str().ok());
+    let supplied_agent = request
+        .headers()
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok());
     // Git's smart-HTTP client cannot attach the callback header. This one
     // narrow route authenticates independently with a per-Agent revocable
     // Basic capability before proxying to GitBucket; every other callback
@@ -102,7 +112,24 @@ async fn require_internal_token(
         .uri()
         .path()
         .starts_with("/api/settings/collaboration/agent/git/");
-    if supplied != Some(token.as_ref()) && !collaboration_git_proxy {
+    let callback_path = request.uri().path();
+    let agent_capability_route = (callback_path.starts_with("/api/workspaces/")
+        && callback_path.ends_with("/repository/resolve-github"))
+        || (callback_path.starts_with("/api/tasks/") && callback_path.ends_with("/pull-requests"));
+    let agent_capability_matches =
+        supplied_agent
+            .zip(supplied)
+            .is_some_and(|(agent_id, supplied)| {
+                xpressclaw_core::repositories::verify_agent_callback_capability(
+                    token.as_ref(),
+                    agent_id,
+                    supplied,
+                )
+            });
+    if supplied != Some(token.as_ref())
+        && !(agent_capability_matches && agent_capability_route)
+        && !collaboration_git_proxy
+    {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(request).await)
@@ -487,6 +514,68 @@ mod tests {
             independently_authenticated_git_proxy.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+
+        let agent_capability =
+            xpressclaw_core::repositories::agent_callback_capability("internal-secret", "atlas");
+        let overbroad_agent_request = app
+            .clone()
+            .oneshot(
+                Request::get("/api/health")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overbroad_agent_request.status(), StatusCode::UNAUTHORIZED);
+        let agent_authorized = app
+            .clone()
+            .oneshot(
+                Request::post("/api/workspaces/atlas/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent_authorized.status(), StatusCode::NOT_FOUND);
+        let cross_agent = app
+            .clone()
+            .oneshot(
+                Request::post("/api/workspaces/zephyr/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "zephyr")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_agent.status(), StatusCode::UNAUTHORIZED);
+
+        let mismatched_registration = app
+            .clone()
+            .oneshot(
+                Request::post("/api/tasks/task/pull-requests")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-internal-token", &agent_capability)
+                    .header("x-xpressclaw-agent-id", "atlas")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent_id": "zephyr",
+                            "phase": "register",
+                            "url": "https://github.com/XpressAI/xpressclaw/pull/1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mismatched_registration.status(), StatusCode::FORBIDDEN);
 
         let authorized = app
             .oneshot(

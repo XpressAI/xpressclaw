@@ -31,6 +31,12 @@ pub fn api_routes() -> Router<AppState> {
         .merge(protected_api_routes())
 }
 
+/// Runner-only callbacks. These routes are mounted exclusively on the
+/// independently authenticated callback listener and never on the public API.
+pub fn internal_api_routes() -> Router<AppState> {
+    Router::new().nest("/workspaces", workspace::internal_routes())
+}
+
 /// Public browser API. Health/bootstrap/login remain reachable while all
 /// instance data, files, streams, and WebSocket handshakes share one auth
 /// boundary.
