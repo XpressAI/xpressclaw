@@ -18,6 +18,7 @@ use crate::visualizations::VisualizationSourceRoot;
 
 pub const MAX_PUBLISHED_FILE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_PUBLISHED_FILES_PER_MESSAGE: usize = 8;
+const MAX_PUBLISHED_FILE_NAME_BYTES: usize = 255;
 const MAX_OOXML_PACKAGE_ENTRIES: u16 = 4096;
 const REFERENCE_START: &str = "xpressclaw-file";
 const REFERENCE_END: &str = "";
@@ -479,7 +480,33 @@ fn attachment_name(reference: &FileReference, source_name: &str, extension: &str
         sanitized = "artifact".into();
     }
     let sanitized = sanitized.chars().take(200).collect::<String>();
-    format!("{sanitized}.{extension}")
+    bound_published_file_name(&format!("{sanitized}.{extension}"))
+}
+
+pub(crate) fn bound_published_file_name(name: &str) -> String {
+    if name.len() <= MAX_PUBLISHED_FILE_NAME_BYTES {
+        return name.to_string();
+    }
+
+    let (stem, suffix) = name
+        .rsplit_once('.')
+        .filter(|(stem, extension)| {
+            !stem.is_empty()
+                && !extension.is_empty()
+                && extension.is_ascii()
+                && extension.len() + 1 < MAX_PUBLISHED_FILE_NAME_BYTES
+        })
+        .map_or((name, String::new()), |(stem, extension)| {
+            (stem, format!(".{extension}"))
+        });
+    let byte_budget = MAX_PUBLISHED_FILE_NAME_BYTES - suffix.len();
+    let end = stem
+        .char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .take_while(|end| *end <= byte_budget)
+        .last()
+        .unwrap_or(0);
+    format!("{}{suffix}", &stem[..end])
 }
 
 fn escape_markdown(value: &str) -> String {
@@ -532,6 +559,25 @@ mod tests {
         assert_eq!(result.attachments[0].name, "Launch _ plan.pptx");
         assert_eq!(result.attachments[0].mime_type, PPTX_MIME_TYPE);
         assert_eq!(result.attachments[0].data, pptx_bytes());
+    }
+
+    #[test]
+    fn published_names_preserve_extensions_within_conversation_byte_limit() {
+        let name = attachment_name(
+            &FileReference {
+                path: "/workspace/deck.pptx".into(),
+                title: Some("📊".repeat(64)),
+            },
+            "deck.pptx",
+            "pptx",
+        );
+
+        assert!(name.len() <= MAX_PUBLISHED_FILE_NAME_BYTES);
+        assert!(name.ends_with(".pptx"));
+        assert_eq!(
+            name.chars().filter(|character| *character == '📊').count(),
+            62
+        );
     }
 
     #[test]

@@ -38,7 +38,7 @@ use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::error::{Error, Result};
-use crate::message_artifacts::prepare_message_artifacts;
+use crate::message_artifacts::{bound_published_file_name, prepare_message_artifacts};
 use crate::repositories::{
     agent_callback_capability, discover_github_access, run_repository_blocking,
     AgentRepositoryManager, RepositoryBoundaryResult, RepositoryInspection,
@@ -1627,7 +1627,7 @@ fn publish_conversation_result(
         .published_files
         .iter()
         .map(|attachment| NewConversationAttachment {
-            name: attachment.name.clone(),
+            name: bound_published_file_name(&attachment.name),
             mime_type: attachment.mime_type.clone(),
             data: attachment.data.clone(),
             source_task_id: Some(item.task_id.clone()),
@@ -5938,7 +5938,7 @@ mod tests {
             .enqueue(&task.id, "atlas")
             .unwrap();
         let published_file = crate::message_artifacts::PublishedFileAttachment {
-            name: "Review.pptx".into(),
+            name: format!("{}.pptx", "📊".repeat(64)),
             mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 .into(),
             data: b"pptx bytes".to_vec(),
@@ -5973,7 +5973,8 @@ mod tests {
         );
         let attachments = conversations.attachments(messages[0].id).unwrap();
         assert_eq!(attachments.len(), 1);
-        assert_eq!(attachments[0].name, "Review.pptx");
+        assert!(attachments[0].name.len() <= 255);
+        assert!(attachments[0].name.ends_with(".pptx"));
         assert_eq!(
             attachments[0].source_task_id.as_deref(),
             Some(task.id.as_str())
