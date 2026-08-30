@@ -1,4 +1,4 @@
-# ADR-041: Task-Linked Split File Editor
+# ADR-044: Task-Linked Split File Editor
 
 ## Status
 
@@ -108,6 +108,6 @@ Task view.
 
 ## Visual evidence
 
-- [Task and collapsed file editor](../assets/adr-041-task-file-split-collapsed.png)
-- [File tree reopened](../assets/adr-041-task-file-split-tree-open.png)
-- [Constrained-width navigation fallback](../assets/adr-041-constrained-navigation.png)
+- [Task and collapsed file editor](../assets/adr-044-task-file-split-collapsed.png)
+- [File tree reopened](../assets/adr-044-task-file-split-tree-open.png)
+- [Constrained-width navigation fallback](../assets/adr-044-constrained-navigation.png)
