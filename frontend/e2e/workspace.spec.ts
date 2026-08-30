@@ -303,6 +303,15 @@ async function mockApi(
 			suggestion: string | null;
 		}>;
 		mcpVerificationRequests?: { name: string; agent_id: string | null }[];
+		openUrlRequests?: string[];
+		agentCatalog?: {
+			kind: string;
+			name: string;
+			install_url: string;
+			image: string;
+			host_image: string;
+		}[];
+		agentKind?: { value: string };
 		workflows?: {
 			id: string;
 			name: string;
@@ -594,7 +603,7 @@ async function mockApi(
 		} else if (path === '/api/setup/mcp-servers') {
 			response = { servers: options.mcpServers ?? [] };
 		} else if (path === '/api/setup/agent-catalog') {
-			response = { agents: [
+			response = { agents: options.agentCatalog ?? [
 				{
 					kind: 'codex', name: 'Codex', mark: 'C', description: 'Codex over ACP.',
 					command: ['codex-acp'], login_command: 'codex login', install_url: 'https://developers.openai.com/codex/cli/',
@@ -608,6 +617,10 @@ async function mockApi(
 					installed: true, configured: true, status: 'ready', executable: 'dsh-acp',
 				},
 			] };
+		} else if (path === '/api/open-url') {
+			const payload = request.postDataJSON() as { url: string };
+			options.openUrlRequests?.push(payload.url);
+			response = { success: true };
 		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
 			const name = decodeURIComponent(path.split('/')[4]);
 			const payload = request.postDataJSON() as { agent_id: string | null };
@@ -789,7 +802,14 @@ async function mockApi(
 		} else if (path === '/api/agents') {
 			response = availableAgents;
 		} else if (path === `/api/agents/${agentId}`) {
-			response = agent;
+			response = options.agentKind ? {
+				...agent,
+				backend: options.agentKind.value,
+				config: {
+					...agent.config,
+					runner: { ...agent.config.runner, kind: options.agentKind.value },
+				},
+			} : agent;
 		} else if (path === '/api/workflows') {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as { name: string; description?: string; yaml_content: string };
@@ -841,16 +861,17 @@ async function mockApi(
 		} else if (path === '/api/schedules') {
 			response = options.schedules ?? [];
 		} else if (path === '/api/setup/config') {
+			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
 				llm: { providers: [] },
 				agents: [{
 					name: agent.name,
 					title: agent.title,
-					backend: agent.backend,
+					backend: configuredKind,
 					model: null,
 					runner: {
-						kind: agentRunnerKind,
-						image: `xpressclaw-runner-${agentRunnerKind}:latest`,
+						kind: configuredKind,
+						image: `xpressclaw-runner-${configuredKind}:latest`,
 						workspace: '/workspace',
 						model: null,
 						session_config: {},
@@ -4279,6 +4300,74 @@ test('MCP verification reports authentication and runner executable failures in 
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('skills and MCP settings surface official discovery documentation', async ({ page }) => {
+	const openUrlRequests: string[] = [];
+	await mockApi(page, { mcpServers: [], openUrlRequests, agentKind: { value: 'claude' } });
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.goto('/settings/mcp');
+	await expect(page.getByRole('button', { name: 'Official MCP Registry' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Add server' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Official MCP Registry' }).click();
+	await expect(page.getByText('Find published packages and remote endpoints')).toBeVisible();
+
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Registry' }).click();
+	await page.getByRole('button', { name: 'Claude Agent skills guide' }).click();
+	expect(openUrlRequests).toEqual([
+		'https://registry.modelcontextprotocol.io/',
+		'https://registry.modelcontextprotocol.io/',
+		'https://code.claude.com/docs/en/skills',
+	]);
+
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('every supported harness resolves the intended documentation and custom stays neutral', async ({ page }) => {
+	const openUrlRequests: string[] = [];
+	const agentKind = { value: 'codex' };
+	const catalog = [
+		['codex', 'Codex', 'https://developers.openai.com/codex/cli/'],
+		['claude', 'Claude Agent', 'https://docs.anthropic.com/en/docs/claude-code/setup'],
+		['github-copilot', 'GitHub Copilot', 'https://docs.github.com/en/copilot/github-copilot-in-the-cli'],
+		['opencode', 'OpenCode', 'https://opencode.ai/docs/'],
+		['qwen', 'Qwen Code', 'https://qwenlm.github.io/qwen-code-docs/'],
+		['cline', 'Cline', 'https://docs.cline.bot/'],
+		['cursor', 'Cursor', 'https://docs.cursor.com/agent/overview'],
+	].map(([kind, name, install_url]) => ({
+		kind,
+		name,
+		install_url,
+		image: `ghcr.io/xpressai/xpressclaw-runner-${kind}:latest`,
+		host_image: `ghcr.io/xpressai/xpressclaw-runner-${kind}-docker:latest`,
+	}));
+	await mockApi(page, { openUrlRequests, agentCatalog: catalog, agentKind });
+
+	const expected = [
+		['codex', 'Codex skills guide', 'https://learn.chatgpt.com/docs/build-skills'],
+		['claude', 'Claude Agent skills guide', 'https://code.claude.com/docs/en/skills'],
+		['github-copilot', 'GitHub Copilot skills guide', 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills'],
+		['opencode', 'OpenCode skills guide', 'https://opencode.ai/docs/skills/'],
+		['qwen', 'Qwen Code skills guide', 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/'],
+		['cline', 'Cline skills guide', 'https://docs.cline.bot/customization/skills'],
+		['cursor', 'Cursor docs', 'https://docs.cursor.com/agent/overview'],
+	] as const;
+
+	for (const [kind, buttonName, url] of expected) {
+		agentKind.value = kind;
+		await page.goto(`/agents/${agentId}?tab=runner`);
+		await expect(page.locator('#runner-kind')).toHaveValue(kind);
+		await page.getByRole('button', { name: buttonName }).click();
+		expect(openUrlRequests.at(-1)).toBe(url);
+	}
+
+	agentKind.value = 'custom';
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expect(page.locator('#runner-kind')).toHaveValue('custom');
+	await expect(page.getByRole('button', { name: /(?:skills guide|docs)$/ })).toHaveCount(0);
 });
 
 test('automation and settings pages show context-specific sidebar lists', async ({ page }) => {
