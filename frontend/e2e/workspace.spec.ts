@@ -3527,6 +3527,15 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	const mainReadCount = workspaceReadRequests.filter((path) => path === 'src/main.ts').length;
 	await requestFile('src/main.ts');
 	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'src/main.ts').length).toBe(mainReadCount + 1);
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	workspaceReadDelaysMs['README.md'] = 500;
+	const readmeReadCount = workspaceReadRequests.filter((path) => path === 'README.md').length;
+	await requestFile('README.md');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'README.md').length).toBe(readmeReadCount + 1);
 	await requestFile('docs/guide.md');
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=docs%2Fguide.md&tree=collapsed`);
 	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
