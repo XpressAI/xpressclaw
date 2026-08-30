@@ -1,4 +1,4 @@
-import type { SessionEvent } from '$lib/api';
+import type { SessionEvent, TaskMessage } from '$lib/api';
 import { serverTimestampMs } from '$lib/serverTime';
 
 const MAX_FRAGMENT_GAP_MS = 2_000;
@@ -37,14 +37,30 @@ function isClearContinuation(previous: string, next: string): boolean {
 	if (!previousText || !nextText) return false;
 
 	const previousEndsWord = /[\p{L}\p{N}]$/u.test(previousText);
+	const previousEndsJoinableToken = /[\p{L}\p{N}\p{M}'\u2019"\u201d)}\]]$/u.test(previousText);
 	const previousEndsContinuation = /[,;:([{\-/\u2010-\u2014]$/u.test(previousText);
 	const nextStartsLowercase = /^\p{Ll}/u.test(nextText);
 	const nextStartsClosingPunctuation = /^[,.;:!?%)}\]]/u.test(nextText);
 	const nextStartsJoinedDash = /^[\u2010-\u2014-]\S/u.test(nextText);
 
-	return nextStartsClosingPunctuation
+	return (previousEndsJoinableToken && nextStartsClosingPunctuation)
 		|| (previousEndsWord && nextStartsJoinedDash)
 		|| ((previousEndsWord || previousEndsContinuation) && nextStartsLowercase);
+}
+
+function hasMessageBoundary(previous: SessionEvent, next: SessionEvent, messages: TaskMessage[]): boolean {
+	const previousTime = serverTimestampMs(previous.created_at);
+	const nextTime = serverTimestampMs(next.created_at);
+	if (previousTime === null || nextTime === null) return true;
+
+	return messages.some((message) => {
+		const messageTime = serverTimestampMs(message.timestamp);
+		if (messageTime === null) return false;
+		const messageRank = message.role === 'user' ? 0 : 2;
+		const followsPrevious = messageTime > previousTime || (messageTime === previousTime && messageRank > 1);
+		const precedesNext = messageTime < nextTime || (messageTime === nextTime && messageRank < 1);
+		return followsPrevious && precedesNext;
+	});
 }
 
 function joinFragments(previous: string, next: string): string {
@@ -60,7 +76,7 @@ function joinFragments(previous: string, next: string): string {
  * update arrives as several near-simultaneous ACP messages. The durable ACP
  * boundaries remain intact; only clearly continuous adjacent rows are folded.
  */
-export function coalesceAgentMessageFragments(events: SessionEvent[]): SessionEvent[] {
+export function coalesceAgentMessageFragments(events: SessionEvent[], messages: TaskMessage[] = []): SessionEvent[] {
 	const coalesced: SessionEvent[] = [];
 
 	for (const event of events) {
@@ -71,6 +87,7 @@ export function coalesceAgentMessageFragments(events: SessionEvent[]): SessionEv
 			&& isAgentMessage(event)
 			&& isSameAgentMessageStream(previous, event)
 			&& isNearSimultaneous(previous, event)
+			&& !hasMessageBoundary(previous, event, messages)
 			&& isClearContinuation(previous.summary, event.summary)) {
 			coalesced[previousIndex] = {
 				...previous,

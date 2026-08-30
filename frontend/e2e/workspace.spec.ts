@@ -1273,22 +1273,33 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 			timelineEvent(6, 12, 'runner_progress', 'the parent conversation, and creates a tombstone.', { item_type: 'agent_message', message_id: 'fragment-6' }),
 			timelineEvent(7, 12, 'runner_progress', 'Tests passed.', { item_type: 'agent_message', message_id: 'status-1' }),
 			timelineEvent(8, 12, 'runner_progress', 'Ready to review.', { item_type: 'agent_message', message_id: 'status-2' }),
+			timelineEvent(9, 13, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'status-3' }),
+			timelineEvent(10, 13, 'runner_progress', '.env is configured.', { item_type: 'agent_message', message_id: 'status-4' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(3);
+	await expect(updates).toHaveCount(5);
 	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
 		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
 	);
 	await expect(updates.nth(1).locator('[data-agent-update-content]')).toHaveText('Tests passed.');
 	await expect(updates.nth(2).locator('[data-agent-update-content]')).toHaveText('Ready to review.');
+	await expect(updates.nth(3).locator('[data-agent-update-content]')).toHaveText('Done.');
+	await expect(updates.nth(4).locator('[data-agent-update-content]')).toHaveText('.env is configured.');
 });
 
-test('agent update coalescing does not cross attempt, time, or tool boundaries', async ({ page }) => {
+test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
 	await mockApi(page, {
-		taskMessages: [],
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'user',
+			content: 'Keep the migration compatible.',
+			attachments: [],
+			timestamp: timestamp(41),
+		}],
 		taskActivityEvents: [
 			timelineEvent(1, 9, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'in_progress' }),
 			timelineEvent(2, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
@@ -1301,12 +1312,14 @@ test('agent update coalescing does not cross attempt, time, or tool boundaries',
 			},
 			timelineEvent(7, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
 			timelineEvent(8, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
+			timelineEvent(9, 40, 'runner_progress', 'Updating', { item_type: 'agent_message', message_id: 'before-message' }),
+			timelineEvent(10, 42, 'runner_progress', 'the query', { item_type: 'agent_message', message_id: 'after-message' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(6);
+	await expect(updates).toHaveCount(8);
 	await expect(updates).toHaveText([
 		/Reading/,
 		/the migration/,
@@ -1314,6 +1327,8 @@ test('agent update coalescing does not cross attempt, time, or tool boundaries',
 		/the workspace/,
 		/Inspecting/,
 		/the repository/,
+		/Updating/,
+		/the query/,
 	]);
 });
 

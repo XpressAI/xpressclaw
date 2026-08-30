@@ -155,7 +155,7 @@
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
-	let collapsedActivityEvents = $derived(collapseToolActivity(coalesceAgentMessageFragments(activityEvents)));
+	let collapsedActivityEvents = $derived(collapseToolActivity(coalesceAgentMessageFragments(activityEvents, messages)));
 	let primaryActivityEvents = $derived(
 		collapsedActivityEvents.filter(event => {
 			const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
