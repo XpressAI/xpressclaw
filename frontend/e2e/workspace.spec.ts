@@ -1413,12 +1413,20 @@ test('agent update coalescing does not cross message, attempt, time, or tool bou
 			timelineEvent(8, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
 			timelineEvent(9, 40, 'runner_progress', 'Updating', { item_type: 'agent_message', message_id: 'before-message' }),
 			timelineEvent(10, 42, 'runner_progress', 'the query', { item_type: 'agent_message', message_id: 'after-message' }),
+			{
+				...timelineEvent(11, 50, 'runner_progress', 'Working on tests', { item_type: 'agent_message', message_id: 'opencode-1' }),
+				source_id: 'opencode',
+			},
+			{
+				...timelineEvent(12, 50, 'runner_progress', 'checking deployment', { item_type: 'agent_message', message_id: 'opencode-2' }),
+				source_id: 'opencode',
+			},
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(8);
+	await expect(updates).toHaveCount(10);
 	await expect(updates).toHaveText([
 		/Reading/,
 		/the migration/,
@@ -1428,6 +1436,8 @@ test('agent update coalescing does not cross message, attempt, time, or tool bou
 		/the repository/,
 		/Updating/,
 		/the query/,
+		/Working on tests/,
+		/checking deployment/,
 	]);
 });
 

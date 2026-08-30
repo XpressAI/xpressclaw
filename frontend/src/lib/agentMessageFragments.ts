@@ -3,8 +3,10 @@ import { serverTimestampMs } from '$lib/serverTime';
 
 const MAX_FRAGMENT_GAP_MS = 2_000;
 
-function isAgentMessage(event: SessionEvent): boolean {
-	return event.event_type === 'runner_progress'
+function isCodexAgentMessage(event: SessionEvent): boolean {
+	return event.source_type === 'acp'
+		&& event.source_id === 'codex'
+		&& event.event_type === 'runner_progress'
 		&& event.payload?.item_type === 'agent_message';
 }
 
@@ -87,8 +89,8 @@ export function coalesceAgentMessageFragments(events: SessionEvent[], messages: 
 		const previousIndex = coalesced.length - 1;
 		const previous = coalesced[previousIndex];
 		if (previous
-			&& isAgentMessage(previous)
-			&& isAgentMessage(event)
+			&& isCodexAgentMessage(previous)
+			&& isCodexAgentMessage(event)
 			&& isSameAgentMessageStream(previous, event)
 			&& isNearSimultaneous(previous, event)
 			&& !hasMessageBoundary(previous, event, messages)
