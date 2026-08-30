@@ -1,14 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 
 use rusqlite::Connection;
+use serde_json::Value;
 use tracing::info;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::conversations::runtime::ConversationTurnQueue;
 use crate::error::{Error, Result};
+use crate::workflows::context;
+use crate::workflows::definition::{WorkflowDefinition, WorkflowInputType};
 
 /// Register sqlite-vec as an auto-extension. Must be called before opening connections.
 static INIT_SQLITE_VEC: Once = Once::new();
@@ -180,6 +183,15 @@ impl Database {
                     })?;
                 }
 
+                if target == 40 {
+                    backfill_workflow_agent_bindings(&transaction).map_err(|error| {
+                        Error::Migration {
+                            version: target,
+                            message: error.to_string(),
+                        }
+                    })?;
+                }
+
                 transaction.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES ('schema_version', ?1)",
                     [target.to_string()],
@@ -219,6 +231,152 @@ impl Database {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Recover Project ownership for workflow instances created before workflow
+/// Agent bindings became durable.
+///
+/// The SQL portion of v40 recovers the Agent attached to a current taskless
+/// wait. This pass also resolves typed inputs and Agent selectors from the
+/// immutable definition/trigger snapshot so future steps cannot outlive a
+/// Project cascade. An active legacy run whose complete Agent set cannot be
+/// recovered is cancelled rather than allowed to resume against a deleted
+/// Agent later. Active scoped runs are also cancelled when their recovered
+/// Agent ownership contradicts their persisted Project scope.
+const UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR: &str =
+    "Stopped during upgrade because not every Agent binding could be recovered safely";
+const CONFLICTING_WORKFLOW_BINDINGS_ERROR: &str =
+    "Stopped during upgrade because an Agent binding conflicts with the workflow Project scope";
+
+fn backfill_workflow_agent_bindings(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let agents = {
+        let mut statement = transaction.prepare("SELECT id, project_id FROM agents")?;
+        let agents = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+        agents
+    };
+    let instances = {
+        let mut statement = transaction.prepare(
+            "SELECT instance.id,
+                    instance.status,
+                    instance.project_id,
+                    conversation.project_id,
+                    COALESCE(NULLIF(instance.definition_yaml, ''), workflow.yaml_content),
+                    COALESCE(instance.trigger_data, '{}')
+             FROM workflow_instances instance
+             JOIN workflows workflow ON workflow.id = instance.workflow_id
+             LEFT JOIN conversations conversation
+               ON conversation.id = instance.conversation_id",
+        )?;
+        let instances = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        instances
+    };
+
+    for (
+        instance_id,
+        status,
+        instance_project_id,
+        conversation_project_id,
+        definition_yaml,
+        trigger_json,
+    ) in instances
+    {
+        let recovered = (|| -> Result<(BTreeSet<String>, bool)> {
+            let mut definition = WorkflowDefinition::parse(&definition_yaml)?;
+            let provided_trigger = serde_json::from_str::<Value>(&trigger_json)
+                .map_err(|error| Error::Workflow(format!("invalid trigger data: {error}")))?;
+            let trigger_data = definition.resolve_inputs(&provided_trigger)?;
+            let initial_context =
+                context::build_context(&trigger_data, &definition.variables, &HashMap::new());
+
+            let (step_bindings, _) = definition.resolve_agent_bindings(&initial_context, false)?;
+            let mut agent_ids = step_bindings
+                .into_iter()
+                .map(|(_, agent_id)| agent_id)
+                .collect::<BTreeSet<_>>();
+            for (name, input) in &definition.inputs {
+                if input.input_type != WorkflowInputType::Agent {
+                    continue;
+                }
+                if let Some(agent_id) = trigger_data.get(name).and_then(Value::as_str) {
+                    agent_ids.insert(agent_id.to_string());
+                }
+            }
+            let every_step_resolved = definition
+                .resolve_agent_bindings(&initial_context, true)
+                .is_ok();
+            Ok((agent_ids, every_step_resolved))
+        })();
+
+        let (agent_ids, mut complete) = recovered.unwrap_or_else(|_| (BTreeSet::new(), false));
+        let scoped_project_id = instance_project_id
+            .as_deref()
+            .or(conversation_project_id.as_deref());
+        let mut scope_consistent = match (
+            instance_project_id.as_deref(),
+            conversation_project_id.as_deref(),
+        ) {
+            (Some(instance_project_id), Some(conversation_project_id)) => {
+                instance_project_id == conversation_project_id
+            }
+            _ => true,
+        };
+        for agent_id in agent_ids {
+            match agents.get(&agent_id) {
+                Some(Some(project_id)) => {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO workflow_instance_agent_bindings
+                         (instance_id, agent_id, project_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![instance_id, agent_id, project_id],
+                    )?;
+                    if scoped_project_id.is_some_and(|scope| project_id.as_str() != scope) {
+                        scope_consistent = false;
+                    }
+                }
+                Some(None) => {
+                    if scoped_project_id.is_some() {
+                        scope_consistent = false;
+                    }
+                }
+                None => complete = false,
+            }
+        }
+
+        let cancellation_error = if !complete {
+            Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR)
+        } else if !scope_consistent {
+            Some(CONFLICTING_WORKFLOW_BINDINGS_ERROR)
+        } else {
+            None
+        };
+        if let Some(cancellation_error) = cancellation_error {
+            if matches!(status.as_str(), "running" | "waiting") {
+                transaction.execute(
+                    "UPDATE workflow_instances
+                     SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP,
+                         error_message = ?1
+                     WHERE id = ?2 AND status IN ('running', 'waiting')",
+                    rusqlite::params![cancellation_error, instance_id],
+                )?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Move work committed by the retired background conversation processor into
@@ -1739,6 +1897,585 @@ CREATE INDEX idx_work_attempts_trigger_message
     ON work_attempts(trigger_message_id);
 ";
 
+const MIGRATION_V41: &str = r#"
+-- Durable, bounded telemetry for the instance-wide Control center. Dashboard
+-- rows contain only short display-safe summaries and normalized counters;
+-- raw tool arguments, terminal output, prompts, and diffs never enter these
+-- tables.
+CREATE TABLE dashboard_events (
+    cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    occurred_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    project_name TEXT,
+    agent_id TEXT,
+    agent_name TEXT,
+    source_kind TEXT NOT NULL DEFAULT 'system',
+    source_label TEXT NOT NULL DEFAULT 'XpressClaw',
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_title TEXT NOT NULL,
+    href TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info'
+        CHECK (severity IN ('info', 'success', 'warning', 'error')),
+    needs_attention INTEGER NOT NULL DEFAULT 0
+        CHECK (needs_attention IN (0, 1)),
+    preview TEXT NOT NULL DEFAULT '',
+    work_kind TEXT,
+    work_id TEXT
+);
+CREATE INDEX idx_dashboard_events_cursor_project
+    ON dashboard_events(project_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_time
+    ON dashboard_events(occurred_at DESC, cursor DESC);
+CREATE INDEX idx_dashboard_events_attention
+    ON dashboard_events(needs_attention, occurred_at DESC, cursor DESC);
+CREATE INDEX idx_dashboard_events_event_version
+    ON dashboard_events(event_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_work
+    ON dashboard_events(work_kind, work_id, cursor DESC);
+CREATE INDEX idx_dashboard_events_kind_project_time
+    ON dashboard_events(event_kind, project_id, occurred_at DESC);
+
+CREATE TABLE dashboard_metric_points (
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('attempt', 'conversation_turn')),
+    work_id TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT,
+    bucket_at TEXT NOT NULL,
+    context_used INTEGER,
+    context_size INTEGER,
+    tool_calls INTEGER NOT NULL DEFAULT 0,
+    code_additions INTEGER,
+    code_deletions INTEGER,
+    git_state TEXT NOT NULL DEFAULT 'unobserved'
+        CHECK (git_state IN ('unobserved', 'available', 'partial', 'unavailable')),
+    git_detail TEXT,
+    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (work_kind, work_id, bucket_at)
+);
+CREATE INDEX idx_dashboard_metrics_project_time
+    ON dashboard_metric_points(project_id, bucket_at DESC);
+CREATE INDEX idx_dashboard_metrics_time
+    ON dashboard_metric_points(bucket_at DESC);
+
+CREATE TABLE dashboard_git_baselines (
+    work_kind TEXT NOT NULL CHECK (work_kind IN ('attempt', 'conversation_turn')),
+    work_id TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+    agent_id TEXT,
+    workspace TEXT NOT NULL,
+    baseline_ref TEXT,
+    baseline_json TEXT NOT NULL DEFAULT '{}',
+    git_state TEXT NOT NULL DEFAULT 'unavailable'
+        CHECK (git_state IN ('available', 'partial', 'unavailable')),
+    git_detail TEXT,
+    captured_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_snapshot_at TEXT,
+    finalized_at TEXT,
+    PRIMARY KEY (work_kind, work_id)
+);
+CREATE INDEX idx_dashboard_git_workspace_active
+    ON dashboard_git_baselines(workspace, finalized_at);
+
+-- Stable message event IDs let the browser replace an in-progress Agent
+-- message with its latest text when a reconnect overlaps streaming updates.
+CREATE TRIGGER dashboard_task_message_insert
+AFTER INSERT ON task_messages
+WHEN NEW.role IN ('user', 'assistant')
+ AND (NEW.role != 'assistant' OR trim(NEW.content) != '')
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-message:' || NEW.id,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.timestamp),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        t.project_id, p.name, t.agent_id, a.name,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent' ELSE 'user' END,
+        CASE WHEN NEW.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+        'task', t.id, t.title, '/tasks/' || t.id,
+        'info', 0,
+        CASE WHEN trim(NEW.content) = '' THEN 'Image attachment'
+             ELSE substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+        END
+    FROM tasks t
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = t.agent_id
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+CREATE TRIGGER dashboard_task_message_update
+AFTER UPDATE OF content ON task_messages
+WHEN NEW.role IN ('user', 'assistant')
+ AND NEW.content != OLD.content
+ AND trim(NEW.content) != ''
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-message:' || NEW.id,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        t.project_id, p.name, t.agent_id, a.name,
+        CASE WHEN NEW.role = 'assistant' THEN 'agent' ELSE 'user' END,
+        CASE WHEN NEW.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+        'task', t.id, t.title, '/tasks/' || t.id,
+        'info', 0,
+        substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+    FROM tasks t
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = t.agent_id
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+CREATE TRIGGER dashboard_conversation_message_insert
+AFTER INSERT ON conversation_messages
+WHEN NEW.sender_type IN ('user', 'agent')
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'conversation-message:' || NEW.id,
+        CASE WHEN NEW.sender_type = 'agent' THEN 'agent_response' ELSE 'conversation_message' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        c.project_id, p.name,
+        CASE WHEN NEW.sender_type = 'agent' THEN NEW.sender_id ELSE NULL END,
+        CASE WHEN NEW.sender_type = 'agent' THEN COALESCE(NEW.sender_name, a.name) ELSE NULL END,
+        NEW.sender_type,
+        COALESCE(NEW.sender_name,
+            CASE WHEN NEW.sender_type = 'user' THEN 'You' ELSE NEW.sender_id END),
+        'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+        '/conversations/' || c.id, 'info', 0,
+        CASE WHEN trim(NEW.content) = '' THEN 'File attachment'
+             ELSE substr(trim(replace(replace(NEW.content, char(10), ' '), char(13), ' ')), 1, 240)
+        END
+    FROM conversations c
+    LEFT JOIN projects p ON p.id = c.project_id
+    LEFT JOIN agents a ON a.id = NEW.sender_id AND NEW.sender_type = 'agent'
+    WHERE c.id = NEW.conversation_id;
+END;
+
+CREATE TRIGGER dashboard_task_status_update
+AFTER UPDATE OF status ON tasks
+WHEN NEW.status != OLD.status AND NEW.hidden = 0
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview
+    )
+    SELECT
+        'task-status:' || lower(hex(randomblob(16))),
+        CASE NEW.status
+            WHEN 'waiting_for_input' THEN 'waiting_for_input'
+            WHEN 'blocked' THEN 'failure'
+            WHEN 'completed' THEN 'completion'
+            WHEN 'cancelled' THEN 'cancellation'
+            ELSE 'status_change'
+        END,
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+        NEW.project_id, p.name, NEW.agent_id, a.name, 'system', 'XpressClaw',
+        'task', NEW.id, NEW.title, '/tasks/' || NEW.id,
+        CASE NEW.status WHEN 'blocked' THEN 'error'
+             WHEN 'waiting_for_input' THEN 'warning'
+             WHEN 'completed' THEN 'success' ELSE 'info' END,
+        CASE WHEN NEW.status IN ('blocked', 'waiting_for_input') THEN 1 ELSE 0 END,
+        CASE NEW.status
+            WHEN 'waiting_for_input' THEN 'The Agent needs your input'
+            WHEN 'blocked' THEN 'Task is blocked'
+            WHEN 'completed' THEN 'Task completed'
+            WHEN 'cancelled' THEN 'Task cancelled'
+            WHEN 'in_progress' THEN 'Work started'
+            ELSE 'Task is pending'
+        END
+    FROM (SELECT 1) singleton
+    LEFT JOIN projects p ON p.id = NEW.project_id
+    LEFT JOIN agents a ON a.id = NEW.agent_id;
+END;
+
+CREATE TRIGGER dashboard_session_event_insert
+AFTER INSERT ON session_events
+WHEN NEW.event_type IN ('runner_progress', 'elicitation_pending', 'attempt_failed')
+ AND (
+    NEW.event_type != 'runner_progress'
+    OR NOT EXISTS (
+        SELECT 1 FROM dashboard_events
+        WHERE event_kind = 'progress'
+          AND work_kind = 'attempt'
+          AND work_id = NEW.attempt_id
+          AND occurred_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 seconds')
+    )
+ )
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT
+        'session-event:' || NEW.id,
+        CASE WHEN NEW.event_type = 'elicitation_pending' THEN 'waiting_for_input'
+             WHEN NEW.event_type = 'attempt_failed' THEN 'failure'
+             ELSE 'progress' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        t.project_id, p.name, ls.agent_id, a.name, 'agent', COALESCE(a.name, ls.agent_id),
+        'task', t.id, t.title, '/tasks/' || t.id,
+        CASE WHEN NEW.event_type = 'attempt_failed' THEN 'error'
+             WHEN NEW.event_type = 'elicitation_pending' THEN 'warning' ELSE 'info' END,
+        CASE WHEN NEW.event_type IN ('elicitation_pending', 'attempt_failed') THEN 1 ELSE 0 END,
+        CASE WHEN NEW.event_type = 'attempt_failed' THEN 'Agent attempt failed'
+             WHEN NEW.event_type = 'elicitation_pending' THEN 'The Agent needs your input'
+             ELSE substr(trim(replace(replace(NEW.summary, char(10), ' '), char(13), ' ')), 1, 240)
+        END,
+        'attempt', NEW.attempt_id
+    FROM tasks t
+    JOIN logical_sessions ls ON ls.id = NEW.session_id
+    LEFT JOIN projects p ON p.id = t.project_id
+    LEFT JOIN agents a ON a.id = ls.agent_id
+    WHERE t.id = NEW.task_id AND t.hidden = 0;
+END;
+
+CREATE TRIGGER dashboard_conversation_turn_status
+AFTER UPDATE OF status ON conversation_turns
+WHEN NEW.status != OLD.status AND NEW.status IN ('completed', 'failed', 'cancelled')
+BEGIN
+    INSERT INTO dashboard_events (
+        event_id, event_kind, occurred_at, project_id, project_name,
+        agent_id, agent_name, source_kind, source_label,
+        target_type, target_id, target_title, href, severity,
+        needs_attention, preview, work_kind, work_id
+    )
+    SELECT
+        'conversation-turn:' || NEW.id || ':' || NEW.status,
+        CASE NEW.status WHEN 'completed' THEN 'completion'
+             WHEN 'failed' THEN 'failure' ELSE 'cancellation' END,
+        COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', NEW.completed_at),
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        c.project_id, p.name, NEW.agent_id, a.name, 'agent', COALESCE(a.name, NEW.agent_id),
+        'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+        '/conversations/' || c.id,
+        CASE NEW.status WHEN 'failed' THEN 'error'
+             WHEN 'completed' THEN 'success' ELSE 'info' END,
+        CASE WHEN NEW.status = 'failed' THEN 1 ELSE 0 END,
+        CASE NEW.status WHEN 'completed' THEN 'Response completed'
+             WHEN 'failed' THEN 'Conversation response failed'
+             ELSE 'Response cancelled' END,
+        'conversation_turn', NEW.id
+    FROM conversations c
+    LEFT JOIN projects p ON p.id = c.project_id
+    LEFT JOIN agents a ON a.id = NEW.agent_id
+    WHERE c.id = NEW.conversation_id;
+END;
+
+CREATE TRIGGER dashboard_attempt_context_update
+AFTER UPDATE OF context_used, context_size ON work_attempts
+WHEN NEW.context_used IS NOT OLD.context_used OR NEW.context_size IS NOT OLD.context_size
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        context_used, context_size, recorded_at
+    )
+    SELECT 'attempt', NEW.id, t.project_id, ls.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', 'now') || printf('%02dZ', (CAST(strftime('%S', 'now') AS INTEGER) / 10) * 10),
+        NEW.context_used, NEW.context_size, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM logical_sessions ls
+    JOIN tasks t ON t.id = NEW.task_id AND t.hidden = 0 AND t.task_type != 'IDLE'
+    WHERE ls.id = NEW.session_id
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        context_used = excluded.context_used,
+        context_size = excluded.context_size,
+        recorded_at = excluded.recorded_at;
+END;
+
+CREATE TRIGGER dashboard_conversation_context_update
+AFTER UPDATE OF context_used, context_size ON conversation_turns
+WHEN NEW.context_used IS NOT OLD.context_used OR NEW.context_size IS NOT OLD.context_size
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        context_used, context_size, recorded_at
+    )
+    SELECT 'conversation_turn', NEW.id, c.project_id, NEW.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', 'now') || printf('%02dZ', (CAST(strftime('%S', 'now') AS INTEGER) / 10) * 10),
+        NEW.context_used, NEW.context_size, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM conversations c WHERE c.id = NEW.conversation_id
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        context_used = excluded.context_used,
+        context_size = excluded.context_size,
+        recorded_at = excluded.recorded_at;
+END;
+
+-- Tool starts remain exact for 1h/24h/7d charts even when the bounded feed
+-- rolls older display rows off its 20,000-row replay window.
+CREATE TRIGGER dashboard_tool_metric_insert
+AFTER INSERT ON dashboard_events
+WHEN NEW.event_kind = 'tool_call'
+ AND NEW.work_kind IN ('attempt', 'conversation_turn')
+ AND NEW.work_id IS NOT NULL
+BEGIN
+    INSERT INTO dashboard_metric_points (
+        work_kind, work_id, project_id, agent_id, bucket_at,
+        tool_calls, recorded_at
+    ) VALUES (
+        NEW.work_kind, NEW.work_id, NEW.project_id, NEW.agent_id,
+        strftime('%Y-%m-%dT%H:%M:', NEW.occurred_at)
+            || printf('%02dZ', (CAST(strftime('%S', NEW.occurred_at) AS INTEGER) / 10) * 10),
+        1, strftime('%Y-%m-%dT%H:%M:%fZ', NEW.occurred_at)
+    )
+    ON CONFLICT(work_kind, work_id, bucket_at) DO UPDATE SET
+        tool_calls = dashboard_metric_points.tool_calls + 1,
+        recorded_at = excluded.recorded_at;
+END;
+
+-- Keep storage bounded even when nobody has the dashboard open. The snapshot
+-- path also prunes, while this amortized trigger limits write-side cleanup to
+-- once per 256 normalized feed rows.
+CREATE TRIGGER dashboard_telemetry_retention
+AFTER INSERT ON dashboard_events
+WHEN NEW.cursor % 256 = 0
+BEGIN
+    DELETE FROM dashboard_events
+    WHERE occurred_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days')
+       OR cursor <= COALESCE((SELECT MAX(cursor) FROM dashboard_events), 0) - 20000;
+    DELETE FROM dashboard_metric_points
+    WHERE bucket_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days');
+    DELETE FROM dashboard_git_baselines
+    WHERE COALESCE(finalized_at, captured_at)
+        < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days');
+END;
+
+-- Seed a useful bounded history for upgraded installations without copying
+-- unbounded message bodies or any sensitive tool payload.
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview
+)
+SELECT 'task-message:' || tm.id,
+       CASE WHEN tm.role = 'assistant' THEN 'agent_response' ELSE 'task_message' END,
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', tm.timestamp),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       t.project_id, p.name, t.agent_id, a.name,
+       CASE WHEN tm.role = 'assistant' THEN 'agent' ELSE 'user' END,
+       CASE WHEN tm.role = 'assistant' THEN COALESCE(a.name, 'Agent') ELSE 'You' END,
+       'task', t.id, t.title, '/tasks/' || t.id, 'info', 0,
+       CASE WHEN trim(tm.content) = '' THEN 'Image attachment'
+            ELSE substr(trim(replace(replace(tm.content, char(10), ' '), char(13), ' ')), 1, 240) END
+FROM task_messages tm
+JOIN tasks t ON t.id = tm.task_id AND t.hidden = 0
+LEFT JOIN projects p ON p.id = t.project_id
+LEFT JOIN agents a ON a.id = t.agent_id
+WHERE tm.id IN (
+    SELECT id FROM task_messages
+    WHERE role IN ('user', 'assistant')
+    ORDER BY id DESC LIMIT 500
+)
+  AND tm.role IN ('user', 'assistant')
+  AND (tm.role != 'assistant' OR trim(tm.content) != '');
+
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview
+)
+SELECT 'conversation-message:' || cm.id,
+       CASE WHEN cm.sender_type = 'agent' THEN 'agent_response' ELSE 'conversation_message' END,
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', cm.created_at),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       c.project_id, p.name,
+       CASE WHEN cm.sender_type = 'agent' THEN cm.sender_id ELSE NULL END,
+       CASE WHEN cm.sender_type = 'agent' THEN COALESCE(cm.sender_name, a.name) ELSE NULL END,
+       cm.sender_type,
+       COALESCE(cm.sender_name, CASE WHEN cm.sender_type = 'user' THEN 'You' ELSE cm.sender_id END),
+       'conversation', c.id, COALESCE(c.title, 'Untitled conversation'),
+       '/conversations/' || c.id, 'info', 0,
+       CASE WHEN trim(cm.content) = '' THEN 'File attachment'
+            ELSE substr(trim(replace(replace(cm.content, char(10), ' '), char(13), ' ')), 1, 240) END
+FROM conversation_messages cm
+JOIN conversations c ON c.id = cm.conversation_id
+LEFT JOIN projects p ON p.id = c.project_id
+LEFT JOIN agents a ON a.id = cm.sender_id AND cm.sender_type = 'agent'
+WHERE cm.id IN (
+    SELECT id FROM conversation_messages
+    WHERE sender_type IN ('user', 'agent')
+    ORDER BY id DESC LIMIT 500
+)
+  AND cm.sender_type IN ('user', 'agent');
+
+INSERT INTO dashboard_events (
+    event_id, event_kind, occurred_at, project_id, project_name,
+    agent_id, agent_name, source_kind, source_label,
+    target_type, target_id, target_title, href, severity,
+    needs_attention, preview, work_kind, work_id
+)
+SELECT 'tool-call:legacy:' || se.id, 'tool_call',
+       COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', se.created_at),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+       t.project_id, p.name, ls.agent_id, a.name,
+       'agent', COALESCE(a.name, ls.agent_id),
+       'task', t.id, t.title, '/tasks/' || t.id, 'info', 0,
+       'Used an Agent tool',
+       'attempt', se.attempt_id
+FROM session_events se
+JOIN logical_sessions ls ON ls.id = se.session_id
+JOIN tasks t ON t.id = se.task_id AND t.hidden = 0
+LEFT JOIN projects p ON p.id = t.project_id
+LEFT JOIN agents a ON a.id = ls.agent_id
+WHERE se.event_type = 'tool_call'
+  AND se.id IN (
+      SELECT id FROM session_events
+      WHERE event_type = 'tool_call'
+      ORDER BY id DESC LIMIT 1000
+  );
+"#;
+
+const MIGRATION_V42: &str = r#"
+-- Codex inline visualizations are copied into the control-plane database at
+-- final-message ingestion time. Exactly one message owns each artifact; the
+-- attempt/turn columns retain execution provenance without making pruning an
+-- accidental deletion boundary for a still-visible message.
+CREATE TABLE message_visualizations (
+    id TEXT PRIMARY KEY,
+    task_message_id INTEGER REFERENCES task_messages(id) ON DELETE CASCADE,
+    conversation_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    conversation_turn_id TEXT REFERENCES conversation_turns(id) ON DELETE SET NULL,
+    reference_index INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    display_mode TEXT NOT NULL DEFAULT 'normal'
+        CHECK (display_mode IN ('normal', 'wide')),
+    status TEXT NOT NULL
+        CHECK (status IN ('ready', 'unavailable')),
+    error_code TEXT,
+    content TEXT,
+    content_sha256 TEXT,
+    size INTEGER,
+    retrieval_token TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (task_message_id IS NOT NULL AND conversation_message_id IS NULL) OR
+        (task_message_id IS NULL AND conversation_message_id IS NOT NULL)
+    ),
+    CHECK (
+        (status = 'ready' AND content IS NOT NULL AND error_code IS NULL
+          AND content_sha256 IS NOT NULL AND length(content_sha256) = 64
+          AND size BETWEEN 1 AND 1048576
+          AND length(CAST(content AS BLOB)) = size) OR
+        (status = 'unavailable' AND content IS NULL AND error_code IS NOT NULL
+          AND content_sha256 IS NULL AND size IS NULL)
+    )
+);
+CREATE UNIQUE INDEX idx_message_visualizations_task_reference
+    ON message_visualizations(task_message_id, reference_index)
+    WHERE task_message_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_message_visualizations_conversation_reference
+    ON message_visualizations(conversation_message_id, reference_index)
+    WHERE conversation_message_id IS NOT NULL;
+CREATE INDEX idx_message_visualizations_attempt
+    ON message_visualizations(attempt_id);
+CREATE INDEX idx_message_visualizations_turn
+    ON message_visualizations(conversation_turn_id);
+"#;
+
+const MIGRATION_V43: &str = r#"
+-- An Agent's bootstrap workspace remains the writable security boundary while
+-- this local-only selection records the narrower repository used as ACP cwd.
+-- Portable Project sync intentionally excludes this machine-specific path.
+CREATE TABLE agent_repository_selections (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    relative_path TEXT,
+    repository_identity TEXT,
+    selection_mode TEXT NOT NULL DEFAULT 'automatic'
+        CHECK (selection_mode IN ('automatic', 'manual', 'cleared')),
+    pending_relative_path TEXT,
+    pending_selection_mode TEXT
+        CHECK (pending_selection_mode IN ('manual', 'cleared')),
+    generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (relative_path IS NOT NULL OR repository_identity IS NULL),
+    CHECK (selection_mode != 'cleared' OR relative_path IS NULL),
+    CHECK (
+        (pending_selection_mode IS NULL AND pending_relative_path IS NULL) OR
+        (pending_selection_mode = 'manual' AND pending_relative_path IS NOT NULL) OR
+        (pending_selection_mode = 'cleared' AND pending_relative_path IS NULL)
+    )
+);
+CREATE INDEX idx_agent_repository_updated
+    ON agent_repository_selections(updated_at);
+"#;
+
+const MIGRATION_V39: &str = "
+-- Cascading Project deletion is a recoverable two-phase operation. The
+-- durable marker is set before workers and retained runtimes are stopped, so
+-- no new work can attach while asynchronous cleanup is in progress. A failed
+-- cleanup can be retried without making a bare DELETE destructive.
+ALTER TABLE projects ADD COLUMN deletion_started_at TIMESTAMP;
+";
+
+const MIGRATION_V40: &str = "
+-- A workflow can deliberately remain projectless while selecting Agents that
+-- belong to Projects. Persist that Agent-derived scope so taskless waits and
+-- pre-task runs still participate in Project lifecycle guards and deletion.
+-- agent_id is an immutable provenance snapshot rather than a foreign key: it
+-- must remain available until the owning workflow instance is removed, even
+-- while the Agent itself is being deleted.
+CREATE TABLE workflow_instance_agent_bindings (
+    instance_id TEXT NOT NULL
+        REFERENCES workflow_instances(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    project_id TEXT NOT NULL
+        REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (instance_id, agent_id, project_id)
+);
+CREATE INDEX idx_workflow_instance_agent_bindings_project
+    ON workflow_instance_agent_bindings(project_id, instance_id);
+
+-- Existing taskless event waits persist their selected Agent in input_context.
+-- Recover that ownership without making runtime lifecycle queries depend on
+-- parsing JSON after this one-time migration. The Rust migration pass also
+-- resolves every typed-input and future-step Agent from each saved run.
+INSERT OR IGNORE INTO workflow_instance_agent_bindings
+    (instance_id, agent_id, project_id)
+SELECT execution.instance_id,
+       json_extract(execution.input_context, '$.agent_id'),
+       agent.project_id
+FROM workflow_step_executions execution
+JOIN agents agent
+  ON agent.id = CASE
+      WHEN json_valid(execution.input_context)
+      THEN json_extract(execution.input_context, '$.agent_id')
+  END
+WHERE execution.task_id IS NULL
+  AND execution.input_context IS NOT NULL
+  AND json_valid(execution.input_context)
+  AND CASE
+      WHEN json_valid(execution.input_context)
+      THEN json_type(execution.input_context, '$.agent_id')
+  END = 'text'
+  AND agent.project_id IS NOT NULL;
+";
+
 fn schema_migrations() -> &'static [(u32, &'static str)] {
     &[
         (1, MIGRATION_V1),
@@ -1779,6 +2516,11 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (36, MIGRATION_V36),
         (37, MIGRATION_V37),
         (38, MIGRATION_V38),
+        (39, MIGRATION_V39),
+        (40, MIGRATION_V40),
+        (41, MIGRATION_V41),
+        (42, MIGRATION_V42),
+        (43, MIGRATION_V43),
     ]
 }
 
@@ -1799,7 +2541,34 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "38");
+        assert_eq!(version, "43");
+        let visualization_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'message_visualizations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visualization_table, 1);
+        let deletion_marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('projects')
+                 WHERE name = 'deletion_started_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deletion_marker, 1);
+        let workflow_agent_scope: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM pragma_table_info('workflow_instance_agent_bindings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(workflow_agent_scope, 3);
         let memory_owner: String = conn
             .query_row(
                 "SELECT \"table\" FROM pragma_foreign_key_list('project_memory_notes')
@@ -1983,6 +2752,299 @@ mod tests {
                 "2026-08-16 11:00:00".into(),
                 "2026-08-16 11:00:07".into(),
             )
+        );
+    }
+
+    #[test]
+    fn v40_backfills_every_resolvable_workflow_agent_scope() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 39 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            r#"INSERT INTO projects (id, name)
+               VALUES ('p-current', 'Current'),
+                      ('p-input', 'Input'),
+                      ('p-future', 'Future');
+               INSERT INTO agents (id, name, backend, config, project_id)
+               VALUES ('atlas', 'Atlas', 'native', '{}', 'p-current'),
+                      ('reviewer', 'Reviewer', 'native', '{}', 'p-input'),
+                      ('future-agent', 'Future Agent', 'native', '{}', 'p-future');
+               INSERT INTO workflows (id, name, yaml_content)
+               VALUES ('workflow', 'Workflow', 'name: Current
+flows:
+  main:
+    steps:
+      - id: no-agent
+        prompt: Continue'),
+                      ('unresolved', 'Unresolved', 'name: Unresolved
+flows:
+  main:
+    steps:
+      - id: known
+        agent: atlas
+        prompt: Continue
+      - id: future
+        agent: "{{future.agent_id}}"
+        prompt: Continue'),
+                      ('missing', 'Missing', 'name: Missing
+flows:
+  main:
+    steps:
+      - id: known
+        agent: atlas
+        prompt: Continue
+      - id: future
+        agent: missing-agent
+        prompt: Continue');
+               INSERT INTO workflow_instances
+                   (id, workflow_id, status, trigger_data, definition_yaml)
+               VALUES ('valid', 'workflow', 'waiting', '{"reviewer":"reviewer"}',
+                       'name: Snapshot
+inputs:
+  reviewer:
+    type: agent
+flows:
+  main:
+    steps:
+      - id: current
+        type: wait
+        agent: atlas
+        event: github.pull_request.activity
+        resource: https://github.com/example/repo/pull/1
+      - id: input
+        agent: "@reviewer"
+        prompt: Review
+  later:
+    steps:
+      - id: future
+        agent: future-agent
+        prompt: Continue'),
+                      ('malformed', 'workflow', 'waiting', '{}', NULL),
+                      ('unknown', 'workflow', 'waiting', '{}', NULL),
+                      ('unresolved-active', 'unresolved', 'waiting', '{}', NULL),
+                      ('unresolved-complete', 'unresolved', 'completed', '{}', NULL),
+                      ('missing-active', 'missing', 'running', '{}', NULL);
+               INSERT INTO workflow_instances
+                   (id, workflow_id, project_id, status, trigger_data, definition_yaml)
+               VALUES ('scoped-valid', 'workflow', 'p-current', 'waiting', '{}',
+                       'name: Scoped valid
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: atlas
+        prompt: Continue'),
+                      ('scoped-conflict', 'workflow', 'p-current', 'waiting',
+                       '{"trigger":{"future_agent":"reviewer"}}',
+                       'name: Scoped conflict
+flows:
+  main:
+    steps:
+      - id: implement
+        agent: atlas
+        prompt: Continue
+  later:
+    steps:
+      - id: future-review
+        agent: "{{trigger.future_agent}}"
+        prompt: Review'),
+                      ('scoped-conflict-complete', 'workflow', 'p-current', 'completed', '{}',
+                       'name: Completed scoped conflict
+flows:
+  main:
+    steps:
+      - id: review
+        agent: reviewer
+        prompt: Review');
+               INSERT INTO workflow_step_executions
+                   (id, instance_id, flow_name, step_id, task_id, status, input_context)
+               VALUES ('valid-wait', 'valid', 'main', 'review', NULL, 'waiting',
+                       '{"agent_id":"atlas"}'),
+                      ('malformed-wait', 'malformed', 'main', 'review', NULL, 'waiting',
+                       '{'),
+                      ('unknown-wait', 'unknown', 'main', 'review', NULL, 'waiting',
+                       '{"agent_id":"missing"}');"#,
+        )
+        .unwrap();
+
+        let transaction = conn.unchecked_transaction().unwrap();
+        transaction.execute_batch(MIGRATION_V40).unwrap();
+        backfill_workflow_agent_bindings(&transaction).unwrap();
+        transaction.commit().unwrap();
+
+        let bindings = conn
+            .prepare(
+                "SELECT instance_id, agent_id, project_id
+                 FROM workflow_instance_agent_bindings ORDER BY instance_id, agent_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            bindings,
+            vec![
+                (
+                    "missing-active".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "scoped-conflict".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "scoped-conflict".to_string(),
+                    "reviewer".to_string(),
+                    "p-input".to_string(),
+                ),
+                (
+                    "scoped-conflict-complete".to_string(),
+                    "reviewer".to_string(),
+                    "p-input".to_string(),
+                ),
+                (
+                    "scoped-valid".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "unresolved-active".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "unresolved-complete".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "valid".to_string(),
+                    "atlas".to_string(),
+                    "p-current".to_string(),
+                ),
+                (
+                    "valid".to_string(),
+                    "future-agent".to_string(),
+                    "p-future".to_string(),
+                ),
+                (
+                    "valid".to_string(),
+                    "reviewer".to_string(),
+                    "p-input".to_string(),
+                ),
+            ]
+        );
+        let statuses = conn
+            .prepare(
+                "SELECT id, status, error_message FROM workflow_instances
+                 WHERE id IN ('valid', 'unresolved-active', 'unresolved-complete', 'missing-active',
+                              'scoped-valid', 'scoped-conflict', 'scoped-conflict-complete')
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                (
+                    "missing-active".into(),
+                    "cancelled".into(),
+                    Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                (
+                    "scoped-conflict".into(),
+                    "cancelled".into(),
+                    Some(CONFLICTING_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                ("scoped-conflict-complete".into(), "completed".into(), None,),
+                ("scoped-valid".into(), "waiting".into(), None),
+                (
+                    "unresolved-active".into(),
+                    "cancelled".into(),
+                    Some(UNRECOVERABLE_WORKFLOW_BINDINGS_ERROR.into()),
+                ),
+                ("unresolved-complete".into(), "completed".into(), None),
+                ("valid".into(), "waiting".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn v41_backfills_only_user_and_agent_authored_messages() {
+        ensure_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        register_sql_functions(&conn).unwrap();
+        for &(target, sql) in schema_migrations() {
+            if target > 40 {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO projects (id, name) VALUES ('p', 'Project');
+             INSERT INTO agents (id, name, backend, config, project_id)
+             VALUES ('atlas', 'Atlas', 'native', '{}', 'p');
+             INSERT INTO tasks (id, title, agent_id, project_id)
+             VALUES ('task', 'Investigate', 'atlas', 'p');
+             INSERT INTO task_messages (task_id, role, content)
+             VALUES ('task', 'system', 'Private generated orchestration prompt'),
+                    ('task', 'user', 'Please investigate'),
+                    ('task', 'assistant', 'I found the cause');
+             INSERT INTO conversations (id, title, project_id)
+             VALUES ('conversation', 'Discuss', 'p');
+             INSERT INTO conversation_messages
+                 (conversation_id, sender_type, sender_id, sender_name, content)
+             VALUES
+                 ('conversation', 'system', 'scheduler', 'Scheduler',
+                  'Private scheduled wake-up instructions'),
+                 ('conversation', 'user', 'user', 'You', 'Can you check this?'),
+                 ('conversation', 'agent', 'atlas', 'Atlas', 'I am checking it now');",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION_V41).unwrap();
+
+        let previews = conn
+            .prepare("SELECT preview FROM dashboard_events ORDER BY cursor")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            previews,
+            vec![
+                "Please investigate",
+                "I found the cause",
+                "Can you check this?",
+                "I am checking it now"
+            ]
         );
     }
 
@@ -2423,5 +3485,9 @@ mod tests {
         assert!(tables.contains(&"task_message_sync".to_string()));
         assert!(tables.contains(&"project_workflows".to_string()));
         assert!(tables.contains(&"project_sync_state".to_string()));
+        assert!(tables.contains(&"dashboard_events".to_string()));
+        assert!(tables.contains(&"dashboard_metric_points".to_string()));
+        assert!(tables.contains(&"dashboard_git_baselines".to_string()));
+        assert!(tables.contains(&"workflow_instance_agent_bindings".to_string()));
     }
 }

@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 
 /// A running (or completed) workflow instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,7 +57,7 @@ pub(super) struct WorkflowInstanceScope<'a> {
     pub project_id: Option<&'a str>,
     pub conversation_id: Option<&'a str>,
     pub creator_agent_id: Option<&'a str>,
-    pub workflow_agent_inputs: &'a [(String, String)],
+    pub workflow_agent_bindings: &'a [(String, String)],
 }
 
 impl InstanceManager {
@@ -160,16 +161,9 @@ impl InstanceManager {
             }
             let resolved_project = scope.project_id.or(conversation_project.as_deref());
             if let Some(project_id) = resolved_project {
-                let exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                    [project_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !exists {
-                    return Err(Error::Workflow(format!(
-                        "project '{project_id}' not found"
-                    )));
-                }
+                ensure_project_accepts_work(&transaction, project_id).map_err(|error| {
+                    Error::Workflow(error.to_string())
+                })?;
             }
             if let Some(creator_agent_id) = scope.creator_agent_id {
                 let conversation_id = scope.conversation_id.ok_or_else(|| {
@@ -193,7 +187,8 @@ impl InstanceManager {
                     )));
                 }
             }
-            for (input_name, agent_id) in scope.workflow_agent_inputs {
+            let mut agent_bindings = Vec::new();
+            for (source, agent_id) in scope.workflow_agent_bindings {
                 let agent_project = transaction
                     .query_row(
                         "SELECT project_id FROM agents WHERE id = ?1",
@@ -203,15 +198,25 @@ impl InstanceManager {
                     .optional()?
                     .ok_or_else(|| {
                         Error::Workflow(format!(
-                            "workflow agent input '{input_name}' references unknown agent '{agent_id}'"
+                            "workflow {source} references unknown agent '{agent_id}'"
                         ))
                     })?;
                 if let Some(project_id) = resolved_project {
                     if agent_project.as_deref() != Some(project_id) {
                         return Err(Error::Workflow(format!(
-                            "workflow agent input '{input_name}' references Agent '{agent_id}' outside project '{project_id}'"
+                            "workflow {source} references Agent '{agent_id}' outside project '{project_id}'"
                         )));
                     }
+                } else if let Some(project_id) = agent_project.as_deref() {
+                    // A projectless workflow still creates work through its
+                    // selected Agents. Validate each Agent's owning Project
+                    // before inserting the instance so a deletion marker
+                    // cannot leave an undiscoverable pre-step run behind.
+                    ensure_project_accepts_work(&transaction, project_id)
+                        .map_err(|error| Error::Workflow(error.to_string()))?;
+                }
+                if let Some(project_id) = agent_project {
+                    agent_bindings.push((agent_id.as_str(), project_id));
                 }
             }
             transaction.execute(
@@ -231,6 +236,9 @@ impl InstanceManager {
                     definition_yaml
                 ],
             )?;
+            for (agent_id, project_id) in agent_bindings {
+                insert_instance_agent_binding(&transaction, &id, agent_id, &project_id)?;
+            }
             let after_insert = after_insert(&transaction, &id)?;
             transaction.commit()?;
             Ok::<_, Error>(after_insert)
@@ -246,11 +254,58 @@ impl InstanceManager {
         conversation_id: Option<&str>,
     ) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            // Validate the instance's current ownership before allowing its
+            // context to move. Otherwise a concurrent cascade could mark the
+            // source Project for deletion and this update could detach the
+            // instance before the cascade's final ownership sweep sees it.
+            ensure_instance_accepts_work(&transaction, instance_id)?;
+            let conversation_project = if let Some(conversation_id) = conversation_id {
+                transaction
+                    .query_row(
+                        "SELECT project_id FROM conversations WHERE id = ?1",
+                        [conversation_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        Error::Workflow(format!("conversation '{conversation_id}' not found"))
+                    })?
+            } else {
+                None
+            };
+            if let (Some(requested), Some(actual)) = (project_id, conversation_project.as_deref()) {
+                if requested != actual {
+                    return Err(Error::Workflow(format!(
+                        "conversation '{}' belongs to project '{actual}', not '{requested}'",
+                        conversation_id.unwrap_or_default()
+                    )));
+                }
+            }
+            let resolved_project = project_id.or(conversation_project.as_deref());
+            if let Some(project_id) = resolved_project {
+                ensure_project_accepts_work(&transaction, project_id)
+                    .map_err(|error| Error::Workflow(error.to_string()))?;
+                ensure_instance_project_matches_durable_work(
+                    &transaction,
+                    instance_id,
+                    project_id,
+                )?;
+            }
+            let updated = transaction.execute(
                 "UPDATE workflow_instances SET project_id = ?1, conversation_id = ?2 WHERE id = ?3",
                 rusqlite::params![project_id, conversation_id, instance_id],
-            )
-            .map_err(|error| Error::Database(error.to_string()))
+            )?;
+            if updated == 0 {
+                return Err(Error::WorkflowInstanceNotFound {
+                    id: instance_id.to_string(),
+                });
+            }
+            transaction.commit()?;
+            Ok(())
         })?;
         Ok(())
     }
@@ -309,11 +364,17 @@ impl InstanceManager {
     /// completion timestamp.
     pub fn set_active_status(&self, id: &str, status: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_instance_accepts_work(&transaction, id)?;
+            transaction.execute(
                 "UPDATE workflow_instances SET status = ?1, completed_at = NULL, error_message = NULL WHERE id = ?2",
                 rusqlite::params![status, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
         Ok(())
     }
@@ -326,11 +387,19 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            if status != "cancelled" {
+                ensure_instance_accepts_work(&transaction, id)?;
+            }
+            transaction.execute(
                 "UPDATE workflow_instances SET status = ?1, error_message = ?2, completed_at = ?3 WHERE id = ?4",
                 rusqlite::params![status, error_msg, now, id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         Ok(())
@@ -415,15 +484,24 @@ impl InstanceManager {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        let attempt = self.get_step_attempt_count(instance_id, step_id)? + 1;
-
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
+            let attempt = transaction.query_row(
+                "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
+                rusqlite::params![instance_id, step_id],
+                |row| row.get::<_, i32>(0),
+            )? + 1;
+            transaction.execute(
                 "INSERT INTO workflow_step_executions (id, instance_id, flow_name, step_id, status, input_context, attempt, started_at)
                  VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
                 rusqlite::params![id, instance_id, flow_name, step_id, input_context, attempt, now],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         self.get_step_execution(&id)
@@ -499,9 +577,12 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| -> Result<()> {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|error| Error::Database(error.to_string()))?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|error| Error::Database(error.to_string()))?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
             let attempt = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
@@ -557,6 +638,37 @@ impl InstanceManager {
         step_id: &str,
         wait_state: &str,
     ) -> Result<StepExecution> {
+        self.create_wait_execution_inner(instance_id, flow_name, step_id, None, wait_state)
+    }
+
+    /// Persist a taskless event wait together with the Project scope implied
+    /// by its selected Agent. The binding and wait are committed atomically so
+    /// Project deletion cannot miss the instance between those operations.
+    pub(super) fn create_agent_wait_execution(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        agent_id: &str,
+        wait_state: &str,
+    ) -> Result<StepExecution> {
+        self.create_wait_execution_inner(
+            instance_id,
+            flow_name,
+            step_id,
+            Some(agent_id),
+            wait_state,
+        )
+    }
+
+    fn create_wait_execution_inner(
+        &self,
+        instance_id: &str,
+        flow_name: &str,
+        step_id: &str,
+        agent_id: Option<&str>,
+        wait_state: &str,
+    ) -> Result<StepExecution> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now()
             .naive_utc()
@@ -564,9 +676,15 @@ impl InstanceManager {
             .to_string();
 
         self.db.with_conn(|conn| -> Result<()> {
-            let transaction = conn
-                .unchecked_transaction()
-                .map_err(|error| Error::Database(error.to_string()))?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(|error| Error::Database(error.to_string()))?;
+            ensure_instance_accepts_work(&transaction, instance_id)?;
+            if let Some(agent_id) = agent_id {
+                bind_instance_to_agent_project(&transaction, instance_id, agent_id)?;
+            }
             let attempt = transaction
                 .query_row(
                     "SELECT COUNT(*) FROM workflow_step_executions WHERE instance_id = ?1 AND step_id = ?2",
@@ -647,13 +765,18 @@ impl InstanceManager {
     /// after a crash, while competing pollers can no longer claim it twice.
     pub fn claim_wait(&self, id: &str, output: &str) -> Result<bool> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, id)?;
+            let changed = transaction.execute(
                 "UPDATE workflow_step_executions SET status = 'resuming', output = ?1
                  WHERE id = ?2 AND status = 'waiting'",
                 rusqlite::params![output, id],
-            )
-            .map(|changed| changed == 1)
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(changed == 1)
         })
     }
 
@@ -674,11 +797,17 @@ impl InstanceManager {
     /// Link a step execution to a task.
     pub fn set_step_task(&self, execution_id: &str, task_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            transaction.execute(
                 "UPDATE workflow_step_executions SET task_id = ?1, status = 'running' WHERE id = ?2",
                 rusqlite::params![task_id, execution_id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
 
         Ok(())
@@ -686,11 +815,17 @@ impl InstanceManager {
 
     pub fn mark_step_running(&self, execution_id: &str) -> Result<()> {
         self.db.with_conn(|conn| {
-            conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_step_execution_accepts_work(&transaction, execution_id)?;
+            transaction.execute(
                 "UPDATE workflow_step_executions SET status = 'running' WHERE id = ?1",
                 [execution_id],
-            )
-            .map_err(|e| Error::Database(e.to_string()))
+            )?;
+            transaction.commit()?;
+            Ok::<_, Error>(())
         })?;
         Ok(())
     }
@@ -747,6 +882,146 @@ impl InstanceManager {
             Ok(count)
         })
     }
+}
+
+fn ensure_instance_accepts_work(conn: &rusqlite::Connection, instance_id: &str) -> Result<()> {
+    let (project_id, conversation_project_id) = conn
+        .query_row(
+            "SELECT instance.project_id, conversation.project_id
+             FROM workflow_instances instance
+             LEFT JOIN conversations conversation
+               ON conversation.id = instance.conversation_id
+             WHERE instance.id = ?1",
+            [instance_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::WorkflowInstanceNotFound {
+            id: instance_id.to_string(),
+        })?;
+    if let Some(project_id) = project_id.as_deref() {
+        ensure_project_accepts_work(conn, project_id)
+            .map_err(|error| Error::Workflow(error.to_string()))?;
+    }
+    if conversation_project_id.as_deref() != project_id.as_deref() {
+        if let Some(project_id) = conversation_project_id.as_deref() {
+            ensure_project_accepts_work(conn, project_id)
+                .map_err(|error| Error::Workflow(error.to_string()))?;
+        }
+    }
+    let derived_project_ids = instance_durable_project_ids(conn, instance_id)?;
+    for derived_project_id in derived_project_ids {
+        if Some(derived_project_id.as_str()) != project_id.as_deref()
+            && Some(derived_project_id.as_str()) != conversation_project_id.as_deref()
+        {
+            ensure_project_accepts_work(conn, &derived_project_id)
+                .map_err(|error| Error::Workflow(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_instance_project_matches_durable_work(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    let conflicting_projects = instance_durable_project_ids(conn, instance_id)?
+        .into_iter()
+        .filter(|derived_project_id| derived_project_id != project_id)
+        .collect::<Vec<_>>();
+    if conflicting_projects.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::Workflow(format!(
+        "workflow instance '{instance_id}' has durable Agent or task work bound to project(s) {} and cannot move to project '{project_id}'",
+        conflicting_projects.join(", ")
+    )))
+}
+
+fn instance_durable_project_ids(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(
+        "SELECT project_id
+         FROM (
+             SELECT binding.project_id AS project_id
+             FROM workflow_instance_agent_bindings binding
+             WHERE binding.instance_id = ?1
+             UNION
+             SELECT task.project_id AS project_id
+             FROM workflow_step_executions execution
+             JOIN tasks task ON task.id = execution.task_id
+             WHERE execution.instance_id = ?1 AND task.project_id IS NOT NULL
+         )
+         ORDER BY project_id",
+    )?;
+    let project_ids = statement
+        .query_map([instance_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(project_ids)
+}
+
+fn bind_instance_to_agent_project(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    agent_id: &str,
+) -> Result<()> {
+    let Some(project_id) = conn
+        .query_row(
+            "SELECT project_id FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+    else {
+        // Preserve the existing workflow error/recovery path for stale or
+        // externally supplied Agent names. Only registered Project Agents add
+        // a lifecycle binding.
+        return Ok(());
+    };
+    if let Some(project_id) = project_id {
+        ensure_project_accepts_work(conn, &project_id)
+            .map_err(|error| Error::Workflow(error.to_string()))?;
+        insert_instance_agent_binding(conn, instance_id, agent_id, &project_id)?;
+    }
+    Ok(())
+}
+
+fn insert_instance_agent_binding(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    agent_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO workflow_instance_agent_bindings
+         (instance_id, agent_id, project_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![instance_id, agent_id, project_id],
+    )?;
+    Ok(())
+}
+
+fn ensure_step_execution_accepts_work(
+    conn: &rusqlite::Connection,
+    execution_id: &str,
+) -> Result<()> {
+    let instance_id = conn
+        .query_row(
+            "SELECT instance_id FROM workflow_step_executions WHERE id = ?1",
+            [execution_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::Workflow(format!("step execution not found: {execution_id}")))?;
+    ensure_instance_accepts_work(conn, &instance_id)
 }
 
 fn row_to_instance(row: &rusqlite::Row) -> WorkflowInstance {
@@ -834,6 +1109,243 @@ mod tests {
             .unwrap();
 
         assert_eq!(inst.variable_store, r#"{"default_agent": "atlas"}"#);
+    }
+
+    #[test]
+    fn deleting_project_blocks_new_and_resumed_workflow_work() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('project-agent', 'Project Agent', 'codex', '{}', 'stopped', 'project-one');",
+            )
+        })
+        .unwrap();
+        let instance = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let waiting = mgr
+            .create_wait_execution(&instance.id, "main", "review", "{}")
+            .unwrap();
+        let agent_inputs = vec![("worker".to_string(), "project-agent".to_string())];
+        let projectless_input = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    workflow_agent_bindings: &agent_inputs,
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let projectless = mgr.create_instance("wf1", None, None).unwrap();
+        let projectless_wait = mgr
+            .create_agent_wait_execution(
+                &projectless.id,
+                "main",
+                "review",
+                "project-agent",
+                r#"{"agent_id":"project-agent"}"#,
+            )
+            .unwrap();
+        let binding: (String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id, project_id
+                     FROM workflow_instance_agent_bindings WHERE instance_id = ?1",
+                    [&projectless.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(binding, ("project-agent".into(), "project-one".into()));
+        let input_binding: (String, String) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT agent_id, project_id
+                     FROM workflow_instance_agent_bindings WHERE instance_id = ?1",
+                    [&projectless_input.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            input_binding,
+            ("project-agent".into(), "project-one".into())
+        );
+
+        crate::projects::ProjectManager::new(db.clone())
+            .begin_cascade("project-one")
+            .unwrap();
+
+        let create_error = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap_err();
+        assert!(create_error.to_string().contains("being deleted"));
+        let projectless_error = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    workflow_agent_bindings: &agent_inputs,
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap_err();
+        assert!(projectless_error.to_string().contains("being deleted"));
+        let instance_count = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instances", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(instance_count, 3);
+        let resume_error = mgr.set_active_status(&instance.id, "running").unwrap_err();
+        assert!(resume_error.to_string().contains("being deleted"));
+        let claim_error = mgr.claim_wait(&waiting.id, "approved").unwrap_err();
+        assert!(claim_error.to_string().contains("being deleted"));
+        let projectless_claim_error = mgr
+            .claim_wait(&projectless_wait.id, "approved")
+            .unwrap_err();
+        assert!(projectless_claim_error
+            .to_string()
+            .contains("being deleted"));
+        assert_eq!(mgr.get_instance(&instance.id).unwrap().status, "cancelled");
+        assert_eq!(
+            mgr.get_instance(&projectless.id).unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            mgr.get_instance(&projectless_input.id).unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn deleting_project_scope_cannot_be_moved_to_another_project() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO projects (id, name) VALUES ('project-two', 'Project Two');
+                 INSERT INTO tasks (id, title, status, project_id)
+                 VALUES ('project-task', 'Project task', 'pending', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        let scoped = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    project_id: Some("project-one"),
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let task_scoped = mgr.create_instance("wf1", None, None).unwrap();
+        let execution = mgr
+            .create_step_execution(&task_scoped.id, "main", "work", None)
+            .unwrap();
+        mgr.set_step_task(&execution.id, "project-task").unwrap();
+
+        crate::projects::ProjectManager::new(db)
+            .begin_cascade("project-one")
+            .unwrap();
+
+        for instance_id in [&scoped.id, &task_scoped.id] {
+            let error = mgr
+                .set_context(instance_id, Some("project-two"), None)
+                .unwrap_err();
+            assert!(error.to_string().contains("being deleted"));
+        }
+        assert_eq!(
+            mgr.get_instance(&scoped.id).unwrap().project_id.as_deref(),
+            Some("project-one")
+        );
+        assert_eq!(mgr.get_instance(&task_scoped.id).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn workflow_context_cannot_cross_durable_project_boundaries() {
+        let (db, mgr) = setup();
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "INSERT INTO projects (id, name) VALUES ('project-one', 'Project One');
+                 INSERT INTO projects (id, name) VALUES ('project-two', 'Project Two');
+                 INSERT INTO agents (id, name, backend, config, status, project_id)
+                 VALUES ('project-agent', 'Project Agent', 'codex', '{}', 'stopped', 'project-one');
+                 INSERT INTO tasks (id, title, status, project_id)
+                 VALUES ('project-task', 'Project task', 'pending', 'project-one');",
+            )
+        })
+        .unwrap();
+
+        let agent_inputs = vec![("worker".to_string(), "project-agent".to_string())];
+        let agent_scoped = mgr
+            .create_instance_with_definition_in_context(
+                "wf1",
+                None,
+                None,
+                None,
+                WorkflowInstanceScope {
+                    workflow_agent_bindings: &agent_inputs,
+                    ..WorkflowInstanceScope::default()
+                },
+            )
+            .unwrap();
+        let task_scoped = mgr.create_instance("wf1", None, None).unwrap();
+        let execution = mgr
+            .create_step_execution(&task_scoped.id, "main", "work", None)
+            .unwrap();
+        mgr.set_step_task(&execution.id, "project-task").unwrap();
+
+        for instance_id in [&agent_scoped.id, &task_scoped.id] {
+            let error = mgr
+                .set_context(instance_id, Some("project-two"), None)
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("durable Agent or task work bound to project(s) project-one"));
+            assert_eq!(mgr.get_instance(instance_id).unwrap().project_id, None);
+        }
+
+        let projects = crate::projects::ProjectManager::new(db);
+        projects.begin_cascade("project-one").unwrap();
+        projects.finish_cascade("project-one").unwrap();
+        for instance_id in [&agent_scoped.id, &task_scoped.id] {
+            assert!(matches!(
+                mgr.get_instance(instance_id),
+                Err(Error::WorkflowInstanceNotFound { .. })
+            ));
+        }
     }
 
     #[test]

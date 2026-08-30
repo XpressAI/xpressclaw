@@ -5,7 +5,6 @@
 //! alive. GitHub polling deliberately reuses the same project-scoped access
 //! discovery as native workers.
 
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -16,7 +15,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::Database;
 use crate::error::{Error, Result};
-use crate::workers::github;
+use crate::workers::{github, native};
 
 use super::engine::WorkflowEngine;
 use super::instance::InstanceManager;
@@ -140,21 +139,35 @@ pub async fn poll_waits_once(db: &Arc<Database>, config: &Config) -> Result<u32>
             )?;
             continue;
         };
-        let workspace = agent
-            .runner
-            .workspace
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.system.workspace_dir.clone());
-        let Some(access) = github::discover(db, &workspace) else {
-            warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), "workflow wait cannot discover project-scoped GitHub access");
-            defer_wait(
-                &instances,
-                &execution.id,
-                &mut state,
-                Some("project-scoped GitHub access is unavailable"),
-            )?;
-            continue;
+        let workspace = native::resolved_workspace(config, agent);
+        let access = match crate::repositories::discover_active_github_access(
+            db,
+            &agent.name,
+            &workspace,
+        )
+        .await
+        {
+            Ok(Some(access)) => access,
+            Ok(None) => {
+                warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), "workflow wait cannot discover project-scoped GitHub access");
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some("project-scoped GitHub access is unavailable"),
+                )?;
+                continue;
+            }
+            Err(error) => {
+                warn!(execution_id = execution.id, agent_id = state.agent_id, workspace = %workspace.display(), %error, "workflow wait repository is unavailable");
+                defer_wait(
+                    &instances,
+                    &execution.id,
+                    &mut state,
+                    Some("the bound Agent workspace or repository is unavailable"),
+                )?;
+                continue;
+            }
         };
         let pull_request = match parse_pull_request(&state.resource) {
             Ok(pull_request) => pull_request,

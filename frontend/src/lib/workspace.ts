@@ -1,5 +1,6 @@
 export type WorkspaceTabKind =
 	| 'home'
+	| 'dashboard'
 	| 'projects'
 	| 'project'
 	| 'agents'
@@ -13,6 +14,7 @@ export type WorkspaceTabKind =
 	| 'workflow'
 	| 'workflow-new'
 	| 'settings'
+	| 'settings-collaboration'
 	| 'settings-mcp'
 	| 'settings-sync'
 	| 'settings-server';
@@ -78,6 +80,7 @@ export function projectSection(route: string): ProjectSection {
 export function workspacePath(route: string): boolean {
 	const pathname = pathnameFromRoute(route);
 	return pathname === '/'
+		|| pathname === '/dashboard'
 		|| pathname === '/projects'
 		|| pathname.startsWith('/projects/')
 		|| pathname === '/conversations'
@@ -97,6 +100,7 @@ export function workspacePath(route: string): boolean {
 export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 'status' | 'lastActiveAt'> {
 	const pathname = pathnameFromRoute(route);
 	if (pathname === '/') return { path: route, kind: 'home', title: 'New work', resourceId: null };
+	if (pathname === '/dashboard') return { path: route, kind: 'dashboard', title: 'Control center', resourceId: null };
 	if (pathname === '/projects') return { path: route, kind: 'projects', title: 'Projects', resourceId: null };
 	if (pathname.startsWith('/projects/')) return { path: route, kind: 'project', title: 'Project', resourceId: decodeURIComponent(pathname.slice('/projects/'.length)) };
 	if (pathname === '/conversations') return { path: route, kind: 'projects', title: 'Conversations', resourceId: null };
@@ -109,6 +113,7 @@ export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 
 	if (pathname === '/workflows/new') return { path: route, kind: 'workflow-new', title: 'New workflow', resourceId: null };
 	if (pathname.startsWith('/workflows/')) return { path: route, kind: 'workflow', title: 'Workflow', resourceId: pathname.slice('/workflows/'.length) };
 	if (pathname === '/settings/server') return { path: route, kind: 'settings-server', title: 'Settings', resourceId: null };
+	if (pathname === '/settings/collaboration') return { path: route, kind: 'settings-collaboration', title: 'Settings', resourceId: null };
 	if (pathname === '/settings/mcp') return { path: route, kind: 'settings-mcp', title: 'Settings', resourceId: null };
 	if (pathname === '/settings/sync') return { path: route, kind: 'settings-sync', title: 'Settings', resourceId: null };
 	return { path: '/settings', kind: 'settings', title: 'Settings', resourceId: null };
@@ -116,7 +121,7 @@ export function describeWorkspacePath(route: string): Omit<WorkspaceTab, 'id' | 
 
 export function sameWorkspaceTab(tab: WorkspaceTab, route: string): boolean {
 	const next = describeWorkspacePath(route);
-	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-mcp', 'settings-sync', 'settings-server'];
+	const settingsKinds: WorkspaceTabKind[] = ['settings', 'settings-collaboration', 'settings-mcp', 'settings-sync', 'settings-server'];
 	const automationKinds: WorkspaceTabKind[] = ['automations', 'schedules', 'workflows'];
 	if (settingsKinds.includes(tab.kind) && settingsKinds.includes(next.kind)) return true;
 	if (automationKinds.includes(tab.kind) && automationKinds.includes(next.kind)) return true;

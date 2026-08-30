@@ -5,12 +5,14 @@ on:
     branches: [main]
     paths:
       - 'harnesses/**'
+      - 'scripts/build-runner-images.sh'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
   pull_request:
     branches: [main]
     paths:
       - 'harnesses/**'
+      - 'scripts/build-runner-images.sh'
       - 'scripts/verify-runner-images.sh'
       - '.github/workflows/harnesses.yml'
   workflow_dispatch:
@@ -33,6 +35,7 @@ jobs:
         runner:
           - codex
           - claude
+          - deepseek-harness
           - github-copilot
           - junie
           - kimi
@@ -60,6 +63,17 @@ jobs:
           - runner: opencode
             dockerfile: opencode
             build_args: ''
+          - runner: deepseek-harness
+            dockerfile: npm
+            build_args: |
+              AGENT_KIND=deepseek-harness
+              AGENT_PACKAGE=@openma/deepseek-harness-acp@0.4.24
+              AGENT_BINARY=dsh-acp
+              AGENT_ACP_SMOKE=1
+              AGENT_DSH_RUNTIME=1
+              AGENT_DSH_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules/@deepseek-ai/dsh
+              AGENT_NODE_PATH=/opt/xpressclaw/deepseek-harness-runtime/node_modules
+              AGENT_DSH_SESSION_ROOT=/home/node/.dsh/acp-sessions
           - runner: github-copilot
             dockerfile: npm
             build_args: |

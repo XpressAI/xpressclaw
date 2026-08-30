@@ -3,10 +3,12 @@
 	import yaml from 'js-yaml';
 	import { agents, conversations, projects, workflows, type Agent, type Conversation, type ConversationMessage, type ConversationMessageUpload, type ConversationTurn, type Project, type Task, type Workflow } from '$lib/api';
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
+	import { clipboardFiles, imageDataUrl, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { PROJECT_MUTATION_EVENT, type ProjectMutation } from '$lib/projectEvents';
 	import { harnessMark, timeAgo } from '$lib/utils';
 	import AgentLoading from '$lib/components/AgentLoading.svelte';
 	import AiMessage from '$lib/components/AiMessage.svelte';
+	import ImageAttachmentPreviews from '$lib/components/ImageAttachmentPreviews.svelte';
 
 	const MESSAGE_PAGE_SIZE = 80;
 
@@ -29,6 +31,7 @@
 	let content = $state('');
 	let attachments = $state<ConversationMessageUpload[]>([]);
 	let error = $state('');
+	let attachmentError = $state('');
 	let viewMode = $state<'conversation' | 'files'>('conversation');
 	let showPeople = $state(false);
 	let showTaskComposer = $state(false);
@@ -52,6 +55,14 @@
 	let availableAgents = $derived(projectAgents.filter((agent) => !participantAgentIds.includes(agent.id)));
 	let activeTurns = $derived(turns.filter((turn) => turn.status === 'queued' || turn.status === 'running'));
 	let allFiles = $derived(messages.flatMap((message) => (message.attachments ?? []).map((attachment) => ({ attachment, message }))));
+	let imageAttachmentPreviews = $derived(attachments.flatMap((attachment, attachmentIndex) =>
+		attachment.mime_type.startsWith('image/')
+			? [{ name: attachment.name, src: imageDataUrl(attachment), attachmentIndex }]
+			: []
+	));
+	let otherAttachmentChips = $derived(attachments.flatMap((attachment, attachmentIndex) =>
+		attachment.mime_type.startsWith('image/') ? [] : [{ attachment, attachmentIndex }]
+	));
 	let workflowDefinition = $derived(parseWorkflow(workflowList.find((workflow) => workflow.id === taskWorkflow)));
 	let workflowInputs = $derived(Object.entries(workflowDefinition?.inputs ?? {}));
 
@@ -198,6 +209,11 @@
 	function connectEvents() {
 		eventSource = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/events`);
 		eventSource.onmessage = () => void refreshActivity().then(() => scrollToLatest());
+		eventSource.onerror = () => {
+			// EventSource hides the handshake status. Probe one protected route so
+			// the shared API client can route an expired session to login.
+			void conversations.get(conversationId).catch(() => undefined);
+		};
 	}
 
 	async function scrollToLatest(behavior: ScrollBehavior = 'smooth') {
@@ -261,6 +277,7 @@
 			await conversations.sendMessage(conversationId, content.trim(), attachments);
 			content = '';
 			attachments = [];
+			attachmentError = '';
 			clearComposerDraft(draftScope);
 			await refreshActivity();
 			await scrollToLatest();
@@ -269,6 +286,12 @@
 		} finally {
 			sending = false;
 		}
+	}
+
+	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
+		await conversations.sendMessage(conversationId, prompt);
+		await refreshActivity();
+		await scrollToLatest();
 	}
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -303,10 +326,15 @@
 			if (attachments.length + files.length > 10) throw new Error('A message can include up to 10 files.');
 			if (currentSize + addedSize > 20 * 1024 * 1024) throw new Error('Files in one message cannot exceed 20 MiB.');
 			attachments = [...attachments, ...await Promise.all(files.map(fileUpload))];
-			error = '';
+			attachmentError = '';
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not attach the files.';
+			attachmentError = cause instanceof Error ? cause.message : 'Could not attach the files.';
 		}
+	}
+
+	function removeAttachment(index: number) {
+		attachments = attachments.filter((_, itemIndex) => itemIndex !== index);
+		attachmentError = '';
 	}
 
 	function fileUpload(file: File): Promise<ConversationMessageUpload> {
@@ -328,10 +356,17 @@
 	}
 
 	function handlePaste(event: ClipboardEvent) {
-		const files = Array.from(event.clipboardData?.files ?? []);
-		if (files.length === 0) return;
+		const files = clipboardFiles(event);
+		if (files.length > 0) {
+			event.preventDefault();
+			void addFiles(files);
+			return;
+		}
+		if (!shouldHandleImagePaste(event)) return;
 		event.preventDefault();
-		void addFiles(files);
+		void pastedImageFiles(event)
+			.then(addFiles)
+			.catch((cause) => (attachmentError = cause instanceof Error ? cause.message : 'Could not attach the clipboard image.'));
 	}
 
 	async function toggleParticipant(agent: Agent) {
@@ -423,15 +458,20 @@
 						{#if messages.length === 0}<div class="rounded-xl border border-dashed border-border p-10 text-center"><h2 class="font-medium">Start the conversation</h2><p class="mt-2 text-sm text-muted-foreground">Every participating Agent can answer, even while its task lane is busy.</p></div>{/if}
 						{#each messages as message (message.id)}
 							{@const fromUser = message.sender_type === 'user'}
+							{@const messageRole = fromUser ? 'user' : message.sender_type === 'agent' ? 'assistant' : 'system'}
 							{@const linkedTask = taskList.find((task) => task.id === message.linked_task_id)}
 							<AiMessage
-								role={fromUser ? 'user' : 'assistant'}
+								role={messageRole}
 								sender={message.sender_name || message.sender_id}
 								timestampLabel={timeAgo(message.created_at)}
 								content={message.content}
 								avatar={fromUser ? 'Y' : message.sender_name?.slice(0, 1).toUpperCase() || 'A'}
 								selectionActions={!fromUser}
 								onselectionaction={handleSelectionAction}
+								visualizations={message.visualizations ?? []}
+								visualizationUrl={(artifact) => conversations.visualizationUrl(conversationId, message.id, artifact.id)}
+								visualizationFollowUpTarget="this Conversation"
+								onvisualizationfollowup={sendVisualizationFollowUp}
 							>
 								{#if linkedTask}
 									<a href="/tasks/{linkedTask.id}" class="mt-3 flex items-center gap-2 rounded-lg bg-background/40 px-3 py-2 text-xs shadow-[var(--shadow-hairline)]">
@@ -472,7 +512,38 @@
 						{/if}
 					</div></div>
 
-					<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4"><div class="ai-card mx-auto max-w-4xl focus-within:ring-1 focus-within:ring-ring/40"><div class="flex flex-wrap gap-1 px-3 pt-2">{#each participantAgents as agent}<button type="button" onclick={() => mention(agent)} class="rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground">@{agent.title || agent.name}</button>{/each}</div>{#if attachments.length}<div class="flex flex-wrap gap-2 px-3 pt-2">{#each attachments as attachment, index}<span class="flex max-w-48 items-center gap-2 rounded-lg bg-muted px-2 py-1 text-[11px] shadow-[var(--shadow-hairline)]"><span class="truncate">{attachment.name}</span><button type="button" onclick={() => (attachments = attachments.filter((_, item) => item !== index))}>×</button></span>{/each}</div>{/if}<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-36 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea><div class="flex items-center justify-between px-2 pb-2"><div><input bind:this={fileInput} onchange={handleFileInput} type="file" multiple class="hidden" /><button type="button" onclick={() => fileInput?.click()} class="ai-icon-button" title="Attach files" aria-label="Attach files"><svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg></button></div><button type="button" onclick={() => void send()} disabled={sending || !content.trim() && attachments.length === 0} class="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-transform enabled:active:scale-95 disabled:opacity-35" aria-label="Send">{#if sending}<span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"></span>{:else}<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>{/if}</button></div></div></div>
+					<div class="shrink-0 border-t border-border bg-background p-3 sm:p-4">
+						<div data-conversation-composer class="ai-card mx-auto max-w-4xl focus-within:ring-1 focus-within:ring-ring/40">
+							<div class="flex flex-wrap gap-1 px-3 pt-2">
+								{#each participantAgents as agent}
+									<button type="button" onclick={() => mention(agent)} class="rounded-full bg-muted px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground">@{agent.title || agent.name}</button>
+								{/each}
+							</div>
+							<ImageAttachmentPreviews
+								attachments={imageAttachmentPreviews}
+								onremove={(previewIndex) => removeAttachment(imageAttachmentPreviews[previewIndex].attachmentIndex)}
+							/>
+							{#if otherAttachmentChips.length}
+								<div class="flex flex-wrap gap-2 px-3 pb-2">
+									{#each otherAttachmentChips as item}
+										<span class="flex max-w-48 items-center gap-2 rounded-lg bg-muted px-2 py-1 text-[11px] shadow-[var(--shadow-hairline)]">
+											<span class="truncate">{item.attachment.name}</span>
+											<button type="button" aria-label="Remove {item.attachment.name}" onclick={() => removeAttachment(item.attachmentIndex)}>×</button>
+										</span>
+									{/each}
+								</div>
+							{/if}
+							<textarea bind:this={composerInput} bind:value={content} onkeydown={handleKeydown} onpaste={handlePaste} oncompositionstart={() => (composing = true)} oncompositionend={() => (composing = false)} rows="3" placeholder="Message #{conversation.title || 'conversation'}…" class="block max-h-36 w-full resize-none bg-transparent px-3.5 py-2.5 text-sm outline-none"></textarea>
+							{#if attachmentError}<div class="px-3.5 pb-2 text-xs text-destructive" role="alert">{attachmentError}</div>{/if}
+							<div class="flex items-center justify-between px-2 pb-2">
+								<div>
+									<input bind:this={fileInput} data-conversation-attachment-input onchange={handleFileInput} type="file" multiple class="hidden" />
+									<button type="button" onclick={() => fileInput?.click()} class="ai-icon-button" title="Attach files" aria-label="Attach files"><svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" /></svg></button>
+								</div>
+								<button type="button" onclick={() => void send()} disabled={sending || !content.trim() && attachments.length === 0} class="flex h-8 w-8 items-center justify-center rounded-lg bg-primary text-primary-foreground transition-transform enabled:active:scale-95 disabled:opacity-35" aria-label="Send">{#if sending}<span class="h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent"></span>{:else}<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 19V5M5 12l7-7 7 7" /></svg>{/if}</button>
+							</div>
+						</div>
+					</div>
 				</div>
 
 				<aside class="hidden w-72 shrink-0 overflow-y-auto border-l border-border bg-card/20 p-4 xl:block"><div class="mb-3 flex items-center justify-between"><h2 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tasks</h2><button type="button" onclick={() => (showTaskComposer = true)} class="text-xs text-primary">+ Add</button></div><div class="space-y-2">{#each taskList.slice(0, 10) as task}<a href="/tasks/{task.id}" class="block rounded-lg border border-border bg-card p-3 hover:border-primary/40"><div class="flex items-start gap-2"><span class="mt-1 h-2 w-2 shrink-0 rounded-full {statusDot(task.status)}"></span><span class="min-w-0 flex-1"><span class="line-clamp-2 text-xs font-medium">{task.title}</span><span class="mt-1 block text-[10px] text-muted-foreground">{task.status.replaceAll('_', ' ')} · {timeAgo(task.updated_at)}</span></span></div></a>{/each}{#if taskList.length === 0}<p class="rounded-lg border border-dashed border-border p-4 text-center text-xs text-muted-foreground">No tasks yet.</p>{/if}</div></aside>

@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   briefingMarkdown,
@@ -15,8 +16,11 @@ import {
   buildProjectMemoryRequest,
   buildWakeupRequest,
   memoryResourceTemplates,
+  runManagedGitPush,
   TOOLS,
 } from './mcp-xpressclaw.mjs';
+
+const execFile = promisify(execFileCallback);
 
 test('binds a scheduled wake-up to the task that armed it', () => {
   const request = buildWakeupRequest(
@@ -182,6 +186,301 @@ test('advertises project memory tools with conservative MCP annotations', () => 
   assert.equal(archive.annotations.destructiveHint, true);
 });
 
+test('local collaboration tools are visible only to explicitly authorized Agent processes', async () => {
+  assert.equal(TOOLS.some((tool) => tool.name === 'local_forge_create_repository'), false);
+  const child = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))],
+    {
+      env: {
+        ...process.env,
+        XPRESSCLAW_URL: 'http://127.0.0.1:1',
+        XPRESSCLAW_AGENT_ID: 'authorized-agent',
+        XPRESSCLAW_LOCAL_COLLABORATION: '1',
+        XPRESSCLAW_COLLABORATION_TOKEN: 'scoped-capability',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`);
+  const listed = JSON.parse((await output.next()).value);
+  const names = listed.result.tools.map((tool) => tool.name);
+  assert.ok(names.includes('local_forge_create_repository'));
+  assert.ok(names.includes('local_forge_push_branch'));
+  assert.ok(names.includes('local_build_trigger'));
+  child.stdin.end();
+  if (child.exitCode === null) await once(child, 'exit');
+  lines.close();
+});
+
+test('managed forge pushes disable repository and configured Git hooks', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-push-'));
+  const checkout = path.join(root, 'checkout');
+  const remote = path.join(root, 'remote.git');
+  const configuredHooks = path.join(root, 'configured-hooks');
+  const repositoryMarker = path.join(root, 'repository-hook-ran');
+  const configuredMarker = path.join(root, 'configured-hook-ran');
+  const token = 'malicious-hook-must-not-see-this-token';
+  const git = (argumentsValue, cwd = checkout) => execFile('git', argumentsValue, { cwd });
+
+  try {
+    await mkdir(checkout);
+    await mkdir(configuredHooks);
+    await git(['init', '-b', 'main']);
+    await git(['config', 'user.name', 'XpressClaw test']);
+    await git(['config', 'user.email', 'test@localhost']);
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'fixture']);
+    await execFile('git', ['init', '--bare', remote]);
+
+    const repositoryHook = path.join(checkout, '.git', 'hooks', 'pre-push');
+    await writeFile(
+      repositoryHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN"\ntouch ${JSON.stringify(repositoryMarker)}\n`,
+    );
+    await chmod(repositoryHook, 0o700);
+    const configuredHook = path.join(configuredHooks, 'pre-push');
+    await writeFile(
+      configuredHook,
+      `#!/bin/sh\nprintf '%s' "$XPRESSCLAW_GIT_TOKEN" >&2\ntouch ${JSON.stringify(configuredMarker)}\n`,
+    );
+    await chmod(configuredHook, 0o700);
+    const remoteHook = path.join(remote, 'hooks', 'pre-receive');
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\n`);
+    await chmod(remoteHook, 0o700);
+
+    const output = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(output.includes(token), false);
+    assert.match(output, /\[REDACTED\]/);
+    await assert.rejects(readFile(repositoryMarker), { code: 'ENOENT' });
+
+    await git(['config', 'core.hooksPath', configuredHooks]);
+    await writeFile(path.join(checkout, 'README.md'), '# configured hook fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise configured hook suppression']);
+    const configuredOutput = await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    });
+    assert.equal(configuredOutput.includes(token), false);
+    assert.match(configuredOutput, /\[REDACTED\]/);
+    await assert.rejects(readFile(configuredMarker), { code: 'ENOENT' });
+
+    await git(['commit', '--amend', '--no-edit']);
+    await runManagedGitPush({
+      directory: checkout,
+      remote,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+      forceWithLease: true,
+    });
+
+    await writeFile(remoteHook, `#!/bin/sh\necho ${JSON.stringify(token)} >&2\nexit 1\n`);
+    await writeFile(path.join(checkout, 'README.md'), '# changed fixture\n');
+    await git(['add', 'README.md']);
+    await git(['commit', '-m', 'exercise failed push redaction']);
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        assert.match(error.message, /\[REDACTED\]/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed forge pushes do not execute configured credential helpers', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-credentials-'));
+  const checkout = path.join(root, 'checkout');
+  const marker = path.join(root, 'credential-helper-ran');
+  const globalMarker = path.join(root, 'global-credential-helper-ran');
+  const globalConfig = path.join(root, 'malicious-global-gitconfig');
+  const token = 'credential-helper-must-not-see-this-token';
+  const server = createServer((_request, response) => {
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="test"' });
+    response.end('authentication required');
+  });
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', 'credential.helper', `!touch ${JSON.stringify(marker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+      { cwd: checkout },
+    );
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    assert.equal(typeof address, 'object');
+
+    await assert.rejects(
+      runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }),
+      (error) => {
+        assert.equal(error.message.includes(token), false);
+        return true;
+      },
+    );
+    await assert.rejects(readFile(marker), { code: 'ENOENT' });
+
+    await execFile('git', ['config', '--unset-all', 'credential.helper'], { cwd: checkout });
+    await execFile(
+      'git',
+      ['config', '--file', globalConfig, 'credential.helper', `!touch ${JSON.stringify(globalMarker)}; echo username=stolen; echo password=$XPRESSCLAW_GIT_TOKEN`],
+    );
+    const previousGlobalConfig = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      await assert.rejects(runManagedGitPush({
+        directory: checkout,
+        remote: `http://127.0.0.1:${address.port}/repository.git`,
+        branch: 'main',
+        username: 'xpressclaw-agent',
+        token,
+      }));
+    } finally {
+      if (previousGlobalConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobalConfig;
+    }
+    await assert.rejects(readFile(globalMarker), { code: 'ENOENT' });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('managed forge pushes ignore repository URL rewrites and inherited proxies', { timeout: 10000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'xpressclaw-managed-url-rewrite-'));
+  const checkout = path.join(root, 'checkout');
+  let expectedRequests = 0;
+  const attackerAuthorization = [];
+  const expectedServer = createServer((_request, response) => {
+    expectedRequests += 1;
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="expected"' });
+    response.end('authentication required');
+  });
+  const attackerServer = createServer((request, response) => {
+    attackerAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="attacker"' });
+    response.end('authentication required');
+  });
+  const proxyAuthorization = [];
+  const proxyServer = createServer((request, response) => {
+    proxyAuthorization.push(request.headers.authorization ?? '');
+    response.writeHead(401, { 'www-authenticate': 'Basic realm="proxy"' });
+    response.end('authentication required');
+  });
+  const proxyKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy'];
+  const previousProxyEnvironment = Object.fromEntries(
+    proxyKeys.map((key) => [key, process.env[key]]),
+  );
+
+  try {
+    await mkdir(checkout);
+    await execFile('git', ['init', '-b', 'main'], { cwd: checkout });
+    await execFile('git', ['config', 'user.name', 'XpressClaw test'], { cwd: checkout });
+    await execFile('git', ['config', 'user.email', 'test@localhost'], { cwd: checkout });
+    await writeFile(path.join(checkout, 'README.md'), '# fixture\n');
+    await execFile('git', ['add', 'README.md'], { cwd: checkout });
+    await execFile('git', ['commit', '-m', 'fixture'], { cwd: checkout });
+
+    expectedServer.listen(0, '127.0.0.1');
+    attackerServer.listen(0, '127.0.0.1');
+    proxyServer.listen(0, '127.0.0.1');
+    await Promise.all([
+      once(expectedServer, 'listening'),
+      once(attackerServer, 'listening'),
+      once(proxyServer, 'listening'),
+    ]);
+    const expectedAddress = expectedServer.address();
+    const attackerAddress = attackerServer.address();
+    const proxyAddress = proxyServer.address();
+    assert.equal(typeof expectedAddress, 'object');
+    assert.equal(typeof attackerAddress, 'object');
+    assert.equal(typeof proxyAddress, 'object');
+    const expectedBase = `http://127.0.0.1:${expectedAddress.port}/`;
+    const attackerBase = `http://127.0.0.1:${attackerAddress.port}/`;
+    const proxyBase = `http://127.0.0.1:${proxyAddress.port}`;
+    await execFile(
+      'git',
+      ['config', `url.${attackerBase}.pushInsteadOf`, expectedBase],
+      { cwd: checkout },
+    );
+    Object.assign(process.env, {
+      HTTP_PROXY: proxyBase,
+      HTTPS_PROXY: proxyBase,
+      NO_PROXY: '',
+      http_proxy: proxyBase,
+      https_proxy: proxyBase,
+      no_proxy: '',
+    });
+
+    const token = 'url-rewrite-must-not-see-this-token';
+    let pushError;
+    await assert.rejects(runManagedGitPush({
+      directory: checkout,
+      remote: `${expectedBase}repository.git`,
+      branch: 'main',
+      username: 'xpressclaw-agent',
+      token,
+    }), (error) => {
+      pushError = error;
+      return true;
+    });
+
+    assert.ok(
+      expectedRequests > 0,
+      `the intended forge endpoint should receive the request: ${pushError?.message}`,
+    );
+    assert.deepEqual(attackerAuthorization, []);
+    assert.deepEqual(proxyAuthorization, []);
+  } finally {
+    for (const [key, value] of Object.entries(previousProxyEnvironment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await Promise.all([
+      new Promise((resolve) => expectedServer.close(resolve)),
+      new Promise((resolve) => attackerServer.close(resolve)),
+      new Promise((resolve) => proxyServer.close(resolve)),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('serves project memory discovery and writes over the stdio MCP protocol', { timeout: 5000 }, async () => {
   let createdBody = null;
   const controlTokens = [];
@@ -281,6 +580,63 @@ test('serves project memory discovery and writes over the stdio MCP protocol', {
     if (child.exitCode === null) await once(child, 'exit');
     lines.close();
     await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('repository adoption maps a nested clone to the assigned workspace boundary', { timeout: 5000 }, async () => {
+  const workspace = await mkdtemp(path.join(tmpdir(), 'xpressclaw-adopt-'));
+  const repository = path.join(workspace, 'nested', 'repo');
+  await mkdir(repository, { recursive: true });
+  await execFile('git', ['-C', repository, 'init', '--quiet']);
+  let proposal = null;
+  let agentHeader = null;
+  const server = createServer(async (request, response) => {
+    if (request.url === '/api/workspaces/atlas/repository/propose' && request.method === 'POST') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      proposal = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      agentHeader = request.headers['x-xpressclaw-agent-id'];
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ status: 'pending', path: proposal.path }));
+      return;
+    }
+    response.writeHead(404, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: 'not found' }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.equal(typeof address, 'object');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./mcp-xpressclaw.mjs', import.meta.url))], {
+    env: {
+      ...process.env,
+      XPRESSCLAW_URL: `http://127.0.0.1:${address.port}`,
+      XPRESSCLAW_CONTROL_TOKEN: 'internal-secret',
+      XPRESSCLAW_AGENT_ID: 'atlas',
+      XPRESSCLAW_WORKSPACE: workspace,
+      XPRESSCLAW_REPOSITORY: workspace,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  const output = lines[Symbol.asyncIterator]();
+  try {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: 'nested/repo' } } })}\n`);
+    const reply = JSON.parse((await output.next()).value);
+    assert.equal(reply.result.structuredContent.status, 'pending');
+    assert.deepEqual(proposal, { path: 'nested/repo' });
+    assert.equal(agentHeader, 'atlas');
+
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'adopt_repository', arguments: { path: '..' } } })}\n`);
+    const rejected = JSON.parse((await output.next()).value);
+    assert.equal(rejected.result.isError, true);
+    assert.match(rejected.result.content[0].text, /inside the Agent's assigned workspace/);
+  } finally {
+    child.stdin.end();
+    if (child.exitCode === null) await once(child, 'exit');
+    lines.close();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(workspace, { recursive: true, force: true });
   }
 });
 

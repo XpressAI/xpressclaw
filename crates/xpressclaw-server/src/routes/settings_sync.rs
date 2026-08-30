@@ -42,6 +42,7 @@ struct ProjectSyncStatus {
     last_commit: Option<String>,
     last_synced_at: Option<String>,
     message: Option<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -64,6 +65,13 @@ struct SyncInspection {
     manifest: Option<ProjectSyncManifest>,
     status: &'static str,
     message: Option<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ManifestReplicaGroup {
+    manifest: ProjectSyncManifest,
+    workspaces: Vec<PathBuf>,
 }
 
 async fn list_project_sync(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -84,6 +92,9 @@ async fn fetch_project(
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
     let _config_guard = state.config_write_lock.lock().await;
+    ProjectManager::new(state.db.clone())
+        .ensure_accepting_work(&project_id)
+        .map_err(core_error)?;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config_path = state.config_path.clone();
@@ -115,6 +126,9 @@ async fn publish_project(
 ) -> Result<Json<ProjectSyncAction>, ApiError> {
     let _sync_guard = state.project_sync_lock.lock().await;
     let _config_guard = state.config_write_lock.lock().await;
+    ProjectManager::new(state.db.clone())
+        .ensure_accepting_work(&project_id)
+        .map_err(core_error)?;
     let project_dir = resolved_sync_directory(&state, &project_id)?;
     let db = state.db.clone();
     let config = state.config();
@@ -140,6 +154,7 @@ fn project_status(state: &AppState, project: &Project) -> ProjectSyncStatus {
         manifest: None,
         status: "error",
         message: Some(error.to_string()),
+        warnings: Vec::new(),
     });
     let (last_commit, last_synced_at) = inspection
         .manifest
@@ -176,53 +191,78 @@ fn project_status(state: &AppState, project: &Project) -> ProjectSyncStatus {
         last_commit,
         last_synced_at,
         message: inspection.message,
+        warnings: inspection.warnings,
     }
 }
 
 fn inspect_project(state: &AppState, project_id: &str) -> Result<SyncInspection, Error> {
     let workspaces = project_workspaces(state, project_id)?;
-    let mut matching = Vec::new();
+    let mut groups = Vec::<ManifestReplicaGroup>::new();
     let mut manifest_errors = Vec::new();
+    let mut missing_manifests = Vec::new();
+    let mut unavailable_workspaces = Vec::new();
 
     for workspace in &workspaces {
-        if !workspace.join(MANIFEST_FILE).exists() {
+        if !workspace.is_dir() {
+            unavailable_workspaces.push(workspace.clone());
+            continue;
+        }
+        let manifest_path = workspace.join(MANIFEST_FILE);
+        if !manifest_path.exists() {
+            missing_manifests.push(workspace.clone());
             continue;
         }
         match ProjectSyncManifest::load(workspace) {
             Ok(manifest) if manifest.project_id == project_id => {
-                matching.push((workspace.clone(), manifest));
+                if let Some(group) = groups.iter_mut().find(|group| group.manifest == manifest) {
+                    group.workspaces.push(workspace.clone());
+                } else {
+                    groups.push(ManifestReplicaGroup {
+                        manifest,
+                        workspaces: vec![workspace.clone()],
+                    });
+                }
             }
             Ok(manifest) => manifest_errors.push(format!(
-                "{} belongs to Project '{}'",
-                workspace.join(MANIFEST_FILE).display(),
+                "{} belongs to Project '{}' instead of this Project",
+                manifest_path.display(),
                 manifest.project_id
             )),
-            Err(error) => manifest_errors.push(error.to_string()),
+            Err(error) => manifest_errors.push(format!(
+                "{} could not be loaded: {error}",
+                manifest_path.display()
+            )),
         }
     }
 
-    if matching.len() == 1 {
-        let (project_dir, manifest) = matching.remove(0);
+    groups.sort_by(|left, right| left.workspaces[0].cmp(&right.workspaces[0]));
+    let warnings = discovery_warnings(
+        &manifest_errors,
+        &missing_manifests,
+        &unavailable_workspaces,
+    );
+
+    if groups.len() == 1 {
+        let group = groups.remove(0);
         return Ok(SyncInspection {
-            project_dir: Some(project_dir),
-            manifest: Some(manifest),
+            // project_workspaces canonicalizes existing paths and returns them
+            // in lexical order. Every replica in this group has the same
+            // parsed configuration, so the first path is a stable source for
+            // both inspection and explicit Fetch/Publish operations.
+            project_dir: group.workspaces.first().cloned(),
+            manifest: Some(group.manifest),
             status: "ready",
             message: None,
+            warnings,
         });
     }
-    if matching.len() > 1 {
+    if groups.len() > 1 {
         return Ok(SyncInspection {
             project_dir: None,
             manifest: None,
-            status: "error",
-            message: Some(format!(
-                "Multiple Agent workspaces contain a sync manifest for this Project: {}",
-                matching
-                    .iter()
-                    .map(|(path, _)| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            status: "conflict",
+            message: Some(manifest_conflict_message(&groups)),
+            warnings,
         });
     }
     if !manifest_errors.is_empty() {
@@ -230,7 +270,11 @@ fn inspect_project(state: &AppState, project_id: &str) -> Result<SyncInspection,
             project_dir: workspaces.first().cloned(),
             manifest: None,
             status: "error",
-            message: Some(manifest_errors.join("; ")),
+            message: Some(format!(
+                "No usable {MANIFEST_FILE} was found for this Project. {} Fix the listed manifest or run `xpressclaw sync init` in an assigned workspace.",
+                manifest_errors.join("; ")
+            )),
+            warnings: discovery_warnings(&[], &missing_manifests, &unavailable_workspaces),
         });
     }
     if workspaces.is_empty() {
@@ -242,10 +286,28 @@ fn inspect_project(state: &AppState, project_id: &str) -> Result<SyncInspection,
                 "Assign an Agent with a local workspace before configuring Project sync."
                     .to_string(),
             ),
+            warnings: Vec::new(),
+        });
+    }
+    if unavailable_workspaces.len() == workspaces.len() {
+        return Ok(SyncInspection {
+            project_dir: None,
+            manifest: None,
+            status: "unavailable",
+            message: Some(format!(
+                "The assigned Agent workspaces are unavailable: {}. Restore a workspace or update the Agent workspace path, then refresh.",
+                display_paths(&unavailable_workspaces)
+            )),
+            warnings: Vec::new(),
         });
     }
 
-    let one_workspace = (workspaces.len() == 1).then(|| workspaces[0].clone());
+    let available_workspaces = workspaces
+        .iter()
+        .filter(|workspace| workspace.is_dir())
+        .cloned()
+        .collect::<Vec<_>>();
+    let one_workspace = (available_workspaces.len() == 1).then(|| available_workspaces[0].clone());
     Ok(SyncInspection {
         project_dir: one_workspace,
         manifest: None,
@@ -260,7 +322,118 @@ fn inspect_project(state: &AppState, project_id: &str) -> Result<SyncInspection,
                 workspaces.len()
             )
         }),
+        warnings: discovery_warnings(&[], &[], &unavailable_workspaces),
     })
+}
+
+fn discovery_warnings(
+    manifest_errors: &[String],
+    missing_manifests: &[PathBuf],
+    unavailable_workspaces: &[PathBuf],
+) -> Vec<String> {
+    let mut warnings = manifest_errors
+        .iter()
+        .map(|error| format!("Ignored {error}."))
+        .collect::<Vec<_>>();
+    if !missing_manifests.is_empty() {
+        warnings.push(format!(
+            "No {MANIFEST_FILE} was found in these assigned Agent workspaces: {}.",
+            display_paths(missing_manifests)
+        ));
+    }
+    if !unavailable_workspaces.is_empty() {
+        warnings.push(format!(
+            "These assigned Agent workspaces are unavailable: {}.",
+            display_paths(unavailable_workspaces)
+        ));
+    }
+    warnings
+}
+
+fn manifest_conflict_message(groups: &[ManifestReplicaGroup]) -> String {
+    let fields = differing_manifest_fields(groups).join(", ");
+    let configurations = groups
+        .iter()
+        .map(|group| {
+            let manifest = &group.manifest;
+            format!(
+                "- version={}, remote={}, branch={}, store path={}, project memory={}: {}",
+                manifest.version,
+                manifest.store.remote,
+                manifest.store.branch,
+                manifest.store.path,
+                if manifest.share.project_memory {
+                    "included"
+                } else {
+                    "local only"
+                },
+                display_paths(&group.workspaces)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Project sync configuration conflict. Differing fields: {fields}. Conflicting manifest groups:\n{configurations}\nMake the listed {MANIFEST_FILE} copies identical, then refresh."
+    )
+}
+
+fn differing_manifest_fields(groups: &[ManifestReplicaGroup]) -> Vec<&'static str> {
+    let first = &groups[0].manifest;
+    let mut fields = Vec::new();
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.version != first.version)
+    {
+        fields.push("version");
+    }
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.project_id != first.project_id)
+    {
+        fields.push("project_id");
+    }
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.store.remote != first.store.remote)
+    {
+        fields.push("store.remote");
+    }
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.store.branch != first.store.branch)
+    {
+        fields.push("store.branch");
+    }
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.store.path != first.store.path)
+    {
+        fields.push("store.path");
+    }
+    if groups
+        .iter()
+        .skip(1)
+        .any(|group| group.manifest.share.project_memory != first.share.project_memory)
+    {
+        fields.push("share.project_memory");
+    }
+    if fields.is_empty() {
+        fields.push("other effective settings");
+    }
+    fields
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn project_workspaces(state: &AppState, project_id: &str) -> Result<Vec<PathBuf>, Error> {
@@ -348,7 +521,7 @@ mod tests {
 
     use super::*;
 
-    fn test_state(root: &Path) -> AppState {
+    fn test_state(control_plane_dir: &Path, workspaces: &[(&str, &Path)]) -> AppState {
         let db = Arc::new(Database::open_memory().unwrap());
         let connection = db.conn();
         connection
@@ -357,34 +530,69 @@ mod tests {
                 [],
             )
             .unwrap();
-        connection
-            .execute(
-                "INSERT INTO agents (id, name, backend, config, project_id)
-                 VALUES ('agent-one', 'Agent One', 'codex', '{}', 'project-one')",
-                [],
-            )
-            .unwrap();
+        for (agent_id, _) in workspaces {
+            connection
+                .execute(
+                    "INSERT INTO agents (id, name, backend, config, project_id)
+                     VALUES (?1, ?2, 'codex', '{}', 'project-one')",
+                    [*agent_id, *agent_id],
+                )
+                .unwrap();
+        }
         drop(connection);
         let config = Config {
-            agents: vec![AgentConfig {
-                name: "agent-one".into(),
-                backend: "codex".into(),
-                runner: NativeRunnerConfig {
-                    kind: "codex".into(),
-                    workspace: Some(root.display().to_string()),
-                    ..NativeRunnerConfig::default()
-                },
-                ..AgentConfig::default()
-            }],
+            agents: workspaces
+                .iter()
+                .map(|(agent_id, workspace)| AgentConfig {
+                    name: (*agent_id).into(),
+                    backend: "codex".into(),
+                    runner: NativeRunnerConfig {
+                        kind: "codex".into(),
+                        workspace: Some(workspace.display().to_string()),
+                        ..NativeRunnerConfig::default()
+                    },
+                    ..AgentConfig::default()
+                })
+                .collect(),
             ..Config::default()
         };
-        let config_path = root.join("xpressclaw.yaml");
+        let config_path = control_plane_dir.join("xpressclaw.yaml");
         config.save(&config_path).unwrap();
         AppState::new(Arc::new(config), db, None, config_path, true)
     }
 
+    fn test_manifest(remote: &Path) -> ProjectSyncManifest {
+        ProjectSyncManifest::new(
+            "project-one",
+            remote.display().to_string(),
+            "main",
+            "projects/project-one",
+        )
+        .unwrap()
+    }
+
+    fn initialize_bare_remote(remote: &Path) {
+        fs::create_dir_all(remote).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .current_dir(remote)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn resolved_test_workspace(state: &AppState, agent_id: &str) -> PathBuf {
+        let config = state.config();
+        let agent = config
+            .agents
+            .iter()
+            .find(|agent| agent.name == agent_id)
+            .unwrap();
+        resolved_workspace(&config, agent)
+    }
+
     #[tokio::test]
-    async fn lists_configured_projects_and_publishes() {
+    async fn lists_one_configured_project_and_publishes() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
         }
@@ -392,15 +600,9 @@ mod tests {
         let workspace = root.path().join("workspace");
         let remote = root.path().join("remote.git");
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&remote).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .current_dir(&remote)
-            .status()
-            .unwrap()
-            .success());
+        initialize_bare_remote(&remote);
 
-        let state = test_state(&workspace);
+        let state = test_state(root.path(), &[("agent-one", &workspace)]);
         sync::initialize(
             &state.db,
             &workspace,
@@ -462,5 +664,201 @@ mod tests {
                 .unwrap();
         assert!(body["projects"][0]["last_commit"].is_string());
         assert!(body["projects"][0]["last_synced_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn equivalent_manifest_replicas_are_ready_and_support_fetch_and_publish() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("a-workspace");
+        let second = root.path().join("z-workspace");
+        let remote = root.path().join("remote.git");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        initialize_bare_remote(&remote);
+
+        // Deliberately register the lexical-last workspace first. Discovery
+        // must not depend on Agent configuration order.
+        let state = test_state(root.path(), &[("agent-z", &second), ("agent-a", &first)]);
+        sync::initialize(
+            &state.db,
+            &second,
+            "project-one",
+            &remote.display().to_string(),
+            "main",
+            "projects/project-one",
+            true,
+        )
+        .unwrap();
+        let manifest = ProjectSyncManifest::load(&second).unwrap();
+        manifest.save_new(&first).unwrap();
+        let manifest_path = first.join(MANIFEST_FILE);
+        let mut yaml = fs::read_to_string(&manifest_path).unwrap();
+        yaml = yaml
+            .replace("  branch: main\n", "")
+            .replace("share:\n  project_memory: true\n", "");
+        fs::write(
+            manifest_path,
+            format!("# replica with defaults omitted\n{yaml}"),
+        )
+        .unwrap();
+
+        let inspection = inspect_project(&state, "project-one").unwrap();
+        assert_eq!(inspection.status, "ready");
+        assert_eq!(
+            inspection.project_dir,
+            Some(resolved_test_workspace(&state, "agent-a"))
+        );
+        assert!(inspection.warnings.is_empty());
+
+        let app = Router::new()
+            .nest("/api/settings/sync", routes())
+            .with_state(state);
+        let publish = app
+            .clone()
+            .oneshot(
+                Request::post("/api/settings/sync/project-one/publish")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish.status(), StatusCode::OK);
+
+        let fetch = app
+            .oneshot(
+                Request::post("/api/settings/sync/project-one/fetch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch.status(), StatusCode::OK);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_and_symlink_workspace_paths_are_one_source() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let workspace_link = root.path().join("workspace-link");
+        let remote = root.path().join("remote.git");
+        fs::create_dir_all(&workspace).unwrap();
+        symlink(&workspace, &workspace_link).unwrap();
+        test_manifest(&remote).save_new(&workspace).unwrap();
+        let state = test_state(
+            root.path(),
+            &[
+                ("agent-direct", &workspace),
+                ("agent-link", &workspace_link),
+            ],
+        );
+
+        let workspaces = project_workspaces(&state, "project-one").unwrap();
+        assert_eq!(workspaces, vec![workspace.canonicalize().unwrap()]);
+        let inspection = inspect_project(&state, "project-one").unwrap();
+        assert_eq!(inspection.status, "ready");
+        assert!(inspection.warnings.is_empty());
+    }
+
+    #[test]
+    fn conflicting_manifests_report_fields_and_grouped_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let third = root.path().join("third");
+        let remote = root.path().join("remote.git");
+        for workspace in [&first, &second, &third] {
+            fs::create_dir_all(workspace).unwrap();
+        }
+        let main = test_manifest(&remote);
+        main.save_new(&first).unwrap();
+        main.save_new(&second).unwrap();
+        let mut release = test_manifest(&remote);
+        release.store.branch = "release".into();
+        release.share.project_memory = false;
+        release.save_new(&third).unwrap();
+        let state = test_state(
+            root.path(),
+            &[
+                ("agent-three", &third),
+                ("agent-two", &second),
+                ("agent-one", &first),
+            ],
+        );
+
+        let inspection = inspect_project(&state, "project-one").unwrap();
+        assert_eq!(inspection.status, "conflict");
+        assert!(inspection.project_dir.is_none());
+        let message = inspection.message.unwrap();
+        let first_workspace = resolved_test_workspace(&state, "agent-one");
+        let second_workspace = resolved_test_workspace(&state, "agent-two");
+        let third_workspace = resolved_test_workspace(&state, "agent-three");
+        assert!(message.contains("Differing fields: store.branch, share.project_memory"));
+        assert!(message.contains(&first_workspace.display().to_string()));
+        assert!(message.contains(&second_workspace.display().to_string()));
+        assert!(message.contains(&third_workspace.display().to_string()));
+        let main_group = format!(
+            "project memory=included: {}, {}",
+            first_workspace.display(),
+            second_workspace.display()
+        );
+        assert!(message.contains(&main_group));
+    }
+
+    #[test]
+    fn valid_manifest_survives_invalid_wrong_project_and_missing_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let valid = root.path().join("valid");
+        let invalid = root.path().join("invalid");
+        let wrong = root.path().join("wrong");
+        let missing = root.path().join("missing");
+        let unavailable = root.path().join("unavailable");
+        let remote = root.path().join("remote.git");
+        for workspace in [&valid, &invalid, &wrong, &missing] {
+            fs::create_dir_all(workspace).unwrap();
+        }
+        test_manifest(&remote).save_new(&valid).unwrap();
+        fs::write(invalid.join(MANIFEST_FILE), "not: [valid").unwrap();
+        ProjectSyncManifest::new(
+            "another-project",
+            remote.display().to_string(),
+            "main",
+            "projects/another-project",
+        )
+        .unwrap()
+        .save_new(&wrong)
+        .unwrap();
+        let state = test_state(
+            root.path(),
+            &[
+                ("agent-unavailable", &unavailable),
+                ("agent-wrong", &wrong),
+                ("agent-missing", &missing),
+                ("agent-invalid", &invalid),
+                ("agent-valid", &valid),
+            ],
+        );
+
+        let inspection = inspect_project(&state, "project-one").unwrap();
+        assert_eq!(inspection.status, "ready");
+        assert_eq!(
+            inspection.project_dir,
+            Some(resolved_test_workspace(&state, "agent-valid"))
+        );
+        let warnings = inspection.warnings.join("\n");
+        let invalid_workspace = resolved_test_workspace(&state, "agent-invalid");
+        let wrong_workspace = resolved_test_workspace(&state, "agent-wrong");
+        let missing_workspace = resolved_test_workspace(&state, "agent-missing");
+        let unavailable_workspace = resolved_test_workspace(&state, "agent-unavailable");
+        assert!(warnings.contains(&invalid_workspace.join(MANIFEST_FILE).display().to_string()));
+        assert!(warnings.contains(&wrong_workspace.join(MANIFEST_FILE).display().to_string()));
+        assert!(warnings.contains("belongs to Project 'another-project'"));
+        assert!(warnings.contains(&missing_workspace.display().to_string()));
+        assert!(warnings.contains(&unavailable_workspace.display().to_string()));
     }
 }

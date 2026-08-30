@@ -107,10 +107,27 @@ share:
   project_memory: true
 ```
 
-Commit or otherwise preserve only this manifest with the main project. The
-manifest schema is strict: unknown fields, unsupported versions, unsafe refs or
-paths, and credential-bearing remote URLs are rejected. `path` must be a
-portable relative path and cannot traverse `.git` or symlinks.
+Commit or otherwise preserve this manifest with the main project. Because it is
+repository-local, `.xpressclaw.yml` is expected to appear in every ordinary
+clone and worktree assigned to the Project's Agents. The control plane parses
+all discovered copies and treats structurally equivalent manifests as replicas
+of one Project configuration; comments, field order, and omitted default values
+do not create a conflict. Fetch and Publish use the lexicographically first
+canonical workspace path, so selection is stable and independent of Agent
+configuration order. The repository manifests remain the sole source of truth;
+there is no separate control-plane copy to drift out of sync.
+
+If effective settings differ—such as the remote, branch, store path, sharing
+policy, or supported schema version—the Settings page reports a configuration
+conflict, identifies the differing fields, and groups the affected workspace
+paths by configuration. Make those checked-in manifest copies identical before
+synchronizing. A missing, unavailable, invalid, or wrong-Project workspace is
+ignored when another usable configuration exists and is shown as a warning so
+it can be repaired without disabling the Project.
+
+The manifest schema is strict: unknown fields, unsupported versions, unsafe
+refs or paths, and credential-bearing remote URLs are rejected. `path` must be
+a portable relative path and cannot traverse `.git` or symlinks.
 
 Use `--no-project-memory`, or set `share.project_memory: false`, when Project
 memory is intentionally local. Fetch then ignores remote memory and publish
@@ -134,12 +151,14 @@ cd ~/Projects/acme/platform
 xpressclaw sync publish
 ```
 
-Once a Project workspace contains `.xpressclaw.yml`, the same explicit Fetch
-and Publish operations are available from **Settings → Project sync** in the
-web UI. The page discovers manifests from the host workspaces assigned to the
-Project's Agents, shows the configured remote, branch, store path, and last
-successful sync, and uses the control-plane process's existing Git
-credentials. Nothing is synchronized in the background.
+Once any assigned Project workspace contains a usable `.xpressclaw.yml`, the
+same explicit Fetch and Publish operations are available from **Settings →
+Project sync** in the web UI. The page deduplicates equivalent copies from the
+host workspaces assigned to the Project's Agents, shows the configured remote,
+branch, store path, representative workspace, and last successful sync, and
+uses the control-plane process's existing Git credentials. Adding or removing
+a clone/worktree changes discovery on the next request and does not require a
+separate registration step. Nothing is synchronized in the background.
 
 The first publish may create the configured branch and store path. If that
 Project path already exists remotely, publish requires a prior fetch. Later

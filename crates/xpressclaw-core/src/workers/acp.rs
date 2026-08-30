@@ -1,7 +1,7 @@
 //! Agent Client Protocol transport and event normalization for isolated runners.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +16,7 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionConfigSelectOptions,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, TextContent, ToolCallStatus,
+    SetSessionModeRequest, TextContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
@@ -31,6 +31,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::AttachedContainer;
 use crate::error::{Error, Result};
@@ -297,6 +298,9 @@ pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
     pub mcp_servers: Vec<McpServer>,
+    /// Extra workspace roots advertised through ACP. Codex ACP maps a root's
+    /// `.agents/skills` directory into its session-scoped skill discovery.
+    pub additional_directories: Vec<PathBuf>,
     /// Optional fingerprint for an out-of-band MCP bridge. ACP agents normally
     /// receive their MCP configuration in `session/*`; adapters such as Pi's
     /// load it in the underlying agent process instead. The fingerprint still
@@ -511,6 +515,35 @@ impl AcpEventRecorder {
                     .insert(call.tool_call_id.to_string(), call.title.clone());
                 let summary = tool_summary(&call.title, call.status);
                 self.append_event("tool_call", &summary, payload)?;
+                let dashboard_summary = dashboard_tool_summary(call.kind);
+                let dashboard = DashboardManager::new(self.db.clone());
+                let telemetry = if let Some(conversation_id) = self.conversation_id.as_deref() {
+                    dashboard.record_conversation_tool_call(
+                        &self.attempt_id,
+                        conversation_id,
+                        &self.logical_session_id,
+                        dashboard_summary,
+                    )
+                } else {
+                    dashboard.record_task_tool_call(
+                        &self.attempt_id,
+                        &self.task_id,
+                        dashboard_summary,
+                    )
+                };
+                if let Err(error) = telemetry {
+                    warn!(%error, "failed to record dashboard tool-call telemetry");
+                }
+                let work_kind = if self.conversation_id.is_some() {
+                    "conversation_turn"
+                } else {
+                    "attempt"
+                };
+                if let Err(error) =
+                    dashboard.record_git_snapshot(work_kind, &self.attempt_id, false)
+                {
+                    warn!(%error, "failed to record dashboard Git metric boundary");
+                }
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 self.flush_prompt_output()?;
@@ -1201,6 +1234,7 @@ async fn run_connected_turn(
         session_config: requested_config,
         mcp_servers,
         mcp_signature,
+        additional_directories,
         image_attachments,
     } = options;
 
@@ -1236,10 +1270,20 @@ async fn run_connected_turn(
             ))
         })?,
     };
+    let mcp_signature =
+        serde_json::to_string(&(mcp_signature, &additional_directories)).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "failed to fingerprint ACP session roots: {error}"
+            ))
+        })?;
     let (prepared_session, session_to_resume) = match session_start {
         AcpSessionStart::New => {
             let response = connection
-                .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()))
+                .send_request(
+                    NewSessionRequest::new(cwd.clone())
+                        .mcp_servers(mcp_servers.clone())
+                        .additional_directories(additional_directories.clone()),
+                )
                 .block_task()
                 .await?;
             (
@@ -1262,7 +1306,8 @@ async fn run_connected_turn(
                 match connection
                     .send_request(
                         ForkSessionRequest::new(source_session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await
@@ -1346,7 +1391,8 @@ async fn run_connected_turn(
                 let response = connection
                     .send_request(
                         ResumeSessionRequest::new(session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await?;
@@ -1359,7 +1405,8 @@ async fn run_connected_turn(
                 let response = connection
                     .send_request(
                         LoadSessionRequest::new(session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await?;
@@ -1678,6 +1725,22 @@ fn tool_summary(title: &str, status: ToolCallStatus) -> String {
     }
 }
 
+fn dashboard_tool_summary(kind: ToolKind) -> &'static str {
+    match kind {
+        ToolKind::Read => "Reading workspace data",
+        ToolKind::Edit => "Editing workspace files",
+        ToolKind::Delete => "Removing workspace content",
+        ToolKind::Move => "Moving workspace content",
+        ToolKind::Search => "Searching workspace data",
+        ToolKind::Execute => "Running a command",
+        ToolKind::Think => "Using an internal planning tool",
+        ToolKind::Fetch => "Fetching external data",
+        ToolKind::SwitchMode => "Switching Agent mode",
+        ToolKind::Other => "Using an Agent tool",
+        _ => "Using an Agent tool",
+    }
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -1923,6 +1986,10 @@ mod tests {
                             request["params"]["mcpServers"][0]["command"],
                             "/opt/xpressclaw/mcp-github.mjs"
                         );
+                        assert_eq!(
+                            request["params"]["additionalDirectories"],
+                            json!(["/opt/xpressclaw/presentation-runtime"])
+                        );
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -2057,6 +2124,7 @@ mod tests {
                     McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
                         .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
                 )],
+                additional_directories: vec![PathBuf::from("/opt/xpressclaw/presentation-runtime")],
                 mcp_signature: None,
                 image_attachments: vec![PromptImageAttachment {
                     name: "screen.png".into(),
@@ -2186,8 +2254,8 @@ mod tests {
 
         let second = process
             .run_turn(
-                AcpTurnRuntime::new(second_recorder, broker, controls),
-                AcpSessionStart::Resume(first.session_id),
+                AcpTurnRuntime::new(second_recorder, broker.clone(), controls.clone()),
+                AcpSessionStart::Resume(first.session_id.clone()),
                 Path::new("/workspace"),
                 "Second prompt",
                 AcpTurnOptions::default(),
@@ -2203,10 +2271,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_band_mcp_signature_reloads_a_live_session_without_acp_servers() {
+    async fn out_of_band_mcp_and_additional_directory_changes_reload_a_live_session() {
         let db = Arc::new(Database::open_memory().unwrap());
         let (first_recorder, _) = test_recorder(db.clone());
-        let (second_recorder, _) = test_recorder(db);
+        let (second_recorder, _) = test_recorder(db.clone());
+        let (third_recorder, _) = test_recorder(db);
         let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
         let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
 
@@ -2255,6 +2324,12 @@ mod tests {
                             mcp_servers.is_null()
                                 || mcp_servers.as_array().is_some_and(Vec::is_empty)
                         );
+                        if resume_count == 2 {
+                            assert_eq!(
+                                request["params"]["additionalDirectories"],
+                                json!(["/opt/xpressclaw/presentation-runtime"])
+                            );
+                        }
                         send_json(
                             &output_tx,
                             json!({
@@ -2276,14 +2351,14 @@ mod tests {
                             }),
                         )
                         .await;
-                        if prompt_count == 2 {
+                        if prompt_count == 3 {
                             break;
                         }
                     }
                     other => panic!("unexpected ACP method: {other}"),
                 }
             }
-            assert_eq!(resume_count, 1);
+            assert_eq!(resume_count, 2);
         });
 
         let process = AcpProcess::start(AttachedContainer {
@@ -2315,12 +2390,28 @@ mod tests {
             .unwrap();
         process
             .run_turn(
-                AcpTurnRuntime::new(second_recorder, broker, controls),
-                AcpSessionStart::Resume(first.session_id),
+                AcpTurnRuntime::new(second_recorder, broker.clone(), controls.clone()),
+                AcpSessionStart::Resume(first.session_id.clone()),
                 Path::new("/workspace"),
                 "Second prompt",
                 AcpTurnOptions {
                     mcp_signature: Some("pi-mcp:second".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        process
+            .run_turn(
+                AcpTurnRuntime::new(third_recorder, broker, controls),
+                AcpSessionStart::Resume(first.session_id),
+                Path::new("/workspace"),
+                "Third prompt",
+                AcpTurnOptions {
+                    mcp_signature: Some("pi-mcp:second".into()),
+                    additional_directories: vec![PathBuf::from(
+                        "/opt/xpressclaw/presentation-runtime",
+                    )],
                     ..Default::default()
                 },
             )
@@ -2977,6 +3068,14 @@ mod tests {
     }
 
     fn test_recorder(db: Arc<Database>) -> (AcpEventRecorder, String) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, backend, config)
+                 VALUES ('session-1', 'Session 1', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let task = TaskBoard::new(db.clone())
             .create(&crate::tasks::board::CreateTask {
                 title: "Parent task".to_string(),

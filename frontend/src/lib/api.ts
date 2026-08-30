@@ -1,4 +1,15 @@
 const BASE = '';
+let csrfToken: string | null = null;
+
+function mutation(method: string | undefined): boolean {
+	return !['GET', 'HEAD', 'OPTIONS'].includes((method ?? 'GET').toUpperCase());
+}
+
+function sendToLogin(): void {
+	if (typeof window === 'undefined' || window.location.pathname === '/login') return;
+	const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+	window.location.assign(`/login?return_to=${encodeURIComponent(returnTo)}`);
+}
 
 export class ApiError extends Error {
 	constructor(message: string, readonly status: number) {
@@ -7,13 +18,22 @@ export class ApiError extends Error {
 	}
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit, retryCsrf = true): Promise<T> {
+	const headers = new Headers(init?.headers);
+	if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+	if (mutation(init?.method) && csrfToken) headers.set('X-XpressClaw-CSRF', csrfToken);
 	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json' },
-		...init
+		credentials: 'same-origin',
+		...init,
+		headers
 	});
 	if (!res.ok) {
 		const body = await res.json().catch(() => ({ error: res.statusText }));
+		if (res.status === 403 && retryCsrf && mutation(init?.method) && String(body.error).includes('CSRF')) {
+			const session = await auth.bootstrap();
+			if (session.authenticated) return request<T>(path, init, false);
+		}
+		if (res.status === 401 && !path.startsWith('/api/auth/')) sendToLogin();
 		throw new ApiError(body.error || res.statusText, res.status);
 	}
 	if (res.status === 204 || res.headers.get('content-length') === '0') return undefined as T;
@@ -21,6 +41,36 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	if (!text) return undefined as T;
 	return JSON.parse(text);
 }
+
+export interface AuthBootstrap {
+	instance_id: string;
+	identity_public_key: string;
+	authentication_enabled: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	authenticated: boolean;
+	csrf_token: string | null;
+}
+
+export const auth = {
+	bootstrap: async () => {
+		const result = await request<AuthBootstrap>('/api/auth/bootstrap', undefined, false);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	login: async (credential: string) => {
+		const result = await request<{ authenticated: boolean; csrf_token: string }>(
+			'/api/auth/login',
+			{ method: 'POST', body: JSON.stringify({ credential }) },
+			false
+		);
+		csrfToken = result.csrf_token;
+		return result;
+	},
+	logout: async () => {
+		await request<void>('/api/auth/logout', { method: 'POST', body: '{}' }, false);
+		csrfToken = null;
+	},
+};
 
 // -- Agents --
 
@@ -97,6 +147,17 @@ export interface Project {
 	agent_ids: string[];
 	conversation_count: number;
 	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflow_runs: number;
+		schedules: number;
+	};
 }
 
 export interface ConversationParticipant {
@@ -115,6 +176,17 @@ export interface ConversationAttachment {
 	created_at: string;
 }
 
+export interface MessageVisualization {
+	id: string;
+	reference_index: number;
+	title: string;
+	mode: 'normal' | 'wide';
+	status: 'ready' | 'unavailable';
+	error_code: string | null;
+	size: number | null;
+	retrieval_token: string;
+}
+
 export interface ConversationMessage {
 	id: number;
 	conversation_id: string;
@@ -126,6 +198,7 @@ export interface ConversationMessage {
 	linked_task_id: string | null;
 	metadata: Record<string, unknown>;
 	attachments?: ConversationAttachment[];
+	visualizations?: MessageVisualization[];
 	created_at: string;
 }
 
@@ -170,6 +243,8 @@ export const projects = {
 		request<Project>(`/api/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(data) }),
 	delete: (id: string) =>
 		request<void>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+	deleteCascade: (id: string) =>
+		request<void>(`/api/projects/${encodeURIComponent(id)}?cascade=confirmed`, { method: 'DELETE' }),
 	assignAgent: (id: string, agentId: string) =>
 		request<Project>(`/api/projects/${encodeURIComponent(id)}/agents/${encodeURIComponent(agentId)}`, { method: 'PUT', body: '{}' }),
 	tasks: (id: string) => request<Task[]>(`/api/projects/${encodeURIComponent(id)}/tasks`),
@@ -209,6 +284,120 @@ export const conversations = {
 		}),
 	turns: (id: string) => request<ConversationTurn[]>(`/api/conversations/${encodeURIComponent(id)}/turns`),
 	attachmentUrl: (conversationId: string, attachmentId: string) => `/api/conversations/${encodeURIComponent(conversationId)}/attachments/${encodeURIComponent(attachmentId)}`,
+	visualizationUrl: (conversationId: string, messageId: number, artifactId: string) =>
+		`/api/conversations/${encodeURIComponent(conversationId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
+};
+
+// -- Control center dashboard --
+
+export type DashboardRange = '1h' | '24h' | '7d';
+
+export interface DashboardProject {
+	id: string;
+	name: string;
+}
+
+export interface DashboardCounters {
+	working_agents: number;
+	active_work: number;
+	needs_attention: number;
+	tool_calls: number;
+}
+
+export interface DashboardSeriesPoint {
+	timestamp: string;
+	context_used: number;
+	context_size: number;
+	tool_calls: number;
+	code_additions: number;
+	code_deletions: number;
+	git_state: 'none' | 'available' | 'partial' | 'unavailable';
+}
+
+export interface DashboardActiveWork {
+	work_kind: 'attempt' | 'conversation_turn';
+	work_id: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string;
+	agent_name: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	phase: 'queued' | 'working';
+	queued_at: string;
+	started_at: string | null;
+	activity: string;
+}
+
+export interface DashboardEvent {
+	cursor: number;
+	event_id: string;
+	event_kind: string;
+	occurred_at: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	source_kind: string;
+	source_label: string;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	severity: 'info' | 'success' | 'warning' | 'error';
+	needs_attention: boolean;
+	preview: string;
+	work_kind: string | null;
+	work_id: string | null;
+}
+
+export interface DashboardAttentionItem {
+	id: string;
+	kind: string;
+	project_id: string | null;
+	project_name: string | null;
+	agent_id: string | null;
+	agent_name: string | null;
+	target_type: 'task' | 'conversation';
+	target_id: string;
+	target_title: string;
+	href: string;
+	summary: string;
+	updated_at: string;
+}
+
+export interface DashboardFeedPage {
+	events: DashboardEvent[];
+	next_before: number | null;
+	has_more: boolean;
+}
+
+export interface DashboardSnapshot {
+	generated_at: string;
+	cursor: number;
+	projects: DashboardProject[];
+	counters: DashboardCounters;
+	series: DashboardSeriesPoint[];
+	active_work: DashboardActiveWork[];
+	attention: DashboardAttentionItem[];
+	feed: DashboardFeedPage;
+}
+
+function dashboardParams(projectId: string, range: DashboardRange, extras: Record<string, string> = {}) {
+	const params = new URLSearchParams({ range, ...extras });
+	if (projectId) params.set('project_id', projectId);
+	return params;
+}
+
+export const dashboard = {
+	snapshot: (projectId: string, range: DashboardRange, limit = 40) =>
+		request<DashboardSnapshot>(`/api/dashboard/snapshot?${dashboardParams(projectId, range, { limit: String(limit) })}`),
+	feed: (projectId: string, range: DashboardRange, before: number, limit = 40) =>
+		request<DashboardFeedPage>(`/api/dashboard/feed?${dashboardParams(projectId, range, { before: String(before), limit: String(limit) })}`),
+	streamUrl: (projectId: string, range: DashboardRange, after: number) =>
+		`/api/dashboard/stream?${dashboardParams(projectId, range, { after: String(after) })}`,
 };
 
 // -- Logical sessions and native work attempts --
@@ -357,6 +546,13 @@ export interface RunnerReadiness {
 	command_present: boolean;
 	subscription_auth: boolean;
 	auth_present: boolean;
+	presentation_artifacts?: {
+		supported: boolean;
+		available: boolean;
+		capability: string | null;
+		runtime: string | null;
+		reason: string | null;
+	};
 	issues: string[];
 }
 
@@ -409,9 +605,34 @@ export const sessions = {
 export interface WorkspaceStatus {
 	agent_id: string;
 	root: string;
+	repository: WorkspaceRepositoryStatus;
 	container_exists: boolean;
 	container_running: boolean;
 	terminal_available: boolean;
+}
+
+export interface WorkspaceRepositoryCandidate {
+	relative_path: string;
+	root: string;
+	github_repository: string | null;
+}
+
+export type WorkspaceRepositoryState = 'attached' | 'pending' | 'no_repository' | 'ambiguous' | 'missing' | 'cleared';
+export type WorkspaceGithubStatus = 'attached' | 'unavailable' | 'non_github_origin' | 'missing_credential' | 'incompatible_image' | 'explicit_override';
+
+export interface WorkspaceRepositoryStatus {
+	state: WorkspaceRepositoryState;
+	message: string;
+	bootstrap_root: string;
+	active: WorkspaceRepositoryCandidate | null;
+	candidates: WorkspaceRepositoryCandidate[];
+	discovery_truncated: boolean;
+	selected_relative_path: string | null;
+	pending_relative_path: string | null;
+	pending_action: 'manual' | 'cleared' | null;
+	github_status: WorkspaceGithubStatus;
+	github_repository: string | null;
+	restart_required: boolean;
 }
 
 export interface WorkspaceEntry {
@@ -448,6 +669,7 @@ export interface WorkspaceGitStatus {
 	repository: boolean;
 	branch: string | null;
 	files: GitChange[];
+	repository_status: WorkspaceRepositoryStatus;
 }
 
 export interface WorkspaceGitDiff {
@@ -479,6 +701,17 @@ export const workspaces = {
 		request<WorkspaceGitStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/git/status`),
 	gitDiff: (agentId: string, path: string) =>
 		request<WorkspaceGitDiff>(`/api/workspaces/${encodeURIComponent(agentId)}/git/diff?path=${encodeURIComponent(path)}`),
+	repository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`),
+	selectRepository: (agentId: string, path: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'PUT',
+			body: JSON.stringify({ path }),
+		}),
+	clearRepository: (agentId: string) =>
+		request<WorkspaceRepositoryStatus>(`/api/workspaces/${encodeURIComponent(agentId)}/repository`, {
+			method: 'DELETE',
+		}),
 };
 
 // -- Tasks --
@@ -563,6 +796,8 @@ export const tasks = {
 		}),
 	delete: (id: string) => request<void>(`/api/tasks/${id}`, { method: 'DELETE' }),
 	messages: (id: string) => request<TaskMessage[]>(`/api/tasks/${id}/messages`),
+	visualizationUrl: (taskId: string, messageId: number, artifactId: string) =>
+		`/api/tasks/${encodeURIComponent(taskId)}/messages/${messageId}/visualizations/${encodeURIComponent(artifactId)}`,
 	activity: (id: string, options: { after?: number; before?: number; limit?: number } = {}) => {
 		const params = new URLSearchParams();
 		if (options.after !== undefined) params.set('after', String(options.after));
@@ -607,6 +842,7 @@ export interface TaskMessage {
 	content: string;
 	timestamp: string;
 	attachments: TaskMessageAttachment[];
+	visualizations?: MessageVisualization[];
 }
 
 export interface TaskMessageAttachment {
@@ -621,6 +857,21 @@ export interface TaskMessageResponse {
 	continuation_queued: boolean;
 	attempt_id: string | null;
 	delivery: 'stored' | 'queued' | 'after_tool' | 'immediate';
+}
+
+export async function fetchVisualizationDocument(path: string, retrievalToken: string): Promise<Blob> {
+	const response = await fetch(`${BASE}${path}`, {
+		headers: { 'X-XpressClaw-Artifact-Token': retrievalToken },
+		credentials: 'same-origin',
+	});
+	if (!response.ok) {
+		throw new ApiError(response.status === 404 ? 'Visualization is no longer available.' : 'Could not load visualization.', response.status);
+	}
+	const contentType = response.headers.get('content-type') ?? '';
+	if (!contentType.toLowerCase().startsWith('text/html')) {
+		throw new ApiError('Visualization response was not HTML.', response.status);
+	}
+	return response.blob();
 }
 
 // -- Schedules --
@@ -820,6 +1071,41 @@ export interface LiveConfig {
 	mcp_servers: McpServerDefinition[];
 }
 
+export interface InstanceListenerSettings {
+	bind: string;
+	port: number;
+	authentication_enabled: boolean;
+	allow_unauthenticated_remote: boolean;
+}
+
+export interface InstanceSettings {
+	instance_id: string;
+	effective: InstanceListenerSettings;
+	saved: InstanceListenerSettings;
+	restart_required: boolean;
+	credential_kind: 'disabled' | 'password' | 'startup_token' | 'restart_required';
+	password_configured: boolean;
+	config_path: string;
+	data_dir: string;
+	workspace_dir: string;
+	transport_encryption: 'operator_managed';
+}
+
+export const instanceSettings = {
+	get: () => request<InstanceSettings>('/api/settings/instance/'),
+	update: (value: {
+		bind: string;
+		port: number;
+		authentication_enabled: boolean;
+		acknowledge_unauthenticated_remote: boolean;
+		password?: string;
+		remove_password?: boolean;
+	}) => request<InstanceSettings>('/api/settings/instance/', {
+		method: 'PUT',
+		body: JSON.stringify(value),
+	}),
+};
+
 export interface McpServerDefinition {
 	name: string;
 	type: 'stdio' | 'http' | 'sse' | string;
@@ -905,7 +1191,7 @@ export interface ProjectSyncStatus {
 	project_id: string;
 	project_name: string;
 	project_icon: string | null;
-	status: 'ready' | 'unconfigured' | 'unavailable' | 'error';
+	status: 'ready' | 'unconfigured' | 'unavailable' | 'conflict' | 'error';
 	project_dir: string | null;
 	remote: string | null;
 	branch: string | null;
@@ -914,6 +1200,7 @@ export interface ProjectSyncStatus {
 	last_commit: string | null;
 	last_synced_at: string | null;
 	message: string | null;
+	warnings: string[];
 }
 
 export interface ProjectSyncCounts {
@@ -933,6 +1220,41 @@ export interface ProjectSyncAction {
 	counts: ProjectSyncCounts;
 }
 
+export interface CollaborationConfig {
+	enabled: boolean;
+	bind_address: string;
+	gitbucket_port: number;
+	jenkins_port: number;
+	gitbucket_image: string;
+	jenkins_image: string;
+	authorized_agents: string[];
+}
+
+export interface CollaborationServiceStatus {
+	state: string;
+	health: string;
+	image: string;
+	version: string;
+	host_url: string;
+	internal_url: string;
+	volume: string;
+	error: string | null;
+}
+
+export interface CollaborationSettings {
+	config: CollaborationConfig;
+	status: {
+		configured: boolean;
+		docker_available: boolean;
+		network: string;
+		data_path: string;
+		gitbucket: CollaborationServiceStatus;
+		jenkins: CollaborationServiceStatus;
+	};
+	credentials_configured: boolean;
+	reset_confirmation: string;
+}
+
 export const settings = {
 	getProfile: () => request<UserProfile>('/api/settings/profile'),
 	putProfile: (profile: UserProfile) =>
@@ -950,7 +1272,22 @@ export const settings = {
 		request<ProjectSyncAction>(`/api/settings/sync/${encodeURIComponent(projectId)}/publish`, {
 			method: 'POST',
 			body: '{}'
-		})
+		}),
+	getCollaboration: () => request<CollaborationSettings>('/api/settings/collaboration'),
+	putCollaboration: (config: CollaborationConfig) =>
+		request<CollaborationSettings>('/api/settings/collaboration', {
+			method: 'PUT', body: JSON.stringify(config)
+		}),
+	runCollaborationAction: (action: 'install' | 'start' | 'stop' | 'restart' | 'upgrade') =>
+		request<CollaborationSettings>(`/api/settings/collaboration/${action}`, {
+			method: 'POST', body: '{}'
+		}),
+	resetCollaboration: (confirmation: string) =>
+		request<CollaborationSettings>('/api/settings/collaboration/reset', {
+			method: 'POST', body: JSON.stringify({ confirmation })
+		}),
+	getCollaborationLogs: (service: 'gitbucket' | 'jenkins') =>
+		request<{ logs: string }>(`/api/settings/collaboration/logs/${service}`)
 };
 
 // -- Connectors --

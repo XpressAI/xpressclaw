@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::sessions::SessionManager;
 
 /// A queued task item for native attempt dispatch.
@@ -36,7 +38,10 @@ impl TaskQueue {
     /// Enqueue a task for an agent.
     pub fn enqueue(&self, task_id: &str, agent_id: &str) -> Result<QueueItem> {
         let item = self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
             transaction.commit()?;
             Ok::<_, Error>(item)
@@ -53,6 +58,7 @@ impl TaskQueue {
         task_id: &str,
         agent_id: &str,
     ) -> Result<QueueItem> {
+        ensure_task_project_accepts_work(transaction, task_id)?;
         let (title, description, context) = transaction.query_row(
             "SELECT title, description, context FROM tasks WHERE id = ?1",
             [task_id],
@@ -156,7 +162,12 @@ impl TaskQueue {
     /// an interrupted) initial dispatch.
     pub fn ensure_enqueued(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
         let id = self.db.with_conn(|conn| {
-            let active = conn
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
+            let active = transaction
                 .query_row(
                     "SELECT id, attempt_id FROM task_queue
                      WHERE task_id = ?1 AND status IN ('queued', 'running')
@@ -166,13 +177,16 @@ impl TaskQueue {
                 )
                 .optional()?;
             if let Some((id, attempt_id)) = active {
+                transaction.commit()?;
                 return Ok::<_, Error>(attempt_id.is_none().then_some(id));
             }
-            conn.execute(
+            transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status) VALUES (?1, ?2, 'queued')",
                 rusqlite::params![task_id, agent_id],
             )?;
-            Ok(Some(conn.last_insert_rowid()))
+            let id = transaction.last_insert_rowid();
+            transaction.commit()?;
+            Ok(Some(id))
         })?;
 
         id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
@@ -184,7 +198,12 @@ impl TaskQueue {
     /// continuation waits behind it and receives any messages sent meanwhile.
     pub fn enqueue_continuation(&self, task_id: &str, agent_id: &str) -> Result<Option<QueueItem>> {
         let id = self.db.with_conn(|conn| {
-            let changed = conn.execute(
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
+            let changed = transaction.execute(
                 "INSERT INTO task_queue (task_id, agent_id, status)
                  SELECT ?1, ?2, 'queued'
                  WHERE NOT EXISTS (
@@ -192,7 +211,9 @@ impl TaskQueue {
                  )",
                 rusqlite::params![task_id, agent_id],
             )?;
-            Ok::<_, Error>((changed == 1).then(|| conn.last_insert_rowid()))
+            let id = (changed == 1).then(|| transaction.last_insert_rowid());
+            transaction.commit()?;
+            Ok::<_, Error>(id)
         })?;
 
         id.map(|id| self.create_attempt_for_item(id, task_id, agent_id))
@@ -217,6 +238,7 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
             let queued_attempt_id = transaction
                 .query_row(
                     "SELECT attempt_id FROM task_queue
@@ -310,7 +332,11 @@ impl TaskQueue {
         message: &str,
     ) -> Result<Option<(String, Option<QueueItem>)>> {
         let outcome = self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            ensure_task_project_accepts_work(&transaction, task_id)?;
             let (agent_id, title, description, context, status): (
                 Option<String>,
                 String,
@@ -690,6 +716,7 @@ impl TaskQueue {
                    AND status IN ('completed', 'failed', 'cancelled', 'interrupted')",
                 [],
             )?;
+            finalize_inactive_git_baselines(&tx, None)?;
             tx.commit()?;
             Ok::<_, Error>(finalized)
         })?;
@@ -746,6 +773,7 @@ impl TaskQueue {
                     [session_id],
                 )?;
             }
+            finalize_inactive_git_baselines(&tx, None)?;
             tx.commit()?;
             Ok::<_, Error>(())
         })?;
@@ -841,6 +869,23 @@ impl TaskQueue {
     }
 }
 
+fn ensure_task_project_accepts_work(conn: &rusqlite::Connection, task_id: &str) -> Result<()> {
+    let project_id = conn
+        .query_row(
+            "SELECT project_id FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| Error::TaskNotFound {
+            id: task_id.to_string(),
+        })?;
+    if let Some(project_id) = project_id.as_deref() {
+        ensure_project_accepts_work(conn, project_id)?;
+    }
+    Ok(())
+}
+
 fn row_to_item(row: &rusqlite::Row) -> Result<QueueItem> {
     Ok(QueueItem {
         id: row.get("id")?,
@@ -862,6 +907,13 @@ mod tests {
 
     fn setup() -> (Arc<Database>, TaskQueue) {
         let db = Arc::new(Database::open_memory().unwrap());
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES ('atlas', 'Atlas', 'native', '{}')",
+                [],
+            )
+        })
+        .unwrap();
         let queue = TaskQueue::new(db.clone());
         (db, queue)
     }
@@ -958,16 +1010,36 @@ mod tests {
         board
             .update_status(&task.id, "in_progress", Some("atlas"))
             .unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_git_baselines
+                     (work_kind, work_id, workspace, baseline_json, git_state)
+                 VALUES ('attempt', ?1, '/tmp/recovered-task', '{}', 'available')",
+                [attempt_id],
+            )
+        })
+        .unwrap();
 
         assert_eq!(queue.recover_in_progress().unwrap(), 1);
         assert_eq!(queue.get(queued.id).unwrap().status, "queued");
         assert_eq!(board.get(&task.id).unwrap().status.as_str(), "pending");
-        let overview = SessionManager::new(db).overview("atlas").unwrap();
+        let overview = SessionManager::new(db.clone()).overview("atlas").unwrap();
         assert_eq!(overview.session.status, "queued");
         assert!(overview
             .recent_events
             .iter()
             .any(|event| event.event_type == "attempt_requeued"));
+        assert!(db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'attempt' AND work_id = ?1",
+                    [attempt_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap()
+            .is_some());
     }
 
     #[test]

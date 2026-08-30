@@ -14,31 +14,52 @@ use agent_client_protocol::schema::v1::{
 use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock,
+    Semaphore,
+};
 use tracing::{error, info, warn};
 
-use crate::acp::{agent_definition, local_runner_image};
+use crate::acp::{
+    agent_definition, canonical_agent_kind, infer_agent_kind_from_backend, local_runner_image,
+};
+use crate::agents::registry::AgentRegistry;
+use crate::collaboration::{network_name as collaboration_network_name, CollaborationSecrets};
 use crate::config::{
     default_native_runner_image, AgentConfig, Config, ContainerEngineAccess, McpServerConfig,
     NativeRunnerConfig,
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
-use crate::conversations::{ConversationManager, SendMessage};
+use crate::conversations::{ConversationManager, NewConversationAttachment, SendMessage};
+use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::error::{Error, Result};
+use crate::message_artifacts::{bound_published_file_name, prepare_message_artifacts};
+use crate::repositories::{
+    agent_callback_capability, discover_github_access, run_repository_blocking,
+    AgentRepositoryManager, RepositoryBoundaryResult, RepositoryInspection,
+};
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
-use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
+use crate::tasks::conversation::{FinalAssistantAttempt, PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
+use crate::visualizations::{
+    is_absolute_runner_root, prepare_message_visualizations, PreparedVisualization,
+    VisualizationSourceRoot,
+};
 use crate::workers::acp::{
     AcpElicitationBroker, AcpEventRecorder, AcpProcess, AcpSessionStart, AcpTurnControlBroker,
     AcpTurnOptions, AcpTurnRuntime,
 };
 use crate::workers::github;
+use crate::workers::presentations::{
+    configure_codex_presentations, PRESENTATION_CAPABILITY, PRESENTATION_CAPABILITY_LABEL,
+    PRESENTATION_RUNTIME_VERSION, PRESENTATION_RUNTIME_VERSION_LABEL,
+};
 
 const BUILT_IN_RUNNER_PROTOCOL: &str = "acp-xpressclaw-v2";
 const PI_MCP_BRIDGE_LABEL: &str = "pi-config-v1";
@@ -46,6 +67,7 @@ const PI_MCP_CONFIG_TARGET: &str = "/run/xpressclaw/pi-mcp/config.json";
 const PI_MCP_CONFIG_DIR_TARGET: &str = "/run/xpressclaw/pi-mcp";
 const PI_MCP_WRAPPER: &str = "/opt/xpressclaw/pi-with-mcp";
 static PI_MCP_CONFIG_LOCK: StdMutex<()> = StdMutex::new(());
+static GIT_WORKTREE_REDIRECT_LOCK: StdMutex<()> = StdMutex::new(());
 const BUNDLED_CONTROL_MCP_COMMAND: &str = "/usr/local/bin/node";
 const CODEX_INITIAL_AGENT_MODE: &str = "INITIAL_AGENT_MODE";
 const CODEX_FULL_ACCESS_MODE: &str = "agent-full-access";
@@ -70,6 +92,8 @@ struct NativeAttemptRuntime {
     elicitation_broker: Arc<AcpElicitationBroker>,
     turn_controls: Arc<AcpTurnControlBroker>,
     processes: Arc<ProjectAcpProcesses>,
+    conversation_processes: Arc<ConversationAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 }
@@ -102,6 +126,53 @@ struct PiMcpBridge {
 #[derive(Default)]
 pub struct ConversationAcpProcesses {
     slots: StdMutex<HashMap<String, Arc<AsyncMutex<Option<ConversationAcpProcess>>>>>,
+}
+
+/// Per-Agent barrier covering native runtime preparation, launch, and use.
+///
+/// Destructive Project lifecycle operations take the write side for their
+/// stable Agent IDs after signalling cancellation. This waits for workers that
+/// already passed their durable queue checks and prevents a claimed worker
+/// from launching a new retained runtime until deletion has finalized.
+#[derive(Default)]
+pub struct NativeRuntimeLifecycle {
+    slots: StdMutex<HashMap<String, Arc<AsyncRwLock<()>>>>,
+}
+
+impl NativeRuntimeLifecycle {
+    fn slot(&self, agent_id: &str) -> Arc<AsyncRwLock<()>> {
+        self.slots
+            .lock()
+            .unwrap()
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncRwLock::new(())))
+            .clone()
+    }
+
+    /// Enter a runtime operation that may create, replace, or use resources
+    /// owned by an Agent. Reconcilers and dispatchers must acquire this before
+    /// acting on a durable desired-state snapshot so Project deletion can
+    /// quiesce every launch path with the write side of the same barrier.
+    pub(crate) async fn enter(&self, agent_id: &str) -> OwnedRwLockReadGuard<()> {
+        self.slot(agent_id).read_owned().await
+    }
+
+    /// Wait for all in-flight native work using these stable Agent IDs and
+    /// prevent new work from entering until the returned guards are dropped.
+    pub async fn quiesce_agents(&self, agent_ids: &[String]) -> Vec<OwnedRwLockWriteGuard<()>> {
+        let mut agent_ids = agent_ids.to_vec();
+        agent_ids.sort();
+        agent_ids.dedup();
+        let slots = agent_ids
+            .iter()
+            .map(|agent_id| self.slot(agent_id))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(slots.len());
+        for slot in slots {
+            guards.push(slot.write_owned().await);
+        }
+        guards
+    }
 }
 
 impl ConversationAcpProcesses {
@@ -320,6 +391,19 @@ impl ProjectAcpProcesses {
             false
         }
     }
+
+    async fn retire_agent(&self, agent_id: &str) -> bool {
+        let slot = self.slots.lock().unwrap().remove(agent_id);
+        let Some(slot) = slot else {
+            return false;
+        };
+        let Some(process) = slot.lock().await.take() else {
+            return false;
+        };
+        process.process.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(2), process.process.wait_for_exit()).await;
+        true
+    }
 }
 
 /// Shared control-plane services used by both task and Conversation ACP
@@ -330,6 +414,8 @@ pub struct NativeDispatcherServices {
     pub elicitation_broker: Arc<AcpElicitationBroker>,
     pub turn_controls: Arc<AcpTurnControlBroker>,
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Per-Agent launch/use barrier shared with destructive lifecycle routes.
+    pub runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Ephemeral capability used only on the container callback listener.
     pub control_plane_token: Arc<str>,
 }
@@ -350,6 +436,7 @@ pub async fn start_dispatcher(
         elicitation_broker,
         turn_controls,
         conversation_processes,
+        runtime_lifecycle,
         control_plane_token,
     } = services;
     let installation_id = match db.installation_id() {
@@ -371,7 +458,9 @@ pub async fn start_dispatcher(
     let conversation_elicitations = elicitation_broker.clone();
     let conversation_controls = turn_controls.clone();
     let conversation_base_processes = processes.clone();
+    let conversation_runtime_lifecycle = runtime_lifecycle.clone();
     let conversation_control_token = control_plane_token.clone();
+    let task_conversation_processes = conversation_processes.clone();
     tokio::spawn(async move {
         start_conversation_dispatcher(
             conversation_db,
@@ -382,6 +471,7 @@ pub async fn start_dispatcher(
             conversation_controls,
             conversation_base_processes,
             conversation_processes,
+            conversation_runtime_lifecycle,
             control_plane_port,
             conversation_control_token,
         )
@@ -418,6 +508,8 @@ pub async fn start_dispatcher(
                 let elicitation_broker = elicitation_broker.clone();
                 let turn_controls = turn_controls.clone();
                 let processes = processes.clone();
+                let conversation_processes = task_conversation_processes.clone();
+                let runtime_lifecycle = runtime_lifecycle.clone();
                 let control_plane_token = control_plane_token.clone();
                 if let Some(attempt_id) = item.attempt_id.as_deref() {
                     turn_controls.begin_attempt(attempt_id);
@@ -433,6 +525,8 @@ pub async fn start_dispatcher(
                             elicitation_broker,
                             turn_controls: turn_controls.clone(),
                             processes,
+                            conversation_processes,
+                            runtime_lifecycle,
                             control_plane_port,
                             control_plane_token,
                         },
@@ -476,6 +570,7 @@ async fn start_conversation_dispatcher(
     turn_controls: Arc<AcpTurnControlBroker>,
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 ) {
@@ -519,6 +614,7 @@ async fn start_conversation_dispatcher(
                     turn_controls: turn_controls.clone(),
                     project_processes: project_processes.clone(),
                     conversation_processes: conversation_processes.clone(),
+                    runtime_lifecycle: runtime_lifecycle.clone(),
                     control_plane_port,
                     control_plane_token: control_plane_token.clone(),
                 };
@@ -568,6 +664,7 @@ struct ConversationAttemptRuntime {
     turn_controls: Arc<AcpTurnControlBroker>,
     project_processes: Arc<ProjectAcpProcesses>,
     conversation_processes: Arc<ConversationAcpProcesses>,
+    runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     control_plane_port: u16,
     control_plane_token: Arc<str>,
 }
@@ -585,6 +682,7 @@ async fn execute_conversation_turn(
         turn_controls,
         project_processes,
         conversation_processes,
+        runtime_lifecycle,
         control_plane_port,
         control_plane_token,
     } = runtime;
@@ -602,13 +700,36 @@ async fn execute_conversation_turn(
             name: turn.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
-    let workspace = resolved_workspace(&config, agent);
-    let github = github::discover(&db, &workspace);
-    let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        agent,
+        &docker,
+        &project_processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
+    if !queue.is_running(&turn.id)? {
+        return Ok(());
+    }
+    let github = if repository.active {
+        discover_github_access(&db, &repository.active_root).await?
+    } else {
+        None
+    };
+    let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
-        .unwrap_or_else(|| "/workspace".to_string());
+        .unwrap_or_else(|| repository.container_root.clone());
+    let visualization_roots = visualization_source_roots(
+        &repository.bootstrap_root,
+        &repository.container_bootstrap,
+        agent,
+    );
     let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
         == Some(spec.image.as_str());
     if !runner_image_ready(&docker, &spec.image, built_in_image, agent).await {
@@ -636,10 +757,12 @@ async fn execute_conversation_turn(
     let github_mcp_attached = configure_bundled_github_mcp(
         &agent.runner,
         &kind,
-        github.is_some(),
         bundled_control_tools,
         &mut spec.environment,
     )?;
+    let presentation_runtime = presentation_runtime_available(&docker, &spec.image).await;
+    let presentation_support =
+        configure_codex_presentations(&kind, presentation_runtime, &mut spec.environment)?;
     if bundled_control_tools
         && !agent
             .runner
@@ -652,18 +775,29 @@ async fn execute_conversation_turn(
             None,
             Some(&turn.conversation_id),
             conversation.project_id.as_deref(),
-            &container_workspace,
+            &repository.container_bootstrap,
+            &repository.container_root,
             RunnerCallback {
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
-    if let Some(access) = github.as_ref() {
-        if github_mcp_attached {
-            mcp_servers.push(access.mcp_server(None));
-        }
+    if github_mcp_attached {
+        mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
+            control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+            control_plane_token: agent_callback_capability(
+                control_plane_token.as_ref(),
+                &agent.name,
+            ),
+            agent_id: agent.name.clone(),
+            workspace: repository.container_bootstrap.clone(),
+            active_repository: repository.active.then(|| repository.container_root.clone()),
+            task_id: None,
+            review_lifecycle: false,
+        }));
     }
     let pi_mcp_bridge = kind == "pi"
         && docker
@@ -682,6 +816,10 @@ async fn execute_conversation_turn(
     } else {
         (None, Vec::new())
     };
+
+    if !queue.is_running(&turn.id)? {
+        return Ok(());
+    }
 
     let base = project_processes
         .get_or_start(&docker, &agent.name, &spec)
@@ -741,6 +879,15 @@ async fn execute_conversation_turn(
         turn.id.clone(),
         kind.clone(),
     );
+    if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+        "conversation_turn",
+        &turn.id,
+        conversation.project_id.as_deref(),
+        &turn.agent_id,
+        &repository.active_root,
+    ) {
+        warn!(%error, turn_id = turn.id, "failed to capture conversation Git baseline");
+    }
     let result = live
         .process
         .run_turn(
@@ -753,10 +900,16 @@ async fn execute_conversation_turn(
                 session_config: agent.runner.session_config.clone(),
                 mcp_servers,
                 mcp_signature,
+                additional_directories: presentation_support.additional_directories,
                 image_attachments: vec![],
             },
         )
         .await;
+    if let Err(error) =
+        DashboardManager::new(db.clone()).record_git_snapshot("conversation_turn", &turn.id, true)
+    {
+        warn!(%error, turn_id = turn.id, "failed to finalize conversation Git metrics");
+    }
     turn_controls.finish_attempt(&turn.id);
     let result = match result {
         Ok(result) => result,
@@ -770,26 +923,33 @@ async fn execute_conversation_turn(
             return Err(error);
         }
     };
-    let Some(message) = queue.complete_with_message(
+    let visualizations = prepare_message_visualizations(&result.summary, &visualization_roots);
+    let published = prepare_message_artifacts(&result.summary, &visualization_roots);
+    let Some(message) = queue.complete_with_message_and_visualizations(
         &turn,
         &result.session_id,
         &SendMessage {
             sender_type: "agent".into(),
             sender_id: turn.agent_id.clone(),
             sender_name: Some(agent.context_label()),
-            content: result.summary,
+            content: published.content,
             message_type: None,
         },
         &json!({ "conversation_turn_id": turn.id, "runner": kind }),
+        &visualizations,
+        &published.attachments,
     )?
     else {
         event_bus.send(&turn.conversation_id, ConversationEvent::Done);
         return Ok(());
     };
+    let mut message_value = json!(message);
+    message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
+    message_value["visualizations"] = json!(manager.visualizations(message.id).unwrap_or_default());
     event_bus.send(
         &turn.conversation_id,
         ConversationEvent::Message {
-            message: json!(message),
+            message: message_value,
         },
     );
     event_bus.send(&turn.conversation_id, ConversationEvent::Done);
@@ -841,6 +1001,129 @@ fn build_conversation_prompt(
     ))
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeRepository {
+    bootstrap_root: PathBuf,
+    active_root: PathBuf,
+    active: bool,
+    git_dir: Option<PathBuf>,
+    git_common_dir: Option<PathBuf>,
+    container_bootstrap: String,
+    container_root: String,
+}
+
+impl RuntimeRepository {
+    fn from_inspection(inspection: RepositoryInspection, agent: &AgentConfig) -> Self {
+        let bootstrap_root = inspection.bootstrap_root.clone();
+        let active_root = inspection.active_root().to_path_buf();
+        let git_dir = inspection
+            .active
+            .as_ref()
+            .map(|candidate| candidate.git_dir().to_path_buf());
+        let git_common_dir = inspection
+            .active
+            .as_ref()
+            .map(|candidate| candidate.git_common_dir().to_path_buf());
+        let container_bootstrap =
+            container_workspace_path(&bootstrap_root, agent.runner.container_engine);
+        let container_root =
+            if agent.runner.container_engine == ContainerEngineAccess::Host && cfg!(unix) {
+                active_root.display().to_string()
+            } else {
+                inspection
+                    .active_relative_path()
+                    .filter(|relative| *relative != ".")
+                    .map(|relative| format!("{container_bootstrap}/{relative}"))
+                    .unwrap_or_else(|| container_bootstrap.clone())
+            };
+        Self {
+            bootstrap_root,
+            active_root,
+            active: inspection.active.is_some(),
+            git_dir,
+            git_common_dir,
+            container_bootstrap,
+            container_root,
+        }
+    }
+}
+
+async fn prepare_repository_for_turn(
+    db: &Arc<Database>,
+    config: &Config,
+    agent: &AgentConfig,
+    docker: &DockerManager,
+    project_processes: &ProjectAcpProcesses,
+    conversation_processes: &ConversationAcpProcesses,
+    runtime_lifecycle: &NativeRuntimeLifecycle,
+) -> Result<(OwnedRwLockReadGuard<()>, RuntimeRepository)> {
+    let bootstrap_root = resolved_workspace(config, agent);
+    let lifecycle = runtime_lifecycle.slot(&agent.name);
+    // Stable repositories retain the ordinary shared runtime path, so Task
+    // and Conversation lanes for one Agent can continue concurrently.
+    let read_guard = lifecycle.clone().read_owned().await;
+    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    if !inspection.requires_boundary_change() {
+        return Ok((
+            read_guard,
+            RuntimeRepository::from_inspection(inspection, agent),
+        ));
+    }
+
+    // Repository reconciliation and destructive Project cleanup share the
+    // same per-Agent write boundary. Recheck after escalation because another
+    // turn or Project deletion may have completed while the read guard was
+    // released. Downgrading atomically then prevents deletion from entering
+    // between repository cleanup and the new turn.
+    drop(read_guard);
+    let write_guard = lifecycle.write_owned().await;
+    AgentRegistry::new(db.clone()).get(&agent.name)?;
+    let inspection = inspect_repository_for_turn(db, &agent.name, &bootstrap_root).await?;
+    let inspection = if inspection.requires_boundary_change() {
+        let boundary = apply_repository_boundary_for_turn(db, &agent.name, &bootstrap_root).await?;
+        if boundary.changed {
+            conversation_processes
+                .retire_agent_everywhere(&agent.name)
+                .await;
+            project_processes.retire_agent(&agent.name).await;
+            let _ = docker.stop_preserving(&agent.name).await;
+        }
+        boundary.inspection
+    } else {
+        inspection
+    };
+    let guard = OwnedRwLockWriteGuard::downgrade(write_guard);
+    Ok((guard, RuntimeRepository::from_inspection(inspection, agent)))
+}
+
+async fn inspect_repository_for_turn(
+    db: &Arc<Database>,
+    agent_id: &str,
+    bootstrap_root: &Path,
+) -> Result<RepositoryInspection> {
+    let db = db.clone();
+    let agent_id = agent_id.to_string();
+    let bootstrap_root = bootstrap_root.to_path_buf();
+    run_repository_blocking(move || {
+        AgentRepositoryManager::new(db).inspect(&agent_id, &bootstrap_root)
+    })
+    .await
+}
+
+async fn apply_repository_boundary_for_turn(
+    db: &Arc<Database>,
+    agent_id: &str,
+    bootstrap_root: &Path,
+) -> Result<RepositoryBoundaryResult> {
+    let db = db.clone();
+    let agent_id = agent_id.to_string();
+    let bootstrap_root = bootstrap_root.to_path_buf();
+    run_repository_blocking(move || {
+        AgentRepositoryManager::new(db).apply_boundary(&agent_id, &bootstrap_root)
+    })
+    .await
+}
+
 async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<()> {
     let NativeAttemptRuntime {
         db,
@@ -850,6 +1133,8 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         elicitation_broker,
         turn_controls,
         processes,
+        conversation_processes,
+        runtime_lifecycle,
         control_plane_port,
         control_plane_token,
     } = runtime;
@@ -865,6 +1150,16 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             name: item.agent_id.clone(),
         })?;
     let kind = resolve_runner_kind(agent)?;
+    let (_runtime_lifecycle_guard, repository) = prepare_repository_for_turn(
+        &db,
+        &config,
+        agent,
+        &docker,
+        &processes,
+        &conversation_processes,
+        &runtime_lifecycle,
+    )
+    .await?;
     let session_start = session_start(&db, &item, &kind)?;
     let requested_session_config = requested_session_config(&db, agent, &item.task_id)?;
     let mut prompt = build_prompt(&db, &item, attempt_id)?;
@@ -901,6 +1196,7 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let board = TaskBoard::new(db.clone());
     let task = board.get(&item.task_id)?;
     let task_project_id = board.project_id(&task.id)?;
+    let capture_task_dashboard_metrics = dashboard_task_metrics_enabled(&task);
     let control_task_id = continuation_task_id(&task).map(str::to_owned);
     let github_review_lifecycle =
         control_task_id.is_some() && github_review_lifecycle_enabled(&task);
@@ -909,13 +1205,23 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     if let AcpSessionStart::Resume(native_session_id) = &session_start {
         sessions.set_native_session(attempt_id, native_session_id)?;
     }
-    let workspace = resolved_workspace(&config, agent);
-    let github = github::discover(&db, &workspace);
-    let mut spec = build_spec(&config, agent, &kind, &docker, github.as_ref())?;
+    let github = if repository.active {
+        discover_github_access(&db, &repository.active_root).await?
+    } else {
+        None
+    };
+    let mut spec = build_spec(&config, agent, &kind, &docker, &repository, github.as_ref())?;
+    let collaboration_token =
+        configure_local_collaboration_access(&db, &config, agent, &mut spec, &docker).await?;
     let container_workspace = spec
         .working_dir
         .clone()
-        .unwrap_or_else(|| "/workspace".to_string());
+        .unwrap_or_else(|| repository.container_root.clone());
+    let visualization_roots = visualization_source_roots(
+        &repository.bootstrap_root,
+        &repository.container_bootstrap,
+        agent,
+    );
     let built_in_image = default_native_runner_image(&kind, agent.runner.container_engine)
         == Some(spec.image.as_str());
     let image_ready = runner_image_ready(&docker, &spec.image, built_in_image, agent).await;
@@ -962,10 +1268,12 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     let github_mcp_attached = configure_bundled_github_mcp(
         &agent.runner,
         &kind,
-        github.is_some(),
         bundled_control_tools,
         &mut spec.environment,
     )?;
+    let presentation_runtime = presentation_runtime_available(&docker, &spec.image).await;
+    let presentation_support =
+        configure_codex_presentations(&kind, presentation_runtime, &mut spec.environment)?;
     if bundled_control_tools
         && !agent
             .runner
@@ -978,33 +1286,35 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
             control_task_id.as_deref(),
             task.conversation_id.as_deref(),
             task_project_id.as_deref(),
-            &container_workspace,
+            &repository.container_bootstrap,
+            &repository.container_root,
             RunnerCallback {
                 port: control_plane_port,
                 token: control_plane_token.as_ref(),
                 container_runtime: docker.runtime(),
+                collaboration_token: collaboration_token.as_deref(),
             },
         ));
     }
-    if let Some(access) = github.as_ref() {
-        if github_mcp_attached {
-            let task_context = control_task_id
-                .as_ref()
-                .map(|task_id| github::GithubTaskContext {
-                    control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
-                    control_plane_token: control_plane_token.to_string(),
-                    task_id: task_id.clone(),
-                    agent_id: agent.name.clone(),
-                    review_lifecycle: github_review_lifecycle,
-                });
-            mcp_servers.push(access.mcp_server(task_context.as_ref()));
-        } else if !bundled_control_tools {
-            warn!(
-                image = spec.image,
-                repository = access.repository(),
-                "runner image does not include the constrained GitHub MCP server"
-            );
-        }
+    if github_mcp_attached {
+        mcp_servers.push(github::mcp_server(&github::GithubMcpContext {
+            control_plane_url: control_plane_url(control_plane_port, docker.runtime()),
+            control_plane_token: agent_callback_capability(
+                control_plane_token.as_ref(),
+                &agent.name,
+            ),
+            agent_id: agent.name.clone(),
+            workspace: repository.container_bootstrap.clone(),
+            active_repository: repository.active.then(|| repository.container_root.clone()),
+            task_id: control_task_id.clone(),
+            review_lifecycle: github_review_lifecycle,
+        }));
+    } else if github.is_some() && !bundled_control_tools {
+        warn!(
+            image = spec.image,
+            repository = github.as_ref().map(|access| access.repository()),
+            "runner image does not include the constrained GitHub MCP server"
+        );
     }
     let pi_mcp_bridge = kind == "pi"
         && docker
@@ -1023,6 +1333,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     } else {
         None
     };
+    if attempt_is_terminal(&sessions.get_attempt(attempt_id)?.status) {
+        return Ok(());
+    }
     let workload_id = agent.name.as_str();
     let live = processes.get_or_start(&docker, workload_id, &spec).await?;
     if let Err(error) = sessions.set_container(attempt_id, &live.container_id) {
@@ -1062,6 +1375,17 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         item.task_id.clone(),
         kind.clone(),
     );
+    if capture_task_dashboard_metrics {
+        if let Err(error) = DashboardManager::new(db.clone()).capture_git_baseline(
+            "attempt",
+            attempt_id,
+            task_project_id.as_deref(),
+            &item.agent_id,
+            &repository.active_root,
+        ) {
+            warn!(%error, attempt_id, "failed to capture task Git baseline");
+        }
+    }
     let turn = live
         .process
         .run_turn(
@@ -1074,15 +1398,23 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
                 session_config: requested_session_config,
                 mcp_servers,
                 mcp_signature,
+                additional_directories: presentation_support.additional_directories,
                 image_attachments: prompt.attachments,
             },
         )
         .await;
+    if capture_task_dashboard_metrics {
+        if let Err(error) =
+            DashboardManager::new(db.clone()).record_git_snapshot("attempt", attempt_id, true)
+        {
+            warn!(%error, attempt_id, "failed to finalize task Git metrics");
+        }
+    }
     if turn.is_err() && processes.invalidate(workload_id, &live.process).await {
         docker.stop_preserving(workload_id).await?;
     }
     sessions.clear_container(attempt_id)?;
-    let turn = turn?;
+    let mut turn = turn?;
     let current = sessions.get_attempt(attempt_id)?;
     if matches!(current.status.as_str(), "cancelled" | "interrupted") {
         return Ok(());
@@ -1118,6 +1450,9 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         sessions.refresh_status(&item.agent_id)?;
         return Ok(());
     }
+    let visualizations = prepare_message_visualizations(&turn.summary, &visualization_roots);
+    let published = prepare_message_artifacts(&turn.summary, &visualization_roots);
+    turn.summary = published.content;
     sessions.add_artifact(
         attempt_id,
         "runner_output",
@@ -1136,23 +1471,21 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
     let completion_summary = truncate(&turn.summary, 2_000);
-    let completed = sessions.transition_attempt(
-        attempt_id,
-        "completed",
-        &completion_summary,
-        Some(&turn.summary),
-        None,
-    )?;
-    if completed.status != "completed" {
-        return Ok(());
-    }
     let queue = TaskQueue::new(db.clone());
-    queue.complete(item.id, &turn.summary)?;
-    if let Err(error) =
-        TaskConversation::new(db.clone()).add_message(&item.task_id, "assistant", &turn.summary)
-    {
-        warn!(%error, task_id = item.task_id, "failed to persist ACP task reply");
-    }
+    let Some(_) = TaskConversation::new(db.clone()).complete_final_assistant_attempt(
+        FinalAssistantAttempt {
+            task_id: &item.task_id,
+            queue_id: item.id,
+            attempt_id,
+            completion_summary: &completion_summary,
+            content: &turn.summary,
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
+    )?
+    else {
+        return Ok(());
+    };
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
@@ -1186,6 +1519,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &item,
         &agent.context_label(),
         &turn.summary,
+        attempt_id,
+        ConversationResultArtifacts {
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
     );
     for completed in completed_tasks {
         advance_workflow(&db, &completed.id, "completed", &turn.summary);
@@ -1267,18 +1605,35 @@ fn conversation_id(db: &Arc<Database>, task_id: &str) -> Option<String> {
         .and_then(|task| task.conversation_id)
 }
 
+struct ConversationResultArtifacts<'a> {
+    visualizations: &'a [PreparedVisualization],
+    published_files: &'a [crate::message_artifacts::PublishedFileAttachment],
+}
+
 fn publish_conversation_result(
     db: &Arc<Database>,
     event_bus: &Arc<ConversationEventBus>,
     item: &QueueItem,
     sender_name: &str,
     content: &str,
+    attempt_id: &str,
+    artifacts: ConversationResultArtifacts<'_>,
 ) {
     let Some(conversation_id) = conversation_id(db, &item.task_id) else {
         return;
     };
     let manager = ConversationManager::new(db.clone());
-    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_attachments(
+    let attachments = artifacts
+        .published_files
+        .iter()
+        .map(|attachment| NewConversationAttachment {
+            name: bound_published_file_name(&attachment.name),
+            mime_type: attachment.mime_type.clone(),
+            data: attachment.data.clone(),
+            source_task_id: Some(item.task_id.clone()),
+        })
+        .collect::<Vec<_>>();
+    if let Ok((message, _, _)) = manager.send_agent_routed_message_with_visualizations(
         &conversation_id,
         &SendMessage {
             sender_type: "agent".to_string(),
@@ -1288,12 +1643,18 @@ fn publish_conversation_result(
             message_type: Some("task_result".to_string()),
         },
         Some(&item.task_id),
-        &[],
+        &attachments,
+        Some(attempt_id),
+        artifacts.visualizations,
     ) {
+        let mut message_value = json!(message);
+        message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
+        message_value["visualizations"] =
+            json!(manager.visualizations(message.id).unwrap_or_default());
         event_bus.send(
             &conversation_id,
             ConversationEvent::Message {
-                message: json!(message),
+                message: message_value,
             },
         );
     }
@@ -1315,15 +1676,14 @@ fn advance_workflow(db: &Arc<Database>, task_id: &str, status: &str, output: &st
 
 pub fn resolve_runner_kind(agent: &AgentConfig) -> Result<String> {
     if agent.runner.kind != "auto" {
-        return Ok(agent.runner.kind.to_lowercase());
+        let configured = agent.runner.kind.to_lowercase();
+        return Ok(canonical_agent_kind(&configured)
+            .unwrap_or(configured.as_str())
+            .to_string());
     }
     let backend = agent.backend.to_lowercase();
-    if let Some(agent) = crate::acp::ACP_AGENTS.iter().find(|agent| {
-        backend == agent.kind
-            || (agent.kind.len() >= 4 && backend.contains(agent.kind))
-            || (agent.kind == "github-copilot" && backend.contains("copilot"))
-    }) {
-        Ok(agent.kind.to_string())
+    if let Some(kind) = infer_agent_kind_from_backend(&backend) {
+        Ok(kind.to_string())
     } else if !agent.runner.command.is_empty() {
         Ok("custom".to_string())
     } else {
@@ -1570,6 +1930,25 @@ pub async fn runner_image_compatible(
                 .await)
 }
 
+/// Exact image contract for the XpressClaw-owned Codex presentation workflow.
+/// Custom images may opt in only by packaging the same paths and labels.
+pub async fn presentation_runtime_available(docker: &DockerManager, image: &str) -> bool {
+    docker
+        .image_has_label(
+            image,
+            PRESENTATION_CAPABILITY_LABEL,
+            PRESENTATION_CAPABILITY,
+        )
+        .await
+        && docker
+            .image_has_label(
+                image,
+                PRESENTATION_RUNTIME_VERSION_LABEL,
+                PRESENTATION_RUNTIME_VERSION,
+            )
+            .await
+}
+
 fn configure_pi_mcp_bridge(
     data_dir: &Path,
     agent_id: &str,
@@ -1668,6 +2047,30 @@ fn container_paths_overlap(left: &str, right: &str) -> bool {
 fn pi_mcp_config_dir(data_dir: &Path, agent_id: &str) -> PathBuf {
     let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
     data_dir.join("runtime").join("pi-mcp").join(agent_hash)
+}
+
+/// Remove XpressClaw-generated per-Agent runtime files after an Agent is
+/// permanently deleted. Repository and managed-workspace directories are
+/// intentionally outside these hashed runtime roots and are never touched.
+pub fn remove_agent_runtime_state(data_dir: &Path, agent_id: &str) -> Result<()> {
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
+        let path = data_dir
+            .join("runtime")
+            .join(runtime_kind)
+            .join(&agent_hash);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::Backend(format!(
+                    "failed to remove Agent runtime directory {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pi_mcp_config(mcp_servers: &[McpServer]) -> Result<Vec<u8>> {
@@ -1852,8 +2255,12 @@ impl Drop for WindowsLocalAllocation {
     }
 }
 
+/// Apply a protected owner-only DACL to a private file or directory.
+///
+/// This is public so other XpressClaw crates can use the same audited Windows
+/// secret-storage primitive instead of inheriting a permissive parent ACL.
 #[cfg(windows)]
-fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
+pub fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
 
@@ -1873,7 +2280,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if wide_path.contains(&0) {
         return Err(Error::Backend(format!(
-            "failed to protect Pi MCP path {}: path contains a NUL character",
+            "failed to protect private path {}: path contains a NUL character",
             path.display()
         )));
     }
@@ -1902,7 +2309,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
     let _security_descriptor = WindowsLocalAllocation(security_descriptor);
     if owner.is_null() {
         return Err(Error::Backend(format!(
-            "failed to protect Pi MCP path {}: Windows returned no owner",
+            "failed to protect private path {}: Windows returned no owner",
             path.display()
         )));
     }
@@ -1954,7 +2361,7 @@ fn set_windows_owner_only_acl(path: &Path, directory: bool) -> Result<()> {
 #[cfg(windows)]
 fn windows_acl_error(action: &str, path: &Path, status: u32) -> Error {
     Error::Backend(format!(
-        "failed to {action} Pi MCP path {}: {}",
+        "failed to {action} private path {}: {}",
         path.display(),
         std::io::Error::from_raw_os_error(status as i32)
     ))
@@ -1977,7 +2384,11 @@ fn configured_mcp_servers(config: &Config, agent: &AgentConfig) -> Result<Vec<Mc
 }
 
 fn continuation_task_id(task: &Task) -> Option<&str> {
-    (!task.hidden && task.task_type != "IDLE").then_some(task.id.as_str())
+    dashboard_task_metrics_enabled(task).then_some(task.id.as_str())
+}
+
+fn dashboard_task_metrics_enabled(task: &Task) -> bool {
+    !task.hidden && task.task_type != "IDLE"
 }
 
 fn github_review_lifecycle_enabled(task: &Task) -> bool {
@@ -2002,6 +2413,7 @@ struct RunnerCallback<'a> {
     port: u16,
     token: &'a str,
     container_runtime: &'a str,
+    collaboration_token: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -2017,10 +2429,12 @@ fn xpressclaw_control_mcp_server(
         None,
         None,
         "/workspace",
+        "/workspace",
         RunnerCallback {
             port: control_plane_port,
             token: "test-control-token",
             container_runtime,
+            collaboration_token: None,
         },
     )
 }
@@ -2031,6 +2445,7 @@ fn xpressclaw_control_mcp_server_for_context(
     conversation_id: Option<&str>,
     project_id: Option<&str>,
     workspace: &str,
+    repository: &str,
     callback: RunnerCallback<'_>,
 ) -> McpServer {
     let mut env = vec![
@@ -2040,6 +2455,7 @@ fn xpressclaw_control_mcp_server_for_context(
         ),
         EnvVariable::new("XPRESSCLAW_AGENT_ID", agent_id),
         EnvVariable::new("XPRESSCLAW_WORKSPACE", workspace),
+        EnvVariable::new("XPRESSCLAW_REPOSITORY", repository),
         EnvVariable::new("XPRESSCLAW_CONTROL_TOKEN", callback.token),
     ];
     if let Some(task_id) = task_id {
@@ -2054,6 +2470,10 @@ fn xpressclaw_control_mcp_server_for_context(
     if let Some(project_id) = project_id {
         env.push(EnvVariable::new("XPRESSCLAW_PROJECT_ID", project_id));
     }
+    if let Some(token) = callback.collaboration_token {
+        env.push(EnvVariable::new("XPRESSCLAW_LOCAL_COLLABORATION", "1"));
+        env.push(EnvVariable::new("XPRESSCLAW_COLLABORATION_TOKEN", token));
+    }
     // The control MCP must move in lockstep with the control plane. Runner
     // images are cached independently and can legitimately remain on an older
     // build, so execute the source embedded in this XpressClaw binary instead
@@ -2067,6 +2487,63 @@ fn xpressclaw_control_mcp_server_for_context(
             ])
             .env(env),
     )
+}
+
+async fn configure_local_collaboration_access(
+    db: &Arc<Database>,
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    docker: &DockerManager,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let installation_id = db.installation_id()?;
+    let network = collaboration_network_name(&installation_id);
+    let network = docker
+        .installation_network_present(&network)
+        .await
+        .then_some(network);
+    configure_local_collaboration_access_for_network(config, agent, spec, network.as_deref())
+}
+
+fn configure_local_collaboration_access_for_network(
+    config: &Config,
+    agent: &AgentConfig,
+    spec: &mut ContainerSpec,
+    network: Option<&str>,
+) -> Result<Option<String>> {
+    if !config.collaboration.agent_authorized(&agent.name) {
+        return Ok(None);
+    }
+    let Some(network) = network else {
+        warn!(
+            agent = %agent.name,
+            "local collaboration network is unavailable or not owned by this installation; continuing without collaboration tools"
+        );
+        return Ok(None);
+    };
+    let secrets = match CollaborationSecrets::load(&config.system.data_dir) {
+        Ok(Some(secrets)) => secrets,
+        Ok(None) => {
+            warn!(
+                agent = %agent.name,
+                "local collaboration credentials are unavailable; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            warn!(
+                agent = %agent.name,
+                %error,
+                "local collaboration credentials could not be loaded; continuing without collaboration tools"
+            );
+            return Ok(None);
+        }
+    };
+    spec.network_mode = Some(network.to_string());
+    Ok(Some(secrets.capability_token_for_agent(&agent.name)))
 }
 
 fn is_absolute_container_path(path: &str) -> bool {
@@ -2181,24 +2658,160 @@ fn requested_session_config(
     Ok(requested)
 }
 
+fn repository_volume_mounts(
+    data_dir: &Path,
+    agent_id: &str,
+    repository: &RuntimeRepository,
+) -> Result<Vec<VolumeMount>> {
+    let mut mounts = vec![VolumeMount {
+        source: repository.bootstrap_root.display().to_string(),
+        target: repository.container_bootstrap.clone(),
+        read_only: false,
+        selinux_relabel: SelinuxRelabel::Shared,
+    }];
+    let dot_git = repository.active_root.join(".git");
+    let linked_worktree = std::fs::symlink_metadata(&dot_git)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file());
+    if !repository.active || !linked_worktree {
+        return Ok(mounts);
+    }
+
+    let git_dir = repository.git_dir.as_deref().ok_or_else(|| {
+        Error::Backend("active linked worktree has no authorized Git directory".to_string())
+    })?;
+    let git_common_dir = repository.git_common_dir.as_deref().ok_or_else(|| {
+        Error::Backend("active linked worktree has no authorized common Git directory".to_string())
+    })?;
+    let container_git_dir = container_descendant_path(repository, git_dir)?;
+    let container_git_common_dir = container_descendant_path(repository, git_common_dir)?;
+    let topology = format!(
+        "{}\0{container_git_dir}\0{container_git_common_dir}",
+        repository.container_root
+    );
+    let topology_hash = format!("{:x}", Sha256::digest(topology.as_bytes()));
+    let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+    let runtime_dir = data_dir
+        .join("runtime")
+        .join("git-worktrees")
+        .join(agent_hash)
+        .join(topology_hash);
+    let _redirect_guard = GIT_WORKTREE_REDIRECT_LOCK.lock().unwrap();
+    std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+        Error::Backend(format!(
+            "failed to create linked-worktree runtime directory {}: {error}",
+            runtime_dir.display()
+        ))
+    })?;
+    if let Some(agent_dir) = runtime_dir.parent() {
+        set_private_directory_permissions(agent_dir)?;
+    }
+    set_private_directory_permissions(&runtime_dir)?;
+
+    let dot_git_redirect = runtime_dir.join("dot-git");
+    write_private_atomic(
+        &dot_git_redirect,
+        format!("gitdir: {container_git_dir}\n").as_bytes(),
+    )?;
+    mounts.push(VolumeMount {
+        source: dot_git_redirect.display().to_string(),
+        target: format!("{}/.git", repository.container_root),
+        read_only: true,
+        selinux_relabel: SelinuxRelabel::Shared,
+    });
+
+    if git_common_dir != git_dir {
+        let host_commondir = git_dir.join("commondir");
+        if !std::fs::symlink_metadata(&host_commondir)
+            .ok()
+            .is_some_and(|metadata| metadata.file_type().is_file())
+        {
+            return Err(Error::Backend(format!(
+                "linked worktree Git directory {} has no regular commondir file",
+                git_dir.display()
+            )));
+        }
+        let common_redirect = runtime_dir.join("commondir");
+        write_private_atomic(
+            &common_redirect,
+            format!("{container_git_common_dir}\n").as_bytes(),
+        )?;
+        mounts.push(VolumeMount {
+            source: common_redirect.display().to_string(),
+            target: format!("{container_git_dir}/commondir"),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+    }
+
+    let host_gitdir_backlink = git_dir.join("gitdir");
+    if std::fs::symlink_metadata(&host_gitdir_backlink)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_file())
+    {
+        let gitdir_backlink = runtime_dir.join("gitdir");
+        write_private_atomic(
+            &gitdir_backlink,
+            format!("{}/.git\n", repository.container_root).as_bytes(),
+        )?;
+        mounts.push(VolumeMount {
+            source: gitdir_backlink.display().to_string(),
+            target: format!("{container_git_dir}/gitdir"),
+            read_only: true,
+            selinux_relabel: SelinuxRelabel::Shared,
+        });
+    }
+    Ok(mounts)
+}
+
+fn container_descendant_path(repository: &RuntimeRepository, host_path: &Path) -> Result<String> {
+    let relative = host_path
+        .strip_prefix(&repository.bootstrap_root)
+        .map_err(|_| {
+            Error::Backend(format!(
+                "Git metadata path {} leaves the Agent workspace {}",
+                host_path.display(),
+                repository.bootstrap_root.display()
+            ))
+        })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().ok_or_else(|| {
+                Error::Backend(format!(
+                    "Git metadata path {} is not valid UTF-8",
+                    host_path.display()
+                ))
+            }),
+            _ => Err(Error::Backend(format!(
+                "Git metadata path {} is not a normalized workspace descendant",
+                host_path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        Ok(repository.container_bootstrap.clone())
+    } else {
+        Ok(format!(
+            "{}/{}",
+            repository.container_bootstrap.trim_end_matches('/'),
+            components.join("/")
+        ))
+    }
+}
+
 fn build_spec(
     config: &Config,
     agent: &AgentConfig,
     kind: &str,
     docker: &DockerManager,
+    repository: &RuntimeRepository,
     github: Option<&github::GithubSessionAccess>,
 ) -> Result<ContainerSpec> {
     let image = resolved_runner_image(&agent.runner, kind)?;
-    let workspace = resolved_workspace(config, agent);
-    let container_workspace = container_workspace_path(&workspace, agent.runner.container_engine);
-    let command = acp_command_for(&agent.runner, kind, &container_workspace)?;
+    let command = acp_command_for(&agent.runner, kind, &repository.container_root)?;
     let command = with_startup_commands(command, &agent.runner.startup_commands);
-    let mut volumes = vec![VolumeMount {
-        source: workspace.display().to_string(),
-        target: container_workspace.clone(),
-        read_only: false,
-        selinux_relabel: SelinuxRelabel::Shared,
-    }];
+    let mut volumes = repository_volume_mounts(&config.system.data_dir, &agent.name, repository)?;
     for volume in &agent.volumes {
         let mount = parse_volume(volume).ok_or_else(|| {
             Error::Backend(format!(
@@ -2282,7 +2895,7 @@ fn build_spec(
         network_mode: Some("bridge".to_string()),
         expose_port: None,
         cmd: Some(command),
-        working_dir: Some(container_workspace),
+        working_dir: Some(repository.container_root.clone()),
         run_as_host_user: true,
     })
 }
@@ -2306,13 +2919,10 @@ fn apply_codex_mode_default(
 fn configure_bundled_github_mcp(
     runner: &NativeRunnerConfig,
     kind: &str,
-    github_available: bool,
     bundled_control_tools: bool,
     environment: &mut Vec<String>,
 ) -> Result<bool> {
-    let attached = github_available
-        && bundled_control_tools
-        && !runner.mcp_servers.iter().any(|name| name == "github");
+    let attached = bundled_control_tools && !runner.mcp_servers.iter().any(|name| name == "github");
     if attached && kind == "codex" {
         const PREFIX: &str = "CODEX_CONFIG=";
         let existing_index = environment
@@ -2395,6 +3005,33 @@ pub fn resolved_workspace(config: &Config, agent: &AgentConfig) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| config.system.workspace_dir.clone());
     canonical_or_original(&workspace)
+}
+
+/// Resolve only runner paths that the Agent can write and that map back to a
+/// known host directory. XpressClaw-injected credential/config mounts are not
+/// part of `agent.volumes`, so they cannot become visualization sources.
+fn visualization_source_roots(
+    workspace: &Path,
+    container_workspace: &str,
+    agent: &AgentConfig,
+) -> Vec<VisualizationSourceRoot> {
+    let mut roots = vec![VisualizationSourceRoot::new(container_workspace, workspace)];
+    for raw in &agent.volumes {
+        let Some(mount) = parse_volume(raw) else {
+            continue;
+        };
+        if mount.read_only
+            || !is_absolute_runner_root(&mount.target)
+            || !Path::new(&mount.source).is_absolute()
+        {
+            continue;
+        }
+        let root = VisualizationSourceRoot::new(mount.target, mount.source);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
 }
 
 pub fn resolved_runner_image(config: &NativeRunnerConfig, kind: &str) -> Result<String> {
@@ -3242,6 +3879,234 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn run_git(repository: &Path, arguments: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    fn add_test_agent(db: &Arc<Database>, agent_id: &str) {
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO agents (id, name, backend, config) VALUES (?1, ?1, 'native', '{}')",
+                [agent_id],
+            )
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn opencode_nested_repository_becomes_cwd_and_accepts_bundled_github_mcp() {
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = workspace.path().join("product");
+        std::fs::create_dir_all(&repository).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "opencode-agent");
+        let manager = AgentRepositoryManager::new(db);
+        manager
+            .apply_boundary("opencode-agent", workspace.path())
+            .unwrap();
+        let inspection = manager.inspect("opencode-agent", workspace.path()).unwrap();
+        let mut agent = AgentConfig {
+            name: "opencode-agent".into(),
+            backend: "opencode".into(),
+            ..AgentConfig::default()
+        };
+        agent.runner.kind = "opencode".into();
+        agent.runner.workspace = Some(workspace.path().display().to_string());
+        let runtime = RuntimeRepository::from_inspection(inspection, &agent);
+        assert_eq!(runtime.container_bootstrap, "/workspace");
+        assert_eq!(runtime.container_root, "/workspace/product");
+
+        let mut environment = Vec::new();
+        assert!(
+            configure_bundled_github_mcp(&agent.runner, "opencode", true, &mut environment,)
+                .unwrap()
+        );
+        let control = xpressclaw_control_mcp_server_for_context(
+            &agent.name,
+            Some("task"),
+            None,
+            Some("project"),
+            &runtime.container_bootstrap,
+            &runtime.container_root,
+            RunnerCallback {
+                port: 8935,
+                token: "control",
+                container_runtime: "docker",
+                collaboration_token: None,
+            },
+        );
+        let McpServer::Stdio(control) = control else {
+            panic!("control MCP must use stdio");
+        };
+        assert!(control.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_REPOSITORY" && variable.value == "/workspace/product"
+        }));
+
+        let github = github::mcp_server(&github::GithubMcpContext {
+            control_plane_url: "http://host.docker.internal:8935".into(),
+            control_plane_token: agent_callback_capability("control", &agent.name),
+            agent_id: agent.name.clone(),
+            workspace: runtime.container_bootstrap,
+            active_repository: Some(runtime.container_root),
+            task_id: Some("task".into()),
+            review_lifecycle: true,
+        });
+        let McpServer::Stdio(github) = github else {
+            panic!("GitHub MCP must use stdio");
+        };
+        assert!(github.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_REPOSITORY" && variable.value == "/workspace/product"
+        }));
+        assert!(github
+            .env
+            .iter()
+            .any(|variable| variable.name == "XPRESSCLAW_TASK_ID" && variable.value == "task"));
+        assert!(github.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_GITHUB_REVIEW_LIFECYCLE" && variable.value == "1"
+        }));
+        assert!(github
+            .env
+            .iter()
+            .all(|variable| variable.name != "GH_TOKEN" && variable.name != "GH_REPO"));
+    }
+
+    #[test]
+    fn linked_worktree_mounts_translate_git_metadata_into_the_container() {
+        let workspace = tempfile::tempdir().unwrap();
+        let primary = workspace.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        run_git(&primary, &["init", "-q"]);
+        run_git(
+            &primary,
+            &[
+                "-c",
+                "user.name=XpressClaw Tests",
+                "-c",
+                "user.email=tests@xpressclaw.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        let linked = workspace.path().join("feature");
+        run_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let original_dot_git = std::fs::read_to_string(linked.join(".git")).unwrap();
+        assert!(original_dot_git.starts_with("gitdir: "));
+        assert!(!original_dot_git.contains("/workspace/primary"));
+
+        let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "opencode-agent");
+        let manager = AgentRepositoryManager::new(db);
+        let inspection = manager
+            .select("opencode-agent", workspace.path(), "feature")
+            .unwrap()
+            .inspection;
+        let mut agent = AgentConfig {
+            name: "opencode-agent".into(),
+            backend: "opencode".into(),
+            ..AgentConfig::default()
+        };
+        agent.runner.kind = "opencode".into();
+        agent.runner.workspace = Some(workspace.path().display().to_string());
+        let runtime = RuntimeRepository::from_inspection(inspection, &agent);
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let mounts = repository_volume_mounts(data_dir.path(), &agent.name, &runtime).unwrap();
+        assert_eq!(mounts.len(), 4);
+        assert!(mounts.iter().any(|mount| {
+            mount.source
+                == workspace
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string()
+                && mount.target == "/workspace"
+                && !mount.read_only
+        }));
+        let expected = [
+            (
+                "/workspace/feature/.git",
+                "gitdir: /workspace/primary/.git/worktrees/feature\n",
+            ),
+            (
+                "/workspace/primary/.git/worktrees/feature/commondir",
+                "/workspace/primary/.git\n",
+            ),
+            (
+                "/workspace/primary/.git/worktrees/feature/gitdir",
+                "/workspace/feature/.git\n",
+            ),
+        ];
+        for (target, contents) in expected {
+            let mount = mounts.iter().find(|mount| mount.target == target).unwrap();
+            assert!(mount.read_only);
+            assert_eq!(mount.selinux_relabel, SelinuxRelabel::Shared);
+            assert_eq!(std::fs::read_to_string(&mount.source).unwrap(), contents);
+        }
+        assert_eq!(
+            std::fs::read_to_string(linked.join(".git")).unwrap(),
+            original_dot_git
+        );
+    }
+
+    #[test]
+    fn agent_runtime_cleanup_is_idempotent_and_preserves_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let agent_id = "atlas";
+        let agent_hash = format!("{:x}", Sha256::digest(agent_id.as_bytes()));
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
+            let runtime_dir = data_dir
+                .join("runtime")
+                .join(runtime_kind)
+                .join(&agent_hash);
+            std::fs::create_dir_all(&runtime_dir).unwrap();
+            std::fs::write(runtime_dir.join("generated.conf"), "owned").unwrap();
+        }
+        let workspace = data_dir.join("workspaces").join(agent_id);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("user-source.txt"), "preserve").unwrap();
+
+        remove_agent_runtime_state(&data_dir, agent_id).unwrap();
+        remove_agent_runtime_state(&data_dir, agent_id).unwrap();
+
+        for runtime_kind in ["pi-mcp", "ssh-known-hosts", "ssh-config", "git-worktrees"] {
+            assert!(!data_dir
+                .join("runtime")
+                .join(runtime_kind)
+                .join(&agent_hash)
+                .exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("user-source.txt")).unwrap(),
+            "preserve"
+        );
+    }
+
     #[tokio::test]
     async fn retiring_conversations_removes_all_registered_acp_lanes() {
         let processes = ConversationAcpProcesses::default();
@@ -3260,6 +4125,44 @@ mod tests {
             1
         );
         assert_eq!(processes.slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_quiescence_waits_for_only_the_selected_agents() {
+        let lifecycle = Arc::new(NativeRuntimeLifecycle::default());
+        let active = lifecycle.enter("atlas").await;
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let quiescing = lifecycle.clone();
+        tokio::spawn(async move {
+            let guards = quiescing.quiesce_agents(&["atlas".to_string()]).await;
+            let _ = sender.send(guards);
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let other_agent = tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("reviewer"))
+            .await
+            .expect("an unrelated Agent must not be blocked");
+        drop(other_agent);
+
+        drop(active);
+        let guards = tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .expect("quiescence should acquire after active work exits")
+            .expect("quiescence task should return its guards");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lifecycle.enter("atlas"))
+                .await
+                .is_err(),
+            "new work must wait while destructive cleanup holds the barrier"
+        );
+        drop(guards);
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.enter("atlas"))
+            .await
+            .expect("new work should resume after cleanup releases the barrier");
     }
 
     #[test]
@@ -3746,6 +4649,9 @@ mod tests {
         assert!(server.env.iter().any(|variable| {
             variable.name == "XPRESSCLAW_CONTROL_TOKEN" && variable.value == "test-control-token"
         }));
+        assert!(server.env.iter().any(|variable| {
+            variable.name == "XPRESSCLAW_REPOSITORY" && variable.value == "/workspace"
+        }));
 
         let McpServer::Stdio(podman) =
             xpressclaw_control_mcp_server("dgx-codex", Some("task-123"), 9123, "podman")
@@ -3773,7 +4679,10 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
-        let board = TaskBoard::new(db);
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("atlas", "native")
+            .unwrap();
+        let board = TaskBoard::new(db.clone());
         let visible = board
             .create(&CreateTask {
                 title: "Visible work".into(),
@@ -3787,6 +4696,15 @@ mod tests {
 
         assert_eq!(continuation_task_id(&visible), Some(visible.id.as_str()));
         assert_eq!(continuation_task_id(&idle), None);
+        assert!(dashboard_task_metrics_enabled(&visible));
+        assert!(!dashboard_task_metrics_enabled(&idle));
+
+        db.with_conn(|conn| conn.execute("UPDATE tasks SET hidden = 0 WHERE id = ?1", [&idle.id]))
+            .unwrap();
+        let visible_idle = board.get(&idle.id).unwrap();
+        assert!(!visible_idle.hidden);
+        assert_eq!(visible_idle.task_type, "IDLE");
+        assert!(!dashboard_task_metrics_enabled(&visible_idle));
     }
 
     #[test]
@@ -3795,6 +4713,7 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let sessions = SessionManager::new(db.clone());
         sessions.ensure("atlas", Some("Atlas")).unwrap();
         let task = TaskBoard::new(db.clone())
@@ -3869,6 +4788,42 @@ mod tests {
     }
 
     #[test]
+    fn resolves_deepseek_harness_aliases_to_the_builtin_runner() {
+        for backend in ["deepseek-harness", "dsh", "dsh-acp"] {
+            let agent = AgentConfig {
+                backend: backend.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(resolve_runner_kind(&agent).unwrap(), "deepseek-harness");
+        }
+
+        let agent = AgentConfig {
+            runner: NativeRunnerConfig {
+                kind: "dsh".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(resolve_runner_kind(&agent).unwrap(), "deepseek-harness");
+    }
+
+    #[test]
+    fn explicit_custom_kind_is_not_reclassified_as_a_builtin() {
+        let agent = AgentConfig {
+            backend: "codex".into(),
+            runner: NativeRunnerConfig {
+                kind: "codex-proxy".into(),
+                command: vec!["codex-proxy".into(), "acp".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let kind = resolve_runner_kind(&agent).unwrap();
+        assert_eq!(kind, "codex-proxy");
+        assert!(agent_definition(&kind).is_none());
+    }
+
+    #[test]
     fn recognizes_explicit_native_questions() {
         assert!(needs_user_input(
             "I need one decision.\n\nNEEDS_USER_INPUT: Which database should I use?"
@@ -3926,6 +4881,10 @@ mod tests {
         assert_eq!(
             acp_command_for(&config, "opencode", "/workspace").unwrap(),
             vec!["opencode", "acp"]
+        );
+        assert_eq!(
+            acp_command_for(&config, "deepseek-harness", "/workspace").unwrap(),
+            vec!["dsh-acp"]
         );
     }
 
@@ -4245,9 +5204,7 @@ mod tests {
         let runner = NativeRunnerConfig::default();
         let mut environment = vec!["HOME=/home/node".to_string()];
 
-        assert!(
-            configure_bundled_github_mcp(&runner, "codex", true, true, &mut environment).unwrap()
-        );
+        assert!(configure_bundled_github_mcp(&runner, "codex", true, &mut environment).unwrap());
         let config: Value = serde_json::from_str(
             environment
                 .iter()
@@ -4268,22 +5225,17 @@ mod tests {
         assert!(!configure_bundled_github_mcp(
             &runner,
             "codex",
-            true,
             false,
             &mut custom_image_environment
         )
         .unwrap());
         assert_eq!(custom_image_environment, original_custom_environment);
 
-        let mut missing_access_environment = Vec::new();
-        assert!(!configure_bundled_github_mcp(
-            &runner,
-            "codex",
-            false,
-            true,
-            &mut missing_access_environment
-        )
-        .unwrap());
+        let mut bootstrap_environment = Vec::new();
+        assert!(
+            configure_bundled_github_mcp(&runner, "codex", true, &mut bootstrap_environment)
+                .unwrap()
+        );
 
         let configured_runner = NativeRunnerConfig {
             mcp_servers: vec!["github".to_string()],
@@ -4293,7 +5245,6 @@ mod tests {
         assert!(!configure_bundled_github_mcp(
             &configured_runner,
             "codex",
-            true,
             true,
             &mut configured_environment
         )
@@ -4307,13 +5258,11 @@ mod tests {
         let mut conversation = ContainerSpec::default();
 
         assert!(
-            configure_bundled_github_mcp(&runner, "codex", true, true, &mut task.environment,)
-                .unwrap()
+            configure_bundled_github_mcp(&runner, "codex", true, &mut task.environment,).unwrap()
         );
         assert!(configure_bundled_github_mcp(
             &runner,
             "codex",
-            true,
             true,
             &mut conversation.environment,
         )
@@ -4327,11 +5276,161 @@ mod tests {
     }
 
     #[test]
+    fn local_collaboration_network_and_capability_are_assigned_per_agent() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = true;
+        config.collaboration.authorized_agents = vec!["allowed".to_string()];
+        let expected_token = CollaborationSecrets::generate();
+        expected_token.save(data_dir.path()).unwrap();
+
+        let allowed = AgentConfig {
+            name: "allowed".to_string(),
+            ..Default::default()
+        };
+        let expected_network = collaboration_network_name(&db.installation_id().unwrap());
+        let mut allowed_spec = ContainerSpec::default();
+        let token = configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut allowed_spec,
+            Some(&expected_network),
+        )
+        .unwrap();
+        assert_eq!(
+            token.as_deref(),
+            Some(
+                expected_token
+                    .capability_token_for_agent("allowed")
+                    .as_str()
+            )
+        );
+        assert_ne!(
+            token.as_deref(),
+            Some(
+                expected_token
+                    .capability_token_for_agent("another-agent")
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            allowed_spec.network_mode.as_deref(),
+            Some(expected_network.as_str())
+        );
+
+        let mut missing_network_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut missing_network_spec,
+            None,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            missing_network_spec.network_mode.as_deref(),
+            Some("ordinary-network")
+        );
+
+        let unassigned = AgentConfig {
+            name: "unassigned".to_string(),
+            ..Default::default()
+        };
+        let mut unassigned_spec = ContainerSpec {
+            network_mode: Some("existing-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &unassigned,
+            &mut unassigned_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            unassigned_spec.network_mode.as_deref(),
+            Some("existing-network")
+        );
+
+        std::fs::remove_file(CollaborationSecrets::path(data_dir.path())).unwrap();
+        let mut ordinary_turn_spec = ContainerSpec {
+            network_mode: Some("ordinary-network".to_string()),
+            ..Default::default()
+        };
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut ordinary_turn_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            ordinary_turn_spec.network_mode.as_deref(),
+            Some("ordinary-network")
+        );
+
+        std::fs::create_dir_all(data_dir.path().join("collaboration")).unwrap();
+        std::fs::write(
+            CollaborationSecrets::path(data_dir.path()),
+            "not valid collaboration credentials",
+        )
+        .unwrap();
+        let mut malformed_credentials_spec = ContainerSpec::default();
+        let original_network = malformed_credentials_spec.network_mode.clone();
+        assert!(configure_local_collaboration_access_for_network(
+            &config,
+            &allowed,
+            &mut malformed_credentials_spec,
+            Some(&expected_network),
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(malformed_credentials_spec.network_mode, original_network);
+    }
+
+    #[test]
+    fn reset_collaboration_access_keeps_task_and_conversation_specs_usable() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = data_dir.path().to_path_buf();
+        config.collaboration.enabled = false;
+        config.collaboration.authorized_agents.clear();
+        let agent = AgentConfig {
+            name: "formerly-assigned".to_string(),
+            ..Default::default()
+        };
+
+        for network in ["task-network", "conversation-network"] {
+            let mut spec = ContainerSpec {
+                network_mode: Some(network.to_string()),
+                ..Default::default()
+            };
+            assert!(configure_local_collaboration_access_for_network(
+                &config,
+                &agent,
+                &mut spec,
+                Some("collaboration-network"),
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(spec.network_mode.as_deref(), Some(network));
+        }
+    }
+
+    #[test]
     fn startup_interrupt_preserves_original_messages_and_images() {
         use crate::tasks::attachments::DecodedImageAttachment;
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let board = TaskBoard::new(db.clone());
         SessionManager::new(db.clone())
             .ensure("atlas", Some("atlas"))
@@ -4418,6 +5517,7 @@ mod tests {
         use crate::tasks::board::CreateTask;
 
         let db = Arc::new(Database::open_memory().unwrap());
+        add_test_agent(&db, "atlas");
         let board = TaskBoard::new(db.clone());
         SessionManager::new(db.clone())
             .ensure("atlas", Some("atlas"))
@@ -4549,6 +5649,9 @@ mod tests {
         use crate::tasks::scheduler::{CreateOneShotSchedule, ScheduleManager};
 
         let db = Arc::new(Database::open_memory().unwrap());
+        crate::agents::registry::AgentRegistry::new(db.clone())
+            .ensure("dgx-codex", "codex")
+            .unwrap();
         let board = TaskBoard::new(db.clone());
         let sessions = SessionManager::new(db.clone());
         sessions.ensure("dgx-codex", Some("DGX")).unwrap();
@@ -4638,6 +5741,10 @@ mod tests {
             Some("ghcr.io/xpressai/xpressclaw-runner-opencode:latest")
         );
         assert_eq!(
+            default_native_runner_image("deepseek-harness", ContainerEngineAccess::None),
+            Some("ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest")
+        );
+        assert_eq!(
             default_native_runner_image("custom", ContainerEngineAccess::None),
             None
         );
@@ -4701,6 +5808,31 @@ mod tests {
         assert_eq!(selinux_private.selinux_relabel, SelinuxRelabel::Private);
 
         assert!(parse_volume("/tmp/cache:/workspace/cache:cached").is_none());
+    }
+
+    #[test]
+    fn visualization_roots_include_only_explicit_writable_agent_mounts() {
+        let host = tempfile::tempdir().unwrap();
+        let project = host.path().join("project");
+        let reference = host.path().join("reference");
+        let output = host.path().join("output");
+        let relative_target = host.path().join("relative-target");
+        let agent = AgentConfig {
+            volumes: vec![
+                format!("{}:/workspace/reference:ro", reference.display()),
+                format!("{}:/workspace/output:rw", output.display()),
+                format!("{}:relative-target:rw", relative_target.display()),
+                "relative-host:/workspace/relative-host:rw".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            visualization_source_roots(&project, "/workspace", &agent),
+            vec![
+                VisualizationSourceRoot::new("/workspace", project),
+                VisualizationSourceRoot::new("/workspace/output", output),
+            ]
+        );
     }
 
     #[test]
@@ -4805,6 +5937,12 @@ mod tests {
         let item = TaskQueue::new(db.clone())
             .enqueue(&task.id, "atlas")
             .unwrap();
+        let published_file = crate::message_artifacts::PublishedFileAttachment {
+            name: format!("{}.pptx", "📊".repeat(64)),
+            mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .into(),
+            data: b"pptx bytes".to_vec(),
+        };
 
         publish_conversation_result(
             &db,
@@ -4812,6 +5950,11 @@ mod tests {
             &item,
             "Atlas",
             "@[AGENT:reviewer:Reviewer] Native result",
+            "attempt",
+            ConversationResultArtifacts {
+                visualizations: &[],
+                published_files: &[published_file],
+            },
         );
 
         let messages = conversations
@@ -4828,6 +5971,18 @@ mod tests {
             messages[0].content,
             "@[AGENT:reviewer:Reviewer] Native result"
         );
+        let attachments = conversations.attachments(messages[0].id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].name.len() <= 255);
+        assert!(attachments[0].name.ends_with(".pptx"));
+        assert_eq!(
+            attachments[0].source_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        let (_, data) = conversations
+            .attachment_data(&conversation.id, &attachments[0].id)
+            .unwrap();
+        assert_eq!(data, b"pptx bytes");
         let turns = ConversationTurnQueue::new(db)
             .list_for_conversation(&conversation.id, 10)
             .unwrap();

@@ -1,4 +1,4 @@
-# ADR-039: Native Extension and MCP Discovery
+# ADR-043: Native Extension and MCP Discovery
 
 ## Status
 

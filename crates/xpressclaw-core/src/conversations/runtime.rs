@@ -5,8 +5,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::conversations::{row_to_message, ConversationManager, ConversationMessage, SendMessage};
+use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::message_artifacts::PublishedFileAttachment;
+use crate::projects::ensure_project_accepts_work;
+use crate::visualizations::{store_conversation_message_visualizations, PreparedVisualization};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -145,7 +149,10 @@ impl ConversationTurnQueue {
         trigger_message_id: i64,
     ) -> Result<bool> {
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let inserted = Self::enqueue_in_transaction(
                 &transaction,
                 conversation_id,
@@ -163,6 +170,19 @@ impl ConversationTurnQueue {
         agent_id: &str,
         trigger_message_id: i64,
     ) -> Result<bool> {
+        let project_id = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conversation_id.to_string(),
+            })?;
+        if let Some(project_id) = project_id.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
         let trigger_exists = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM conversation_messages
@@ -370,15 +390,35 @@ impl ConversationTurnQueue {
         })
     }
 
-    /// Store an Agent response and finish its turn in the same transaction.
-    /// A participant removed while the prompt is running cannot publish a
-    /// late response: cancellation wins before either record becomes visible.
+    /// Store an Agent response and its copied artifacts, then finish the turn
+    /// in the same transaction. A participant removed while the prompt is
+    /// running cannot publish a late response: cancellation wins before any
+    /// of those records become visible.
     pub fn complete_with_message(
         &self,
         turn: &ConversationTurn,
         native_session_id: &str,
         message: &SendMessage,
         metadata: &serde_json::Value,
+    ) -> Result<Option<ConversationMessage>> {
+        self.complete_with_message_and_visualizations(
+            turn,
+            native_session_id,
+            message,
+            metadata,
+            &[],
+            &[],
+        )
+    }
+
+    pub fn complete_with_message_and_visualizations(
+        &self,
+        turn: &ConversationTurn,
+        native_session_id: &str,
+        message: &SendMessage,
+        metadata: &serde_json::Value,
+        visualizations: &[PreparedVisualization],
+        published_files: &[PublishedFileAttachment],
     ) -> Result<Option<ConversationMessage>> {
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
@@ -426,6 +466,28 @@ impl ConversationTurnQueue {
                 [message_id],
                 row_to_message,
             )?;
+            store_conversation_message_visualizations(
+                &transaction,
+                message_id,
+                None,
+                Some(&turn.id),
+                visualizations,
+            )?;
+            for attachment in published_files {
+                transaction.execute(
+                    "INSERT INTO conversation_message_attachments
+                     (id, message_id, name, mime_type, data, size, source_task_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        message_id,
+                        attachment.name,
+                        attachment.mime_type,
+                        attachment.data,
+                        attachment.data.len() as i64,
+                    ],
+                )?;
+            }
             Self::enqueue_for_message_in_transaction(
                 &transaction,
                 &turn.conversation_id,
@@ -613,7 +675,8 @@ impl ConversationTurnQueue {
 
     pub fn recover(&self) -> Result<usize> {
         self.db.with_conn(|conn| {
-            let changed = conn.execute(
+            let transaction = conn.unchecked_transaction()?;
+            let changed = transaction.execute(
                 "UPDATE conversation_turns
                  SET status = 'queued', started_at = NULL,
                      response_queued_at = CURRENT_TIMESTAMP, response_started_at = NULL,
@@ -621,11 +684,13 @@ impl ConversationTurnQueue {
                  WHERE status = 'running'",
                 [],
             )?;
-            conn.execute(
+            transaction.execute(
                 "UPDATE conversation_agent_sessions SET status = 'queued'
                  WHERE status = 'running'",
                 [],
             )?;
+            finalize_inactive_git_baselines(&transaction, None)?;
+            transaction.commit()?;
             Ok(changed)
         })
     }
@@ -755,6 +820,74 @@ mod tests {
     }
 
     #[test]
+    fn recovery_closes_interrupted_conversation_git_baseline() {
+        let (db, manager, queue) = setup();
+        let conversation = manager
+            .create_in_project(
+                Some("p"),
+                &CreateConversation {
+                    title: Some("Recovery".into()),
+                    icon: None,
+                    participant_ids: vec!["atlas".into()],
+                },
+            )
+            .unwrap();
+        let message = manager
+            .send_message(
+                &conversation.id,
+                &SendMessage {
+                    sender_type: "user".into(),
+                    sender_id: "local".into(),
+                    sender_name: None,
+                    content: "Please continue after restart".into(),
+                    message_type: None,
+                },
+            )
+            .unwrap();
+        queue
+            .enqueue_for_message(
+                &conversation.id,
+                message.id,
+                "user",
+                "local",
+                &message.content,
+            )
+            .unwrap();
+        let running = queue.claim_next().unwrap().unwrap();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dashboard_git_baselines
+                     (work_kind, work_id, workspace, baseline_json, git_state)
+                 VALUES (
+                     'conversation_turn', ?1, '/tmp/recovered-conversation', '{}', 'available'
+                 )",
+                [&running.id],
+            )
+        })
+        .unwrap();
+
+        assert_eq!(queue.recover().unwrap(), 1);
+        let recovered = queue
+            .list_for_conversation(&conversation.id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|turn| turn.id == running.id)
+            .unwrap();
+        assert_eq!(recovered.status, "queued");
+        assert!(db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT finalized_at FROM dashboard_git_baselines
+                     WHERE work_kind = 'conversation_turn' AND work_id = ?1",
+                    [&running.id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn routed_messages_roll_back_when_their_agent_turns_cannot_be_stored() {
         let (db, manager, _queue) = setup();
         let conversation = manager
@@ -830,7 +963,7 @@ mod tests {
         assert_eq!(running.trigger_message_id, Some(request.id));
 
         let response = queue
-            .complete_with_message(
+            .complete_with_message_and_visualizations(
                 &running,
                 "session",
                 &SendMessage {
@@ -841,9 +974,20 @@ mod tests {
                     message_type: None,
                 },
                 &serde_json::json!({}),
+                &[],
+                &[PublishedFileAttachment {
+                    name: "Review.pptx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            .into(),
+                    data: b"presentation".to_vec(),
+                }],
             )
             .unwrap()
             .unwrap();
+        let attachments = manager.attachments(response.id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "Review.pptx");
 
         let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
         assert!(turns.iter().any(|turn| {

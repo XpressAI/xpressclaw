@@ -140,6 +140,7 @@ fn parse_db_timestamp(value: &str) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::registry::AgentRegistry;
     use crate::workflows::instance::InstanceManager;
     use crate::workflows::manager::CreateWorkflow;
 
@@ -176,9 +177,17 @@ flows:
             template: "Release ready"
 "#;
 
+    fn setup() -> Arc<Database> {
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "codex")
+            .unwrap();
+        db
+    }
+
     #[test]
     fn scheduled_workflow_fires_once_and_persists_inputs() {
-        let db = Arc::new(Database::open_memory().unwrap());
+        let db = setup();
         let manager = WorkflowManager::new(db.clone());
         let workflow = manager
             .create(&CreateWorkflow {
@@ -221,7 +230,7 @@ flows:
 
     #[test]
     fn disabled_workflow_does_not_fire() {
-        let db = Arc::new(Database::open_memory().unwrap());
+        let db = setup();
         let manager = WorkflowManager::new(db.clone());
         let workflow = manager
             .create(&CreateWorkflow {
@@ -241,7 +250,7 @@ flows:
 
     #[test]
     fn connector_backed_workflow_never_fires_on_a_schedule() {
-        let db = Arc::new(Database::open_memory().unwrap());
+        let db = setup();
         let manager = WorkflowManager::new(db.clone());
         let workflow = manager
             .create(&CreateWorkflow {
@@ -278,7 +287,7 @@ flows:
 
     #[test]
     fn resumed_schedule_skips_occurrences_from_before_it_was_enabled() {
-        let db = Arc::new(Database::open_memory().unwrap());
+        let db = setup();
         let manager = WorkflowManager::new(db.clone());
         let workflow = manager
             .create(&CreateWorkflow {

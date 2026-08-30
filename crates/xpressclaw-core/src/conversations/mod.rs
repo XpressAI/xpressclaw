@@ -10,8 +10,13 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::projects::ensure_project_accepts_work;
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
 use crate::tasks::queue::TaskQueue;
+use crate::visualizations::{
+    store_conversation_message_visualizations, MessageVisualization, PreparedVisualization,
+    VisualizationManager,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -188,18 +193,12 @@ impl ConversationManager {
         let id = Uuid::new_v4().to_string();
 
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             if let Some(project_id) = project_id {
-                let exists = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-                    [project_id],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !exists {
-                    return Err(Error::ProjectNotFound {
-                        id: project_id.to_string(),
-                    });
-                }
+                ensure_project_accepts_work(&transaction, project_id)?;
             }
             for agent_id in &req.participant_ids {
                 let agent_project = transaction
@@ -417,6 +416,9 @@ impl ConversationManager {
                 .map_err(|_| Error::ConversationNotFound {
                     id: conv_id.to_string(),
                 })?;
+            if let Some(project_id) = conversation_project.as_deref() {
+                ensure_project_accepts_work(&transaction, project_id)?;
+            }
 
             if participant_type == "agent" {
                 let agent_project = transaction
@@ -433,6 +435,11 @@ impl ConversationManager {
                         "an Agent must belong to the conversation's project before it can join"
                             .into(),
                     ));
+                }
+                if agent_project.as_deref() != conversation_project.as_deref() {
+                    if let Some(project_id) = agent_project.as_deref() {
+                        ensure_project_accepts_work(&transaction, project_id)?;
+                    }
                 }
             }
 
@@ -565,7 +572,10 @@ impl ConversationManager {
     ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
         validate_new_attachments(attachments)?;
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let result = Self::insert_structured_message(
                 &transaction,
                 conv_id,
@@ -594,7 +604,10 @@ impl ConversationManager {
     )> {
         validate_new_attachments(attachments)?;
         self.db.with_conn(|conn| {
-            let transaction = conn.unchecked_transaction()?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
             let (message, attachments) = Self::insert_structured_message(
                 &transaction,
                 conv_id,
@@ -624,6 +637,31 @@ impl ConversationManager {
         msg: &SendMessage,
         source_task_id: Option<&str>,
         attachments: &[NewConversationAttachment],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
+        self.send_agent_routed_message_with_visualizations(
+            conv_id,
+            msg,
+            source_task_id,
+            attachments,
+            None,
+            &[],
+        )
+    }
+
+    /// Publish a final Agent message and its already-copied visualization
+    /// fragments atomically with membership validation and peer routing.
+    pub fn send_agent_routed_message_with_visualizations(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        source_task_id: Option<&str>,
+        attachments: &[NewConversationAttachment],
+        attempt_id: Option<&str>,
+        visualizations: &[PreparedVisualization],
     ) -> Result<(
         ConversationMessage,
         Vec<ConversationAttachment>,
@@ -692,6 +730,13 @@ impl ConversationManager {
                 source_task_id,
                 None,
                 attachments,
+            )?;
+            store_conversation_message_visualizations(
+                &transaction,
+                message.id,
+                attempt_id,
+                None,
+                visualizations,
             )?;
             let queued_agents = runtime::ConversationTurnQueue::enqueue_for_message_in_transaction(
                 &transaction,
@@ -786,6 +831,19 @@ impl ConversationManager {
         metadata: Option<&serde_json::Value>,
         attachments: &[NewConversationAttachment],
     ) -> Result<(ConversationMessage, Vec<ConversationAttachment>)> {
+        let conversation_project = transaction
+            .query_row(
+                "SELECT project_id FROM conversations WHERE id = ?1",
+                [conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::ConversationNotFound {
+                id: conv_id.to_string(),
+            })?;
+        if let Some(project_id) = conversation_project.as_deref() {
+            ensure_project_accepts_work(transaction, project_id)?;
+        }
         let message_type = msg.message_type.as_deref().unwrap_or("message");
         let metadata = metadata.cloned().unwrap_or_else(|| serde_json::json!({}));
         transaction.execute(
@@ -887,6 +945,10 @@ impl ConversationManager {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(attachments)
         })
+    }
+
+    pub fn visualizations(&self, message_id: i64) -> Result<Vec<MessageVisualization>> {
+        VisualizationManager::new(self.db.clone()).list_for_conversation_message(message_id)
     }
 
     pub fn attachment_data(

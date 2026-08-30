@@ -14,6 +14,73 @@ function recentSqliteTimestamp(millisecondsAgo: number): string {
 	return new Date(Date.now() - millisecondsAgo).toISOString().slice(0, 19).replace('T', ' ');
 }
 
+function visualizationDocument(artifactId: string, label: string, followUp?: { prompt: string; title?: string }): string {
+	const action = followUp
+		? `<button id="visual-follow-up" type="button">Follow up</button><script>
+			window.openai = Object.freeze({ sendFollowUpMessage(value) {
+				parent.postMessage({ source: 'xpressclaw-visualization', type: 'follow-up-request', artifactId: ${JSON.stringify(artifactId)}, requestId: 'request-browser-test', prompt: value.prompt, title: value.title || null }, '*');
+			} });
+			document.querySelector('#visual-follow-up').addEventListener('click', () => window.openai.sendFollowUpMessage(${JSON.stringify(followUp)}));
+		</script>`
+		: '';
+	const artifactDocument = `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"></head><body><div id="visual-content">${label}</div>${action}<script>
+		addEventListener('message', (event) => {
+			if (event.source === parent && event.data?.source === 'xpressclaw-host' && event.data.artifactId === ${JSON.stringify(artifactId)} && event.data.type === 'theme') {
+				document.documentElement.dataset.theme = event.data.theme;
+			}
+		});
+		try { void parent.document.body; document.documentElement.dataset.parentBlocked = 'false'; } catch { document.documentElement.dataset.parentBlocked = 'true'; }
+		try { localStorage.setItem('artifact-test', 'bad'); document.documentElement.dataset.storageBlocked = 'false'; } catch { document.documentElement.dataset.storageBlocked = 'true'; }
+		try { document.cookie = 'artifact-test=bad'; document.documentElement.dataset.cookieBlocked = document.cookie ? 'false' : 'true'; } catch { document.documentElement.dataset.cookieBlocked = 'true'; }
+		try { const popup = window.open('about:blank'); document.documentElement.dataset.popupBlocked = popup === null ? 'true' : 'false'; popup?.close(); } catch { document.documentElement.dataset.popupBlocked = 'true'; }
+		try { top.location.href = 'https://example.invalid/visualization-top-navigation'; document.documentElement.dataset.navigationBlocked = 'false'; } catch { document.documentElement.dataset.navigationBlocked = 'true'; }
+		fetch('https://example.invalid/visualization-network').then(() => { document.documentElement.dataset.networkBlocked = 'false'; }).catch(() => { document.documentElement.dataset.networkBlocked = 'true'; });
+		const form = document.createElement('form'); form.action = 'https://example.invalid/visualization-form'; form.method = 'post'; document.body.append(form); const beforeSubmit = location.href; form.submit(); setTimeout(() => { document.documentElement.dataset.formBlocked = location.href === beforeSubmit ? 'true' : 'false'; }, 0);
+	</script></body></html>`;
+	const encodedDocument = Buffer.from(artifactDocument, 'utf8').toString('base64');
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-src blob:; child-src blob:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><style>html,body,#root,iframe{width:100%;height:100%;margin:0;border:0}#blocked[hidden]{display:none}</style><script>
+		const artifactId = ${JSON.stringify(artifactId)};
+		let child;
+		let childUrl;
+		let initialLoadComplete = false;
+		let lastTheme = null;
+		addEventListener('message', (event) => {
+			const data = event.data;
+			if (!data || typeof data !== 'object') return;
+			if (event.source === parent) {
+				if (data.source !== 'xpressclaw-host' || data.artifactId !== artifactId) return;
+				if (data.type === 'theme') lastTheme = data.theme;
+				if (data.type === 'theme' || data.type === 'follow-up-result') child?.contentWindow?.postMessage(data, '*');
+				return;
+			}
+			if (event.source !== child?.contentWindow || data.source !== 'xpressclaw-visualization' || data.artifactId !== artifactId) return;
+			if (data.type === 'resize' || data.type === 'follow-up-request') parent.postMessage(data, '*');
+		});
+		addEventListener('DOMContentLoaded', () => {
+			const binary = atob(${JSON.stringify(encodedDocument)});
+			const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+			childUrl = URL.createObjectURL(new Blob([bytes], { type: 'text/html;charset=utf-8' }));
+			child = document.createElement('iframe');
+			child.dataset.artifactFrame = '';
+			child.title = ${JSON.stringify(label)};
+			child.setAttribute('sandbox', 'allow-scripts');
+			child.setAttribute('referrerpolicy', 'no-referrer');
+			child.addEventListener('load', () => {
+				if (initialLoadComplete) {
+					child.remove();
+					document.querySelector('#blocked').hidden = false;
+					parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 160 }, '*');
+					return;
+				}
+				initialLoadComplete = true;
+				if (lastTheme) child.contentWindow?.postMessage({ source: 'xpressclaw-host', type: 'theme', artifactId, theme: lastTheme }, '*');
+			});
+			child.src = childUrl;
+			document.querySelector('#root').append(child);
+		});
+	</script></head><body><div id="root"></div><div id="blocked" role="status" hidden>Navigation was blocked.</div></body></html>`;
+}
+
 async function expectVerticalScroll(scroller: Locator) {
 	await expect(scroller).toBeVisible();
 	await expect(scroller).toHaveCSS('overflow-y', 'auto');
@@ -26,6 +93,85 @@ async function elapsedSeconds(indicator: Locator): Promise<number> {
 	const text = await indicator.locator('[data-elapsed-time]').innerText();
 	expect(text).toMatch(/^\d{1,2}\.\d+s$/);
 	return Number.parseFloat(text);
+}
+
+function cssRgb(value: string): [number, number, number] {
+	const channels = value.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+	if (!channels || channels.length !== 3) throw new Error(`Could not parse CSS color: ${value}`);
+	return channels as [number, number, number];
+}
+
+function contrastRatio(foreground: string, background: string): number {
+	const luminance = (value: string) => {
+		const channels = cssRgb(value).map((channel) => {
+			const normalized = channel / 255;
+			return normalized <= 0.04045
+				? normalized / 12.92
+				: ((normalized + 0.055) / 1.055) ** 2.4;
+		});
+		return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+	};
+	const lighter = Math.max(luminance(foreground), luminance(background));
+	const darker = Math.min(luminance(foreground), luminance(background));
+	return (lighter + 0.05) / (darker + 0.05);
+}
+
+async function expectReadableCode(message: Locator) {
+	const inlineCode = message.locator('.prose-chat p code').first();
+	const fencedCode = message.locator('.prose-chat pre').first();
+	await expect(inlineCode).toBeVisible();
+	await expect(fencedCode).toBeVisible();
+
+	const inlineStyles = await inlineCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		return {
+			color: styles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			userSelect: styles.userSelect,
+		};
+	});
+	const fencedStyles = await fencedCode.evaluate((element) => {
+		const styles = getComputedStyle(element);
+		const codeStyles = getComputedStyle(element.querySelector('code')!);
+		return {
+			color: codeStyles.color,
+			background: styles.backgroundColor,
+			borderStyle: styles.borderStyle,
+			borderWidth: styles.borderWidth,
+			overflowX: styles.overflowX,
+			userSelect: codeStyles.userSelect,
+		};
+	});
+
+	expect(contrastRatio(inlineStyles.color, inlineStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(contrastRatio(fencedStyles.color, fencedStyles.background)).toBeGreaterThanOrEqual(4.5);
+	expect(inlineStyles.borderStyle).not.toBe('none');
+	expect(inlineStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.borderStyle).not.toBe('none');
+	expect(fencedStyles.borderWidth).not.toBe('0px');
+	expect(fencedStyles.overflowX).toBe('auto');
+	expect(inlineStyles.userSelect).not.toBe('none');
+	expect(fencedStyles.userSelect).not.toBe('none');
+}
+
+async function installTauriClipboardImage(page: Page) {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands = [];
+		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
+			invoke: async (command: string) => {
+				if (command === 'get_active_instance_profile') return { identity_status: 'matched', local: true };
+				(window as unknown as { __clipboardCommands: string[] }).__clipboardCommands.push(command);
+				if (command === 'plugin:clipboard-manager|read_image') return 42;
+				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
+				if (command === 'plugin:image|size') return { width: 1, height: 1 };
+				if (command === 'plugin:resources|close') return null;
+				throw new Error(`Unexpected Tauri command: ${command}`);
+			},
+		};
+	});
 }
 
 function activityEvent(id: number, prefix = id <= 20 ? 'Earlier activity' : 'Current activity') {
@@ -95,6 +241,17 @@ interface MockProject {
 	agent_ids: string[];
 	conversation_count: number;
 	task_count: number;
+	deletion_started_at?: string | null;
+	deletion_counts?: {
+		agents: number;
+		tasks: number;
+		task_messages: number;
+		conversations: number;
+		conversation_messages: number;
+		memory_notes: number;
+		workflow_runs: number;
+		schedules: number;
+	};
 }
 
 interface SharedProjectState {
@@ -188,6 +345,8 @@ async function mockApi(
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
+		repositoryStatus?: Record<string, unknown>;
+		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
@@ -197,9 +356,15 @@ async function mockApi(
 		projectSyncStatuses?: Record<string, unknown>[];
 		projectSyncRequests?: { projectId: string; operation: 'fetch' | 'publish'; force: boolean }[];
 		projectSyncFetchConflictOnce?: boolean;
+		collaborationSettings?: Record<string, unknown>;
+		collaborationActions?: string[];
 		projectUpdateRequests?: { projectId: string; data: Record<string, unknown> }[];
 		projectDeleteRequests?: string[];
+		projectDeleteAcknowledgements?: (string | null)[];
+		projectDeleteGate?: Promise<void>;
 		projectDeleteError?: string;
+		projectDeletionStartedAt?: string | null;
+		projectDeletionCounts?: MockProject['deletion_counts'];
 		projectGetRequests?: string[];
 		projectGetGate?: Promise<void>;
 		projectListRequests?: string[];
@@ -209,6 +374,10 @@ async function mockApi(
 		secondaryProjectUpdatedAt?: string;
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
+		agentRunnerKind?: string;
+		runnerReadiness?: Record<string, unknown>;
+		visualizationDocuments?: Record<string, string>;
+		visualizationRequests?: { path: string; token: string | undefined }[];
 	} = {},
 ) {
 	let liveEvent = 0;
@@ -216,6 +385,22 @@ async function mockApi(
 	let createdWorkflow: Record<string, unknown> | null = null;
 	let workspaceFileContent = 'export const greeting = "hello";\n';
 	let workspaceFileRevision = 'revision-before-save';
+	let repositoryStatus: Record<string, unknown> = options.repositoryStatus ?? {
+		state: 'attached',
+		message: 'The active repository and bundled GitHub MCP are ready.',
+		bootstrap_root: '/srv/workspaces/browser-tested',
+		active: { relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		candidates: [
+			{ relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		],
+		discovery_truncated: false,
+		selected_relative_path: 'xpressclaw',
+		pending_relative_path: null,
+		pending_action: null,
+		github_status: 'attached',
+		github_repository: 'XpressAI/xpressclaw',
+		restart_required: false,
+	};
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
 	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
@@ -264,11 +449,12 @@ async function mockApi(
 		blocked_by: [],
 		ready: true,
 	};
+	const agentRunnerKind = options.agentRunnerKind ?? 'codex';
 	const agent = {
 		id: agentId,
 		name: 'browser-tested-workspace',
 		title: 'Browser-tested workspace',
-		backend: 'codex',
+		backend: agentRunnerKind,
 		project_id: projectId,
 		status: options.live ? 'running' : 'stopped',
 		desired_status: options.live ? 'running' : 'stopped',
@@ -276,7 +462,7 @@ async function mockApi(
 		container_id: options.live ? 'container-browser-test' : null,
 		config: {
 			runner: {
-				kind: 'codex',
+				kind: agentRunnerKind,
 				workspace: '/srv/repos/xpressclaw',
 				project_name: 'Browser-tested workspace',
 				session_config: {},
@@ -344,6 +530,17 @@ async function mockApi(
 		agent_ids: availableAgents.map((availableAgent) => availableAgent.id),
 		conversation_count: options.conversations?.length ?? 0,
 		task_count: listedTasks.length,
+		deletion_started_at: options.projectDeletionStartedAt ?? null,
+		deletion_counts: options.projectDeletionCounts ?? {
+			agents: availableAgents.length,
+			tasks: listedTasks.length,
+			task_messages: options.taskMessages?.length ?? 0,
+			conversations: options.conversations?.length ?? 0,
+			conversation_messages: options.conversationMessages?.length ?? 0,
+			memory_notes: 0,
+			workflow_runs: 0,
+			schedules: 0,
+		},
 	};
 	if (options.sharedProjectState?.project) {
 		project = { ...project, ...options.sharedProjectState.project };
@@ -377,7 +574,21 @@ async function mockApi(
 		const path = url.pathname;
 		let response: unknown;
 
-		if (path === '/api/health') {
+		if (path.includes('/visualizations/')) {
+			options.visualizationRequests?.push({ path, token: request.headers()['x-xpressclaw-artifact-token'] });
+			const document = options.visualizationDocuments?.[path];
+			if (!document) {
+				await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'Visualization not found' }) });
+				return;
+			}
+			await route.fulfill({
+				status: 200,
+				contentType: 'text/html; charset=utf-8',
+				headers: { 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' },
+				body: document,
+			});
+			return;
+		} else if (path === '/api/health') {
 			if (options.connection?.online === false) {
 				await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ status: 'unavailable' }) });
 				return;
@@ -387,14 +598,27 @@ async function mockApi(
 			response = { available: true, installed: true, can_start: false };
 		} else if (path === '/api/setup/status') {
 			response = { setup_complete: true };
+		} else if (path === '/api/setup/mcp-servers') {
+			response = { servers: options.mcpServers ?? [] };
 		} else if (path === '/api/setup/agent-catalog') {
-			response = { agents: options.agentCatalog ?? [] };
+			response = { agents: options.agentCatalog ?? [
+				{
+					kind: 'codex', name: 'Codex', mark: 'C', description: 'Codex over ACP.',
+					command: ['codex-acp'], login_command: 'codex login', install_url: 'https://developers.openai.com/codex/cli/',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'codex',
+				},
+				{
+					kind: 'deepseek-harness', name: 'DeepSeek Harness', mark: 'DS', description: "DeepSeek Harness through openma-ai's maintained ACP adapter.",
+					command: ['dsh-acp'], login_command: 'dsh-acp login', install_url: 'https://github.com/openma-ai/deepseek-harness-acp',
+					image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+					installed: true, configured: true, status: 'ready', executable: 'dsh-acp',
+				},
+			] };
 		} else if (path === '/api/open-url') {
 			const payload = request.postDataJSON() as { url: string };
 			options.openUrlRequests?.push(payload.url);
 			response = { success: true };
-		} else if (path === '/api/setup/mcp-servers') {
-			response = { servers: options.mcpServers ?? [] };
 		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
 			const name = decodeURIComponent(path.split('/')[4]);
 			const payload = request.postDataJSON() as { agent_id: string | null };
@@ -436,6 +660,28 @@ async function mockApi(
 				commit: operation === 'fetch' ? '12345678fetch' : '87654321publish',
 				counts: { agents: 2, tasks: 8, task_messages: 13, conversations: 3, conversation_messages: 21, workflows: 1, memory_notes: 5 },
 			};
+		} else if (path === '/api/settings/collaboration') {
+			response = options.collaborationSettings ?? {
+				config: {
+					enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+					gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+					authorized_agents: [],
+				},
+				status: {
+					configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+					gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+					jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+				},
+				credentials_configured: false, reset_confirmation: 'RESET LOCAL COLLABORATION',
+			};
+			if (request.method() === 'PUT') {
+				options.collaborationActions?.push('save');
+				response = { ...response, config: request.postDataJSON() };
+				options.collaborationSettings = response;
+			}
+		} else if (/^\/api\/settings\/collaboration\/(install|start|stop|restart|upgrade|reset)$/.test(path)) {
+			options.collaborationActions?.push(path.split('/').at(-1) ?? '');
+			response = options.collaborationSettings;
 		} else if (path === '/api/projects') {
 			const sharedProject = options.sharedProjectState?.project;
 			const projectListSnapshot = availableProjects
@@ -468,6 +714,8 @@ async function mockApi(
 				response = project;
 			} else if (request.method() === 'DELETE') {
 				options.projectDeleteRequests?.push(projectId);
+				options.projectDeleteAcknowledgements?.push(url.searchParams.get('cascade'));
+				await options.projectDeleteGate;
 				if (options.projectDeleteError) {
 					await route.fulfill({
 						status: 409,
@@ -508,12 +756,26 @@ async function mockApi(
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as Record<string, unknown>;
 				options.conversationMessageRequests?.push(payload);
+				const messageId = conversationMessages.length + 100;
+				const uploads = Array.isArray(payload.attachments)
+					? payload.attachments as { name: string; mime_type: string; data: string }[]
+					: [];
 				const sent = {
-					id: conversationMessages.length + 100,
+					id: messageId,
 					conversation_id: conversationId,
 					sender_type: 'user', sender_id: 'local', sender_name: 'You',
 					content: payload.content, message_type: 'message', linked_task_id: null,
-					metadata: {}, attachments: [], created_at: timestamp(200),
+					metadata: {},
+					attachments: uploads.map((attachment, index) => ({
+						id: `sent-attachment-${index}`,
+						message_id: messageId,
+						name: attachment.name,
+						mime_type: attachment.mime_type,
+						size: Math.floor(attachment.data.length * 3 / 4),
+						source_task_id: null,
+						created_at: timestamp(200),
+					})),
+					created_at: timestamp(200),
 				};
 				conversationMessages.push(sent);
 				response = { message: sent, queued_agents: [agentId] };
@@ -597,7 +859,7 @@ async function mockApi(
 		} else if (path === '/api/schedules') {
 			response = options.schedules ?? [];
 		} else if (path === '/api/setup/config') {
-			const configuredKind = options.agentKind?.value ?? 'codex';
+			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
 				llm: { providers: [] },
 				agents: [{
@@ -628,11 +890,37 @@ async function mockApi(
 		} else if (path === `/api/workspaces/${agentId}`) {
 			response = {
 				agent_id: agentId,
-				root: '/srv/repos/xpressclaw',
+				root: (repositoryStatus.active as { root?: string } | null)?.root ?? '/srv/workspaces/browser-tested',
+				repository: repositoryStatus,
 				container_exists: true,
 				container_running: true,
 				terminal_available: true,
 			};
+		} else if (path === `/api/workspaces/${agentId}/repository`) {
+			if (request.method() === 'PUT') {
+				const payload = request.postDataJSON() as { path: string };
+				options.repositorySelections?.push(payload.path);
+				const selected = (repositoryStatus.candidates as Record<string, unknown>[]).find((candidate) => candidate.relative_path === payload.path) ?? null;
+				repositoryStatus = {
+					...repositoryStatus,
+					state: selected ? 'pending' : 'missing',
+					pending_relative_path: selected ? payload.path : null,
+					pending_action: selected ? 'manual' : null,
+					restart_required: Boolean(selected),
+					message: selected ? 'The repository change is pending and will be applied at the next safe turn boundary.' : 'The selected repository is missing.',
+				};
+			} else if (request.method() === 'DELETE') {
+				options.repositorySelections?.push(null);
+				repositoryStatus = {
+					...repositoryStatus,
+					state: 'pending',
+					pending_relative_path: null,
+					pending_action: 'cleared',
+					restart_required: true,
+					message: 'The repository change is pending and will be applied at the next safe turn boundary.',
+				};
+			}
+			response = repositoryStatus;
 		} else if (path === `/api/workspaces/${agentId}/tree`) {
 			const directory = url.searchParams.get('path') ?? '';
 			response = directory === 'src'
@@ -676,6 +964,7 @@ async function mockApi(
 			response = {
 				repository: true,
 				branch: 'feature/workspace-browser',
+				repository_status: repositoryStatus,
 				files: [
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
@@ -873,7 +1162,7 @@ async function mockApi(
 				artifacts: [],
 			};
 		} else if (path === `/api/sessions/${agentId}/readiness`) {
-			response = { ready: true };
+			response = options.runnerReadiness ?? { ready: true };
 		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
 			const targetAgentId = path.split('/')[3];
 			const payload = request.postDataJSON() as Record<string, unknown>;
@@ -1312,18 +1601,7 @@ test('new activity follows only while the transcript is at the bottom', async ({
 
 test('task messages accept selected and pasted images', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
-	await page.addInitScript(() => {
-		Object.defineProperty(window, 'isTauri', { value: true });
-		(window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> } }).__TAURI_INTERNALS__ = {
-			invoke: async (command: string) => {
-				if (command === 'plugin:clipboard-manager|read_image') return 42;
-				if (command === 'plugin:image|rgba') return [255, 0, 0, 255];
-				if (command === 'plugin:image|size') return { width: 1, height: 1 };
-				if (command === 'plugin:resources|close') return null;
-				throw new Error(`Unexpected Tauri command: ${command}`);
-			},
-		};
-	});
+	await installTauriClipboardImage(page);
 	await mockApi(page, { postedMessages });
 	await page.goto(`/tasks/${taskId}`);
 
@@ -1377,6 +1655,219 @@ test('task messages accept selected and pasted images', async ({ page }) => {
 	expect(postedMessages[0].content).toBe('');
 	expect(attachments.map((attachment) => attachment.name)).toEqual(['selected.png', 'pasted.png', 'pasted-image.png']);
 	expect(attachments.every((attachment) => attachment.mime_type === 'image/png' && attachment.data.length > 0)).toBe(true);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
+});
+
+test('inline and fenced code stay readable in user and agent chat bubbles in both themes', async ({ page }) => {
+	const codeConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Code contrast review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const conversationMessages = [
+		{
+			id: 1,
+			conversation_id: conversationId,
+			sender_type: 'user', sender_id: 'local', sender_name: 'You',
+			content: 'Conversation user `conversation-inline-user`.\n\n```ts\nconst conversationUserBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(10),
+		},
+		{
+			id: 2,
+			conversation_id: conversationId,
+			sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace',
+			content: 'Conversation agent `conversation-inline-agent`.\n\n```ts\nconst conversationAgentBlock = true;\n```',
+			message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], created_at: timestamp(20),
+		},
+	];
+	const taskMessages = [
+		{
+			id: 1, task_id: taskId, role: 'user', attachments: [], timestamp: timestamp(25),
+			content: 'Task user `task-inline-user`.\n\n```ts\nconst taskUserBlock = true;\n```',
+		},
+		{
+			id: 2, task_id: taskId, role: 'assistant', attachments: [], timestamp: timestamp(30),
+			content: 'Task agent `task-inline-agent`.\n\n```ts\nconst taskAgentBlock = true;\n```',
+		},
+	];
+	await mockApi(page, {
+		conversations: [codeConversation],
+		conversationMessages,
+		taskMessages,
+	});
+
+	await page.goto(`/conversations/${conversationId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'conversation-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'conversation-inline-agent' }));
+	}
+
+	await page.goto(`/tasks/${taskId}`);
+	for (const dark of [false, true]) {
+		await page.evaluate((useDark) => {
+			document.documentElement.classList.toggle('dark', useDark);
+			document.documentElement.dataset.theme = useDark ? 'dark' : 'light';
+		}, dark);
+		await expectReadableCode(page.locator('[data-message-role="user"]', { hasText: 'task-inline-user' }));
+		await expectReadableCode(page.locator('[data-message-role="assistant"]', { hasText: 'task-inline-agent' }));
+	}
+});
+
+test('project conversations accept picker, browser, and native clipboard attachments', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const attachmentConversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Image handoff',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2QAAAABJRU5ErkJggg==', 'base64');
+	await installTauriClipboardImage(page);
+	await mockApi(page, {
+		conversations: [attachmentConversation],
+		conversationMessageRequests,
+	});
+	await page.route(new RegExp(`/api/conversations/${conversationId}/attachments/sent-attachment-(1|2)$`), async (route) => {
+		await route.fulfill({ status: 200, contentType: 'image/png', body: png });
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	const fileInput = page.locator('[data-conversation-attachment-input]');
+	await fileInput.setInputFiles([
+		{ name: 'selected.png', mimeType: 'image/png', buffer: png },
+		{ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('supporting notes') },
+	]);
+	const composer = page.getByPlaceholder('Message #Image handoff…');
+	const composerShell = page.locator('[data-conversation-composer]');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+	await expect(composerShell.getByAltText('selected.png')).toHaveAttribute('src', /^data:image\/png;base64,/);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toBeVisible();
+
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.items.add(new File(
+			[new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+			'pasted.png',
+			{ type: 'image/png' },
+		));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted.png')).toBeVisible();
+
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByAltText('pasted-image.png')).toBeVisible();
+
+	const textPasteAllowed = await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'ordinary text');
+		return element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	expect(textPasteAllowed).toBe(true);
+
+	await composer.fill('Keep this draft');
+	await composer.evaluate((element) => {
+		const transfer = new DataTransfer();
+		transfer.setData('text/plain', 'clipboard caption');
+		transfer.items.add(new File([new Uint8Array([1, 2, 3, 4])], 'mixed.png', { type: 'image/png' }));
+		Object.defineProperty(transfer, 'files', { value: [] });
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: transfer,
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composer).toHaveValue('Keep this draft');
+	await expect(composerShell.getByAltText('mixed.png')).toBeVisible();
+
+	await fileInput.setInputFiles(Array.from({ length: 6 }, (_, index) => ({
+		name: `overflow-${index + 1}.txt`,
+		mimeType: 'text/plain',
+		buffer: Buffer.from('x'),
+	})));
+	await expect(composerShell.getByRole('alert')).toHaveText('A message can include up to 10 files.');
+	await expect(composerShell.getByAltText('selected.png')).toBeVisible();
+
+	await composerShell.getByRole('button', { name: 'Remove selected.png' }).click();
+	await composerShell.getByRole('button', { name: 'Remove mixed.png' }).click();
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+	await expect(composerShell.getByAltText('selected.png')).toHaveCount(0);
+	await page.evaluate(() => {
+		const target = window as unknown as {
+			__clipboardCommands: string[];
+			__TAURI_INTERNALS__: { invoke: (command: string) => Promise<unknown> };
+		};
+		target.__TAURI_INTERNALS__.invoke = async (command: string) => {
+			target.__clipboardCommands.push(command);
+			if (command === 'plugin:clipboard-manager|read_image') throw new Error('Clipboard unavailable');
+			throw new Error(`Unexpected Tauri command: ${command}`);
+		};
+	});
+	await composer.evaluate((element) => {
+		element.dispatchEvent(new ClipboardEvent('paste', {
+			clipboardData: new DataTransfer(),
+			bubbles: true,
+			cancelable: true,
+		}));
+	});
+	await expect(composerShell.getByRole('alert')).toHaveText('Could not read an image from the system clipboard.');
+	await composer.fill('');
+	await page.getByRole('button', { name: 'Send', exact: true }).click();
+
+	await expect.poll(() => conversationMessageRequests.length).toBe(1);
+	const request = conversationMessageRequests[0];
+	const attachments = request.attachments as { name: string; mime_type: string; data: string }[];
+	expect(request.content).toBe('');
+	expect(attachments.map((attachment) => attachment.name)).toEqual(['notes.txt', 'pasted.png', 'pasted-image.png']);
+	expect(attachments.every((attachment) => attachment.data.length > 0)).toBe(true);
+	await expect(composerShell.locator('[data-image-attachments]')).toHaveCount(0);
+	await expect(composerShell.getByText('notes.txt', { exact: true })).toHaveCount(0);
+	await expect(composerShell.getByRole('alert')).toHaveCount(0);
+
+	const sentPastedImage = page.getByAltText('pasted.png');
+	const sentNativeImage = page.getByAltText('pasted-image.png');
+	await expect(sentPastedImage).toBeVisible();
+	await expect(sentNativeImage).toBeVisible();
+	await expect.poll(() => sentPastedImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	await expect.poll(() => sentNativeImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+	expect(await page.evaluate(() => (
+		window as unknown as { __clipboardCommands: string[] }
+	).__clipboardCommands)).toContain('plugin:resources|close');
 });
 
 test('project conversations coordinate files and project-wide linked work', async ({ page }) => {
@@ -1668,6 +2159,202 @@ test('raw HTML stays literal across task messages, activity, results, and previe
 	await expect(preview.locator('custom-prompt')).toHaveCount(0);
 });
 
+test('task presentation attachments render as durable download cards', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 7,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'The rendered and validated deck is attached.',
+			attachments: [{
+				id: 'presentation-browser-test',
+				name: 'Review deck.pptx',
+				mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+				size: 2_621_440,
+			}],
+			timestamp: timestamp(25),
+		}],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const message = page.locator('[data-message-role="assistant"]');
+	await expect(message).toContainText('The rendered and validated deck is attached.');
+	const attachment = message.getByRole('link', { name: 'Download Review deck.pptx' });
+	await expect(attachment).toHaveAttribute(
+		'href',
+		`/api/tasks/${taskId}/messages/7/attachments/presentation-browser-test`,
+	);
+	await expect(attachment).toContainText('PowerPoint presentation · 2.5 MB');
+	await expect(message.locator('[data-message-attachments] img')).toHaveCount(0);
+});
+
+test('task assistant visualizations render in order, stay isolated, and confirm follow-ups', async ({ page }) => {
+	const postedMessages: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const firstReference = 'visualize{"path":"/workspace/dependencies.html","title":"Task dependency map"}';
+	const wideReference = 'visualize{"path":"/workspace/timeline.html","mode":"wide"}';
+	const missingReference = 'visualize{"path":"/workspace/large.html"}';
+	const userReference = 'visualize{"path":"/workspace/user.html"}';
+	const firstPath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-one`;
+	const widePath = `/api/tasks/${taskId}/messages/2/visualizations/viz-task-wide`;
+	await mockApi(page, {
+		postedMessages,
+		visualizationRequests,
+		visualizationDocuments: {
+			[firstPath]: visualizationDocument('viz-task-one', 'Task visualization loaded', { prompt: 'Inspect dependency node A', title: 'Inspect dependency' }),
+			[widePath]: visualizationDocument('viz-task-wide', 'Wide timeline loaded'),
+		},
+		taskMessages: [
+			{ id: 1, task_id: taskId, role: 'user', content: userReference, attachments: [], visualizations: [], timestamp: timestamp(20) },
+			{
+				id: 2,
+				task_id: taskId,
+				role: 'assistant',
+				content: [
+					'**Dependency analysis**',
+					firstReference,
+					'Markdown between views.',
+					wideReference,
+					missingReference,
+					'\\visualize{"path":"/workspace/escaped.html"}',
+					'visualize{"path":"/workspace/bad.html","mode":"fullscreen"}',
+				].join('\n\n'),
+				attachments: [],
+				visualizations: [
+					{ id: 'viz-task-one', reference_index: 0, title: 'Task dependency map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'token-one' },
+					{ id: 'viz-task-wide', reference_index: 1, title: 'Timeline', mode: 'wide', status: 'ready', error_code: null, size: 130, retrieval_token: 'token-wide' },
+					{ id: 'viz-task-missing', reference_index: 2, title: 'Large view', mode: 'normal', status: 'unavailable', error_code: 'oversize', size: null, retrieval_token: 'token-missing' },
+				],
+				timestamp: timestamp(25),
+			},
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const assistant = page.locator('[data-message-role="assistant"]');
+	await expect(assistant.locator('strong', { hasText: 'Dependency analysis' })).toBeVisible();
+	await expect(assistant).toContainText('Markdown between views.');
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(3);
+	await expect(page.locator('[data-inline-visualization][data-visualization-mode="wide"]')).toHaveCount(1);
+	await expect(page.getByText('The generated visualization exceeded the 1 MiB limit.')).toBeVisible();
+	await expect(page.locator('[data-message-role="user"] .prose-chat').filter({ hasText: userReference })).toHaveText(userReference);
+	await expect(assistant).toContainText('visualize{"path":"/workspace/escaped.html"}');
+	await expect(assistant).toContainText('visualize{"path":"/workspace/bad.html","mode":"fullscreen"}');
+
+	const firstFrameElement = page.locator('iframe[title="Task dependency map"]');
+	await expect(firstFrameElement).toHaveAttribute('sandbox', 'allow-scripts');
+	await expect(firstFrameElement).toHaveAttribute('referrerpolicy', 'no-referrer');
+	const firstOuterFrame = page.frameLocator('iframe[title="Task dependency map"]');
+	const firstFrame = firstOuterFrame.frameLocator('iframe[data-artifact-frame]');
+	await expect(firstFrame.getByText('Task visualization loaded')).toBeVisible();
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-parent-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-storage-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-cookie-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-popup-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-navigation-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-network-blocked', 'true');
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-form-blocked', 'true');
+	await page.evaluate(() => document.documentElement.classList.add('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'dark');
+	await page.evaluate(() => document.documentElement.classList.remove('dark'));
+	await expect(firstFrame.locator('html')).toHaveAttribute('data-theme', 'light');
+	await expect(page.frameLocator('iframe[title="Timeline"]').frameLocator('iframe[data-artifact-frame]').getByText('Wide timeline loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests).toEqual(expect.arrayContaining([
+		{ path: firstPath, token: 'token-one' },
+		{ path: widePath, token: 'token-wide' },
+	]));
+
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Inspect dependency' });
+	await expect(dialog).toContainText('Inspect dependency node A');
+	expect(postedMessages).toEqual([]);
+	await dialog.getByRole('button', { name: 'Cancel' }).click();
+	expect(postedMessages).toEqual([]);
+	await firstFrame.getByRole('button', { name: 'Follow up' }).click();
+	await page.getByRole('dialog', { name: 'Inspect dependency' }).getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => postedMessages).toEqual([expect.objectContaining({
+		role: 'user',
+		content: 'Inspect dependency node A',
+		delivery: 'after_tool',
+	})]);
+
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 260 }, '*');
+	}, 'viz-task-one');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
+	await page.setViewportSize({ width: 390, height: 844 });
+	const firstCard = page.locator('[data-inline-visualization]').first();
+	await firstCard.getByRole('button', { name: 'Expand visualization' }).click();
+	await expect(firstCard).toHaveCSS('position', 'fixed');
+	await firstFrame.locator('html').evaluate((_, artifactId) => {
+		parent.postMessage({ source: 'xpressclaw-visualization', type: 'resize', artifactId, height: 700 }, '*');
+	}, 'viz-task-one');
+	await firstCard.getByRole('button', { name: 'Exit expanded visualization' }).click();
+	await expect(firstCard).not.toHaveCSS('position', 'fixed');
+	await expect(firstFrameElement).toHaveCSS('height', '260px');
+
+	const selfNavigationRequests: string[] = [];
+	page.on('request', (request) => {
+		if (request.url().startsWith('https://example.invalid/visualization-self-navigation')) selfNavigationRequests.push(request.url());
+	});
+	await firstFrame.locator('html').evaluate(() => {
+		window.location.assign('https://example.invalid/visualization-self-navigation?artifact-data=secret');
+	});
+	await expect(firstOuterFrame.getByRole('status')).toHaveText('Navigation was blocked.');
+	expect(selfNavigationRequests).toEqual([]);
+});
+
+test('conversation visualizations persist on reload and route confirmed follow-ups to the conversation', async ({ page }) => {
+	const conversationMessageRequests: Record<string, unknown>[] = [];
+	const visualizationRequests: { path: string; token: string | undefined }[] = [];
+	const reference = 'visualize{"path":"/workspace/conversation-map.html","title":"Conversation map"}';
+	const path = `/api/conversations/${conversationId}/messages/3/visualizations/viz-conversation`;
+	const conversation = {
+		id: conversationId,
+		project_id: projectId,
+		title: 'Visualization review',
+		icon: null,
+		created_at: timestamp(1),
+		updated_at: timestamp(20),
+		last_message_at: timestamp(20),
+		participants: [
+			{ participant_type: 'user', participant_id: 'local', joined_at: timestamp(1) },
+			{ participant_type: 'agent', participant_id: agentId, joined_at: timestamp(2) },
+		],
+	};
+	await mockApi(page, {
+		conversations: [conversation],
+		conversationMessageRequests,
+		visualizationRequests,
+		visualizationDocuments: {
+			[path]: visualizationDocument('viz-conversation', 'Conversation visualization loaded', { prompt: 'Compare the highlighted paths' }),
+		},
+		conversationMessages: [
+			{ id: 1, conversation_id: conversationId, sender_type: 'user', sender_id: 'local', sender_name: 'You', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(10) },
+			{ id: 2, conversation_id: conversationId, sender_type: 'system', sender_id: 'system', sender_name: 'System', content: reference, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [], created_at: timestamp(15) },
+			{ id: 3, conversation_id: conversationId, sender_type: 'agent', sender_id: agentId, sender_name: 'Browser-tested workspace', content: `Here is the map.\n\n${reference}`, message_type: 'message', linked_task_id: null, metadata: {}, attachments: [], visualizations: [{ id: 'viz-conversation', reference_index: 0, title: 'Conversation map', mode: 'normal', status: 'ready', error_code: null, size: 120, retrieval_token: 'conversation-token' }], created_at: timestamp(20) },
+		],
+	});
+	await page.goto(`/conversations/${conversationId}`);
+
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.locator('[data-message-role="user"] .prose-chat')).toHaveText(reference);
+	await expect(page.locator('[data-message-role="system"] .prose-chat')).toHaveText(reference);
+	const frame = page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]');
+	await expect(frame.getByText('Conversation visualization loaded')).toBeVisible();
+	await frame.getByRole('button', { name: 'Follow up' }).click();
+	const dialog = page.getByRole('dialog', { name: 'Send this follow-up?' });
+	await expect(dialog).toContainText('Compare the highlighted paths');
+	expect(conversationMessageRequests).toEqual([]);
+	await dialog.getByRole('button', { name: 'Send follow-up' }).click();
+	await expect.poll(() => conversationMessageRequests).toEqual([{ content: 'Compare the highlighted paths', attachments: [] }]);
+
+	await page.reload();
+	await expect(page.locator('[data-inline-visualization]')).toHaveCount(1);
+	await expect(page.frameLocator('iframe[title="Conversation map"]').frameLocator('iframe[data-artifact-frame]').getByText('Conversation visualization loaded')).toBeVisible();
+	await expect.poll(() => visualizationRequests.filter((request) => request.path === path).length).toBeGreaterThanOrEqual(2);
+});
+
 test('project pages expose a copyable canonical ID', async ({ page }) => {
 	await page.addInitScript(() => {
 		Object.defineProperty(navigator, 'clipboard', {
@@ -1693,7 +2380,22 @@ test('project pages expose a copyable canonical ID', async ({ page }) => {
 test('project settings rename and delete a project', async ({ page }) => {
 	const projectUpdateRequests: { projectId: string; data: Record<string, unknown> }[] = [];
 	const projectDeleteRequests: string[] = [];
-	await mockApi(page, { projectUpdateRequests, projectDeleteRequests });
+	const projectDeleteAcknowledgements: (string | null)[] = [];
+	await mockApi(page, {
+		projectUpdateRequests,
+		projectDeleteRequests,
+		projectDeleteAcknowledgements,
+		projectDeletionCounts: {
+			agents: 1,
+			tasks: 3,
+			task_messages: 7,
+			conversations: 2,
+			conversation_messages: 11,
+			memory_notes: 4,
+			workflow_runs: 5,
+			schedules: 2,
+		},
+	});
 	await page.goto(`/projects/${projectId}`);
 
 	await page.getByRole('button', { name: 'Project settings' }).click();
@@ -1719,13 +2421,60 @@ test('project settings rename and delete a project', async ({ page }) => {
 	dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
 	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByText('This permanently deletes “Renamed collaboration project” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('7 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('11 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('local collaboration access', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('including steps and waits', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('source repositories, workspace folders, and reusable workflow definitions', { exact: false })).toBeVisible();
+	const permanentDelete = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await expect(permanentDelete).toBeDisabled();
+	await dialog.getByLabel('Type Renamed collaboration project to confirm').fill('Renamed collaboration project');
+	await permanentDelete.click();
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect.poll(() => projectDeleteAcknowledgements).toEqual(['confirmed']);
 	await expect(page).toHaveURL(/\/projects$/);
 	await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
 	await expect(page.getByRole('heading', { name: 'Create your first project' })).toBeVisible();
 	await expect(page.locator(`[data-workspace-tab][data-workspace-tab-title="Renamed collaboration project"]`)).toHaveCount(0);
+});
+
+test('project deletion refreshes the authoritative name and counts before confirmation', async ({ page }) => {
+	const projectGetRequests: string[] = [];
+	const sharedProjectState: SharedProjectState = {};
+	await mockApi(page, { projectGetRequests, sharedProjectState });
+	await page.goto(`/projects/${projectId}`);
+	await expect.poll(() => projectGetRequests).toHaveLength(1);
+
+	sharedProjectState.project = {
+		...sharedProjectState.project!,
+		name: 'Current Project name',
+		updated_at: timestamp(120),
+		deletion_counts: {
+			agents: 2,
+			tasks: 9,
+			task_messages: 13,
+			conversations: 4,
+			conversation_messages: 17,
+			memory_notes: 3,
+			workflow_runs: 5,
+			schedules: 6,
+		},
+	};
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+
+	await expect.poll(() => projectGetRequests).toHaveLength(2);
+	await expect(dialog.getByRole('heading', { name: 'Delete project?' })).toBeVisible();
+	await expect(dialog.getByText('This permanently deletes “Current Project name” and cannot be undone.')).toBeVisible();
+	await expect(dialog.getByText('9 tasks', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('13 task messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByText('17 conversation messages', { exact: false })).toBeVisible();
+	await expect(dialog.getByLabel('Type Current Project name to confirm')).toBeVisible();
+	await expect(dialog.getByLabel('Type Browser collaboration project to confirm')).toHaveCount(0);
 });
 
 test('project mutations synchronize split panes and separate workspace windows', async ({ page, context }) => {
@@ -1795,6 +2544,7 @@ test('project mutations synchronize split panes and separate workspace windows',
 			last_commit: null,
 			last_synced_at: null,
 			message: null,
+			warnings: [],
 		}],
 	});
 	await syncPage.goto('/settings/sync?_xpressclaw_window=workspace-12345-4');
@@ -1922,7 +2672,8 @@ test('project mutations synchronize split panes and separate workspace windows',
 	await panes.first().getByRole('button', { name: 'Project settings' }).click();
 	dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Remote project rename to confirm').fill('Remote project rename');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
 	await expect(page).toHaveURL(/\/projects$/);
@@ -1972,19 +2723,56 @@ test('project mutations synchronize split panes and separate workspace windows',
 
 test('project settings keep deletion errors visible and actionable', async ({ page }) => {
 	const projectDeleteRequests: string[] = [];
-	const projectDeleteError = "move or remove this project's agents, conversations, and tasks first";
-	await mockApi(page, { projectDeleteRequests, projectDeleteError });
+	const projectDeleteError = 'Project work was cancelled, but Docker or Podman is unavailable. Start it and retry deletion.';
+	await mockApi(page, {
+		projectDeleteRequests,
+		projectDeleteError,
+		projectDeletionStartedAt: timestamp(60),
+	});
+	await page.goto(`/projects/${projectId}`);
+	await expect(page.getByText('Deletion was interrupted after this Project stopped accepting new work.', { exact: false })).toBeVisible();
+
+	await page.getByRole('button', { name: 'Project settings' }).click();
+	const dialog = page.getByRole('dialog');
+	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await expect(dialog.getByText('A previous deletion attempt was interrupted', { exact: false })).toBeVisible();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	await dialog.getByRole('button', { name: 'Permanently delete project' }).click();
+
+	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
+	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
+	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
+	await expect(dialog.getByRole('button', { name: 'Permanently delete project' })).toBeEnabled();
+});
+
+test('project deletion shows progress, ignores duplicate confirmation, and opens the next project', async ({ page }) => {
+	let releaseDelete!: () => void;
+	const projectDeleteGate = new Promise<void>((resolve) => (releaseDelete = resolve));
+	const projectDeleteRequests: string[] = [];
+	await mockApi(page, {
+		projectCount: 2,
+		secondaryProjectName: 'Next project',
+		projectDeleteRequests,
+		projectDeleteGate,
+	});
 	await page.goto(`/projects/${projectId}`);
 
 	await page.getByRole('button', { name: 'Project settings' }).click();
 	const dialog = page.getByRole('dialog');
 	await dialog.getByRole('button', { name: 'Delete project' }).click();
-	await dialog.getByRole('button', { name: 'Delete project' }).click();
+	await dialog.getByLabel('Type Browser collaboration project to confirm').fill('Browser collaboration project');
+	const deleteButton = dialog.getByRole('button', { name: 'Permanently delete project' });
+	await deleteButton.evaluate((element) => {
+		(element as HTMLButtonElement).click();
+		(element as HTMLButtonElement).click();
+	});
 
 	await expect.poll(() => projectDeleteRequests).toEqual([projectId]);
-	await expect(dialog.getByRole('alert')).toHaveText(projectDeleteError);
-	await expect(page).toHaveURL(new RegExp(`/projects/${projectId}$`));
-	await expect(dialog.getByRole('button', { name: 'Delete project' })).toBeEnabled();
+	await expect(dialog.getByRole('status')).toHaveText('Cancelling active work and removing Project data…');
+	await expect(dialog.getByRole('button', { name: 'Deleting…' })).toBeDisabled();
+
+	releaseDelete();
+	await expect(page).toHaveURL(/\/projects\/project-mobile-2$/);
 });
 
 test('opening a conversation reveals its newest messages after media loads', async ({ page }) => {
@@ -2068,6 +2856,86 @@ test('running agents can be guided at a safe break or interrupted immediately', 
 
 	await page.getByRole('button', { name: 'Interrupt agent now' }).click();
 	await expect.poll(() => interruptedAttempts).toEqual(['attempt-browser-test']);
+});
+
+test('Codex plugin install elicitations can be accepted', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'plugin',
+				suggest_type: 'install',
+				suggest_reason: 'The Stripe plugin can verify coupon and promotion-code configuration.',
+				tool_id: 'stripe@openai-curated-remote',
+				tool_name: 'Stripe',
+				remote_plugin_id: 'stripe',
+				app_connector_ids: ['stripe'],
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toBeVisible();
+	await expect(request).toContainText('Plugin installation requested');
+	await expect(request).toContainText('Install Stripe?');
+	await expect(request).toContainText('The Stripe plugin can verify coupon and promotion-code configuration.');
+	await expect(page.locator('[data-unsupported-elicitation]')).toHaveCount(0);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeDisabled();
+	await request.getByRole('button', { name: 'Install plugin' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: {
+			action: 'accept',
+			content: {},
+			message: 'Approved installing the Stripe plugin.',
+		},
+	}]);
+	await expect(request).toHaveCount(0);
+});
+
+test('Codex connector install elicitations can be declined', async ({ page }) => {
+	const elicitationResponses: { elicitationId: string; payload: Record<string, unknown> }[] = [];
+	await mockApi(page, {
+		pendingElicitation: {
+			mode: 'form',
+			message: 'Connect GitHub to inspect pull requests.',
+			requestedSchema: {
+				type: 'object',
+				properties: {},
+			},
+			_meta: {
+				codex_approval_kind: 'tool_suggestion',
+				persist: 'always',
+				tool_type: 'connector',
+				suggest_type: 'install',
+				suggest_reason: 'Connect GitHub to inspect pull requests.',
+				tool_id: 'github',
+				tool_name: 'GitHub',
+			},
+		},
+		elicitationResponses,
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const request = page.locator('[data-tool-install-elicitation]');
+	await expect(request).toContainText('Connector installation requested');
+	await expect(request.getByRole('button', { name: 'Install connector' })).toBeVisible();
+	await request.getByRole('button', { name: 'Not now' }).click();
+	await expect.poll(() => elicitationResponses).toEqual([{
+		elicitationId: 'elicitation-browser-test',
+		payload: { action: 'decline' },
+	}]);
+	await expect(request).toHaveCount(0);
 });
 
 test('unsupported ACP elicitations stay visible and actionable', async ({ page }) => {
@@ -2403,6 +3271,27 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
 });
 
+test('agent Work reports the pinned Codex presentation capability', async ({ page }) => {
+	await mockApi(page, {
+		runnerReadiness: {
+			ready: true,
+			kind: 'codex',
+			presentation_artifacts: {
+				supported: true,
+				available: true,
+				capability: 'xpressclaw-pptx-v1',
+				runtime: 'PptxGenJS 4.0.1',
+				reason: null,
+			},
+		},
+	});
+	await page.goto(`/agents/${agentId}`);
+
+	const readiness = page.locator('[data-presentation-readiness]');
+	await expect(readiness).toContainText('PowerPoint artifacts ready');
+	await expect(readiness).toContainText('PptxGenJS 4.0.1 is pinned in this runner');
+});
+
 test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {
 	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
 	await mockApi(page, { workspaceSaveRequests });
@@ -2500,6 +3389,104 @@ test('task details deep-link current Git changes into the workspace editor', asy
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+});
+
+test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, {
+		repositorySelections,
+		repositoryStatus: {
+			state: 'ambiguous',
+			message: 'Multiple repositories were found. Select the one this Agent should use.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: null,
+			candidates: [
+				{ relative_path: 'alpha', root: '/srv/workspaces/browser-tested/alpha', github_repository: 'example/alpha' },
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: null,
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'unavailable',
+			github_repository: null,
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('Multiple repositories were found. Select the one this Agent should use.')).toBeVisible();
+	await card.getByText('product', { exact: true }).locator('..').locator('..').getByRole('button', { name: 'Use' }).click();
+	await expect.poll(() => repositorySelections).toEqual(['product']);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+	await expect(card.getByText('The current turn keeps its existing process. The next turn starts a fresh session with the pending repository change.')).toBeVisible();
+});
+
+test('clearing an active repository is queued for a safe turn boundary', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, { repositorySelections });
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await card.getByRole('button', { name: 'Clear active repository' }).click();
+	await expect.poll(() => repositorySelections).toEqual([null]);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+});
+
+test('active repository reports a missing GitHub credential without hiding Git access', async ({ page }) => {
+	await mockApi(page, {
+		repositoryStatus: {
+			state: 'attached',
+			message: 'The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: { relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			candidates: [
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: 'product',
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'missing_credential',
+			github_repository: 'XpressAI/product',
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('GitHub credential missing')).toBeVisible();
+	await expect(card.getByText('XpressAI/product').first()).toBeVisible();
+	await expect(card.getByText('The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.')).toBeVisible();
+	await expect(card.getByText('/srv/workspaces/browser-tested/product')).toBeVisible();
+});
+
+test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'deepseek-harness' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('deepseek-harness');
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest',
+	);
+	await page.getByLabel('Host Docker or Podman access').check();
+	await expect(page.locator('#runner-image')).toHaveValue(
+		'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest',
+	);
+});
+
+test('custom runner kinds containing a built-in name stay custom in Agent settings', async ({ page }) => {
+	await mockApi(page, { agentRunnerKind: 'codex-proxy' });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+
+	await expect(page.getByRole('heading', { name: 'Browser-tested workspace' })).toBeVisible();
+	await expect(page.locator('#runner-kind')).toHaveValue('codex-proxy');
+	await expect(page.locator('#runner-kind').locator('option:checked')).toHaveText(
+		'Other ACP harness (codex-proxy)',
+	);
+	await expect(page.locator('#runner-image')).toHaveValue('xpressclaw-runner-codex-proxy:latest');
 });
 
 test('mobile connection recovery stays non-blocking and does not reload the workspace', async ({ page }) => {
@@ -2801,6 +3788,9 @@ test('tab context menus create native webview windows in the desktop app', async
 			__TAURI_INTERNALS__: { invoke: (command: string, args: unknown) => Promise<unknown> };
 		}).__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: unknown) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: true };
+				}
 				(window as unknown as { __workspaceWindowCalls: unknown[] }).__workspaceWindowCalls.push({ command, args });
 				return null;
 			},
@@ -3297,6 +4287,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await expect(settingsSidebar.locator('[data-sidebar-setting]')).toHaveText([
 		'P Profile',
 		'↕ Project sync',
+		'C Local collaboration',
 		'M MCP servers',
 		'I Instance',
 	]);
@@ -3316,7 +4307,7 @@ test('automation and settings pages show context-specific sidebar lists', async 
 	await page.locator('aside:visible').getByRole('button', { name: 'Close' }).click();
 	await page.locator('nav a[href="/settings"]:visible').click();
 	await page.getByRole('button', { name: 'Open agent switcher' }).click();
-	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(4);
+	await expect(page.locator('aside:visible [data-sidebar-mode="settings"] [data-sidebar-setting]')).toHaveCount(5);
 	await expect(page.getByRole('navigation', { name: 'Settings sections' })).toHaveCount(0);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
@@ -3653,6 +4644,9 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 				last_commit: 'abcdef1234567890',
 				last_synced_at: '2026-07-19 00:01:01',
 				message: null,
+				warnings: [
+					'No .xpressclaw.yml was found in these assigned Agent workspaces: /srv/repos/temporary-clone.',
+				],
 			},
 			{
 				project_id: 'project-without-manifest',
@@ -3667,6 +4661,22 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 				last_commit: null,
 				last_synced_at: null,
 				message: 'No .xpressclaw.yml was found in this Project workspace. Run `xpressclaw sync init` there first.',
+				warnings: [],
+			},
+			{
+				project_id: 'project-with-conflict',
+				project_name: 'Conflicting project',
+				project_icon: null,
+				status: 'conflict',
+				project_dir: null,
+				remote: null,
+				branch: null,
+				store_path: null,
+				share_project_memory: null,
+				last_commit: null,
+				last_synced_at: null,
+				message: 'Project sync configuration conflict. Differing fields: store.branch.\n- branch=main: /srv/repos/one\n- branch=release: /srv/repos/two',
+				warnings: [],
 			},
 		],
 	});
@@ -3678,11 +4688,20 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 	await expect(ready).toContainText('git@github.com:XpressAI/project-data.git');
 	await expect(ready).toContainText(`projects/${projectId}`);
 	await expect(ready).toContainText('Included');
+	await expect(ready).toContainText('Ready');
+	await expect(ready.locator('[data-project-sync-warnings]')).toContainText('/srv/repos/temporary-clone');
 
 	const unconfigured = page.locator('[data-project-sync="project-without-manifest"]');
 	await expect(unconfigured).toContainText('Needs setup');
 	await expect(unconfigured.getByRole('button', { name: 'Fetch' })).toBeDisabled();
 	await expect(unconfigured.getByRole('button', { name: 'Publish' })).toBeDisabled();
+
+	const conflict = page.locator('[data-project-sync="project-with-conflict"]');
+	await expect(conflict).toContainText('Configuration conflict');
+	await expect(conflict).toContainText('Differing fields: store.branch');
+	await expect(conflict).toContainText('/srv/repos/one');
+	await expect(conflict.getByRole('button', { name: 'Fetch' })).toBeDisabled();
+	await expect(conflict.getByRole('button', { name: 'Publish' })).toBeDisabled();
 
 	await ready.getByRole('button', { name: 'Fetch' }).click();
 	await expect(ready).toContainText('rerun with --force');
@@ -3699,4 +4718,133 @@ test('project sync settings fetch, acknowledge conflicts, and publish explicitly
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration settings stay opt-in and expose safe lifecycle controls', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: ['browser-tested-workspace'],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await expect(page.getByRole('heading', { name: 'Local collaboration services' })).toBeVisible();
+	await expect(page.locator('[data-sidebar-setting="settings-collaboration"]')).toHaveAttribute('aria-current', 'page');
+	await expect(page.getByText('Healthy', { exact: true })).toHaveCount(2);
+	await expect(page.getByText('http://gitbucket:8080')).toBeVisible();
+	await expect(page.getByText('http://jenkins:8080')).toBeVisible();
+	await expect(page.getByText('browser-tested-workspace', { exact: true })).toBeVisible();
+	await expect(page.getByText(/no host Docker socket/i)).toBeVisible();
+
+	await page.getByRole('button', { name: 'stop', exact: true }).click();
+	await expect.poll(() => collaborationActions).toContain('stop');
+	await page.getByText('Permanently reset local collaboration data').click();
+	const destructive = page.getByRole('button', { name: 'Delete services and persistent data' });
+	await expect(destructive).toBeDisabled();
+	await page.getByLabel(/Type RESET LOCAL COLLABORATION/).fill('RESET LOCAL COLLABORATION');
+	await expect(destructive).toBeEnabled();
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('local collaboration install persists the visible enabled configuration first', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: false, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: false, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'not_installed', health: 'unknown', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'not_installed', health: 'unknown', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: false,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	const install = page.getByRole('button', { name: 'Install services' });
+	const restart = page.getByRole('button', { name: 'Restart & apply configuration' });
+	const upgrade = page.getByRole('button', { name: 'Upgrade pinned images' });
+	await expect(install).toBeDisabled();
+	await expect(restart).toBeDisabled();
+	await expect(upgrade).toBeDisabled();
+	await page.getByLabel('Enable local collaboration configuration').check();
+	await expect(install).toBeEnabled();
+	await expect(restart).toBeEnabled();
+	await expect(upgrade).toBeEnabled();
+	await install.click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'install']);
+	await expect(page.getByText('Install completed.')).toBeVisible();
+});
+
+test('local collaboration restart saves and applies visible port changes', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await page.getByLabel('Jenkins port').fill('9089');
+	await page.getByRole('button', { name: 'Restart & apply configuration' }).click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'restart']);
+	await expect(page.getByLabel('Jenkins port')).toHaveValue('9089');
+	await expect(page.getByText('Restart completed.')).toBeVisible();
+});
+
+test('local collaboration upgrade saves the visible pinned images first', async ({ page }) => {
+	const collaborationActions: string[] = [];
+	const collaborationSettings = {
+		config: {
+			enabled: true, bind_address: '127.0.0.1', gitbucket_port: 8088, jenkins_port: 8089,
+			gitbucket_image: 'ghcr.io/gitbucket/gitbucket:4.46.1', jenkins_image: 'jenkins/jenkins:2.568.1-jdk21',
+			authorized_agents: [],
+		},
+		status: {
+			configured: true, docker_available: true, network: 'xpressclaw-collaboration-test-network', data_path: '/data/collaboration',
+			gitbucket: { state: 'running', health: 'healthy', image: 'ghcr.io/gitbucket/gitbucket:4.46.1', version: '4.46.1', host_url: 'http://127.0.0.1:8088', internal_url: 'http://gitbucket:8080', volume: 'gitbucket-data', error: null },
+			jenkins: { state: 'running', health: 'healthy', image: 'jenkins/jenkins:2.568.1-jdk21', version: '2.568.1-jdk21', host_url: 'http://127.0.0.1:8089', internal_url: 'http://jenkins:8080', volume: 'jenkins-data', error: null },
+		},
+		credentials_configured: true,
+		reset_confirmation: 'RESET LOCAL COLLABORATION',
+	};
+	await mockApi(page, { collaborationActions, collaborationSettings });
+	await page.goto('/settings/collaboration');
+
+	await page.getByText('Pinned images and upgrade policy').click();
+	await page.getByLabel('GitBucket image').fill('ghcr.io/gitbucket/gitbucket:4.47.0');
+	await page.getByRole('button', { name: 'Upgrade pinned images' }).click();
+
+	await expect.poll(() => collaborationActions).toEqual(['save', 'upgrade']);
+	await expect(page.getByLabel('GitBucket image')).toHaveValue('ghcr.io/gitbucket/gitbucket:4.47.0');
+	await expect(page.getByText('Upgrade completed.')).toBeVisible();
 });

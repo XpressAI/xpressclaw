@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { agents, conversations as conversationsApi, projects as projectsApi, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
+	import { agents, conversations as conversationsApi, projects as projectsApi, request, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
@@ -519,7 +519,7 @@
 	}
 
 	function tabCategory(kind: WorkspaceTabKind | undefined): 'projects' | 'tasks' | 'automations' | 'settings' {
-		if (kind === 'home' || kind === 'projects' || kind === 'project' || kind === 'agents' || kind === 'agent' || kind === 'conversation') return 'projects';
+		if (kind === 'home' || kind === 'dashboard' || kind === 'projects' || kind === 'project' || kind === 'agents' || kind === 'agent' || kind === 'conversation') return 'projects';
 		if (kind === 'tasks' || kind === 'task') return 'tasks';
 		if (kind === 'automations' || kind === 'schedules' || kind === 'workflows' || kind === 'workflow' || kind === 'workflow-new') return 'automations';
 		return 'settings';
@@ -623,7 +623,7 @@
 	async function startDocker() {
 		dockerStarting = true;
 		try {
-			await fetch('/api/setup/start-docker', { method: 'POST' });
+			await request<void>('/api/setup/start-docker', { method: 'POST', body: '{}' });
 			for (let attempt = 0; attempt < 30; attempt += 1) {
 				await new Promise((resolve) => setTimeout(resolve, 2000));
 				await checkDocker();
@@ -719,8 +719,11 @@
 <div class="flex h-[100dvh] min-w-0 overflow-hidden">
 	<aside class="hidden shrink-0 flex-col border-r border-border/60 transition-[width] duration-200 md:flex {sidebarCollapsed ? 'w-14' : 'w-64'}" style="background: hsl(var(--sidebar))">
 		<div class="flex h-11 shrink-0 items-center {sidebarCollapsed ? 'justify-center' : 'gap-2 px-3'}">
-			<img src="/icon-32.png" alt="" class="h-5 w-5 rounded" />
-			{#if !sidebarCollapsed}<span class="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">xpressclaw</span>{/if}
+			<a href="/dashboard" class="flex min-w-0 items-center gap-2 rounded-md outline-none transition hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center" title="Control center">
+				<img src="/icon-32.png" alt="" class="h-5 w-5 rounded" />
+				{#if !sidebarCollapsed}<span class="min-w-0 flex-1 truncate text-xs font-semibold text-muted-foreground">xpressclaw</span>{/if}
+			</a>
+			{#if !sidebarCollapsed}<span class="min-w-0 flex-1"></span>{/if}
 			<button type="button" onclick={() => { sidebarCollapsed = !sidebarCollapsed; persistWorkspace(); }} class="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/50 hover:text-foreground" title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
 				<svg class="h-3.5 w-3.5 {sidebarCollapsed ? 'rotate-180' : ''}" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" /></svg>
 			</button>
@@ -791,6 +794,7 @@
 			<button type="button" onclick={() => (mobileMenuOpen = true)} aria-label="Open agent switcher" class="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground">
 				<svg class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" d="M4 6h16M4 12h16M4 18h16" /></svg>
 			</button>
+			<a href="/dashboard" aria-label="Open Control center" title="Control center" class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"><img src="/icon-32.png" alt="" class="h-5 w-5 rounded" /></a>
 			<div class="min-w-0 flex-1">
 				<div class="truncate text-sm font-semibold">{focusedTab?.title || focusedProject?.name || 'xpressclaw'}</div>
 				{#if focusedAgent}
@@ -853,7 +857,7 @@
 	<div class="fixed inset-0 z-50 md:hidden">
 		<button type="button" class="absolute inset-0 bg-black/60" aria-label="Close agent switcher" onclick={() => (mobileMenuOpen = false)}></button>
 		<aside class="absolute inset-y-0 left-0 flex min-h-0 w-[min(88vw,22rem)] flex-col overflow-hidden border-r border-border p-3 shadow-2xl" style="background: hsl(var(--sidebar))">
-			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="flex-1 text-sm font-semibold">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
+			<div class="mb-3 flex h-9 shrink-0 items-center gap-2"><a href="/dashboard" onclick={() => (mobileMenuOpen = false)} class="flex min-w-0 items-center gap-2 rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50" aria-label="Open Control center"><img src="/icon-32.png" alt="" class="h-6 w-6 rounded" /><span class="text-sm font-semibold">xpressclaw</span></a><span class="min-w-0 flex-1 truncate text-right text-xs text-muted-foreground">{sidebarTitle}</span><button type="button" onclick={() => (mobileMenuOpen = false)} aria-label="Close" class="flex h-8 w-8 items-center justify-center rounded-lg text-xl text-muted-foreground hover:bg-accent">×</button></div>
 			<a href="/" onclick={() => (mobileMenuOpen = false)} class="mb-3 flex shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">+ New work</a>
 			{#if sidebarCategory === 'tasks'}
 				<div data-mobile-sidebar-scroll class="workspace-scroll-y flex-1">

@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
@@ -56,7 +56,14 @@
 		kind: 'unsupported';
 	}
 
-	type PendingElicitation = PendingFormElicitation | PendingUnsupportedElicitation;
+	interface PendingToolInstallElicitation extends PendingElicitationBase {
+		kind: 'tool_install';
+		toolId: string;
+		toolName: string;
+		toolType: 'plugin' | 'connector';
+	}
+
+	type PendingElicitation = PendingFormElicitation | PendingToolInstallElicitation | PendingUnsupportedElicitation;
 
 	interface ContextUsage {
 		used: number;
@@ -71,7 +78,9 @@
 			timestamp: string;
 			role: string;
 			content: string;
-			attachments: { id?: string; name: string; src: string }[];
+			messageId?: number;
+			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
+			visualizations: MessageVisualization[];
 			sequence: number;
 		}
 		| {
@@ -182,6 +191,7 @@
 				role: 'user',
 				content: taskPrompt,
 				attachments: [],
+				visualizations: [],
 				sequence: -1,
 			});
 		}
@@ -191,11 +201,15 @@
 			timestamp: message.timestamp,
 			role: message.role,
 			content: message.content,
+			messageId: message.id,
 			attachments: (message.attachments ?? []).map((attachment) => ({
 				id: attachment.id,
 				name: attachment.name,
 				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+				mimeType: attachment.mime_type,
+				size: attachment.size,
 			})),
+			visualizations: message.visualizations ?? [],
 			sequence: message.id,
 		})));
 		items.push(...activityTimelineEvents.map((event): TranscriptItem => ({
@@ -227,7 +241,9 @@
 			.filter((item): item is PendingElicitation => item !== null);
 	})());
 	let pendingElicitation = $derived(pendingElicitations.at(-1) ?? null);
-	let composerBlockedByElicitation = $derived(pendingElicitation?.kind === 'form');
+	let composerBlockedByElicitation = $derived(
+		pendingElicitation?.kind === 'form' || pendingElicitation?.kind === 'tool_install'
+	);
 	let runningAttempt = $derived(
 		attempts.find(attempt => ['preparing', 'running', 'waiting_for_input', 'review'].includes(attempt.status)) ?? null
 	);
@@ -262,7 +278,9 @@
 		!task?.agent_id
 			? 'Assign an agent to chat about this task'
 			: composerBlockedByElicitation
-				? 'Answer the agent’s question above...'
+				? pendingElicitation?.kind === 'tool_install'
+					? 'Choose whether to install the suggested tool above...'
+					: 'Answer the agent’s question above...'
 			: pendingElicitation?.kind === 'unsupported'
 				? 'Reply to continue with different guidance...'
 			: task.status === 'waiting_for_input'
@@ -467,6 +485,41 @@
 		return false;
 	}
 
+	function parseToolInstallElicitation(
+		event: SessionEvent,
+		id: string,
+		message: string,
+		properties: Record<string, unknown> | null,
+	): PendingToolInstallElicitation | null {
+		const meta = isRecord(event.payload._meta) ? event.payload._meta : null;
+		const toolType = meta?.tool_type;
+		const toolId = meta?.tool_id;
+		const toolName = meta?.tool_name;
+		if (
+			event.payload.mode !== 'form'
+			|| !properties
+			|| Object.keys(properties).length !== 0
+			|| meta?.codex_approval_kind !== 'tool_suggestion'
+			|| meta?.suggest_type !== 'install'
+			|| (toolType !== 'plugin' && toolType !== 'connector')
+			|| typeof toolId !== 'string'
+			|| !toolId.trim()
+			|| typeof toolName !== 'string'
+			|| !toolName.trim()
+		) return null;
+
+		return {
+			kind: 'tool_install',
+			id,
+			eventId: event.id,
+			attemptId: event.attempt_id,
+			message,
+			toolId: toolId.trim(),
+			toolName: toolName.trim(),
+			toolType,
+		};
+	}
+
 	function parsePendingElicitation(event: SessionEvent): PendingElicitation | null {
 		const id = typeof event.payload.elicitationId === 'string' ? event.payload.elicitationId : null;
 		const message = typeof event.payload.message === 'string' ? event.payload.message : 'The agent needs your input.';
@@ -476,6 +529,8 @@
 		const fallback: PendingUnsupportedElicitation = {
 			kind: 'unsupported', id, eventId: event.id, attemptId: event.attempt_id, message,
 		};
+		const toolInstall = parseToolInstallElicitation(event, id, message, properties);
+		if (toolInstall) return toolInstall;
 		if (event.payload.mode !== 'form' || !properties) return fallback;
 
 		const rawEntries = Object.entries(properties);
@@ -575,8 +630,12 @@
 			.join('\n\n');
 	}
 
+	function toolInstallResponseMessage(elicitation: PendingToolInstallElicitation): string {
+		return `Approved installing the ${elicitation.toolName} ${elicitation.toolType}.`;
+	}
+
 	async function respondToElicitation(elicitation: PendingElicitation, action: 'accept' | 'decline' | 'cancel') {
-		if (!task || elicitationSending || (action === 'accept' && elicitation.kind !== 'form')) return;
+		if (!task || elicitationSending || (action === 'accept' && elicitation.kind === 'unsupported')) return;
 		elicitationSending = true;
 		try {
 			await tasks.respondToElicitation(task.id, elicitation.id, {
@@ -584,6 +643,9 @@
 				...(action === 'accept' && elicitation.kind === 'form' ? {
 					content: answersFor(elicitation.id),
 					message: elicitationResponseMessage(elicitation),
+				} : action === 'accept' && elicitation.kind === 'tool_install' ? {
+					content: {},
+					message: toolInstallResponseMessage(elicitation),
 				} : {}),
 			});
 			locallyResolvedElicitations = { ...locallyResolvedElicitations, [elicitation.id]: true };
@@ -892,6 +954,18 @@
 		} finally {
 			messageSending = false;
 		}
+	}
+
+	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
+		if (!task) throw new Error('This task is no longer available.');
+		followLatest = true;
+		showJumpToLatest = false;
+		await tasks.addMessage(task.id, 'user', prompt, {
+			configOptions: selectedConfig,
+			delivery: 'after_tool',
+		});
+		await poll();
+		scrollToBottom(true);
 	}
 
 	async function interruptAgent() {
@@ -1306,6 +1380,10 @@
 										openLinksInNewWindow={isAssistant}
 										selectionActions={isAssistant}
 										onselectionaction={handleSelectionAction}
+										visualizations={item.visualizations}
+										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
+										visualizationFollowUpTarget="this Task"
+										onvisualizationfollowup={sendVisualizationFollowUp}
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>
@@ -1366,6 +1444,33 @@
 								<div>No activity yet</div>
 							</div>
 						</div>
+					{/if}
+
+					{#if pendingElicitation?.kind === 'tool_install'}
+						{@const request = pendingElicitation}
+						<section class="ai-card mx-auto w-full max-w-lg overflow-hidden" data-tool-install-elicitation aria-live="polite">
+							<div class="flex items-center gap-2 border-b border-border bg-[hsl(var(--inset))] px-4 py-3">
+								<span class="h-2 w-2 shrink-0 animate-pulse rounded-full bg-orange-400"></span>
+								<span class="truncate text-xs font-semibold text-foreground">{request.toolType === 'plugin' ? 'Plugin' : 'Connector'} installation requested</span>
+							</div>
+							<div class="space-y-3 p-4">
+								<div>
+									<h3 class="text-sm font-semibold text-foreground">Install {request.toolName}?</h3>
+									<p class="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-foreground">{request.message}</p>
+								</div>
+								<p class="text-xs leading-relaxed text-muted-foreground">
+									Accepting lets Codex install this {request.toolType}. It may ask you to sign in or authorize connected services.
+								</p>
+								<div class="flex flex-wrap items-center gap-2 pt-1">
+									<button type="button" onclick={() => respondToElicitation(request, 'decline')} disabled={elicitationSending}
+										class="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-accent disabled:opacity-50">Not now</button>
+									<button type="button" onclick={() => respondToElicitation(request, 'accept')} disabled={elicitationSending}
+										class="ml-auto rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+										{elicitationSending ? 'Installing…' : `Install ${request.toolType}`}
+									</button>
+								</div>
+							</div>
+						</section>
 					{/if}
 
 					{#if pendingElicitation?.kind === 'unsupported'}
@@ -1803,7 +1908,7 @@
 						{:else if workspaceGit.repository}
 							<p class="text-xs text-muted-foreground">Working tree clean</p>
 						{:else}
-							<p class="text-xs text-muted-foreground">Not a Git repository</p>
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
 						{/if}
 					</div>
 				{/if}

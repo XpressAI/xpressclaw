@@ -5,7 +5,7 @@
 <h3 align="center">Distributed, Multiplayer Control Plane for Native Agent Work</h3>
 
 <p align="center">
-Run Codex, Claude Code, OpenCode, and other native harnesses as isolated workers on an always-on machine. Coordinate people and Agents through durable Projects, Conversations, Tasks, memory, and multi-agent workflows from any connected client.
+Run Codex, Claude Code, DeepSeek Harness, OpenCode, and other native harnesses as isolated workers on an always-on machine. Coordinate people and Agents through durable Projects, Conversations, Tasks, memory, and multi-agent workflows from any connected client.
 </p>
 
 <p align="center">
@@ -32,7 +32,7 @@ The matching runner image is pulled automatically.
 
 ## Why xpressclaw?
 
-Codex, Claude Code, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
+Codex, Claude Code, DeepSeek Harness, and OpenCode already supply excellent agent loops. xpressclaw is the **control plane around them**: durable work, automation, isolation, devices, and a UI for outcomes rather than terminals.
 
 - **Multiplayer Project spaces** — Coordinate people and specialized Agents through shared Conversations, Tasks, workflows, files, and memory.
 - **Distributed by design** — Keep Agents working on an always-on desktop or server while browsers and future native clients reconnect from other devices.
@@ -44,6 +44,14 @@ Codex, Claude Code, and OpenCode already supply excellent agent loops. xpresscla
 - **Container-aware workspaces** — Opt trusted agents into a separate runner variant with Docker CLI, Compose, Buildx, and access to the host Docker/Podman engine.
 
 ## Features
+
+### Real-time Control Center
+
+Leave the Control center open to see working Agents, active Task and
+Conversation turns, items needing input, canonical tool calls, context usage,
+and attributed Git line changes across every Project. One durable live feed
+replays missed responses and status changes after reconnecting, with direct
+links back to the relevant work. See the [Control center guide](docs/control-center.md).
 
 ### Project Conversations
 
@@ -57,6 +65,16 @@ Turn a Conversation message into a linked Task with **Continue with task**, or
 start a reusable workflow with typed inputs. Agents can create linked Tasks for
 themselves, publish task results back to the Conversation, and share files that
 people or other Agents can download into their workspaces.
+
+Codex can also publish interactive Visualize results directly inside Task and
+Conversation replies. XpressClaw preserves the generated fragment with the
+message, runs it in an isolated viewer, and asks before an interactive visual
+can send a follow-up. See [Inline visualizations](docs/inline-visualizations.md).
+
+The built-in Codex runner also provides a pinned, XpressClaw-owned workflow for
+creating, rendering, visually checking, validating, and durably attaching new
+PowerPoint decks. It is deliberately distinct from OpenAI's desktop-host
+artifact skill. See [PowerPoint presentation artifacts](docs/presentations.md).
 
 ### Persistent Agents
 
@@ -78,12 +96,18 @@ step back to the Conversation that started the run.
 
 - **Codex:** reuses an eligible host ChatGPT/Codex login
 - **Claude Code:** reuses an eligible host Claude subscription login
+- **DeepSeek Harness:** runs through the maintained openma-ai ACP adapter and reuses `~/.dsh`
 - **OpenCode:** uses its built-in ACP server
 - **Custom:** any image and command that speaks ACP over stdin/stdout
 
 Each Agent keeps an isolated, reusable environment for its selected harness,
 workspace, installed tools, and caches. Trusted workspaces can optionally use
 the host container engine for existing Compose-based workflows.
+
+For DeepSeek Harness, sign in on the control-plane host with `dsh-acp login`
+or use `dsh web` and save a model credential in its Settings page. XpressClaw
+mounts the resulting `~/.dsh` directory only when host login is enabled; no API
+key belongs in `xpressclaw.yaml`. See the [DeepSeek Harness guide](docs/deepseek-harness.md).
 
 ### Privacy & Safety
 
@@ -107,8 +131,10 @@ Session events, attempt lifecycle, artifacts, provenance, and cancellation. Know
 - A **Project** is the collaboration and memory boundary containing Agents,
   Conversations, Tasks, and workflows.
 - An **Agent** is an execution identity with one ACP harness, retained
-  environment, and workspace. Its workspace may be an existing repository or
-  an XpressClaw-managed folder.
+  environment, and writable workspace boundary. Its active repository may be
+  that folder or one Git checkout nested inside it. An Agent created without a
+  path receives an isolated XpressClaw-managed workspace, so it can clone and
+  adopt a repository later without sharing a broad instance directory.
 
 `xpressclaw.yaml` configures an instance; it does not add a repository and
 does not belong in every repository. Repository-local harness instructions
@@ -158,9 +184,16 @@ Releases also attach a standalone x64 `.zip` for manual CLI/server installs.
 ### 2. Create your first Project and Agent
 
 Choose an existing repository folder or start with an empty managed workspace,
-name the Agent, and select Codex, Claude Code, OpenCode, or a custom ACP
+name the Agent, and select Codex, Claude Code, DeepSeek Harness, OpenCode, or a custom ACP
 harness. XpressClaw creates the first Project around that Agent. Add more
 Projects and Agents from the UI; you do not run `init` for each repository.
+If an Agent clones one repository into its blank workspace, XpressClaw adopts
+it at the next turn boundary and restarts the retained ACP session with that
+checkout as its working directory. If several repositories exist, choose one
+under **Agent → Environment → Active repository**. The bundled GitHub tool can
+also use a just-cloned checkout immediately when the Agent passes its container
+directory as `cwd`; the validated choice is persisted and the session switches
+its default cwd on the following turn.
 
 ### 3. Start work
 
@@ -178,8 +211,7 @@ task** for durable work, or send private work directly to one Agent from
 
 The control plane is the durable machine running Agents; Desktop and the web
 UI are clients. To leave work running on a desktop or server and reconnect
-from a laptop or phone, keep XpressClaw bound to its default loopback address
-and put an authenticated transport in front of it.
+from a laptop or phone, choose the connection boundary that fits your network.
 
 For example, from a laptop with SSH access to the control-plane host:
 
@@ -187,17 +219,22 @@ For example, from a laptop with SSH access to the control-plane host:
 ssh -N -L 8935:127.0.0.1:8935 user@control-plane-host
 ```
 
-Then open `http://localhost:8935` on that laptop. An authenticated HTTPS
-reverse proxy is another option. XpressClaw does not yet provide native remote
-authentication, so it refuses non-loopback binds unless
-`--allow-insecure-remote` explicitly acknowledges that another security layer
-protects the address. Never expose the port directly to a LAN or the internet.
+Then open `http://localhost:8935` on that laptop. An HTTPS reverse proxy is
+another option. For a direct Tailscale or operator-trusted LAN connection,
+choose `0.0.0.0` or `::` in **Settings → Instance** and explicitly confirm
+unauthenticated access, or enable XpressClaw password/token authentication.
+Authentication protects the app but does not supply TLS. Never expose the raw
+port to the public internet.
+
+Desktop can save local and remote instance profiles. Profile credentials stay
+in the operating-system keychain, and the automatic local sidecar keeps
+running while the app is connected to a remote instance.
 
 Browser disconnection does not cancel work. Reopening the same instance loads
 durable state and live streams reconnect; after a control-plane process
 restart, interrupted work is recovered into the queue. See
-[Remote access](docs/remote-access.md) for the current security boundary and
-Desktop limitations.
+[Remote access](docs/remote-access.md) for direct-tailnet, password/token,
+SSH, HTTPS proxy, and Desktop-profile guidance.
 
 ## Common Workflows
 
@@ -210,9 +247,13 @@ Desktop limitations.
   loops.
 - Let the scoped GitHub integration publish a task's pull request, monitor
   review feedback, and resume the same Agent context until approval or merge.
+- Optionally run local GitBucket and Jenkins collaboration services for
+  selected Agents without changing existing GitHub flows.
 
 See the guides for [workflows](docs/workflows.md),
-[scheduling](docs/scheduling.md), and [remote access](docs/remote-access.md).
+[scheduling](docs/scheduling.md), [local collaboration](docs/local-collaboration.md),
+[Project management and deletion](docs/projects.md),
+[remote access](docs/remote-access.md), and the [Control center](docs/control-center.md).
 
 ## CLI Essentials
 

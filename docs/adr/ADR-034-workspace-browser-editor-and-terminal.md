@@ -17,8 +17,9 @@ state: users and later tasks can change the same checkout.
 
 Each Agent has a **Files** view with three related capabilities:
 
-1. A lazy directory tree and UTF-8 file API rooted at the Agent's configured
-   host workspace. The workspace is already mounted read-write into the
+1. A lazy directory tree and UTF-8 file API rooted at the Agent's active
+   repository when one is selected, otherwise at its configured host
+   workspace. The workspace is already mounted read-write into the
    retained Agent container, so host-side reads and saves immediately appear
    to the harness without requiring the container to be running.
 2. A lazily loaded Monaco editor with language-aware highlighting and a diff
@@ -33,18 +34,25 @@ Each Agent has a **Files** view with three related capabilities:
    before a terminal is available.
 
 Git status and per-file staged/working-tree diffs are read directly from the
-configured workspace. Task details show the current changed files and link
+active repository. Task details show the current changed files and link
 into the Agent's Files view. The UI deliberately calls these **workspace
 changes**, not task changes, because Git cannot prove which task produced an
 uncommitted edit.
+
+The configured workspace remains the outer writable capability boundary. An
+active repository (ADR-041) may narrow Files and Git operations to a canonical
+checkout beneath it. When repository discovery is ambiguous or explicitly
+cleared, Files can still expose the bootstrap workspace so the user can inspect
+and resolve the selection, but Git operations require an active repository.
 
 ## Security and limits
 
 Workspace and terminal endpoints are intentionally equivalent to local project
 access. They therefore:
 
-- accept browser requests only when `Origin` matches `Host` (or the first
-  forwarded host); origin-less calls remain available to the desktop shell and
+- accept browser requests only when `Origin` matches `Host`, or when the
+  browser reports `Sec-Fetch-Site: same-origin` through a reverse proxy that
+  rewrites `Host`; origin-less calls remain available to the desktop shell and
   trusted API clients;
 - resolve only normalized relative paths through a capability directory handle
   rooted at the workspace. Reads, listings, temporary saves, and atomic renames

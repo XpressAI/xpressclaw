@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: xpressclaw-validate-presentation INPUT.pptx" >&2
+  exit 64
+fi
+
+input="$1"
+if [[ ! -f "$input" ]]; then
+  echo "presentation does not exist: $input" >&2
+  exit 66
+fi
+case "${input,,}" in
+  *.pptx) ;;
+  *) echo "presentation must use the .pptx extension: $input" >&2; exit 65 ;;
+esac
+
+input="$(realpath "$input")"
+timeout --signal=TERM --kill-after=2s 5s \
+  /opt/xpressclaw/presentation-runtime/bin/xpressclaw-check-presentation-package "$input"
+(
+  ulimit -v 262144
+  timeout --signal=TERM --kill-after=2s 20s unzip -tqq "$input"
+)
+
+preview_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$preview_dir"
+}
+trap cleanup EXIT INT TERM
+/opt/xpressclaw/presentation-runtime/bin/xpressclaw-render-slides "$input" "$preview_dir" >/dev/null
+echo "valid presentation: $input"

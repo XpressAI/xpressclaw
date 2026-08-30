@@ -2355,6 +2355,18 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allows the bundled local XpressClaw frontend to use all Desktop commands.",
+          "type": "string",
+          "const": "desktop-local-commands",
+          "markdownDescription": "Allows the bundled local XpressClaw frontend to use all Desktop commands."
+        },
+        {
+          "description": "Allows one explicitly selected remote XpressClaw origin to manage Desktop instance profiles and authenticate through the OS keychain.",
+          "type": "string",
+          "const": "desktop-profile-commands",
+          "markdownDescription": "Allows one explicitly selected remote XpressClaw origin to manage Desktop instance profiles and authenticate through the OS keychain."
+        },
+        {
           "description": "No features are enabled by default, as we believe\nthe clipboard can be inherently dangerous and it is \napplication specific if read and/or write access is needed.\n\nClipboard interaction needs to be explicitly enabled.\n",
           "type": "string",
           "const": "clipboard-manager:default",

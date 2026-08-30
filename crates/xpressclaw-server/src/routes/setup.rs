@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use tracing::{info, warn};
-use xpressclaw_core::acp::ACP_AGENTS;
+use xpressclaw_core::acp::{canonical_agent_kind, infer_agent_kind_from_backend, ACP_AGENTS};
 use xpressclaw_core::agents::registry::AgentRegistry;
 use xpressclaw_core::config::{
     context_label, default_native_runner_image, unique_session_id, AgentConfig, Config,
@@ -789,21 +789,21 @@ struct AgentSetup {
 }
 
 fn runner_kind_from_setup(setup: &AgentSetup) -> String {
-    let configured = setup
-        .runner_kind
-        .as_deref()
-        .or(setup.backend.as_deref())
-        .unwrap_or("codex")
-        .to_lowercase();
-    if configured.contains("claude") {
-        "claude".to_string()
-    } else if configured.contains("opencode") {
-        "opencode".to_string()
-    } else if configured.contains("codex") || configured == "auto" {
-        "codex".to_string()
-    } else {
-        configured
+    if let Some(configured) = setup.runner_kind.as_deref() {
+        let configured = configured.to_lowercase();
+        return if configured == "auto" {
+            "codex".to_string()
+        } else {
+            canonical_agent_kind(&configured)
+                .unwrap_or(configured.as_str())
+                .to_string()
+        };
     }
+
+    let backend = setup.backend.as_deref().unwrap_or("codex").to_lowercase();
+    infer_agent_kind_from_backend(&backend)
+        .unwrap_or(backend.as_str())
+        .to_string()
 }
 
 fn runner_from_setup(setup: &AgentSetup) -> NativeRunnerConfig {
@@ -886,6 +886,12 @@ fn validate_runner(runner: &NativeRunnerConfig) -> Result<(), String> {
 
 fn managed_workspace_requested(setup: &AgentSetup) -> bool {
     setup.workspace_mode.as_deref() == Some("managed")
+        || (setup.workspace_mode.as_deref() != Some("existing")
+            && setup
+                .runner_workspace
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty))
 }
 
 fn runner_context(runner: &NativeRunnerConfig) -> String {
@@ -901,6 +907,12 @@ fn assign_managed_workspace(
     session_id: &str,
     data_dir: &FsPath,
 ) -> std::io::Result<()> {
+    if setup.workspace_mode.as_deref() == Some("existing") && runner.workspace.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "an existing workspace path is required",
+        ));
+    }
     if !managed_workspace_requested(setup) {
         return Ok(());
     }
@@ -911,6 +923,14 @@ fn assign_managed_workspace(
         runner.project_name = Some("New project".to_string());
     }
     Ok(())
+}
+
+fn managed_workspace_error(error: std::io::Error) -> (StatusCode, Json<Value>) {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        bad_request(error.to_string())
+    } else {
+        internal_error(error)
+    }
 }
 
 /// Save the setup configuration and mark setup as complete.
@@ -937,7 +957,7 @@ async fn complete_setup(
         let id_refs: Vec<&str> = used_ids.iter().map(String::as_str).collect();
         let session_id = unique_session_id(&context, &runner.kind, &id_refs);
         assign_managed_workspace(session, &mut runner, &session_id, &managed_root)
-            .map_err(internal_error)?;
+            .map_err(managed_workspace_error)?;
         validate_runner(&runner).map_err(bad_request)?;
         used_ids.push(session_id.clone());
         agents.push(AgentConfig {
@@ -1028,7 +1048,7 @@ async fn add_session(
     let title = runner_context(&runner);
     let session_id = unique_session_id(&title, &runner.kind, &existing_ids);
     assign_managed_workspace(&req, &mut runner, &session_id, &old_config.system.data_dir)
-        .map_err(internal_error)?;
+        .map_err(managed_workspace_error)?;
 
     let agent_config = AgentConfig {
         name: session_id,
@@ -1069,6 +1089,10 @@ async fn add_session(
             .create_in_project(&agent_config.name, &agent_config.backend, project_id)
             .map_err(|error| match error {
                 xpressclaw_core::error::Error::ProjectNotFound { .. } => not_found(&error),
+                xpressclaw_core::error::Error::Project(_) => (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": error.to_string() })),
+                ),
                 _ => internal_error(error),
             })?;
         if let Err(error) = new_config.save(&state.config_path) {
@@ -1278,6 +1302,8 @@ async fn upsert_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents: old_config.agents.clone(),
+        instance: old_config.instance.clone(),
+        collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -2060,6 +2086,8 @@ async fn delete_mcp_server(
     let new_config = Config {
         mcp_servers: new_mcp,
         agents,
+        instance: old_config.instance.clone(),
+        collaboration: old_config.collaboration.clone(),
         llm: old_config.llm.clone(),
         system: old_config.system.clone(),
         tools: old_config.tools.clone(),
@@ -2481,6 +2509,33 @@ mod tests {
     }
 
     #[test]
+    fn setup_selects_deepseek_harness_by_catalog_id_or_dsh_alias() {
+        for kind in ["deepseek-harness", "dsh"] {
+            let setup: AgentSetup = serde_json::from_value(json!({
+                "runner_kind": kind
+            }))
+            .unwrap();
+            let runner = runner_from_setup(&setup);
+            assert_eq!(runner.kind, "deepseek-harness");
+            assert_eq!(
+                runner.image,
+                "ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_does_not_reclassify_an_explicit_custom_kind() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex-proxy",
+            "backend": "codex",
+            "runner_command": ["codex-proxy", "acp"]
+        }))
+        .unwrap();
+        assert_eq!(runner_kind_from_setup(&setup), "codex-proxy");
+    }
+
+    #[test]
     fn managed_workspace_creates_a_durable_empty_project_folder() {
         let setup: AgentSetup = serde_json::from_value(json!({
             "runner_kind": "codex",
@@ -2500,6 +2555,57 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn omitted_workspace_path_defaults_to_an_isolated_managed_folder() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "opencode"
+        }))
+        .unwrap();
+        assert!(managed_workspace_requested(&setup));
+        let mut runner = runner_from_setup(&setup);
+        let root = tempfile::tempdir().unwrap();
+        assign_managed_workspace(&setup, &mut runner, "blank-opencode", root.path()).unwrap();
+        assert_eq!(
+            PathBuf::from(runner.workspace.unwrap()),
+            root.path().join("workspaces/blank-opencode")
+        );
+    }
+
+    #[test]
+    fn existing_workspace_mode_requires_a_path() {
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "codex",
+            "workspace_mode": "existing"
+        }))
+        .unwrap();
+        let mut runner = runner_from_setup(&setup);
+        let root = tempfile::tempdir().unwrap();
+        let error =
+            assign_managed_workspace(&setup, &mut runner, "invalid", root.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn explicit_existing_workspace_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let setup: AgentSetup = serde_json::from_value(json!({
+            "runner_kind": "opencode",
+            "workspace_mode": "existing",
+            "runner_workspace": root.path().display().to_string()
+        }))
+        .unwrap();
+        let mut runner = runner_from_setup(&setup);
+        let data_dir = tempfile::tempdir().unwrap();
+
+        assign_managed_workspace(&setup, &mut runner, "must-not-replace", data_dir.path()).unwrap();
+
+        assert_eq!(
+            runner.workspace.as_deref(),
+            Some(root.path().to_str().unwrap())
+        );
+        assert!(!data_dir.path().join("workspaces/must-not-replace").exists());
+    }
+
     #[tokio::test]
     async fn agent_catalog_lists_every_supported_product() {
         let catalog = agent_catalog().await.0;
@@ -2507,6 +2613,13 @@ mod tests {
         assert_eq!(agents.len(), ACP_AGENTS.len());
         assert!(agents.iter().any(|agent| agent["kind"] == "cursor"));
         assert!(agents.iter().any(|agent| agent["kind"] == "mistral-vibe"));
+        let dsh = agents
+            .iter()
+            .find(|agent| agent["kind"] == "deepseek-harness")
+            .unwrap();
+        assert_eq!(dsh["command"], json!(["dsh-acp"]));
+        assert_eq!(dsh["login_command"], "dsh-acp login");
+        assert_eq!(dsh["mark"], "DS");
         assert!(!agents.iter().any(|agent| agent["kind"] == "agoragentic"));
     }
 

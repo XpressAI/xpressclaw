@@ -6,6 +6,7 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 | --- | --- |
 | `claude` | Claude Agent |
 | `codex` | Codex |
+| `deepseek-harness` | DeepSeek Harness via the maintained openma-ai ACP adapter |
 | `github-copilot` | GitHub Copilot CLI |
 | `junie` | Junie |
 | `kimi` | Kimi CLI |
@@ -21,9 +22,42 @@ XpressClaw publishes one product-specific image for each supported ACP agent:
 
 `codex`, `claude`, and `opencode` retain dedicated Dockerfiles. The `npm` and
 `binary` Dockerfiles are parameterized templates; CI supplies the exact
-package or platform archive pinned by the official ACP Registry. Run
+package or platform archive pinned by its source project or the ACP Registry. Run
 `scripts/build-runner-images.sh` from the repository root to build every local
 tag.
+
+## DeepSeek Harness
+
+The `deepseek-harness` images install the stable
+`@openma/deepseek-harness-acp@0.4.24` package and start its standalone
+`dsh-acp` stdio command. The adapter is maintained by openma-ai; it is not an
+official DeepSeek package. Standalone mode is deliberate here: the runner has
+to be reproducible and cannot depend on every host having an ACP profile under
+`$DSH_HOME/profiles`.
+
+The adapter package carries an exact, lockfile-built DeepSeek Harness runtime.
+At image build time XpressClaw validates the archive against its independently
+pinned SHA-256, reinstalls that exact lock for the target architecture, and
+sets `DSH_PATH`/`NODE_PATH` to the resulting tree. This works around the stable
+package's private-runtime module-resolution gap and replaces the publisher's
+x64 native optional packages with the locked amd64 or arm64 variants, without
+independently resolving mutable DSH dependencies. The parameterized image uses
+Node 24, which satisfies the adapter's Node 22.15 minimum.
+
+The build runs `verify-acp-stdio.mjs` against the real adapter and a loopback
+DeepSeek-compatible stream without a paid model call. It verifies ACP v1
+initialization, `auth_required` and Agent Auth, image ingestion, two
+task/Conversation-style sessions on one process, a stdio MCP server, streamed
+reasoning and text, plans, tools, file diffs, a permission escalation, active
+cancellation, session list/load, persisted reload, and process shutdown.
+
+Users authenticate on the host with `dsh-acp login` or through `dsh web`.
+When **Use my existing login** is enabled, XpressClaw mounts host `~/.dsh`
+read-write at `/home/node/.dsh`; it never copies that sensitive tree into the
+image. XpressClaw also sets the adapter session root to
+`/home/node/.dsh/acp-sessions`, keeping task and Conversation sessions inside
+that one explicit mount. See
+[`docs/deepseek-harness.md`](../../docs/deepseek-harness.md).
 
 The default `runner` stage stays minimal. The build script also creates a
 separate `xpressclaw-runner-<agent>-docker:latest` `runner-host` variant for
@@ -37,6 +71,18 @@ The control plane launches the image's ACP server and attaches over
 bidirectional stdio. Tasks are sent with `session/prompt`, while fresh and
 continued work use ACP session lifecycle methods. Agent commands and versions
 follow the official ACP Registry.
+
+## Codex presentation artifacts
+
+The Codex images include the separate `xpressclaw-presentations` skill and a
+read-only PptxGenJS 4.0.1, LibreOffice, and Poppler runtime. The Dockerfile
+authors and renders a smoke deck during the image build. Exact image labels
+gate discovery through ACP `additionalDirectories`, so an older or custom
+image without the runtime remains usable but cannot advertise presentation
+delivery. OpenAI's primary-runtime Presentations and Spreadsheets skills are
+disabled in Codex ACP sessions because their host-provided
+`load_workspace_dependencies`/`@oai/artifact-tool` contract is not available
+there. See [`docs/presentations.md`](../../docs/presentations.md).
 
 ## Publishing
 

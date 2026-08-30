@@ -3,13 +3,17 @@ use std::sync::{Arc, RwLock};
 
 use xpressclaw_core::budget::rate_limiter::RateLimiter;
 use xpressclaw_core::config::Config;
+use xpressclaw_core::config::InstanceConfig;
 use xpressclaw_core::conversations::event_bus::ConversationEventBus;
 use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
 use xpressclaw_core::llm::router::LlmRouter;
 use xpressclaw_core::tools::mcp_manager::McpManager;
 use xpressclaw_core::workers::acp::{AcpElicitationBroker, AcpInterruptMode, AcpTurnControlBroker};
-use xpressclaw_core::workers::native::ConversationAcpProcesses;
+use xpressclaw_core::workers::native::{ConversationAcpProcesses, NativeRuntimeLifecycle};
+use zeroize::Zeroizing;
+
+use crate::auth::InstanceAuth;
 
 /// Shared application state passed to all Axum handlers.
 ///
@@ -37,12 +41,24 @@ pub struct AppState {
     pub turn_controls: Arc<AcpTurnControlBroker>,
     /// Retained per-Conversation ACP lanes shared with the native dispatcher.
     pub conversation_processes: Arc<ConversationAcpProcesses>,
+    /// Per-Agent barrier shared by native dispatchers and destructive Project
+    /// lifecycle operations.
+    pub native_runtime_lifecycle: Arc<NativeRuntimeLifecycle>,
     /// Serialize writes that replace the file-backed and in-memory
     /// configuration so handlers cannot persist and apply stale snapshots.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serialize explicit Git-backed Project sync operations so fetch and
     /// publish cannot race through the same temporary Git store state.
     pub project_sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serialize Docker lifecycle reconciliation for the local collaboration
+    /// stack. Every clone shares this lock, so fixed container, network, and
+    /// volume names cannot be concurrently recreated or removed.
+    pub collaboration_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Listener/authentication values effective for this running process.
+    /// Saved configuration may differ until the next restart.
+    pub effective_instance: Arc<InstanceConfig>,
+    /// Process-local browser sessions and credential verifier/token.
+    pub auth: Arc<InstanceAuth>,
 }
 
 impl AppState {
@@ -53,6 +69,60 @@ impl AppState {
         llm_router: Option<Arc<LlmRouter>>,
         config_path: PathBuf,
         setup_complete: bool,
+    ) -> Self {
+        let effective_instance = config.instance.clone();
+        let instance_id = db
+            .installation_id()
+            .unwrap_or_else(|_| "unknown-instance".to_string());
+        let auth = Arc::new(InstanceAuth::disabled(instance_id));
+        Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        )
+    }
+
+    /// Production constructor with the listener/auth settings selected by the
+    /// CLI and an optional token supplied by the detached launcher.
+    pub fn new_with_instance(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        supplied_startup_token: Option<Zeroizing<String>>,
+    ) -> anyhow::Result<Self> {
+        let instance_id = db.installation_id()?;
+        let auth = Arc::new(InstanceAuth::load(
+            &config.system.data_dir,
+            instance_id,
+            effective_instance.authentication_enabled,
+            supplied_startup_token,
+        )?);
+        Ok(Self::new_inner(
+            config,
+            db,
+            llm_router,
+            config_path,
+            setup_complete,
+            effective_instance,
+            auth,
+        ))
+    }
+
+    fn new_inner(
+        config: Arc<Config>,
+        db: Arc<Database>,
+        llm_router: Option<Arc<LlmRouter>>,
+        config_path: PathBuf,
+        setup_complete: bool,
+        effective_instance: InstanceConfig,
+        auth: Arc<InstanceAuth>,
     ) -> Self {
         let rate_limiter = Arc::new(RateLimiter::new(config.clone()));
         Self {
@@ -68,8 +138,12 @@ impl AppState {
             elicitations: Arc::new(AcpElicitationBroker::new()),
             turn_controls: Arc::new(AcpTurnControlBroker::new()),
             conversation_processes: Arc::new(ConversationAcpProcesses::default()),
+            native_runtime_lifecycle: Arc::new(NativeRuntimeLifecycle::default()),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             project_sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            collaboration_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            effective_instance: Arc::new(effective_instance),
+            auth,
         }
     }
 
@@ -205,5 +279,36 @@ impl AppState {
         }
         sessions.refresh_status(&current.session_id)?;
         Ok(interrupted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_state_serializes_collaboration_lifecycle_operations() {
+        let state = AppState::new(
+            Arc::new(Config::default()),
+            Arc::new(Database::open_memory().unwrap()),
+            None,
+            PathBuf::from("test.yaml"),
+            true,
+        );
+        let concurrent_request = state.clone();
+        let first = state.collaboration_lifecycle_lock.lock().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .is_err());
+        drop(first);
+        let _second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            concurrent_request.collaboration_lifecycle_lock.lock(),
+        )
+        .await
+        .expect("the next lifecycle operation should proceed after release");
     }
 }

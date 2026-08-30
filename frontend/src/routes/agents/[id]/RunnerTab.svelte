@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { mcpServers, sessions, setup } from '$lib/api';
+	import { canonicalHarnessKind, harnessName, inferHarnessKindFromBackend, openExternal } from '$lib/utils';
 	import DirectoryPicker from '$lib/components/DirectoryPicker.svelte';
-	import { openExternal } from '$lib/utils';
 	import type { AcpAgentCatalogEntry, AcpConfigOption, AcpModeState, LiveConfig, McpServerDefinition, McpVerificationResult, NativeRunnerConfig } from '$lib/api';
 
 	interface Props {
@@ -58,7 +58,8 @@
 	const fallbackAgents = [
 		{ kind: 'codex', name: 'Codex', install_url: 'https://developers.openai.com/codex/cli/', image: 'ghcr.io/xpressai/xpressclaw-runner-codex:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-codex-docker:latest' },
 		{ kind: 'claude', name: 'Claude Agent', install_url: 'https://docs.anthropic.com/en/docs/claude-code/setup', image: 'ghcr.io/xpressai/xpressclaw-runner-claude:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-claude-docker:latest' },
-		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' }
+		{ kind: 'opencode', name: 'OpenCode', install_url: 'https://opencode.ai/docs/', image: 'ghcr.io/xpressai/xpressclaw-runner-opencode:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-opencode-docker:latest' },
+		{ kind: 'deepseek-harness', name: 'DeepSeek Harness', install_url: 'https://github.com/openma-ai/deepseek-harness-acp', image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness:latest', host_image: 'ghcr.io/xpressai/xpressclaw-runner-deepseek-harness-docker:latest' }
 	];
 	let agentOptions = $derived(agentCatalog.length > 0 ? agentCatalog : fallbackAgents);
 	let selectedAgent = $derived(agentOptions.find((agent) => agent.kind === kind));
@@ -145,26 +146,31 @@
 		}
 	});
 
+	let initializedAgentId = '';
+	let initializedConfig: LiveConfig['agents'][0] | null = null;
 	$effect(() => {
-		if (agentConfig?.runner) {
-			const configuredKind = agentConfig.runner.kind;
-			kind = configuredKind === 'auto'
-				? (agentConfig.backend.includes('claude') ? 'claude' : agentConfig.backend.includes('opencode') ? 'opencode' : 'codex')
-				: configuredKind;
-			containerEngine = agentConfig.runner.container_engine ?? 'none';
-			image = isBuiltInImage(agentConfig.runner.image) ? defaultImage() : agentConfig.runner.image;
-			workspace = agentConfig.runner.workspace ?? '';
-			projectName = agentConfig.runner.project_name ?? '';
-			model = agentConfig.runner.model ?? '';
-			sessionConfig = { ...agentConfig.runner.session_config };
-			selectedMcpServers = [...agentConfig.runner.mcp_servers];
-			environmentText = Object.entries(agentConfig.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
-			startupCommandsText = (agentConfig.runner.startup_commands ?? []).join('\n');
-			volumesText = agentConfig.volumes.join('\n');
-			subscriptionAuth = agentConfig.runner.subscription_auth;
-			sshAgentForwarding = agentConfig.runner.ssh_agent_forwarding ?? false;
-			commandText = agentConfig.runner.command.join('\n');
-		}
+		const config = agentConfig;
+		if (!config?.runner || (config === initializedConfig && agentId === initializedAgentId)) return;
+		initializedConfig = config;
+		initializedAgentId = agentId;
+
+		const configuredKind = config.runner.kind;
+		kind = configuredKind === 'auto'
+			? inferHarnessKindFromBackend(config.backend)
+			: canonicalHarnessKind(configuredKind);
+		containerEngine = config.runner.container_engine ?? 'none';
+		image = isBuiltInImage(config.runner.image) ? defaultImage() : config.runner.image;
+		workspace = config.runner.workspace ?? '';
+		projectName = config.runner.project_name ?? '';
+		model = config.runner.model ?? '';
+		sessionConfig = { ...config.runner.session_config };
+		selectedMcpServers = [...config.runner.mcp_servers];
+		environmentText = Object.entries(config.runner.environment).map(([key, value]) => `${key}=${value}`).join('\n');
+		startupCommandsText = (config.runner.startup_commands ?? []).join('\n');
+		volumesText = config.volumes.join('\n');
+		subscriptionAuth = config.runner.subscription_auth;
+		sshAgentForwarding = config.runner.ssh_agent_forwarding ?? false;
+		commandText = config.runner.command.join('\n');
 	});
 
 	let lastSignal = 0;
@@ -331,6 +337,9 @@
 					{#each agentOptions as agent}
 						<option value={agent.kind}>{agent.name}</option>
 					{/each}
+					{#if kind !== 'custom' && !agentOptions.some((agent) => agent.kind === kind)}
+						<option value={kind}>Other ACP harness ({kind})</option>
+					{/if}
 					<option value="custom">Other ACP harness</option>
 				</select>
 			</div>
@@ -480,7 +489,7 @@
 			<h2 class="text-sm font-semibold">Skills, plugins, hooks, and native configuration</h2>
 			{#if extensionDocumentationUrl}
 				<button type="button" onclick={() => openExternal(extensionDocumentationUrl)} class="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent">
-					{hasSkillsGuide ? `${selectedAgent?.name ?? 'Harness'} skills guide` : `${selectedAgent?.name ?? 'Harness'} docs`}
+					{hasSkillsGuide ? `${selectedAgent?.name ?? harnessName(kind)} skills guide` : `${selectedAgent?.name ?? harnessName(kind)} docs`}
 				</button>
 			{/if}
 		</div>

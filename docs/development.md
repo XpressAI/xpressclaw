@@ -116,7 +116,7 @@ Build all standard and host-engine runner variants:
 Build only selected products:
 
 ```bash
-./build.sh --runner=codex --runner=claude
+./build.sh --runner=codex --runner=deepseek-harness
 ```
 
 Or build one image directly:
@@ -127,6 +127,30 @@ docker buildx build --load \
   -t xpressclaw-runner-codex:latest \
   -t localhost/xpressclaw-runner-codex:latest \
   harnesses/native
+```
+
+The Codex Dockerfile verifies its presentation runtime by creating, rendering,
+and validating a real PPTX during the build. After a custom build, confirm the
+capability contract as well:
+
+```bash
+docker image inspect xpressclaw-runner-codex:latest \
+  --format '{{ index .Config.Labels "io.xpressclaw.presentations" }} {{ index .Config.Labels "io.xpressclaw.presentations.pptxgenjs" }}'
+docker run --rm xpressclaw-runner-codex:latest \
+  /opt/xpressclaw/presentation-runtime/bin/xpressclaw-presentation-runtime
+```
+
+The expected values are `xpressclaw-pptx-v1`, `4.0.1`, and absolute paths
+inside `/opt/xpressclaw/presentation-runtime`. See
+[`docs/presentations.md`](presentations.md) for the publication boundary and
+custom-image contract.
+
+Parameterized npm runners, including DeepSeek Harness, should normally be
+built through the shared script so the pinned package, runtime preparation,
+and ACP smoke arguments remain identical to CI:
+
+```bash
+./scripts/build-runner-images.sh deepseek-harness
 ```
 
 Set `CONTAINER_RUNTIME=docker` or `CONTAINER_RUNTIME=podman` when invoking
@@ -152,6 +176,13 @@ absolute paths inside that harness image; remote HTTP and SSE endpoints do not
 need to be installed in the image. After the first turn, composers and
 workflow editors show the commands, modes, models, and reasoning controls the
 ACP harness actually advertises.
+
+The DeepSeek Harness image smoke launches the real `dsh-acp` adapter against a
+loopback DeepSeek-compatible stream. It verifies authentication, image
+ingestion, two coexisting sessions, MCP propagation, streamed reasoning/text,
+plans, tools, diffs, permissions, active cancellation, session list/load,
+persistence across process restart, and clean shutdown without a paid or
+external provider call.
 
 ## Tests and formatting
 
