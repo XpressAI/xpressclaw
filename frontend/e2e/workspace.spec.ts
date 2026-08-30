@@ -345,6 +345,8 @@ async function mockApi(
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
+		workspaceReadRequests?: string[];
+		workspaceReadDelaysMs?: Record<string, number>;
 		repositoryStatus?: Record<string, unknown>;
 		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
@@ -949,6 +951,9 @@ async function mockApi(
 				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
 			} else {
 				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				options.workspaceReadRequests?.push(filePath);
+				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
+				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
 				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
 					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
 					return;
@@ -1326,6 +1331,164 @@ test('agent updates stay beside their tools while the final reply is shown once'
 	expect(toolIndex).toBeLessThan(testIndex);
 	expect(finalIndexes).toHaveLength(1);
 	expect(testIndex).toBeLessThan(finalIndexes[0]);
+});
+
+test('near-simultaneous sentence fragments render as one agent update', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'The audit', { item_type: 'agent_message', message_id: 'fragment-1' }),
+			timelineEvent(2, 10, 'runner_progress', '-retention regression is now exercising the actual migration DDL', { item_type: 'agent_message', message_id: 'fragment-2' }),
+			timelineEvent(3, 11, 'runner_progress', 'against H2: it inserts an audit row', { item_type: 'agent_message', message_id: 'fragment-3' }),
+			timelineEvent(4, 11, 'runner_progress', ',', { item_type: 'agent_message', message_id: 'fragment-4' }),
+			timelineEvent(5, 12, 'runner_progress', 'deletes', { item_type: 'agent_message', message_id: 'fragment-5' }),
+			timelineEvent(6, 12, 'runner_progress', 'the parent conversation, and creates a tombstone.', { item_type: 'agent_message', message_id: 'fragment-6' }),
+			timelineEvent(7, 12, 'runner_progress', 'Tests passed.', { item_type: 'agent_message', message_id: 'status-1' }),
+			timelineEvent(8, 12, 'runner_progress', 'Ready to review.', { item_type: 'agent_message', message_id: 'status-2' }),
+			timelineEvent(9, 13, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'status-3' }),
+			timelineEvent(10, 13, 'runner_progress', '.env is configured.', { item_type: 'agent_message', message_id: 'status-4' }),
+			timelineEvent(11, 14, 'runner_progress', 'Updated config', { item_type: 'agent_message', message_id: 'status-5' }),
+			timelineEvent(12, 14, 'runner_progress', '.env is ready.', { item_type: 'agent_message', message_id: 'status-6' }),
+			timelineEvent(13, 15, 'runner_progress', 'The exit code is', { item_type: 'agent_message', message_id: 'status-7' }),
+			timelineEvent(14, 15, 'runner_progress', '-1 when unavailable.', { item_type: 'agent_message', message_id: 'status-8' }),
+			timelineEvent(15, 16, 'runner_progress', 'Then use', { item_type: 'agent_message', message_id: 'status-9' }),
+			timelineEvent(16, 16, 'runner_progress', '--force to override.', { item_type: 'agent_message', message_id: 'status-10' }),
+			timelineEvent(17, 17, 'runner_progress', 'The audit-', { item_type: 'agent_message', message_id: 'fragment-7' }),
+			timelineEvent(18, 17, 'runner_progress', 'retention policy passed.', { item_type: 'agent_message', message_id: 'fragment-8' }),
+			timelineEvent(19, 18, 'runner_progress', 'Choose and/', { item_type: 'agent_message', message_id: 'fragment-9' }),
+			timelineEvent(20, 18, 'runner_progress', 'or syntax.', { item_type: 'agent_message', message_id: 'fragment-10' }),
+			timelineEvent(21, 19, 'runner_progress', 'Call (', { item_type: 'agent_message', message_id: 'fragment-11' }),
+			timelineEvent(22, 19, 'runner_progress', 'child) first.', { item_type: 'agent_message', message_id: 'fragment-12' }),
+			timelineEvent(23, 20, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-13' }),
+			timelineEvent(24, 20, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'fragment-14' }),
+			timelineEvent(25, 21, 'runner_progress', 'Use input /', { item_type: 'agent_message', message_id: 'fragment-15' }),
+			timelineEvent(26, 21, 'runner_progress', 'output channels.', { item_type: 'agent_message', message_id: 'fragment-16' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(16);
+	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
+		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
+	);
+	await expect(updates.nth(1).locator('[data-agent-update-content]')).toHaveText('Tests passed.');
+	await expect(updates.nth(2).locator('[data-agent-update-content]')).toHaveText('Ready to review.');
+	await expect(updates.nth(3).locator('[data-agent-update-content]')).toHaveText('Done.');
+	await expect(updates.nth(4).locator('[data-agent-update-content]')).toHaveText('.env is configured.');
+	await expect(updates.nth(5).locator('[data-agent-update-content]')).toHaveText('Updated config');
+	await expect(updates.nth(6).locator('[data-agent-update-content]')).toHaveText('.env is ready.');
+	await expect(updates.nth(7).locator('[data-agent-update-content]')).toHaveText('The exit code is');
+	await expect(updates.nth(8).locator('[data-agent-update-content]')).toHaveText('-1 when unavailable.');
+	await expect(updates.nth(9).locator('[data-agent-update-content]')).toHaveText('Then use');
+	await expect(updates.nth(10).locator('[data-agent-update-content]')).toHaveText('--force to override.');
+	await expect(updates.nth(11).locator('[data-agent-update-content]')).toHaveText('The audit-retention policy passed.');
+	await expect(updates.nth(12).locator('[data-agent-update-content]')).toHaveText('Choose and/or syntax.');
+	await expect(updates.nth(13).locator('[data-agent-update-content]')).toHaveText('Call (child) first.');
+	await expect(updates.nth(14).locator('[data-agent-update-content]')).toHaveText('Tests passed - ready for review.');
+	await expect(updates.nth(15).locator('[data-agent-update-content]')).toHaveText('Use input / output channels.');
+});
+
+test('mirrored final fragments stay hidden without duplicating durable replies', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'ready for review.',
+			attachments: [],
+			timestamp: timestamp(11),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Tests passed -', { item_type: 'agent_message', message_id: 'fragment-before-reply' }),
+			timelineEvent(2, 11, 'runner_progress', 'ready for review.', { item_type: 'agent_message', message_id: 'mirrored-reply' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(1);
+	await expect(updates.locator('[data-agent-update-content]')).toHaveText('Tests passed -');
+	await expect(transcript.locator('[data-message-role="assistant"]')).toHaveCount(1);
+	await expect(transcript.getByText('ready for review.', { exact: true })).toHaveCount(1);
+});
+
+test('mirrored replies remain boundaries between otherwise joinable updates', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'Done.',
+			attachments: [],
+			timestamp: timestamp(50),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 10, 'runner_progress', 'Database ready', { item_type: 'agent_message', message_id: 'before-mirror' }),
+			timelineEvent(2, 10, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'mirrored-boundary' }),
+			timelineEvent(3, 11, 'runner_progress', 'checking deployment', { item_type: 'agent_message', message_id: 'after-mirror' }),
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const transcript = page.locator('[data-task-transcript]');
+	const updates = transcript.locator('[data-agent-update]');
+	await expect(updates).toHaveCount(2);
+	await expect(updates).toHaveText([/Database ready/, /checking deployment/]);
+	await expect(transcript.getByText('Done.', { exact: true })).toHaveCount(1);
+});
+
+test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 1,
+			task_id: taskId,
+			role: 'user',
+			content: 'Keep the migration compatible.',
+			attachments: [],
+			timestamp: timestamp(41),
+		}],
+		taskActivityEvents: [
+			timelineEvent(1, 9, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'in_progress' }),
+			timelineEvent(2, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
+			timelineEvent(3, 10, 'tool_call_update', 'Completed Read the project', { toolCallId: 'tool-boundary', status: 'completed' }),
+			timelineEvent(4, 10, 'runner_progress', 'the migration', { item_type: 'agent_message', message_id: 'after-tool' }),
+			timelineEvent(5, 20, 'runner_progress', 'Checking', { item_type: 'agent_message', message_id: 'attempt-a' }),
+			{
+				...timelineEvent(6, 20, 'runner_progress', 'the workspace', { item_type: 'agent_message', message_id: 'attempt-b' }),
+				attempt_id: 'attempt-browser-test-2',
+			},
+			timelineEvent(7, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
+			timelineEvent(8, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
+			timelineEvent(9, 40, 'runner_progress', 'Updating', { item_type: 'agent_message', message_id: 'before-message' }),
+			timelineEvent(10, 42, 'runner_progress', 'the query', { item_type: 'agent_message', message_id: 'after-message' }),
+			{
+				...timelineEvent(11, 50, 'runner_progress', 'Working on tests', { item_type: 'agent_message', message_id: 'opencode-1' }),
+				source_id: 'opencode',
+			},
+			{
+				...timelineEvent(12, 50, 'runner_progress', 'checking deployment', { item_type: 'agent_message', message_id: 'opencode-2' }),
+				source_id: 'opencode',
+			},
+		],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const updates = page.locator('[data-task-transcript] [data-agent-update]');
+	await expect(updates).toHaveCount(10);
+	await expect(updates).toHaveText([
+		/Reading/,
+		/the migration/,
+		/Checking/,
+		/the workspace/,
+		/Inspecting/,
+		/the repository/,
+		/Updating/,
+		/the query/,
+		/Working on tests/,
+		/checking deployment/,
+	]);
 });
 
 test('links in agent responses open in new windows without changing user links', async ({ page }) => {
@@ -3376,7 +3539,7 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
-test('task details deep-link current Git changes into the workspace editor', async ({ page }) => {
+test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
 
@@ -3387,8 +3550,180 @@ test('task details deep-link current Git changes into the workspace editor', asy
 		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
 	);
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
-	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+	await expect(page.locator('[data-workspace-tree]')).toHaveCount(0);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await page.getByRole('button', { name: 'Show files' }).click();
+	await expect(page.locator('[data-workspace-tree]')).toBeVisible();
+});
+
+test('keyboard-activated task files open beside their source pane', async ({ page }) => {
+	await page.setViewportSize({ width: 1800, height: 900 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	const changedFile = panes.first().locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(panes).toHaveCount(3);
+	await expect(panes.nth(0).locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(panes.nth(1).locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(panes.nth(2).locator(`#task-message-input-${taskId}`)).toBeVisible();
+});
+
+test('task changed files use normal navigation when the workspace is too narrow to split', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await expect(changedFile).toBeVisible();
+	await changedFile.click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByRole('button', { name: 'Show files' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	const preserved = await changedFile.evaluate((element) => [
+		{ ctrlKey: true },
+		{ metaKey: true },
+		{ shiftKey: true },
+		{ altKey: true },
+	].every((modifiers) => {
+		let defaultPreventedByHandler = true;
+		const observeThenSuppressNavigation = (event: MouseEvent) => {
+			defaultPreventedByHandler = event.defaultPrevented;
+			event.preventDefault();
+		};
+		document.addEventListener('click', observeThenSuppressNavigation, { once: true });
+		element.dispatchEvent(new MouseEvent('click', {
+			bubbles: true,
+			cancelable: true,
+			...modifiers,
+		}));
+		return !defaultPreventedByHandler;
+	}));
+
+	expect(preserved).toBe(true);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});
+
+test('task changed files use normal navigation at the workspace pane limit', async ({ page }) => {
+	const workspaceReadRequests: string[] = [];
+	const workspaceReadDelaysMs: Record<string, number> = {};
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page, { workspaceReadRequests, workspaceReadDelaysMs });
+	await page.goto(`/tasks/${taskId}`);
+
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
+
+	const focusedPane = page.locator('[data-workspace-pane]').first();
+	const changedFile = focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.locator('[data-workspace-pane]').last().locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	const editor = focusedPane.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click({ position: { x: 20, y: 20 } });
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const unsaved = true;');
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	const requestFile = (path?: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
+			detail: {
+				path: `/agents/${requestedAgentId}?tab=files${requestedPath ? `&path=${encodeURIComponent(requestedPath)}` : ''}&tree=collapsed`,
+			},
+		}));
+	}, { requestedAgentId: agentId, requestedPath: path });
+
+	page.once('dialog', (dialog) => void dialog.dismiss());
+	await requestFile('README.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	page.once('dialog', (dialog) => void dialog.accept());
+	await requestFile('README.md');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
+
+	workspaceReadDelaysMs['src/main.ts'] = 500;
+	const mainReadCount = workspaceReadRequests.filter((path) => path === 'src/main.ts').length;
+	await requestFile('src/main.ts');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'src/main.ts').length).toBe(mainReadCount + 1);
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	workspaceReadDelaysMs['README.md'] = 500;
+	const readmeReadCount = workspaceReadRequests.filter((path) => path === 'README.md').length;
+	await requestFile('README.md');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'README.md').length).toBe(readmeReadCount + 1);
+	await requestFile('docs/guide.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=docs%2Fguide.md&tree=collapsed`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+	await page.waitForTimeout(600);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+
+	await requestFile();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&tree=collapsed`);
+	await expect(focusedPane.getByText('Choose a file to browse or edit it with Monaco.')).toBeVisible();
+	await expect(focusedPane.locator('[data-monaco-editor]')).toHaveCount(0);
+});
+
+test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]')).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]').first()).toBeHidden();
+	await expect(panes.locator('[data-task-details-sidebar]').last()).toBeHidden();
+	await expect(panes.locator(`#task-message-input-${taskId}`)).toHaveCount(2);
+
+	const transcriptWidths = await panes.locator('[data-task-transcript-scroll]').evaluateAll((elements) =>
+		elements.map((element) => element.getBoundingClientRect().width),
+	);
+	expect(transcriptWidths.every((width) => width >= 350)).toBe(true);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
