@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -34,6 +34,19 @@ try {
   await exec('/opt/xpressclaw/presentation-runtime/bin/xpressclaw-validate-presentation', [output], {
     timeout: 150_000,
   });
+
+  const oversized = Buffer.from(await readFile(output));
+  const centralHeader = oversized.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+  assert.ok(centralHeader >= 0, 'smoke deck should contain a ZIP central directory');
+  oversized.writeUInt32LE(129 * 1024 * 1024, centralHeader + 24);
+  const oversizedOutput = path.join(directory, 'oversized-uncompressed.pptx');
+  await writeFile(oversizedOutput, oversized);
+  await assert.rejects(
+    exec('/opt/xpressclaw/presentation-runtime/bin/xpressclaw-validate-presentation', [oversizedOutput], {
+      timeout: 10_000,
+    }),
+    /uncompressed limit/,
+  );
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

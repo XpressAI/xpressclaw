@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -64,6 +65,16 @@ struct MessageExtras<'a> {
     published_files: &'a [PublishedFileAttachment],
     attempt_id: Option<&'a str>,
     visualizations: &'a [PreparedVisualization],
+}
+
+pub(crate) struct FinalAssistantAttempt<'a> {
+    pub(crate) task_id: &'a str,
+    pub(crate) queue_id: i64,
+    pub(crate) attempt_id: &'a str,
+    pub(crate) completion_summary: &'a str,
+    pub(crate) content: &'a str,
+    pub(crate) visualizations: &'a [PreparedVisualization],
+    pub(crate) published_files: &'a [PublishedFileAttachment],
 }
 
 impl TaskConversation {
@@ -129,6 +140,18 @@ impl TaskConversation {
         let conn = self.db.conn();
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let message = Self::insert_message_in_transaction(&tx, task_id, role, content, extras)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
+    fn insert_message_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        role: &str,
+        content: &str,
+        extras: MessageExtras<'_>,
+    ) -> Result<TaskMessage> {
         let project_id = tx
             .query_row(
                 "SELECT project_id FROM tasks WHERE id = ?1",
@@ -140,7 +163,7 @@ impl TaskConversation {
                 id: task_id.to_string(),
             })?;
         if let Some(project_id) = project_id.as_deref() {
-            ensure_project_accepts_work(&tx, project_id)?;
+            ensure_project_accepts_work(tx, project_id)?;
         }
         tx.execute(
             "INSERT INTO task_messages (task_id, role, content) VALUES (?1, ?2, ?3)",
@@ -200,8 +223,7 @@ impl TaskConversation {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let stored_visualizations =
-            store_task_message_visualizations(&tx, id, extras.attempt_id, extras.visualizations)?;
-        tx.commit()?;
+            store_task_message_visualizations(tx, id, extras.attempt_id, extras.visualizations)?;
 
         Ok(TaskMessage {
             id,
@@ -212,6 +234,125 @@ impl TaskConversation {
             attachments: stored_attachments,
             visualizations: stored_visualizations,
         })
+    }
+
+    /// Commit the final Task reply and terminal attempt/queue state together.
+    /// Cancellation and completion therefore have one SQLite serialization
+    /// point, and a failed attachment/message write leaves the running work
+    /// retryable instead of exposing a completed attempt without its reply.
+    pub(crate) fn complete_final_assistant_attempt(
+        &self,
+        completion: FinalAssistantAttempt<'_>,
+    ) -> Result<Option<TaskMessage>> {
+        let conn = self.db.conn();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let attempt = tx
+            .query_row(
+                "SELECT attempt.session_id, attempt.runner
+                 FROM work_attempts attempt
+                 JOIN task_queue queue
+                   ON queue.id = ?1 AND queue.attempt_id = attempt.id
+                 WHERE attempt.id = ?2 AND attempt.task_id = ?3
+                   AND attempt.queue_id = ?1
+                   AND attempt.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                   AND queue.status = 'running'",
+                rusqlite::params![
+                    completion.queue_id,
+                    completion.attempt_id,
+                    completion.task_id
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((session_id, runner)) = attempt else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let message = Self::insert_message_in_transaction(
+            &tx,
+            completion.task_id,
+            "assistant",
+            completion.content,
+            MessageExtras {
+                image_attachments: &[],
+                published_files: completion.published_files,
+                attempt_id: Some(completion.attempt_id),
+                visualizations: completion.visualizations,
+            },
+        )?;
+        let attempt_updated = tx.execute(
+            "UPDATE work_attempts
+             SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
+                 result = ?1, error_message = NULL
+             WHERE id = ?2
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')",
+            rusqlite::params![completion.content, completion.attempt_id],
+        )?;
+        let queue_updated = tx.execute(
+            "UPDATE task_queue
+             SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
+                 harness_response = ?1
+             WHERE id = ?2 AND attempt_id = ?3 AND status = 'running'",
+            rusqlite::params![
+                completion.content,
+                completion.queue_id,
+                completion.attempt_id
+            ],
+        )?;
+        if attempt_updated != 1 || queue_updated != 1 {
+            return Err(Error::Task(
+                "native completion lost its running attempt or queue lease".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE tasks SET active_attempt_id = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND active_attempt_id = ?2",
+            rusqlite::params![completion.task_id, completion.attempt_id],
+        )?;
+        tx.execute(
+            "UPDATE logical_sessions
+             SET status = CASE
+                    WHEN EXISTS(
+                        SELECT 1 FROM work_attempts
+                        WHERE session_id = ?1
+                          AND status IN ('preparing', 'running', 'review')
+                    ) THEN 'running'
+                    WHEN EXISTS(
+                        SELECT 1 FROM work_attempts
+                        WHERE session_id = ?1 AND status = 'queued'
+                    ) THEN 'queued'
+                    WHEN EXISTS(
+                        SELECT 1 FROM tasks
+                        WHERE agent_id = ?1 AND status = 'waiting_for_input'
+                    ) THEN 'waiting_for_input'
+                    WHEN EXISTS(
+                        SELECT 1 FROM tasks
+                        WHERE agent_id = ?1 AND status = 'blocked'
+                    ) THEN 'blocked'
+                    ELSE 'idle'
+                 END,
+                 latest_summary = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            rusqlite::params![session_id, completion.completion_summary],
+        )?;
+        tx.execute(
+            "INSERT INTO session_events
+             (session_id, attempt_id, task_id, source_type, source_id,
+              event_type, summary, payload)
+             VALUES (?1, ?2, ?3, 'runner', ?4, 'attempt_completed', ?5, ?6)",
+            rusqlite::params![
+                session_id,
+                completion.attempt_id,
+                completion.task_id,
+                runner,
+                completion.completion_summary,
+                json!({ "status": "completed", "error": null }).to_string(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(message))
     }
 
     pub fn update_message_content(&self, message_id: i64, content: &str) -> Result<()> {
@@ -340,7 +481,10 @@ impl TaskConversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::registry::AgentRegistry;
+    use crate::sessions::SessionManager;
     use crate::tasks::board::{CreateTask, TaskBoard};
+    use crate::tasks::queue::TaskQueue;
 
     #[test]
     fn stores_attachment_metadata_and_loads_prompt_bytes() {
@@ -413,5 +557,150 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(downloaded.data, b"pptx bytes");
+    }
+
+    fn running_attempt(db: &Arc<Database>) -> (String, i64, String) {
+        AgentRegistry::new(db.clone())
+            .ensure("atlas", "generic")
+            .unwrap();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Build a deck".to_string(),
+                agent_id: Some("atlas".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = TaskQueue::new(db.clone());
+        queue.enqueue(&task.id, "atlas").unwrap();
+        let item = queue.claim("atlas").unwrap().unwrap();
+        let attempt_id = item.attempt_id.clone().unwrap();
+        SessionManager::new(db.clone())
+            .transition_attempt(&attempt_id, "running", "Working", None, None)
+            .unwrap();
+        (task.id, item.id, attempt_id)
+    }
+
+    #[test]
+    fn final_reply_and_terminal_attempt_state_commit_atomically() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (task_id, queue_id, attempt_id) = running_attempt(&db);
+        let file = PublishedFileAttachment {
+            name: "Review.pptx".into(),
+            mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .into(),
+            data: b"pptx bytes".to_vec(),
+        };
+
+        let message = TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &task_id,
+                queue_id,
+                attempt_id: &attempt_id,
+                completion_summary: "Deck complete",
+                content: "The deck is attached.",
+                visualizations: &[],
+                published_files: &[file],
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(
+            TaskQueue::new(db.clone()).get(queue_id).unwrap().status,
+            "completed"
+        );
+        let active_attempt = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                    [&task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+            })
+            .unwrap();
+        assert!(active_attempt.is_none());
+        let completed_events = SessionManager::new(db)
+            .list_events("atlas", None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "attempt_completed")
+            .count();
+        assert_eq!(completed_events, 1);
+    }
+
+    #[test]
+    fn failed_final_reply_write_leaves_attempt_and_queue_running() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (task_id, queue_id, attempt_id) = running_attempt(&db);
+        let invalid_visualization = PreparedVisualization {
+            reference_index: 0,
+            title: "Invalid".into(),
+            mode: "normal".into(),
+            status: "ready".into(),
+            error_code: None,
+            content: None,
+            content_sha256: None,
+            size: None,
+        };
+
+        let result = TaskConversation::new(db.clone()).complete_final_assistant_attempt(
+            FinalAssistantAttempt {
+                task_id: &task_id,
+                queue_id,
+                attempt_id: &attempt_id,
+                completion_summary: "Deck complete",
+                content: "The deck is attached.",
+                visualizations: &[invalid_visualization],
+                published_files: &[],
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(TaskConversation::new(db.clone())
+            .get_messages(&task_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            SessionManager::new(db.clone())
+                .get_attempt(&attempt_id)
+                .unwrap()
+                .status,
+            "running"
+        );
+        assert_eq!(TaskQueue::new(db).get(queue_id).unwrap().status, "running");
+    }
+
+    #[test]
+    fn cancelled_attempt_cannot_publish_a_late_final_reply() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let (task_id, queue_id, attempt_id) = running_attempt(&db);
+        SessionManager::new(db.clone())
+            .transition_attempt(&attempt_id, "cancelled", "Cancelled", None, None)
+            .unwrap();
+
+        let message = TaskConversation::new(db.clone())
+            .complete_final_assistant_attempt(FinalAssistantAttempt {
+                task_id: &task_id,
+                queue_id,
+                attempt_id: &attempt_id,
+                completion_summary: "Too late",
+                content: "This must not appear.",
+                visualizations: &[],
+                published_files: &[],
+            })
+            .unwrap();
+
+        assert!(message.is_none());
+        assert!(TaskConversation::new(db)
+            .get_messages(&task_id)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -31,7 +31,7 @@ use crate::config::{
 };
 use crate::conversations::event_bus::{ConversationEvent, ConversationEventBus};
 use crate::conversations::runtime::{ConversationTurn, ConversationTurnQueue};
-use crate::conversations::{ConversationManager, SendMessage};
+use crate::conversations::{ConversationManager, NewConversationAttachment, SendMessage};
 use crate::dashboard::DashboardManager;
 use crate::db::Database;
 use crate::docker::manager::{
@@ -45,7 +45,7 @@ use crate::repositories::{
 };
 use crate::sessions::SessionManager;
 use crate::tasks::board::{Task, TaskBoard};
-use crate::tasks::conversation::{PromptImageAttachment, TaskConversation};
+use crate::tasks::conversation::{FinalAssistantAttempt, PromptImageAttachment, TaskConversation};
 use crate::tasks::queue::{QueueItem, TaskQueue};
 use crate::visualizations::{
     is_absolute_runner_root, prepare_message_visualizations, PreparedVisualization,
@@ -1471,27 +1471,21 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         json!({ "protocol": "acp", "stop_reason": turn.stop_reason, "runner": kind }),
     )?;
     let completion_summary = truncate(&turn.summary, 2_000);
-    let completed = sessions.transition_attempt(
-        attempt_id,
-        "completed",
-        &completion_summary,
-        Some(&turn.summary),
-        None,
-    )?;
-    if completed.status != "completed" {
-        return Ok(());
-    }
     let queue = TaskQueue::new(db.clone());
-    queue.complete(item.id, &turn.summary)?;
-    if let Err(error) = TaskConversation::new(db.clone()).add_final_assistant_message(
-        &item.task_id,
-        &turn.summary,
-        attempt_id,
-        &visualizations,
-        &published.attachments,
-    ) {
-        warn!(%error, task_id = item.task_id, "failed to persist ACP task reply");
-    }
+    let Some(_) = TaskConversation::new(db.clone()).complete_final_assistant_attempt(
+        FinalAssistantAttempt {
+            task_id: &item.task_id,
+            queue_id: item.id,
+            attempt_id,
+            completion_summary: &completion_summary,
+            content: &turn.summary,
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
+    )?
+    else {
+        return Ok(());
+    };
 
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
@@ -1526,7 +1520,10 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
         &agent.context_label(),
         &turn.summary,
         attempt_id,
-        &visualizations,
+        ConversationResultArtifacts {
+            visualizations: &visualizations,
+            published_files: &published.attachments,
+        },
     );
     for completed in completed_tasks {
         advance_workflow(&db, &completed.id, "completed", &turn.summary);
@@ -1608,6 +1605,11 @@ fn conversation_id(db: &Arc<Database>, task_id: &str) -> Option<String> {
         .and_then(|task| task.conversation_id)
 }
 
+struct ConversationResultArtifacts<'a> {
+    visualizations: &'a [PreparedVisualization],
+    published_files: &'a [crate::message_artifacts::PublishedFileAttachment],
+}
+
 fn publish_conversation_result(
     db: &Arc<Database>,
     event_bus: &Arc<ConversationEventBus>,
@@ -1615,12 +1617,22 @@ fn publish_conversation_result(
     sender_name: &str,
     content: &str,
     attempt_id: &str,
-    visualizations: &[PreparedVisualization],
+    artifacts: ConversationResultArtifacts<'_>,
 ) {
     let Some(conversation_id) = conversation_id(db, &item.task_id) else {
         return;
     };
     let manager = ConversationManager::new(db.clone());
+    let attachments = artifacts
+        .published_files
+        .iter()
+        .map(|attachment| NewConversationAttachment {
+            name: attachment.name.clone(),
+            mime_type: attachment.mime_type.clone(),
+            data: attachment.data.clone(),
+            source_task_id: Some(item.task_id.clone()),
+        })
+        .collect::<Vec<_>>();
     if let Ok((message, _, _)) = manager.send_agent_routed_message_with_visualizations(
         &conversation_id,
         &SendMessage {
@@ -1631,11 +1643,12 @@ fn publish_conversation_result(
             message_type: Some("task_result".to_string()),
         },
         Some(&item.task_id),
-        &[],
+        &attachments,
         Some(attempt_id),
-        visualizations,
+        artifacts.visualizations,
     ) {
         let mut message_value = json!(message);
+        message_value["attachments"] = json!(manager.attachments(message.id).unwrap_or_default());
         message_value["visualizations"] =
             json!(manager.visualizations(message.id).unwrap_or_default());
         event_bus.send(
@@ -5924,6 +5937,12 @@ mod tests {
         let item = TaskQueue::new(db.clone())
             .enqueue(&task.id, "atlas")
             .unwrap();
+        let published_file = crate::message_artifacts::PublishedFileAttachment {
+            name: "Review.pptx".into(),
+            mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .into(),
+            data: b"pptx bytes".to_vec(),
+        };
 
         publish_conversation_result(
             &db,
@@ -5932,7 +5951,10 @@ mod tests {
             "Atlas",
             "@[AGENT:reviewer:Reviewer] Native result",
             "attempt",
-            &[],
+            ConversationResultArtifacts {
+                visualizations: &[],
+                published_files: &[published_file],
+            },
         );
 
         let messages = conversations
@@ -5949,6 +5971,17 @@ mod tests {
             messages[0].content,
             "@[AGENT:reviewer:Reviewer] Native result"
         );
+        let attachments = conversations.attachments(messages[0].id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "Review.pptx");
+        assert_eq!(
+            attachments[0].source_task_id.as_deref(),
+            Some(task.id.as_str())
+        );
+        let (_, data) = conversations
+            .attachment_data(&conversation.id, &attachments[0].id)
+            .unwrap();
+        assert_eq!(data, b"pptx bytes");
         let turns = ConversationTurnQueue::new(db)
             .list_for_conversation(&conversation.id, 10)
             .unwrap();

@@ -90,9 +90,8 @@ pub fn prepare_message_artifacts(
     let mut captured_bytes = 0usize;
     let mut cursor = 0;
     let mut text_start = 0;
-    let mut references = 0;
 
-    while cursor < content.len() && references < MAX_PUBLISHED_FILES_PER_MESSAGE {
+    while cursor < content.len() {
         let Some(relative_start) = content[cursor..].find(REFERENCE_START) else {
             break;
         };
@@ -111,10 +110,15 @@ pub fn prepare_message_artifacts(
         };
 
         rendered.push_str(&content[text_start..start]);
-        references += 1;
         let title = display_title(&reference);
         if captured_paths.insert(reference.path.clone()) {
-            match capture_presentation(&reference, source_roots) {
+            if attachments.len() >= MAX_PUBLISHED_FILES_PER_MESSAGE {
+                rendered.push_str(&format!(
+                    "\n\n> Artifact unavailable: **{}** — a message can publish at most eight files.\n\n",
+                    escape_markdown(&title),
+                ));
+            } else {
+                match capture_presentation(&reference, source_roots) {
                 Ok(attachment)
                     if captured_bytes
                         .checked_add(attachment.data.len())
@@ -132,6 +136,7 @@ pub fn prepare_message_artifacts(
                     escape_markdown(&title),
                     error.message()
                 )),
+                }
             }
         }
         text_start = cursor;
@@ -635,5 +640,33 @@ mod tests {
         assert_eq!(result.attachments.len(), 1);
         assert_eq!(result.content.matches("Artifact unavailable").count(), 1);
         assert!(result.content.contains("Lost deck"));
+    }
+
+    #[test]
+    fn strips_every_valid_reference_after_the_attachment_cap() {
+        let directory = tempdir().unwrap();
+        let mut content = String::new();
+        for index in 0..=MAX_PUBLISHED_FILES_PER_MESSAGE {
+            let name = format!("deck-{index}.pptx");
+            fs::write(directory.path().join(&name), pptx_bytes()).unwrap();
+            content.push_str(&format!(
+                "before {index} xpressclaw-file{{\"path\":\"/workspace/{name}\"}} after {index}\n"
+            ));
+        }
+
+        let result = prepare_message_artifacts(&content, &root(directory.path()));
+
+        assert_eq!(result.attachments.len(), MAX_PUBLISHED_FILES_PER_MESSAGE);
+        assert!(!result.content.contains(REFERENCE_START));
+        assert!(!result.content.contains("/workspace/"));
+        assert_eq!(
+            result
+                .content
+                .matches("a message can publish at most eight files")
+                .count(),
+            1
+        );
+        assert!(result.content.contains("before 8"));
+        assert!(result.content.contains("after 8"));
     }
 }
