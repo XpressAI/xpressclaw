@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod db;
 pub mod desktop_auth;
 pub mod error;
+mod external_tools;
 pub mod runtime;
 pub mod sync;
 pub mod system;
