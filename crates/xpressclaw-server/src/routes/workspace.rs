@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path as FsPath, PathBuf};
 use std::process::Output;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,7 +21,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
+use xpressclaw_core::db::Database;
 use xpressclaw_core::docker::manager::DockerManager;
+use xpressclaw_core::repositories::{
+    AgentRepositoryManager, RepositoryInspection, RepositorySelectionState,
+};
+use xpressclaw_core::workers::{github, native};
 
 use crate::state::AppState;
 
@@ -42,6 +48,16 @@ struct SaveFileInput {
     path: String,
     content: String,
     expected_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepositorySelectionInput {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepositoryResolutionInput {
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +100,24 @@ pub fn routes() -> Router<AppState> {
         .route("/{agent_id}/file", get(read_file).put(write_file))
         .route("/{agent_id}/git/status", get(git_status))
         .route("/{agent_id}/git/diff", get(git_diff))
+        .route(
+            "/{agent_id}/repository",
+            get(repository_status)
+                .put(select_repository)
+                .delete(clear_repository),
+        )
+        .route(
+            "/{agent_id}/repository/propose",
+            axum::routing::post(propose_repository),
+        )
         .route("/{agent_id}/terminal", get(open_terminal))
+}
+
+pub(crate) fn internal_routes() -> Router<AppState> {
+    Router::new().route(
+        "/{agent_id}/repository/resolve-github",
+        axum::routing::post(resolve_github_repository),
+    )
 }
 
 async fn workspace_status(
@@ -93,7 +126,8 @@ async fn workspace_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
+    let repository = repository_status_json(&state, &agent_id).await?;
     let docker = state.docker().await;
     let container_exists = match docker.as_ref() {
         Some(docker) => docker.is_project_container(&agent_id).await,
@@ -106,10 +140,386 @@ async fn workspace_status(
     Ok(Json(json!({
         "agent_id": agent_id,
         "root": root.display().to_string(),
+        "repository": repository,
         "container_exists": container_exists,
         "container_running": container_running,
         "terminal_available": container_exists && docker.is_some(),
     })))
+}
+
+async fn repository_status(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_same_origin(&headers)?;
+    Ok(Json(repository_status_json(&state, &agent_id).await?))
+}
+
+async fn select_repository(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RepositorySelectionInput>,
+) -> ApiResult<Json<Value>> {
+    require_same_origin(&headers)?;
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose(&operation_agent_id, &bootstrap, &input.path)
+    })
+    .await?;
+    Ok(Json(repository_status_json(&state, &agent_id).await?))
+}
+
+async fn clear_repository(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    require_same_origin(&headers)?;
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose_clear(&operation_agent_id, &bootstrap)
+    })
+    .await?;
+    Ok(Json(repository_status_json(&state, &agent_id).await?))
+}
+
+async fn propose_repository(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<RepositorySelectionInput>,
+) -> ApiResult<Json<Value>> {
+    let supplied_agent = headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok());
+    if supplied_agent != Some(agent_id.as_str()) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "repository proposals must target the calling Agent",
+        ));
+    }
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let db = state.db.clone();
+    let operation_agent_id = agent_id.clone();
+    let inspection = run_repository_operation(move || {
+        AgentRepositoryManager::new(db).propose(&operation_agent_id, &bootstrap, &input.path)
+    })
+    .await?;
+    Ok(Json(json!({
+        "status": "pending",
+        "path": inspection.pending_relative_path,
+        "message": "Repository adoption is queued for the next safe turn boundary. End this turn; the next turn will start a fresh ACP session with GitHub attached when available."
+    })))
+}
+
+/// Resolve the repository-scoped credential for the constrained GitHub MCP.
+/// This endpoint exists only on the independently authenticated runner
+/// callback listener. The token is deliberately never returned by public APIs.
+async fn resolve_github_repository(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<GithubRepositoryResolutionInput>,
+) -> ApiResult<Json<Value>> {
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        != Some(agent_id.as_str())
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "GitHub repository resolution must target the calling Agent",
+        ));
+    }
+
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let db = state.db.clone();
+    let response =
+        run_blocking(move || resolve_github_repository_blocking(db, agent_id, bootstrap, input))
+            .await?;
+    Ok(Json(response))
+}
+
+fn resolve_github_repository_blocking(
+    db: Arc<Database>,
+    agent_id: String,
+    bootstrap: PathBuf,
+    input: GithubRepositoryResolutionInput,
+) -> ApiResult<Value> {
+    let manager = AgentRepositoryManager::new(db.clone());
+    let inspection = manager.inspect(&agent_id, &bootstrap).map_err(core_error)?;
+    let requested = input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+
+    let candidate = if let Some(path) = requested {
+        if inspection.state == RepositorySelectionState::Cleared {
+            return Err(repository_resolution_conflict(
+                &inspection,
+                "repository selection was explicitly cleared; select a repository in Agent settings before using GitHub",
+            ));
+        }
+        let candidate = manager.candidate_at(&bootstrap, path).map_err(core_error)?;
+        if let Some(active) = inspection.active.as_ref() {
+            if active.relative_path != candidate.relative_path {
+                return Err(repository_resolution_conflict(
+                    &inspection,
+                    "a different repository is active; propose or select the new repository before changing GitHub scope",
+                ));
+            }
+        } else if inspection.selected_relative_path.is_some() {
+            return Err(repository_resolution_conflict(
+                &inspection,
+                "the previous repository selection is unavailable; select its replacement explicitly",
+            ));
+        }
+        candidate
+    } else if let Some(active) = inspection.active.clone() {
+        active
+    } else {
+        if inspection.state != RepositorySelectionState::Pending
+            || inspection.pending_action.as_deref() == Some("cleared")
+        {
+            return Err(repository_resolution_conflict(
+                &inspection,
+                repository_resolution_message(&inspection),
+            ));
+        }
+        inspection
+            .pending_relative_path
+            .as_deref()
+            .and_then(|path| {
+                inspection
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.relative_path == path)
+            })
+            .or_else(|| {
+                inspection
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.relative_path == ".")
+            })
+            .or_else(|| (inspection.candidates.len() == 1).then(|| &inspection.candidates[0]))
+            .cloned()
+            .ok_or_else(|| {
+                repository_resolution_conflict(
+                    &inspection,
+                    "the proposed repository is no longer available",
+                )
+            })?
+    };
+
+    let github_repository = candidate.github_repository.clone().ok_or_else(|| {
+        repository_resolution_conflict(
+            &inspection,
+            "the selected Git repository does not have a supported GitHub origin",
+        )
+    })?;
+    let access = github::discover(&db, &candidate.root).ok_or_else(|| {
+        repository_resolution_conflict(
+            &inspection,
+            "no matching GitHub connector, GH_TOKEN, or host gh credential is available",
+        )
+    })?;
+    if access.repository() != github_repository {
+        return Err(repository_resolution_conflict(
+            &inspection,
+            "the repository origin changed while GitHub access was being resolved; retry after refreshing repository status",
+        ));
+    }
+
+    if inspection.active_relative_path() != Some(candidate.relative_path.as_str())
+        && manager
+            .select_live(
+                &agent_id,
+                &bootstrap,
+                &candidate.relative_path,
+                inspection.generation(),
+            )
+            .map_err(core_error)?
+            .is_none()
+    {
+        let refreshed = manager.inspect(&agent_id, &bootstrap).map_err(core_error)?;
+        return Err(repository_resolution_conflict(
+            &refreshed,
+            "repository selection changed while GitHub access was being resolved; retry with the current selection",
+        ));
+    }
+
+    Ok(json!({
+        "path": candidate.relative_path,
+        "repository": github_repository,
+        "token": access.mcp_token(),
+    }))
+}
+
+fn repository_resolution_message(inspection: &RepositoryInspection) -> &'static str {
+    match inspection.state {
+        RepositorySelectionState::NoRepository => {
+            "no Git repository was found inside this Agent's workspace"
+        }
+        RepositorySelectionState::Ambiguous if inspection.discovery_truncated => {
+            "repository discovery reached its safety limit; pass cwd or select an exact repository path"
+        }
+        RepositorySelectionState::Ambiguous => {
+            "multiple repositories were found; pass cwd or select one in Agent settings"
+        }
+        RepositorySelectionState::Missing => {
+            "the selected repository is missing or outside the approved workspace"
+        }
+        RepositorySelectionState::Cleared => {
+            "repository selection was explicitly cleared; select one in Agent settings"
+        }
+        _ => "the repository is not ready for GitHub resolution",
+    }
+}
+
+fn repository_resolution_conflict(
+    inspection: &RepositoryInspection,
+    message: impl Into<String>,
+) -> ApiError {
+    let candidates = inspection
+        .candidates
+        .iter()
+        .map(|candidate| candidate.relative_path.as_str())
+        .collect::<Vec<_>>();
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": message.into(),
+            "state": inspection.state,
+            "candidates": candidates,
+            "discovery_truncated": inspection.discovery_truncated,
+        })),
+    )
+}
+
+async fn repository_status_json(state: &AppState, agent_id: &str) -> ApiResult<Value> {
+    let (agent, bootstrap) = agent_workspace(state, agent_id)?;
+    let inspection = inspect_repository(state, agent_id, bootstrap).await?;
+    let (github_status, github_repository) =
+        github_availability(state, &agent, &inspection).await?;
+    let message = repository_message(&inspection, github_status);
+    let restart_required = inspection.requires_runtime_restart();
+    Ok(json!({
+        "state": inspection.state,
+        "message": message,
+        "bootstrap_root": inspection.bootstrap_root,
+        "active": inspection.active,
+        "candidates": inspection.candidates,
+        "discovery_truncated": inspection.discovery_truncated,
+        "selected_relative_path": inspection.selected_relative_path,
+        "pending_relative_path": inspection.pending_relative_path,
+        "pending_action": inspection.pending_action,
+        "github_status": github_status,
+        "github_repository": github_repository,
+        "restart_required": restart_required,
+    }))
+}
+
+async fn github_availability(
+    state: &AppState,
+    agent: &xpressclaw_core::config::AgentConfig,
+    inspection: &RepositoryInspection,
+) -> ApiResult<(&'static str, Option<String>)> {
+    let Some(repository) = inspection.active.as_ref() else {
+        return Ok(("unavailable", None));
+    };
+    if agent
+        .runner
+        .mcp_servers
+        .iter()
+        .any(|server| server == "github")
+    {
+        return Ok(("explicit_override", repository.github_repository.clone()));
+    }
+    let Some(repository_name) = repository.github_repository.clone() else {
+        return Ok(("non_github_origin", None));
+    };
+    let db = state.db.clone();
+    let repository_root = repository.root.clone();
+    let credential_available =
+        run_blocking(move || Ok(github::discover(&db, &repository_root).is_some())).await?;
+    if !credential_available {
+        return Ok(("missing_credential", Some(repository_name)));
+    }
+    let kind = match native::resolve_runner_kind(agent) {
+        Ok(kind) => kind,
+        Err(_) => return Ok(("incompatible_image", Some(repository_name))),
+    };
+    let image = match native::resolved_runner_image(&agent.runner, &kind) {
+        Ok(image) => image,
+        Err(_) => return Ok(("incompatible_image", Some(repository_name))),
+    };
+    let built_in =
+        xpressclaw_core::config::default_native_runner_image(&kind, agent.runner.container_engine)
+            == Some(image.as_str());
+    let compatible = if built_in {
+        true
+    } else if let Some(docker) = state.docker().await {
+        docker
+            .image_has_label(&image, "io.xpressclaw.protocol", "acp-xpressclaw-v2")
+            .await
+    } else {
+        false
+    };
+    if compatible {
+        Ok(("attached", Some(repository_name)))
+    } else {
+        Ok(("incompatible_image", Some(repository_name)))
+    }
+}
+
+fn repository_message(inspection: &RepositoryInspection, github_status: &str) -> &'static str {
+    match inspection.state {
+        RepositorySelectionState::Pending => {
+            "The repository change is pending and will be applied at the next safe turn boundary."
+        }
+        RepositorySelectionState::NoRepository => {
+            "No Git repository was found inside this Agent's workspace."
+        }
+        RepositorySelectionState::Ambiguous if inspection.discovery_truncated => {
+            "Repository discovery reached its safety limit. Select a listed repository or adopt an exact path."
+        }
+        RepositorySelectionState::Ambiguous => {
+            "Multiple repositories were found. Select the one this Agent should use."
+        }
+        RepositorySelectionState::Missing => {
+            if inspection.active.is_some() && inspection.pending_relative_path.is_some() {
+                "The pending repository is unavailable. The current repository remains active, and the stale choice will be discarded at the next turn boundary."
+            } else {
+                "The selected repository is missing or no longer inside the approved workspace."
+            }
+        }
+        RepositorySelectionState::Cleared => {
+            "Repository selection is cleared; automatic adoption is disabled."
+        }
+        RepositorySelectionState::Attached => match github_status {
+            "attached" => "The active repository and bundled GitHub MCP are ready.",
+            "explicit_override" => {
+                "The active repository uses the Agent's explicit github MCP configuration."
+            }
+            "non_github_origin" => {
+                "The active repository has no supported GitHub origin, so the bundled GitHub MCP is unavailable."
+            }
+            "missing_credential" => {
+                "The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential."
+            }
+            "incompatible_image" => {
+                "The configured runner image does not advertise the bundled XpressClaw MCP protocol."
+            }
+            _ => "The active repository is selected, but GitHub is unavailable.",
+        },
+    }
 }
 
 async fn list_directory(
@@ -119,7 +529,7 @@ async fn list_directory(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&query.path)?;
     let workspace = open_workspace_dir(&root)?;
 
@@ -192,7 +602,7 @@ async fn read_file(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&query.path)?;
     let workspace = open_workspace_dir(&root)?;
     let mut file = workspace
@@ -257,7 +667,7 @@ async fn write_file(
             ),
         ));
     }
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
     let relative = normalize_relative_path(&input.path)?;
     let workspace = open_workspace_dir(&root)?;
     let (parent, file_name) = open_parent_dir(&workspace, &relative)?;
@@ -318,13 +728,26 @@ async fn git_status(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let root = workspace_root(&state, &agent_id).await?;
+    let repository_status = repository_status_json(&state, &agent_id).await?;
+    if repository_status
+        .get("active")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return Ok(Json(json!({
+            "repository": false,
+            "branch": Value::Null,
+            "files": [],
+            "repository_status": repository_status,
+        })));
+    }
     let repository = git_output(&root, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !repository.status.success() {
         return Ok(Json(json!({
             "repository": false,
             "branch": Value::Null,
             "files": [],
+            "repository_status": repository_status,
         })));
     }
     let branch = git_output(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -363,6 +786,7 @@ async fn git_status(
         "repository": true,
         "branch": branch,
         "files": files,
+        "repository_status": repository_status,
     })))
 }
 
@@ -373,7 +797,12 @@ async fn git_diff(
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
     require_same_origin(&headers)?;
-    let root = workspace_root(&state, &agent_id)?;
+    let (_, bootstrap) = agent_workspace(&state, &agent_id)?;
+    let root = inspect_repository(&state, &agent_id, bootstrap)
+        .await?
+        .active
+        .map(|candidate| candidate.root)
+        .ok_or_else(|| api_error(StatusCode::CONFLICT, "no active Git repository is selected"))?;
     let relative = normalize_relative_path(&query.path)?;
     if relative.as_os_str().is_empty() {
         return Err(api_error(
@@ -443,7 +872,7 @@ async fn open_terminal(
     websocket: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     require_same_origin(&headers)?;
-    let _ = workspace_root(&state, &agent_id)?;
+    let _ = workspace_root(&state, &agent_id).await?;
     let docker = state.docker().await.ok_or_else(|| {
         api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -548,6 +977,35 @@ async fn terminal_socket(
     let _ = input.shutdown().await;
 }
 
+async fn run_blocking<T>(operation: impl FnOnce() -> ApiResult<T> + Send + 'static) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| internal_error(format!("repository worker failed: {error}")))?
+}
+
+async fn run_repository_operation<T>(
+    operation: impl FnOnce() -> xpressclaw_core::error::Result<T> + Send + 'static,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    run_blocking(move || operation().map_err(core_error)).await
+}
+
+async fn inspect_repository(
+    state: &AppState,
+    agent_id: &str,
+    bootstrap: PathBuf,
+) -> ApiResult<RepositoryInspection> {
+    let db = state.db.clone();
+    let agent_id = agent_id.to_string();
+    run_repository_operation(move || AgentRepositoryManager::new(db).inspect(&agent_id, &bootstrap))
+        .await
+}
+
 fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     match output {
         bollard::container::LogOutput::StdIn { message }
@@ -557,7 +1015,16 @@ fn log_output_bytes(output: bollard::container::LogOutput) -> Vec<u8> {
     }
 }
 
-fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
+async fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
+    let (_, bootstrap) = agent_workspace(state, agent_id)?;
+    let inspection = inspect_repository(state, agent_id, bootstrap).await?;
+    Ok(inspection.active_root().to_path_buf())
+}
+
+fn agent_workspace(
+    state: &AppState,
+    agent_id: &str,
+) -> ApiResult<(xpressclaw_core::config::AgentConfig, PathBuf)> {
     let config = state.config();
     let agent = config
         .agents
@@ -568,30 +1035,18 @@ fn workspace_root(state: &AppState, agent_id: &str) -> ApiResult<PathBuf> {
                 StatusCode::NOT_FOUND,
                 format!("agent configuration not found: {agent_id}"),
             )
-        })?;
-    let workspace = agent
-        .runner
-        .workspace
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(expand_home)
-        .unwrap_or_else(|| config.system.workspace_dir.clone());
-    workspace.canonicalize().map_err(|error| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            format!("workspace {} is unavailable: {error}", workspace.display()),
-        )
-    })
-}
-
-fn expand_home(path: &str) -> PathBuf {
-    if let Some(relative) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            return PathBuf::from(home).join(relative);
-        }
-    }
-    PathBuf::from(path)
+        })?
+        .clone();
+    let workspace = native::resolved_workspace(&config, &agent);
+    workspace
+        .canonicalize()
+        .map_err(|error| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("workspace {} is unavailable: {error}", workspace.display()),
+            )
+        })
+        .map(|workspace| (agent, workspace))
 }
 
 fn normalize_relative_path(raw: &str) -> ApiResult<PathBuf> {
@@ -798,9 +1253,305 @@ fn internal_error(message: impl Into<String>) -> ApiError {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+fn core_error(error: xpressclaw_core::error::Error) -> ApiError {
+    match &error {
+        xpressclaw_core::error::Error::AgentNotFound { .. } => {
+            api_error(StatusCode::NOT_FOUND, error.to_string())
+        }
+        xpressclaw_core::error::Error::Backend(_) => {
+            api_error(StatusCode::BAD_REQUEST, error.to_string())
+        }
+        _ => internal_error(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    use xpressclaw_core::agents::registry::AgentRegistry;
+    use xpressclaw_core::config::{AgentConfig, Config};
+    use xpressclaw_core::connectors::manager::{ConnectorManager, CreateConnector};
+    use xpressclaw_core::db::Database;
+
     use super::*;
+
+    fn git_repository(path: &FsPath) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn repository_app() -> (Router, Router, Arc<Database>, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        git_repository(&workspace.path().join("alpha"));
+        git_repository(&workspace.path().join("product"));
+        let db = Arc::new(Database::open_memory().unwrap());
+        AgentRegistry::new(db.clone())
+            .ensure("workspace-agent", "opencode")
+            .unwrap();
+        let mut config = Config::default();
+        config.system.data_dir = workspace.path().join("control-plane");
+        let mut agent = AgentConfig {
+            name: "workspace-agent".into(),
+            backend: "opencode".into(),
+            ..AgentConfig::default()
+        };
+        agent.runner.kind = "auto".into();
+        agent.runner.workspace = Some(workspace.path().display().to_string());
+        config.agents = vec![agent];
+        let state = AppState::new(
+            Arc::new(config),
+            db.clone(),
+            None,
+            workspace.path().join("xpressclaw.yaml"),
+            true,
+        );
+        let public = Router::new()
+            .nest("/workspaces", routes())
+            .with_state(state.clone());
+        let internal = Router::new()
+            .nest("/workspaces", internal_routes())
+            .with_state(state);
+        (public, internal, db, workspace)
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repository_work_runs_outside_the_async_worker() {
+        let async_worker = std::thread::current().id();
+        let repository_worker =
+            run_blocking(move || Ok::<_, ApiError>(std::thread::current().id()))
+                .await
+                .unwrap();
+
+        assert_ne!(repository_worker, async_worker);
+    }
+
+    #[tokio::test]
+    async fn repository_api_queues_selection_and_clear_for_turn_boundaries() {
+        let (app, _internal, db, workspace) = repository_app();
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/repository")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(response_json(initial).await["state"], "ambiguous");
+
+        let selected = app
+            .clone()
+            .oneshot(
+                Request::put("/workspaces/workspace-agent/repository")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"product"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.status(), StatusCode::OK);
+        let selected = response_json(selected).await;
+        assert_eq!(selected["state"], "pending");
+        assert_eq!(selected["pending_relative_path"], "product");
+        assert_eq!(selected["pending_action"], "manual");
+        assert!(selected["active"].is_null());
+
+        AgentRepositoryManager::new(db.clone())
+            .apply_boundary("workspace-agent", workspace.path())
+            .unwrap();
+        let attached = app
+            .clone()
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/repository")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attached = response_json(attached).await;
+        assert_eq!(attached["state"], "attached");
+        assert_eq!(attached["active"]["relative_path"], "product");
+        assert_eq!(attached["github_status"], "non_github_origin");
+
+        let cleared = app
+            .clone()
+            .oneshot(
+                Request::delete("/workspaces/workspace-agent/repository")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cleared = response_json(cleared).await;
+        assert_eq!(cleared["state"], "pending");
+        assert_eq!(cleared["pending_action"], "cleared");
+        assert_eq!(cleared["active"]["relative_path"], "product");
+
+        AgentRepositoryManager::new(db)
+            .apply_boundary("workspace-agent", workspace.path())
+            .unwrap();
+        let cleared = app
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/repository")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(cleared).await["state"], "cleared");
+    }
+
+    #[tokio::test]
+    async fn repository_api_rejects_escape_and_cross_agent_proposals() {
+        let (app, _internal, _db, _workspace) = repository_app();
+        let traversal = app
+            .clone()
+            .oneshot(
+                Request::put("/workspaces/workspace-agent/repository")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"../escape"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+
+        let unbound = app
+            .clone()
+            .oneshot(
+                Request::post("/workspaces/workspace-agent/repository/propose")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"product"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unbound.status(), StatusCode::FORBIDDEN);
+
+        let bound = app
+            .oneshot(
+                Request::post("/workspaces/workspace-agent/repository/propose")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-agent-id", "workspace-agent")
+                    .body(Body::from(r#"{"path":"product"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.status(), StatusCode::OK);
+        assert_eq!(response_json(bound).await["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_github_resolution_persists_one_validated_repository() {
+        let (public, internal, db, workspace) = repository_app();
+        let product = workspace.path().join("product");
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&product)
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/XpressAI/product.git",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        ConnectorManager::new(db.clone())
+            .create(&CreateConnector {
+                name: "Product GitHub".into(),
+                connector_type: "github".into(),
+                config: json!({
+                    "owner": "XpressAI",
+                    "repo": "product",
+                    "token": "scoped-secret",
+                }),
+            })
+            .unwrap();
+
+        let public_resolution = public
+            .clone()
+            .oneshot(
+                Request::post("/workspaces/workspace-agent/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-agent-id", "workspace-agent")
+                    .body(Body::from(r#"{"path":"product"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_resolution.status(), StatusCode::NOT_FOUND);
+
+        let ambiguous = internal
+            .clone()
+            .oneshot(
+                Request::post("/workspaces/workspace-agent/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-agent-id", "workspace-agent")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.status(), StatusCode::CONFLICT);
+        let ambiguous = response_json(ambiguous).await;
+        assert_eq!(ambiguous["candidates"], json!(["alpha", "product"]));
+        assert!(!ambiguous
+            .to_string()
+            .contains(workspace.path().to_str().unwrap()));
+
+        let resolved = internal
+            .oneshot(
+                Request::post("/workspaces/workspace-agent/repository/resolve-github")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-xpressclaw-agent-id", "workspace-agent")
+                    .body(Body::from(r#"{"path":"product"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.status(), StatusCode::OK);
+        let resolved = response_json(resolved).await;
+        assert_eq!(resolved["path"], "product");
+        assert_eq!(resolved["repository"], "XpressAI/product");
+        assert_eq!(resolved["token"], "scoped-secret");
+        assert_eq!(
+            AgentRepositoryManager::new(db)
+                .inspect("workspace-agent", workspace.path())
+                .unwrap()
+                .active_relative_path(),
+            Some("product")
+        );
+
+        let status = public
+            .oneshot(
+                Request::get("/workspaces/workspace-agent/repository")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_json(status).await["github_status"], "attached");
+    }
 
     #[test]
     fn workspace_paths_reject_traversal_and_absolute_paths() {

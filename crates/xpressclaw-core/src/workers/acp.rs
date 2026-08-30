@@ -1,7 +1,7 @@
 //! Agent Client Protocol transport and event normalization for isolated runners.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -298,6 +298,9 @@ pub struct AcpTurnOptions {
     pub model: Option<String>,
     pub session_config: HashMap<String, Value>,
     pub mcp_servers: Vec<McpServer>,
+    /// Extra workspace roots advertised through ACP. Codex ACP maps a root's
+    /// `.agents/skills` directory into its session-scoped skill discovery.
+    pub additional_directories: Vec<PathBuf>,
     /// Optional fingerprint for an out-of-band MCP bridge. ACP agents normally
     /// receive their MCP configuration in `session/*`; adapters such as Pi's
     /// load it in the underlying agent process instead. The fingerprint still
@@ -1231,6 +1234,7 @@ async fn run_connected_turn(
         session_config: requested_config,
         mcp_servers,
         mcp_signature,
+        additional_directories,
         image_attachments,
     } = options;
 
@@ -1266,10 +1270,20 @@ async fn run_connected_turn(
             ))
         })?,
     };
+    let mcp_signature =
+        serde_json::to_string(&(mcp_signature, &additional_directories)).map_err(|error| {
+            agent_client_protocol::util::internal_error(format!(
+                "failed to fingerprint ACP session roots: {error}"
+            ))
+        })?;
     let (prepared_session, session_to_resume) = match session_start {
         AcpSessionStart::New => {
             let response = connection
-                .send_request(NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers.clone()))
+                .send_request(
+                    NewSessionRequest::new(cwd.clone())
+                        .mcp_servers(mcp_servers.clone())
+                        .additional_directories(additional_directories.clone()),
+                )
                 .block_task()
                 .await?;
             (
@@ -1292,7 +1306,8 @@ async fn run_connected_turn(
                 match connection
                     .send_request(
                         ForkSessionRequest::new(source_session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await
@@ -1376,7 +1391,8 @@ async fn run_connected_turn(
                 let response = connection
                     .send_request(
                         ResumeSessionRequest::new(session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await?;
@@ -1389,7 +1405,8 @@ async fn run_connected_turn(
                 let response = connection
                     .send_request(
                         LoadSessionRequest::new(session_id.clone(), cwd.clone())
-                            .mcp_servers(mcp_servers.clone()),
+                            .mcp_servers(mcp_servers.clone())
+                            .additional_directories(additional_directories.clone()),
                     )
                     .block_task()
                     .await?;
@@ -1969,6 +1986,10 @@ mod tests {
                             request["params"]["mcpServers"][0]["command"],
                             "/opt/xpressclaw/mcp-github.mjs"
                         );
+                        assert_eq!(
+                            request["params"]["additionalDirectories"],
+                            json!(["/opt/xpressclaw/presentation-runtime"])
+                        );
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -2103,6 +2124,7 @@ mod tests {
                     McpServerStdio::new("github", "/opt/xpressclaw/mcp-github.mjs")
                         .env(vec![EnvVariable::new("GH_REPO", "owner/repo")]),
                 )],
+                additional_directories: vec![PathBuf::from("/opt/xpressclaw/presentation-runtime")],
                 mcp_signature: None,
                 image_attachments: vec![PromptImageAttachment {
                     name: "screen.png".into(),
@@ -2232,8 +2254,8 @@ mod tests {
 
         let second = process
             .run_turn(
-                AcpTurnRuntime::new(second_recorder, broker, controls),
-                AcpSessionStart::Resume(first.session_id),
+                AcpTurnRuntime::new(second_recorder, broker.clone(), controls.clone()),
+                AcpSessionStart::Resume(first.session_id.clone()),
                 Path::new("/workspace"),
                 "Second prompt",
                 AcpTurnOptions::default(),
@@ -2249,10 +2271,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_band_mcp_signature_reloads_a_live_session_without_acp_servers() {
+    async fn out_of_band_mcp_and_additional_directory_changes_reload_a_live_session() {
         let db = Arc::new(Database::open_memory().unwrap());
         let (first_recorder, _) = test_recorder(db.clone());
-        let (second_recorder, _) = test_recorder(db);
+        let (second_recorder, _) = test_recorder(db.clone());
+        let (third_recorder, _) = test_recorder(db);
         let (client_input, agent_input) = tokio::io::duplex(64 * 1024);
         let (output_tx, output_rx) = tokio::sync::mpsc::channel(8);
 
@@ -2301,6 +2324,12 @@ mod tests {
                             mcp_servers.is_null()
                                 || mcp_servers.as_array().is_some_and(Vec::is_empty)
                         );
+                        if resume_count == 2 {
+                            assert_eq!(
+                                request["params"]["additionalDirectories"],
+                                json!(["/opt/xpressclaw/presentation-runtime"])
+                            );
+                        }
                         send_json(
                             &output_tx,
                             json!({
@@ -2322,14 +2351,14 @@ mod tests {
                             }),
                         )
                         .await;
-                        if prompt_count == 2 {
+                        if prompt_count == 3 {
                             break;
                         }
                     }
                     other => panic!("unexpected ACP method: {other}"),
                 }
             }
-            assert_eq!(resume_count, 1);
+            assert_eq!(resume_count, 2);
         });
 
         let process = AcpProcess::start(AttachedContainer {
@@ -2361,12 +2390,28 @@ mod tests {
             .unwrap();
         process
             .run_turn(
-                AcpTurnRuntime::new(second_recorder, broker, controls),
-                AcpSessionStart::Resume(first.session_id),
+                AcpTurnRuntime::new(second_recorder, broker.clone(), controls.clone()),
+                AcpSessionStart::Resume(first.session_id.clone()),
                 Path::new("/workspace"),
                 "Second prompt",
                 AcpTurnOptions {
                     mcp_signature: Some("pi-mcp:second".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        process
+            .run_turn(
+                AcpTurnRuntime::new(third_recorder, broker, controls),
+                AcpSessionStart::Resume(first.session_id),
+                Path::new("/workspace"),
+                "Third prompt",
+                AcpTurnOptions {
+                    mcp_signature: Some("pi-mcp:second".into()),
+                    additional_directories: vec![PathBuf::from(
+                        "/opt/xpressclaw/presentation-runtime",
+                    )],
                     ..Default::default()
                 },
             )

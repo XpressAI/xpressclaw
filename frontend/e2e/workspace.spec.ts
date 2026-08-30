@@ -336,6 +336,8 @@ async function mockApi(
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
+		repositoryStatus?: Record<string, unknown>;
+		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
 		conversations?: Record<string, unknown>[];
 		conversationMessages?: Record<string, unknown>[];
@@ -364,6 +366,7 @@ async function mockApi(
 		sharedProjectState?: SharedProjectState;
 		preserveWorkspace?: boolean;
 		agentRunnerKind?: string;
+		runnerReadiness?: Record<string, unknown>;
 		visualizationDocuments?: Record<string, string>;
 		visualizationRequests?: { path: string; token: string | undefined }[];
 	} = {},
@@ -373,6 +376,22 @@ async function mockApi(
 	let createdWorkflow: Record<string, unknown> | null = null;
 	let workspaceFileContent = 'export const greeting = "hello";\n';
 	let workspaceFileRevision = 'revision-before-save';
+	let repositoryStatus: Record<string, unknown> = options.repositoryStatus ?? {
+		state: 'attached',
+		message: 'The active repository and bundled GitHub MCP are ready.',
+		bootstrap_root: '/srv/workspaces/browser-tested',
+		active: { relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		candidates: [
+			{ relative_path: 'xpressclaw', root: '/srv/workspaces/browser-tested/xpressclaw', github_repository: 'XpressAI/xpressclaw' },
+		],
+		discovery_truncated: false,
+		selected_relative_path: 'xpressclaw',
+		pending_relative_path: null,
+		pending_action: null,
+		github_status: 'attached',
+		github_repository: 'XpressAI/xpressclaw',
+		restart_required: false,
+	};
 	let projectSyncConflictReturned = false;
 	let taskLoadFailed = false;
 	const status = options.taskStatus ?? (options.pendingElicitation ? 'waiting_for_input' : options.live ? 'in_progress' : 'completed');
@@ -850,11 +869,37 @@ async function mockApi(
 		} else if (path === `/api/workspaces/${agentId}`) {
 			response = {
 				agent_id: agentId,
-				root: '/srv/repos/xpressclaw',
+				root: (repositoryStatus.active as { root?: string } | null)?.root ?? '/srv/workspaces/browser-tested',
+				repository: repositoryStatus,
 				container_exists: true,
 				container_running: true,
 				terminal_available: true,
 			};
+		} else if (path === `/api/workspaces/${agentId}/repository`) {
+			if (request.method() === 'PUT') {
+				const payload = request.postDataJSON() as { path: string };
+				options.repositorySelections?.push(payload.path);
+				const selected = (repositoryStatus.candidates as Record<string, unknown>[]).find((candidate) => candidate.relative_path === payload.path) ?? null;
+				repositoryStatus = {
+					...repositoryStatus,
+					state: selected ? 'pending' : 'missing',
+					pending_relative_path: selected ? payload.path : null,
+					pending_action: selected ? 'manual' : null,
+					restart_required: Boolean(selected),
+					message: selected ? 'The repository change is pending and will be applied at the next safe turn boundary.' : 'The selected repository is missing.',
+				};
+			} else if (request.method() === 'DELETE') {
+				options.repositorySelections?.push(null);
+				repositoryStatus = {
+					...repositoryStatus,
+					state: 'pending',
+					pending_relative_path: null,
+					pending_action: 'cleared',
+					restart_required: true,
+					message: 'The repository change is pending and will be applied at the next safe turn boundary.',
+				};
+			}
+			response = repositoryStatus;
 		} else if (path === `/api/workspaces/${agentId}/tree`) {
 			const directory = url.searchParams.get('path') ?? '';
 			response = directory === 'src'
@@ -898,6 +943,7 @@ async function mockApi(
 			response = {
 				repository: true,
 				branch: 'feature/workspace-browser',
+				repository_status: repositoryStatus,
 				files: [
 					{ path: 'src/main.ts', original_path: null, status: ' M', index_status: ' ', worktree_status: 'M' },
 					{ path: 'README.md', original_path: null, status: '??', index_status: '?', worktree_status: '?' },
@@ -1095,7 +1141,7 @@ async function mockApi(
 				artifacts: [],
 			};
 		} else if (path === `/api/sessions/${agentId}/readiness`) {
-			response = { ready: true };
+			response = options.runnerReadiness ?? { ready: true };
 		} else if (/^\/api\/sessions\/[^/]+\/messages$/.test(path) && request.method() === 'POST') {
 			const targetAgentId = path.split('/')[3];
 			const payload = request.postDataJSON() as Record<string, unknown>;
@@ -2184,6 +2230,35 @@ test('raw HTML stays literal across task messages, activity, results, and previe
 	await expect(preview.locator('custom-prompt')).toHaveCount(0);
 });
 
+test('task presentation attachments render as durable download cards', async ({ page }) => {
+	await mockApi(page, {
+		taskMessages: [{
+			id: 7,
+			task_id: taskId,
+			role: 'assistant',
+			content: 'The rendered and validated deck is attached.',
+			attachments: [{
+				id: 'presentation-browser-test',
+				name: 'Review deck.pptx',
+				mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+				size: 2_621_440,
+			}],
+			timestamp: timestamp(25),
+		}],
+	});
+	await page.goto(`/tasks/${taskId}`);
+
+	const message = page.locator('[data-message-role="assistant"]');
+	await expect(message).toContainText('The rendered and validated deck is attached.');
+	const attachment = message.getByRole('link', { name: 'Download Review deck.pptx' });
+	await expect(attachment).toHaveAttribute(
+		'href',
+		`/api/tasks/${taskId}/messages/7/attachments/presentation-browser-test`,
+	);
+	await expect(attachment).toContainText('PowerPoint presentation · 2.5 MB');
+	await expect(message.locator('[data-message-attachments] img')).toHaveCount(0);
+});
+
 test('task assistant visualizations render in order, stay isolated, and confirm follow-ups', async ({ page }) => {
 	const postedMessages: Record<string, unknown>[] = [];
 	const visualizationRequests: { path: string; token: string | undefined }[] = [];
@@ -3267,6 +3342,27 @@ test('agent Work shows only the five most recently updated tasks', async ({ page
 	await expect(page.getByRole('link', { name: 'All tasks' })).toHaveAttribute('href', '/tasks');
 });
 
+test('agent Work reports the pinned Codex presentation capability', async ({ page }) => {
+	await mockApi(page, {
+		runnerReadiness: {
+			ready: true,
+			kind: 'codex',
+			presentation_artifacts: {
+				supported: true,
+				available: true,
+				capability: 'xpressclaw-pptx-v1',
+				runtime: 'PptxGenJS 4.0.1',
+				reason: null,
+			},
+		},
+	});
+	await page.goto(`/agents/${agentId}`);
+
+	const readiness = page.locator('[data-presentation-readiness]');
+	await expect(readiness).toContainText('PowerPoint artifacts ready');
+	await expect(readiness).toContainText('PptxGenJS 4.0.1 is pinned in this runner');
+});
+
 test('agent files browse Git changes and save Monaco edits with a revision', async ({ page }) => {
 	const workspaceSaveRequests: { path: string; content: string; expected_revision: string }[] = [];
 	await mockApi(page, { workspaceSaveRequests });
@@ -3364,6 +3460,77 @@ test('task details deep-link current Git changes into the workspace editor', asy
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+});
+
+test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, {
+		repositorySelections,
+		repositoryStatus: {
+			state: 'ambiguous',
+			message: 'Multiple repositories were found. Select the one this Agent should use.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: null,
+			candidates: [
+				{ relative_path: 'alpha', root: '/srv/workspaces/browser-tested/alpha', github_repository: 'example/alpha' },
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: null,
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'unavailable',
+			github_repository: null,
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('Multiple repositories were found. Select the one this Agent should use.')).toBeVisible();
+	await card.getByText('product', { exact: true }).locator('..').locator('..').getByRole('button', { name: 'Use' }).click();
+	await expect.poll(() => repositorySelections).toEqual(['product']);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+	await expect(card.getByText('The current turn keeps its existing process. The next turn starts a fresh session with the pending repository change.')).toBeVisible();
+});
+
+test('clearing an active repository is queued for a safe turn boundary', async ({ page }) => {
+	const repositorySelections: (string | null)[] = [];
+	await mockApi(page, { repositorySelections });
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await card.getByRole('button', { name: 'Clear active repository' }).click();
+	await expect.poll(() => repositorySelections).toEqual([null]);
+	await expect(card.getByText('The repository change is pending and will be applied at the next safe turn boundary.')).toBeVisible();
+});
+
+test('active repository reports a missing GitHub credential without hiding Git access', async ({ page }) => {
+	await mockApi(page, {
+		repositoryStatus: {
+			state: 'attached',
+			message: 'The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.',
+			bootstrap_root: '/srv/workspaces/browser-tested',
+			active: { relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			candidates: [
+				{ relative_path: 'product', root: '/srv/workspaces/browser-tested/product', github_repository: 'XpressAI/product' },
+			],
+			discovery_truncated: false,
+			selected_relative_path: 'product',
+			pending_relative_path: null,
+			pending_action: null,
+			github_status: 'missing_credential',
+			github_repository: 'XpressAI/product',
+			restart_required: false,
+		},
+	});
+	await page.goto(`/agents/${agentId}?tab=workspace`);
+
+	const card = page.locator('[data-active-repository]');
+	await expect(card.getByText('GitHub credential missing')).toBeVisible();
+	await expect(card.getByText('XpressAI/product').first()).toBeVisible();
+	await expect(card.getByText('The active GitHub repository has no matching connector, GH_TOKEN, or host gh credential.')).toBeVisible();
+	await expect(card.getByText('/srv/workspaces/browser-tested/product')).toBeVisible();
 });
 
 test('DeepSeek Harness is preserved in Agent runner settings', async ({ page }) => {

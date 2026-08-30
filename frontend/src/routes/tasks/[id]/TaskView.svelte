@@ -80,7 +80,7 @@
 			role: string;
 			content: string;
 			messageId?: number;
-			attachments: { id?: string; name: string; src: string }[];
+			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
 			visualizations: MessageVisualization[];
 			sequence: number;
 		}
@@ -207,6 +207,8 @@
 				id: attachment.id,
 				name: attachment.name,
 				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+				mimeType: attachment.mime_type,
+				size: attachment.size,
 			})),
 			visualizations: message.visualizations ?? [],
 			sequence: message.id,
@@ -1907,7 +1909,7 @@
 						{:else if workspaceGit.repository}
 							<p class="text-xs text-muted-foreground">Working tree clean</p>
 						{:else}
-							<p class="text-xs text-muted-foreground">Not a Git repository</p>
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
 						{/if}
 					</div>
 				{/if}

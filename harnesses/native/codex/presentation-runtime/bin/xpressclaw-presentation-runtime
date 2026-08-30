@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+
+import { access } from 'node:fs/promises';
+
+if (process.argv.length !== 2) {
+  console.error('xpressclaw-presentation-runtime accepts no arguments');
+  process.exit(64);
+}
+
+const runtime = '/opt/xpressclaw/presentation-runtime';
+const paths = {
+  capability: 'xpressclaw-pptx-v1',
+  runtime,
+  node: '/usr/local/bin/node',
+  node_modules: `${runtime}/node_modules`,
+  bin: `${runtime}/bin`,
+  module: `${runtime}/pptxgenjs.mjs`,
+  pptxgenjs: '4.0.1',
+};
+
+await Promise.all([
+  access(paths.node),
+  access(paths.node_modules),
+  access(paths.bin),
+  access(paths.module),
+]);
+
+process.stdout.write(`${JSON.stringify(paths)}\n`);

@@ -129,6 +129,22 @@ docker buildx build --load \
   harnesses/native
 ```
 
+The Codex Dockerfile verifies its presentation runtime by creating, rendering,
+and validating a real PPTX during the build. After a custom build, confirm the
+capability contract as well:
+
+```bash
+docker image inspect xpressclaw-runner-codex:latest \
+  --format '{{ index .Config.Labels "io.xpressclaw.presentations" }} {{ index .Config.Labels "io.xpressclaw.presentations.pptxgenjs" }}'
+docker run --rm xpressclaw-runner-codex:latest \
+  /opt/xpressclaw/presentation-runtime/bin/xpressclaw-presentation-runtime
+```
+
+The expected values are `xpressclaw-pptx-v1`, `4.0.1`, and absolute paths
+inside `/opt/xpressclaw/presentation-runtime`. See
+[`docs/presentations.md`](presentations.md) for the publication boundary and
+custom-image contract.
+
 Parameterized npm runners, including DeepSeek Harness, should normally be
 built through the shared script so the pinned package, runtime preparation,
 and ACP smoke arguments remain identical to CI:
