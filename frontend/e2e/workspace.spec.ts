@@ -336,6 +336,8 @@ async function mockApi(
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
+		workspaceReadRequests?: string[];
+		workspaceReadDelaysMs?: Record<string, number>;
 		repositoryStatus?: Record<string, unknown>;
 		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
@@ -928,6 +930,9 @@ async function mockApi(
 				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
 			} else {
 				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				options.workspaceReadRequests?.push(filePath);
+				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
+				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
 				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
 					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
 					return;
@@ -3424,8 +3429,10 @@ test('task changed-file modified clicks retain normal link behavior', async ({ p
 });
 
 test('task changed files use normal navigation at the workspace pane limit', async ({ page }) => {
+	const workspaceReadRequests: string[] = [];
+	const workspaceReadDelaysMs: Record<string, number> = {};
 	await page.setViewportSize({ width: 2200, height: 1000 });
-	await mockApi(page);
+	await mockApi(page, { workspaceReadRequests, workspaceReadDelaysMs });
 	await page.goto(`/tasks/${taskId}`);
 
 	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
@@ -3449,26 +3456,36 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await page.keyboard.insertText('export const unsaved = true;');
 	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
 
-	const requestReadme = () => page.evaluate(({ requestedAgentId }) => {
+	const requestFile = (path: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
 		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
-			detail: { path: `/agents/${requestedAgentId}?tab=files&path=README.md&tree=collapsed` },
+			detail: { path: `/agents/${requestedAgentId}?tab=files&path=${encodeURIComponent(requestedPath)}&tree=collapsed` },
 		}));
-	}, { requestedAgentId: agentId });
+	}, { requestedAgentId: agentId, requestedPath: path });
 
 	page.once('dialog', (dialog) => void dialog.dismiss());
-	await requestReadme();
+	await requestFile('README.md');
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
 	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
 	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
 	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
 
 	page.once('dialog', (dialog) => void dialog.accept());
-	await requestReadme();
+	await requestFile('README.md');
 
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
 	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
 	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
+
+	workspaceReadDelaysMs['src/main.ts'] = 500;
+	const mainReadCount = workspaceReadRequests.filter((path) => path === 'src/main.ts').length;
+	await requestFile('src/main.ts');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'src/main.ts').length).toBe(mainReadCount + 1);
+	await requestFile('docs/guide.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=docs%2Fguide.md&tree=collapsed`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+	await page.waitForTimeout(600);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
 });
 
 test('narrow manual task splits preserve the compact task layout', async ({ page }) => {

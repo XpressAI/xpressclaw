@@ -23,8 +23,10 @@
 	let showTree = $state(true);
 	let initialized = $state(false);
 	let syncedRoute = '';
+	let fileOpenSequence = 0;
 	let error = $state('');
 	let saveMessage = $state('');
+	type FileOpenResult = 'opened' | 'cancelled' | 'stale' | 'failed';
 
 	let visibleEntries = $derived(flattenEntries());
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
@@ -65,10 +67,14 @@
 		const previousShowTree = showTree;
 		const requested = routeState(requestedRoute);
 		showTree = requested.showTree;
-		if (!requested.path || requested.path === selectedPath) return;
+		if (!requested.path || requested.path === selectedPath) {
+			fileOpenSequence += 1;
+			loadingFile = false;
+			return;
+		}
 
-		const opened = await openFile(requested.path, false, false);
-		if (opened || route !== requestedRoute) return;
+		const result = await openFile(requested.path, false, false);
+		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
 
 		showTree = previousShowTree;
 		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
@@ -125,8 +131,12 @@
 		}
 	}
 
-	async function openFile(path: string, force = false, navigate = true): Promise<boolean> {
-		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) return false;
+	async function openFile(path: string, force = false, navigate = true): Promise<FileOpenResult> {
+		const requestSequence = ++fileOpenSequence;
+		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+			loadingFile = false;
+			return 'cancelled';
+		}
 		loadingFile = true;
 		error = '';
 		saveMessage = '';
@@ -137,6 +147,7 @@
 					.catch((cause: unknown) => ({ file: null, error: cause })),
 				workspaces.gitDiff(agentId, path).catch(() => null),
 			]);
+			if (requestSequence !== fileOpenSequence) return 'stale';
 			const deleted = changeByPath.get(path)?.status.includes('D') ?? false;
 			if (!fileResult.file && !(deleted && diff)) throw fileResult.error;
 			selectedPath = path;
@@ -150,12 +161,13 @@
 				url.searchParams.set('path', path);
 				await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
 			}
-			return true;
+			return 'opened';
 		} catch (cause) {
+			if (requestSequence !== fileOpenSequence) return 'stale';
 			error = cause instanceof Error ? cause.message : String(cause);
-			return false;
+			return 'failed';
 		} finally {
-			loadingFile = false;
+			if (requestSequence === fileOpenSequence) loadingFile = false;
 		}
 	}
 
