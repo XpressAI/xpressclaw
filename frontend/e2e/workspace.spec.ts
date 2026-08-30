@@ -1277,12 +1277,22 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 			timelineEvent(10, 13, 'runner_progress', '.env is configured.', { item_type: 'agent_message', message_id: 'status-4' }),
 			timelineEvent(11, 14, 'runner_progress', 'Updated config', { item_type: 'agent_message', message_id: 'status-5' }),
 			timelineEvent(12, 14, 'runner_progress', '.env is ready.', { item_type: 'agent_message', message_id: 'status-6' }),
+			timelineEvent(13, 15, 'runner_progress', 'The exit code is', { item_type: 'agent_message', message_id: 'status-7' }),
+			timelineEvent(14, 15, 'runner_progress', '-1 when unavailable.', { item_type: 'agent_message', message_id: 'status-8' }),
+			timelineEvent(15, 16, 'runner_progress', 'Then use', { item_type: 'agent_message', message_id: 'status-9' }),
+			timelineEvent(16, 16, 'runner_progress', '--force to override.', { item_type: 'agent_message', message_id: 'status-10' }),
+			timelineEvent(17, 17, 'runner_progress', 'The audit-', { item_type: 'agent_message', message_id: 'fragment-7' }),
+			timelineEvent(18, 17, 'runner_progress', 'retention policy passed.', { item_type: 'agent_message', message_id: 'fragment-8' }),
+			timelineEvent(19, 18, 'runner_progress', 'Choose and/', { item_type: 'agent_message', message_id: 'fragment-9' }),
+			timelineEvent(20, 18, 'runner_progress', 'or syntax.', { item_type: 'agent_message', message_id: 'fragment-10' }),
+			timelineEvent(21, 19, 'runner_progress', 'Call (', { item_type: 'agent_message', message_id: 'fragment-11' }),
+			timelineEvent(22, 19, 'runner_progress', 'child) first.', { item_type: 'agent_message', message_id: 'fragment-12' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(7);
+	await expect(updates).toHaveCount(14);
 	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
 		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
 	);
@@ -1292,6 +1302,13 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 	await expect(updates.nth(4).locator('[data-agent-update-content]')).toHaveText('.env is configured.');
 	await expect(updates.nth(5).locator('[data-agent-update-content]')).toHaveText('Updated config');
 	await expect(updates.nth(6).locator('[data-agent-update-content]')).toHaveText('.env is ready.');
+	await expect(updates.nth(7).locator('[data-agent-update-content]')).toHaveText('The exit code is');
+	await expect(updates.nth(8).locator('[data-agent-update-content]')).toHaveText('-1 when unavailable.');
+	await expect(updates.nth(9).locator('[data-agent-update-content]')).toHaveText('Then use');
+	await expect(updates.nth(10).locator('[data-agent-update-content]')).toHaveText('--force to override.');
+	await expect(updates.nth(11).locator('[data-agent-update-content]')).toHaveText('The audit-retention policy passed.');
+	await expect(updates.nth(12).locator('[data-agent-update-content]')).toHaveText('Choose and/or syntax.');
+	await expect(updates.nth(13).locator('[data-agent-update-content]')).toHaveText('Call (child) first.');
 });
 
 test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {

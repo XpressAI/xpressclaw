@@ -37,14 +37,15 @@ function isClearContinuation(previous: string, next: string): boolean {
 	if (!previousText || !nextText) return false;
 
 	const previousEndsWord = /[\p{L}\p{N}]$/u.test(previousText);
+	const previousEndsLetter = /\p{L}$/u.test(previousText);
 	const previousEndsJoinableToken = /[\p{L}\p{N}\p{M}'\u2019"\u201d)}\]]$/u.test(previousText);
 	const previousEndsContinuation = /[,;:([{\-/\u2010-\u2014]$/u.test(previousText);
 	const nextStartsLowercase = /^\p{Ll}/u.test(nextText);
 	const nextIsClosingPunctuation = /^[,.;:!?%)}\]]$/u.test(nextText);
-	const nextStartsJoinedDash = /^[\u2010-\u2014-]\S/u.test(nextText);
+	const nextStartsCompoundSuffix = /^(?:-(?!-)|[\u2010-\u2014])\p{Ll}{2,}/u.test(nextText);
 
 	return (previousEndsJoinableToken && nextIsClosingPunctuation)
-		|| (previousEndsWord && nextStartsJoinedDash)
+		|| (previousEndsLetter && nextStartsCompoundSuffix)
 		|| ((previousEndsWord || previousEndsContinuation) && nextStartsLowercase);
 }
 
@@ -67,7 +68,8 @@ function joinFragments(previous: string, next: string): string {
 	const previousText = previous.trimEnd();
 	const nextText = next.trimStart();
 	const joinsWithoutSpace = /^[,.;:!?%)}\]]/u.test(nextText)
-		|| (/^[\u2010-\u2014-]\S/u.test(nextText) && /[\p{L}\p{N}]$/u.test(previousText));
+		|| (/^(?:-(?!-)|[\u2010-\u2014])\p{Ll}{2,}/u.test(nextText) && /\p{L}$/u.test(previousText))
+		|| /[([{\/\-\u2010-\u2014]$/u.test(previousText);
 	return `${previousText}${joinsWithoutSpace ? '' : ' '}${nextText}`;
 }
 
