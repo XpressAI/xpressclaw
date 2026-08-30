@@ -19,7 +19,10 @@
 		validWorkspacePane,
 		workspaceId,
 		workspacePath,
+		WORKSPACE_OPEN_SPLIT_EVENT,
+		TASK_FILE_SPLIT_MIN_PANE_WIDTH,
 		type WorkspacePaneState,
+		type WorkspaceOpenSplitDetail,
 		type ProjectSection,
 		type WorkspaceTab,
 		type WorkspaceTabKind,
@@ -44,6 +47,7 @@
 		: 'xpressclaw.workspace.v1';
 	const MAX_PANES = 4;
 	const MAX_TABS = 10;
+	const MIN_PANE_WIDTH = 380;
 	let recencyClock = Date.now();
 	const initialRoute = currentRoute();
 	const initialDescription = describeWorkspacePath(initialRoute);
@@ -464,8 +468,7 @@
 	}
 
 	function splitPane(paneId: string) {
-		if (panes.length >= MAX_PANES) return;
-		if (workspaceEl && workspaceEl.clientWidth / (panes.length + 1) < 380) return;
+		if (!canCreatePane()) return;
 		const paneIndex = panes.findIndex((pane) => pane.id === paneId);
 		if (paneIndex < 0) return;
 		const pane = panes[paneIndex];
@@ -481,6 +484,38 @@
 		focusedPaneId = nextPane.id;
 		panes = enforceTabLimit(panes);
 		persistWorkspace();
+	}
+
+	function canCreatePane(minimumPaneWidth = MIN_PANE_WIDTH): boolean {
+		return panes.length < MAX_PANES
+			&& (!workspaceEl || workspaceEl.clientWidth / (panes.length + 1) >= minimumPaneWidth);
+	}
+
+	function openPathInSplit(route: string) {
+		if (!workspacePath(route)) return;
+		if (!canCreatePane(TASK_FILE_SPLIT_MIN_PANE_WIDTH)) {
+			openPath(route);
+			return;
+		}
+		const paneIndex = Math.max(0, panes.findIndex((pane) => pane.id === focusedPaneId));
+		const tab = decorateTab({ ...createWorkspaceTab(route), lastActiveAt: nextTabRecency() });
+		const nextPane: WorkspacePaneState = { id: workspaceId('pane'), tabs: [tab], activeTabId: tab.id, width: 1 };
+		panes = [
+			...panes.slice(0, paneIndex + 1),
+			nextPane,
+			...panes.slice(paneIndex + 1),
+		].map((candidate) => ({ ...candidate, width: 1 }));
+		focusedPaneId = nextPane.id;
+		panes = enforceTabLimit(panes);
+		persistWorkspace();
+		if (currentRoute() !== route) {
+			lastSyncedPath = route;
+			goto(route, { keepFocus: true, noScroll: true });
+		}
+	}
+
+	function handleOpenSplit(event: Event) {
+		openPathInSplit((event as CustomEvent<WorkspaceOpenSplitDetail>).detail.path);
 	}
 
 	function startResize(index: number, event: PointerEvent) {
@@ -703,6 +738,7 @@
 		const handleOnline = () => void checkConnection();
 		window.addEventListener('online', handleOnline);
 		window.addEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+		window.addEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
 		const interval = setInterval(() => {
 			loadWorkspaceSummary();
 			checkConnection();
@@ -712,6 +748,7 @@
 			clearInterval(interval);
 			window.removeEventListener('online', handleOnline);
 			window.removeEventListener(PROJECT_MUTATION_EVENT, handleProjectMutation);
+			window.removeEventListener(WORKSPACE_OPEN_SPLIT_EVENT, handleOpenSplit);
 		};
 	});
 </script>
@@ -834,7 +871,7 @@
 							{pane}
 							focused={pane.id === focusedPaneId}
 							compact={panes.length > 1}
-							canSplit={panes.length < MAX_PANES && (!workspaceEl || workspaceEl.clientWidth / (panes.length + 1) >= 380)}
+							canSplit={canCreatePane()}
 							onfocus={() => focusPane(pane.id)}
 							onactivate={(tab) => activateTab(pane.id, tab)}
 							onclose={(tab) => closeTab(pane.id, tab)}
