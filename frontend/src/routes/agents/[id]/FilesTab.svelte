@@ -39,11 +39,7 @@
 		const requestedRoute = route;
 		if (!initialized || requestedRoute === syncedRoute) return;
 		syncedRoute = requestedRoute;
-		const requested = routeState(requestedRoute);
-		showTree = requested.showTree;
-		if (requested.path && requested.path !== selectedPath) {
-			void openFile(requested.path, false, false);
-		}
+		void applyRoute(requestedRoute);
 	});
 
 	function routeState(value: string): { path: string; showTree: boolean } {
@@ -53,6 +49,31 @@
 			path: params.get('path') ?? '',
 			showTree: params.get('tree') !== 'collapsed',
 		};
+	}
+
+	function routeForFileState(value: string, path: string, treeVisible: boolean): string {
+		const url = new URL(value || window.location.href, window.location.origin);
+		if (path) url.searchParams.set('path', path);
+		else url.searchParams.delete('path');
+		if (treeVisible) url.searchParams.delete('tree');
+		else url.searchParams.set('tree', 'collapsed');
+		return `${url.pathname}${url.search}${url.hash}`;
+	}
+
+	async function applyRoute(requestedRoute: string) {
+		const previousPath = selectedPath;
+		const previousShowTree = showTree;
+		const requested = routeState(requestedRoute);
+		showTree = requested.showTree;
+		if (!requested.path || requested.path === selectedPath) return;
+
+		const opened = await openFile(requested.path, false, false);
+		if (opened || route !== requestedRoute) return;
+
+		showTree = previousShowTree;
+		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
+		syncedRoute = restoredRoute;
+		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
 	}
 
 	async function initialize() {
@@ -104,8 +125,8 @@
 		}
 	}
 
-	async function openFile(path: string, force = false, navigate = true) {
-		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) return;
+	async function openFile(path: string, force = false, navigate = true): Promise<boolean> {
+		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) return false;
 		loadingFile = true;
 		error = '';
 		saveMessage = '';
@@ -129,8 +150,10 @@
 				url.searchParams.set('path', path);
 				await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
 			}
+			return true;
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
+			return false;
 		} finally {
 			loadingFile = false;
 		}
@@ -171,10 +194,7 @@
 
 	async function toggleTree() {
 		showTree = !showTree;
-		const url = new URL(window.location.href);
-		if (showTree) url.searchParams.delete('tree');
-		else url.searchParams.set('tree', 'collapsed');
-		await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
+		await goto(routeForFileState(window.location.href, selectedPath, showTree), { replaceState: true, keepFocus: true, noScroll: true });
 	}
 
 	function statusLabel(change: GitChange): string {

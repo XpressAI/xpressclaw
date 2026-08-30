@@ -37,6 +37,7 @@ export interface WorkspacePaneState {
 }
 
 export const WORKSPACE_OPEN_SPLIT_EVENT = 'xpressclaw:workspace-open-split';
+export const TASK_FILE_SPLIT_MIN_PANE_WIDTH = 480;
 
 export interface WorkspaceOpenSplitDetail {
 	path: string;

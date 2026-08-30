@@ -3443,13 +3443,52 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await focusedPane.getByRole('button', { name: 'Show files' }).click();
 	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
 
-	const firstTaskPane = page.locator('[data-workspace-pane]').first();
-	await firstTaskPane.locator('[data-task-changed-files]').getByRole('link', { name: 'README.md' }).click();
+	const editor = focusedPane.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const unsaved = true;');
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	const requestReadme = () => page.evaluate(({ requestedAgentId }) => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
+			detail: { path: `/agents/${requestedAgentId}?tab=files&path=README.md&tree=collapsed` },
+		}));
+	}, { requestedAgentId: agentId });
+
+	page.once('dialog', (dialog) => void dialog.dismiss());
+	await requestReadme();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	page.once('dialog', (dialog) => void dialog.accept());
+	await requestReadme();
 
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
 	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
 	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
+});
+
+test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]')).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]').first()).toBeHidden();
+	await expect(panes.locator('[data-task-details-sidebar]').last()).toBeHidden();
+	await expect(panes.locator(`#task-message-input-${taskId}`)).toHaveCount(2);
+
+	const transcriptWidths = await panes.locator('[data-task-transcript-scroll]').evaluateAll((elements) =>
+		elements.map((element) => element.getBoundingClientRect().width),
+	);
+	expect(transcriptWidths.every((width) => width >= 350)).toBe(true);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {

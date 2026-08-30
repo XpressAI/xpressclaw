@@ -20,6 +20,7 @@
 		workspaceId,
 		workspacePath,
 		WORKSPACE_OPEN_SPLIT_EVENT,
+		TASK_FILE_SPLIT_MIN_PANE_WIDTH,
 		type WorkspacePaneState,
 		type WorkspaceOpenSplitDetail,
 		type ProjectSection,
@@ -47,7 +48,6 @@
 	const MAX_PANES = 4;
 	const MAX_TABS = 10;
 	const MIN_PANE_WIDTH = 380;
-	const TASK_FILE_SPLIT_MIN_PANE_WIDTH = 480;
 	let recencyClock = Date.now();
 	const initialRoute = currentRoute();
 	const initialDescription = describeWorkspacePath(initialRoute);
