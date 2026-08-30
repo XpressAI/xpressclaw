@@ -1290,16 +1290,17 @@ test('agent update coalescing does not cross attempt, time, or tool boundaries',
 	await mockApi(page, {
 		taskMessages: [],
 		taskActivityEvents: [
-			timelineEvent(1, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
-			timelineEvent(2, 10, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'completed' }),
-			timelineEvent(3, 10, 'runner_progress', 'the migration', { item_type: 'agent_message', message_id: 'after-tool' }),
-			timelineEvent(4, 20, 'runner_progress', 'Checking', { item_type: 'agent_message', message_id: 'attempt-a' }),
+			timelineEvent(1, 9, 'tool_call', 'Read the project', { toolCallId: 'tool-boundary', status: 'in_progress' }),
+			timelineEvent(2, 10, 'runner_progress', 'Reading', { item_type: 'agent_message', message_id: 'before-tool' }),
+			timelineEvent(3, 10, 'tool_call_update', 'Completed Read the project', { toolCallId: 'tool-boundary', status: 'completed' }),
+			timelineEvent(4, 10, 'runner_progress', 'the migration', { item_type: 'agent_message', message_id: 'after-tool' }),
+			timelineEvent(5, 20, 'runner_progress', 'Checking', { item_type: 'agent_message', message_id: 'attempt-a' }),
 			{
-				...timelineEvent(5, 20, 'runner_progress', 'the workspace', { item_type: 'agent_message', message_id: 'attempt-b' }),
+				...timelineEvent(6, 20, 'runner_progress', 'the workspace', { item_type: 'agent_message', message_id: 'attempt-b' }),
 				attempt_id: 'attempt-browser-test-2',
 			},
-			timelineEvent(6, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
-			timelineEvent(7, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
+			timelineEvent(7, 30, 'runner_progress', 'Inspecting', { item_type: 'agent_message', message_id: 'early' }),
+			timelineEvent(8, 33, 'runner_progress', 'the repository', { item_type: 'agent_message', message_id: 'late' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
