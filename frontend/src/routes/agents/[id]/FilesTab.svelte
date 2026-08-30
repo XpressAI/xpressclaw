@@ -222,7 +222,9 @@
 
 	async function toggleTree() {
 		showTree = !showTree;
-		await goto(routeForFileState(window.location.href, selectedPath, showTree), { replaceState: true, keepFocus: true, noScroll: true });
+		const currentRoute = route || window.location.href;
+		const requestedPath = routeState(currentRoute).path;
+		await goto(routeForFileState(currentRoute, requestedPath, showTree), { replaceState: true, keepFocus: true, noScroll: true });
 	}
 
 	function statusLabel(change: GitChange): string {
