@@ -8,7 +8,9 @@ use crate::conversations::{row_to_message, ConversationManager, ConversationMess
 use crate::dashboard::finalize_inactive_git_baselines;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::message_artifacts::PublishedFileAttachment;
 use crate::projects::ensure_project_accepts_work;
+use crate::visualizations::{store_conversation_message_visualizations, PreparedVisualization};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationTurn {
@@ -388,15 +390,35 @@ impl ConversationTurnQueue {
         })
     }
 
-    /// Store an Agent response and finish its turn in the same transaction.
-    /// A participant removed while the prompt is running cannot publish a
-    /// late response: cancellation wins before either record becomes visible.
+    /// Store an Agent response and its copied artifacts, then finish the turn
+    /// in the same transaction. A participant removed while the prompt is
+    /// running cannot publish a late response: cancellation wins before any
+    /// of those records become visible.
     pub fn complete_with_message(
         &self,
         turn: &ConversationTurn,
         native_session_id: &str,
         message: &SendMessage,
         metadata: &serde_json::Value,
+    ) -> Result<Option<ConversationMessage>> {
+        self.complete_with_message_and_visualizations(
+            turn,
+            native_session_id,
+            message,
+            metadata,
+            &[],
+            &[],
+        )
+    }
+
+    pub fn complete_with_message_and_visualizations(
+        &self,
+        turn: &ConversationTurn,
+        native_session_id: &str,
+        message: &SendMessage,
+        metadata: &serde_json::Value,
+        visualizations: &[PreparedVisualization],
+        published_files: &[PublishedFileAttachment],
     ) -> Result<Option<ConversationMessage>> {
         self.db.with_conn(|conn| {
             let transaction = conn.unchecked_transaction()?;
@@ -444,6 +466,28 @@ impl ConversationTurnQueue {
                 [message_id],
                 row_to_message,
             )?;
+            store_conversation_message_visualizations(
+                &transaction,
+                message_id,
+                None,
+                Some(&turn.id),
+                visualizations,
+            )?;
+            for attachment in published_files {
+                transaction.execute(
+                    "INSERT INTO conversation_message_attachments
+                     (id, message_id, name, mime_type, data, size, source_task_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        message_id,
+                        attachment.name,
+                        attachment.mime_type,
+                        attachment.data,
+                        attachment.data.len() as i64,
+                    ],
+                )?;
+            }
             Self::enqueue_for_message_in_transaction(
                 &transaction,
                 &turn.conversation_id,
@@ -919,7 +963,7 @@ mod tests {
         assert_eq!(running.trigger_message_id, Some(request.id));
 
         let response = queue
-            .complete_with_message(
+            .complete_with_message_and_visualizations(
                 &running,
                 "session",
                 &SendMessage {
@@ -930,9 +974,20 @@ mod tests {
                     message_type: None,
                 },
                 &serde_json::json!({}),
+                &[],
+                &[PublishedFileAttachment {
+                    name: "Review.pptx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            .into(),
+                    data: b"presentation".to_vec(),
+                }],
             )
             .unwrap()
             .unwrap();
+        let attachments = manager.attachments(response.id).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "Review.pptx");
 
         let turns = queue.list_for_conversation(&conversation.id, 10).unwrap();
         assert!(turns.iter().any(|turn| {

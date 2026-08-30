@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 use crate::projects::ensure_project_accepts_work;
 use crate::tasks::board::{CreateTask, Task, TaskBoard};
 use crate::tasks::queue::TaskQueue;
+use crate::visualizations::{
+    store_conversation_message_visualizations, MessageVisualization, PreparedVisualization,
+    VisualizationManager,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -638,6 +642,31 @@ impl ConversationManager {
         Vec<ConversationAttachment>,
         Vec<String>,
     )> {
+        self.send_agent_routed_message_with_visualizations(
+            conv_id,
+            msg,
+            source_task_id,
+            attachments,
+            None,
+            &[],
+        )
+    }
+
+    /// Publish a final Agent message and its already-copied visualization
+    /// fragments atomically with membership validation and peer routing.
+    pub fn send_agent_routed_message_with_visualizations(
+        &self,
+        conv_id: &str,
+        msg: &SendMessage,
+        source_task_id: Option<&str>,
+        attachments: &[NewConversationAttachment],
+        attempt_id: Option<&str>,
+        visualizations: &[PreparedVisualization],
+    ) -> Result<(
+        ConversationMessage,
+        Vec<ConversationAttachment>,
+        Vec<String>,
+    )> {
         validate_new_attachments(attachments)?;
         if msg.sender_type != "agent" {
             return Err(Error::Conversation(
@@ -701,6 +730,13 @@ impl ConversationManager {
                 source_task_id,
                 None,
                 attachments,
+            )?;
+            store_conversation_message_visualizations(
+                &transaction,
+                message.id,
+                attempt_id,
+                None,
+                visualizations,
             )?;
             let queued_agents = runtime::ConversationTurnQueue::enqueue_for_message_in_transaction(
                 &transaction,
@@ -909,6 +945,10 @@ impl ConversationManager {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(attachments)
         })
+    }
+
+    pub fn visualizations(&self, message_id: i64) -> Result<Vec<MessageVisualization>> {
+        VisualizationManager::new(self.db.clone()).list_for_conversation_message(message_id)
     }
 
     pub fn attachment_data(

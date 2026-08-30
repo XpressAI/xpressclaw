@@ -79,12 +79,12 @@ loads its durable state and resumes polling/event streams. A server process
 restart is a separate lifecycle event: interrupted work is recovered into the
 queue and workflow bookkeeping resumes on startup.
 
-A future client-side **connection profile** will identify an instance URL and
-protected credential. “Profile” is not another name for a server directory.
-Desktop currently starts one local sidecar, enforces one app process, and
-routes every window to it. Native local/remote profile switching and
-per-window profile binding are intentionally deferred until authentication and
-credential storage exist.
+A client-side **connection profile** identifies an instance URL, pinned
+instance identity, authentication mode, and OS-keychain credential. “Profile”
+is not another name for a server directory. Desktop still starts one local
+sidecar and currently enforces one selected profile for every app window;
+switching profiles closes secondary windows before reconnecting. Optional
+authentication and the profile threat model are specified by ADR-040.
 
 ### Remote access is loopback-safe by default
 
@@ -95,12 +95,11 @@ runner callback listener. Every callback request requires a random per-process
 capability injected only into bundled runner MCP processes; the callback port
 is neither stable nor a client connection surface.
 
-Remote clients use an SSH tunnel or an authenticated TLS reverse proxy that
-keeps the user-facing XpressClaw backend on loopback. A non-loopback CLI bind
-requires the explicit `--allow-insecure-remote` acknowledgement because
-XpressClaw has no built-in user authentication today. The acknowledgement
-changes no security property and is intended only for deployments protected by
-another complete access-control layer.
+Remote clients may use an SSH tunnel, TLS reverse proxy, or direct
+operator-trusted LAN/tailnet access. Non-loopback access without app
+authentication requires an explicit CLI or persisted Settings acknowledgement.
+Optional password/token authentication protects every user-facing route but
+does not provide TLS. The separate runner callback capability is unchanged.
 
 ## Consequences
 
@@ -115,9 +114,7 @@ another complete access-control layer.
   existing installations keep their prior database locations until an
   operator deliberately changes them.
 - The previous implicit LAN exposure is removed. Direct remote access remains
-  an advanced, externally secured deployment rather than a misleadingly safe
-  default.
-- Desktop remote profiles, per-window instance selection, application-level
-  authentication, and portable Agent templates remain necessary follow-up
-  work. They should land together with explicit threat models and migrations,
-  not as URL fields that imply security the server does not provide.
+  explicit, with optional app authentication and operator-owned transport
+  security rather than misleading defaults.
+- Desktop remote profiles use one app-wide selection and keychain isolation.
+  Portable Agent templates remain outside this instance/client decision.

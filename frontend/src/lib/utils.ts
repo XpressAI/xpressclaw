@@ -1,6 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import { serverTimestampMs } from './serverTime';
+import { request } from './api';
 
 export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
@@ -28,7 +29,7 @@ export function formatCost(usd: number): string {
 /** Open a URL in the system browser via the server, with browser fallback. */
 export async function openExternal(url: string): Promise<void> {
 	try {
-		await fetch('/api/open-url', {
+		await request<void>('/api/open-url', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ url })

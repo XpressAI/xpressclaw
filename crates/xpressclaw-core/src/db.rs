@@ -2350,6 +2350,81 @@ WHERE se.event_type = 'tool_call'
   );
 "#;
 
+const MIGRATION_V42: &str = r#"
+-- Codex inline visualizations are copied into the control-plane database at
+-- final-message ingestion time. Exactly one message owns each artifact; the
+-- attempt/turn columns retain execution provenance without making pruning an
+-- accidental deletion boundary for a still-visible message.
+CREATE TABLE message_visualizations (
+    id TEXT PRIMARY KEY,
+    task_message_id INTEGER REFERENCES task_messages(id) ON DELETE CASCADE,
+    conversation_message_id INTEGER REFERENCES conversation_messages(id) ON DELETE CASCADE,
+    attempt_id TEXT REFERENCES work_attempts(id) ON DELETE SET NULL,
+    conversation_turn_id TEXT REFERENCES conversation_turns(id) ON DELETE SET NULL,
+    reference_index INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    display_mode TEXT NOT NULL DEFAULT 'normal'
+        CHECK (display_mode IN ('normal', 'wide')),
+    status TEXT NOT NULL
+        CHECK (status IN ('ready', 'unavailable')),
+    error_code TEXT,
+    content TEXT,
+    content_sha256 TEXT,
+    size INTEGER,
+    retrieval_token TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (task_message_id IS NOT NULL AND conversation_message_id IS NULL) OR
+        (task_message_id IS NULL AND conversation_message_id IS NOT NULL)
+    ),
+    CHECK (
+        (status = 'ready' AND content IS NOT NULL AND error_code IS NULL
+          AND content_sha256 IS NOT NULL AND length(content_sha256) = 64
+          AND size BETWEEN 1 AND 1048576
+          AND length(CAST(content AS BLOB)) = size) OR
+        (status = 'unavailable' AND content IS NULL AND error_code IS NOT NULL
+          AND content_sha256 IS NULL AND size IS NULL)
+    )
+);
+CREATE UNIQUE INDEX idx_message_visualizations_task_reference
+    ON message_visualizations(task_message_id, reference_index)
+    WHERE task_message_id IS NOT NULL;
+CREATE UNIQUE INDEX idx_message_visualizations_conversation_reference
+    ON message_visualizations(conversation_message_id, reference_index)
+    WHERE conversation_message_id IS NOT NULL;
+CREATE INDEX idx_message_visualizations_attempt
+    ON message_visualizations(attempt_id);
+CREATE INDEX idx_message_visualizations_turn
+    ON message_visualizations(conversation_turn_id);
+"#;
+
+const MIGRATION_V43: &str = r#"
+-- An Agent's bootstrap workspace remains the writable security boundary while
+-- this local-only selection records the narrower repository used as ACP cwd.
+-- Portable Project sync intentionally excludes this machine-specific path.
+CREATE TABLE agent_repository_selections (
+    agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+    relative_path TEXT,
+    repository_identity TEXT,
+    selection_mode TEXT NOT NULL DEFAULT 'automatic'
+        CHECK (selection_mode IN ('automatic', 'manual', 'cleared')),
+    pending_relative_path TEXT,
+    pending_selection_mode TEXT
+        CHECK (pending_selection_mode IN ('manual', 'cleared')),
+    generation INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CHECK (relative_path IS NOT NULL OR repository_identity IS NULL),
+    CHECK (selection_mode != 'cleared' OR relative_path IS NULL),
+    CHECK (
+        (pending_selection_mode IS NULL AND pending_relative_path IS NULL) OR
+        (pending_selection_mode = 'manual' AND pending_relative_path IS NOT NULL) OR
+        (pending_selection_mode = 'cleared' AND pending_relative_path IS NULL)
+    )
+);
+CREATE INDEX idx_agent_repository_updated
+    ON agent_repository_selections(updated_at);
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2444,6 +2519,8 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (39, MIGRATION_V39),
         (40, MIGRATION_V40),
         (41, MIGRATION_V41),
+        (42, MIGRATION_V42),
+        (43, MIGRATION_V43),
     ]
 }
 
@@ -2464,7 +2541,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "41");
+        assert_eq!(version, "43");
+        let visualization_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'message_visualizations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visualization_table, 1);
         let deletion_marker: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('projects')

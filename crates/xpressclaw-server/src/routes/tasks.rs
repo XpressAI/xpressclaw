@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -12,12 +12,15 @@ use xpressclaw_core::tasks::attachments::{decode_image_attachments, ImageAttachm
 use xpressclaw_core::tasks::board::{CreateTask, Task, TaskBoard, TaskStatus, UpdateTask};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
+use xpressclaw_core::visualizations::VisualizationManager;
 use xpressclaw_core::workers::acp::{
     AcpElicitationResponseError, AcpInterruptMode, CreateElicitationResponse,
 };
 use xpressclaw_core::workers::{github, github_review::GithubReviewManager, native};
 
 use crate::state::AppState;
+
+use super::visualizations;
 
 #[derive(Deserialize)]
 pub struct ListParams {
@@ -121,6 +124,10 @@ pub fn routes() -> Router<AppState> {
             "/{id}/messages/{message_id}/attachments/{attachment_id}",
             get(get_message_attachment),
         )
+        .route(
+            "/{id}/messages/{message_id}/visualizations/{artifact_id}",
+            get(get_message_visualization),
+        )
         .route("/{id}/activity", get(get_activity))
         .route("/{id}/pull-requests", post(register_pull_request))
         .route(
@@ -133,8 +140,19 @@ pub fn routes() -> Router<AppState> {
 async fn register_pull_request(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<PullRequestInput>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    if headers
+        .get("x-xpressclaw-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|agent_id| agent_id != request.agent_id)
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "pull-request registration must target the calling Agent" })),
+        ));
+    }
     let config = state.config();
     let agent = config
         .agents
@@ -147,12 +165,14 @@ async fn register_pull_request(
             )
         })?;
     let workspace = native::resolved_workspace(&config, agent);
-    let access = github::discover(&state.db, &workspace).ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
-        )
-    })?;
+    let access = github_access_for_workspace(&state, agent.name.clone(), workspace)
+        .await?
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "project-scoped GitHub access is unavailable" })),
+            )
+        })?;
     let manager = GithubReviewManager::new(state.db.clone());
     match request.phase {
         PullRequestRegistrationPhase::Begin => {
@@ -416,9 +436,11 @@ async fn update_task(
 
     // Check if agent is being assigned — we may need to enqueue
     let new_agent = req.agent_id.clone();
-    let agent_repository = new_agent
-        .as_deref()
-        .and_then(|agent_id| github_access_for_agent(&state, agent_id));
+    let agent_repository = if let Some(agent_id) = new_agent.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
 
     let task = board
         .update_with_agent_repository(
@@ -541,6 +563,13 @@ async fn update_task_status(
             .map_err(internal_error)?;
         return Ok(Json(json!(board.get(&id).map_err(internal_error)?)));
     }
+    let agent_repository = if req.status == "completed" {
+        None
+    } else if let Some(agent_id) = req.agent_id.as_deref() {
+        github_access_for_agent(&state, agent_id).await
+    } else {
+        None
+    };
     let updated = if req.status == "completed" {
         board
             .complete_and_roll_up(&id, req.agent_id.as_deref())
@@ -551,10 +580,6 @@ async fn update_task_status(
                     .ok_or_else(|| xpressclaw_core::error::Error::Task("task is not ready".into()))
             })
     } else {
-        let agent_repository = req
-            .agent_id
-            .as_deref()
-            .and_then(|agent_id| github_access_for_agent(&state, agent_id));
         board.update_status_with_agent_repository(
             &id,
             &req.status,
@@ -579,14 +604,27 @@ async fn update_task_status(
     Ok(Json(json!(task)))
 }
 
-fn github_access_for_agent(
+async fn github_access_for_agent(
     state: &AppState,
     agent_id: &str,
 ) -> Option<github::GithubSessionAccess> {
     let config = state.config();
     let agent = config.agents.iter().find(|agent| agent.name == agent_id)?;
     let workspace = native::resolved_workspace(&config, agent);
-    github::discover(&state.db, &workspace)
+    github_access_for_workspace(state, agent.name.clone(), workspace)
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn github_access_for_workspace(
+    state: &AppState,
+    agent_id: String,
+    workspace: std::path::PathBuf,
+) -> Result<Option<github::GithubSessionAccess>, (StatusCode, Json<Value>)> {
+    xpressclaw_core::repositories::discover_active_github_access(&state.db, &agent_id, &workspace)
+        .await
+        .map_err(internal_error)
 }
 
 async fn task_counts(
@@ -616,18 +654,64 @@ async fn get_message_attachment(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "image attachment not found" })),
+                Json(json!({ "error": "attachment not found" })),
             )
         })?;
+    let disposition = if attachment.mime_type.starts_with("image/") {
+        "inline"
+    } else {
+        "attachment"
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, attachment.mime_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!(
+                "{disposition}; filename=\"{}\"",
+                safe_attachment_filename(&attachment.name)
+            ),
+        )
+        .header("x-content-type-options", "nosniff")
         .header(
             header::CACHE_CONTROL,
             "private, max-age=31536000, immutable",
         )
         .body(Body::from(attachment.data))
         .map_err(internal_error)
+}
+
+fn safe_attachment_filename(name: &str) -> String {
+    name.chars()
+        .map(|character| match character {
+            '\r' | '\n' | '"' | '\\' => '_',
+            other if other == ' ' || other.is_ascii_graphic() => other,
+            _ => '_',
+        })
+        .collect()
+}
+
+async fn get_message_visualization(
+    State(state): State<AppState>,
+    Path((id, message_id, artifact_id)): Path<(String, i64, String)>,
+    headers: HeaderMap,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let token = visualizations::retrieval_token(&headers).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "visualization not found" })),
+        )
+    })?;
+    let artifact = VisualizationManager::new(state.db.clone())
+        .task_artifact(&id, message_id, &artifact_id, token)
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "visualization not found" })),
+            )
+        })?;
+    visualizations::artifact_response(artifact).map_err(internal_error)
 }
 
 async fn get_activity(
@@ -957,6 +1041,7 @@ mod tests {
 
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::message_artifacts::PublishedFileAttachment;
 
     use super::*;
 
@@ -1744,8 +1829,65 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "image/png");
+        assert_eq!(
+            resp.headers()["content-disposition"],
+            "inline; filename=\"screen.png\""
+        );
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), b"\x89PNG\r\n\x1a\nbytes");
+    }
+
+    #[tokio::test]
+    async fn generated_presentation_is_downloaded_without_content_sniffing() {
+        let (app, db) = test_app_with_db();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Presentation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = TaskConversation::new(db)
+            .add_final_assistant_message(
+                &task.id,
+                "The checked deck is attached.",
+                "attempt-presentation",
+                &[],
+                &[PublishedFileAttachment {
+                    name: "Résumé \"deck\"\r\n.pptx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            .into(),
+                    data: b"pptx fixture".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/tasks/{}/messages/{}/attachments/{}",
+                        task.id, message.id, message.attachments[0].id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        );
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"R_sum_ _deck___.pptx\""
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"pptx fixture");
     }
 
     #[tokio::test]
@@ -2101,5 +2243,76 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event["event_type"] == "attempt_queued"));
+    }
+
+    #[tokio::test]
+    async fn visualization_retrieval_requires_its_message_scoped_capability() {
+        let (app, db) = test_app_with_db();
+        let message_id = db
+            .with_conn(|connection| -> std::result::Result<i64, xpressclaw_core::error::Error> {
+                connection.execute(
+                    "INSERT INTO tasks (id, title) VALUES ('visual-task', 'Visual'), ('other-task', 'Other')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO task_messages (task_id, role, content)
+                     VALUES ('visual-task', 'assistant', 'visual')",
+                    [],
+                )?;
+                let message_id = connection.last_insert_rowid();
+                connection.execute(
+                    "INSERT INTO message_visualizations
+                     (id, task_message_id, reference_index, title, display_mode,
+                      status, content, content_sha256, size, retrieval_token)
+                     VALUES ('viz-route', ?1, 0, 'Route test', 'normal',
+                             'ready', '<div data-secret>safe</div>',
+                             '0000000000000000000000000000000000000000000000000000000000000000',
+                             27, 'route-token')",
+                    [message_id],
+                )?;
+                Ok(message_id)
+            })
+            .unwrap();
+
+        let path = format!("/tasks/visual-task/messages/{message_id}/visualizations/viz-route");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(&path)
+                    .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::REFERRER_POLICY], "no-referrer");
+        assert!(response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("connect-src 'none'"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("<div data-secret>safe</div>"));
+        assert!(body.contains("const encodedDocument ="));
+        assert!(body.contains("child.setAttribute(\"sandbox\", \"allow-scripts\")"));
+
+        for request in [
+            Request::get(&path)
+                .header(visualizations::RETRIEVAL_TOKEN_HEADER, "wrong")
+                .body(Body::empty())
+                .unwrap(),
+            Request::get(format!(
+                "/tasks/other-task/messages/{message_id}/visualizations/viz-route"
+            ))
+            .header(visualizations::RETRIEVAL_TOKEN_HEADER, "route-token")
+            .body(Body::empty())
+            .unwrap(),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::NOT_FOUND
+            );
+        }
     }
 }

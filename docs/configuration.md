@@ -40,6 +40,49 @@ system:
 agents: []
 ```
 
+## Listener and optional authentication
+
+The migration-safe defaults are loopback port 8935 with application
+authentication off. **Settings → Instance** edits this instance-local block:
+
+```yaml
+instance:
+  bind: 127.0.0.1
+  port: 8935
+  authentication_enabled: false
+  allow_unauthenticated_remote: false
+```
+
+`allow_unauthenticated_remote` is an explicit acknowledgement, not an access
+control or encryption setting. The UI sets it only after warning about a
+non-loopback listener with authentication off. `xpressclaw up --bind` and
+`--port` override saved values for one start; the existing
+`--allow-insecure-remote` flag acknowledges an explicit CLI no-auth remote
+bind. Saved bind/port/authentication-mode edits take effect on restart, and the
+UI shows saved and effective values separately.
+
+Passwords are never represented in YAML. XpressClaw writes only a memory-hard
+Argon2id verifier to `instance-auth.json` under `system.data_dir`, with
+restricted file permissions. The long-lived Ed25519 private key used to prove
+instance identity is stored separately in restricted `instance-identity.json`;
+Desktop profiles retain only its public key. Browser sessions and no-password
+startup tokens are process-local and disappear on restart. These secret files,
+Desktop profile data, and sessions are outside Project synchronization. Desktop
+stores remote profile credentials in the operating-system keychain; its JSON
+profile file contains only non-secret connection metadata. Automatic keychain
+login is limited to the exact local HTTP identity announced by the sidecar
+whose listeners Desktop started. Desktop opens a one-use encrypted channel
+authenticated by that identity; browser-session material returns through the
+same channel and is installed as an HttpOnly cookie by native Desktop, so web
+content receives no credential, session value, or redeemable bearer ticket.
+Remote profiles use the normal browser login, even over HTTPS, because native
+code cannot bind the browser's cookie-bearing connection to the separately
+proved XpressClaw identity. The channel protects native secrets but does not
+replace TLS for the subsequent browser session.
+
+Application authentication does not provide TLS. See [Remote
+access](remote-access.md) before selecting a non-loopback address.
+
 ## Project lifecycle and configuration
 
 One control-plane instance can contain many Projects. Deleting a Project from
@@ -97,7 +140,7 @@ agents:
 |---|---|
 | `kind` | Built-in catalog ID such as `codex`, `claude`, `deepseek-harness`, or `opencode`; otherwise `custom` |
 | `image` | Product-specific ACP server image or compatible derivative |
-| `workspace` | Host project mounted read-write at `/workspace`, or at the same absolute path in host-engine mode |
+| `workspace` | Host writable bootstrap boundary mounted at `/workspace`, or at the same absolute path in host-engine mode. The active Git repository may be this folder or one selected checkout beneath it. |
 | `project_name` | User-facing Agent name; falls back to the workspace folder when omitted |
 | `model` | Optional model value ID applied through ACP session configuration |
 | `subscription_auth` | Reuse the built-in product's host login directory |
@@ -176,6 +219,25 @@ authoritative for that session.
 ## Existing repositories and SSH remotes
 
 An existing workspace is mounted read-write, including its `.git` directory.
+For an Agent created without a path, XpressClaw creates
+`<data-dir>/workspaces/<agent-id>` and never reuses the instance root. A local
+SQLite selection records an active repository relative to that workspace; it
+is runtime state, not portable `xpressclaw.yaml` configuration. Existing
+explicit workspaces and legacy files are not moved during migration.
+
+Repository discovery occurs at safe turn boundaries and through explicit
+GitHub-tool `cwd` resolution. It is bounded, does not follow symlinks, and stays
+inside the configured writable workspace. A root
+repository wins; exactly one nested repository is adopted; multiple nested
+repositories require an explicit choice in **Agent → Environment**. If the
+bounded scan reaches its safety limit, XpressClaw also requires an explicit
+selection rather than assuming the partial candidate list is complete. Changing
+or clearing the active repository recreates the Agent's retained ACP session
+on the next turn while preserving Tasks, Conversations, and managed review
+state. Files, Git status, the ACP working directory, and the bundled GitHub MCP
+then use the active repository. The workspace remains the outer mount and
+authorization boundary.
+
 For GitHub repositories, XpressClaw prefers its project-scoped HTTPS credential
 helper and rewrites the standard `git@github.com:` remote forms when a GitHub
 connector is available. No SSH key is needed for that path.

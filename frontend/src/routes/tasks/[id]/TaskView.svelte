@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { tasks, agents, sessions, workspaces } from '$lib/api';
-	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus } from '$lib/api';
+	import type { AcpCommand, AcpConfigOption, AcpModeState, Task, TaskMessage, Agent, WorkAttempt, SessionEvent, ImageAttachmentUpload, GitChange, WorkspaceGitStatus, MessageVisualization } from '$lib/api';
 	import { timeAgo } from '$lib/utils';
 	import { serverTimestampMs } from '$lib/serverTime';
 	import { renderContent } from '$lib/formatMessage';
@@ -79,7 +79,9 @@
 			timestamp: string;
 			role: string;
 			content: string;
-			attachments: { id?: string; name: string; src: string }[];
+			messageId?: number;
+			attachments: { id?: string; name: string; src: string; mimeType?: string; size?: number }[];
+			visualizations: MessageVisualization[];
 			sequence: number;
 		}
 		| {
@@ -190,6 +192,7 @@
 				role: 'user',
 				content: taskPrompt,
 				attachments: [],
+				visualizations: [],
 				sequence: -1,
 			});
 		}
@@ -199,11 +202,15 @@
 			timestamp: message.timestamp,
 			role: message.role,
 			content: message.content,
+			messageId: message.id,
 			attachments: (message.attachments ?? []).map((attachment) => ({
 				id: attachment.id,
 				name: attachment.name,
 				src: `/api/tasks/${encodeURIComponent(taskId)}/messages/${message.id}/attachments/${encodeURIComponent(attachment.id)}`,
+				mimeType: attachment.mime_type,
+				size: attachment.size,
 			})),
+			visualizations: message.visualizations ?? [],
 			sequence: message.id,
 		})));
 		items.push(...activityTimelineEvents.map((event): TranscriptItem => ({
@@ -950,6 +957,18 @@
 		}
 	}
 
+	async function sendVisualizationFollowUp(prompt: string): Promise<void> {
+		if (!task) throw new Error('This task is no longer available.');
+		followLatest = true;
+		showJumpToLatest = false;
+		await tasks.addMessage(task.id, 'user', prompt, {
+			configOptions: selectedConfig,
+			delivery: 'after_tool',
+		});
+		await poll();
+		scrollToBottom(true);
+	}
+
 	async function interruptAgent() {
 		if (!task?.agent_id || !runningAttempt || interrupting || messageSending) return;
 		if (!composerBlockedByElicitation && (messageInput.trim() || messageAttachments.length > 0)) {
@@ -1371,6 +1390,10 @@
 										openLinksInNewWindow={isAssistant}
 										selectionActions={isAssistant}
 										onselectionaction={handleSelectionAction}
+										visualizations={item.visualizations}
+										visualizationUrl={item.messageId === undefined ? undefined : (artifact) => tasks.visualizationUrl(taskId, item.messageId!, artifact.id)}
+										visualizationFollowUpTarget="this Task"
+										onvisualizationfollowup={sendVisualizationFollowUp}
 									>
 										<ImageAttachmentPreviews attachments={item.attachments} message />
 									</AiMessage>
@@ -1896,7 +1919,7 @@
 						{:else if workspaceGit.repository}
 							<p class="text-xs text-muted-foreground">Working tree clean</p>
 						{:else}
-							<p class="text-xs text-muted-foreground">Not a Git repository</p>
+							<p class="text-xs text-muted-foreground">{workspaceGit.repository_status?.message || 'No active Git repository'}</p>
 						{/if}
 					</div>
 				{/if}

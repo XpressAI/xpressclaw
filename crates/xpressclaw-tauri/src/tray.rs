@@ -4,7 +4,7 @@ use tauri::{App, Manager};
 use tracing::{info, warn};
 
 /// Set up the system tray with menu items.
-pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub fn setup_tray(app: &App, local_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dashboard = MenuItem::with_id(app, "dashboard", "Open Dashboard", true, None::<&str>)?;
     let browser = MenuItem::with_id(app, "browser", "Open in Browser", true, None::<&str>)?;
     let separator = MenuItem::with_id(app, "sep", "─────────────", false, None::<&str>)?;
@@ -14,7 +14,7 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
 
     if let Some(tray) = app.tray_by_id("main-tray") {
         tray.set_menu(Some(menu))?;
-        tray.set_tooltip(Some(&format!("xpressclaw - localhost:{port}")))?;
+        tray.set_tooltip(Some("xpressclaw"))?;
 
         // On Linux, the default tray icon is a black monochrome template
         // designed for macOS (which auto-inverts it). On dark panels (GNOME,
@@ -32,6 +32,7 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
         }
 
         let handle = app.handle().clone();
+        let local_url = local_url.to_string();
         tray.on_menu_event(move |_app, event| {
             match event.id().as_ref() {
                 "dashboard" => {
@@ -42,7 +43,10 @@ pub fn setup_tray(app: &App, port: u16) -> Result<(), Box<dyn std::error::Error>
                     }
                 }
                 "browser" => {
-                    let url = format!("http://localhost:{port}");
+                    let url = handle
+                        .state::<crate::profiles::ProfileState>()
+                        .active_url()
+                        .unwrap_or_else(|_| local_url.clone());
                     let _ = open::that(&url);
                 }
                 "quit" => {

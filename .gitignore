@@ -39,6 +39,7 @@ temp/
 .xpressclaw/
 /xpressclaw.yaml
 /xpressclaw.yaml.bak
+/instance-auth.json
 /skills/
 
 # Models (too large for git)

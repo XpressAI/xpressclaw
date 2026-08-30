@@ -3,7 +3,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
-	import { agents, conversations as conversationsApi, projects as projectsApi, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
+	import { agents, conversations as conversationsApi, projects as projectsApi, request, schedules as schedulesApi, tasks as tasksApi, workflows as workflowsApi } from '$lib/api';
 	import type { Agent, Conversation, Project, Schedule, Task, Workflow } from '$lib/api';
 	import { PROJECT_CONTEXT_MENU_ITEMS, type ContextMenuItem } from '$lib/contextMenu';
 	import { openWorkspaceWindow, WORKSPACE_WINDOW_PARAM } from '$lib/openWorkspaceWindow';
@@ -658,7 +658,7 @@
 	async function startDocker() {
 		dockerStarting = true;
 		try {
-			await fetch('/api/setup/start-docker', { method: 'POST' });
+			await request<void>('/api/setup/start-docker', { method: 'POST', body: '{}' });
 			for (let attempt = 0; attempt < 30; attempt += 1) {
 				await new Promise((resolve) => setTimeout(resolve, 2000));
 				await checkDocker();
