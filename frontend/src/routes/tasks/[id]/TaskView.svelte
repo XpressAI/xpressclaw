@@ -13,6 +13,7 @@
 	import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '$lib/composerDrafts';
 	import { appendImageFiles, imageDataUrl, IMAGE_FILE_ACCEPT, MAX_IMAGE_ATTACHMENTS, pastedImageFiles, shouldHandleImagePaste } from '$lib/imageAttachments';
 	import { coalesceAgentMessageFragments } from '$lib/agentMessageFragments';
+	import { TASK_FILE_SPLIT_MIN_PANE_WIDTH, WORKSPACE_OPEN_SPLIT_EVENT, type WorkspaceOpenSplitDetail } from '$lib/workspace';
 
 	let { taskId, compact = false }: { taskId: string; compact?: boolean } = $props();
 	const messageDraftScope = () => `task.${taskId}`;
@@ -138,6 +139,9 @@
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
 	let messagesEl = $state<HTMLDivElement>();
 	let composerEl = $state<HTMLDivElement>();
+	let taskViewEl = $state<HTMLDivElement>();
+	let taskViewResizeObserver: ResizeObserver | null = null;
+	let showDetailsSidebar = $state(false);
 	let prevMessageCount = 0;
 	let lastActivityEventId = 0;
 	let hasEarlierActivity = $state(false);
@@ -734,8 +738,21 @@
 		}
 	}
 
+	function updateDetailsSidebarVisibility() {
+		showDetailsSidebar = !compact || (taskViewEl?.clientWidth ?? 0) >= TASK_FILE_SPLIT_MIN_PANE_WIDTH;
+	}
+
+	$effect(() => {
+		compact;
+		taskViewEl;
+		updateDetailsSidebarVisibility();
+	});
+
 	onMount(async () => {
 		document.addEventListener('pointerdown', handleComposerPointerDown);
+		taskViewResizeObserver = new ResizeObserver(updateDetailsSidebarVisibility);
+		if (taskViewEl) taskViewResizeObserver.observe(taskViewEl);
+		updateDetailsSidebarVisibility();
 		messageInput = loadComposerDraft(messageDraftScope());
 		messageDraftReady = true;
 		await load();
@@ -750,6 +767,7 @@
 
 	onDestroy(() => {
 		if (pollTimer) clearInterval(pollTimer);
+		taskViewResizeObserver?.disconnect();
 		document.removeEventListener('pointerdown', handleComposerPointerDown);
 	});
 
@@ -1176,6 +1194,15 @@
 		return path ? `${base}&path=${encodeURIComponent(path)}` : base;
 	}
 
+	function openChangedFile(event: MouseEvent, agentId: string, path: string) {
+		if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+		event.preventDefault();
+		const route = `${workspaceFileUrl(agentId, path)}&tree=collapsed`;
+		window.dispatchEvent(new CustomEvent<WorkspaceOpenSplitDetail>(WORKSPACE_OPEN_SPLIT_EVENT, {
+			detail: { path: route },
+		}));
+	}
+
 	function startsFreshConversation(): boolean {
 		if (!task?.context || typeof task.context !== 'object') return false;
 		return (task.context as Record<string, unknown>).session_mode === 'new';
@@ -1183,7 +1210,7 @@
 
 </script>
 
-<div class="flex min-h-0 h-full flex-col">
+<div bind:this={taskViewEl} class="flex min-h-0 h-full flex-col">
 	<!-- Header -->
 	<div class="shrink-0 border-b border-border px-3 py-3 sm:px-6 sm:py-4">
 		<div class="flex items-center gap-2 text-sm text-muted-foreground mb-2">
@@ -1398,7 +1425,7 @@
 					{/if}
 
 					{#if subtaskList.length > 0}
-					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {compact ? '' : 'lg:hidden'}">
+					<section class="rounded-lg border border-border/60 bg-card/30 p-3 {showDetailsSidebar ? 'lg:hidden' : ''}">
 							<div class="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
 								Steps ({completedStepCount()} complete{deferredStepCount() ? `, ${deferredStepCount()} deferred` : ''})
 							</div>
@@ -1830,7 +1857,7 @@
 			</div>
 
 			<!-- Right: details sidebar -->
-			<div class="w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 {compact ? 'hidden' : 'hidden lg:block'}">
+			<div data-task-details-sidebar class="hidden w-72 shrink-0 space-y-4 overflow-y-auto border-l border-border p-4 {showDetailsSidebar ? 'lg:block' : ''}">
 				<!-- Details -->
 				<div class="space-y-2">
 					<h3 class="text-xs font-medium text-muted-foreground uppercase tracking-wide">Details</h3>
@@ -1893,6 +1920,7 @@
 								{#each workspaceGit.files.slice(0, 12) as change (change.path)}
 									<a
 										href={workspaceFileUrl(task.agent_id, change.path)}
+										onclick={(event) => openChangedFile(event, task?.agent_id ?? '', change.path)}
 										title={change.path}
 										class="flex items-center gap-2 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
 									>

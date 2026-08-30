@@ -6,7 +6,7 @@
 	import MonacoEditor from '$lib/components/MonacoEditor.svelte';
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte';
 
-	let { agentId }: { agentId: string } = $props();
+	let { agentId, route = '' }: { agentId: string; route?: string } = $props();
 	let status = $state<WorkspaceStatus | null>(null);
 	let git = $state<WorkspaceGitStatus | null>(null);
 	let directories = $state<Record<string, WorkspaceEntry[]>>({});
@@ -20,16 +20,83 @@
 	let loadingFile = $state(false);
 	let saving = $state(false);
 	let showTerminal = $state(false);
+	let showTree = $state(true);
+	let initialized = $state(false);
+	let syncedRoute = '';
+	let fileOpenSequence = 0;
 	let error = $state('');
 	let saveMessage = $state('');
+	type FileOpenResult = 'opened' | 'cancelled' | 'stale' | 'failed';
 
 	let visibleEntries = $derived(flattenEntries());
 	let dirty = $derived(Boolean(selectedFile && editorValue !== selectedFile.content));
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
-		void initialize();
+		showTree = routeState(route).showTree;
+		void initialize().finally(() => (initialized = true));
 	});
+
+	$effect(() => {
+		const requestedRoute = route;
+		if (!initialized || requestedRoute === syncedRoute) return;
+		syncedRoute = requestedRoute;
+		void applyRoute(requestedRoute);
+	});
+
+	function routeState(value: string): { path: string; showTree: boolean } {
+		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
+		const params = new URLSearchParams(search);
+		return {
+			path: params.get('path') ?? '',
+			showTree: params.get('tree') !== 'collapsed',
+		};
+	}
+
+	function routeForFileState(value: string, path: string, treeVisible: boolean): string {
+		const url = new URL(value || window.location.href, window.location.origin);
+		if (path) url.searchParams.set('path', path);
+		else url.searchParams.delete('path');
+		if (treeVisible) url.searchParams.delete('tree');
+		else url.searchParams.set('tree', 'collapsed');
+		return `${url.pathname}${url.search}${url.hash}`;
+	}
+
+	async function applyRoute(requestedRoute: string) {
+		const previousPath = selectedPath;
+		const previousShowTree = showTree;
+		const requested = routeState(requestedRoute);
+		showTree = requested.showTree;
+		if (requested.path === selectedPath) {
+			fileOpenSequence += 1;
+			loadingFile = false;
+			return;
+		}
+
+		const result = requested.path
+			? await openFile(requested.path, false, false)
+			: clearFileSelection();
+		if (result === 'opened' || result === 'stale' || route !== requestedRoute) return;
+
+		showTree = previousShowTree;
+		const restoredRoute = routeForFileState(requestedRoute, previousPath, previousShowTree);
+		syncedRoute = restoredRoute;
+		await goto(restoredRoute, { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
+	function clearFileSelection(): FileOpenResult {
+		fileOpenSequence += 1;
+		loadingFile = false;
+		if (dirty && !window.confirm('Discard the unsaved changes in the current file?')) return 'cancelled';
+		selectedPath = '';
+		selectedFile = null;
+		editorValue = '';
+		fileDiff = null;
+		viewMode = 'code';
+		error = '';
+		saveMessage = '';
+		return 'opened';
+	}
 
 	async function initialize() {
 		loading = true;
@@ -43,7 +110,7 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initialPath = new URLSearchParams(window.location.search).get('path');
+			const initialPath = routeState(route).path;
 			if (initialPath) await openFile(initialPath, true, false);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
@@ -80,8 +147,12 @@
 		}
 	}
 
-	async function openFile(path: string, force = false, navigate = true) {
-		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) return;
+	async function openFile(path: string, force = false, navigate = true): Promise<FileOpenResult> {
+		const requestSequence = ++fileOpenSequence;
+		if (!force && dirty && !window.confirm('Discard the unsaved changes in the current file?')) {
+			loadingFile = false;
+			return 'cancelled';
+		}
 		loadingFile = true;
 		error = '';
 		saveMessage = '';
@@ -92,6 +163,7 @@
 					.catch((cause: unknown) => ({ file: null, error: cause })),
 				workspaces.gitDiff(agentId, path).catch(() => null),
 			]);
+			if (requestSequence !== fileOpenSequence) return 'stale';
 			const deleted = changeByPath.get(path)?.status.includes('D') ?? false;
 			if (!fileResult.file && !(deleted && diff)) throw fileResult.error;
 			selectedPath = path;
@@ -105,10 +177,13 @@
 				url.searchParams.set('path', path);
 				await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
 			}
+			return 'opened';
 		} catch (cause) {
+			if (requestSequence !== fileOpenSequence) return 'stale';
 			error = cause instanceof Error ? cause.message : String(cause);
+			return 'failed';
 		} finally {
-			loadingFile = false;
+			if (requestSequence === fileOpenSequence) loadingFile = false;
 		}
 	}
 
@@ -145,6 +220,11 @@
 		git = await workspaces.gitStatus(agentId).catch(() => git);
 	}
 
+	async function toggleTree() {
+		showTree = !showTree;
+		await goto(routeForFileState(window.location.href, selectedPath, showTree), { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
 	function statusLabel(change: GitChange): string {
 		if (change.status === '??') return 'U';
 		if (change.status.includes('R')) return 'R';
@@ -169,6 +249,9 @@
 			{#if status?.repository.github_status === 'attached'}<div class="mt-0.5 text-[10px] text-emerald-600 dark:text-emerald-400">GitHub MCP · {status.repository.github_repository}</div>{/if}
 		</div>
 		<div class="flex items-center gap-2">
+			<button type="button" onclick={toggleTree} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
+				{showTree ? 'Hide files' : 'Show files'}
+			</button>
 			<button type="button" onclick={refreshGit} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>
 			<button
 				type="button"
@@ -191,6 +274,7 @@
 		<div class="flex min-h-0 flex-1 items-center justify-center text-sm text-muted-foreground">Loading workspace…</div>
 	{:else}
 		<div class="flex min-h-0 flex-1 flex-col md:flex-row">
+			{#if showTree}
 			<div class="flex max-h-60 w-full shrink-0 flex-col border-b border-border md:max-h-none md:w-64 md:border-b-0 md:border-r">
 				{#if git?.files.length}
 					<div class="shrink-0 border-b border-border">
@@ -229,6 +313,7 @@
 					{/each}
 				</div>
 			</div>
+			{/if}
 
 			<div class="flex min-h-[20rem] min-w-0 flex-1 flex-col">
 				{#if selectedPath}

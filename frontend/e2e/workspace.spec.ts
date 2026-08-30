@@ -303,6 +303,15 @@ async function mockApi(
 			suggestion: string | null;
 		}>;
 		mcpVerificationRequests?: { name: string; agent_id: string | null }[];
+		openUrlRequests?: string[];
+		agentCatalog?: {
+			kind: string;
+			name: string;
+			install_url: string;
+			image: string;
+			host_image: string;
+		}[];
+		agentKind?: { value: string };
 		workflows?: {
 			id: string;
 			name: string;
@@ -336,6 +345,8 @@ async function mockApi(
 		workflowRunRequests?: { id: string; inputs: Record<string, unknown>; projectId?: string }[];
 		workspaceSaveRequests?: { path: string; content: string; expected_revision: string }[];
 		workspaceSaveDelayMs?: number;
+		workspaceReadRequests?: string[];
+		workspaceReadDelaysMs?: Record<string, number>;
 		repositoryStatus?: Record<string, unknown>;
 		repositorySelections?: (string | null)[];
 		includeDeletedWorkspaceFile?: boolean;
@@ -592,7 +603,7 @@ async function mockApi(
 		} else if (path === '/api/setup/mcp-servers') {
 			response = { servers: options.mcpServers ?? [] };
 		} else if (path === '/api/setup/agent-catalog') {
-			response = { agents: [
+			response = { agents: options.agentCatalog ?? [
 				{
 					kind: 'codex', name: 'Codex', mark: 'C', description: 'Codex over ACP.',
 					command: ['codex-acp'], login_command: 'codex login', install_url: 'https://developers.openai.com/codex/cli/',
@@ -606,6 +617,10 @@ async function mockApi(
 					installed: true, configured: true, status: 'ready', executable: 'dsh-acp',
 				},
 			] };
+		} else if (path === '/api/open-url') {
+			const payload = request.postDataJSON() as { url: string };
+			options.openUrlRequests?.push(payload.url);
+			response = { success: true };
 		} else if (/^\/api\/setup\/mcp-servers\/[^/]+\/verify$/.test(path)) {
 			const name = decodeURIComponent(path.split('/')[4]);
 			const payload = request.postDataJSON() as { agent_id: string | null };
@@ -787,7 +802,14 @@ async function mockApi(
 		} else if (path === '/api/agents') {
 			response = availableAgents;
 		} else if (path === `/api/agents/${agentId}`) {
-			response = agent;
+			response = options.agentKind ? {
+				...agent,
+				backend: options.agentKind.value,
+				config: {
+					...agent.config,
+					runner: { ...agent.config.runner, kind: options.agentKind.value },
+				},
+			} : agent;
 		} else if (path === '/api/workflows') {
 			if (request.method() === 'POST') {
 				const payload = request.postDataJSON() as { name: string; description?: string; yaml_content: string };
@@ -839,16 +861,17 @@ async function mockApi(
 		} else if (path === '/api/schedules') {
 			response = options.schedules ?? [];
 		} else if (path === '/api/setup/config') {
+			const configuredKind = options.agentKind?.value ?? agentRunnerKind;
 			response = {
 				llm: { providers: [] },
 				agents: [{
 					name: agent.name,
 					title: agent.title,
-					backend: agent.backend,
+					backend: configuredKind,
 					model: null,
 					runner: {
-						kind: agentRunnerKind,
-						image: `xpressclaw-runner-${agentRunnerKind}:latest`,
+						kind: configuredKind,
+						image: `xpressclaw-runner-${configuredKind}:latest`,
 						workspace: '/workspace',
 						model: null,
 						session_config: {},
@@ -928,6 +951,9 @@ async function mockApi(
 				response = { path: payload.path, revision: workspaceFileRevision, size: payload.content.length };
 			} else {
 				const filePath = url.searchParams.get('path') ?? 'src/main.ts';
+				options.workspaceReadRequests?.push(filePath);
+				const readDelayMs = options.workspaceReadDelaysMs?.[filePath] ?? 0;
+				if (readDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, readDelayMs));
 				if (options.includeDeletedWorkspaceFile && filePath === 'src/removed.ts') {
 					await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ error: 'workspace path was not found' }) });
 					return;
@@ -3447,7 +3473,7 @@ test('deleted workspace changes remain available as diff-only selections', async
 	await expect(page.getByText('workspace path was not found')).toBeHidden();
 });
 
-test('task details deep-link current Git changes into the workspace editor', async ({ page }) => {
+test('task changed files open beside the task with the file tree collapsed', async ({ page }) => {
 	await mockApi(page);
 	await page.goto(`/tasks/${taskId}`);
 
@@ -3458,8 +3484,148 @@ test('task details deep-link current Git changes into the workspace editor', asy
 		`/agents/${agentId}?tab=files&path=src%2Fmain.ts`,
 	);
 	await changedFiles.getByRole('link', { name: 'src/main.ts' }).click();
-	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(2);
+	await expect(page.locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(page.locator('[data-task-details-sidebar]')).toBeVisible();
+	await expect(page.locator('[data-workspace-tree]')).toHaveCount(0);
 	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByText('Loading editor…')).toBeHidden({ timeout: 20_000 });
+	await page.getByRole('button', { name: 'Show files' }).click();
+	await expect(page.locator('[data-workspace-tree]')).toBeVisible();
+});
+
+test('task changed files use normal navigation when the workspace is too narrow to split', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await expect(changedFile).toBeVisible();
+	await changedFile.click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+	await expect(page.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByRole('button', { name: 'Show files' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('task changed-file modified clicks retain normal link behavior', async ({ page }) => {
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	const changedFile = page.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	const preserved = await changedFile.evaluate((element) => [
+		{ ctrlKey: true },
+		{ metaKey: true },
+		{ shiftKey: true },
+		{ altKey: true },
+	].every((modifiers) => {
+		let defaultPreventedByHandler = true;
+		const observeThenSuppressNavigation = (event: MouseEvent) => {
+			defaultPreventedByHandler = event.defaultPrevented;
+			event.preventDefault();
+		};
+		document.addEventListener('click', observeThenSuppressNavigation, { once: true });
+		element.dispatchEvent(new MouseEvent('click', {
+			bubbles: true,
+			cancelable: true,
+			...modifiers,
+		}));
+		return !defaultPreventedByHandler;
+	}));
+
+	expect(preserved).toBe(true);
+	await expect(page).toHaveURL(`/tasks/${taskId}`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(1);
+});
+
+test('task changed files use normal navigation at the workspace pane limit', async ({ page }) => {
+	const workspaceReadRequests: string[] = [];
+	const workspaceReadDelaysMs: Record<string, number> = {};
+	await page.setViewportSize({ width: 2200, height: 1000 });
+	await mockApi(page, { workspaceReadRequests, workspaceReadDelaysMs });
+	await page.goto(`/tasks/${taskId}`);
+
+	for (let paneCount = 2; paneCount <= 4; paneCount += 1) {
+		await page.getByRole('button', { name: 'Split active tab right' }).last().click();
+		await expect(page.locator('[data-workspace-pane]')).toHaveCount(paneCount);
+	}
+	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
+
+	const focusedPane = page.locator('[data-workspace-pane]').last();
+	await focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' }).click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	const editor = focusedPane.locator('[data-monaco-editor]');
+	await editor.locator('.view-lines').click();
+	await page.keyboard.press('Control+A');
+	await page.keyboard.insertText('export const unsaved = true;');
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	const requestFile = (path?: string) => page.evaluate(({ requestedAgentId, requestedPath }) => {
+		window.dispatchEvent(new CustomEvent('xpressclaw:workspace-open-split', {
+			detail: {
+				path: `/agents/${requestedAgentId}?tab=files${requestedPath ? `&path=${encodeURIComponent(requestedPath)}` : ''}&tree=collapsed`,
+			},
+		}));
+	}, { requestedAgentId: agentId, requestedPath: path });
+
+	page.once('dialog', (dialog) => void dialog.dismiss());
+	await requestFile('README.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="src/main.ts"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();
+
+	page.once('dialog', (dialog) => void dialog.accept());
+	await requestFile('README.md');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
+
+	workspaceReadDelaysMs['src/main.ts'] = 500;
+	const mainReadCount = workspaceReadRequests.filter((path) => path === 'src/main.ts').length;
+	await requestFile('src/main.ts');
+	await expect.poll(() => workspaceReadRequests.filter((path) => path === 'src/main.ts').length).toBe(mainReadCount + 1);
+	await requestFile('docs/guide.md');
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=docs%2Fguide.md&tree=collapsed`);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+	await page.waitForTimeout(600);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="docs/guide.md"]')).toBeVisible();
+
+	await requestFile();
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&tree=collapsed`);
+	await expect(focusedPane.getByText('Choose a file to browse or edit it with Monaco.')).toBeVisible();
+	await expect(focusedPane.locator('[data-monaco-editor]')).toHaveCount(0);
+});
+
+test('narrow manual task splits preserve the compact task layout', async ({ page }) => {
+	await page.setViewportSize({ width: 1024, height: 768 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]')).toHaveCount(2);
+	await expect(panes.locator('[data-task-details-sidebar]').first()).toBeHidden();
+	await expect(panes.locator('[data-task-details-sidebar]').last()).toBeHidden();
+	await expect(panes.locator(`#task-message-input-${taskId}`)).toHaveCount(2);
+
+	const transcriptWidths = await panes.locator('[data-task-transcript-scroll]').evaluateAll((elements) =>
+		elements.map((element) => element.getBoundingClientRect().width),
+	);
+	expect(transcriptWidths.every((width) => width >= 350)).toBe(true);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
 test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
@@ -4226,6 +4392,74 @@ test('MCP verification reports authentication and runner executable failures in 
 
 	await page.setViewportSize({ width: 390, height: 844 });
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('skills and MCP settings surface official discovery documentation', async ({ page }) => {
+	const openUrlRequests: string[] = [];
+	await mockApi(page, { mcpServers: [], openUrlRequests, agentKind: { value: 'claude' } });
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.goto('/settings/mcp');
+	await expect(page.getByRole('button', { name: 'Official MCP Registry' })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'Add server' })).toBeVisible();
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+	await page.getByRole('button', { name: 'Official MCP Registry' }).click();
+	await expect(page.getByText('Find published packages and remote endpoints')).toBeVisible();
+
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Registry' }).click();
+	await page.getByRole('button', { name: 'Claude Agent skills guide' }).click();
+	expect(openUrlRequests).toEqual([
+		'https://registry.modelcontextprotocol.io/',
+		'https://registry.modelcontextprotocol.io/',
+		'https://code.claude.com/docs/en/skills',
+	]);
+
+	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+});
+
+test('every supported harness resolves the intended documentation and custom stays neutral', async ({ page }) => {
+	const openUrlRequests: string[] = [];
+	const agentKind = { value: 'codex' };
+	const catalog = [
+		['codex', 'Codex', 'https://developers.openai.com/codex/cli/'],
+		['claude', 'Claude Agent', 'https://docs.anthropic.com/en/docs/claude-code/setup'],
+		['github-copilot', 'GitHub Copilot', 'https://docs.github.com/en/copilot/github-copilot-in-the-cli'],
+		['opencode', 'OpenCode', 'https://opencode.ai/docs/'],
+		['qwen', 'Qwen Code', 'https://qwenlm.github.io/qwen-code-docs/'],
+		['cline', 'Cline', 'https://docs.cline.bot/'],
+		['cursor', 'Cursor', 'https://docs.cursor.com/agent/overview'],
+	].map(([kind, name, install_url]) => ({
+		kind,
+		name,
+		install_url,
+		image: `ghcr.io/xpressai/xpressclaw-runner-${kind}:latest`,
+		host_image: `ghcr.io/xpressai/xpressclaw-runner-${kind}-docker:latest`,
+	}));
+	await mockApi(page, { openUrlRequests, agentCatalog: catalog, agentKind });
+
+	const expected = [
+		['codex', 'Codex skills guide', 'https://learn.chatgpt.com/docs/build-skills'],
+		['claude', 'Claude Agent skills guide', 'https://code.claude.com/docs/en/skills'],
+		['github-copilot', 'GitHub Copilot skills guide', 'https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills'],
+		['opencode', 'OpenCode skills guide', 'https://opencode.ai/docs/skills/'],
+		['qwen', 'Qwen Code skills guide', 'https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/'],
+		['cline', 'Cline skills guide', 'https://docs.cline.bot/customization/skills'],
+		['cursor', 'Cursor docs', 'https://docs.cursor.com/agent/overview'],
+	] as const;
+
+	for (const [kind, buttonName, url] of expected) {
+		agentKind.value = kind;
+		await page.goto(`/agents/${agentId}?tab=runner`);
+		await expect(page.locator('#runner-kind')).toHaveValue(kind);
+		await page.getByRole('button', { name: buttonName }).click();
+		expect(openUrlRequests.at(-1)).toBe(url);
+	}
+
+	agentKind.value = 'custom';
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await expect(page.locator('#runner-kind')).toHaveValue('custom');
+	await expect(page.getByRole('button', { name: /(?:skills guide|docs)$/ })).toHaveCount(0);
 });
 
 test('automation and settings pages show context-specific sidebar lists', async ({ page }) => {
