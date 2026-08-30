@@ -82,13 +82,19 @@ function joinFragments(previous: string, next: string): string {
  * update arrives as several near-simultaneous ACP messages. The durable ACP
  * boundaries remain intact; only clearly continuous adjacent rows are folded.
  */
-export function coalesceAgentMessageFragments(events: SessionEvent[], messages: TaskMessage[] = []): SessionEvent[] {
+export function coalesceAgentMessageFragments(
+	events: SessionEvent[],
+	messages: TaskMessage[] = [],
+	boundaryEventIds: ReadonlySet<number> = new Set(),
+): SessionEvent[] {
 	const coalesced: SessionEvent[] = [];
 
 	for (const event of events) {
 		const previousIndex = coalesced.length - 1;
 		const previous = coalesced[previousIndex];
 		if (previous
+			&& !boundaryEventIds.has(previous.id)
+			&& !boundaryEventIds.has(event.id)
 			&& isCodexAgentMessage(previous)
 			&& isCodexAgentMessage(event)
 			&& isSameAgentMessageStream(previous, event)

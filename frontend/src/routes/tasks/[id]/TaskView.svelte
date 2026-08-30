@@ -159,20 +159,23 @@
 	let availableDeps = $derived(
 		allTasks.filter(t => t.id !== task?.id && t.status !== 'completed' && t.status !== 'cancelled')
 	);
-	let distinctActivityEvents = $derived(activityEvents.filter(event => {
+	let mirroredActivityEventIds = $derived(new Set(activityEvents.filter(event => {
 		const mirrorsTaskReply = event.payload?.item_type === 'agent_message' && messages.some(message =>
 			message.role === 'assistant' && (
 				message.content === event.summary ||
 				(event.summary.length >= 200 && message.content.startsWith(event.summary.slice(0, 180)))
 			)
 		);
-		return !mirrorsTaskReply;
-	}));
-	let collapsedActivityEvents = $derived(collapseToolActivity(coalesceAgentMessageFragments(distinctActivityEvents, messages)));
+		return mirrorsTaskReply;
+	}).map(event => event.id)));
+	let collapsedActivityEvents = $derived(collapseToolActivity(
+		coalesceAgentMessageFragments(activityEvents, messages, mirroredActivityEventIds)
+	));
 	let primaryActivityEvents = $derived(
 		collapsedActivityEvents.filter(event =>
 			!['artifact_created', 'attempt_completed', 'elicitation_pending', 'elicitation_resolved', 'usage'].includes(event.event_type) &&
-			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message')
+			(event.event_type !== 'runner_progress' || event.payload?.item_type === 'agent_message') &&
+			!mirroredActivityEventIds.has(event.id)
 		)
 	);
 	let technicalActivityEvents = $derived(
