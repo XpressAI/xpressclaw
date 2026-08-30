@@ -21,6 +21,8 @@
 	let saving = $state(false);
 	let showTerminal = $state(false);
 	let showTree = $state(true);
+	let initialized = $state(false);
+	let syncedRoute = '';
 	let error = $state('');
 	let saveMessage = $state('');
 
@@ -29,10 +31,29 @@
 	let changeByPath = $derived(new Map((git?.files ?? []).map((change) => [change.path, change])));
 
 	onMount(() => {
-		const initialSearch = route.includes('?') ? route.slice(route.indexOf('?')) : window.location.search;
-		showTree = new URLSearchParams(initialSearch).get('tree') !== 'collapsed';
-		void initialize();
+		showTree = routeState(route).showTree;
+		void initialize().finally(() => (initialized = true));
 	});
+
+	$effect(() => {
+		const requestedRoute = route;
+		if (!initialized || requestedRoute === syncedRoute) return;
+		syncedRoute = requestedRoute;
+		const requested = routeState(requestedRoute);
+		showTree = requested.showTree;
+		if (requested.path && requested.path !== selectedPath) {
+			void openFile(requested.path, false, false);
+		}
+	});
+
+	function routeState(value: string): { path: string; showTree: boolean } {
+		const search = value.includes('?') ? value.slice(value.indexOf('?')) : window.location.search;
+		const params = new URLSearchParams(search);
+		return {
+			path: params.get('path') ?? '',
+			showTree: params.get('tree') !== 'collapsed',
+		};
+	}
 
 	async function initialize() {
 		loading = true;
@@ -46,8 +67,7 @@
 			status = workspaceStatus;
 			directories = { '': rootDirectory.entries };
 			git = gitStatus;
-			const initialSearch = route.includes('?') ? route.slice(route.indexOf('?')) : window.location.search;
-			const initialPath = new URLSearchParams(initialSearch).get('path');
+			const initialPath = routeState(route).path;
 			if (initialPath) await openFile(initialPath, true, false);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : String(cause);
@@ -149,6 +169,14 @@
 		git = await workspaces.gitStatus(agentId).catch(() => git);
 	}
 
+	async function toggleTree() {
+		showTree = !showTree;
+		const url = new URL(window.location.href);
+		if (showTree) url.searchParams.delete('tree');
+		else url.searchParams.set('tree', 'collapsed');
+		await goto(`${url.pathname}${url.search}`, { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
 	function statusLabel(change: GitChange): string {
 		if (change.status === '??') return 'U';
 		if (change.status.includes('R')) return 'R';
@@ -173,7 +201,7 @@
 			{#if status?.repository.github_status === 'attached'}<div class="mt-0.5 text-[10px] text-emerald-600 dark:text-emerald-400">GitHub MCP · {status.repository.github_repository}</div>{/if}
 		</div>
 		<div class="flex items-center gap-2">
-			<button type="button" onclick={() => (showTree = !showTree)} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
+			<button type="button" onclick={toggleTree} aria-expanded={showTree} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">
 				{showTree ? 'Hide files' : 'Show files'}
 			</button>
 			<button type="button" onclick={refreshGit} class="rounded-md border border-border px-2.5 py-1.5 text-xs hover:bg-accent">Refresh</button>

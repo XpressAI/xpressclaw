@@ -3440,6 +3440,16 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
 	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await focusedPane.getByRole('button', { name: 'Show files' }).click();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
+
+	const firstTaskPane = page.locator('[data-workspace-pane]').first();
+	await firstTaskPane.locator('[data-task-changed-files]').getByRole('link', { name: 'README.md' }).click();
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=README.md&tree=collapsed`);
+	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
+	await expect(focusedPane.locator('[data-workspace-files] span[title="README.md"]')).toBeVisible();
+	await expect(focusedPane.locator('[data-workspace-tree]')).toHaveCount(0);
 });
 
 test('ambiguous cloned repositories require an explicit durable selection', async ({ page }) => {
