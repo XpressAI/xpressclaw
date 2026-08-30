@@ -40,10 +40,10 @@ function isClearContinuation(previous: string, next: string): boolean {
 	const previousEndsJoinableToken = /[\p{L}\p{N}\p{M}'\u2019"\u201d)}\]]$/u.test(previousText);
 	const previousEndsContinuation = /[,;:([{\-/\u2010-\u2014]$/u.test(previousText);
 	const nextStartsLowercase = /^\p{Ll}/u.test(nextText);
-	const nextStartsClosingPunctuation = /^[,.;:!?%)}\]]/u.test(nextText);
+	const nextIsClosingPunctuation = /^[,.;:!?%)}\]]$/u.test(nextText);
 	const nextStartsJoinedDash = /^[\u2010-\u2014-]\S/u.test(nextText);
 
-	return (previousEndsJoinableToken && nextStartsClosingPunctuation)
+	return (previousEndsJoinableToken && nextIsClosingPunctuation)
 		|| (previousEndsWord && nextStartsJoinedDash)
 		|| ((previousEndsWord || previousEndsContinuation) && nextStartsLowercase);
 }

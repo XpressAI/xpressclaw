@@ -1275,12 +1275,14 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 			timelineEvent(8, 12, 'runner_progress', 'Ready to review.', { item_type: 'agent_message', message_id: 'status-2' }),
 			timelineEvent(9, 13, 'runner_progress', 'Done.', { item_type: 'agent_message', message_id: 'status-3' }),
 			timelineEvent(10, 13, 'runner_progress', '.env is configured.', { item_type: 'agent_message', message_id: 'status-4' }),
+			timelineEvent(11, 14, 'runner_progress', 'Updated config', { item_type: 'agent_message', message_id: 'status-5' }),
+			timelineEvent(12, 14, 'runner_progress', '.env is ready.', { item_type: 'agent_message', message_id: 'status-6' }),
 		],
 	});
 	await page.goto(`/tasks/${taskId}`);
 
 	const updates = page.locator('[data-task-transcript] [data-agent-update]');
-	await expect(updates).toHaveCount(5);
+	await expect(updates).toHaveCount(7);
 	await expect(updates.nth(0).locator('[data-agent-update-content]')).toHaveText(
 		'The audit-retention regression is now exercising the actual migration DDL against H2: it inserts an audit row, deletes the parent conversation, and creates a tombstone.',
 	);
@@ -1288,6 +1290,8 @@ test('near-simultaneous sentence fragments render as one agent update', async ({
 	await expect(updates.nth(2).locator('[data-agent-update-content]')).toHaveText('Ready to review.');
 	await expect(updates.nth(3).locator('[data-agent-update-content]')).toHaveText('Done.');
 	await expect(updates.nth(4).locator('[data-agent-update-content]')).toHaveText('.env is configured.');
+	await expect(updates.nth(5).locator('[data-agent-update-content]')).toHaveText('Updated config');
+	await expect(updates.nth(6).locator('[data-agent-update-content]')).toHaveText('.env is ready.');
 });
 
 test('agent update coalescing does not cross message, attempt, time, or tool boundaries', async ({ page }) => {
