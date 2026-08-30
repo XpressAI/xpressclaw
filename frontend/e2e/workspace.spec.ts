@@ -3501,6 +3501,26 @@ test('task changed files open beside the task with the file tree collapsed', asy
 	await expect(page.locator('[data-workspace-tree]')).toBeVisible();
 });
 
+test('keyboard-activated task files open beside their source pane', async ({ page }) => {
+	await page.setViewportSize({ width: 1800, height: 900 });
+	await mockApi(page);
+	await page.goto(`/tasks/${taskId}`);
+
+	await page.getByRole('button', { name: 'Split active tab right' }).click();
+	const panes = page.locator('[data-workspace-pane]');
+	await expect(panes).toHaveCount(2);
+
+	const changedFile = panes.first().locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
+
+	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
+	await expect(panes).toHaveCount(3);
+	await expect(panes.nth(0).locator(`#task-message-input-${taskId}`)).toBeVisible();
+	await expect(panes.nth(1).locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(panes.nth(2).locator(`#task-message-input-${taskId}`)).toBeVisible();
+});
+
 test('task changed files use normal navigation when the workspace is too narrow to split', async ({ page }) => {
 	await page.setViewportSize({ width: 1024, height: 768 });
 	await mockApi(page);
@@ -3560,17 +3580,20 @@ test('task changed files use normal navigation at the workspace pane limit', asy
 	}
 	await expect(page.getByRole('button', { name: 'Split active tab right' }).last()).toBeDisabled();
 
-	const focusedPane = page.locator('[data-workspace-pane]').last();
-	await focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' }).click();
+	const focusedPane = page.locator('[data-workspace-pane]').first();
+	const changedFile = focusedPane.locator('[data-task-changed-files]').getByRole('link', { name: 'src/main.ts' });
+	await changedFile.focus();
+	await page.keyboard.press('Enter');
 
 	await expect(page).toHaveURL(`/agents/${agentId}?tab=files&path=src%2Fmain.ts&tree=collapsed`);
 	await expect(page.locator('[data-workspace-pane]')).toHaveCount(4);
 	await expect(focusedPane.locator('[data-monaco-editor]')).toBeVisible({ timeout: 20_000 });
+	await expect(page.locator('[data-workspace-pane]').last().locator(`#task-message-input-${taskId}`)).toBeVisible();
 	await focusedPane.getByRole('button', { name: 'Show files' }).click();
 	await expect(focusedPane.locator('[data-workspace-tree]')).toBeVisible();
 
 	const editor = focusedPane.locator('[data-monaco-editor]');
-	await editor.locator('.view-lines').click();
+	await editor.locator('.view-lines').click({ position: { x: 20, y: 20 } });
 	await page.keyboard.press('Control+A');
 	await page.keyboard.insertText('export const unsaved = true;');
 	await expect(focusedPane.getByRole('button', { name: 'Save' })).toBeEnabled();

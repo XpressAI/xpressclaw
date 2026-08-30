@@ -51,6 +51,7 @@
 <section
 	class="workspace-pane flex min-w-0 flex-1 flex-col overflow-hidden bg-background {focused ? 'ring-1 ring-inset ring-primary/25' : ''}"
 	onpointerdown={onfocus}
+	onfocusin={onfocus}
 	role="group"
 	aria-label="Workspace pane"
 >
