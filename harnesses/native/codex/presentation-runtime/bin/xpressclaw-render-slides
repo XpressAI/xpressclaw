@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: xpressclaw-render-slides INPUT.pptx [OUTPUT_DIR]" >&2
+  exit 64
+fi
+
+input="$1"
+if [[ ! -f "$input" ]]; then
+  echo "presentation does not exist: $input" >&2
+  exit 66
+fi
+case "${input,,}" in
+  *.pptx) ;;
+  *) echo "presentation must use the .pptx extension: $input" >&2; exit 65 ;;
+esac
+
+input="$(realpath "$input")"
+if [[ $# -eq 2 ]]; then
+  output="$2"
+else
+  output="${input%.pptx}-rendered"
+fi
+mkdir -p "$output"
+output="$(realpath "$output")"
+
+runtime_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$runtime_dir"
+}
+trap cleanup EXIT INT TERM
+mkdir -p "$runtime_dir/home" "$runtime_dir/profile" "$runtime_dir/pdf"
+
+HOME="$runtime_dir/home" timeout 120s libreoffice \
+  -env:UserInstallation="file://$runtime_dir/profile" \
+  --headless --nologo --nodefault --nolockcheck --norestore \
+  --convert-to pdf --outdir "$runtime_dir/pdf" "$input" >/dev/null
+
+pdf="$runtime_dir/pdf/$(basename "${input%.pptx}.pdf")"
+if [[ ! -s "$pdf" ]]; then
+  echo "LibreOffice did not produce a PDF preview for $input" >&2
+  exit 70
+fi
+
+rm -f -- "$output"/slide-*.png
+pdftoppm -png -r 144 "$pdf" "$output/slide" >/dev/null
+shopt -s nullglob
+slides=("$output"/slide-*.png)
+if (( ${#slides[@]} == 0 )); then
+  echo "presentation preview contains no slides: $input" >&2
+  exit 70
+fi
+for slide in "${slides[@]}"; do
+  [[ -s "$slide" ]] || { echo "empty rendered slide: $slide" >&2; exit 70; }
+done
+
+printf '%s\n' "${slides[@]}"

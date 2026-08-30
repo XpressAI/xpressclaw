@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::message_artifacts::PublishedFileAttachment;
 use crate::projects::ensure_project_accepts_work;
 use crate::tasks::attachments::DecodedImageAttachment;
 use crate::visualizations::{
@@ -58,6 +59,13 @@ pub struct TaskConversation {
     db: Arc<Database>,
 }
 
+struct MessageExtras<'a> {
+    image_attachments: &'a [DecodedImageAttachment],
+    published_files: &'a [PublishedFileAttachment],
+    attempt_id: Option<&'a str>,
+    visualizations: &'a [PreparedVisualization],
+}
+
 impl TaskConversation {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
@@ -78,29 +86,36 @@ impl TaskConversation {
             task_id,
             role,
             content,
-            attachments,
-            None,
-            &[],
+            MessageExtras {
+                image_attachments: attachments,
+                published_files: &[],
+                attempt_id: None,
+                visualizations: &[],
+            },
         )
     }
 
-    /// Persist a final assistant response and its copied visualization
-    /// fragments in one transaction. A process crash can therefore expose
-    /// neither a dangling content reference nor an ownerless artifact.
+    /// Persist a final assistant response and its copied visualizations/files
+    /// in one transaction. A process crash can therefore expose neither a
+    /// dangling content reference nor an ownerless artifact.
     pub fn add_final_assistant_message(
         &self,
         task_id: &str,
         content: &str,
         attempt_id: &str,
         visualizations: &[PreparedVisualization],
+        published_files: &[PublishedFileAttachment],
     ) -> Result<TaskMessage> {
         self.add_message_with_attachments_and_visualizations(
             task_id,
             "assistant",
             content,
-            &[],
-            Some(attempt_id),
-            visualizations,
+            MessageExtras {
+                image_attachments: &[],
+                published_files,
+                attempt_id: Some(attempt_id),
+                visualizations,
+            },
         )
     }
 
@@ -109,9 +124,7 @@ impl TaskConversation {
         task_id: &str,
         role: &str,
         content: &str,
-        attachments: &[DecodedImageAttachment],
-        attempt_id: Option<&str>,
-        visualizations: &[PreparedVisualization],
+        extras: MessageExtras<'_>,
     ) -> Result<TaskMessage> {
         let conn = self.db.conn();
         let tx =
@@ -135,8 +148,31 @@ impl TaskConversation {
         )?;
 
         let id = tx.last_insert_rowid();
-        let mut stored_attachments = Vec::with_capacity(attachments.len());
-        for attachment in attachments {
+        let mut stored_attachments =
+            Vec::with_capacity(extras.image_attachments.len() + extras.published_files.len());
+        for attachment in extras.image_attachments {
+            let attachment_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO task_message_attachments
+                    (id, message_id, name, mime_type, data, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    attachment_id,
+                    id,
+                    attachment.name,
+                    attachment.mime_type,
+                    attachment.data,
+                    attachment.data.len() as i64,
+                ],
+            )?;
+            stored_attachments.push(TaskMessageAttachment {
+                id: attachment_id,
+                name: attachment.name.clone(),
+                mime_type: attachment.mime_type.clone(),
+                size: attachment.data.len(),
+            });
+        }
+        for attachment in extras.published_files {
             let attachment_id = Uuid::new_v4().to_string();
             tx.execute(
                 "INSERT INTO task_message_attachments
@@ -164,7 +200,7 @@ impl TaskConversation {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let stored_visualizations =
-            store_task_message_visualizations(&tx, id, attempt_id, visualizations)?;
+            store_task_message_visualizations(&tx, id, extras.attempt_id, extras.visualizations)?;
         tx.commit()?;
 
         Ok(TaskMessage {
@@ -342,5 +378,40 @@ mod tests {
             .unwrap();
         assert_eq!(downloaded.mime_type, "image/png");
         assert_eq!(downloaded.data, b"\x89PNG\r\n\x1a\nbytes");
+    }
+
+    #[test]
+    fn stores_final_presentation_with_its_assistant_message() {
+        let db = Arc::new(Database::open_memory().unwrap());
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Build a deck".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        let conversation = TaskConversation::new(db);
+        let file = PublishedFileAttachment {
+            name: "Review.pptx".into(),
+            mime_type: "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                .into(),
+            data: b"pptx bytes".to_vec(),
+        };
+
+        let message = conversation
+            .add_final_assistant_message(
+                &task.id,
+                "The checked deck is attached.",
+                "attempt-1",
+                &[],
+                &[file],
+            )
+            .unwrap();
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].name, "Review.pptx");
+        let downloaded = conversation
+            .get_attachment(&task.id, message.id, &message.attachments[0].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(downloaded.data, b"pptx bytes");
     }
 }

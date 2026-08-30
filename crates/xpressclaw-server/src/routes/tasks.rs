@@ -654,18 +654,41 @@ async fn get_message_attachment(
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "error": "image attachment not found" })),
+                Json(json!({ "error": "attachment not found" })),
             )
         })?;
+    let disposition = if attachment.mime_type.starts_with("image/") {
+        "inline"
+    } else {
+        "attachment"
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, attachment.mime_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!(
+                "{disposition}; filename=\"{}\"",
+                safe_attachment_filename(&attachment.name)
+            ),
+        )
+        .header("x-content-type-options", "nosniff")
         .header(
             header::CACHE_CONTROL,
             "private, max-age=31536000, immutable",
         )
         .body(Body::from(attachment.data))
         .map_err(internal_error)
+}
+
+fn safe_attachment_filename(name: &str) -> String {
+    name.chars()
+        .map(|character| match character {
+            '\r' | '\n' | '"' | '\\' => '_',
+            other if other == ' ' || other.is_ascii_graphic() => other,
+            _ => '_',
+        })
+        .collect()
 }
 
 async fn get_message_visualization(
@@ -1018,6 +1041,7 @@ mod tests {
 
     use xpressclaw_core::config::Config;
     use xpressclaw_core::db::Database;
+    use xpressclaw_core::message_artifacts::PublishedFileAttachment;
 
     use super::*;
 
@@ -1805,8 +1829,65 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "image/png");
+        assert_eq!(
+            resp.headers()["content-disposition"],
+            "inline; filename=\"screen.png\""
+        );
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.as_ref(), b"\x89PNG\r\n\x1a\nbytes");
+    }
+
+    #[tokio::test]
+    async fn generated_presentation_is_downloaded_without_content_sniffing() {
+        let (app, db) = test_app_with_db();
+        let task = TaskBoard::new(db.clone())
+            .create(&CreateTask {
+                title: "Presentation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = TaskConversation::new(db)
+            .add_final_assistant_message(
+                &task.id,
+                "The checked deck is attached.",
+                "attempt-presentation",
+                &[],
+                &[PublishedFileAttachment {
+                    name: "Résumé \"deck\"\r\n.pptx".into(),
+                    mime_type:
+                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                            .into(),
+                    data: b"pptx fixture".to_vec(),
+                }],
+            )
+            .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/tasks/{}/messages/{}/attachments/{}",
+                        task.id, message.id, message.attachments[0].id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        );
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"R_sum_ _deck___.pptx\""
+        );
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), b"pptx fixture");
     }
 
     #[tokio::test]

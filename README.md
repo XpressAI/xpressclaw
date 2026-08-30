@@ -71,6 +71,11 @@ Conversation replies. XpressClaw preserves the generated fragment with the
 message, runs it in an isolated viewer, and asks before an interactive visual
 can send a follow-up. See [Inline visualizations](docs/inline-visualizations.md).
 
+The built-in Codex runner also provides a pinned, XpressClaw-owned workflow for
+creating, rendering, visually checking, validating, and durably attaching new
+PowerPoint decks. It is deliberately distinct from OpenAI's desktop-host
+artifact skill. See [PowerPoint presentation artifacts](docs/presentations.md).
+
 ### Persistent Agents
 
 Each Agent is a durable execution identity inside a Project. It has a name,

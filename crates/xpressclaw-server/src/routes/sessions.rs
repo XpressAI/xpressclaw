@@ -15,8 +15,9 @@ use xpressclaw_core::tasks::board::{CreateTask, TaskBoard};
 use xpressclaw_core::tasks::conversation::TaskConversation;
 use xpressclaw_core::tasks::queue::TaskQueue;
 use xpressclaw_core::workers::native::{
-    host_ssh_agent_socket, local_runner_image_alias, resolve_runner_kind, resolved_runner_image,
-    runner_image_compatible, subscription_auth_available,
+    host_ssh_agent_socket, local_runner_image_alias, presentation_runtime_available,
+    resolve_runner_kind, resolved_runner_image, runner_image_compatible,
+    subscription_auth_available,
 };
 
 use crate::state::AppState;
@@ -183,6 +184,13 @@ async fn readiness(
         None => None,
     };
     let image_present = runtime_image.is_some();
+    let presentation_supported = kind == "codex";
+    let presentation_available = match (docker.as_ref(), runtime_image.as_deref()) {
+        (Some(docker), Some(image)) if presentation_supported => {
+            presentation_runtime_available(docker, image).await
+        }
+        _ => false,
+    };
     let mut issues = Vec::new();
     if !docker_available {
         issues.push("Docker or Podman is not available".to_string());
@@ -245,6 +253,17 @@ async fn readiness(
         "command_present": command_present,
         "subscription_auth": agent.runner.subscription_auth,
         "auth_present": auth_present,
+        "presentation_artifacts": {
+            "supported": presentation_supported,
+            "available": presentation_available,
+            "capability": presentation_available.then_some(xpressclaw_core::workers::presentations::PRESENTATION_CAPABILITY),
+            "runtime": presentation_available.then_some(format!("PptxGenJS {}", xpressclaw_core::workers::presentations::PRESENTATION_RUNTIME_VERSION)),
+            "reason": if presentation_supported && !presentation_available {
+                Some("This runner image does not include the pinned XpressClaw presentation runtime; incompatible OpenAI desktop artifact skills are disabled")
+            } else {
+                None
+            },
+        },
         "issues": issues,
     }))
 }
@@ -786,6 +805,12 @@ mod tests {
             "ghcr.io/xpressai/xpressclaw-runner-codex:latest"
         );
         assert!(value["workspace_present"].as_bool().is_some());
+        assert_eq!(value["presentation_artifacts"]["supported"], true);
+        assert_eq!(value["presentation_artifacts"]["available"], false);
+        assert!(value["presentation_artifacts"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not include the pinned XpressClaw presentation runtime"));
         assert!(value["issues"].is_array());
     }
 }
