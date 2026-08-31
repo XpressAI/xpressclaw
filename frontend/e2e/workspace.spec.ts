@@ -116,6 +116,17 @@ function contrastRatio(foreground: string, background: string): number {
 	return (lighter + 0.05) / (darker + 0.05);
 }
 
+async function expectExternalPopup(page: Page, buttonName: string, expectedUrl: string) {
+	await page.context().route(expectedUrl, async (route) => {
+		await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>External documentation</title>' });
+	}, { times: 1 });
+	const popupPromise = page.waitForEvent('popup');
+	await page.getByRole('button', { name: buttonName, exact: true }).click();
+	const popup = await popupPromise;
+	await expect.poll(() => popup.url()).toBe(expectedUrl);
+	await popup.close();
+}
+
 async function expectReadableCode(message: Locator) {
 	const inlineCode = message.locator('.prose-chat p code').first();
 	const fencedCode = message.locator('.prose-chat pre').first();
@@ -4501,23 +4512,46 @@ test('skills and MCP settings surface official discovery documentation', async (
 	await expect(page.getByRole('button', { name: 'Official MCP Registry' })).toBeVisible();
 	await expect(page.getByRole('button', { name: 'Add server' })).toBeVisible();
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
-	await page.getByRole('button', { name: 'Official MCP Registry' }).click();
+	await expectExternalPopup(page, 'Official MCP Registry', 'https://registry.modelcontextprotocol.io/');
 	await expect(page.getByText('Find published packages and remote endpoints')).toBeVisible();
 
 	await page.goto(`/agents/${agentId}?tab=runner`);
-	await page.getByRole('button', { name: 'Registry' }).click();
-	await page.getByRole('button', { name: 'Claude Agent skills guide' }).click();
-	expect(openUrlRequests).toEqual([
-		'https://registry.modelcontextprotocol.io/',
-		'https://registry.modelcontextprotocol.io/',
-		'https://code.claude.com/docs/en/skills',
-	]);
+	await expectExternalPopup(page, 'Registry', 'https://registry.modelcontextprotocol.io/');
+	await expectExternalPopup(page, 'Claude Agent skills guide', 'https://code.claude.com/docs/en/skills');
 
+	expect(openUrlRequests).toEqual([]);
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
+test('Harness discovery links use the native opener in the desktop app', async ({ page }) => {
+	await page.addInitScript(() => {
+		Object.defineProperty(window, 'isTauri', { value: true });
+		(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls = [];
+		(window as unknown as {
+			__TAURI_INTERNALS__: { invoke: (command: string, args: Record<string, unknown>) => Promise<unknown> };
+		}).__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: Record<string, unknown>) => {
+				if (command === 'get_active_instance_profile') {
+					return { identity_status: 'matched', local: true };
+				}
+				(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls.push({ command, args });
+				return null;
+			},
+		};
+	});
+	await mockApi(page, { mcpServers: [] });
+	await page.goto(`/agents/${agentId}?tab=runner`);
+	await page.getByRole('button', { name: 'Registry', exact: true }).click();
+
+	await expect.poll(() => page.evaluate(() => (
+		window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }
+	).__externalOpenCalls)).toEqual([{
+		command: 'plugin:opener|open_url',
+		args: { url: 'https://registry.modelcontextprotocol.io/', with: undefined },
+	}]);
+});
+
 test('every supported harness resolves the intended documentation and custom stays neutral', async ({ page }) => {
-	const openUrlRequests: string[] = [];
 	const agentKind = { value: 'codex' };
 	const catalog = [
 		['codex', 'Codex', 'https://developers.openai.com/codex/cli/'],
@@ -4534,7 +4568,7 @@ test('every supported harness resolves the intended documentation and custom sta
 		image: `ghcr.io/xpressai/xpressclaw-runner-${kind}:latest`,
 		host_image: `ghcr.io/xpressai/xpressclaw-runner-${kind}-docker:latest`,
 	}));
-	await mockApi(page, { openUrlRequests, agentCatalog: catalog, agentKind });
+	await mockApi(page, { agentCatalog: catalog, agentKind });
 
 	const expected = [
 		['codex', 'Codex skills guide', 'https://learn.chatgpt.com/docs/build-skills'],
@@ -4550,8 +4584,7 @@ test('every supported harness resolves the intended documentation and custom sta
 		agentKind.value = kind;
 		await page.goto(`/agents/${agentId}?tab=runner`);
 		await expect(page.locator('#runner-kind')).toHaveValue(kind);
-		await page.getByRole('button', { name: buttonName }).click();
-		expect(openUrlRequests.at(-1)).toBe(url);
+		await expectExternalPopup(page, buttonName, url);
 	}
 
 	agentKind.value = 'custom';

@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { isTauri } from '@tauri-apps/api/core';
 import { serverTimestampMs } from './serverTime';
 import { request } from './api';
 
@@ -26,16 +27,29 @@ export function formatCost(usd: number): string {
 	return `$${usd.toFixed(2)}`;
 }
 
-/** Open a URL in the system browser via the server, with browser fallback. */
+/** Open a URL in the user's browser, never on the machine hosting the API. */
 export async function openExternal(url: string): Promise<void> {
+	const target = new URL(url);
+	if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+		throw new Error('Only HTTP and HTTPS links can be opened');
+	}
+
+	if (!isTauri()) {
+		window.open(target.href, '_blank', 'noopener,noreferrer');
+		return;
+	}
+
 	try {
+		const { openUrl } = await import('@tauri-apps/plugin-opener');
+		await openUrl(target.href);
+	} catch {
+		// Older Desktop builds may not expose the opener plugin. Their local
+		// sidecar still provides this compatibility path.
 		await request<void>('/api/open-url', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ url })
+			body: JSON.stringify({ url: target.href })
 		});
-	} catch {
-		window.open(url, '_blank');
 	}
 }
 
