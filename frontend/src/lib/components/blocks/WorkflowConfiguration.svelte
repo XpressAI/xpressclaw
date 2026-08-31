@@ -186,7 +186,7 @@
 						<input aria-label="Workflow cron schedule" type="text" value={schedule.cron} oninput={(event) => updateSchedule({ cron: event.currentTarget.value })} placeholder="0 9 * * 1" class="mt-1 w-full rounded border border-input bg-background px-2 py-1.5 font-mono text-xs text-foreground" />
 					</label>
 				{:else}
-					<p class="self-end pb-1 text-[10px] leading-relaxed text-muted-foreground">The Run button is always available. Add a schedule when this workflow should also start on its own.</p>
+					<p class="self-end pb-1 text-[10px] leading-relaxed text-muted-foreground">Independent workflows can use the Run button. Add a schedule when one should also start on its own.</p>
 				{/if}
 			</div>
 

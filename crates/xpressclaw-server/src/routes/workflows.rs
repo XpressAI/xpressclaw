@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/{id}/enable", post(enable_workflow))
         .route("/{id}/disable", post(disable_workflow))
+        .route("/{id}/default", post(set_default_workflow))
         .route("/{id}/run", post(run_workflow))
         .route("/{id}/instances", get(list_instances))
         .route("/instances/{instance_id}", get(get_instance))
@@ -142,6 +143,27 @@ async fn disable_workflow(
         _ => internal_error(e),
     })?;
     Ok(Json(json!(wf)))
+}
+
+#[derive(Deserialize)]
+struct DefaultWorkflowReq {
+    default_for_tasks: bool,
+}
+
+async fn set_default_workflow(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DefaultWorkflowReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mgr = WorkflowManager::new(state.db.clone());
+    let workflow = mgr
+        .set_default_for_tasks(&id, req.default_for_tasks)
+        .map_err(|error| match &error {
+            xpressclaw_core::error::Error::WorkflowNotFound { .. } => not_found(&error),
+            xpressclaw_core::error::Error::Workflow(_) => bad_request(&error),
+            _ => internal_error(error),
+        })?;
+    Ok(Json(json!(workflow)))
 }
 
 async fn run_workflow(
@@ -396,6 +418,78 @@ flows:
         assert_eq!(workflow["trigger_count"], 0);
         assert!(workflow["last_triggered_at"].is_null());
         assert!(workflow["trigger_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn marks_eligible_workflows_as_default_task_policy() {
+        let app = test_app();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/workflows")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "final-ui-check",
+                            "yaml_content": r#"
+name: final-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Ensure the UI contains no unnecessary messages.
+"#,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let workflow = body_json(response.into_body()).await;
+        assert_eq!(workflow["default_for_tasks"], false);
+        let id = workflow["id"].as_str().unwrap();
+
+        let marked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workflows/{id}/default"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"default_for_tasks":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(marked.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(marked.into_body()).await["default_for_tasks"],
+            true
+        );
+
+        let typed = create_workflow(&app).await;
+        let typed_id = typed["id"].as_str().unwrap();
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/workflows/{typed_id}/default"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"default_for_tasks":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(rejected.into_body()).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot collect run-time inputs"));
     }
 
     #[tokio::test]

@@ -236,6 +236,29 @@ impl TaskConversation {
         })
     }
 
+    /// Insert a plain task-chat message inside a caller-owned transaction.
+    /// Workflow continuation steps use this to commit the fixed prompt, its
+    /// step execution, and the queued response cycle atomically.
+    pub(crate) fn insert_text_message_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<TaskMessage> {
+        Self::insert_message_in_transaction(
+            transaction,
+            task_id,
+            role,
+            content,
+            MessageExtras {
+                image_attachments: &[],
+                published_files: &[],
+                attempt_id: None,
+                visualizations: &[],
+            },
+        )
+    }
+
     /// Commit the final Task reply and terminal attempt/queue state together.
     /// Cancellation and completion therefore have one SQLite serialization
     /// point, and a failed attachment/message write leaves the running work

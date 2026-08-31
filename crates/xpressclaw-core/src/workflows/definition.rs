@@ -94,7 +94,7 @@ pub struct Step {
     pub step_type: String, // step, sink, when, loop, jump
     #[serde(default)]
     pub label: Option<String>,
-    // Step (task) fields
+    // Step (task) and continue-current-task fields
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
@@ -217,9 +217,28 @@ impl WorkflowDefinition {
                 .any(|flow| Self::steps_use_connectors(&flow.steps))
     }
 
+    /// Whether this workflow contains a step that must be attached to an
+    /// existing source task. Such definitions can be saved before they are
+    /// marked as defaults, but cannot be started as independent manual runs.
+    pub fn continues_source_task(&self) -> bool {
+        self.flows
+            .values()
+            .any(|flow| Self::steps_continue_source_task(&flow.steps))
+    }
+
     fn steps_use_connectors(steps: &[Step]) -> bool {
         steps.iter().any(|step| {
             step.step_type == "sink" || step.body.as_deref().is_some_and(Self::steps_use_connectors)
+        })
+    }
+
+    fn steps_continue_source_task(steps: &[Step]) -> bool {
+        steps.iter().any(|step| {
+            step.step_type == "continue"
+                || step
+                    .body
+                    .as_deref()
+                    .is_some_and(Self::steps_continue_source_task)
         })
     }
 
@@ -363,6 +382,12 @@ impl WorkflowDefinition {
         }
 
         if let Some(schedule) = self.schedule.as_ref() {
+            if self.continues_source_task() {
+                return Err(Error::Workflow(
+                    "continue steps require a source task and cannot run from a cron schedule"
+                        .into(),
+                ));
+            }
             if schedule.cron.trim().is_empty() {
                 return Err(Error::Workflow(
                     "workflow schedule cron cannot be empty".into(),
@@ -428,6 +453,63 @@ impl WorkflowDefinition {
             }
         }
         Ok(Value::Object(resolved))
+    }
+
+    /// Resolve the inputs available to a workflow that runs automatically for
+    /// a task. Default workflows cannot stop to ask for run-time values. Their
+    /// primary Agent input, when present, is bound to the task's Agent and all
+    /// other required inputs must declare defaults.
+    pub fn resolve_default_task_inputs(&self, agent_id: Option<&str>) -> Result<Value> {
+        let mut provided = serde_json::Map::new();
+        if let Some((name, _)) = self
+            .inputs
+            .iter()
+            .find(|(_, input)| input.input_type == WorkflowInputType::Agent && input.primary)
+        {
+            if let Some(agent_id) = agent_id.filter(|agent_id| !agent_id.trim().is_empty()) {
+                provided.insert(name.clone(), Value::String(agent_id.to_string()));
+            }
+        }
+        self.resolve_inputs(&Value::Object(provided)).map_err(|error| {
+            Error::Workflow(format!(
+                "default task workflow cannot collect run-time inputs: {error}; add defaults for required inputs"
+            ))
+        })
+    }
+
+    /// Check that every automatic task run can be initialized without a form.
+    pub fn validate_default_task_trigger(&self) -> Result<()> {
+        const TASK_AGENT_SENTINEL: &str = "__xpressclaw_source_task_agent__";
+        if self.inputs.contains_key("source_task") || self.variables.contains_key("source_task") {
+            return Err(Error::Workflow(
+                "default task workflows reserve 'source_task' for the triggering task metadata"
+                    .into(),
+            ));
+        }
+        let inputs = self.resolve_default_task_inputs(Some(TASK_AGENT_SENTINEL))?;
+        for (name, input) in &self.inputs {
+            if input.input_type == WorkflowInputType::Agent {
+                if let Some(agent_id) = inputs.get(name).and_then(Value::as_str) {
+                    if agent_id != TASK_AGENT_SENTINEL {
+                        return Err(Error::Workflow(format!(
+                            "default task workflow agent input '{name}' resolves to Agent '{agent_id}'; use one primary agent input so it follows each source task's Project"
+                        )));
+                    }
+                }
+            }
+        }
+        let initial_context = context::build_context(&inputs, &self.variables, &HashMap::new());
+        let mut resolved = self.clone();
+        let (bindings, _) = resolved.resolve_agent_bindings(&initial_context, true)?;
+        if let Some((source, agent_id)) = bindings
+            .iter()
+            .find(|(_, agent_id)| agent_id != TASK_AGENT_SENTINEL)
+        {
+            return Err(Error::Workflow(format!(
+                "default task workflow {source} resolves to Agent '{agent_id}'; use a primary agent input so it follows each source task's Project"
+            )));
+        }
+        Ok(())
     }
 
     /// Recursively collect step IDs, detecting duplicates.
@@ -514,6 +596,19 @@ impl WorkflowDefinition {
                     }
                 }
                 "step" => self.validate_agent_reference(step, flow_name, false)?,
+                "continue" => {
+                    if step
+                        .prompt
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(Error::Workflow(format!(
+                            "continue step '{}' in flow '{flow_name}' is missing 'prompt'",
+                            step.id
+                        )));
+                    }
+                }
                 "wait" => {
                     self.validate_agent_reference(step, flow_name, true)?;
                     let event = step
@@ -1647,5 +1742,136 @@ flows:
             .unwrap_err()
             .to_string()
             .contains("invalid timeout"));
+    }
+
+    #[test]
+    fn validates_fixed_current_task_prompts() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: final-ui-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Ensure the UI contains no messages unnecessary to the end user.
+"#,
+        )
+        .unwrap();
+        definition.validate().unwrap();
+
+        let missing_prompt = WorkflowDefinition::parse(
+            r#"
+name: invalid-final-check
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+"#,
+        )
+        .unwrap();
+        assert!(missing_prompt
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("missing 'prompt'"));
+
+        let scheduled = WorkflowDefinition::parse(
+            r#"
+name: invalid-scheduled-final-check
+schedule:
+  cron: "0 0 * * *"
+flows:
+  main:
+    steps:
+      - id: review_ui
+        type: continue
+        prompt: Review the completed task.
+"#,
+        )
+        .unwrap();
+        assert!(scheduled
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot run from a cron schedule"));
+    }
+
+    #[test]
+    fn default_task_inputs_bind_the_primary_agent_and_require_other_defaults() {
+        let definition = WorkflowDefinition::parse(
+            r#"
+name: default-policy
+inputs:
+  worker: { type: agent, required: true, primary: true }
+  focus: { type: string, required: true, default: user-facing UI }
+flows:
+  main:
+    steps:
+      - id: check
+        agent: "@worker"
+        prompt: Check @focus
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            definition
+                .resolve_default_task_inputs(Some("atlas"))
+                .unwrap(),
+            serde_json::json!({"worker": "atlas", "focus": "user-facing UI"})
+        );
+
+        let missing = WorkflowDefinition::parse(
+            r#"
+name: invalid-default-policy
+inputs:
+  focus: { type: string, required: true }
+flows:
+  main:
+    steps: []
+"#,
+        )
+        .unwrap();
+        assert!(missing
+            .validate_default_task_trigger()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot collect run-time inputs"));
+
+        let fixed_agent = WorkflowDefinition::parse(
+            r#"
+name: invalid-fixed-agent-policy
+flows:
+  main:
+    steps:
+      - id: check
+        agent: atlas
+        prompt: Check every task
+"#,
+        )
+        .unwrap();
+        assert!(fixed_agent
+            .validate_default_task_trigger()
+            .unwrap_err()
+            .to_string()
+            .contains("use a primary agent input"));
+
+        let reserved_source_task = WorkflowDefinition::parse(
+            r#"
+name: invalid-source-task-variable
+variables:
+  source_task: stale value
+flows:
+  main:
+    steps: []
+"#,
+        )
+        .unwrap();
+        assert!(reserved_source_task
+            .validate_default_task_trigger()
+            .unwrap_err()
+            .to_string()
+            .contains("reserve 'source_task'"));
     }
 }

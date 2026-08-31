@@ -65,6 +65,7 @@
 	));
 	let workflowDefinition = $derived(parseWorkflow(workflowList.find((workflow) => workflow.id === taskWorkflow)));
 	let workflowInputs = $derived(Object.entries(workflowDefinition?.inputs ?? {}));
+	let manualWorkflowList = $derived(workflowList.filter((workflow) => !workflowContinuesSourceTask(parseWorkflow(workflow))));
 
 	interface WorkflowInput {
 		type?: 'string' | 'number' | 'boolean' | 'agent';
@@ -72,7 +73,11 @@
 		default?: string | number | boolean;
 		description?: string;
 	}
-	interface WorkflowSummary { inputs?: Record<string, WorkflowInput> }
+	interface WorkflowStepSummary { type?: string; steps?: WorkflowStepSummary[]; body?: WorkflowStepSummary[] }
+	interface WorkflowSummary {
+		inputs?: Record<string, WorkflowInput>;
+		flows?: Record<string, { steps?: WorkflowStepSummary[] }>;
+	}
 
 	$effect(() => { if (draftReady) saveComposerDraft(draftScope, content); });
 
@@ -95,6 +100,12 @@
 	function parseWorkflow(workflow: Workflow | undefined): WorkflowSummary | null {
 		if (!workflow) return null;
 		try { return yaml.load(workflow.yaml_content) as WorkflowSummary; } catch { return null; }
+	}
+
+	function workflowContinuesSourceTask(definition: WorkflowSummary | null): boolean {
+		const continues = (steps: WorkflowStepSummary[]): boolean =>
+			steps.some((step) => step.type === 'continue' || continues(step.steps ?? step.body ?? []));
+		return Object.values(definition?.flows ?? {}).some((flow) => continues(flow.steps ?? []));
 	}
 
 	function turnAgentName(turn: ConversationTurn): string {
@@ -560,7 +571,7 @@
 			<div class="flex items-center justify-between"><div><h2 class="font-semibold">Continue with work</h2><p class="text-xs text-muted-foreground">Create one Agent task or run a reusable workflow in this conversation.</p></div><button type="button" onclick={() => (showTaskComposer = false)} class="text-xl text-muted-foreground">×</button></div>
 			<div><label for="task-title" class="text-xs font-medium">Title</label><input id="task-title" bind:value={taskTitle} class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm" placeholder="What needs to be done?" /></div>
 			<div><label for="task-description" class="text-xs font-medium">Details</label><textarea id="task-description" bind:value={taskDescription} rows="3" class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm" placeholder="Context, constraints, or expected outcome"></textarea></div>
-			<div class="grid gap-3 sm:grid-cols-2"><div><label for="task-workflow" class="text-xs font-medium">Workflow</label><select id="task-workflow" value={taskWorkflow} onchange={(event) => selectWorkflow(event.currentTarget.value)} class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"><option value="">No workflow</option>{#each workflowList as workflow}<option value={workflow.id}>{workflow.name}</option>{/each}</select></div>{#if !taskWorkflow}<div><label for="task-agent" class="text-xs font-medium">Agent</label><select id="task-agent" bind:value={taskAgent} class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"><option value="">Unassigned</option>{#each projectAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}</select></div>{/if}</div>
+			<div class="grid gap-3 sm:grid-cols-2"><div><label for="task-workflow" class="text-xs font-medium">Workflow</label><select id="task-workflow" value={taskWorkflow} onchange={(event) => selectWorkflow(event.currentTarget.value)} class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"><option value="">No workflow</option>{#each manualWorkflowList as workflow}<option value={workflow.id}>{workflow.name}</option>{/each}</select></div>{#if !taskWorkflow}<div><label for="task-agent" class="text-xs font-medium">Agent</label><select id="task-agent" bind:value={taskAgent} class="mt-1 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"><option value="">Unassigned</option>{#each projectAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}</select></div>{/if}</div>
 			{#if taskWorkflow && workflowInputs.length}<div class="space-y-3 rounded-lg border border-border bg-background/50 p-3"><p class="text-xs font-semibold">Workflow inputs</p>{#each workflowInputs as [name, input]}<label class="block text-xs"><span class="mb-1 block font-medium">{name}{input.required ? ' *' : ''}</span>{#if input.type === 'agent'}<select value={String(workflowValues[name] ?? '')} onchange={(event) => (workflowValues[name] = event.currentTarget.value)} class="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"><option value="">Choose an Agent</option>{#each projectAgents as agent}<option value={agent.id}>{agent.title || agent.name}</option>{/each}</select>{:else if input.type === 'boolean'}<input type="checkbox" checked={Boolean(workflowValues[name])} onchange={(event) => (workflowValues[name] = event.currentTarget.checked)} />{:else}<input type={input.type === 'number' ? 'number' : 'text'} value={String(workflowValues[name] ?? '')} oninput={(event) => (workflowValues[name] = input.type === 'number' ? Number(event.currentTarget.value) : event.currentTarget.value)} class="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm" placeholder={input.description || name} />{/if}</label>{/each}</div>{/if}
 			<div class="flex justify-end gap-2"><button type="button" onclick={() => (showTaskComposer = false)} class="rounded-lg border border-border px-3 py-2 text-sm">Cancel</button><button disabled={!taskTitle.trim() || taskWorkflow !== '' && !workflowReady()} class="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground disabled:opacity-40">{taskWorkflow ? 'Run workflow' : 'Create task'}</button></div>
 		</form>

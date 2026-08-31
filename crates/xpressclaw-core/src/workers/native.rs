@@ -502,6 +502,15 @@ pub async fn start_dispatcher(
         let queue = TaskQueue::new(db.clone());
         match queue.claim_next() {
             Ok(Some(item)) => {
+                if let Err(error) = crate::workflows::engine::WorkflowEngine::new(db.clone())
+                    .attach_default_workflows_to_task(&item.task_id)
+                {
+                    warn!(
+                        task_id = item.task_id,
+                        error = %error,
+                        "default task workflow attachment failed"
+                    );
+                }
                 let db = db.clone();
                 let config = config.read().unwrap().clone();
                 let event_bus = event_bus.clone();

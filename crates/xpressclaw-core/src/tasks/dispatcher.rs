@@ -778,6 +778,16 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             None => continue,
         };
 
+        if let Err(error) =
+            WorkflowEngine::new(db.clone()).attach_default_workflows_to_task(&claimed.task_id)
+        {
+            warn!(
+                task_id = claimed.task_id,
+                error = %error,
+                "default task workflow attachment failed"
+            );
+        }
+
         // Check dependencies before dispatching (ADR-020).
         // If not all dependencies are completed, skip this task for now.
         if !board.is_ready(&claimed.task_id).unwrap_or(true) {

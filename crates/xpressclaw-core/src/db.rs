@@ -2425,6 +2425,23 @@ CREATE INDEX idx_agent_repository_updated
     ON agent_repository_selections(updated_at);
 "#;
 
+const MIGRATION_V44: &str = r#"
+-- Default task workflows are local automation policy. A workflow marked as a
+-- default is attached once to each ordinary Agent task when its first attempt
+-- is dispatched. The source-task link is both the continuation target and the
+-- idempotency boundary for dispatcher retries and process recovery.
+ALTER TABLE workflows ADD COLUMN default_for_tasks INTEGER NOT NULL DEFAULT 0
+    CHECK (default_for_tasks IN (0, 1));
+ALTER TABLE workflow_instances ADD COLUMN source_task_id TEXT
+    REFERENCES tasks(id) ON DELETE CASCADE;
+CREATE UNIQUE INDEX idx_workflow_instances_source_task
+    ON workflow_instances(workflow_id, source_task_id)
+    WHERE source_task_id IS NOT NULL;
+CREATE INDEX idx_workflow_instances_source_task_lookup
+    ON workflow_instances(source_task_id, status)
+    WHERE source_task_id IS NOT NULL;
+"#;
+
 const MIGRATION_V39: &str = "
 -- Cascading Project deletion is a recoverable two-phase operation. The
 -- durable marker is set before workers and retained runtimes are stopped, so
@@ -2521,6 +2538,7 @@ fn schema_migrations() -> &'static [(u32, &'static str)] {
         (41, MIGRATION_V41),
         (42, MIGRATION_V42),
         (43, MIGRATION_V43),
+        (44, MIGRATION_V44),
     ]
 }
 
@@ -2541,7 +2559,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "43");
+        assert_eq!(version, "44");
         let visualization_table: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master

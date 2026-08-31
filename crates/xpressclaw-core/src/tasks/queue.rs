@@ -238,48 +238,13 @@ impl TaskQueue {
                 conn,
                 rusqlite::TransactionBehavior::Immediate,
             )?;
-            ensure_task_project_accepts_work(&transaction, task_id)?;
-            let queued_attempt_id = transaction
-                .query_row(
-                    "SELECT attempt_id FROM task_queue
-                     WHERE task_id = ?1 AND status = 'queued'
-                     ORDER BY id DESC LIMIT 1",
-                    [task_id],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?;
-
-            let item = match queued_attempt_id {
-                Some(Some(attempt_id)) => {
-                    Self::associate_response_trigger_in_transaction(
-                        &transaction,
-                        &attempt_id,
-                        message_id,
-                        message_timestamp,
-                    )?;
-                    None
-                }
-                Some(None) => {
-                    return Err(Error::Task(format!(
-                        "queued continuation for task {task_id} has no work attempt"
-                    )));
-                }
-                None => {
-                    let item = Self::enqueue_in_transaction(&transaction, task_id, agent_id)?;
-                    let attempt_id = item.attempt_id.as_deref().ok_or_else(|| {
-                        Error::Task(format!(
-                            "queued continuation for task {task_id} has no work attempt"
-                        ))
-                    })?;
-                    Self::associate_response_trigger_in_transaction(
-                        &transaction,
-                        attempt_id,
-                        message_id,
-                        message_timestamp,
-                    )?;
-                    Some(item)
-                }
-            };
+            let item = Self::enqueue_continuation_for_message_in_transaction(
+                &transaction,
+                task_id,
+                agent_id,
+                message_id,
+                message_timestamp,
+            )?;
             transaction.commit()?;
             Ok::<_, Error>(item)
         })?;
@@ -293,6 +258,58 @@ impl TaskQueue {
             );
         }
         Ok(created)
+    }
+
+    /// Enqueue or coalesce a message-triggered continuation in a caller-owned
+    /// transaction. The message itself may therefore share one commit with a
+    /// workflow step execution.
+    pub(crate) fn enqueue_continuation_for_message_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        task_id: &str,
+        agent_id: &str,
+        message_id: i64,
+        message_timestamp: &str,
+    ) -> Result<Option<QueueItem>> {
+        ensure_task_project_accepts_work(transaction, task_id)?;
+        let queued_attempt_id = transaction
+            .query_row(
+                "SELECT attempt_id FROM task_queue
+                 WHERE task_id = ?1 AND status = 'queued'
+                 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+
+        match queued_attempt_id {
+            Some(Some(attempt_id)) => {
+                Self::associate_response_trigger_in_transaction(
+                    transaction,
+                    &attempt_id,
+                    message_id,
+                    message_timestamp,
+                )?;
+                Ok(None)
+            }
+            Some(None) => Err(Error::Task(format!(
+                "queued continuation for task {task_id} has no work attempt"
+            ))),
+            None => {
+                let item = Self::enqueue_in_transaction(transaction, task_id, agent_id)?;
+                let attempt_id = item.attempt_id.as_deref().ok_or_else(|| {
+                    Error::Task(format!(
+                        "queued continuation for task {task_id} has no work attempt"
+                    ))
+                })?;
+                Self::associate_response_trigger_in_transaction(
+                    transaction,
+                    attempt_id,
+                    message_id,
+                    message_timestamp,
+                )?;
+                Ok(Some(item))
+            }
+        }
     }
 
     fn associate_response_trigger_in_transaction(

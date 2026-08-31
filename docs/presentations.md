@@ -14,8 +14,9 @@ install packages during a Task, or advertise the incompatible upstream skill.
 
 ## Use it
 
-1. Select the built-in Codex runner for an Agent. The Agent's **Work** page
-   shows **PowerPoint artifacts ready** when the compatible image is present.
+1. Select the built-in Codex runner for an Agent. XpressClaw detects the
+   compatible presentation runtime without adding a persistent capability
+   notice to the Agent's **Work** page.
 2. Ask Codex to create a new PowerPoint presentation. The separate
    `xpressclaw-presentations` skill uses the immutable runtime bundled in the
    runner image.

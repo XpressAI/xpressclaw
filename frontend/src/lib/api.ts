@@ -1312,6 +1312,7 @@ export interface Workflow {
 	description: string | null;
 	yaml_content: string;
 	enabled: boolean;
+	default_for_tasks: boolean;
 	version: number;
 	created_at: string;
 	updated_at: string;
@@ -1325,6 +1326,7 @@ export interface WorkflowInstance {
 	workflow_id: string;
 	project_id?: string | null;
 	conversation_id?: string | null;
+	source_task_id?: string | null;
 	current_task_id?: string | null;
 	status: string;
 	current_flow: string;
@@ -1371,6 +1373,10 @@ export const workflows = {
 	delete: (id: string) => request<void>(`/api/workflows/${id}`, { method: 'DELETE' }),
 	enable: (id: string) => request<Workflow>(`/api/workflows/${id}/enable`, { method: 'POST' }),
 	disable: (id: string) => request<Workflow>(`/api/workflows/${id}/disable`, { method: 'POST' }),
+	setDefaultForTasks: (id: string, defaultForTasks: boolean) => request<Workflow>(`/api/workflows/${id}/default`, {
+		method: 'POST',
+		body: JSON.stringify({ default_for_tasks: defaultForTasks })
+	}),
 	run: (id: string, triggerData?: Record<string, unknown>, projectId?: string) => {
 		const params = new URLSearchParams();
 		if (projectId) params.set('project_id', projectId);
