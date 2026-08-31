@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 
 const EVENT_RETENTION_DAYS: i64 = 8;
 const EVENT_RETENTION_ROWS: i64 = 20_000;
@@ -1216,7 +1217,7 @@ impl GitSnapshot {
 fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(workspace)
+        .arg(path_for_external_tool(workspace))
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_EXTERNAL_DIFF")

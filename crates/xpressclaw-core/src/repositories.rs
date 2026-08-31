@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 use crate::workers::github;
 
 const MAX_DISCOVERY_DEPTH: usize = 4;
@@ -987,13 +988,16 @@ fn inspect_repository(bootstrap_root: &Path, directory: &Path) -> Option<Reposit
         return None;
     }
     let mut command = Command::new("git");
-    command.arg("-C").arg(&directory).args([
-        "rev-parse",
-        "--show-toplevel",
-        "--absolute-git-dir",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ]);
+    command
+        .arg("-C")
+        .arg(path_for_external_tool(&directory))
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]);
     let output = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT)?;
     if !output.status.success() {
         return None;
@@ -1063,7 +1067,7 @@ fn git_origin(repository: &Path) -> Option<String> {
     let mut command = Command::new("git");
     command
         .arg("-C")
-        .arg(repository)
+        .arg(path_for_external_tool(repository))
         .args(["remote", "get-url", "origin"]);
     let output = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT)?;
     output
@@ -1214,7 +1218,7 @@ fn has_self_contained_git_config(
         let mut command = Command::new("git");
         command
             .args(["config", "--file"])
-            .arg(&config)
+            .arg(path_for_external_tool(&config))
             .args(["--no-includes", "--null", "--list"]);
         let Some(output) = bounded_command_output(&mut command, GIT_INSPECTION_TIMEOUT) else {
             return false;
@@ -1743,6 +1747,7 @@ mod tests {
         let git_dir = checkout
             .join(".git")
             .canonicalize()
+            .map(|path| path_for_external_tool(&path))
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");

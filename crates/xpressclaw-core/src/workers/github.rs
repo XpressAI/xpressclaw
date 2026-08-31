@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use crate::connectors::manager::ConnectorManager;
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 
 const GITHUB_HOST: &str = "github.com";
 const GITHUB_MCP_COMMAND: &str = "/usr/local/bin/node";
@@ -333,16 +334,20 @@ pub fn add_codex_mcp_guidance(
 }
 
 fn origin_repository(workspace: &Path) -> Option<(String, String)> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+    let output = origin_repository_command(workspace).output().ok()?;
     if !output.status.success() {
         return None;
     }
     parse_repository_remote(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn origin_repository_command(workspace: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(path_for_external_tool(workspace))
+        .args(["remote", "get-url", "origin"]);
+    command
 }
 
 pub fn parse_repository_remote(remote: &str) -> Option<(String, String)> {
@@ -428,6 +433,15 @@ fn host_git_config(key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_lookup_normalizes_windows_verbatim_paths_on_every_host() {
+        let command = origin_repository_command(Path::new(r"\\?\C:\workspace\project"));
+        assert_eq!(
+            command.get_args().nth(1),
+            Some(std::ffi::OsStr::new(r"C:\workspace\project"))
+        );
+    }
 
     #[test]
     fn parses_common_github_remote_forms() {

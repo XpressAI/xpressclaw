@@ -38,6 +38,7 @@ use crate::docker::manager::{
     container_spec_fingerprint, ContainerSpec, DockerManager, SelinuxRelabel, VolumeMount,
 };
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 use crate::message_artifacts::{bound_published_file_name, prepare_message_artifacts};
 use crate::repositories::{
     agent_callback_capability, discover_github_access, run_repository_blocking,
@@ -3807,22 +3808,7 @@ fn expand_home(path: &str) -> String {
 
 fn canonical_or_original(path: &Path) -> PathBuf {
     let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    strip_verbatim(resolved)
-}
-
-/// Strip the `\\?\` prefix Windows `canonicalize()` adds to drive paths;
-/// Docker Desktop's bind-mount parser rejects it. Others pass through as-is.
-#[cfg(windows)]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
-        _ => path,
-    }
-}
-
-#[cfg(not(windows))]
-fn strip_verbatim(path: PathBuf) -> PathBuf {
-    path
+    path_for_external_tool(&resolved)
 }
 
 fn needs_user_input(summary: &str) -> bool {

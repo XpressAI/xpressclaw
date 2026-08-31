@@ -20,6 +20,7 @@ use tokio::io::AsyncWrite;
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 
 const LIFECYCLE_LABEL: &str = "io.xpressclaw.lifecycle";
 const PROJECT_LIFECYCLE: &str = "project";
@@ -1548,6 +1549,13 @@ fn runtime_mounts(volumes: &[VolumeMount], selinux_enabled: bool) -> Result<Runt
             && !volume.source.contains('\\')
             && !volume.source.contains(':')
             && !volume.source.starts_with('~');
+        let source = if is_named_volume {
+            volume.source.clone()
+        } else {
+            path_for_external_tool(Path::new(&volume.source))
+                .display()
+                .to_string()
+        };
         let relabel = match volume.selinux_relabel {
             SelinuxRelabel::Shared => Some("z"),
             SelinuxRelabel::Private => Some("Z"),
@@ -1555,23 +1563,22 @@ fn runtime_mounts(volumes: &[VolumeMount], selinux_enabled: bool) -> Result<Runt
         };
         if selinux_enabled && !is_named_volume {
             if let Some(relabel) = relabel {
-                if volume.source.contains(':') || volume.target.contains(':') {
+                if source.contains(':') || volume.target.contains(':') {
                     return Err(Error::Container(format!(
                         "SELinux relabeling cannot represent a mount path containing ':' ({} -> {})",
-                        volume.source, volume.target
+                        source, volume.target
                     )));
                 }
                 let access = if volume.read_only { "ro" } else { "rw" };
-                result.binds.push(format!(
-                    "{}:{}:{access},{relabel}",
-                    volume.source, volume.target
-                ));
+                result
+                    .binds
+                    .push(format!("{}:{}:{access},{relabel}", source, volume.target));
                 continue;
             }
         }
         result.mounts.push(Mount {
             target: Some(volume.target.clone()),
-            source: Some(volume.source.clone()),
+            source: Some(source),
             typ: Some(if is_named_volume {
                 MountTypeEnum::VOLUME
             } else {
@@ -1890,6 +1897,34 @@ mod tests {
         let without_selinux = runtime_mounts(&volumes, false).unwrap();
         assert!(without_selinux.binds.is_empty());
         assert_eq!(without_selinux.mounts.len(), volumes.len());
+    }
+
+    #[test]
+    fn bind_mounts_normalize_windows_verbatim_sources_on_every_host() {
+        let volumes = vec![
+            VolumeMount {
+                source: r"\\?\C:\workspace\project".into(),
+                target: "/workspace".into(),
+                read_only: false,
+                selinux_relabel: SelinuxRelabel::None,
+            },
+            VolumeMount {
+                source: r"\\?\UNC\server\share\project".into(),
+                target: "/network-workspace".into(),
+                read_only: true,
+                selinux_relabel: SelinuxRelabel::None,
+            },
+        ];
+
+        let rendered = runtime_mounts(&volumes, false).unwrap();
+        assert_eq!(
+            rendered.mounts[0].source.as_deref(),
+            Some(r"C:\workspace\project")
+        );
+        assert_eq!(
+            rendered.mounts[1].source.as_deref(),
+            Some(r"\\server\share\project")
+        );
     }
 
     #[test]
