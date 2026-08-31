@@ -7,16 +7,9 @@ use std::path::{Path, PathBuf};
 /// containment checks, but tools including Git and Docker Desktop do not
 /// consistently accept them as command-line arguments.
 pub(crate) fn path_for_external_tool(path: &Path) -> PathBuf {
-    if cfg!(windows) {
-        windows_path_for_external_tool(path)
-    } else {
-        path.to_path_buf()
-    }
-}
-
-/// Keep this transformation platform-independent so the Linux and macOS test
-/// suites exercise the Windows regression too.
-fn windows_path_for_external_tool(path: &Path) -> PathBuf {
+    // Recognized verbatim prefixes are unambiguous, so perform the conversion
+    // on every host. This lets Linux and macOS exercise both the conversion
+    // and its external-tool call sites without requiring a Windows runner.
     let Some(path) = path.to_str() else {
         return path.to_path_buf();
     };
@@ -44,11 +37,11 @@ mod tests {
     #[test]
     fn windows_drive_verbatim_paths_are_safe_for_external_tools_on_every_host() {
         assert_eq!(
-            windows_path_for_external_tool(Path::new(r"\\?\C:\workspace\project\.git")),
+            path_for_external_tool(Path::new(r"\\?\C:\workspace\project\.git")),
             PathBuf::from(r"C:\workspace\project\.git")
         );
         assert_eq!(
-            windows_path_for_external_tool(Path::new(r"\\?\d:/workspace/project/.git")),
+            path_for_external_tool(Path::new(r"\\?\d:/workspace/project/.git")),
             PathBuf::from(r"d:/workspace/project/.git")
         );
     }
@@ -56,7 +49,7 @@ mod tests {
     #[test]
     fn windows_unc_verbatim_paths_are_safe_for_external_tools_on_every_host() {
         assert_eq!(
-            windows_path_for_external_tool(Path::new(r"\\?\UNC\server\share\project\.git")),
+            path_for_external_tool(Path::new(r"\\?\UNC\server\share\project\.git")),
             PathBuf::from(r"\\server\share\project\.git")
         );
     }
@@ -69,7 +62,7 @@ mod tests {
             Path::new("/workspace/project"),
             Path::new(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\project"),
         ] {
-            assert_eq!(windows_path_for_external_tool(path), path);
+            assert_eq!(path_for_external_tool(path), path);
         }
     }
 }

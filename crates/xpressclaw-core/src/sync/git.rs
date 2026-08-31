@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 use crate::error::{Error, Result};
+use crate::external_tools::path_for_external_tool;
 
 use super::manifest::GitStoreConfig;
 
@@ -189,7 +190,7 @@ where
     let mut command = Command::new("git");
     command
         .args(args)
-        .current_dir(root)
+        .current_dir(path_for_external_tool(root))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
     command
