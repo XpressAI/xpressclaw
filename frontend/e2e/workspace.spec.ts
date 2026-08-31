@@ -4523,7 +4523,7 @@ test('skills and MCP settings surface official discovery documentation', async (
 	expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 });
 
-test('Harness discovery links use the native opener in the desktop app', async ({ page }) => {
+test('Harness discovery links use the identity-checked opener for remote Desktop profiles', async ({ page }) => {
 	await page.addInitScript(() => {
 		Object.defineProperty(window, 'isTauri', { value: true });
 		(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls = [];
@@ -4532,7 +4532,7 @@ test('Harness discovery links use the native opener in the desktop app', async (
 		}).__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: Record<string, unknown>) => {
 				if (command === 'get_active_instance_profile') {
-					return { identity_status: 'matched', local: true };
+					return { identity_status: 'matched', navigation_status: 'ready', local: false };
 				}
 				(window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }).__externalOpenCalls.push({ command, args });
 				return null;
@@ -4546,8 +4546,8 @@ test('Harness discovery links use the native opener in the desktop app', async (
 	await expect.poll(() => page.evaluate(() => (
 		window as unknown as { __externalOpenCalls: { command: string; args: Record<string, unknown> }[] }
 	).__externalOpenCalls)).toEqual([{
-		command: 'plugin:opener|open_url',
-		args: { url: 'https://registry.modelcontextprotocol.io/', with: undefined },
+		command: 'open_external_url',
+		args: { url: 'https://registry.modelcontextprotocol.io/' },
 	}]);
 });
 

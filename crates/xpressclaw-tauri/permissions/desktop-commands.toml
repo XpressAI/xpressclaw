@@ -6,6 +6,7 @@ commands.allow = [
   "get_server_port",
   "get_status",
   "open_browser",
+  "open_external_url",
   "list_instance_profiles",
   "save_instance_profile",
   "select_instance_profile",
@@ -18,8 +19,9 @@ commands.allow = [
 
 [[permission]]
 identifier = "desktop-profile-commands"
-description = "Allows one explicitly selected remote XpressClaw origin to manage Desktop instance profiles and authenticate through the OS keychain."
+description = "Allows one explicitly selected remote XpressClaw origin to manage Desktop instance profiles, authenticate through the OS keychain, and open identity-checked HTTP(S) links."
 commands.allow = [
+  "open_external_url",
   "list_instance_profiles",
   "save_instance_profile",
   "select_instance_profile",

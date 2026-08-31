@@ -1,8 +1,7 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import { isTauri } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { serverTimestampMs } from './serverTime';
-import { request } from './api';
 
 export function cn(...inputs: ClassValue[]) {
 	return twMerge(clsx(inputs));
@@ -34,23 +33,12 @@ export async function openExternal(url: string): Promise<void> {
 		throw new Error('Only HTTP and HTTPS links can be opened');
 	}
 
-	if (!isTauri()) {
-		window.open(target.href, '_blank', 'noopener,noreferrer');
+	if (isTauri()) {
+		await invoke('open_external_url', { url: target.href });
 		return;
 	}
 
-	try {
-		const { openUrl } = await import('@tauri-apps/plugin-opener');
-		await openUrl(target.href);
-	} catch {
-		// Older Desktop builds may not expose the opener plugin. Their local
-		// sidecar still provides this compatibility path.
-		await request<void>('/api/open-url', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ url: target.href })
-		});
-	}
+	window.open(target.href, '_blank', 'noopener,noreferrer');
 }
 
 /** Compact product mark for an ACP-backed agent. */

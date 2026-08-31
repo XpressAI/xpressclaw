@@ -401,6 +401,7 @@ fn main() {
             commands::get_server_port,
             commands::get_status,
             commands::open_browser,
+            commands::open_external_url,
             profiles::list_instance_profiles,
             profiles::save_instance_profile,
             profiles::select_instance_profile,
