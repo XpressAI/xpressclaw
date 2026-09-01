@@ -853,7 +853,7 @@ async fn poll_once(db: &Arc<Database>, config: &Config) -> crate::error::Result<
             }
             DriverResult::Failed(reason) => {
                 let _ = queue.fail(claimed.id, reason);
-                let _ = board.update_status(&claimed.task_id, "cancelled", None);
+                let _ = board.update_status(&claimed.task_id, "blocked", None);
                 warn!(task_id = claimed.task_id, reason, "task execution failed");
                 notify_conversation(db, config, &claimed.task_id, &claimed.agent_id, "failed");
                 // Advance workflow if this task is part of one

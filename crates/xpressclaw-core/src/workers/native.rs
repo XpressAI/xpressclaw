@@ -1502,10 +1502,11 @@ async fn execute_item(runtime: NativeAttemptRuntime, item: QueueItem) -> Result<
     else {
         return Ok(());
     };
-    advance_workflow_attempt(&db, &item.task_id, attempt_id, "completed", &turn.summary);
-
     let continuation_queued = queue.has_queued_for_task(&item.task_id)?;
     let waiting_for_user = needs_user_input(&turn.summary);
+    if !waiting_for_user {
+        advance_workflow_attempt(&db, &item.task_id, attempt_id, "completed", &turn.summary);
+    }
     if !continuation_queued && !waiting_for_user {
         board.defer_reported_subtasks(&item.task_id, "successful_attempt_completed")?;
     }
